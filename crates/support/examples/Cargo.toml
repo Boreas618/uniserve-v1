@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 serde_json.workspace = true
 uniserve-server-app.workspace = true
+uniserve-serving.workspace = true
 
 [lints]
 workspace = true
