@@ -1,10 +1,14 @@
-//! Cross-rank coordination: stream-ordered collectives, expert exchange,
-//! microbatch rotation and expert weight prefetch.
+//! Cross-rank coordination: host collectives, the process-group plan,
+//! stream-ordered collectives, expert exchange, microbatch rotation and
+//! expert weight prefetch.
 
 mod collectives;
 mod experts;
+pub mod host;
 mod microbatches;
+pub mod topology;
 mod weight_prefetch;
+pub mod world;
 
 pub use collectives::StreamCommunicator;
 pub use experts::ExpertExchange;

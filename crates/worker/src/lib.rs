@@ -6,15 +6,20 @@
 //! state, storage, streams, graphs policy, transfers and the IPC service;
 //! Python computes through the functions in that table.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod capacity;
 mod completion;
 pub mod config;
-mod error;
-mod executor;
+pub mod error;
+pub mod executor;
 pub mod ffi;
 mod host;
-mod parallel;
-mod profiling;
+pub mod launch;
+mod logging;
+pub mod model;
+pub mod parallel;
+pub mod profiling;
 mod request;
 mod runner;
 mod sampling;
@@ -22,10 +27,12 @@ mod service;
 pub mod storage;
 mod stream;
 pub mod transfer;
+pub mod warmup;
+pub mod worker;
 
 pub use completion::{Completion, Outcome};
 pub use config::WorkerConfig;
-pub use error::{Error, Result};
+pub use error::{Error, ErrorCode, Result, WorkerError};
 pub use executor::{
     Backend, Batch, BatchInputs, BatchResult, Executor, InputReady, InputWait, PendingOutput,
     Submission, request_output,
@@ -55,3 +62,18 @@ pub use transfer::{
     SharedRead, TransferCapacity, TransferPool, TransferRead, TransferTicket, fetch_descriptor,
     plan_reads,
 };
+
+/// The library's exported entry point, `main(argv, interface) -> int`.
+///
+/// The Python entry calls it once with the process arguments and the
+/// numerical interface table (`uniserve_models.interface.table()`); the
+/// returned value is the process exit status.
+fn main(
+    argv: tvm_ffi::Array<tvm_ffi::String>,
+    interface: tvm_ffi::Map<tvm_ffi::String, tvm_ffi::Function>,
+) -> tvm_ffi::Result<i64> {
+    let argv: Vec<String> = argv.iter().map(|value| value.as_str().to_owned()).collect();
+    Ok(launch::main(&argv, interface))
+}
+
+tvm_ffi::tvm_ffi_dll_export_typed_func!(main, main);

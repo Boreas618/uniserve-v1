@@ -18,7 +18,7 @@ use tvm_ffi::{Any, AnyView};
 use crate::{Error, Result};
 
 pub use dlpack::{Backing, DType, Device, contiguous_strides, export};
-pub use record::Record;
+pub use record::{Fields, Record, integer_list, integers, is_none, json, list, strings, to_json};
 pub use tvm_ffi::{Array, Map, Shape, Tensor};
 
 /// A function from the interface table or a binding map.
@@ -74,6 +74,17 @@ impl Function {
     pub fn invoke(&self, args: &[AnyView<'_>]) -> Result<()> {
         self.call(args).map(drop)
     }
+
+    /// Call with owned argument values.
+    pub fn call_values(&self, args: &[Any]) -> Result<Any> {
+        let views: Vec<AnyView<'_>> = args.iter().map(AnyView::from).collect();
+        self.call(&views)
+    }
+
+    /// The function as a value, to pass to another function.
+    pub fn to_any(&self) -> Any {
+        Any::from(self.inner.clone())
+    }
 }
 
 impl std::fmt::Debug for Function {
@@ -104,6 +115,16 @@ impl Handle {
     pub fn view(&self) -> AnyView<'_> {
         AnyView::from(&self.0)
     }
+
+    /// The handle as an argument value.
+    pub fn to_any(&self) -> Any {
+        self.0.clone()
+    }
+
+    /// Whether Python returned `None` instead of an object.
+    pub fn is_none(&self) -> bool {
+        is_none(&self.0)
+    }
 }
 
 impl std::fmt::Debug for Handle {
@@ -125,6 +146,21 @@ impl Functions {
         let owner = owner.into();
         let functions = Map::try_from(value).map_err(|error| Error::numerical(&owner, &error))?;
         Ok(Self { owner, functions })
+    }
+
+    /// Wrap a map received as a typed argument.
+    pub fn from_map(
+        owner: impl Into<String>,
+        functions: Map<tvm_ffi::String, tvm_ffi::Function>,
+    ) -> Self {
+        Self {
+            owner: owner.into(),
+            functions,
+        }
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
     }
 
     /// A required function. Startup fails naming the missing key.

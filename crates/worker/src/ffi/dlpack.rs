@@ -71,6 +71,45 @@ impl DType {
         }
     }
 
+    /// Parse a torch dtype name (`bfloat16`, `torch.int64`, ...).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name.trim_start_matches("torch.") {
+            "bool" => Self::Bool,
+            "uint8" => Self::U8,
+            "int8" => Self::I8,
+            "int16" => Self::I16,
+            "int32" => Self::I32,
+            "int64" => Self::I64,
+            "uint32" => Self::U32,
+            "float16" => Self::F16,
+            "bfloat16" => Self::BF16,
+            "float32" => Self::F32,
+            "float64" => Self::F64,
+            "float8_e4m3fn" => Self::F8E4M3,
+            "float8_e5m2" => Self::F8E5M2,
+            _ => return None,
+        })
+    }
+
+    /// The torch spelling of this dtype.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::U8 => "uint8",
+            Self::I8 => "int8",
+            Self::I16 => "int16",
+            Self::I32 => "int32",
+            Self::I64 => "int64",
+            Self::U32 => "uint32",
+            Self::F16 => "float16",
+            Self::BF16 => "bfloat16",
+            Self::F32 => "float32",
+            Self::F64 => "float64",
+            Self::F8E4M3 => "float8_e4m3fn",
+            Self::F8E5M2 => "float8_e5m2",
+        }
+    }
+
     fn to_dlpack(self) -> DLDataType {
         let (code, bits) = match self {
             Self::Bool => (DLDataTypeCode::kDLBool, 8),

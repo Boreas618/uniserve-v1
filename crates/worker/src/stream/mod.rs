@@ -53,6 +53,12 @@ impl CUDAStream {
         })
     }
 
+    /// Own a new non-blocking stream on `device`'s full device, in its
+    /// primary context.
+    pub fn create(device: DeviceId, event_slots: usize) -> Result<Self> {
+        Self::new(device, Stream::new(device)?, event_slots)
+    }
+
     /// Borrow an existing numerical stream; its creator retains the handle.
     ///
     /// # Safety

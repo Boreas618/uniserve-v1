@@ -1,4 +1,12 @@
 //! Startup storage bounds shared by model workers and their resource owners.
+//!
+//! [`plan`] resolves a rank's capacity after loading; [`device`] measures
+//! device storage; [`checks`] verifies auxiliary devices and the final
+//! startup footprint against the grant.
+
+pub mod checks;
+pub mod device;
+pub mod plan;
 
 use crate::{Error, Result};
 
