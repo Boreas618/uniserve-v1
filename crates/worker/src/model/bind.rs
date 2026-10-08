@@ -8,23 +8,24 @@
 //!    operators need, without allocating. Shared transient work areas carry
 //!    a role (`matmul`, `moe`, `attention`, `vsa.0`, `vsa.1`); the other
 //!    requirements are persistent per binding.
-//! 2. [`bind`] allocates: one backing per stream, role, device and schema,
-//!    sized to the maximum over every binding prepared on that stream (they
-//!    run serially there), and one allocation per persistent requirement.
+//! 2. [`bind`] allocates through the stream's [`Workspaces`]: each shared
+//!    field one backing per stream and device, sized to the largest binding
+//!    prepared on that stream (they run serially there), and one allocation
+//!    per persistent requirement.
 //! 3. `component.bind` receives the allocations as DLPack tensors once and
 //!    creates operators over them.
 //!
 //! Every binding prepared for a stream must be prepared before any of them
 //! is bound, so the shared backings never grow after a graph captured them.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
 
-use tvm_ffi::{Any, Tensor};
+use tvm_ffi::Any;
 
 use crate::config::Device;
-use crate::ffi::{Backing, DType, Fields, Function, Functions, Handle, Record};
-use crate::storage::memory::{Memory, StorageView};
+use crate::ffi::{DType, Fields, Function, Functions, Handle, Record};
+use crate::storage::memory::StorageView;
+use crate::storage::{WorkspaceRequest, Workspaces};
 use crate::{Error, Result};
 
 use super::interface::Interface;
@@ -88,6 +89,9 @@ pub struct Requirement {
     pub host: bool,
     /// CUDA ordinal, `-1` for the host.
     pub device: i32,
+    /// Process ranks, in member order, whose allocations of this field
+    /// must be peer-mapped; empty for local storage.
+    pub symmetric: Vec<usize>,
 }
 
 impl Requirement {
@@ -103,32 +107,17 @@ impl Requirement {
             })?,
             shape: record.shape("shape")?,
             host: record.flag("host")?,
+            symmetric: match record.optional_value("symmetric")? {
+                Some(ranks) => crate::ffi::integers(ranks)
+                    .map_err(|error| Error::numerical("component.prepare", &error))?
+                    .into_iter()
+                    .map(|rank| rank as usize)
+                    .collect(),
+                None => Vec::new(),
+            },
             device: i32::try_from(record.get::<i64>("device")?)
                 .map_err(|_| Error::Interface("component.prepare device is invalid".into()))?,
         })
-    }
-
-    fn bytes(&self) -> Result<usize> {
-        let elements = self.shape.iter().try_fold(1usize, |total, &extent| {
-            usize::try_from(extent)
-                .ok()
-                .and_then(|extent| total.checked_mul(extent))
-        });
-        elements
-            .and_then(|elements| elements.checked_mul(self.dtype.bytes()))
-            .ok_or_else(|| {
-                Error::Interface(format!("workspace {} has an invalid shape", self.name))
-            })
-    }
-
-    /// Requirements sharing a backing must describe the same tensor.
-    fn schema(&self) -> (String, &'static str, bool, usize) {
-        (
-            self.name.clone(),
-            self.dtype.name(),
-            self.host,
-            self.shape.len(),
-        )
     }
 }
 
@@ -153,7 +142,7 @@ pub struct ComponentBinding {
     close: Function,
     /// Workspaces retained until every graph and call that addresses them
     /// has retired; Python views also retain them.
-    workspaces: Vec<Arc<Memory>>,
+    workspaces: Vec<StorageView>,
     closed: bool,
 }
 
@@ -176,7 +165,10 @@ impl ComponentBinding {
 
     /// Bytes of the Rust allocations backing this binding.
     pub fn workspace_bytes(&self) -> usize {
-        self.workspaces.iter().map(|memory| memory.len()).sum()
+        self.workspaces
+            .iter()
+            .map(|view| view.byte_len().unwrap_or(0))
+            .sum()
     }
 
     /// Release operators. An aborted close drops Python references without
@@ -258,101 +250,99 @@ pub fn prepare(
     })
 }
 
-/// A shared backing's key: stream, role and device, then the schema of its
-/// fields.
-type SharedKey = (usize, String, i32, Vec<(String, &'static str, bool, usize)>);
-
-/// The largest shape of each field over every binding sharing a backing.
-fn envelopes(prepared: &[Prepared]) -> Result<BTreeMap<SharedKey, BTreeMap<String, Vec<i64>>>> {
-    let mut shared: BTreeMap<SharedKey, BTreeMap<String, Vec<i64>>> = BTreeMap::new();
-    for binding in prepared {
-        let mut roles: BTreeMap<(String, i32), Vec<&Requirement>> = BTreeMap::new();
-        for requirement in &binding.requirements {
-            if let Some(role) = &requirement.role {
-                roles
-                    .entry((role.clone(), requirement.device))
-                    .or_default()
-                    .push(requirement);
-            }
-        }
-        for ((role, device), fields) in roles {
-            let schema = fields.iter().map(|field| field.schema()).collect();
-            let envelope = shared
-                .entry((binding.request.stream, role, device, schema))
-                .or_default();
-            for field in fields {
-                let bound = envelope
-                    .entry(field.name.clone())
-                    .or_insert_with(|| vec![0; field.shape.len()]);
-                for (bound, &extent) in bound.iter_mut().zip(&field.shape) {
-                    *bound = (*bound).max(extent);
-                }
-            }
-        }
-    }
-    Ok(shared)
+/// The workspaces of each stream and device bindings run on.
+#[derive(Default)]
+pub struct StreamWorkspaces {
+    streams: BTreeMap<(usize, i32), Workspaces>,
 }
 
-fn allocate(requirement: &Requirement, shape: &[i64]) -> Result<(Arc<Memory>, Tensor)> {
-    let sized = Requirement {
-        shape: shape.to_vec(),
-        ..requirement.clone()
-    };
-    let bytes = sized.bytes()?.max(1);
-    let memory = match (requirement.device, requirement.host) {
-        (-1, _) => Memory::host(bytes),
-        (device, true) => Memory::pinned(device, bytes)?,
-        (device, false) => Memory::device(device, bytes)?,
-    };
-    let backing: Arc<dyn Backing> = Arc::<Memory>::clone(&memory);
-    let tensor = StorageView::contiguous(backing, 0, requirement.dtype, shape)?.to_tensor()?;
-    Ok((memory, tensor))
+impl StreamWorkspaces {
+    fn requests(binding: &Prepared, device: i32) -> Vec<WorkspaceRequest> {
+        binding
+            .requirements
+            .iter()
+            .filter(|requirement| requirement.device == device)
+            .map(|requirement| WorkspaceRequest {
+                name: requirement.name.clone(),
+                dtype: requirement.dtype,
+                shape: requirement.shape.clone(),
+                host: requirement.host,
+                // A shared field is named `{role}/{field}`: every binding on
+                // the stream borrows one backing per field of a role.
+                role: requirement.role.as_ref().map(|_| requirement.name.clone()),
+            })
+            .collect()
+    }
+
+    fn devices(binding: &Prepared) -> BTreeSet<i32> {
+        binding
+            .requirements
+            .iter()
+            .map(|requirement| requirement.device)
+            .collect()
+    }
+
+    fn workspaces(&mut self, stream: usize, device: i32) -> &mut Workspaces {
+        self.streams
+            .entry((stream, device))
+            .or_insert_with(|| Workspaces::new((device >= 0).then_some(device)))
+    }
+
+    /// Bytes allocated for every stream's workspaces.
+    pub fn bytes(&self) -> u64 {
+        self.streams.values().map(Workspaces::bytes).sum()
+    }
+
+    /// Refuse new workspace storage: captured graphs address the current
+    /// backings.
+    pub fn seal(&mut self) {
+        self.streams.values_mut().for_each(Workspaces::seal);
+    }
 }
 
 /// Allocate every prepared binding's workspaces and bind them, in order.
 ///
-/// Fails without binding the remaining requests when one fails; bindings
-/// already returned by earlier calls are unaffected.
-pub fn bind(interface: &Interface, prepared: Vec<Prepared>) -> Result<Vec<ComponentBinding>> {
+/// All bindings are declared to their streams' workspaces before any
+/// allocation, so a shared field's backing holds the largest of them.
+pub fn bind(
+    interface: &Interface,
+    workspaces: &mut StreamWorkspaces,
+    prepared: Vec<Prepared>,
+) -> Result<Vec<ComponentBinding>> {
     let _range = crate::profiling::range(c"uniserve.worker.bind", None);
-    let envelopes = envelopes(&prepared)?;
-    let mut backings: BTreeMap<(SharedKey, String), (Arc<Memory>, Tensor)> = BTreeMap::new();
+    if let Some(field) = prepared
+        .iter()
+        .flat_map(|binding| &binding.requirements)
+        .find(|requirement| !requirement.symmetric.is_empty())
+    {
+        // Peer-mapped storage is formed over the host group by the expert
+        // and parallel runtime, which owns symmetric allocations.
+        return Err(Error::Unsupported(format!(
+            "symmetric workspace {} is served by the experts runtime",
+            field.name
+        )));
+    }
+    for binding in &prepared {
+        for device in StreamWorkspaces::devices(binding) {
+            let requests = StreamWorkspaces::requests(binding, device);
+            workspaces
+                .workspaces(binding.request.stream, device)
+                .declare(&requests)?;
+        }
+    }
+
     let mut bound = Vec::with_capacity(prepared.len());
     for binding in prepared {
-        let mut workspaces = Vec::new();
+        let mut views = Vec::new();
         let mut tensors = Fields::new();
-        let mut roles: BTreeMap<(String, i32), Vec<&Requirement>> = BTreeMap::new();
-        for requirement in &binding.requirements {
-            match &requirement.role {
-                Some(role) => roles
-                    .entry((role.clone(), requirement.device))
-                    .or_default()
-                    .push(requirement),
-                None => {
-                    let (memory, tensor) = allocate(requirement, &requirement.shape)?;
-                    workspaces.push(memory);
-                    tensors = tensors.with(&requirement.name, tensor);
-                }
-            }
-        }
-        for ((role, device), fields) in roles {
-            let schema: Vec<_> = fields.iter().map(|field| field.schema()).collect();
-            let key: SharedKey = (binding.request.stream, role, device, schema);
-            for field in fields {
-                let entry = (key.clone(), field.name.clone());
-                if !backings.contains_key(&entry) {
-                    let shape = envelopes
-                        .get(&key)
-                        .and_then(|envelope| envelope.get(&field.name))
-                        .ok_or_else(|| {
-                            Error::Invariant("shared workspace has no envelope".into())
-                        })?;
-                    let allocation = allocate(field, shape)?;
-                    backings.insert(entry.clone(), allocation);
-                }
-                let (memory, tensor) = &backings[&entry];
-                workspaces.push(Arc::clone(memory));
-                tensors = tensors.with(&field.name, tensor.clone());
+        for device in StreamWorkspaces::devices(&binding) {
+            let requests = StreamWorkspaces::requests(&binding, device);
+            for (name, view) in workspaces
+                .workspaces(binding.request.stream, device)
+                .bind(&requests)?
+            {
+                tensors = tensors.with(&name, view.to_tensor()?);
+                views.push(view);
             }
         }
 
@@ -373,81 +363,9 @@ pub fn bind(interface: &Interface, prepared: Vec<Prepared>) -> Result<Vec<Compon
             prepared: binding.handle,
             kernels: functions.get("kernels")?,
             close: functions.get("close")?,
-            workspaces,
+            workspaces: views,
             closed: false,
         });
     }
     Ok(bound)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn requirement(name: &str, role: Option<&str>, shape: &[i64]) -> Requirement {
-        Requirement {
-            name: name.into(),
-            role: role.map(str::to_owned),
-            dtype: DType::U8,
-            shape: shape.to_vec(),
-            host: false,
-            device: 0,
-        }
-    }
-
-    fn prepared(stream: usize, requirements: Vec<Requirement>) -> Prepared {
-        Prepared {
-            request: BindingRequest {
-                component: "model".into(),
-                path: String::new(),
-                device: Device::Cuda(0),
-                stream,
-                size: None,
-                backends: Backends::default(),
-                derive_host_lengths: true,
-                experts: None,
-                weights: None,
-                cache: None,
-            },
-            handle: Handle::new(Any::default()),
-            requirements,
-        }
-    }
-
-    #[test]
-    fn shared_workspaces_take_the_largest_size_on_one_stream() {
-        let bindings = vec![
-            prepared(
-                7,
-                vec![
-                    requirement("matmul/workspace", Some("matmul"), &[1024]),
-                    requirement("0000/exchange", None, &[64]),
-                ],
-            ),
-            prepared(
-                7,
-                vec![requirement("matmul/workspace", Some("matmul"), &[4096])],
-            ),
-            // Another stream runs concurrently and needs its own backing.
-            prepared(
-                9,
-                vec![requirement("matmul/workspace", Some("matmul"), &[512])],
-            ),
-        ];
-        let envelopes = envelopes(&bindings).unwrap();
-        assert_eq!(envelopes.len(), 2);
-        let sizes: Vec<_> = envelopes
-            .iter()
-            .map(|((stream, role, _, _), fields)| {
-                (*stream, role.clone(), fields["matmul/workspace"].clone())
-            })
-            .collect();
-        assert_eq!(
-            sizes,
-            vec![
-                (7, "matmul".to_owned(), vec![4096]),
-                (9, "matmul".to_owned(), vec![512])
-            ]
-        );
-    }
 }

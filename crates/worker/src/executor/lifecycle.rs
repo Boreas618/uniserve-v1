@@ -60,6 +60,16 @@ pub trait RequestStorage {
     fn awaiting_acknowledgment(&self) -> bool {
         false
     }
+
+    /// Install (or clear) the service wake fired by asynchronous
+    /// completions while the rank serves.
+    fn set_wake(&self, _wake: Option<uniserve_ipc::Wake>) {}
+
+    /// Release the owner's storage at shutdown, after the executor drained.
+    /// An aborted close keeps whatever device work may still address.
+    fn close(&mut self, _aborted: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// One batch's Finish and Free commands.
