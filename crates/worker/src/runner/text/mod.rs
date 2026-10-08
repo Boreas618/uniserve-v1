@@ -378,7 +378,10 @@ impl TextRunner {
             .any(|row| matches!(row.source, RowSource::Placed { .. }));
         let multimodal =
             placed || !request.embeddings.is_empty() || rows.iter().any(|row| !row.causal);
-        let axes = if placed { 3 } else { 1 };
+        let spatial = rows
+            .iter()
+            .any(|row| matches!(row.source, RowSource::Placed { spatial: true, .. }));
+        let axes = if spatial { 3 } else { 1 };
 
         // Graph selection depends only on call metadata, so every rank of a
         // group selects the same graph.
@@ -543,10 +546,11 @@ impl TextRunner {
                     RowSource::Placed {
                         tokens,
                         positions: placed,
+                        ..
                     } => {
                         for (index, &token) in tokens.iter().enumerate() {
                             token_ids[offset + index] = i64::from(token);
-                            for (axis, values) in placed.iter().enumerate() {
+                            for (axis, values) in placed.iter().take(axes).enumerate() {
                                 positions[axis * padded_tokens + offset + index] = values[index];
                             }
                         }
