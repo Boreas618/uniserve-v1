@@ -18,3 +18,4 @@ tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uniserve-core.workspace = true
+uniserve-ipc.workspace = true
