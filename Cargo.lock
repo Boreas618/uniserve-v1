@@ -6594,6 +6594,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-error"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da25490ff9892aab3fcf7c36f08cfb902dd3e71ca0f9f9517bea02a73a5ce38c"
+dependencies = [
+ "proc-macro-error-attr",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+ "version_check",
+]
+
+[[package]]
+name = "proc-macro-error-attr"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1be40180e52ecc98ad80b184934baf3d0d29f979574e439af5a55274b35f869"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "version_check",
+]
+
+[[package]]
 name = "proc-macro-error-attr2"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8304,6 +8328,17 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
@@ -9264,6 +9299,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "tvm-ffi"
+version = "0.1.14-post1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2573e03b4bc46bfb606b2801c7a94d332b7640acbe5936a0c64935d664ff9875"
+dependencies = [
+ "paste",
+ "tvm-ffi-macros",
+ "tvm-ffi-sys",
+]
+
+[[package]]
+name = "tvm-ffi-macros"
+version = "0.1.14-post1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c0f660be122ead0def43f986c9ec4aa635bb9e285820adbc449b8230426933f"
+dependencies = [
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "tvm-ffi-sys"
+version = "0.1.14-post1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0b29bc4a713c7e86bcb98e1655832058c272eb336f8d62cece8344cb2666ee2"
+
+[[package]]
 name = "twox-hash"
 version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9570,6 +9634,7 @@ dependencies = [
  "nvtx",
  "rustix 1.1.4",
  "thiserror 2.0.18",
+ "tvm-ffi",
  "uniserve-core",
  "uniserve-ipc",
 ]

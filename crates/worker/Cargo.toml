@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The cdylib is the library `uniserve_models.worker` loads through TVM-FFI;
+# the rlib serves Rust tests and benches.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 crossbeam-channel.workspace = true
 indexmap.workspace = true
@@ -12,6 +17,7 @@ libloading.workspace = true
 nvtx.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
+tvm-ffi.workspace = true
 uniserve-core.workspace = true
 uniserve-ipc.workspace = true
 
