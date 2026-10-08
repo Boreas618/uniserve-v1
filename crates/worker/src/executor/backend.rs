@@ -55,6 +55,9 @@ pub struct WorkerBackend {
     image: Option<forward::image::ImageRuntime>,
     /// The canvas runtime, on ranks holding a token denoiser.
     canvas: Option<forward::canvas::CanvasRuntime>,
+    /// The transfer runtime: tensor transfers, KV exports and installs, and
+    /// the streams batch imports run on.
+    transfer: Option<forward::transfer::TransferRuntime>,
     /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
@@ -71,15 +74,18 @@ pub(crate) struct Parts<'a> {
     pub text: Option<&'a mut forward::token::TextRuntime>,
     pub image: Option<&'a mut forward::image::ImageRuntime>,
     pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
+    pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, then the
-/// text, image and canvas runtimes, then the other runtimes' owners.
+/// text, image, canvas and transfer runtimes, then the other runtimes'
+/// owners.
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<forward::token::TextRuntime>,
     image: &'a mut Option<forward::image::ImageRuntime>,
     canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
+    transfer: &'a mut Option<forward::transfer::TransferRuntime>,
     others: &'a mut [Box<dyn RequestStorage>],
 ) -> Vec<&'a mut dyn RequestStorage> {
     let mut owners: Vec<&'a mut dyn RequestStorage> = Vec::new();
@@ -94,6 +100,9 @@ fn owners<'a>(
     }
     if let Some(canvas) = canvas {
         owners.push(canvas);
+    }
+    if let Some(transfer) = transfer {
+        owners.push(transfer);
     }
     owners.extend(
         others
@@ -113,6 +122,8 @@ pub struct WorkerBatch {
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
     image_inputs: Option<forward::image::Inputs>,
+    /// Products and KV transfers imported from other calls.
+    inputs: forward::inputs::Inputs,
     output: Option<BatchResult>,
 }
 
@@ -125,6 +136,7 @@ impl WorkerBatch {
             retirement,
             running: None,
             image_inputs: None,
+            inputs: forward::inputs::Inputs::default(),
             output: None,
         }
     }
@@ -180,6 +192,15 @@ impl WorkerBatch {
     pub(crate) fn take_image_inputs(&mut self) -> Option<forward::image::Inputs> {
         self.image_inputs.take()
     }
+
+    /// The batch's imported inputs.
+    pub(crate) fn inputs(&self) -> &forward::inputs::Inputs {
+        &self.inputs
+    }
+
+    pub(crate) fn inputs_mut(&mut self) -> &mut forward::inputs::Inputs {
+        &mut self.inputs
+    }
 }
 
 impl WorkerBackend {
@@ -192,6 +213,7 @@ impl WorkerBackend {
             text: None,
             image: None,
             canvas: None,
+            transfer: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -259,6 +281,29 @@ impl WorkerBackend {
         self.canvas.as_mut()
     }
 
+    /// Install the transfer runtime.
+    pub(crate) fn set_transfer(&mut self, transfer: forward::transfer::TransferRuntime) {
+        self.transfer = Some(transfer);
+    }
+
+    /// The stream serving `kind` calls on `device` (none on host devices):
+    /// imports for such calls are read and published on it.
+    pub(crate) fn transfer_stream(
+        &self,
+        kind: CallKind,
+        device: crate::ffi::Device,
+    ) -> Result<Option<uniserve_cuda::Stream>> {
+        if !matches!(device, crate::ffi::Device::Cuda(_)) {
+            return Ok(None);
+        }
+        self.transfer
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Unsupported("device transfers require the transfer runtime".into())
+            })?
+            .stream(kind, device)
+    }
+
     /// Register another runtime's storage owner taking part in request
     /// lifecycles.
     pub fn add_storage(&mut self, storage: Box<dyn RequestStorage>) {
@@ -275,6 +320,7 @@ impl WorkerBackend {
             text: self.text.as_mut(),
             image: self.image.as_mut(),
             canvas: self.canvas.as_mut(),
+            transfer: self.transfer.as_mut(),
         }
     }
 
@@ -328,6 +374,7 @@ impl WorkerBackend {
                 &mut self.text,
                 &mut self.image,
                 &mut self.canvas,
+                &mut self.transfer,
                 &mut self.storage,
             ) {
                 owner.admit_slots(&admitted)?;
@@ -452,18 +499,24 @@ impl WorkerBackend {
         if let Some(image) = &self.image {
             image.set_wake(wake.clone());
         }
+        if let Some(transfer) = &self.transfer {
+            transfer.set_wake(wake.clone());
+        }
         for owner in &self.storage {
             owner.set_wake(wake.clone());
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, the canvas,
-    /// image and text runtimes, then rank storage), after the executor
-    /// drained; returns the first failure.
+    /// Close every storage owner, newest first (other runtimes, the
+    /// transfer, canvas, image and text runtimes, then rank storage), after
+    /// the executor drained; returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
+        }
+        if let Some(mut transfer) = self.transfer.take() {
+            result = result.and(transfer.close(aborted));
         }
         if let Some(mut canvas) = self.canvas.take() {
             result = result.and(canvas.close(aborted));
@@ -601,6 +654,7 @@ impl Backend for WorkerBackend {
             &mut self.text,
             &mut self.image,
             &mut self.canvas,
+            &mut self.transfer,
             &mut self.storage,
         );
         batch.retirement.admit(&mut owners)?;
@@ -625,6 +679,12 @@ impl Backend for WorkerBackend {
         batch: &mut WorkerBatch,
         submission: &Arc<Submission>,
     ) -> std::result::Result<bool, WorkerError> {
+        // Products and KV transfers other calls published are imported
+        // first, for every runtime alike (`await_inputs` subscribes to what
+        // blocks them).
+        if !forward::inputs::prepare(self, batch)? {
+            return Ok(false);
+        }
         // Inline images of an image encoding batch are decoded on the image
         // runtime's host lane while other batches execute; the batch
         // launches once they are ready (the lane notifies `submission`).
@@ -637,10 +697,10 @@ impl Backend for WorkerBackend {
 
     fn await_inputs(
         &mut self,
-        _batch: &mut WorkerBatch,
-        _submission: &Arc<Submission>,
+        batch: &mut WorkerBatch,
+        submission: &Arc<Submission>,
     ) -> std::result::Result<(), WorkerError> {
-        Ok(())
+        Ok(forward::inputs::subscribe(self, batch, submission)?)
     }
 
     fn execute(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
@@ -657,6 +717,10 @@ impl Backend for WorkerBackend {
             });
             return Ok(());
         };
+
+        // Imported products become resident before the runtime consumes
+        // them like local ones.
+        forward::inputs::complete(self, batch)?;
 
         // Each executed batch with calls is one profiler step.
         let mut profiler = self.profiler.take();
@@ -680,6 +744,7 @@ impl Backend for WorkerBackend {
             &mut self.text,
             &mut self.image,
             &mut self.canvas,
+            &mut self.transfer,
             &mut self.storage,
         );
         batch.retirement.begin(&self.requests, &mut owners)?;
@@ -704,6 +769,7 @@ impl Backend for WorkerBackend {
             &mut self.text,
             &mut self.image,
             &mut self.canvas,
+            &mut self.transfer,
             &mut self.storage,
         );
         let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
@@ -725,10 +791,14 @@ impl Backend for WorkerBackend {
         // Calls become pending only when a capability runtime commits them;
         // unresolved launched work cancels its pending calls. Lifecycle
         // commands hold no resource beyond their retirement.
-        if let Some(running) = batch.running.take() {
-            forward::abandon(self, running)?;
-        }
-        Ok(())
+        let abandoned = batch
+            .running
+            .take()
+            .map_or(Ok(()), |running| forward::abandon(self, running));
+        // Imports the batch did not consume are abandoned; their storage
+        // retires with their physical accesses.
+        let closed = forward::inputs::close(self, batch).map_err(WorkerError::from);
+        abandoned.and(closed)
     }
 
     fn reap(&mut self) -> std::result::Result<(), WorkerError> {
@@ -737,6 +807,7 @@ impl Backend for WorkerBackend {
             &mut self.text,
             &mut self.image,
             &mut self.canvas,
+            &mut self.transfer,
             &mut self.storage,
         ) {
             owner.reap()?;
