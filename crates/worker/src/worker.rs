@@ -49,13 +49,15 @@ use crate::executor::forward::canvas::warmup::CanvasWarmup;
 use crate::executor::forward::canvas::{
     CanvasRuntime, Startup as CanvasStartup, reserved_bytes as canvas_bytes,
 };
+use crate::executor::forward::experts::warmup::ExpertWarmup;
+use crate::executor::forward::experts::{ExpertRuntime, ExpertStart, WeightRuntime};
 use crate::executor::forward::token::TextRuntime;
-use crate::executor::forward::token::start::{Startup, TextBounds, reserved_bytes};
+use crate::executor::forward::token::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
 use crate::executor::forward::token::warmup::TextWarmup;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
 use crate::launch::Endpoint;
-use crate::model::bind::StreamWorkspaces;
+use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
@@ -66,6 +68,7 @@ use crate::parallel::world::{World, startup_timeout};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
+use crate::runner::graphs::reserve_pools;
 use crate::runner::{GraphStorage, graph_storage_budget_bytes};
 use crate::service::Service;
 use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
@@ -109,7 +112,6 @@ fn phase(phase: &'static str) -> impl Fn(Error) -> WorkerError {
 
 /// A rank.
 pub struct Worker {
-    launch: WorkerLaunch,
     interface: Interface,
     config: WorkerConfig,
     info: WorkerInfo,
@@ -232,8 +234,23 @@ impl Worker {
             .devices()
             .filter_map(|name| Device::parse(name, "device").ok())
             .collect();
-        let lanes = Lanes::create(&config, &devices, launch.ipc.queue_depth + 1)
+        let mut lanes = Lanes::create(&config, &devices, launch.ipc.queue_depth + 1)
             .map_err(phase("streams"))?;
+        let node = host_name();
+        // Expert transports map their device workspaces before capacity
+        // planning measures free memory.
+        let mut experts = ExpertRuntime::start(ExpertStart {
+            interface: &interface,
+            launch: &launch,
+            world: &world,
+            model: &model,
+            lanes: &mut lanes,
+            max_tokens: expert_tokens(&config),
+            node: &node,
+        })
+        .map_err(phase("experts"))?;
+        let weights = WeightRuntime::start(&interface, &launch, &world, &model, &lanes, &node)
+            .map_err(phase("experts"))?;
         let budget = match device {
             Device::Cuda(_) => Some(
                 DeviceBudget::new(interface.release_cached.clone()).map_err(phase("capacity"))?,
@@ -288,6 +305,21 @@ impl Worker {
             .map(CUDAStream::stream)
             .transpose()
             .map_err(phase("bind"))?;
+        // Numerical collectives of each binding run on NCCL communicators
+        // bound to its stream, over its component's mesh groups.
+        let first = launch
+            .expert_parallel
+            .as_ref()
+            .map_or(0, |union| union.rank - launch.execution.rank);
+        let peers = PeerGroup {
+            group: &world.host,
+            node: &node,
+            collectives: launch
+                .components
+                .keys()
+                .map(|name| (name.clone(), world.collective_groups(name, first)))
+                .collect(),
+        };
         let text = TextRuntime::start(Startup {
             interface: &interface,
             config: &config,
@@ -302,6 +334,9 @@ impl Worker {
             workspaces: &mut workspaces,
             graphs: &mut graphs,
             preparation,
+            experts: experts.as_mut(),
+            peers: Some(&peers),
+            weights: weights.as_ref().map(WeightRuntime::prefetch),
         })
         .map_err(phase("bind"))?;
         let canvas = CanvasRuntime::start(CanvasStartup {
@@ -318,8 +353,19 @@ impl Worker {
             workspaces: &mut workspaces,
             graphs: &mut graphs,
             preparation,
+            peers: Some(&peers),
+            expert_runtime: experts.as_mut(),
+            weights: weights.as_ref().map(WeightRuntime::prefetch),
         })
         .map_err(phase("bind"))?;
+        if let Some(experts) = experts.as_mut() {
+            if dedicated {
+                experts
+                    .bind_experts(&interface, &model, &mut workspaces)
+                    .map_err(phase("bind"))?;
+            }
+            reserve_join_pools(&interface, &config, experts, &mut graphs).map_err(phase("bind"))?;
+        }
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
         backend.set_rank_storage(storage);
@@ -330,6 +376,13 @@ impl Worker {
         let canvas_warmup = canvas.is_some();
         if let Some(canvas) = canvas {
             backend.set_canvas(canvas);
+        }
+        if let Some(weights) = weights {
+            backend.set_weights(weights);
+        }
+        let expert_warmup = experts.is_some();
+        if let Some(experts) = experts {
+            backend.set_experts(experts);
         }
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
@@ -368,10 +421,14 @@ impl Worker {
         if canvas_warmup {
             hooks.push(Box::new(CanvasWarmup));
         }
+        if expert_warmup {
+            // After the text captures, whose eager warmups were announced
+            // expert steps.
+            hooks.push(Box::new(ExpertWarmup));
+        }
 
         tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", facts.model_name);
         Ok(Self {
-            launch,
             interface,
             config,
             info,
@@ -513,12 +570,13 @@ impl Worker {
     /// response ends admission.
     pub fn run(&mut self, endpoint: &mut Endpoint) -> std::result::Result<(), WorkerError> {
         self.warmup()?;
-        let experts = self.launch.expert_parallel.is_some();
         let info = self.info.clone();
         let executor = self
             .executor
             .as_mut()
             .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
+        // Ranks of an expert union join every step outside their own.
+        let experts = executor.backend().experts().is_some();
         executor
             .backend()
             .set_storage_wake(Some(endpoint.completion_wake()));
@@ -558,6 +616,10 @@ impl Worker {
             let closed = executor.backend_mut().close_runtimes(aborted);
             record(closed.map_err(WorkerError::from));
             let closed = executor.backend_mut().components_mut().close(aborted);
+            record(closed.map_err(WorkerError::from));
+            // Transports retire after every binding and graph using them;
+            // their close is collective over the expert union.
+            let closed = executor.backend_mut().close_experts(aborted);
             record(closed.map_err(WorkerError::from));
             let closed = executor.backend_mut().close_storage(aborted);
             record(closed.map_err(WorkerError::from));
@@ -893,11 +955,11 @@ fn log_capacity(config: &WorkerConfig, plan: &Plan) {
     );
 }
 
-/// The rank's identity for transfers: host, process and incarnation.
-fn endpoint(worker_id: &str, rank: usize) -> WorkerEndpoint {
+/// This host's name.
+fn host_name() -> String {
     let mut name = [0u8; 256];
     // SAFETY: gethostname writes at most `name.len()` bytes.
-    let node = if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
         let end = name
             .iter()
             .position(|&byte| byte == 0)
@@ -905,11 +967,47 @@ fn endpoint(worker_id: &str, rank: usize) -> WorkerEndpoint {
         String::from_utf8_lossy(&name[..end]).into_owned()
     } else {
         "localhost".to_owned()
+    }
+}
+
+/// Graph pools for an expert runtime's captured joins, one per microbatch,
+/// when no text runner shares its pools on the microbatch streams.
+fn reserve_join_pools(
+    interface: &Interface,
+    config: &WorkerConfig,
+    experts: &mut ExpertRuntime,
+    graphs: &mut GraphStorage<String, Handle>,
+) -> Result<()> {
+    if config.graph_policy == "off" || experts.has_pools() {
+        return Ok(());
+    }
+    let Device::Cuda(device) = config.primary_device() else {
+        return Ok(());
     };
+    let create = interface.function("graphs.pool")?;
+    let mut pools = Vec::new();
+    for peer in 0..experts.microbatches() {
+        let stream = experts.stream(peer).raw();
+        let reserved = reserve_pools(
+            graphs,
+            &create,
+            stream,
+            format!("experts:join:{peer}"),
+            &[device],
+            None,
+        )?;
+        pools.extend(reserved.first().map(|pool| pool.value.clone()));
+    }
+    experts.set_pools(pools);
+    Ok(())
+}
+
+/// The rank's identity for transfers: host, process and incarnation.
+fn endpoint(worker_id: &str, rank: usize) -> WorkerEndpoint {
     WorkerEndpoint {
         worker_id: worker_id.to_owned(),
         rank: rank as u32,
-        node,
+        node: host_name(),
         address_space: format!("{}:{}", std::process::id(), uuid::Uuid::new_v4().simple()),
         incarnation: uuid::Uuid::new_v4().simple().to_string(),
     }
@@ -1118,7 +1216,12 @@ fn plan(
 /// Whether routed experts use an expert exchange, and the attention ranks of
 /// a disaggregated expert union (zero when every rank holds its experts).
 fn expert_exchange(launch: &WorkerLaunch) -> (bool, usize) {
-    launch.expert_parallel.as_ref().map_or((false, 0), |union| {
+    // Weight prefetch moves no tokens.
+    let exchanging = launch
+        .expert_parallel
+        .as_ref()
+        .filter(|union| union.exchange != "dwdp");
+    exchanging.map_or((false, 0), |union| {
         (
             true,
             if union.disaggregated() {

@@ -11,7 +11,7 @@ from typing import Any, Literal
 import torch
 import torch.distributed as dist
 
-from uniserve_models.runtime import communication
+from uniserve_models.distributed import collectives as communication
 
 
 def divide(numerator: int, denominator: int) -> int:

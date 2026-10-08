@@ -651,6 +651,7 @@ def bind(
         sampling: Sequence[int],
         greedy_finish: int,
         prompt: Sequence[int],
+        expert_capacity: int,
     ) -> None:
         """Evaluate one invocation; see the module documentation.
 
@@ -659,7 +660,10 @@ def bind(
         ``logit_count`` rows are projected for a non-decode invocation, at
         the ``logit_rows`` token positions or, with ``all_last``, at every
         row's last query token; a decode invocation's candidates are its
-        live rows' final-position logits.
+        live rows' final-position logits. ``expert_capacity`` is the agreed
+        per-rank token capacity of the expert step an eager forward runs
+        as (zero for a model without expert-parallel layers); a replayed
+        graph was captured at that capacity.
         """
         rows, live, tokens = int(rows), int(live), int(tokens)
         with torch.inference_mode(), context.activate():
@@ -673,12 +677,14 @@ def bind(
                 graph.replay()
                 if not decode and not cache_only:
                     hidden = b["hidden"][:tokens]
-            elif decode:
-                decode_body(inputs, rows)
-            elif cache_only:
-                model.fill_cache(inputs)
             else:
-                hidden = model(inputs)
+                with context.expert_step(int(expert_capacity)):
+                    if decode:
+                        decode_body(inputs, rows)
+                    elif cache_only:
+                        model.fill_cache(inputs)
+                    else:
+                        hidden = model(inputs)
 
             if decode:
                 candidates = b["logits"][:live]
@@ -714,13 +720,16 @@ def bind(
         writes: int,
         cache_only: int,
         pool,
+        expert_capacity: int,
     ) -> graphs.Graph:
         """Capture the forward of the shapes the last eager step prepared.
 
         Inputs are the fixed columns, so the graph reads whatever the next
         step gathers into them. A decode graph writes the logits and greedy
         selection columns; a prefill graph writes ``hidden`` or, for a
-        cache-only family, only the K/V cache.
+        cache-only family, only the K/V cache. With ``expert_capacity``, the
+        graph is the expert step of that capacity, including the joins of
+        expert layers the forward does not reach.
         """
         if computation is None:
             raise ValueError("graph capture requires a CUDA binding")
@@ -732,7 +741,7 @@ def bind(
             context.bind_attention(inputs.attention, replay=False)
 
         def body():
-            with context.activate():
+            with context.activate(), context.expert_step(int(expert_capacity)):
                 if decode:
                     decode_body(inputs, rows)
                 elif cache_only:

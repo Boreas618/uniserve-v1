@@ -153,6 +153,12 @@ impl Lanes {
             .ok_or(Error::State("microbatch stream was not registered"))
     }
 
+    /// The owned stream whose handle is `handle`.
+    pub fn owner(&self, handle: usize) -> Option<&CUDAStream> {
+        self.streams()
+            .find(|stream| stream.handle().is_ok_and(|raw| raw == handle))
+    }
+
     /// Every owned stream, for synchronization before teardown.
     pub fn streams(&self) -> impl Iterator<Item = &CUDAStream> {
         self.preparation

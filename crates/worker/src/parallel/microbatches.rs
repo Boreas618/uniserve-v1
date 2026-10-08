@@ -188,3 +188,212 @@ impl Drop for Turn {
         self.owner.ready.notify_all();
     }
 }
+
+/// One microbatch's numerical call, run on its lane thread inside the
+/// rotation.
+pub type MicrobatchCall<T> = Box<dyn FnOnce() -> Result<T> + Send>;
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// One persistent host thread executing a microbatch's calls in order.
+struct LaneThread {
+    jobs: Option<crossbeam_channel::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Persistent host threads and the cooperative rotation of numerical
+/// microbatches.
+///
+/// Each microbatch has its own host thread, CUDA stream and expert exchange.
+/// [`Self::run`] submits one call per microbatch: calls start in index order
+/// and pass the host turn to the next active microbatch whenever they yield
+/// after an expert dispatch, so every rank submits its microbatches'
+/// collectives in the same order while their device work overlaps on
+/// distinct streams. Threads persist so thread-local numerical state (cuBLAS
+/// handles) exists before graph capture.
+pub struct MicrobatchLanes {
+    control: Arc<Microbatches>,
+    threads: Vec<LaneThread>,
+    /// Recorded on the parent stream; every microbatch stream waits on it.
+    fork: uniserve_cuda::Event,
+    /// Recorded on each microbatch stream; the parent waits on them.
+    joins: Vec<uniserve_cuda::Event>,
+}
+
+impl MicrobatchLanes {
+    /// Start `count` lane threads, named `microbatch-{index}`.
+    pub fn new(count: usize) -> Result<Self> {
+        let control = Arc::new(Microbatches::new(count)?);
+        let mut threads = Vec::with_capacity(count);
+        for index in 0..count {
+            let (sender, receiver) = crossbeam_channel::unbounded::<Job>();
+            let thread = std::thread::Builder::new()
+                .name(format!("microbatch-{index}"))
+                .spawn(move || {
+                    // Jobs report their own outcome; a closed channel ends
+                    // the thread.
+                    while let Ok(job) = receiver.recv() {
+                        job();
+                    }
+                })
+                .map_err(|error| Error::Transport(format!("microbatch thread: {error}")))?;
+            threads.push(LaneThread {
+                jobs: Some(sender),
+                thread: Some(thread),
+            });
+        }
+        let event = || uniserve_cuda::Event::new(uniserve_cuda::EventFlags::default());
+        Ok(Self {
+            control,
+            threads,
+            fork: event(),
+            joins: (0..count).map(|_| event()).collect(),
+        })
+    }
+
+    pub fn count(&self) -> usize {
+        self.threads.len()
+    }
+
+    /// Run `call(index)` once on every lane thread, outside the rotation,
+    /// for thread-local preparation.
+    pub fn each(&self, call: Arc<dyn Fn(usize) -> Result<()> + Send + Sync>) -> Result<()> {
+        let calls: Vec<MicrobatchCall<()>> = (0..self.count())
+            .map(|index| {
+                let call = Arc::clone(&call);
+                Box::new(move || call(index)) as MicrobatchCall<()>
+            })
+            .collect();
+        self.submit(calls, None)
+            .into_iter()
+            .collect::<Result<Vec<()>>>()?;
+        Ok(())
+    }
+
+    /// Run one call per microbatch inside the rotation and return their
+    /// results in index order.
+    ///
+    /// Every microbatch stream first waits on `parent`'s submitted work, and
+    /// `parent` waits on every microbatch stream before this returns, also
+    /// on failure, so the caller reads results (or retires inputs) in
+    /// `parent`'s order. On failure every suspended call is woken and every
+    /// host turn retires before the first failing microbatch's error is
+    /// returned.
+    pub fn run<T: Send + 'static>(
+        &self,
+        parent: &uniserve_cuda::Stream,
+        streams: &[uniserve_cuda::Stream],
+        calls: Vec<MicrobatchCall<T>>,
+    ) -> Result<Vec<T>> {
+        if streams.len() != self.count() || calls.len() != self.count() {
+            return Err(Error::Invalid(
+                "each microbatch needs one stream and one call".into(),
+            ));
+        }
+        self.fork.record(parent)?;
+        for stream in streams {
+            stream.wait_event(&self.fork)?;
+        }
+        self.control.begin(calls.len())?;
+        let mut outcomes = self.submit(calls, Some(&self.control));
+        let failure = self.control.failure();
+        self.control.end();
+
+        // Results are read in the parent's order whatever happened.
+        let mut joined = Ok(());
+        for (stream, event) in streams.iter().zip(&self.joins) {
+            joined = joined
+                .and_then(|()| event.record(stream).map_err(Error::from))
+                .and_then(|()| parent.wait_event(event).map_err(Error::from));
+        }
+        // The first failing microbatch caused every other abort.
+        if let Some(index) = failure
+            && outcomes[index].is_err()
+        {
+            return outcomes.swap_remove(index).map(|_| Vec::new());
+        }
+        let results = outcomes.into_iter().collect::<Result<Vec<T>>>()?;
+        joined?;
+        Ok(results)
+    }
+
+    /// Submit one call per lane and wait for every outcome. Inside a
+    /// rotation (`control`), each call runs its turn.
+    fn submit<T: Send + 'static>(
+        &self,
+        calls: Vec<MicrobatchCall<T>>,
+        control: Option<&Arc<Microbatches>>,
+    ) -> Vec<Result<T>> {
+        let (sender, receiver) = crossbeam_channel::bounded::<(usize, Result<T>)>(calls.len());
+        let mut outcomes: Vec<Option<Result<T>>> = (0..calls.len()).map(|_| None).collect();
+        let mut pending = 0;
+        for (index, call) in calls.into_iter().enumerate() {
+            let sender = sender.clone();
+            let rotation = control.cloned();
+            let job: Job = Box::new(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match &rotation {
+                        Some(control) => control.run(index, call).and_then(|result| result),
+                        None => call(),
+                    }
+                }))
+                .unwrap_or_else(|_| Err(Error::Invariant(format!("microbatch {index} panicked"))));
+                let _ = sender.send((index, outcome));
+            });
+            let sent = self.threads[index]
+                .jobs
+                .as_ref()
+                .ok_or(Error::State("microbatch execution is closed"))
+                .and_then(|jobs| {
+                    jobs.send(job)
+                        .map_err(|_| Error::State("microbatch thread exited"))
+                });
+            match sent {
+                Ok(()) => pending += 1,
+                Err(error) => {
+                    // Unsubmitted calls never take their turn; wake the rest.
+                    if let Some(control) = control {
+                        control.abort();
+                    }
+                    outcomes[index] = Some(Err(error));
+                }
+            }
+        }
+        drop(sender);
+        for _ in 0..pending {
+            match receiver.recv() {
+                Ok((index, outcome)) => outcomes[index] = Some(outcome),
+                Err(_) => break,
+            }
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.unwrap_or(Err(Error::State("microbatch call was lost"))))
+            .collect()
+    }
+
+    /// Join the lane threads after every invocation and captured reader
+    /// retired.
+    pub fn close(&mut self) -> Result<()> {
+        self.control.close()?;
+        for lane in &mut self.threads {
+            drop(lane.jobs.take());
+            if let Some(thread) = lane.thread.take()
+                && thread.join().is_err()
+            {
+                return Err(Error::Invariant("a microbatch thread panicked".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MicrobatchLanes {
+    fn drop(&mut self) {
+        // Closing the channels ends the threads; they are not joined here,
+        // because a failed rank may still have a call blocked on a peer.
+        for lane in &mut self.threads {
+            drop(lane.jobs.take());
+        }
+    }
+}

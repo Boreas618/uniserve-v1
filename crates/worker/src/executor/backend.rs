@@ -52,6 +52,10 @@ pub struct WorkerBackend {
     text: Option<forward::token::TextRuntime>,
     /// The canvas runtime, on ranks holding a token denoiser.
     canvas: Option<forward::canvas::CanvasRuntime>,
+    /// The expert-parallel runtime, on ranks of an expert union.
+    experts: Option<forward::experts::ExpertRuntime>,
+    /// Distributed expert weights, on ranks that prefetch them.
+    weights: Option<forward::experts::WeightRuntime>,
     /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
@@ -67,6 +71,7 @@ pub(crate) struct Parts<'a> {
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut forward::token::TextRuntime>,
     pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
+    pub experts: Option<&'a forward::experts::ExpertRuntime>,
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, then the
@@ -168,6 +173,8 @@ impl WorkerBackend {
             rank_storage: None,
             text: None,
             canvas: None,
+            experts: None,
+            weights: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -226,6 +233,38 @@ impl WorkerBackend {
         self.canvas.as_mut()
     }
 
+    /// Install the expert-parallel runtime.
+    pub(crate) fn set_experts(&mut self, experts: forward::experts::ExpertRuntime) {
+        self.experts = Some(experts);
+    }
+
+    /// Install the distributed expert weights.
+    pub(crate) fn set_weights(&mut self, weights: forward::experts::WeightRuntime) {
+        self.weights = Some(weights);
+    }
+
+    pub(crate) fn experts(&self) -> Option<&forward::experts::ExpertRuntime> {
+        self.experts.as_ref()
+    }
+
+    pub(crate) fn experts_mut(&mut self) -> Option<&mut forward::experts::ExpertRuntime> {
+        self.experts.as_mut()
+    }
+
+    /// Release the expert runtime after the bindings and graphs using its
+    /// transports retired; collective unless `aborted`.
+    pub(crate) fn close_experts(&mut self, aborted: bool) -> Result<()> {
+        let experts = match &mut self.experts {
+            Some(experts) => experts.close(aborted),
+            None => Ok(()),
+        };
+        let weights = match &mut self.weights {
+            Some(weights) => weights.close(aborted),
+            None => Ok(()),
+        };
+        experts.and(weights)
+    }
+
     /// Register another runtime's storage owner taking part in request
     /// lifecycles.
     pub fn add_storage(&mut self, storage: Box<dyn RequestStorage>) {
@@ -241,6 +280,7 @@ impl WorkerBackend {
             storage: self.rank_storage.as_mut(),
             text: self.text.as_mut(),
             canvas: self.canvas.as_mut(),
+            experts: self.experts.as_ref(),
         }
     }
 

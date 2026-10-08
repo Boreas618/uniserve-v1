@@ -15,8 +15,14 @@ use crate::storage::KVCache;
 use crate::warmup::WarmupHooks;
 
 impl CanvasRuntime {
-    /// Capture every runner's graphs over scratch prefixes.
-    pub(crate) fn warm(&mut self, kv: &mut KVCache) -> Result<()> {
+    /// Capture every runner's graphs over scratch prefixes. With experts,
+    /// every graph is captured at every expert capacity holding its tokens,
+    /// largest first, each warmup an announced expert step.
+    pub(crate) fn warm(
+        &mut self,
+        kv: &mut KVCache,
+        experts: Option<&super::super::experts::ExpertRuntime>,
+    ) -> Result<()> {
         let groups = kv.plan().group_shapes()?;
         let row_units: usize = groups
             .iter()
@@ -51,9 +57,26 @@ impl CanvasRuntime {
                 .map(|unit| (first + row * row_units + unit) as u32)
                 .collect()
         };
+        let variants = |tokens: usize| -> Vec<Option<usize>> {
+            match experts {
+                None => vec![None],
+                Some(experts) => experts
+                    .parallel()
+                    .capacities()
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|&capacity| capacity >= tokens)
+                    .map(Some)
+                    .collect(),
+            }
+        };
         let mut warmed = Ok(());
-        for runner in &mut self.runners {
-            warmed = runner.warm(&units);
+        for (index, runner) in self.runners.iter_mut().enumerate() {
+            let mut coordinate = |extent: usize, forced: Option<usize>| {
+                super::coordinator(experts, index, forced)(extent)
+            };
+            warmed = runner.warm(&units, &variants, &mut coordinate);
             if warmed.is_err() {
                 break;
             }
@@ -86,7 +109,7 @@ impl WarmupHooks for CanvasWarmup {
             .kv
             .as_mut()
             .ok_or(crate::Error::State("canvas warmup requires a KV cache"))?;
-        runtime.warm(kv).map_err(|error| {
+        runtime.warm(kv, parts.experts).map_err(|error| {
             WorkerError::classify(error, Some("canvas graph capture")).with_phase("warmup")
         })
     }

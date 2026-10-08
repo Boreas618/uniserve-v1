@@ -12,10 +12,12 @@ import socket
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from uniserve_models.backends.deepep import DeepEP
-from uniserve_models.runtime.process_groups import initialize_process_groups
+from uniserve_models.backends.experts import TorchBootstrap
+from uniserve_models.backends.experts.deepep import DeepEP
+from uniserve_models.distributed import Communicator
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -23,19 +25,23 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 @torch.inference_mode()
 def _exercise(rank, local_rank, world_size, attention_ranks, init_method):
     device = torch.device("cuda", local_rank)
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=local_rank,
-        world_size=world_size,
-        device=device,
-        backend="cpu:gloo,cuda:nccl",
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "cpu:gloo,cuda:nccl",
         init_method=init_method,
-    ) as groups:
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        group = Communicator(
+            tuple(range(world_size)), rank, "experts", device, dist.group.WORLD
+        )
         experts = 2 * (world_size - attention_ranks)
         # A width below the transport alignment exercises zero extension.
         hidden_size, capacity, top_k = 192, 32, 2
         exchange = DeepEP(
-            groups.process_group,
+            group,
+            TorchBootstrap(dist.group.WORLD),
             attention_ranks=attention_ranks,
             num_experts=experts,
             hidden_size=hidden_size,
@@ -74,7 +80,7 @@ def _exercise(rank, local_rank, world_size, attention_ranks, init_method):
 
             def forward():
                 received, routes, scales = exchange.dispatch(
-                    hidden, ids, weights
+                    hidden, ids, weights, invalid_expert=-1
                 )
                 # Each expert multiplies by its global id + 1. Invalid
                 # slots have zero weight and contribute no output.
@@ -82,8 +88,10 @@ def _exercise(rank, local_rank, world_size, attention_ranks, init_method):
                     received.float()
                     * ((routes + 1).float() * scales).sum(-1, keepdim=True)
                 ).to(torch.bfloat16)
-                return exchange.combine(partial)
+                return exchange.combine(partial, count)
 
+            # Calls run inside an expert step of the transport's capacity.
+            exchange.capacity = capacity
             stream.wait_stream(torch.cuda.current_stream(device))
             with torch.cuda.stream(stream):
                 eager = forward()
@@ -107,7 +115,10 @@ def _exercise(rank, local_rank, world_size, attention_ranks, init_method):
                 )
             del graph, captured
         torch.cuda.synchronize(device)
+        exchange.capacity = 0
         exchange.close()
+    finally:
+        dist.destroy_process_group()
 
 
 def _local(rank, port):
