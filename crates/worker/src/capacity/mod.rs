@@ -139,7 +139,6 @@ impl ArenaCapacity {
         depth: usize,
         calls: usize,
         requests: usize,
-        devices: usize,
         scalar_bytes: u64,
         latent_pool_bytes: u64,
         transfer_bytes_per_read: u64,
@@ -152,8 +151,7 @@ impl ArenaCapacity {
         Ok(Self {
             latent_pool_bytes,
             tensor_store,
-            device_product_bytes: product_bytes(tensor_store, requests, window, scalar_bytes)
-                * devices as u64,
+            device_product_bytes: product_bytes(tensor_store, requests, window, scalar_bytes),
             transfer_bytes: transfer_bytes_per_read.max(1) * transfer_tickets as u64,
             transfer_tickets,
             host_lane_inflight: 256,
