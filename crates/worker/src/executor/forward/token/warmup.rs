@@ -107,12 +107,18 @@ fn with_scratch<T>(
     Ok(value)
 }
 
-fn rows(lengths: &[usize], prefix: usize, selection: TokenSelection) -> Vec<TokenRow> {
+/// Rows of `lengths` host tokens for consecutive slots from `first`.
+fn rows(
+    first: usize,
+    lengths: &[usize],
+    prefix: usize,
+    selection: TokenSelection,
+) -> Vec<TokenRow> {
     lengths
         .iter()
         .enumerate()
         .map(|(row, &length)| TokenRow {
-            slot: row as u32 + 1,
+            slot: (first + row) as u32,
             source: RowSource::Host {
                 tokens: vec![0; length],
                 position: prefix as u64,
@@ -142,6 +148,14 @@ fn capture(runtime: &mut TextRuntime, kv: &mut KVCache, row_tokens: usize) -> Re
         let decode = capture_order(runtime.runners[index].shapes().decode().to_vec(), |&rows| {
             (rows, rows)
         });
+        let prime = runtime.runners[index]
+            .shapes()
+            .prefill()
+            .iter()
+            .map(|shape| shape.row_bucket - 1)
+            .max()
+            .unwrap_or(usize::MAX)
+            .max(1);
         let stream = runtime.runners[index].stream().map(|stream| {
             // SAFETY: the lanes own the stream for the runtime's lifetime.
             unsafe { uniserve_cuda::Stream::borrowed(stream.device(), stream.raw()) }
@@ -156,28 +170,33 @@ fn capture(runtime: &mut TextRuntime, kv: &mut KVCache, row_tokens: usize) -> Re
                 TokenSelection::Cache
             };
             with_scratch(kv, &lengths, stream, |kv| {
-                step(runtime, index, kv, &rows(&lengths, 0, selection), false)
+                step(runtime, index, kv, &rows(1, &lengths, 0, selection), false)
             })?;
         }
         for size in decode {
             let lengths = vec![1; size];
             with_scratch(kv, &vec![2; size], stream, |kv| {
-                // One real token per row, then the decode the graph captures
-                // with every row's continuation flag set.
-                step(
-                    runtime,
-                    index,
-                    kv,
-                    &rows(&lengths, 0, TokenSelection::LastLogits),
-                    false,
-                )?;
+                // One real token per row, prefilled in batches no larger than
+                // the scheduler admits (the largest prefill bucket's live
+                // rows), then the decode the graph captures with every row's
+                // continuation flag set.
+                for first in (0..size).step_by(prime) {
+                    let count = prime.min(size - first);
+                    step(
+                        runtime,
+                        index,
+                        kv,
+                        &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
+                        false,
+                    )?;
+                }
                 let slots: Vec<usize> = (1..=size).collect();
                 runtime.state.set_predicates(&slots, true, stream)?;
                 let captured = step(
                     runtime,
                     index,
                     kv,
-                    &rows(&lengths, 1, TokenSelection::LastLogits),
+                    &rows(1, &lengths, 1, TokenSelection::LastLogits),
                     true,
                 );
                 runtime.state.set_predicates(&slots, false, stream)?;
