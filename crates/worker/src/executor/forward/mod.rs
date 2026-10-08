@@ -20,10 +20,39 @@ pub(crate) mod video;
 
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
 
+use uniserve_ipc::Batch as BatchPlan;
+
 use super::backend::{WorkerBackend, WorkerBatch};
 use crate::Error;
 use crate::error::WorkerError;
+use crate::executor::BatchResult;
 use crate::model::components::Capability;
+
+/// A capability runtime's launched batch awaiting materialization.
+pub(crate) enum Running {
+    Token(token::Launched),
+}
+
+/// Materialize launched work whose device results are ready.
+pub(crate) fn poll(
+    backend: &mut WorkerBackend,
+    plan: &BatchPlan,
+    running: &mut Running,
+) -> std::result::Result<Option<BatchResult>, WorkerError> {
+    match running {
+        Running::Token(launched) => token::poll(backend, plan, launched),
+    }
+}
+
+/// Cancel launched work that will not be materialized.
+pub(crate) fn abandon(
+    backend: &mut WorkerBackend,
+    running: Running,
+) -> std::result::Result<(), WorkerError> {
+    match running {
+        Running::Token(launched) => token::abandon(backend, launched),
+    }
+}
 
 /// The error of a call kind whose runtime is not available on this rank.
 pub(crate) fn unsupported(kind: CallKind, runtime: &str) -> WorkerError {

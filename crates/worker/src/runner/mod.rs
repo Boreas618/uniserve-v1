@@ -6,6 +6,7 @@ pub(crate) mod encoder;
 mod graph_shapes;
 mod graph_storage;
 pub(crate) mod graphs;
+pub(crate) mod text;
 pub(crate) mod video;
 pub(crate) mod vision;
 
