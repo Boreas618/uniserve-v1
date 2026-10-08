@@ -2,7 +2,7 @@
 
 mod events;
 
-pub use events::EventPool;
+pub use events::{Deferred, EventPool};
 
 use std::sync::Arc;
 

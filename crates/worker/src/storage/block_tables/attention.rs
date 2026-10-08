@@ -125,8 +125,8 @@ pub fn table_pages(
 
 impl BlockTables {
     /// Resolve an attention batch while checking scheduler-assigned capacity.
-    /// The caller supplies the cache's write check, so physical intervals never
-    /// need to pass through the numerical backend.
+    /// The caller supplies the cache's write check over the batch's physical
+    /// intervals.
     pub fn prepare_attention(
         &self,
         rows: &[AttentionRow],

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use uniserve_core::SharedMemory;
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, HostRegistration, Stream};
 
+use crate::ffi::{Backing, Device};
 use crate::{Error, Result};
 
 pub const SHM_HEADER_BYTES: usize = 512;
@@ -79,6 +80,21 @@ impl SharedMapping {
     }
 }
 
+/// Shared mappings are host memory that copies read or write in place.
+impl Backing for SharedMapping {
+    fn device(&self) -> Device {
+        Device::Cpu
+    }
+
+    fn address(&self) -> u64 {
+        self.address as u64
+    }
+
+    fn len(&self) -> usize {
+        self.size
+    }
+}
+
 impl Drop for SharedMapping {
     fn drop(&mut self) {
         // SAFETY: this is the last owner of this live mapping.
@@ -92,8 +108,8 @@ impl Drop for SharedMapping {
 pub struct SharedBuffer {
     // Declared before the mapping: the registration ends while it is mapped.
     registration: Option<HostRegistration>,
-    // Some tensor consumers retain only the exporter, not a Py_buffer lease.
-    // Keep this reference even after close has unlinked the allocation.
+    // Views of the payload retain the mapping itself; keep this reference
+    // even after close has unlinked the allocation.
     mapping: Arc<SharedMapping>,
     storage: Option<SharedMemory>,
     consumers: Vec<usize>,
@@ -195,8 +211,8 @@ impl SharedBuffer {
         }
     }
 
-    /// Declare possible DMA before the numerical backend submits its first
-    /// copy. A failed submission may still have enqueued earlier spans.
+    /// Declare possible DMA before the producer submits its first copy. A
+    /// failed submission may still have enqueued earlier spans.
     pub fn begin_copy(&mut self) {
         self.submitted = true;
     }
