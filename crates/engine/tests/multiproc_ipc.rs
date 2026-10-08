@@ -1,12 +1,14 @@
-//! Multiprocess launch, request lifecycle, close and rank recovery.
+//! Multiprocess launch, request lifecycle, token execution, close and rank
+//! recovery.
 //!
 //! These tests launch real rank processes (`uniserve_models.worker` with the
 //! weightless stub model on CPU) and drive them through the engine's
-//! `WorkerGroup` or `EngineCore`, or through a raw `ClientEndpoint` when the
-//! worker's own protocol handling is under test. The batches carry lifecycle
-//! commands (Start, Finish, Free) only: they exercise registration, startup,
-//! Info, admission, retirement, close and signals, whatever numerical
-//! runtimes the rank serves. The interpreter comes from
+//! `WorkerGroup`, `WorkerExecutor` or `EngineCore`, or through a raw
+//! `ClientEndpoint` when the worker's own protocol handling is under test.
+//! Lifecycle batches (Start, Finish, Free) exercise registration, startup,
+//! Info, admission, retirement, close and signals; token batches run the
+//! stub's text runtime (prefill, decode, verification, sampling, logprobs and
+//! device token relays). The interpreter comes from
 //! `UNISERVE_WORKER_PYTHON` or the repository's `.venv/bin/python`. Several
 //! tests replace that interpreter with a small wrapper script that records a
 //! rank's process id, exits a chosen rank, rewrites a relaunched rank's
@@ -31,14 +33,16 @@ use std::time::Duration;
 use anyhow::Context as _;
 use uniserve_core::{
     DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId, RuntimeFamily,
-    SamplingParams,
+    SamplingParams, UnitId,
 };
 use uniserve_engine::{
-    CallReaders, EngineConfig, EngineCore, WorkerConfig, WorkerFailure, WorkerGroup,
+    CallReaders, EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup,
     WorkerProcessArgs,
 };
 use uniserve_ipc::{
-    ArRequestParams, Batch, BatchCommand, LaunchDescriptor, NewRequest, RequestKey,
+    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call,
+    CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode, ForwardBatch, ForwardMode,
+    LaunchDescriptor, NewRequest, RequestKey, ShapeBound, TensorRef,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -607,6 +611,372 @@ fn closing_a_group_lets_every_rank_finish_a_collective_teardown() -> anyhow::Res
         );
     }
     Ok(())
+}
+
+#[test]
+fn a_rank_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()> {
+    let mut executor = spawn_rank_group()?;
+    let info = executor.info();
+    assert_eq!(info.world_size, WORLD_SIZE as u32);
+    assert_eq!(info.max_batch_calls, 256);
+    assert_eq!(info.max_batch_tokens, 256);
+
+    let mut admission = text_admission(11, 1, 1)?;
+    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    sampling.return_logprobs = true;
+    sampling.n_logprobs = 1;
+    sampling.return_prompt_logprobs = true;
+    sampling.n_prompt_logprobs = 1;
+    let mut initial = token_batch(
+        1,
+        1,
+        admission.request_key,
+        Some(admission.clone()),
+        CallId::new(1, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7, 8],
+        UnitId(1),
+        0,
+    );
+    // The bound the scheduler's `logprob_result_bytes` would derive: the
+    // generated token and the one scored prompt position each take four bytes
+    // plus twelve per ranked entry, and each has two entries (the scored token
+    // and one requested candidate).
+    initial.calls[0].bounds.max_completion_bytes = 4 + 2 * 12 + 4 + 2 * 12;
+    let first = execute(&mut executor, initial.clone())?;
+    let first_record = &first.results[0].output;
+    assert_eq!(first_record.status, CallStatus::Ok);
+    // The stub's head maps 8 to 1000.
+    assert_eq!(first_record.committed_tokens, vec![1000]);
+    assert!(
+        first_record
+            .sampled_logprob
+            .is_some_and(|score| score.is_finite() && score <= 0.0)
+    );
+    assert_eq!(
+        first_record.top_logprobs[0].token_id,
+        first_record.committed_tokens[0]
+    );
+    // The first chunk scores its second token only.
+    assert_eq!(first_record.prompt_logprobs.len(), 1);
+    assert_eq!(first_record.prompt_logprobs[0][0].token_id, 8);
+    assert_eq!(first_record.position, 2);
+    assert_eq!(first_record.kv_visible_len, 2);
+
+    // A repeated or conflicting batch id is refused before submission.
+    assert!(executor.submit_batch(initial, &CallReaders::new()).is_err());
+
+    // A Finish for another epoch of the same request id leaves the resident
+    // epoch in place: the continuation below still runs.
+    let stale = BatchCommand::Finish {
+        request_key: RequestKey::new(
+            admission.request_key.engine_id,
+            admission.request_key.request_id,
+            admission.request_key.request_epoch + 1,
+        ),
+        retained_buffers: Vec::new(),
+    };
+    assert!(
+        execute(&mut executor, command_batch(2, stale))?
+            .results
+            .is_empty()
+    );
+
+    let mut continuation = token_batch(
+        3,
+        2,
+        admission.request_key,
+        None,
+        CallId::new(3, 0),
+        CallKind::Forward(ForwardMode::Decode),
+        &[first_record.committed_tokens[0]],
+        UnitId(1),
+        2,
+    );
+    continuation.calls[0].bounds.max_completion_bytes = 4 + 2 * 12;
+    let continued = execute(&mut executor, continuation)?;
+    let record = &continued.results[0].output;
+    assert_eq!(record.status, CallStatus::Ok);
+    assert_eq!(record.committed_tokens, vec![1001]);
+    assert_eq!(record.position, 3);
+    assert!(record.sampled_logprob.is_some());
+    assert_eq!(record.top_logprobs[0].token_id, 1001);
+    assert!(record.prompt_logprobs.is_empty());
+
+    // Retire the request in a batch that also admits and runs an
+    // independent one; a later call on the retired request fails as an
+    // invalid call.
+    let independent = text_admission(12, 1, 2)?;
+    let mut close_batch = token_batch(
+        6,
+        3,
+        independent.request_key,
+        Some(independent),
+        CallId::new(6, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[9, 10],
+        UnitId(2),
+        0,
+    );
+    close_batch.commands.push(BatchCommand::Finish {
+        request_key: admission.request_key,
+        retained_buffers: Vec::new(),
+    });
+    let result = execute(&mut executor, close_batch)?;
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(result.results[0].output.status, CallStatus::Ok);
+    assert_eq!(result.results[0].output.committed_tokens, vec![1000]);
+    let descendant = token_batch(
+        8,
+        4,
+        admission.request_key,
+        None,
+        CallId::new(8, 0),
+        CallKind::Forward(ForwardMode::Decode),
+        &[first_record.committed_tokens[0]],
+        UnitId(1),
+        2,
+    );
+    let closed = execute(&mut executor, descendant)?;
+    let closed_record = &closed.results[0].output;
+    assert_eq!(closed_record.status, CallStatus::Error);
+    assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidCall));
+    executor.close()?;
+    Ok(())
+}
+
+#[test]
+fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result<()> {
+    use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
+
+    // Four calls of one request travel as four batches, all submitted before
+    // any result is read, so each successor starts from its predecessor's
+    // device product rather than from a host observation.
+    let transfer = uniserve_engine::TransferConfig::default();
+    let mut args = rank_group_args(1 << 20, 8 << 20);
+    args.queue_depth = 4;
+    let mut executor = WorkerExecutor::try_new(
+        vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
+        transfer,
+    )?;
+    let admission = text_admission(63, 1, 1)?;
+    let key = admission.request_key;
+    let first_id = CallId::new(9, 0);
+    let second_id = CallId::new(10, 0);
+    let verify_id = CallId::new(11, 0);
+    let resumed_id = CallId::new(12, 0);
+    let first = token_batch(
+        9,
+        1,
+        key,
+        Some(admission),
+        first_id,
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7],
+        UnitId(1),
+        0,
+    );
+    let mut successor = token_batch(
+        10,
+        2,
+        key,
+        None,
+        second_id,
+        CallKind::Forward(ForwardMode::Decode),
+        &[0],
+        UnitId(1),
+        1,
+    );
+    // Reserve the next row's shape, but obtain its token only from the device
+    // relay. No host result is read between the two logical call kinds.
+    successor.calls[0].input_token_ids.clear();
+    successor.calls[0].predicate = Some(first.calls[0].token_output.clone().unwrap());
+    let mut verifier = token_batch(
+        11,
+        3,
+        key,
+        None,
+        verify_id,
+        CallKind::Forward(ForwardMode::Verify),
+        &[0, 900, 901],
+        UnitId(1),
+        2,
+    );
+    verifier.calls[0].input_token_ids = vec![900, 901];
+    verifier.calls[0].predicate = Some(successor.calls[0].token_output.clone().unwrap());
+    let mut resumed = token_batch(
+        12,
+        4,
+        key,
+        None,
+        resumed_id,
+        CallKind::Forward(ForwardMode::Decode),
+        &[0],
+        UnitId(1),
+        5,
+    );
+    resumed.calls[0].input_token_ids.clear();
+    resumed.calls[0].predicate = Some(verifier.calls[0].token_output.clone().unwrap());
+    // Five initialized cache positions are the verifier's maximum. Its first
+    // rejected draft must leave only three positions visible to the next decode.
+    resumed.calls[0].coordinates = CallCoordinates {
+        logical_position: 3,
+        kv_visible_len: 3,
+        kv_computed_len: 5,
+        flow_step: 0,
+    };
+    for mut batch in [first, successor, verifier, resumed] {
+        let batch_id = batch.batch_id;
+        let commands = std::mem::take(&mut batch.commands);
+        let call = batch.calls.remove(0);
+        let placement = RequestPlacement {
+            worker: WorkerId("worker".into()),
+            request_pool_idx: None,
+            block_tables: batch.block_tables,
+            new_cache_units: batch.new_cache_units,
+            forward: batch.forward,
+            latent: None,
+            decode: None,
+            buffers: batch.buffer_allocations,
+            readers: Default::default(),
+        };
+        executor.submit(ExecutionBatch::new(
+            batch_id,
+            vec![(call, placement)],
+            commands,
+            vec![],
+        ))?;
+    }
+    let mut outputs = std::collections::BTreeMap::new();
+    while outputs.len() < 4 {
+        let result = poll_logical(&mut executor)?.context("device successor did not complete")?;
+        for result in result.results {
+            assert_eq!(result.output.status, CallStatus::Ok);
+            assert!(
+                outputs
+                    .insert(result.output.call_id, result.output)
+                    .is_none()
+            );
+        }
+    }
+    // The stub model's head maps 7 to 1000, 1000 to 1001, 1001 to its
+    // image-start token 151_670, and that token to 1002. The verifier's first
+    // draft (900) therefore disagrees with the target and only the target's
+    // own token commits, leaving the prompt token, 1000 and 1001 visible.
+    assert_eq!(
+        outputs.keys().copied().collect::<Vec<_>>(),
+        vec![first_id, second_id, verify_id, resumed_id]
+    );
+    assert_eq!(outputs[&first_id].committed_tokens, vec![1000]);
+    assert_eq!(outputs[&second_id].committed_tokens, vec![1001]);
+    assert_eq!(outputs[&second_id].kv_visible_len, 2);
+    assert_eq!(outputs[&verify_id].committed_tokens, vec![151_670]);
+    assert_eq!(outputs[&verify_id].kv_visible_len, 3);
+    assert_eq!(outputs[&verify_id].kv_computed_len, 5);
+    assert_eq!(outputs[&resumed_id].committed_tokens, vec![1002]);
+    assert_eq!(outputs[&resumed_id].kv_visible_len, 4);
+    assert_eq!(outputs[&resumed_id].position, 4);
+    executor.close()?;
+    Ok(())
+}
+
+/// Waits up to 30 seconds in total for the executor's next partial or
+/// terminal batch result, polling again after progress-only wakes.
+fn poll_logical(
+    executor: &mut impl Executor,
+) -> anyhow::Result<Option<uniserve_engine::BatchResult>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Ok(None);
+        };
+        if let Some(result) = executor.poll(remaining)? {
+            return Ok(Some(result));
+        }
+    }
+}
+
+/// Builds a batch with one token call of kind `mode` on the `model` component.
+///
+/// The call reads `tokens` after `prefix_length` cached positions and writes
+/// its sampled token to an `I64` token output produced by `call_id`, with
+/// generation `4 * call_id.batch_id + 1` (saturating). `admission`, when
+/// given, becomes the batch's `Start` command and supplies the request pool
+/// slot; without it the call targets slot 1. The block table maps the request
+/// to the single page `unit`, which the batch allocates only when
+/// `prefix_length` is zero; a continuation passes the same page and a nonzero
+/// prefix.
+#[allow(clippy::too_many_arguments)]
+fn token_batch(
+    batch_id: u64,
+    collective_seq: u64,
+    request_key: RequestKey,
+    admission: Option<NewRequest>,
+    call_id: CallId,
+    mode: CallKind,
+    tokens: &[u32],
+    unit: UnitId,
+    prefix_length: u32,
+) -> Batch {
+    let request_pool_idx = admission.as_ref().map_or(1, |value| value.request_pool_idx);
+    let token_output = TensorRef {
+        request_key,
+        producer_call_id: call_id,
+        output_index: 0,
+        generation: (call_id.batch_id as u32)
+            .saturating_mul(4)
+            .saturating_add(1),
+        dtype: DType::I64,
+        shape_bound: ShapeBound::default(),
+    };
+    let mut call = Call::new(request_key, call_id, mode);
+    // These requests hold no cached prefix beyond their own tokens, so the
+    // logical sequence and the initialized cache advance together.
+    call.coordinates = CallCoordinates {
+        logical_position: prefix_length,
+        kv_visible_len: prefix_length,
+        kv_computed_len: prefix_length,
+        flow_step: 0,
+    };
+    call.token_output = Some(token_output);
+    call.input_token_ids = tokens.to_vec();
+    call.component = "model".into();
+    call.bounds = Bounds {
+        max_tokens: tokens.len().max(1) as u32,
+        max_kv_units: u32::from(prefix_length == 0),
+        ..Bounds::default()
+    };
+    let input_length = tokens.len() as u32;
+    let mut batch = Batch::new(batch_id, admission.into_iter().collect(), vec![call]);
+    batch.collective_seq = collective_seq;
+    batch.block_tables = vec![BlockTable {
+        request_pool_idx,
+        group_id: 0,
+        start_page: 0,
+        unit_ids: vec![unit],
+        allocated_tokens: prefix_length + input_length,
+    }];
+    batch.new_cache_units = if prefix_length == 0 {
+        vec![CacheUnitAllocation {
+            request_pool_idx,
+            group_id: 0,
+            unit_ids: vec![unit],
+        }]
+    } else {
+        Vec::new()
+    };
+    batch.forward = ForwardBatch {
+        call_indices: vec![0],
+        request_pool_indices: vec![request_pool_idx],
+        seq_lens: vec![prefix_length + input_length.max(1)],
+        query_lens: vec![input_length.max(1)],
+        write_kv: vec![true],
+    };
+    batch
+}
+
+fn command_batch(batch_id: u64, command: BatchCommand) -> Batch {
+    Batch::new(batch_id, Vec::new(), Vec::new()).with_commands(vec![command])
 }
 
 /// Reads one rank's registration report and returns the endpoint it names.
