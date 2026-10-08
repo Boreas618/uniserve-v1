@@ -240,7 +240,8 @@ fn vision_row(
 
 /// The rows of a context prefill: its prompt runs and vision blocks, the
 /// last returned separately. `descriptors` are the scheduler's forward rows
-/// of the call, which must match its rows.
+/// of the call, which must match its rows. A call that `scores` its prompt
+/// projects every text token and each block's last token.
 pub(super) fn context(
     sources: &Sources<'_>,
     call: &Call,
@@ -248,6 +249,7 @@ pub(super) fn context(
     slot: u32,
     descriptors: &[usize],
     forward: &ForwardBatch,
+    scores: bool,
 ) -> Result<(TokenRow, Media)> {
     let mut position = output.progress.logical_position;
     let (_, mut visible, _) = sources
@@ -271,7 +273,11 @@ pub(super) fn context(
             ));
         }
         if end > begin {
-            let selection = if index == blocks && call.token_output.is_some() {
+            // A scored prompt projects every text token; its last row
+            // also samples.
+            let selection = if scores {
+                TokenSelection::AllLogits
+            } else if index == blocks && call.token_output.is_some() {
                 TokenSelection::LastLogits
             } else {
                 TokenSelection::Cache
@@ -291,7 +297,8 @@ pub(super) fn context(
         }
         if index < blocks {
             let last = index + 1 == blocks && end == tokens.len();
-            let selection = if last && call.token_output.is_some() {
+            // A block's last logits predict the prompt's next token.
+            let selection = if scores || (last && call.token_output.is_some()) {
                 TokenSelection::LastLogits
             } else {
                 TokenSelection::Cache

@@ -19,11 +19,13 @@
 //! the latent pool's step workspace, into which the caller gathers each
 //! trajectory's committed pages.
 //!
-//! Graphs: each captured step evaluates a fixed number of rows of one image
-//! size at the configured attention widths ([`DiffusionShape`]); its host
-//! prefix lengths are rebound per replay. Startup captures the configured
-//! shapes largest first; serving replays an exact shape and runs any other
-//! eagerly. Solver updates always run eagerly.
+//! Graphs: each captured step evaluates a fixed set of rows of one image
+//! size at the configured attention widths ([`DiffusionShape`]): the rows'
+//! sample offsets fix where it reads latents, and rows pack their tokens
+//! and predictions in order. Host prefix lengths are rebound per replay.
+//! Startup captures the configured shapes largest first; serving replays an
+//! exact shape and runs any other eagerly. Solver updates always run
+//! eagerly.
 
 use std::sync::Arc;
 
@@ -44,12 +46,27 @@ use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable};
 use crate::{Error, Result};
 
-/// The geometry of a captured denoising step: its rows of one image size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// The geometry of a captured denoising step: its rows of one image size,
+/// by the first sample row each reads (rows of one image share it).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DiffusionShape {
-    pub rows: usize,
     pub height: u32,
     pub width: u32,
+    pub samples: Vec<u32>,
+}
+
+impl DiffusionShape {
+    /// The shape `rows` evaluate, when they share one image size.
+    pub fn of(rows: &[DenoiseRow]) -> Option<Self> {
+        let first = rows.first()?;
+        rows.iter()
+            .all(|row| (row.height, row.width) == (first.height, first.width))
+            .then(|| Self {
+                height: first.height,
+                width: first.width,
+                samples: rows.iter().map(|row| row.sample).collect(),
+            })
+    }
 }
 
 /// One denoising row: a guidance branch of one image.
@@ -126,11 +143,9 @@ pub struct DiffusionCapacity {
 
 /// What a runner binds beside its own columns.
 pub struct DiffusionStorage {
-    /// The latent pool's step workspace `[units, width]`.
+    /// The latent pool's step workspace `[units, width]`, on the
+    /// denoiser's device.
     pub samples: StorageView,
-    /// The samples the network reads, on the denoiser's device: the step
-    /// workspace, or a mirror of it.
-    pub inputs: StorageView,
     /// The latent pool's per-slot timesteps `[slots + 1, 1]` float32.
     pub slot_timesteps: StorageView,
     /// The denoiser device's product arena (`uint8`).
@@ -155,7 +170,6 @@ pub struct ImageDiffusion {
     layout: ImageDenoiserLayout,
     device: Device,
     stream: Option<Stream>,
-    sample_stream: Option<Stream>,
     steps: Steps,
     capacity: DiffusionCapacity,
     attention: AttentionColumns,
@@ -192,9 +206,8 @@ fn bytes<T: Copy>(values: &[T]) -> &[u8] {
 
 impl ImageDiffusion {
     /// Allocate the runner's columns and bind the denoiser at `path` of
-    /// `binding`. `stream` borrows the binding's stream and
-    /// `sample_stream` the latent pool's (the same stream when the pool
-    /// shares the denoiser's device).
+    /// `binding`. `stream` borrows the binding's stream, on which every
+    /// step and sample update runs.
     #[expect(
         clippy::too_many_arguments,
         reason = "the binding's complete resources"
@@ -207,7 +220,7 @@ impl ImageDiffusion {
         layout: ImageDenoiserLayout,
         capacity: DiffusionCapacity,
         storage: DiffusionStorage,
-        streams: (Option<Stream>, Option<Stream>),
+        stream: Option<Stream>,
     ) -> Result<Self> {
         let owner = if path.is_empty() {
             binding.component.clone()
@@ -215,8 +228,7 @@ impl ImageDiffusion {
             format!("{}.{path}", binding.component)
         };
         let device = binding.device;
-        let (stream, sample_stream) = streams;
-        if device.is_cuda() != stream.is_some() || stream.is_some() != sample_stream.is_some() {
+        if device.is_cuda() != stream.is_some() {
             return Err(Error::Invariant(
                 "an image denoiser runs on streams exactly on CUDA devices".into(),
             ));
@@ -263,7 +275,6 @@ impl ImageDiffusion {
             ("predictions", predictions),
             ("step", step),
             ("samples", storage.samples),
-            ("inputs", storage.inputs),
             ("slot_timesteps", storage.slot_timesteps),
             ("products", storage.products),
         ];
@@ -279,8 +290,6 @@ impl ImageDiffusion {
         }
         let tensors = attention.tensors(tensors)?;
         let function = interface.function("denoiser.bind")?;
-        let handle =
-            |stream: &Option<Stream>| stream.as_ref().map_or(0, |stream| stream.raw() as i64);
         let functions = Functions::new(
             function.name(),
             function.call_values(&[
@@ -289,7 +298,6 @@ impl ImageDiffusion {
                 Any::from(tvm_ffi::String::from(path)),
                 tensors.into_any(),
                 Any::from(storage.layout),
-                Any::from(handle(&sample_stream)),
             ])?,
         )?;
         let steps = Steps {
@@ -308,7 +316,6 @@ impl ImageDiffusion {
             layout,
             device,
             stream,
-            sample_stream,
             steps,
             capacity,
             attention,
@@ -330,11 +337,6 @@ impl ImageDiffusion {
     /// The binding's stream; `None` on the host.
     pub fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
-    }
-
-    /// The latent pool's stream; `None` on the host.
-    pub fn sample_stream(&self) -> Option<&Stream> {
-        self.sample_stream.as_ref()
     }
 
     pub fn capacity(&self) -> &DiffusionCapacity {
@@ -505,17 +507,9 @@ impl ImageDiffusion {
             })
             .collect();
 
-        // One image size per evaluation can replay a captured shape.
-        let shape = rows.first().map(|first| DiffusionShape {
-            rows: rows.len(),
-            height: first.height,
-            width: first.width,
-        });
-        let uniform = rows.iter().all(|row| {
-            Some((row.height, row.width)) == shape.map(|shape| (shape.height, shape.width))
-        });
-        let graph = match shape {
-            Some(shape) if self.capturing && uniform && self.graphs.contains(&shape, None) => {
+        // A captured shape replays when the rows match it exactly.
+        let graph = match DiffusionShape::of(rows) {
+            Some(shape) if self.capturing && self.graphs.contains(&shape, None) => {
                 match self.graphs.lookup(&shape, None)? {
                     Lookup::Replay(graph) => Some(graph.clone()),
                     Lookup::Capture => None,
@@ -614,17 +608,22 @@ impl ImageDiffusion {
             .invoke(&[(&described).into(), (&plans).into()])
     }
 
-    /// Capture `shape` after an eager evaluation of `rows` (its warmup),
-    /// which gathered the geometry the graph reads. `check` runs after the
-    /// capture (the graph storage budget); a failed check releases it.
+    /// Capture the shape of `rows` after an eager evaluation of them (its
+    /// warmup), which gathered the geometry the graph reads. `pools` holds
+    /// the owner's allocator pool on the runner's device and one on each
+    /// other device the network's modules run on (a generation tower).
+    /// `check` runs after the capture (the graph storage budget); a failed
+    /// check releases it.
     pub fn capture(
         &mut self,
-        shape: DiffusionShape,
         rows: &[DenoiseRow],
         tables: &BlockTables,
-        pool: &Arc<GraphPool<Handle>>,
+        pools: &[Arc<GraphPool<Handle>>],
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let shape = DiffusionShape::of(rows).ok_or_else(|| {
+            Error::Invalid("a captured denoising step evaluates rows of one image size".into())
+        })?;
         if self.graphs.contains(&shape, None) {
             return Ok(());
         }
@@ -659,10 +658,27 @@ impl ImageDiffusion {
             (&Self::described(&described)).into(),
             (&geometry.to_any()).into(),
         ])?;
+        let ordinal = self.device.cuda_index();
+        let pool = pools
+            .iter()
+            .find(|pool| Some(pool.device) == ordinal)
+            .ok_or_else(|| Error::Invariant("a denoiser graph has no pool on its device".into()))?;
+        let peers = list(
+            pools
+                .iter()
+                .filter(|pool| Some(pool.device) != ordinal)
+                .map(|pool| {
+                    Any::from(list([
+                        Any::from(i64::from(pool.device)),
+                        pool.value.to_any(),
+                    ]))
+                }),
+        );
         let graph = Handle::new(self.steps.capture.call_values(&[
             Self::described(&described),
             geometry.to_any(),
             pool.value.to_any(),
+            Any::from(peers),
         ])?);
         if let Err(error) = check() {
             if let Err(cleanup) = self.release.invoke(&[graph.view()]) {
@@ -673,6 +689,17 @@ impl ImageDiffusion {
         self.graphs.insert(shape, None, graph)?;
         self.capturing = true;
         Ok(())
+    }
+
+    /// Graphs captured so far.
+    pub fn captured(&self) -> usize {
+        self.graphs.len()
+    }
+
+    /// The graph pool's identity: the address of the runner's positions
+    /// column, which no other runner shares.
+    pub fn graph_key(&self) -> usize {
+        self.positions.address() as usize
     }
 
     /// Refuse further captures: serving replays what startup captured.

@@ -606,16 +606,31 @@ def bind(
 
         Each record is ``[row, count, token, continued, slot, words, tail,
         top, requested, ids...]``: the chunk's candidate rows and input
-        tokens, whether the slot's retained logits predict its first token,
-        the logprob words it writes and the tail row its last logits go to.
+        tokens, what predicts its first token (nothing for 0, the slot's
+        retained logits for 1, candidate row ``continued - 2`` otherwise:
+        the vision block before it), the logprob words it writes and the
+        tail row its last logits go to. A record of no rows only retains
+        candidate row ``row`` (a prompt ending with a vision block).
         """
         cursor = _Cursor(descriptor)
         while not cursor.done():
             row, count, token, continued, slot, words, tail = cursor.take(7)
             top = cursor.next()
             ids = cursor.take(cursor.next())
+            if not count:
+                b["prompt_tail"][tail].copy_(
+                    gathered(candidates[row : row + 1])[0]
+                )
+                continue
             logits = gathered(candidates[row : row + count])
-            previous = b["slot.prompt_logits"][slot] if continued else None
+            if continued == 1:
+                previous = b["slot.prompt_logits"][slot]
+            elif continued > 1:
+                previous = gathered(candidates[continued - 2 : continued - 1])[
+                    0
+                ]
+            else:
+                previous = None
             retained, packed = prompt_logprobs(
                 b["input_ids"][token : token + count],
                 logits,
