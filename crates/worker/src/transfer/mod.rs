@@ -5,7 +5,8 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::cuda::{DeviceGuard, Event, Stream};
+use uniserve_cuda::{DeviceGuard, DeviceId, Event, Stream};
+
 use crate::{Completion, Error, EventPool, Outcome, Result};
 
 mod descriptor_grants;
@@ -445,7 +446,7 @@ impl<V, E, C> TransferTicket<V, E, C> {
         let ReadAccess::Copy { handoff } = &mut self.access else {
             return Err(Error::State("a borrowed transfer cannot copy into storage"));
         };
-        let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
+        let _device = DeviceGuard::new(DeviceId(device))?;
         let event = pool.acquire(device, false, false)?;
         pool.record(&event, device, stream)?;
         pool.retain(&event, device, 1)?;
@@ -454,13 +455,12 @@ impl<V, E, C> TransferTicket<V, E, C> {
     }
 
     /// Order a transport stream after the destination's submitting stream.
-    /// The caller selects the transport device context.
-    pub fn wait_for_copy(&self, stream: usize) -> Result<()> {
+    pub fn wait_for_copy(&self, stream: &Stream) -> Result<()> {
         let ReadAccess::Copy { handoff } = &self.access else {
             return Err(Error::State("a borrowed transfer cannot copy into storage"));
         };
         if let Some(event) = handoff {
-            event.wait_on(stream).map_err(Error::Cuda)?;
+            stream.wait_event(event)?;
         }
         Ok(())
     }
@@ -469,8 +469,11 @@ impl<V, E, C> TransferTicket<V, E, C> {
     /// The numerical backend separately records views with its allocator.
     pub fn consume(&mut self, device: i32, stream: usize) -> Result<()> {
         if let Some(producer) = &self.producer {
-            let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
-            producer.wait_on(stream).map_err(Error::Cuda)?;
+            // A default-stream handle resolves against the current context.
+            let _device = DeviceGuard::new(DeviceId(device))?;
+            // SAFETY: the numerical backend consumes on this live stream of
+            // `device`; it is borrowed only for this wait.
+            unsafe { Stream::borrowed(DeviceId(device), stream) }?.wait_event(producer)?;
 
             if let ReadAccess::Borrowed { streams, .. } = &mut self.access {
                 streams.insert((device, stream));
@@ -488,7 +491,7 @@ impl<V, E, C> TransferTicket<V, E, C> {
     pub fn record_consumers<O>(&mut self, pool: &mut EventPool<O>) -> Result<()> {
         if let ReadAccess::Borrowed { streams, events } = &mut self.access {
             for &(device, stream) in streams.iter() {
-                let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
+                let _device = DeviceGuard::new(DeviceId(device))?;
                 let event = pool.acquire(device, false, false)?;
                 pool.record(&event, device, stream)?;
                 pool.retain(&event, device, 1)?;

@@ -9,12 +9,10 @@
 pub mod capacity;
 mod completion;
 pub mod config;
-pub mod cuda;
 mod error;
 mod executor;
 pub mod ffi;
 mod host;
-pub mod nccl;
 mod parallel;
 mod profiling;
 mod request;
@@ -33,7 +31,9 @@ pub use executor::{
     Submission, request_output,
 };
 pub use host::{HostAction, HostLane, HostTask};
-pub use parallel::{ExpertExchange, Microbatches, WeightPrefetch, yield_microbatch};
+pub use parallel::{
+    ExpertExchange, Microbatches, StreamCommunicator, WeightPrefetch, yield_microbatch,
+};
 pub use request::{Request, RequestPool, RequestProgress};
 pub use runner::{
     GraphPool, GraphPools, GraphStorage, ModelBatch, ModelRunners, PrefillShape, TextShapes,
@@ -44,15 +44,14 @@ pub use sampling::{
 };
 pub use service::{Service, ServiceBackend};
 pub use storage::{
-    AttentionRow, BlockTableUpdate, BlockTables, BufferBinding, BufferPool, GroupShape,
-    GroupTable, HostBuffers, KVCacheManager, LatentExport, LatentImport, LatentPool,
-    LatentUpdate, LogprobLayout, OutputBuffer, OutputPool, OutputStorage, TablePages,
-    table_pages,
+    AttentionRow, BlockTableUpdate, BlockTables, BufferBinding, BufferPool, GroupShape, GroupTable,
+    HostBuffers, KVCacheManager, LatentExport, LatentImport, LatentPool, LatentUpdate,
+    LogprobLayout, OutputBuffer, OutputPool, OutputStorage, TablePages, table_pages,
 };
 pub use stream::{CUDAStream, EventPool};
 pub use transfer::{
-    BufferRegistry, DescriptorGrants, ImportBackend, ImportCopy, KVImport, KVImporter,
-    ReadBackend, ReadRegion, ReadReservation, RegisteredBuffer, SHM_HEADER_BYTES, SharedBuffer,
-    SharedMapping, SharedRead, TransferCapacity, TransferPool, TransferRead, TransferTicket,
-    fetch_descriptor, plan_reads,
+    BufferRegistry, DescriptorGrants, ImportBackend, ImportCopy, KVImport, KVImporter, ReadBackend,
+    ReadRegion, ReadReservation, RegisteredBuffer, SHM_HEADER_BYTES, SharedBuffer, SharedMapping,
+    SharedRead, TransferCapacity, TransferPool, TransferRead, TransferTicket, fetch_descriptor,
+    plan_reads,
 };

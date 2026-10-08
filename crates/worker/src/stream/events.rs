@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::cuda::{Event, Stream};
+use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
+
 use crate::{Error, Result};
 
 type PoolKey = (i32, bool, bool);
@@ -17,6 +18,7 @@ enum Status {
 
 struct ActiveEvent {
     event: Arc<Event>,
+    device: i32,
     references: usize,
     stream: Option<usize>,
     recorded: bool,
@@ -68,11 +70,18 @@ impl<O> EventPool<O> {
             .position(|event| Arc::strong_count(event) == 1);
         let event = reusable
             .map(|index| available.swap_remove(index))
-            .unwrap_or_else(|| Arc::new(Event::new(device, timing, interprocess)));
+            .unwrap_or_else(|| {
+                Arc::new(Event::new(EventFlags {
+                    timing,
+                    interprocess,
+                    external: false,
+                }))
+            });
         self.active.insert(
             key(&event),
             ActiveEvent {
                 event: Arc::clone(&event),
+                device,
                 references: 0,
                 stream: None,
                 recorded: false,
@@ -100,6 +109,10 @@ impl<O> EventPool<O> {
     }
 
     /// Records this lease once, honoring its declared stream when present.
+    ///
+    /// Stream handles are live numerical streams of `device`. The caller
+    /// selects the device's context, since a default-stream handle resolves
+    /// against the calling thread's current context.
     pub fn record(&mut self, event: &Arc<Event>, device: i32, current: usize) -> Result<usize> {
         self.require_open()?;
         let state = self.require(event, device)?;
@@ -107,7 +120,10 @@ impl<O> EventPool<O> {
             return Err(invariant("device event was recorded more than once"));
         }
         let stream = state.stream.unwrap_or(current);
-        event.record(stream).map_err(Error::Cuda)?;
+        // SAFETY: the producer stream is live (see above); it is borrowed only
+        // for this record.
+        let producer = unsafe { Stream::borrowed(DeviceId(device), stream) }?;
+        event.record(&producer)?;
         state.stream = Some(stream);
         state.recorded = true;
         Ok(stream)
@@ -130,11 +146,14 @@ impl<O> EventPool<O> {
         if self.status == Status::Closed {
             return Ok(());
         }
-        let state = self.require(event, event.device())?;
+        let state = self
+            .active
+            .get_mut(&key(event))
+            .ok_or_else(|| invariant("device event is not owned by its declared device"))?;
         if count == 0 || state.references < count {
             return Err(invariant("device event reference accounting is invalid"));
         }
-        if state.references == count && (!state.recorded || !event.ready().map_err(Error::Cuda)?) {
+        if state.references == count && (!state.recorded || !event.query()?) {
             return Err(invariant(
                 "device event was released before it became query-ready",
             ));
@@ -165,7 +184,7 @@ impl<O> EventPool<O> {
         while index < self.deferred.len() {
             let deferred = &self.deferred[index];
             let ready = deferred.events.iter().try_fold(true, |ready, event| {
-                event.ready().map(|done| ready && done).map_err(Error::Cuda)
+                event.query().map(|done| ready && done).map_err(Error::Cuda)
             });
             let result = ready.and_then(|ready| {
                 if ready {
@@ -206,13 +225,13 @@ impl<O> EventPool<O> {
         let stream = match self.wake_streams.get(&(device, producer)) {
             Some(stream) => Arc::clone(stream),
             None => {
-                let stream = Arc::new(Stream::new(device).map_err(Error::Cuda)?);
+                let stream = Arc::new(Stream::new(DeviceId(device))?);
                 self.wake_streams
                     .insert((device, producer), Arc::clone(&stream));
                 stream
             }
         };
-        event.wait_on(stream.handle()).map_err(Error::Cuda)?;
+        stream.wait_event(event)?;
         Ok(stream)
     }
 
@@ -232,10 +251,10 @@ impl<O> EventPool<O> {
 
         move || {
             for stream in streams {
-                stream.wait().map_err(Error::Cuda)?;
+                stream.synchronize()?;
             }
             for event in events {
-                event.wait().map_err(Error::Cuda)?;
+                event.synchronize()?;
             }
             Ok(())
         }
@@ -265,13 +284,9 @@ impl<O> EventPool<O> {
     }
 
     fn require(&mut self, event: &Arc<Event>, device: i32) -> Result<&mut ActiveEvent> {
-        if event.device() != device {
-            return Err(invariant(
-                "device event is not owned by its declared device",
-            ));
-        }
         self.active
             .get_mut(&key(event))
+            .filter(|state| state.device == device)
             .ok_or_else(|| invariant("device event is not owned by its declared device"))
     }
 
@@ -296,9 +311,11 @@ impl<O> EventPool<O> {
         if let Some(state) = self.active.get_mut(&key(event)) {
             state.references -= count;
             if state.references == 0 {
+                let device = state.device;
+                let flags = event.flags();
                 self.active.remove(&key(event));
                 self.available
-                    .entry((event.device(), event.timing(), event.interprocess()))
+                    .entry((device, flags.timing, flags.interprocess))
                     .or_default()
                     .push(Arc::clone(event));
             }
