@@ -1,4 +1,4 @@
-"""Unit-pool ownership of paged K/V state with column planes.
+"""Unit-pool layout and borrowed views of paged K/V state with column planes.
 
 The pool is ``num_units`` equally sized allocation units. Every unit is
 ordinary memory; a serving owner reserves unit zero as the padding sentinel
@@ -23,24 +23,26 @@ A cache whose layers all share one group has one unit per page with one
 column per layer, ``page_tokens`` equal to ``block_size`` and one table, so
 each layer's view and the stacked allocation of each field are the
 ``[layers, blocks, block_size, heads, dim]`` layout of a per-layer stack.
+
+The serving worker allocates the fields itself and binds a ``UnitPool`` over
+them with ``UnitPool.from_plan``; standalone library callers allocate with
+``UnitPool.allocate``. Either way the pool only borrows its fields: unit
+assignment, retirement and the lifetime of the backing belong to its owner.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import gcd
-from typing import Self
 
 import torch
 
-from uniserve_models.cache import Config, State, mha
-from uniserve_models.cache.state import _blocks
 from uniserve_models.quantization import Quantizer
 from uniserve_models.tensors import BufferConfig
 
-from .device import async_tensor_h2d
-from .tensor_buffers import TensorBuffers
+from . import mha
+from .state import Config, State
 
 _FIELDS = ("key", "value")
 
@@ -140,7 +142,7 @@ class Planes:
             )
             if self.quantized:
                 result[f"{field}.scale"] = BufferConfig(
-                    (self.columns, num_units, 1, 1, 1), torch.float32
+                    (self.columns, num_units), torch.float32
                 )
             result[f"{field}.initialized"] = BufferConfig(
                 (self.columns, num_units), torch.bool
@@ -249,63 +251,76 @@ def plan_units(
     return Planes(columns, plane_bytes, tuple(groups), quantizer is not None)
 
 
-class PrefixCache:
-    """Allocate a K/V unit pool; callers own unit assignment and retirement.
+_STORAGE_DTYPES = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+}
 
-    No layer, attention method, or numerical input receives this owning
-    object: layers borrow their states, and block tables name units by id.
+
+def _dtype(name: str) -> torch.dtype:
+    """Resolve a storage dtype name (a torch name without its prefix)."""
+    try:
+        return _STORAGE_DTYPES[name.removeprefix("torch.")]
+    except KeyError:
+        raise ValueError(f"unsupported K/V storage dtype {name!r}") from None
+
+
+class UnitPool:
+    """Borrowed views of a K/V unit pool's fields and its layers' states.
+
+    The fields are ``{key,value}.values`` uint8 ``[columns, num_units,
+    plane_bytes]``, ``{key,value}.initialized`` bool ``[columns,
+    num_units]`` and, for FP8 storage, ``{key,value}.scale`` float32
+    ``[columns, num_units]``. No layer, attention method or numerical input
+    receives the pool itself: layers borrow their states, and block tables
+    name units by id.
     """
 
     def __init__(
         self,
-        config: Config,
+        planes: Planes,
+        fields: Mapping[str, torch.Tensor],
+        configs: Mapping[str, mha.Config],
         *,
         num_units: int,
-        block_size: int,
-        device: torch.device | str,
-        dtype: torch.dtype | None = None,
-        quantization: Mapping[str, Quantizer | None] | None = None,
     ) -> None:
-        """Allocate and reset the pool's planes and bind every layer's state.
+        """Bind every layer's state over already allocated ``fields``.
 
-        ``block_size``, ``dtype`` and ``quantization`` are interpreted as by
-        ``plan_units``; ``num_units`` counts every unit, sentinel included.
+        Use ``from_plan`` or ``allocate``. ``configs`` gives each resident
+        layer's MHA layout. Dense layers bind their group's stored dtype as
+        their logical storage dtype; FP8 layers encode their compute dtype.
         """
-        self.config = config
-        self.device = torch.device(device)
-        self.planes = plan_units(
-            config,
-            block_size=block_size,
-            dtype=dtype,
-            quantization=quantization,
-        )
+        expected = planes.buffers(num_units)
+        for name, requirement in expected.items():
+            tensor = fields.get(name)
+            if (
+                tensor is None
+                or tuple(tensor.shape) != requirement.shape
+                or tensor.dtype != requirement.dtype
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"K/V unit field {name!r} disagrees with its layout"
+                )
+        self.planes = planes
         self.num_units = num_units
+        self._fields = {name: fields[name] for name in expected}
+        self.device = self._fields["key.values"].device
         # Groups storing different element types reinterpret each other's
         # stale bytes, which need not decode as finite (`recycle_units`).
-        self._mixed_types = (
-            len({group.dtype for group in self.planes.groups}) > 1
-        )
+        self._mixed_types = len({group.dtype for group in planes.groups}) > 1
 
-        requirements = self.planes.buffers(num_units)
-        self._backing = TensorBuffers.allocate(requirements, device=self.device)
-        self._fields = dict(self._backing.view(requirements))
-        for name, tensor in self._fields.items():
-            # Multiplicative scales restart at one; encoded bytes and flags
-            # restart at zero.
-            tensor.fill_(int(name.endswith(".scale")))
-
+        quantizer = Quantizer("fp8", axis=0) if planes.quantized else None
+        self._configs = dict(configs)
         self._states: dict[str, State] = {}
         self._tables: dict[str, int] = {}
-        columns = self.planes.columns
+        columns = planes.columns
         first_table = 0
-        for group_index, group in enumerate(self.planes.groups):
+        for group in planes.groups:
             for index, name in enumerate(group.layers):
                 row, column = divmod(index, columns)
-                layout = config.layers[name]
-                assert isinstance(layout, mha.Config)
-                quantizer = (
-                    None if quantization is None else quantization.get(name)
-                )
                 views = {}
                 for field in _FIELDS:
                     # One plane read as [units, page tokens, heads, dim]; the
@@ -323,18 +338,110 @@ class PrefixCache:
                     views[f"{field}.initialized"] = self._fields[
                         f"{field}.initialized"
                     ][column]
-                    if self.planes.quantized:
+                    if planes.quantized:
+                        # One FP32 scale per unit of this column.
                         views[f"{field}.scale"] = self._fields[
                             f"{field}.scale"
-                        ][column]
-                self._states[name] = layout.bind(
+                        ][column].view(num_units, 1, 1, 1)
+                self._states[name] = configs[name].bind(
                     views,
                     block_size=group.page_tokens,
-                    dtype=dtype,
+                    dtype=None if planes.quantized else group.dtype,
                     quantizer=quantizer,
                 )
                 self._tables[name] = first_table + row
             first_table += group.units_per_page
+
+    @classmethod
+    def from_plan(
+        cls, plan: Mapping, tensors: Mapping[str, torch.Tensor]
+    ) -> UnitPool:
+        """Bind a pool over fields its owner allocated for ``plan``.
+
+        Args:
+            plan: The cache description ``interface.cache.cache_plan``
+                returns, plus ``"num_units"``, the units the fields hold
+                (sentinel included).
+            tensors: The unit fields by name; other entries, such as block
+                tables, are ignored. Nothing is allocated or initialized.
+
+        Raises:
+            ValueError: A field disagrees with the plan's layout.
+        """
+        quantized = bool(plan["quantized"])
+        groups = []
+        configs = {}
+        for value in plan["groups"]:
+            window = int(value["window"])
+            offset = int(value["kv_head_offset"])
+            heads = int(value["num_kv_heads"])
+            layers = tuple(str(name) for name in value["layers"])
+            groups.append(
+                CacheGroup(
+                    window=None if window < 0 else window,
+                    page_tokens=int(value["page_tokens"]),
+                    units_per_page=int(value["units_per_page"]),
+                    layers=layers,
+                    num_kv_heads=heads,
+                    head_dim=int(value["head_dim"]),
+                    dtype=_dtype(str(value["dtype"])),
+                )
+            )
+            config = mha.Config(
+                int(value["total_kv_heads"]),
+                int(value["head_dim"]),
+                tuple(range(offset, offset + heads)),
+                _dtype(str(value["compute_dtype"])),
+                window=None if window < 0 else window,
+            )
+            configs.update(dict.fromkeys(layers, config))
+        planes = Planes(
+            int(plan["columns"]),
+            int(plan["plane_bytes"]),
+            tuple(groups),
+            quantized,
+        )
+        if planes.unit_bytes != int(plan["unit_bytes"]):
+            raise ValueError("the cache plan's unit bytes disagree with it")
+        return cls(planes, tensors, configs, num_units=int(plan["num_units"]))
+
+    @classmethod
+    def allocate(
+        cls,
+        config: Config,
+        *,
+        num_units: int,
+        block_size: int,
+        device: torch.device | str,
+        dtype: torch.dtype | None = None,
+        quantization: Mapping[str, Quantizer | None] | None = None,
+    ) -> UnitPool:
+        """Allocate and reset a pool's fields for standalone library use.
+
+        ``block_size``, ``dtype`` and ``quantization`` are interpreted as by
+        ``plan_units``; ``num_units`` counts every unit, sentinel included.
+        Scales start at one and every other field at zero.
+        """
+        planes = plan_units(
+            config,
+            block_size=block_size,
+            dtype=dtype,
+            quantization=quantization,
+        )
+        fields = {
+            # Multiplicative scales restart at one; encoded bytes and flags
+            # restart at zero.
+            name: (torch.ones if name.endswith(".scale") else torch.zeros)(
+                requirement.shape, dtype=requirement.dtype, device=device
+            )
+            for name, requirement in planes.buffers(num_units).items()
+        }
+        configs = {}
+        for name, layout in config.layers.items():
+            if not isinstance(layout, mha.Config):
+                raise ValueError("a K/V unit pool requires MHA cache layers")
+            configs[name] = layout
+        return cls(planes, fields, configs, num_units=num_units)
 
     @property
     def groups(self) -> tuple[CacheGroup, ...]:
@@ -347,10 +454,7 @@ class PrefixCache:
         return self.planes.tables
 
     def state(self, name: str) -> State:
-        """Borrow one layer's state.
-
-        Borrow one layer's state while retaining this owner through its use.
-        """
+        """Borrow one layer's state; the fields' owner outlives its use."""
         return self._states[name]
 
     def table(self, name: str) -> int:
@@ -363,22 +467,31 @@ class PrefixCache:
         self.state(name)
         return self._tables[name]
 
+    def head_offset(self, name: str) -> int:
+        """Return one layer's first global K/V head; local heads follow it.
+
+        Raises:
+            ValueError: The layer's local heads are not consecutive.
+        """
+        heads = self._configs[name].head_indices
+        if heads != tuple(range(heads[0], heads[0] + len(heads))):
+            raise ValueError("the layer's local K/V heads are not consecutive")
+        return heads[0]
+
     def planes_of(self, group: int, field: str) -> torch.Tensor:
         """Borrow one field's planes as one group reads them.
 
         Returns ``[columns, num_units, page_tokens, heads, dim]`` in the
         group's stored dtype for ``field`` ``"key"`` or ``"value"``: the
         group's layer ``k`` of a page's unit ``u`` is ``[k % columns, u]``.
-        Writes through a layer's state are visible here and vice versa; the
-        caller retains this owner through every asynchronous reader.
+        Writes through a layer's state are visible here and vice versa.
         """
         values = self.planes.groups[group]
-        columns = self.planes.columns
         return (
             self._fields[f"{field}.values"]
             .view(values.dtype)
             .view(
-                columns,
+                self.planes.columns,
                 self.num_units,
                 values.page_tokens,
                 values.num_kv_heads,
@@ -387,7 +500,7 @@ class PrefixCache:
         )
 
     def scales_of(self, field: str) -> torch.Tensor:
-        """Borrow one field's FP8 scales as ``[columns, num_units, 1, 1, 1]``.
+        """Borrow one field's FP8 scales as ``[columns, num_units]``.
 
         Raises:
             ValueError: The pool stores unquantized values.
@@ -396,25 +509,44 @@ class PrefixCache:
             raise ValueError("unquantized K/V planes carry no scales")
         return self._fields[f"{field}.scale"]
 
-    def zero_units(self, units: tuple[int, ...]) -> None:
-        """Reset caller-selected units in every column and field.
+    def _index(self, units: torch.Tensor | Sequence[int]) -> torch.Tensor:
+        """Return unit ids as an int64 index on the pool's device.
+
+        A tensor index is used as given: the serving owner validated its
+        units, and reading them back would synchronize the device.
+        """
+        if isinstance(units, torch.Tensor):
+            if units.dtype != torch.int64 or units.device != self.device:
+                raise ValueError(
+                    "unit indices must be int64 on the pool's device"
+                )
+            return units
+        if any(
+            type(unit) is not int or not 0 <= unit < self.num_units
+            for unit in units
+        ):
+            raise ValueError("unit ids must lie within the pool")
+        return torch.tensor(tuple(units), dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+
+    def zero_units(self, units: torch.Tensor | Sequence[int]) -> None:
+        """Reset the selected units in every column and field.
 
         Resets the units' bytes, initialization flags and FP8 scales, so a
-        unit leaving one group can join any other. Each field resets with one
-        indexed fill over its unit axis, however the units are scattered,
-        enqueued on the current stream of the pool's device without a host
-        read. Repeated ids are allowed.
+        unit leaving one group can join any other. Each field resets with
+        one indexed fill over its unit axis, however the units are
+        scattered, enqueued on the current stream without a host read.
+        Repeated ids are allowed.
         """
-        _blocks(units, self.num_units)
-        if not units:
+        index = self._index(units)
+        if not index.numel():
             return
-
-        index = async_tensor_h2d(units, dtype=torch.long, device=self.device)
         for name, tensor in self._fields.items():
             # Every field is laid out [columns, num_units, ...].
             tensor.index_fill_(1, index, int(name.endswith(".scale")))
 
-    def recycle_units(self, units: tuple[int, ...]) -> None:
+    def recycle_units(self, units: torch.Tensor | Sequence[int]) -> None:
         """Prepare units that held earlier tokens for a new owner.
 
         Readers never weigh tokens a unit's owner has not written: every
@@ -430,48 +562,36 @@ class PrefixCache:
         (``zero_units``), since stale bytes of one type need not decode as
         finite values of another.
         """
-        _blocks(units, self.num_units)
-        if not units:
-            return
-
         if self._mixed_types:
             self.zero_units(units)
             return
         if not self.planes.quantized:
             return
+        self.reset_flags(units)
 
-        index = async_tensor_h2d(units, dtype=torch.long, device=self.device)
+    def reset_flags(self, units: torch.Tensor | Sequence[int]) -> None:
+        """Clear the selected units' initialization flags and FP8 scales.
+
+        This is the device work of ``recycle_units`` for a quantized pool of
+        one element type.
+        """
+        index = self._index(units)
+        if not index.numel():
+            return
         for field in _FIELDS:
             self._fields[f"{field}.initialized"].index_fill_(1, index, False)
-            self._fields[f"{field}.scale"].index_fill_(1, index, 1)
+            if self.planes.quantized:
+                self._fields[f"{field}.scale"].index_fill_(1, index, 1)
 
-    def mark_initialized(self, units: tuple[int, ...]) -> None:
+    def mark_initialized(self, units: torch.Tensor | Sequence[int]) -> None:
         """Commit externally transferred values and scales of whole units.
 
         Every column of a unit holds a layer of the unit's group, so the
         flags of both fields in every column are set with one indexed fill
         per field, without a host read.
         """
-        _blocks(units, self.num_units)
-        if not units:
+        index = self._index(units)
+        if not index.numel():
             return
-
-        index = async_tensor_h2d(units, dtype=torch.long, device=self.device)
         for field in _FIELDS:
             self._fields[f"{field}.initialized"].index_fill_(1, index, True)
-
-    def close(self) -> None:
-        """Release owner references.
-
-        Release owner references after the caller has retired borrowed uses.
-        """
-        self._states.clear()
-        self._tables.clear()
-        self._fields.clear()
-        self._backing.close()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
