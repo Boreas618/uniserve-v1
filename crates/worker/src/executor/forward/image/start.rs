@@ -43,6 +43,68 @@ use crate::{Error, Result};
 /// Guidance branches one image evaluates at most per step.
 const MAX_BRANCHES: usize = 3;
 
+/// Prefix tokens of each scratch slot a captured denoising step reads; host
+/// prefix lengths are rebound when the step replays.
+pub(crate) const CAPTURE_PREFIX: usize = 16;
+
+/// A denoising step captured at startup: `images` images of one size, each
+/// evaluating `branches` guidance branches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FlowShape {
+    pub(crate) images: usize,
+    pub(crate) branches: usize,
+    pub(crate) height: u32,
+    pub(crate) width: u32,
+}
+
+/// The configured denoising steps that fit the denoiser's columns and the
+/// latent pool, largest footprint first: every configured image size and
+/// batch size with one to three guidance branches, keeping those within
+/// the batch's calls, the evaluation's tokens, one image's sequence and the
+/// pool's units.
+fn flow_shapes(
+    config: &WorkerConfig,
+    layout: &ImageDenoiserLayout,
+    max_calls: usize,
+    tokens: usize,
+    pool_units: usize,
+) -> Vec<FlowShape> {
+    let mut shapes = Vec::new();
+    for &(height, width) in &config.flow_graph_shapes {
+        let (height, width) = (height as u32, width as u32);
+        let (Ok(units), Ok(length)) = (
+            layout.latent_rows(height, width),
+            layout.sequence_length(height, width),
+        ) else {
+            continue;
+        };
+        for &images in &config.flow_graph_batch_sizes {
+            for branches in 1..=MAX_BRANCHES {
+                if images > 0
+                    && images <= max_calls
+                    && images * length as usize * branches <= tokens
+                    && units <= layout.max_sequence_tokens
+                    && images * units as usize <= pool_units
+                {
+                    shapes.push(FlowShape {
+                        images,
+                        branches,
+                        height,
+                        width,
+                    });
+                }
+            }
+        }
+    }
+    shapes.sort_by_key(|shape| {
+        std::cmp::Reverse(
+            shape.images * shape.branches * shape.height as usize * shape.width as usize,
+        )
+    });
+    shapes.dedup();
+    shapes
+}
+
 /// Host workers encoding and preparing images.
 const HOST_WORKERS: usize = 4;
 
@@ -106,7 +168,11 @@ pub(crate) fn flow_tokens(layout: &ImageDenoiserLayout, config: &WorkerConfig) -
             tokens = tokens.max(length as usize);
         }
     }
-    tokens * MAX_BRANCHES
+    // Denoising and prompt invocations share one token extent: a batch's
+    // tokens beside one image's sequence.
+    (tokens * MAX_BRANCHES).max(
+        config.max_batch_tokens + (layout.max_sequence_tokens + layout.framing_tokens) as usize,
+    )
 }
 
 /// The largest image a decoder stages: the longest latent sequence's
@@ -429,6 +495,35 @@ impl ImageRuntime {
         }
         startup.components.add_bindings(bindings);
 
+        // The configured denoising steps capture at warmup into one pool.
+        let mut flow = Vec::new();
+        let mut flow_pool = None;
+        if let (Some((_, runner)), Some(latents)) = (&diffusion, &latents)
+            && config.graph_policy != "off"
+            && config.flow_cuda_graph
+            && let Some(ordinal) = runner.device().cuda_index()
+        {
+            flow = flow_shapes(
+                config,
+                runner.layout(),
+                max_calls,
+                runner.capacity().tokens,
+                latents.pool.capacity_units(),
+            );
+            if !flow.is_empty() {
+                flow_pool = reserve_pools(
+                    startup.graphs,
+                    &interface.function("graphs.pool")?,
+                    runner.graph_key(),
+                    "image:denoiser".to_owned(),
+                    &[ordinal],
+                    None,
+                )?
+                .into_iter()
+                .next();
+            }
+        }
+
         // Packed vision encoders capture their slot counts at warmup.
         let mut pools = HashMap::new();
         if config.graph_policy != "off" {
@@ -480,6 +575,8 @@ impl ImageRuntime {
             arenas,
             units,
             pools,
+            flow,
+            flow_pool,
             max_pixel_words,
             outputs,
             host,
