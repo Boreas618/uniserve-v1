@@ -9482,6 +9482,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniserve-cuda"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "libloading 0.8.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "uniserve-dynamo-worker"
 version = "2.0.0"
 dependencies = [

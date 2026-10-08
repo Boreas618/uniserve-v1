@@ -5,6 +5,7 @@ members = [
     "crates/observability",
     "crates/observability-derive",
     "crates/ipc",
+    "crates/cuda",
     "crates/worker",
     "crates/engine",
     "crates/server",
@@ -25,6 +26,7 @@ uniserve-core = { path = "crates/core" }
 uniserve-observability = { path = "crates/observability" }
 uniserve-observability-derive = { path = "crates/observability-derive" }
 uniserve-ipc = { path = "crates/ipc" }
+uniserve-cuda = { path = "crates/cuda" }
 uniserve-worker = { path = "crates/worker" }
 uniserve-engine = { path = "crates/engine" }
 uniserve-server = { path = "crates/server" }
