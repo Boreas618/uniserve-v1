@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use uniserve_cuda::Stream;
-use uniserve_ipc::{Batch as BatchPlan, CallStatus, DType, RequestKey, TensorRef};
+use uniserve_ipc::{Batch as BatchPlan, BufferId, CallStatus, DType, RequestKey, TensorRef};
 
+use super::super::image::ImageRuntime;
 use super::super::launch::{lock, read_flag, reports_output, seal};
 use super::super::products::Publications;
 use super::kv::{self, Installation, Published};
@@ -76,6 +77,9 @@ pub(super) struct TransferBatch<'a> {
     pub(super) reads: Vec<Arc<ProductRead>>,
     /// Product exports, registered once the batch commits.
     pub(super) publications: Publications,
+    /// Trajectory versions exported from the latent pool, released from it
+    /// if the batch fails before committing.
+    pub(super) latent_exports: Vec<BufferId>,
     /// KV exports and installs, resident once the batch commits.
     pub(super) published: Vec<Published>,
     pub(super) installations: Vec<Installation>,
@@ -148,6 +152,7 @@ impl<'a> TransferBatch<'a> {
             writes: Vec::new(),
             reads: Vec::new(),
             publications: Publications::default(),
+            latent_exports: Vec::new(),
             published: Vec::new(),
             installations: Vec::new(),
             retirement: Arc::new(Retirement::default()),
@@ -291,9 +296,20 @@ impl<'a> TransferBatch<'a> {
     }
 
     /// Retire every reservation after a failure before the commit point;
-    /// storage returns once the fences recorded here complete.
-    pub(super) fn discard(&mut self) -> Result<()> {
+    /// storage returns once the fences recorded here complete. Trajectory
+    /// versions exported from `image`'s latent pool are released from it.
+    pub(super) fn discard(&mut self, image: Option<&mut ImageRuntime>) -> Result<()> {
         let revoked = self.publications.revoke();
+        let exported = std::mem::take(&mut self.latent_exports);
+        let released = match (exported.is_empty(), image) {
+            (true, _) => Ok(()),
+            (false, Some(image)) => image
+                .latent_pool()
+                .map(|(pool, _)| pool.release_exports(&exported)),
+            (false, None) => Err(Error::Invariant(
+                "exported trajectory versions lost their latent pool".into(),
+            )),
+        };
         let published = std::mem::take(&mut self.published);
         for export in &published {
             self.calls[export.call].output.output.kv_output = None;
@@ -311,6 +327,7 @@ impl<'a> TransferBatch<'a> {
         };
         lock(&self.buffer).abandon();
         revoked
+            .and(released)
             .and(unpublished)
             .and(completed)
             .and(abandoned)

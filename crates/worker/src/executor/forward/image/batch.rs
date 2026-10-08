@@ -105,9 +105,12 @@ pub(super) struct ImageBatch<'a> {
     pub(super) encodings: Vec<Encoding>,
     /// Conditioning KV exports, resident once the batch commits.
     pub(super) published: Vec<Published>,
-    /// Product exports (encoder features), registered once the batch
-    /// commits.
+    /// Product exports (encoder features, trajectory versions),
+    /// registered once the batch commits.
     pub(super) publications: Publications,
+    /// Trajectory versions exported from the latent pool, released from it
+    /// if the batch fails before committing.
+    pub(super) latent_exports: Vec<BufferId>,
     /// Signals the physical end of the batch's KV accesses.
     pub(super) retirement: Arc<Retirement>,
     /// The batch uses the latent pool on its stream (see
@@ -198,6 +201,7 @@ impl<'a> ImageBatch<'a> {
             encodings: Vec::new(),
             published: Vec::new(),
             publications: Publications::default(),
+            latent_exports: Vec::new(),
             retirement: Arc::new(Retirement::default()),
             latents_entered: false,
             started,
@@ -337,7 +341,7 @@ impl<'a> ImageBatch<'a> {
             for transfer in cancelled {
                 // Released trajectories' pending imports end; their pages
                 // retire with the transfer.
-                crate::transfer::notify(transfer.cancel().1);
+                transfer.read().cancel().map_err(fatal)?;
             }
         }
         let published = std::mem::take(&mut self.published);
@@ -372,6 +376,13 @@ impl<'a> ImageBatch<'a> {
     pub(super) fn discard(&mut self) -> Result<()> {
         let left = self.leave_latents();
         let revoked = self.revoke_conditioning().and(self.publications.revoke());
+        let exported = std::mem::take(&mut self.latent_exports);
+        if !exported.is_empty()
+            && let Ok(latents) = self.runtime.latents()
+        {
+            // The versions retire once their transports drop them.
+            latents.pool.release_exports(&exported);
+        }
         let stream = self.stream.as_ref();
         let reads = std::mem::take(&mut self.reads);
         let completed = self.storage.tensors.complete_reads(&reads, stream, &[]);

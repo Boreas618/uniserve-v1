@@ -13,7 +13,7 @@
 //! them.
 
 use uniserve_cuda::Stream;
-use uniserve_ipc::{BufferId, Call, TensorRef};
+use uniserve_ipc::{BufferId, Call, TensorExport, TensorRef};
 
 use crate::executor::PendingOutput;
 use crate::storage::{ProductBuffer, TensorStore};
@@ -47,9 +47,22 @@ impl Publications {
     ) -> Result<()> {
         let (export, locations) =
             tensors.export_buffer(call, product, write, transports, false, None, stream)?;
+        self.accept(write.id(), locations, export, output)
+    }
+
+    /// Accept an export another owner made of `buffer` (a latent version,
+    /// say): its `locations` register with the batch's products and its
+    /// descriptor joins the call's completion products.
+    pub(crate) fn accept(
+        &mut self,
+        buffer: BufferId,
+        locations: Vec<Location>,
+        export: TensorExport,
+        output: &mut PendingOutput,
+    ) -> Result<()> {
         // Record the locations before the descriptor is accepted, so a
         // failure from here on revokes them with the batch.
-        self.exports.push((write.id(), locations));
+        self.exports.push((buffer, locations));
         let mut products = output.products().to_vec();
         products.push(export);
         output.set_products(products)
