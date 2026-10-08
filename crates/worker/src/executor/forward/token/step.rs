@@ -31,8 +31,11 @@ pub(super) struct PromptScore {
     span: (usize, usize),
     /// Offset of the chunk's first token in the invocation.
     token: usize,
-    /// The slot's retained logits predict the chunk's first token.
-    continued: bool,
+    /// What predicts the chunk's first token: nothing (0), the slot's
+    /// retained logits (1), or candidate row `continued - 2` (the vision
+    /// block before it). A chunk of no candidate rows only retains the
+    /// logits of its row.
+    continued: i64,
     slot: usize,
     /// Row of the binding's tail column receiving the chunk's last logits.
     pub(super) tail: usize,
@@ -70,7 +73,7 @@ impl PromptScore {
             self.span.0 as i64,
             self.span.1 as i64,
             self.token as i64,
-            i64::from(self.continued),
+            self.continued,
             self.slot as i64,
             self.words as i64,
             self.tail as i64,
@@ -106,6 +109,8 @@ impl TokenBatch<'_> {
         let mut rows: Vec<TokenRow> = Vec::with_capacity(active.len());
         // Each call's last row, from which it samples.
         let mut last_rows: Vec<Option<usize>> = vec![None; plan.calls.len()];
+        // Each image prompt's rows: first and count.
+        let mut call_rows: Vec<(usize, usize)> = vec![(0, 0); plan.calls.len()];
         let mut embeddings: Vec<Embeddings> = Vec::new();
         let mut conditions: Vec<ConditionRow> = Vec::new();
         let mut reads = Vec::new();
@@ -122,11 +127,9 @@ impl TokenBatch<'_> {
                 .unwrap_or_default();
             let state = &mut self.calls[index];
             let prepared = if call.writes_context() || call.writes_visual_state() {
-                if admitted.prompt_logprobs_requested() {
-                    return Err(Error::Unsupported(
-                        "prompt scoring of image prompts is not served".into(),
-                    ));
-                }
+                // A context prefill scores its prompt text; a visual-state
+                // row has no prompt tokens.
+                let scores = call.writes_context() && admitted.prompt_logprobs_requested();
                 let sources = Sources {
                     tensors: &self.storage.tensors,
                     image: self.image.as_deref(),
@@ -144,6 +147,7 @@ impl TokenBatch<'_> {
                         slot,
                         &forward_rows[index],
                         &plan.forward,
+                        scores,
                     )?
                 } else {
                     context::visual(&sources, call, &state.output, slot)?
@@ -151,7 +155,7 @@ impl TokenBatch<'_> {
                 Prepared {
                     row,
                     media: Some(media),
-                    scores: false,
+                    scores,
                     drafts: Vec::new(),
                     tagged: false,
                 }
@@ -179,6 +183,7 @@ impl TokenBatch<'_> {
                                 values: values.clone(),
                             });
                         }
+                        call_rows[index] = (rows.len(), media.rows.len() + 1);
                         rows.extend(media.rows.iter().cloned());
                         last_rows[index] = Some(rows.len());
                         rows.push(prepared.row.clone());
@@ -211,7 +216,9 @@ impl TokenBatch<'_> {
         let dimensions = self.runtime.runners[self.runner].dimensions();
         let mut metadata = Vec::new();
         let mut greedy = self.mode == ForwardMode::Decode;
-        let mut prompts: Vec<(usize, (usize, usize), usize, bool)> = Vec::new();
+        // Prompt chunks: call, candidate rows, first token and what
+        // predicts the first token (see `PromptScore::continued`).
+        let mut prompts: Vec<(usize, (usize, usize), usize, i64)> = Vec::new();
         for &index in &active {
             let call = &plan.calls[index];
             let state = &mut self.calls[index];
@@ -252,7 +259,10 @@ impl TokenBatch<'_> {
             } else {
                 first + count.saturating_sub(1)
             };
-            if call.code == CallKind::Forward(ForwardMode::Prefill) && prepared.scores {
+            if call.code == CallKind::Forward(ForwardMode::Prefill)
+                && prepared.scores
+                && prepared.media.is_none()
+            {
                 let continued = start > 0;
                 if continued && !state.output.progress.prompt_logits_ready {
                     return Err(Error::Invalid(
@@ -260,10 +270,40 @@ impl TokenBatch<'_> {
                     ));
                 }
                 let token = rows[..position].iter().map(|row| row.query as usize).sum();
-                prompts.push((index, (first, count), token, continued));
+                prompts.push((index, (first, count), token, i64::from(continued)));
             }
             state.task = Some(metadata.len());
             metadata.push((index, controls, draws, row, prepared.tagged));
+        }
+        // An image prompt scores each prompt run; a run after a vision block
+        // continues from the block's last logits, and a prompt ending with a
+        // block retains its logits for the next chunk.
+        for &index in &active {
+            let state = &self.calls[index];
+            let Some(prepared) = &state.prepared else {
+                continue;
+            };
+            if !prepared.scores || prepared.media.is_none() {
+                continue;
+            }
+            let start = state.output.progress.logical_position;
+            if start > 0 && !state.output.progress.prompt_logits_ready {
+                return Err(Error::Invalid(
+                    "continued prompt scoring has no preceding logits".into(),
+                ));
+            }
+            let mut previous = i64::from(start > 0);
+            let (first_row, count) = call_rows[index];
+            for row in first_row..first_row + count {
+                let (first, candidates) = layout[row];
+                if rows[row].causal {
+                    let token = rows[..row].iter().map(|row| row.query as usize).sum();
+                    prompts.push((index, (first, candidates), token, previous));
+                } else if row + 1 == first_row + count {
+                    prompts.push((index, (first + candidates - 1, 0), 0, 0));
+                }
+                previous = 2 + (first + candidates - 1) as i64;
+            }
         }
         let tasks: Vec<SampleTask<'_>> = metadata
             .iter()
@@ -314,7 +354,7 @@ impl TokenBatch<'_> {
                 vocab,
             );
             // A first chunk has no prediction for its first token.
-            let scored = span.1 - usize::from(!continued);
+            let scored = span.1.saturating_sub(usize::from(continued == 0));
             let score = PromptScore {
                 span,
                 token,
@@ -333,7 +373,7 @@ impl TokenBatch<'_> {
             };
             score.record(&mut prompt_words, top, &ids);
             cursor += score.size;
-            self.calls[index].prompt = Some(score);
+            self.calls[index].prompt.push(score);
         }
         if cursor > dimensions.logprob_words() {
             return Err(Error::Resource(
