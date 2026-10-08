@@ -19,6 +19,8 @@ use uniserve_ipc::{
 };
 
 use super::forward;
+use super::forward::batch::MediaBatch;
+use super::forward::video::{Parts, VideoRuntime};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
@@ -28,6 +30,7 @@ use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
 use crate::service::ServiceBackend;
+use crate::worker::RankStorage;
 use crate::{Error, Result};
 
 /// Serving-time kernel reporting: a cheap counter tells when any provider
@@ -45,6 +48,10 @@ pub struct WorkerBackend {
     info: WorkerInfo,
     rank: usize,
     requests: RequestPool,
+    /// The rank's storage owners: events, transports, products and KV.
+    rank_storage: Option<RankStorage>,
+    /// The video runtime of a video model's rank.
+    video: Option<VideoRuntime>,
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
     profiler: Option<Profiler>,
@@ -57,6 +64,8 @@ pub struct WorkerBatch {
     /// The accepted state call each call follows, by call.
     predecessors: Vec<Option<CallId>>,
     retirement: Retirement,
+    /// A media batch's inputs, calls and completion.
+    media: Option<MediaBatch>,
     output: Option<BatchResult>,
 }
 
@@ -67,8 +76,14 @@ impl WorkerBatch {
             plan,
             predecessors: Vec::new(),
             retirement,
+            media: None,
             output: None,
         }
+    }
+
+    /// The batch's plan and media state, borrowed apart.
+    pub(crate) fn media_parts(&mut self) -> (&BatchPlan, &mut Option<MediaBatch>) {
+        (&self.plan, &mut self.media)
     }
 
     pub fn plan(&self) -> &BatchPlan {
@@ -109,6 +124,8 @@ impl WorkerBackend {
             requests: RequestPool::new(info.request_slots as usize)?,
             info,
             rank,
+            rank_storage: None,
+            video: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -139,6 +156,61 @@ impl WorkerBackend {
     /// Register a storage owner taking part in request lifecycles.
     pub fn add_storage(&mut self, storage: Box<dyn RequestStorage>) {
         self.storage.push(storage);
+    }
+
+    /// Install the rank's storage owners.
+    pub fn set_rank_storage(&mut self, storage: RankStorage) {
+        self.rank_storage = Some(storage);
+    }
+
+    pub fn rank_storage(&self) -> Option<&RankStorage> {
+        self.rank_storage.as_ref()
+    }
+
+    /// Install the video runtime of a video model's rank.
+    pub(crate) fn set_video(&mut self, video: VideoRuntime) {
+        self.video = Some(video);
+    }
+
+    pub(crate) fn video_mut(&mut self) -> Option<&mut VideoRuntime> {
+        self.video.as_mut()
+    }
+
+    /// The parts a media batch executes with.
+    pub(crate) fn media_parts(&mut self) -> Result<Parts<'_>> {
+        Ok(Parts {
+            requests: &mut self.requests,
+            storage: self
+                .rank_storage
+                .as_ref()
+                .ok_or_else(|| Error::Invariant("the rank has no storage owners".into()))?,
+            video: self.video.as_mut().ok_or_else(|| {
+                Error::Unsupported("video calls are served by the video runtime".into())
+            })?,
+            info: &self.info,
+        })
+    }
+
+    /// Every storage owner taking part in request lifecycles, rank storage
+    /// first.
+    fn owners<'a>(
+        rank_storage: &'a mut Option<RankStorage>,
+        video: &'a mut Option<VideoRuntime>,
+        storage: &'a mut [Box<dyn RequestStorage>],
+    ) -> Vec<&'a mut dyn RequestStorage> {
+        let mut owners: Vec<&mut dyn RequestStorage> = Vec::new();
+        if let Some(rank) = rank_storage.as_mut() {
+            owners.push(rank);
+        }
+        if let Some(video) = video.as_mut() {
+            owners.push(video);
+        }
+        owners.extend(
+            storage
+                .iter_mut()
+                .map(|owner| owner.as_mut() as &mut dyn RequestStorage),
+        );
+        owners
     }
 
     pub fn set_profiler(&mut self, profiler: Option<Profiler>) {
@@ -174,23 +246,30 @@ impl WorkerBackend {
     /// Install every Start, then follow each call's predecessor.
     fn admit_requests(&mut self, batch: &mut WorkerBatch) -> Result<()> {
         let mut admitted = Vec::new();
+        let mut installed = Vec::new();
         let started = (|| -> Result<()> {
             for command in &batch.plan.commands {
                 if let BatchCommand::Start { request } = command
                     && let Some(slot) = self.requests.start(request.as_ref().clone())?
                 {
                     admitted.push(slot);
+                    installed.push(request.as_ref().clone());
                 }
             }
             Ok(())
         })();
         // Reset every admitted slot even when a later Start failed.
         if !admitted.is_empty() {
-            for owner in &mut self.storage {
+            for owner in Self::owners(&mut self.rank_storage, &mut self.video, &mut self.storage) {
                 owner.admit_slots(&admitted)?;
             }
         }
         started?;
+        if let Some(video) = &mut self.video {
+            for request in &installed {
+                video.admit(request)?;
+            }
+        }
 
         batch.predecessors = batch
             .plan
@@ -300,17 +379,30 @@ impl WorkerBackend {
     /// Install (or clear) the service's completion wake on every storage
     /// owner.
     pub fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
+        if let Some(rank) = &self.rank_storage {
+            rank.set_wake(wake.clone());
+        }
+        if let Some(video) = &self.video {
+            video.set_wake(wake.clone());
+        }
         for owner in &self.storage {
             owner.set_wake(wake.clone());
         }
     }
 
     /// Close every storage owner, newest first, after the executor drained;
-    /// returns the first failure.
+    /// returns the first failure. The video runtime closes before the rank
+    /// storage its products live in.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
+        }
+        if let Some(mut video) = self.video.take() {
+            result = result.and(video.close(aborted));
+        }
+        if let Some(mut rank) = self.rank_storage.take() {
+            result = result.and(rank.close(aborted));
         }
         result
     }
@@ -357,7 +449,8 @@ impl Backend for WorkerBackend {
     fn admit(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
         // Explicit revocation must not wait behind an allocation-dependent
         // batch; existing readers retain their leases.
-        batch.retirement.admit(&mut self.storage)?;
+        let mut owners = Self::owners(&mut self.rank_storage, &mut self.video, &mut self.storage);
+        batch.retirement.admit(&mut owners)?;
         Ok(())
     }
 
@@ -375,19 +468,25 @@ impl Backend for WorkerBackend {
 
     fn prepare_inputs(
         &mut self,
-        _batch: &mut WorkerBatch,
+        batch: &mut WorkerBatch,
         _submission: &Arc<Submission>,
     ) -> std::result::Result<bool, WorkerError> {
-        // Lifecycle batches read no inputs; a capability runtime's inputs
-        // are prepared when it executes the batch.
-        Ok(true)
+        // Media batches import their products before executing; lifecycle
+        // batches read no inputs.
+        if !forward::media_route(batch.route(), self.video.is_some()) {
+            return Ok(true);
+        }
+        let (plan, media) = batch.media_parts();
+        let mut parts = self.media_parts()?;
+        Ok(forward::video::prepare_inputs(&mut parts, plan, media)?)
     }
 
     fn await_inputs(
         &mut self,
-        _batch: &mut WorkerBatch,
-        _submission: &Arc<Submission>,
+        batch: &mut WorkerBatch,
+        submission: &Arc<Submission>,
     ) -> std::result::Result<(), WorkerError> {
+        forward::video::await_inputs(&batch.media, submission);
         Ok(())
     }
 
@@ -421,18 +520,29 @@ impl Backend for WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<(), WorkerError> {
-        batch.retirement.begin(&self.requests, &mut self.storage)?;
+        let mut owners = Self::owners(&mut self.rank_storage, &mut self.video, &mut self.storage);
+        batch.retirement.begin(&self.requests, &mut owners)?;
         Ok(())
     }
 
     fn poll(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(bool, bool), WorkerError> {
-        if batch.output.is_none() {
-            return Ok((false, false));
+        let mut advanced = false;
+        if batch.output.is_none()
+            && let Some(media) = &mut batch.media
+        {
+            let parts = self.media_parts()?;
+            let owners = parts.owners()?;
+            if let Some(result) = media.poll(&batch.plan, owners, parts.requests)? {
+                batch.output = Some(result);
+                advanced = true;
+            }
         }
-        let retired = batch
-            .retirement
-            .poll(&mut self.requests, &mut self.storage)?;
-        Ok((retired, retired))
+        if batch.output.is_none() {
+            return Ok((advanced, false));
+        }
+        let mut owners = Self::owners(&mut self.rank_storage, &mut self.video, &mut self.storage);
+        let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
+        Ok((retired || advanced, retired))
     }
 
     fn result(&mut self, batch: &mut WorkerBatch) -> std::result::Result<BatchResult, WorkerError> {
@@ -446,15 +556,20 @@ impl Backend for WorkerBackend {
         })
     }
 
-    fn close(&mut self, _batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
+    fn close(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
         // Calls become pending only when a capability runtime commits them,
         // and that runtime cancels what it committed. Lifecycle commands
         // hold no resource beyond their retirement.
+        if let Some(media) = &mut batch.media {
+            let parts = self.media_parts()?;
+            let owners = parts.owners()?;
+            media.close(owners, parts.requests)?;
+        }
         Ok(())
     }
 
     fn reap(&mut self) -> std::result::Result<(), WorkerError> {
-        for owner in &mut self.storage {
+        for owner in Self::owners(&mut self.rank_storage, &mut self.video, &mut self.storage) {
             owner.reap()?;
         }
         Ok(())
@@ -516,8 +631,10 @@ impl ServiceBackend for WorkerBackend {
 
     fn awaiting_acknowledgment(&self) -> std::result::Result<bool, WorkerError> {
         Ok(self
-            .storage
+            .rank_storage
             .iter()
+            .map(|owner| owner as &dyn RequestStorage)
+            .chain(self.storage.iter().map(|owner| owner.as_ref()))
             .any(|owner| owner.awaiting_acknowledgment()))
     }
 

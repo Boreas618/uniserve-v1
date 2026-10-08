@@ -7,6 +7,7 @@
 pub mod checks;
 pub mod device;
 pub mod plan;
+pub(crate) mod video;
 
 use crate::{Error, Result};
 

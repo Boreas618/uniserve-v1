@@ -9,7 +9,7 @@
 //!
 //! | kind | module | calls |
 //! | --- | --- | --- |
-//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `prepare_resident`; packed: `encode_packed`, `capture_packed`, `release` |
+//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `encode_patches`, `prepare_resident`; packed: `encode_packed`, `capture_packed`, `release` |
 //! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident` |
 //! | [`EncoderInfo::Text`] | `TextEncoder` | `text_positions`, `encode_text`, `capture_text`, `release` |
 //!
@@ -419,6 +419,7 @@ struct PackedVision {
 enum Steps {
     Vision {
         encode: Function,
+        patches: Function,
         prepare_resident: Function,
         packed: Option<(Function, Function)>,
     },
@@ -597,6 +598,7 @@ impl EncoderRunner {
                 (
                     Steps::Vision {
                         encode: functions.get("encode")?,
+                        patches: functions.get("encode_patches")?,
                         prepare_resident: functions.get("prepare_resident")?,
                         packed: packed_steps,
                     },
@@ -792,6 +794,63 @@ impl EncoderRunner {
             offset += slots;
         }
         Ok(())
+    }
+
+    /// Encode vision blocks whose patch rows are already packed, such as a
+    /// media reader's `vision_pixels` product.
+    ///
+    /// `rows` holds every block's patch rows back to back, in block order;
+    /// `grids` holds each block's `(time, height, width)` patch grid, whose
+    /// product is the block's row count. Block `i`'s features are written
+    /// into `out[i]`. Each block is one sample of one numerical call, so a
+    /// block's features do not depend on the other blocks. Returns each
+    /// block's feature shape.
+    pub fn encode_patches(
+        &mut self,
+        rows: &Region,
+        grids: &[[u32; 3]],
+        out: &[Region],
+    ) -> Result<Encoded> {
+        let Steps::Vision { patches, .. } = &self.steps else {
+            return Err(Error::Invalid(format!(
+                "{} encodes no vision blocks",
+                self.owner
+            )));
+        };
+        if grids.len() != out.len() {
+            return Err(Error::Invariant(
+                "vision blocks and products must align".into(),
+            ));
+        }
+        let total: u64 = grids
+            .iter()
+            .map(|grid| {
+                grid.iter()
+                    .map(|&extent| u64::from(extent))
+                    .product::<u64>()
+            })
+            .sum();
+        if rows.shape().first().map(|&extent| extent as u64) != Some(total) {
+            return Err(Error::Invalid(
+                "vision patch rows disagree with their blocks' grids".into(),
+            ));
+        }
+        let mut result = Encoded::default();
+        if grids.is_empty() {
+            return Ok(result);
+        }
+        let grid_list = list(
+            grids
+                .iter()
+                .map(|grid| Any::from(integer_list(grid.iter().map(|&extent| i64::from(extent))))),
+        );
+        result.shapes = call_shapes(
+            &patches.clone(),
+            &[rows.to_any(), Any::from(grid_list), region_list(out.iter())],
+            grids.len(),
+        )?;
+        result.record(GraphMode::Eager);
+        Ok(result)
     }
 
     /// Encode one prompt of `tokens` ids into `out`.

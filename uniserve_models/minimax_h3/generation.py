@@ -183,7 +183,7 @@ def generate(
                 (conditioning,),
             )
             runner.step(inputs, schedules, state=request)
-        group = denoiser._sequence_group()
+        group = denoiser.sequence_group()
         latents = {
             name: _gather(
                 samples[name],
