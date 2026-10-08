@@ -464,9 +464,7 @@ fn now() -> f64 {
 
 /// Maps a model dtype to the IPC dtype of worker latents; `None` maps to
 /// `None`.
-fn worker_float_dtype(
-    value: Option<uniserve_core::ModelDtype>,
-) -> Option<uniserve_ipc::DType> {
+fn worker_float_dtype(value: Option<uniserve_core::ModelDtype>) -> Option<uniserve_ipc::DType> {
     match value {
         Some(uniserve_core::ModelDtype::Float16) => Some(uniserve_ipc::DType::F16),
         Some(uniserve_core::ModelDtype::BFloat16) => Some(uniserve_ipc::DType::BF16),

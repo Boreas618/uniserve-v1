@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use uniserve_core::{CallId, RequestId};
-use uniserve_worker::{BufferPool, Error, Result};
 use uniserve_ipc::{BufferAllocation, BufferId, RequestKey};
+use uniserve_worker::{BufferPool, Error, Result};
 
 fn allocation(output_index: u16, offset: u64, bytes: u64) -> BufferAllocation {
     BufferAllocation {

@@ -180,10 +180,7 @@ fn events(mut receiver: EventRx) -> Vec<EngineCoreOutput> {
 }
 
 /// The calls of one request in submission order.
-fn calls_of(
-    batches: &[ExecutionBatch],
-    request: u64,
-) -> Vec<(Call, uniserve_ipc::ForwardBatch)> {
+fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, uniserve_ipc::ForwardBatch)> {
     batches
         .iter()
         .flat_map(|batch| &batch.requests)

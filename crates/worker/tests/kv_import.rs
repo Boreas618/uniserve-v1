@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use uniserve_core::{CallId, RequestId};
+use uniserve_ipc::{BufferId, RequestKey};
 use uniserve_worker::{
     Completion, Error, HostLane, ImportBackend, ImportCopy, KVImport, KVImporter, Outcome,
 };
-use uniserve_ipc::{BufferId, RequestKey};
 
 type Read = Arc<Completion<String, ()>>;
 type Import = KVImport<Read, ()>;

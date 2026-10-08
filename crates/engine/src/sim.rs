@@ -325,9 +325,7 @@ impl Executor for SimExecutor {
             // skipped, as `logical_result` assigns them.
             let command = commands
                 .iter()
-                .filter(|command| {
-                    !matches!(command, uniserve_ipc::BatchCommand::Start { .. })
-                })
+                .filter(|command| !matches!(command, uniserve_ipc::BatchCommand::Start { .. }))
                 .nth(receipt.command_index as usize)
                 .expect("logical command has its registered payload");
             use uniserve_ipc::BatchCommand;

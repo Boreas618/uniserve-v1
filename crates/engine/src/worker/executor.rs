@@ -1239,9 +1239,7 @@ impl WorkerExecutor {
             let failed = report
                 .results
                 .iter()
-                .filter(|completion| {
-                    completion.output.status == uniserve_ipc::CallStatus::Error
-                })
+                .filter(|completion| completion.output.status == uniserve_ipc::CallStatus::Error)
                 .map(|completion| {
                     (
                         completion.output.request_key,

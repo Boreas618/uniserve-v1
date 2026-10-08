@@ -6,6 +6,7 @@ mod buffer;
 mod host_buffers;
 mod kv_cache;
 mod latent;
+pub mod memory;
 mod output;
 pub mod tensor;
 
