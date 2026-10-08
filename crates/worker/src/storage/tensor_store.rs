@@ -1846,17 +1846,23 @@ impl TensorStore {
         lock(write).retain_transfer(ReadRef::new(read))
     }
 
+    /// Check that `buffer` registers no export locations other than
+    /// `locations`.
+    pub fn validate_exports(&self, buffer: BufferId, locations: &[Location]) -> Result<()> {
+        match lock(&self.exports).get(&buffer) {
+            Some(existing) if !same_locations(existing, locations) => Err(Error::Invalid(
+                "buffer already has different export locations".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Record a committed product's export locations, revoked when the
     /// buffer is released. A buffer keeps one set of locations.
     pub fn register_exports(&self, buffer: BufferId, locations: Vec<Location>) -> Result<()> {
         let mut exports = lock(&self.exports);
         if let Some(existing) = exports.get(&buffer) {
-            let same = existing.len() == locations.len()
-                && existing
-                    .iter()
-                    .zip(&locations)
-                    .all(|(left, right)| left.1 == right.1);
-            if !same {
+            if !same_locations(existing, &locations) {
                 return Err(Error::Invalid(
                     "buffer already has different export locations".into(),
                 ));
@@ -2044,6 +2050,16 @@ impl TensorStore {
         ))
     }
 
+    /// Revoke every registered export location (shutdown); the transports
+    /// retire them once their readers finished.
+    pub fn revoke_exports(&self) -> Result<()> {
+        let revoked: Vec<_> = lock(&self.exports)
+            .drain()
+            .flat_map(|(_, locations)| locations)
+            .collect();
+        exports::release(&revoked)
+    }
+
     /// Forget every product after physical accesses drained. Existing reads
     /// retain their views.
     pub fn close(&self) {
@@ -2086,6 +2102,14 @@ fn create_buffer(
             storage,
         }),
     }))
+}
+
+fn same_locations(left: &[Location], right: &[Location]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.1 == right.1)
 }
 
 fn import_read(imported: &ImportHandle) -> Arc<ProductRead> {
