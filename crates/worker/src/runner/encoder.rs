@@ -58,7 +58,7 @@ use crate::config::Device;
 use crate::ffi::{
     Backing, DType, Fields, Function, Functions, Handle, Record, Region, integer_list, list,
 };
-use crate::model::bind::ComponentBinding;
+use crate::model::bind::{ComponentBinding, TextSize};
 use crate::model::interface::Interface;
 use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
@@ -178,6 +178,8 @@ pub struct VisionEncoder {
     pub output_dtype: DType,
     /// Patch rows of one packed slot; `None` for an unpacked encoder.
     pub max_patches: Option<u32>,
+    /// Patch rows of the largest image the image policy admits.
+    pub image_patches: u32,
     /// Values per packed patch row.
     pub row_width: u32,
     /// The image policy's pixel dtype.
@@ -220,23 +222,58 @@ pub enum EncoderInfo {
 }
 
 impl EncoderInfo {
-    /// Describe the encoder at `path` within a bound component.
+    /// Describe the encoder at module `path` of the loaded model, before
+    /// its component is bound. `dtype` is the deployment's model dtype.
     pub fn describe(
         interface: &Interface,
-        binding: &ComponentBinding,
         loaded: &Handle,
         path: &str,
+        dtype: DType,
     ) -> Result<Self> {
         let function = interface.function("encoder.describe")?;
         let record = Record::new(
             function.name(),
             function.call_values(&[
-                binding.prepared().to_any(),
                 loaded.to_any(),
                 Any::from(tvm_ffi::String::from(path)),
+                Any::from(tvm_ffi::String::from(dtype.name())),
             ])?,
         )?;
         Self::from_record(&record)
+    }
+
+    /// The text size the encoder's component binding prepares its
+    /// operators for: the most rows one numerical call passes through its
+    /// projections. A latent encoder's convolutions need none.
+    pub fn binding_size(&self, config: &EncoderConfig) -> Option<TextSize> {
+        match self {
+            Self::Vision(vision) => Some(match vision.max_patches {
+                Some(max_patches) => {
+                    // Every packed slot is two segments: its image and its
+                    // padding.
+                    let slots = packed_capacity(config.max_images);
+                    TextSize {
+                        tokens: slots * max_patches as usize,
+                        rows: 2 * slots,
+                    }
+                }
+                None => TextSize {
+                    tokens: unpacked_rows(vision, config),
+                    rows: config.max_images.max(1),
+                },
+            }),
+            Self::Latent(_) => None,
+            Self::Text(_) => Some(TextSize {
+                tokens: config
+                    .text_capacities
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(config.max_text_tokens)
+                    .max(1),
+                rows: 1,
+            }),
+        }
     }
 
     fn from_record(record: &Record) -> Result<Self> {
@@ -268,6 +305,7 @@ impl EncoderInfo {
                     output_size: extent("output_size")?,
                     output_dtype: dtype("output_dtype")?,
                     max_patches: (max_patches > 0).then_some(max_patches),
+                    image_patches: extent("image_patches")?,
                     row_width: extent("row_width")?,
                     pixel_dtype: dtype("pixel_dtype")?,
                 })
@@ -337,6 +375,31 @@ pub fn packed_grids(
     Ok(grids)
 }
 
+/// Packed vision slots of one numerical call.
+fn packed_capacity(max_images: usize) -> usize {
+    max_images.clamp(1, MAX_PACKED_IMAGES)
+}
+
+/// Patch rows one unpacked vision call passes: the largest admitted image,
+/// or the configured row budget when larger.
+fn unpacked_rows(vision: &VisionEncoder, config: &EncoderConfig) -> usize {
+    (vision.image_patches as usize)
+        .max(config.row_budget)
+        .max(1)
+}
+
+/// Patch rows an image passes through a vision encoder: its packed rows,
+/// or its pixels' patches.
+fn image_rows(image: &PreparedImage, patch_size: u32) -> usize {
+    match image.shape[..] {
+        [rows, _] => rows as usize,
+        [_, height, width] => {
+            (height as usize / patch_size as usize) * (width as usize / patch_size as usize)
+        }
+        _ => 0,
+    }
+}
+
 /// The text capacity a prompt of `tokens` is encoded at: the smallest
 /// configured capacity holding it, or the prompt's own length without
 /// configured capacities.
@@ -371,6 +434,10 @@ pub struct PromptVision<'a> {
 pub struct EncoderConfig {
     /// Images one batch may carry (`max_batch_calls`).
     pub max_images: usize,
+    /// Patch rows one unpacked vision call may pass beside the largest
+    /// image (`max_batch_tokens`); larger groups of one pixel shape encode
+    /// in consecutive calls.
+    pub row_budget: usize,
     /// Configured text capacities, ascending; empty for exact lengths.
     pub text_capacities: Vec<usize>,
     /// The longest admitted prompt.
@@ -448,6 +515,7 @@ pub struct EncoderRunner {
     /// The text token column `[max capacity]` int64.
     tokens: Option<StorageView>,
     text_capacities: Vec<usize>,
+    config: EncoderConfig,
     graphs: Option<GraphTable<EncoderGraph>>,
     /// Releases a captured graph the storage check refused.
     release: Option<Function>,
@@ -467,14 +535,21 @@ fn allocate(device: Device, dtype: DType, shape: &[i64]) -> Result<StorageView> 
 }
 
 impl EncoderRunner {
-    /// Describe the encoder at `path` of `binding`, allocate its buffers and
-    /// bind them. `products` is the binding device's product arena (a
-    /// `uint8` view); `stream` borrows the binding's stream.
+    /// Allocate the buffers of the encoder `info` describes and bind them
+    /// to the encoder at `path` of `binding` (relative to the binding's
+    /// root, which was prepared for [`EncoderInfo::binding_size`]).
+    /// `products` is the binding device's product arena (a `uint8` view);
+    /// `stream` borrows the binding's stream.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the binding's complete resources"
+    )]
     pub fn bind(
         interface: &Interface,
         binding: &ComponentBinding,
         loaded: &Handle,
         path: &str,
+        info: EncoderInfo,
         config: &EncoderConfig,
         products: StorageView,
         stream: Option<Stream>,
@@ -484,7 +559,6 @@ impl EncoderRunner {
         } else {
             format!("{}.{path}", binding.component)
         };
-        let info = EncoderInfo::describe(interface, binding, loaded, path)?;
         let device = binding.device;
         if products.dtype() != DType::U8 || products.shape().len() != 1 {
             return Err(Error::Invariant(
@@ -505,7 +579,7 @@ impl EncoderRunner {
                 if let (Some(max_patches), Some(slot_tokens)) =
                     (vision.max_patches, vision.slot_tokens())
                 {
-                    let capacity = config.max_images.clamp(1, MAX_PACKED_IMAGES) as i64;
+                    let capacity = packed_capacity(config.max_images) as i64;
                     let pixels = allocate(
                         device,
                         vision.pixel_dtype,
@@ -638,6 +712,7 @@ impl EncoderRunner {
             packed,
             tokens,
             text_capacities,
+            config: config.clone(),
             capturing: false,
             _buffers: buffers.into_iter().map(|(_, view)| view).collect(),
         })
@@ -717,7 +792,23 @@ impl EncoderRunner {
             } => self.encode_packed(images, out, &mut result)?,
             Steps::Vision { encode, .. } | Steps::Latent { encode, .. } => {
                 let encode = encode.clone();
-                for group in shape_groups(images) {
+                let groups = match self.info {
+                    EncoderInfo::Vision(vision) => {
+                        // Each call stays within the rows its projections
+                        // were prepared for.
+                        let budget = unpacked_rows(&vision, &self.config);
+                        shape_groups(images)
+                            .into_iter()
+                            .flat_map(|group| {
+                                chunk_rows(group, budget, |index| {
+                                    image_rows(images[index], vision.patch_size)
+                                })
+                            })
+                            .collect()
+                    }
+                    _ => shape_groups(images),
+                };
+                for group in groups {
                     let shapes = call_shapes(
                         &encode,
                         &[
@@ -1002,6 +1093,27 @@ impl EncoderRunner {
     }
 }
 
+/// Split a group into consecutive chunks of at most `budget` rows (a
+/// larger member takes a chunk of its own).
+fn chunk_rows(group: Vec<usize>, budget: usize, rows: impl Fn(usize) -> usize) -> Vec<Vec<usize>> {
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    let mut used = 0;
+    for index in group {
+        let count = rows(index);
+        match chunks.last_mut() {
+            Some(chunk) if used + count <= budget => {
+                chunk.push(index);
+                used += count;
+            }
+            _ => {
+                chunks.push(vec![index]);
+                used = count;
+            }
+        }
+    }
+    chunks
+}
+
 /// Image indices grouped by exact pixel shape, groups in first-appearance
 /// order.
 fn shape_groups(images: &[&PreparedImage]) -> Vec<Vec<usize>> {
@@ -1087,6 +1199,13 @@ mod tests {
     }
 
     #[test]
+    fn groups_split_into_chunks_within_their_row_budget() {
+        let rows = [3, 4, 2, 9, 1];
+        let chunks = chunk_rows(vec![0, 1, 2, 3, 4], 6, |index| rows[index]);
+        assert_eq!(chunks, vec![vec![0], vec![1, 2], vec![3], vec![4]]);
+    }
+
+    #[test]
     fn unpacked_images_group_by_pixel_shape_in_appearance_order() {
         let image = |shape: &[i64]| PreparedImage {
             value: Handle::new(Any::default()),
@@ -1113,13 +1232,28 @@ mod tests {
             .with("output_size", 32_i64)
             .text("output_dtype", "bfloat16")
             .with("max_patches", 2520_i64)
+            .with("image_patches", 2520_i64)
             .with("row_width", 768_i64)
             .text("pixel_dtype", "float32");
-        let EncoderInfo::Vision(info) = EncoderInfo::from_record(&record(vision)?)? else {
+        let described = EncoderInfo::from_record(&record(vision)?)?;
+        let EncoderInfo::Vision(info) = described else {
             panic!("vision encoder");
         };
         assert_eq!(info.slot_tokens(), Some(280));
         assert_eq!(info.pixel_dtype, DType::F32);
+        // A packed binding covers every slot of its capacity, two segments
+        // per slot.
+        let config = EncoderConfig {
+            max_images: 40,
+            ..EncoderConfig::default()
+        };
+        assert_eq!(
+            described.binding_size(&config),
+            Some(TextSize {
+                tokens: 16 * 2520,
+                rows: 32,
+            })
+        );
 
         let unaligned = Fields::new()
             .text("kind", "vision")
@@ -1128,6 +1262,7 @@ mod tests {
             .with("output_size", 32_i64)
             .text("output_dtype", "bfloat16")
             .with("max_patches", 100_i64)
+            .with("image_patches", 100_i64)
             .with("row_width", 768_i64)
             .text("pixel_dtype", "float32");
         assert!(EncoderInfo::from_record(&record(unaligned)?).is_err());

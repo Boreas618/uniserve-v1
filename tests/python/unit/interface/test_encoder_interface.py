@@ -52,7 +52,8 @@ def bound(table, model, component, root, path):
     assert not requirements["workspaces"]
     table["component.bind"](prepared, {"workspaces": {}})
     arena = torch.zeros(ARENA_BYTES, dtype=torch.uint8)
-    info = table["encoder.describe"](prepared, model, path)
+    module = ".".join(part for part in (root, path) if part)
+    info = table["encoder.describe"](model, module, "bfloat16")
     steps = table["encoder.bind"](
         prepared, model, path, tvm_ffi.convert({"products": arena})
     )
