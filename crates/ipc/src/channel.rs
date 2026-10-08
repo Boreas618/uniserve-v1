@@ -11,7 +11,7 @@
 //! The engine's registration refuses any mechanism other than
 //! [`SHARED_STORAGE_CHANNEL`] and [`SOCKET_CHANNEL`], and `PendingRank::adopt`
 //! then connects a [`RankChannel`] to whatever the report named. On the rank
-//! side the PyO3 `Server` in `worker-ipc-py` owns the [`RankServer`].
+//! side the worker runtime's launch endpoint owns the [`RankServer`].
 //!
 //! The two mechanisms differ in ways the enums do not hide: a shared-storage
 //! request can be sent before any server exists (see
@@ -295,8 +295,8 @@ impl RankServer {
     /// A shared-storage endpoint returns `service` unchanged, so the caller
     /// passes the name it bound. A socket endpoint returns its bound address,
     /// whose host is the bind interface and may be a wildcard;
-    /// `uniserve_worker.bootstrap.launch.register_endpoint` keeps its port and
-    /// replaces the host with an address the head can route to.
+    /// the rank's registration keeps its port and replaces the host with the
+    /// address of the interface it reached the head through.
     pub fn endpoint(&self, service: &str) -> String {
         match self {
             Self::Shared(_) => service.to_string(),
