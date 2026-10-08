@@ -226,6 +226,12 @@ impl KVCache {
         &mut self.manager
     }
 
+    /// The block tables and the access manager together, for a batch that
+    /// resolves attention pages while checking writes.
+    pub fn split(&mut self) -> (&BlockTables, &mut KVCacheManager<Arc<Retirement>>) {
+        (&self.tables, &mut self.manager)
+    }
+
     /// Every bound tensor of the cache: the planes and the block tables,
     /// keyed as numerical bindings receive them.
     pub fn views(&self) -> crate::Result<Vec<(String, StorageView)>> {

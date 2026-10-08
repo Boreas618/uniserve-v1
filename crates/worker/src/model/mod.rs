@@ -20,6 +20,7 @@ pub mod bind;
 pub mod components;
 pub mod interface;
 pub mod registry;
+pub mod text;
 
 use std::collections::BTreeMap;
 
