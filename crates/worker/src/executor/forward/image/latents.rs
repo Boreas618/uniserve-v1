@@ -17,9 +17,10 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, Event, EventFlags, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 use uniserve_ipc::LatentParams;
 
+use super::super::launch::StreamOrder;
 use crate::storage::memory::StorageView;
 use crate::storage::{LatentExport, LatentImport, LatentPool, LatentStorage};
 use crate::transfer::Retirement;
@@ -45,39 +46,6 @@ impl Scratch {
 
 pub(crate) type Pool =
     LatentPool<Arc<LatentImport<Arc<Retirement>>>, Arc<LatentExport<Arc<Retirement>>>>;
-
-/// Device order of work sharing storage across streams: the last stream
-/// that used it and an event recorded there.
-#[derive(Default)]
-pub(crate) struct StreamOrder {
-    last: Option<(usize, Event)>,
-}
-
-impl StreamOrder {
-    /// Order `stream` after the last use on another stream.
-    pub(crate) fn wait(&self, stream: Option<&Stream>) -> Result<()> {
-        if let (Some(stream), Some((previous, event))) = (stream, &self.last)
-            && *previous != stream.raw()
-        {
-            stream.wait_event(event)?;
-        }
-        Ok(())
-    }
-
-    /// Record the end of `stream`'s use.
-    pub(crate) fn record(&mut self, stream: Option<&Stream>) -> Result<()> {
-        let Some(stream) = stream else {
-            return Ok(());
-        };
-        let event = match self.last.take() {
-            Some((_, event)) => event,
-            None => Event::new(EventFlags::default()),
-        };
-        event.record(stream)?;
-        self.last = Some((stream.raw(), event));
-        Ok(())
-    }
-}
 
 /// The image latent pool of a rank.
 pub(crate) struct ImageLatents {
