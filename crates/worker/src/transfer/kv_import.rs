@@ -2,14 +2,17 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use uniserve_ipc::{BufferId, RequestKey};
 
 use crate::{Completion, Error, Result};
 
+mod backend;
 mod copy;
 
+pub(crate) use backend::{CacheImporter, ImportTask, KVImportBackend, Retired};
+pub use backend::{ImportEntry, ImportWorkspace};
 pub use copy::{ImportBackend, ImportCopy};
 
 struct ImportState<T, W> {
@@ -23,7 +26,7 @@ struct ImportState<T, W> {
 }
 
 /// One destination held until adoption or abandonment and all physical access
-/// finishes. T borrows a transfer's native retirement; W owns numerical scratch.
+/// finishes. T borrows a read's retirement; W is the import workspace.
 pub struct KVImport<T, W> {
     pub buffer: BufferId,
     pub request_pool_idx: usize,
@@ -92,11 +95,6 @@ impl<T, W> KVImport<T, W> {
         state.cancelled
     }
 
-    pub fn visit<R>(&self, visit: impl FnOnce(&[Arc<T>], Option<&Arc<W>>) -> R) -> R {
-        let state = self.lock();
-        visit(&state.reads, state.workspace.as_ref())
-    }
-
     fn lock(&self) -> MutexGuard<'_, ImportState<T, W>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -108,8 +106,8 @@ struct PoolState<I, W> {
     closed: bool,
 }
 
-/// Share a bounded set of conversion workspaces among native host tasks.
-/// I retains a public import owner and dereferences its stable native state.
+/// Share a bounded set of import workspaces among host tasks.
+/// I retains an import owner and dereferences its stable state.
 pub struct KVImporter<I, W> {
     state: Mutex<PoolState<I, W>>,
     available: Condvar,
@@ -132,18 +130,6 @@ impl<I, W> KVImporter<I, W> {
             return Err(Error::Resource("KV imports still own physical storage"));
         }
         Ok(())
-    }
-
-    pub fn visit<R>(
-        &self,
-        visit: impl FnOnce(&HashMap<BufferId, I>, &VecDeque<Arc<W>>) -> R,
-    ) -> Option<R> {
-        let state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(TryLockError::WouldBlock) => return None,
-        };
-        Some(visit(&state.imports, &state.available))
     }
 
     fn lock(&self) -> MutexGuard<'_, PoolState<I, W>> {

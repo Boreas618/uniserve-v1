@@ -45,9 +45,9 @@ impl Drop for Allocation {
 
 /// Own chunk placement and retirement within one device's exported mapping.
 ///
-/// The numerical backend supplies the mapping and retains its allocation in
-/// `backing`. Reader words are copied on a private stream. Polling observes a
-/// completed snapshot and never waits for device work on the host.
+/// `backing` retains the exportable allocation the pool places chunks in.
+/// Reader words are copied on a private stream. Polling observes a completed
+/// snapshot and never waits for device work on the host.
 pub struct VmmPool<B> {
     backing: Option<B>,
     device: DeviceId,
