@@ -69,7 +69,6 @@ call's capacity, into ``tokens``.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
 from typing import Any, cast
 
 import torch
@@ -78,18 +77,13 @@ from uniserve_models.media.pixels import PreparedImage, prepare_tensor_image
 from uniserve_models.model import PatchEncoder, TextEncoder, VisionInput
 from uniserve_models.nn.vae import PatchAutoencoder
 
-from . import graphs, regions
+from . import calls, graphs, regions
 from .errors import translate
-from .image import describe as describe_image
+from .image import image_facts
 
 
 def functions() -> dict[str, Callable[..., Any]]:
     return {"encoder.describe": describe, "encoder.bind": bind}
-
-
-def _module(prepared, path: str):
-    path = str(path)
-    return prepared.module.get_submodule(path) if path else prepared.module
 
 
 def _kind(module) -> str:
@@ -128,7 +122,7 @@ def describe(prepared, loaded, path: str) -> dict[str, Any]:
     Raises:
         UnsupportedCall: The module has no worker encoder binding.
     """
-    module = _module(prepared, path)
+    module = calls.module(prepared, path)
     kind = _kind(module)
     if kind == "vision":
         encoder = cast(PatchEncoder, module)
@@ -167,34 +161,6 @@ def describe(prepared, loaded, path: str) -> dict[str, Any]:
     }
 
 
-def _tensors(buffers: Mapping[str, Any]) -> dict[str, torch.Tensor]:
-    return {
-        str(name): torch.from_dlpack(value) for name, value in buffers.items()
-    }
-
-
-@contextmanager
-def _call(context):
-    """Run one step on the binding's stream with its bound operators."""
-    with torch.inference_mode(), context.activate():
-        yield
-
-
-def _write(target: torch.Tensor, value: torch.Tensor) -> list[int]:
-    """Copy ``value`` into the leading elements of a product region.
-
-    Converts to the product's dtype on the current stream and returns the
-    value's shape, which the worker publishes as the product's shape.
-    """
-    shape = list(value.shape)
-    if value.numel() > target.numel():
-        raise ValueError("encoder output exceeds its product bound")
-    target.reshape(-1)[: value.numel()].view(value.shape).copy_(
-        value.detach(), non_blocking=True
-    )
-    return shape
-
-
 def bind(
     prepared, loaded, path: str, buffers: Mapping[str, Any]
 ) -> dict[str, Callable[..., Any]]:
@@ -204,9 +170,9 @@ def bind(
         The kind's step functions (see the module documentation), each
         translating its failures into interface error kinds.
     """
-    module = _module(prepared, path)
+    module = calls.module(prepared, path)
     kind = _kind(module)
-    tensors = _tensors(buffers)
+    tensors = calls.tensors(buffers)
     context = prepared.context
     if context is None:
         raise RuntimeError("encoder binding requires a bound component")
@@ -249,7 +215,7 @@ def _resident(loaded, context, products):
         processor = getattr(loaded, "image_processor", None)
         if processor is None:
             raise ValueError("the model declares no image processing")
-        with _call(context):
+        with calls.scope(context):
             prepared = prepare_tensor_image(
                 processor,
                 str(tower),
@@ -257,7 +223,7 @@ def _resident(loaded, context, products):
                 device=context.device,
                 signed_unit=bool(signed_unit),
             )
-        return describe_image(prepared)
+        return image_facts(prepared)
 
     return prepare_resident
 
@@ -269,7 +235,7 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
     def encode(images: Sequence[PreparedImage], out: Sequence) -> list:
         if len(images) != len(out):
             raise ValueError("vision images and products must align")
-        with _call(context):
+        with calls.scope(context):
             features = encoder.encode(
                 VisionInput(
                     tuple(_device_pixels(image, device) for image in images),
@@ -281,7 +247,7 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
                 )
             )
             return [
-                _write(regions.view(products, region), value)
+                calls.write(regions.view(products, region), value)
                 for value, region in zip(features, out, strict=True)
             ]
 
@@ -313,7 +279,7 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
         slots = int(slots)
         if len(images) != len(out) or len(images) > slots:
             raise ValueError("packed images must fit their slots")
-        with _call(context):
+        with calls.scope(context):
             # Image i's rows fill the front of slot i; rows past an image
             # keep earlier finite values, which only padding reads.
             for index, image in enumerate(images):
@@ -338,7 +304,7 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
                 count = height * width // encoder.downsample**2
                 start = index * tokens
                 shapes.append(
-                    _write(
+                    calls.write(
                         regions.view(products, region),
                         features[start : start + count],
                     )
@@ -347,7 +313,7 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
 
     def capture_packed(slots: int, pool) -> graphs.Graph:
         slots = int(slots)
-        with _call(context):
+        with calls.scope(context):
             # Warm eagerly so lazy initialization stays out of the capture.
             run_packed(slots)
         return graphs.capture(
@@ -371,13 +337,13 @@ def _latent(autoencoder: PatchAutoencoder, loaded, context, tensors):
     def encode(images: Sequence[PreparedImage], out: Sequence) -> list:
         if len(images) != len(out):
             raise ValueError("latent images and products must align")
-        with _call(context):
+        with calls.scope(context):
             pixels = torch.stack(
                 tuple(_device_pixels(image, device) for image in images)
             )
             latents = autoencoder.encode(pixels).unbind(0)
             return [
-                _write(regions.view(products, region), value)
+                calls.write(regions.view(products, region), value)
                 for value, region in zip(latents, out, strict=True)
             ]
 
@@ -427,7 +393,7 @@ def _text(encoder: TextEncoder, context, tensors):
         )
         if values.shape != (3, capacity):
             raise ValueError("rotary coordinates must cover the capacity")
-        with _call(context):
+        with calls.scope(context):
             positions[:, :capacity].copy_(values, non_blocking=True)
 
     def encode_text(
@@ -436,7 +402,7 @@ def _text(encoder: TextEncoder, context, tensors):
         capacity, count = int(capacity), int(count)
         if not 0 < count <= capacity <= tokens.numel():
             raise ValueError("text encoder input exceeds its token capacity")
-        with _call(context):
+        with calls.scope(context):
             if graph is not None:
                 graph.replay()
                 if not final["stage"]:
@@ -447,11 +413,11 @@ def _text(encoder: TextEncoder, context, tensors):
                 None if visual is None else regions.view(products, visual),
             ):
                 return []
-            return _write(regions.view(products, out), features[:count])
+            return calls.write(regions.view(products, out), features[:count])
 
     def capture_text(capacity: int, pool) -> graphs.Graph:
         capacity = int(capacity)
-        with _call(context):
+        with calls.scope(context):
             compute(capacity, False, None)
         return graphs.capture(
             lambda: compute(capacity, False, None),
