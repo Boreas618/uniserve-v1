@@ -105,6 +105,10 @@ dynamo-backend-common = { git = "https://github.com/ai-dynamo/dynamo.git", rev =
 iceoryx2 = "0.9.2"
 iceoryx2-bb-elementary-traits = "0.9.2"
 
+# The worker's only interface to Python; must match the apache-tvm-ffi
+# release pinned in pyproject.toml.
+tvm-ffi = "=0.1.14-post1"
+
 # ---- build-time helpers ----
 flatbuffers-build = "0.2.4"
 flatc-fork = "0.6.0"
