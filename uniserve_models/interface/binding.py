@@ -84,8 +84,9 @@ def prepare(loaded, request: Mapping[str, Any]) -> list[Any]:
     declared = DeclaredWorkspace()
     context = ExecutionContext(module, workspace=declared, **options)
     try:
-        if prepared.size is not None:
-            context.prepare(prepared.size)
+        # Without a text size the call sites bind without a row bound, as
+        # encoders, decoders and media denoisers serve their sizes.
+        context.prepare(prepared.size)
         requirements = [
             {
                 "name": item.name,
@@ -126,8 +127,7 @@ def bind(prepared: Prepared, resources: Mapping[str, Any]) -> dict:
     context = ExecutionContext(
         prepared.module, workspace=BoundWorkspace(tensors), **prepared.options
     )
-    if prepared.size is not None:
-        context.prepare(prepared.size)
+    context.prepare(prepared.size)
     prepared.context = context
 
     def kernels() -> list[dict]:
