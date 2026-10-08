@@ -45,6 +45,11 @@ use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
+use crate::executor::forward::image::ImageRuntime;
+use crate::executor::forward::image::start::{
+    Startup as ImageStartup, reserved_bytes as image_reserved_bytes,
+};
+use crate::executor::forward::image::warmup::ImageWarmup;
 use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::token::start::{Startup, TextBounds, reserved_bytes};
 use crate::executor::forward::token::warmup::TextWarmup;
@@ -53,6 +58,7 @@ use crate::ffi::{DType, Handle, Record};
 use crate::launch::Endpoint;
 use crate::model::bind::StreamWorkspaces;
 use crate::model::components::Capability;
+use crate::model::image::ImageModel;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::model::{
@@ -300,12 +306,32 @@ impl Worker {
             preparation,
         })
         .map_err(phase("bind"))?;
+        let image = ImageRuntime::start(ImageStartup {
+            interface: &interface,
+            config: &config,
+            request_slots: info.request_slots as usize,
+            queue_depth: launch.ipc.queue_depth,
+            host_capacity: info.host_lane_capacity as usize,
+            model: &model,
+            lanes: &lanes,
+            storage: &storage,
+            latent: plan.latent,
+            components: &mut components,
+            workspaces: &mut workspaces,
+            graphs: &mut graphs,
+            preparation,
+        })
+        .map_err(phase("bind"))?;
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
         backend.set_rank_storage(storage);
         let text_warmup = text.is_some();
         if let Some(text) = text {
             backend.set_text(text);
+        }
+        let image_warmup = image.is_some();
+        if let Some(image) = image {
+            backend.set_image(image);
         }
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
@@ -333,6 +359,9 @@ impl Worker {
         )
         .map_err(|error| error.with_phase("executor"))?;
         let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
+        if image_warmup {
+            hooks.push(Box::new(ImageWarmup));
+        }
         if text_warmup {
             hooks.push(Box::new(TextWarmup {
                 row_tokens: config
@@ -691,6 +720,9 @@ impl Worker {
         if let Some(text) = executor.backend_mut().text_mut() {
             text.seal();
         }
+        if let Some(image) = executor.backend_mut().image_mut() {
+            image.seal();
+        }
         self.workspaces.seal();
         let choices: i64 = self
             .interface
@@ -1044,6 +1076,18 @@ fn plan(
                 unit_columns,
             )?,
         );
+        // The image runtime's denoiser columns and decoder staging.
+        if facts.image_flow.is_some() {
+            let image = ImageModel::describe(interface, model.handle())?;
+            layout.reserve(
+                &config.device,
+                image_reserved_bytes(
+                    config,
+                    layout.info().request_slots as usize,
+                    image.denoiser.as_ref(),
+                ),
+            );
+        }
         let columns = KVCache::import_workers(import_capacity) + unit_columns;
         layout.fit_cache(&cache, 8 * columns as u64, config, total, &world.host)?;
         Some(Arc::new(cache))

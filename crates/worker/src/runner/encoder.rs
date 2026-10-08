@@ -487,11 +487,13 @@ enum Steps {
     Vision {
         encode: Function,
         prepare_resident: Function,
+        warm: Function,
         packed: Option<(Function, Function)>,
     },
     Latent {
         encode: Function,
         prepare_resident: Function,
+        warm: Function,
     },
     Text {
         positions: Function,
@@ -674,6 +676,7 @@ impl EncoderRunner {
                     Steps::Vision {
                         encode: functions.get("encode")?,
                         prepare_resident: functions.get("prepare_resident")?,
+                        warm: functions.get("warm")?,
                         packed: packed_steps,
                     },
                     release,
@@ -683,6 +686,7 @@ impl EncoderRunner {
                 Steps::Latent {
                     encode: functions.get("encode")?,
                     prepare_resident: functions.get("prepare_resident")?,
+                    warm: functions.get("warm")?,
                 },
                 None,
             ),
@@ -739,6 +743,28 @@ impl EncoderRunner {
     /// Images one packed numerical call encodes; `None` when unpacked.
     pub fn packed_capacity(&self) -> Option<usize> {
         self.packed.as_ref().map(|packed| packed.capacity)
+    }
+
+    /// The identity of the runner's graph pool owner: the address of its
+    /// packed grids, which no other runner shares. `None` when unpacked.
+    pub fn graph_key(&self) -> Option<usize> {
+        self.packed
+            .as_ref()
+            .map(|packed| packed.grids.address() as usize)
+    }
+
+    /// Encode one black `side` x `side` image through the model's input
+    /// transform and discard it: the startup warmup of an unpacked image
+    /// encoder (packed vision encoders warm by capturing). A latent encoder
+    /// sampling its posterior draws from the device's default generator.
+    pub fn warm(&self, side: u32) -> Result<()> {
+        match &self.steps {
+            Steps::Vision { warm, packed, .. } if packed.is_none() => {
+                warm.invoke(&[(&Any::from(i64::from(side))).into()])
+            }
+            Steps::Latent { warm, .. } => warm.invoke(&[(&Any::from(i64::from(side))).into()]),
+            _ => Ok(()),
+        }
     }
 
     /// Prepare a resident image product for this encoder on its stream.

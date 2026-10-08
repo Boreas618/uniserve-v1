@@ -27,6 +27,7 @@ _AREAS = (
     "image",
     "encoder",
     "decoder",
+    "denoiser",
     "memory",
     "kernels",
     "profiling",

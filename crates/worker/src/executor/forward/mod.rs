@@ -13,6 +13,7 @@ pub(crate) mod canvas;
 pub(crate) mod experts;
 pub(crate) mod image;
 pub(crate) mod media;
+pub(crate) mod products;
 pub(crate) mod token;
 pub(crate) mod transfer;
 pub(crate) mod video;
@@ -30,6 +31,7 @@ use crate::model::components::Capability;
 /// A capability runtime's launched batch awaiting materialization.
 pub(crate) enum Running {
     Token(token::Launched),
+    Image(image::Launched),
 }
 
 /// Materialize launched work whose device results are ready.
@@ -40,6 +42,7 @@ pub(crate) fn poll(
 ) -> std::result::Result<Option<BatchResult>, WorkerError> {
     match running {
         Running::Token(launched) => token::poll(backend, plan, launched),
+        Running::Image(launched) => image::poll(backend, plan, launched),
     }
 }
 
@@ -50,6 +53,7 @@ pub(crate) fn abandon(
 ) -> std::result::Result<(), WorkerError> {
     match running {
         Running::Token(launched) => token::abandon(backend, launched),
+        Running::Image(launched) => image::abandon(backend, launched),
     }
 }
 

@@ -165,6 +165,32 @@ impl LatentStorage {
         views
     }
 
+    /// One page of `bank` as `[page_units, width]` units.
+    pub fn page(&self, bank: u8, page: u32) -> Result<StorageView> {
+        if bank > 1 || page == 0 || page >= self.num_pages {
+            return Err(Error::Invalid("latent page is outside the pool".into()));
+        }
+        self.pages
+            .select(0, i64::from(bank))?
+            .select(0, i64::from(page))
+    }
+
+    /// Values per latent unit.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// The per-slot timesteps `[request_pool_size + 1, 1]` float32.
+    pub fn timesteps(&self) -> &StorageView {
+        &self.timesteps
+    }
+
+    /// The contiguous step workspace `[capacity_units, width]`, when
+    /// declared.
+    pub fn step(&self) -> Option<&StorageView> {
+        self.step.as_ref()
+    }
+
     /// Both banks' pages flattened to rows: `[2 * num_pages, page_units * width]`.
     pub fn page_rows(&self) -> Result<StorageView> {
         self.pages.reshape(

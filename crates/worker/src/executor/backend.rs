@@ -50,6 +50,9 @@ pub struct WorkerBackend {
     rank_storage: Option<RankStorage>,
     /// The text runtime, on ranks holding a causal language model.
     text: Option<forward::token::TextRuntime>,
+    /// The image runtime, on ranks holding encoders, image denoisers or
+    /// image decoders of a model that is not a video model.
+    image: Option<forward::image::ImageRuntime>,
     /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
@@ -64,13 +67,15 @@ pub(crate) struct Parts<'a> {
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut forward::token::TextRuntime>,
+    pub image: Option<&'a mut forward::image::ImageRuntime>,
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, then the
-/// text runtime, then the other runtimes' owners.
+/// text and image runtimes, then the other runtimes' owners.
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<forward::token::TextRuntime>,
+    image: &'a mut Option<forward::image::ImageRuntime>,
     others: &'a mut [Box<dyn RequestStorage>],
 ) -> Vec<&'a mut dyn RequestStorage> {
     let mut owners: Vec<&'a mut dyn RequestStorage> = Vec::new();
@@ -79,6 +84,9 @@ fn owners<'a>(
     }
     if let Some(text) = text {
         owners.push(text);
+    }
+    if let Some(image) = image {
+        owners.push(image);
     }
     owners.extend(
         others
@@ -96,6 +104,8 @@ pub struct WorkerBatch {
     retirement: Retirement,
     /// A capability runtime's launched work awaiting materialization.
     running: Option<Running>,
+    /// The host preparation of an image encoding batch's inline images.
+    image_inputs: Option<forward::image::Inputs>,
     output: Option<BatchResult>,
 }
 
@@ -107,6 +117,7 @@ impl WorkerBatch {
             predecessors: Vec::new(),
             retirement,
             running: None,
+            image_inputs: None,
             output: None,
         }
     }
@@ -150,6 +161,18 @@ impl WorkerBatch {
     pub(crate) fn launch(&mut self, running: Running) {
         self.running = Some(running);
     }
+
+    pub(crate) fn image_inputs(&self) -> Option<&forward::image::Inputs> {
+        self.image_inputs.as_ref()
+    }
+
+    pub(crate) fn set_image_inputs(&mut self, inputs: forward::image::Inputs) {
+        self.image_inputs = Some(inputs);
+    }
+
+    pub(crate) fn take_image_inputs(&mut self) -> Option<forward::image::Inputs> {
+        self.image_inputs.take()
+    }
 }
 
 impl WorkerBackend {
@@ -160,6 +183,7 @@ impl WorkerBackend {
             rank,
             rank_storage: None,
             text: None,
+            image: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -209,6 +233,15 @@ impl WorkerBackend {
         self.text.as_mut()
     }
 
+    /// Install the image runtime.
+    pub(crate) fn set_image(&mut self, image: forward::image::ImageRuntime) {
+        self.image = Some(image);
+    }
+
+    pub(crate) fn image_mut(&mut self) -> Option<&mut forward::image::ImageRuntime> {
+        self.image.as_mut()
+    }
+
     /// Register another runtime's storage owner taking part in request
     /// lifecycles.
     pub fn add_storage(&mut self, storage: Box<dyn RequestStorage>) {
@@ -223,6 +256,7 @@ impl WorkerBackend {
             requests: &mut self.requests,
             storage: self.rank_storage.as_mut(),
             text: self.text.as_mut(),
+            image: self.image.as_mut(),
         }
     }
 
@@ -271,7 +305,12 @@ impl WorkerBackend {
         })();
         // Reset every admitted slot even when a later Start failed.
         if !admitted.is_empty() {
-            for owner in owners(&mut self.rank_storage, &mut self.text, &mut self.storage) {
+            for owner in owners(
+                &mut self.rank_storage,
+                &mut self.text,
+                &mut self.image,
+                &mut self.storage,
+            ) {
                 owner.admit_slots(&admitted)?;
             }
         }
@@ -391,18 +430,24 @@ impl WorkerBackend {
         if let Some(text) = &self.text {
             text.set_wake(wake.clone());
         }
+        if let Some(image) = &self.image {
+            image.set_wake(wake.clone());
+        }
         for owner in &self.storage {
             owner.set_wake(wake.clone());
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, the text
-    /// runtime, then rank storage), after the executor drained; returns the
-    /// first failure.
+    /// Close every storage owner, newest first (other runtimes, the image
+    /// and text runtimes, then rank storage), after the executor drained;
+    /// returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
+        }
+        if let Some(mut image) = self.image.take() {
+            result = result.and(image.close(aborted));
         }
         if let Some(mut text) = self.text.take() {
             result = result.and(text.close(aborted));
@@ -413,13 +458,18 @@ impl WorkerBackend {
         result
     }
 
-    /// Close the text runtime (graphs, then steps) before the bindings it
-    /// runs close.
+    /// Close the image and text runtimes (graphs, then steps) before the
+    /// bindings they run close.
     pub fn close_text(&mut self, aborted: bool) -> Result<()> {
-        match self.text.take() {
+        let image = match self.image.take() {
+            Some(mut image) => image.close(aborted),
+            None => Ok(()),
+        };
+        let text = match self.text.take() {
             Some(mut text) => text.close(aborted),
             None => Ok(()),
-        }
+        };
+        image.and(text)
     }
 
     /// Release the outputs of the predecessors this batch's calls follow.
@@ -519,7 +569,12 @@ impl Backend for WorkerBackend {
     fn admit(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
         // Explicit revocation must not wait behind an allocation-dependent
         // batch; existing readers retain their leases.
-        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        let mut owners = owners(
+            &mut self.rank_storage,
+            &mut self.text,
+            &mut self.image,
+            &mut self.storage,
+        );
         batch.retirement.admit(&mut owners)?;
         Ok(())
     }
@@ -539,11 +594,16 @@ impl Backend for WorkerBackend {
 
     fn prepare_inputs(
         &mut self,
-        _batch: &mut WorkerBatch,
-        _submission: &Arc<Submission>,
+        batch: &mut WorkerBatch,
+        submission: &Arc<Submission>,
     ) -> std::result::Result<bool, WorkerError> {
-        // Lifecycle batches read no inputs; a capability runtime's inputs
-        // are prepared when it executes the batch.
+        // Inline images of an image encoding batch are decoded on the image
+        // runtime's host lane while other batches execute; the batch
+        // launches once they are ready (the lane notifies `submission`).
+        // Other batches' inputs are prepared when their runtime executes.
+        if self.image.is_some() && !self.video_model(batch) {
+            return forward::image::prepare_inputs(self, batch, submission);
+        }
         Ok(true)
     }
 
@@ -587,7 +647,12 @@ impl Backend for WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<(), WorkerError> {
-        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        let mut owners = owners(
+            &mut self.rank_storage,
+            &mut self.text,
+            &mut self.image,
+            &mut self.storage,
+        );
         batch.retirement.begin(&self.requests, &mut owners)?;
         Ok(())
     }
@@ -605,7 +670,12 @@ impl Backend for WorkerBackend {
         if batch.output.is_none() {
             return Ok((advanced, false));
         }
-        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        let mut owners = owners(
+            &mut self.rank_storage,
+            &mut self.text,
+            &mut self.image,
+            &mut self.storage,
+        );
         let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
         Ok((advanced || retired, retired))
     }
@@ -632,7 +702,12 @@ impl Backend for WorkerBackend {
     }
 
     fn reap(&mut self) -> std::result::Result<(), WorkerError> {
-        for owner in owners(&mut self.rank_storage, &mut self.text, &mut self.storage) {
+        for owner in owners(
+            &mut self.rank_storage,
+            &mut self.text,
+            &mut self.image,
+            &mut self.storage,
+        ) {
             owner.reap()?;
         }
         Ok(())
