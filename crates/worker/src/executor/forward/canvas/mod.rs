@@ -80,6 +80,9 @@ pub(crate) struct Context<'a> {
     pub(crate) kv: &'a mut KVCache,
     pub(crate) tensors: &'a TensorStore,
     pub(crate) events: &'a Arc<EventPool>,
+    /// The text runtime's batch order: canvases read the KV its prefills
+    /// write, possibly on another stream.
+    pub(crate) text: Option<&'a StreamOrder>,
 }
 
 /// A failure, the batch phase it happened in and whether the batch had
@@ -167,6 +170,7 @@ impl CanvasRuntime {
             kv,
             tensors,
             events,
+            text,
         } = context;
         let calls = &plan.calls;
         let first = calls
@@ -222,6 +226,9 @@ impl CanvasRuntime {
         // Readouts gate on host predicates. A step's continuation stays on
         // the device: reading it here would serialize steps that can run.
         self.order.wait(stream).map_err(&reserve)?;
+        if let Some(text) = text {
+            text.wait(stream).map_err(&reserve)?;
+        }
         for (call, state) in calls.iter().zip(&mut states) {
             if let Some(predicate) = &call.predicate
                 && predicate.dtype == DType::U8
@@ -797,6 +804,7 @@ pub(crate) fn execute(
         kv,
         tensors,
         events,
+        text: parts.text.map(|text| text.order()),
     };
     let failure = match runtime.launch(context, &plan) {
         Ok(launched) => {
