@@ -2026,7 +2026,7 @@ impl Scheduler {
     ///   the worker's device order puts the write first: forwards run in
     ///   submission order on one stream, and a forward on an execution lane
     ///   forks from and joins back into the device's control stream
-    ///   (`ModelExecutor.forward` in uniserve_worker).
+    ///   (the rank runtime's text runner).
     /// - A stopped block's commit queued behind the block's steps still in
     ///   flight. The host has accepted the step that stopped the block, so
     ///   every step behind it is a no-op whose completion is false, and the

@@ -4,8 +4,8 @@ import pytest
 import torch
 from torch import nn
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.nn.routing import RoutedTensor, RouteSpan
-from uniserve_models.runtime import ExecutionContext
 
 pytestmark = pytest.mark.unit
 

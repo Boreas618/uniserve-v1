@@ -29,8 +29,8 @@ pytestmark = pytest.mark.unit
 def test_unsharded_row_projection_preserves_dense_affine_rounding(
     dtype, large, device
 ):
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import ExecutionContext
 
     layer = RowParallelLinear(2, 1, device=device, dtype=dtype)
     layer.weight.copy_(torch.tensor([[large, 1]], device=device, dtype=dtype))

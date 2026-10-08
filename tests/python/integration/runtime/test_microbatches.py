@@ -5,10 +5,11 @@ from contextvars import ContextVar
 
 import pytest
 import torch
-
-from uniserve_models.model import TextSize
-from uniserve_models.runtime import CUDAStream, ExecutionContext, Microbatches
 from uniserve_models.runtime.microbatches import yield_microbatch
+
+from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.model import TextSize
+from uniserve_models.runtime import CUDAStream, Microbatches
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

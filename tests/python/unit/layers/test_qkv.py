@@ -7,9 +7,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.nn import QKVParallelLinear, RMSNorm
 from uniserve_models.nn.attention import RotaryQKVProjection
-from uniserve_models.runtime import CUDAGraph, CUDAStream, ExecutionContext
+from uniserve_models.runtime import CUDAGraph, CUDAStream
 
 
 class Projection(nn.Module):

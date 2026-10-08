@@ -4,8 +4,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.nn.attention import Attention, AttentionBatch, DenseInput
-from uniserve_models.runtime import CUDAGraph, CUDAStream, ExecutionContext
+from uniserve_models.runtime import CUDAGraph, CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

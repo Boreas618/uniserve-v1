@@ -68,6 +68,23 @@ pub fn driver_version() -> Result<i32> {
     Ok(version)
 }
 
+/// Start the CUDA profiler's capture range for `device`'s primary context
+/// (`cuProfilerStart`), for external profilers launched with capture ranges.
+pub fn profiler_start(device: DeviceId) -> Result<()> {
+    let _guard = DeviceGuard::new(device)?;
+    let driver = driver()?;
+    // SAFETY: takes no arguments; applies to the current context.
+    driver.check(unsafe { (driver.profiler_start)() }, "cuProfilerStart")
+}
+
+/// End the CUDA profiler's capture range (`cuProfilerStop`).
+pub fn profiler_stop(device: DeviceId) -> Result<()> {
+    let _guard = DeviceGuard::new(device)?;
+    let driver = driver()?;
+    // SAFETY: takes no arguments; applies to the current context.
+    driver.check(unsafe { (driver.profiler_stop)() }, "cuProfilerStop")
+}
+
 impl DeviceId {
     /// The number of devices visible to this process.
     pub fn count() -> Result<i32> {

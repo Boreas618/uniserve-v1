@@ -8,6 +8,9 @@ import pytest
 import torch
 from uniserve_kernels.attention.merge import merge_attention_states
 
+from uniserve_models.backends.attention import resolve
+from uniserve_models.backends.attention.torch import Backend as TorchBackend
+from uniserve_models.bindings.context import TensorBuffers
 from uniserve_models.cache import Config, mha
 from uniserve_models.model import TextSize
 from uniserve_models.nn.attention import (
@@ -18,9 +21,7 @@ from uniserve_models.nn.attention import (
     VarlenInput,
     VisibleInput,
 )
-from uniserve_models.runtime import PrefixCache, TensorBuffers
-from uniserve_models.backends.attention import resolve
-from uniserve_models.backends.attention.torch import Backend as TorchBackend
+from uniserve_models.runtime import PrefixCache
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

@@ -26,8 +26,11 @@ use super::BatchSubmitError;
 use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use uniserve_ipc::{Batch, DEFAULT_COMPONENT, WorkerInfo, WorkerRequest, WorkerResponse};
+use serde_json::Value;
+use uniserve_ipc::{
+    Batch, DEFAULT_COMPONENT, ExpertParallelDescriptor, LaunchDescriptor, WorkerInfo,
+    WorkerRequest, WorkerResponse,
+};
 use uniserve_ipc::{Frame, Outstanding, RankChannel};
 
 /// How long the head waits for a rank's socket channel to accept.
@@ -235,22 +238,21 @@ impl WorkerProcessArgs {
     /// Builds the typed launch descriptor the worker process consumes.
     ///
     /// Every tuning value is stated explicitly, so the launching side is the
-    /// single source of defaults and the worker never re-derives one. The keys
-    /// become attributes of the namespace `WorkerProcessArgs.from_namespace`
-    /// reads, and the worker refuses a descriptor missing any key listed in
-    /// `REQUIRED_FIELDS` (`uniserve_worker.bootstrap.cli`). Only the process
-    /// identity and the descriptor's path travel on argv.
+    /// single source of defaults and the worker never re-derives one. The
+    /// worker deserializes the same [`LaunchDescriptor`] type and refuses an
+    /// unknown or missing key. Only the process identity and the
+    /// descriptor's path travel on argv.
     ///
     /// `rank` must index `self.ranks`. Fails when a host-relative rank value
-    /// does not fit `u32` or the component configuration does not serialize.
-    fn launch_descriptor(
+    /// does not fit `u32` or the role does not serialize.
+    pub(crate) fn launch_descriptor(
         &self,
         rank: u32,
         registration: &str,
         rendezvous: Option<&str>,
         rendezvous_listen_fd: Option<std::os::fd::RawFd>,
         expert_listen_fd: Option<std::os::fd::RawFd>,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<LaunchDescriptor> {
         let depth = self.queue_depth.max(1);
         let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
         // Resolve mechanism ownership from the physical rank's incident edges.
@@ -263,53 +265,8 @@ impl WorkerProcessArgs {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let path = |path: &std::path::Path| path.to_string_lossy().into_owned();
 
-        let mut fields = serde_json::Map::new();
-        fields.insert("worker_id".into(), json!(self.worker_id));
-        fields.insert("registration_address".into(), json!(registration));
-        // The placement decides the mechanism and the rank names the endpoint:
-        // a rank on the head's host can offer shared storage, a rank elsewhere
-        // cannot, and only the head knows where a rank was placed.
-        fields.insert(
-            "channel_transport".into(),
-            json!(self.channel_transport(rank)),
-        );
-        // A rank cannot name the ranks that read what it publishes: it knows
-        // its own component, not which component consumes its products, and a
-        // product is consumed in a later batch than the one producing it. The
-        // head states a product's readers on the call that produces it and
-        // gives the rank its own slot here. A consumer writes its own slot's
-        // word in every chunk or segment it reads; the slots a producer
-        // watches travel on each producing call.
-        fields.insert(
-            "acknowledgment_slot".into(),
-            json!(self.transfer.acknowledgment_slot(&self.worker_id, rank)),
-        );
-        // Which of those slots are on this rank's host decides the mechanism
-        // a host product is published over: shared storage reaches the host,
-        // the rank channel reaches the rest.
-        fields.insert(
-            "host_slots".into(),
-            json!(self.transfer.host_slots(&self.worker_id, rank)),
-        );
-        // Readiness is a producer synchronize only where an interprocess event
-        // cannot carry it, which is exactly where a consumer is on another
-        // host. Only the placement knows that.
-        fields.insert(
-            "products_cross_hosts".into(),
-            json!(self.transfer.products_cross_hosts(&self.worker_id, rank)),
-        );
-        fields.insert("queue_depth".into(), json!(depth));
-        fields.insert("ipc_payload_cap".into(), json!(max_payload));
-        fields.insert("model".into(), json!(self.model));
-        if let Some(base) = &self.base_model {
-            fields.insert("base_model".into(), json!(base));
-        }
-        fields.insert("device".into(), json!(self.ranks[rank as usize].device));
-        fields.insert("rank".into(), json!(rank));
-        fields.insert("local_rank".into(), json!(self.host_slot(rank)?.0));
-        fields.insert("world_size".into(), json!(self.world_size()));
-        fields.insert("components".into(), serde_json::to_value(&self.components)?);
         // Every component any group of the deployment places, so each rank
         // resolves the capabilities the deployment as a whole selects, such
         // as which of a checkpoint's denoisers it serves.
@@ -318,146 +275,128 @@ impl WorkerProcessArgs {
             .values()
             .flat_map(|components| components.keys())
             .chain(self.components.keys())
-            .collect::<std::collections::BTreeSet<_>>();
-        fields.insert("deployment_components".into(), json!(deployment));
-        // Null lets the worker serve every capability group it implements.
-        fields.insert(
-            "supported_calls".into(),
-            if self.capability_groups.is_empty() {
-                Value::Null
-            } else {
-                json!(self.capability_groups.join(","))
-            },
-        );
-        fields.insert("transfer_backends".into(), json!(names(&transfer_backends)));
-        fields.insert("export_backends".into(), json!(names(&export_backends)));
-        // Every rank of a group connects to the collective store at this
-        // address. The group's first rank serves it on the socket it inherits
-        // at the named descriptor rather than binding the port itself; a
-        // first rank placed elsewhere has the number filled in by the
-        // launcher that holds its host's reservation.
-        fields.insert("rendezvous_address".into(), json!(rendezvous));
-        fields.insert(
-            uniserve_core::launch::RENDEZVOUS_LISTEN_FD.into(),
-            json!(rendezvous_listen_fd),
-        );
-        // A replica sharing its experts joins the expert-parallel world at the
-        // store world rank 0 serves on the socket it inherits at the named
-        // descriptor; the other replicas receive only the address.
-        fields.insert(
-            "expert_parallel".into(),
-            match &self.expert_parallel {
-                Some(placement) => json!({
-                    "rank": placement.rank + rank,
-                    "size": placement.size,
-                    "attention_ranks": placement.attention_ranks,
-                    "address": placement.address,
-                    "listen_fd": expert_listen_fd,
-                    "exchange": placement.exchange,
-                }),
-                None => Value::Null,
-            },
-        );
-        fields.insert("role".into(), json!(self.role));
-        fields.insert(
-            "expert_microbatches".into(),
-            json!(self.expert_microbatches),
-        );
-        fields.insert(
-            "distributed_backend".into(),
-            json!(self.distributed_backend),
-        );
-        fields.insert("mesh".into(), json!(self.mesh));
-        fields.insert("lane".into(), json!(self.lanes));
-        // The worker refuses `no_model` without `allow_stub`, so a stub
-        // launch states both.
-        fields.insert("no_model".into(), json!(self.stub));
-        fields.insert("allow_stub".into(), json!(self.stub));
-        fields.insert("load_format".into(), json!(self.load_format));
-        fields.insert("download_dir".into(), json!(self.download_dir));
-        fields.insert("load_threads".into(), json!(self.load_threads));
-        fields.insert("checksum_manifest".into(), json!(self.checksum_manifest));
-        fields.insert("model_dtype".into(), json!(self.model_dtype.as_str()));
-        fields.insert(
-            "quantization_config".into(),
-            self.quantization_config.clone(),
-        );
-        fields.insert(
-            "kv_cache_dtype".into(),
-            json!(self.kv_cache_dtype.as_ref().map(|value| value.as_str())),
-        );
-        fields.insert("kv_memory_fraction".into(), json!(self.kv_storage_fraction));
-        fields.insert("kv_token_capacity".into(), json!(self.kv_token_capacity));
-        fields.insert(
-            "attention_backend".into(),
-            json!(self.attention_backend.as_name()),
-        );
-        fields.insert("block_size".into(), json!(self.block_size));
-        fields.insert("max_batch_calls".into(), json!(self.max_batch_calls));
-        fields.insert("max_batch_tokens".into(), json!(self.max_batch_tokens));
-        fields.insert(
-            "max_request_pool_size".into(),
-            json!(self.max_request_pool_size),
-        );
-        fields.insert("max_model_len".into(), json!(self.max_model_len));
-        fields.insert("max_video_seconds".into(), json!(self.max_video_seconds));
-        fields.insert("max_condition_rows".into(), json!(self.max_condition_rows));
-        fields.insert("ffmpeg".into(), json!(self.ffmpeg));
-        fields.insert("min_video_seconds".into(), json!(self.min_video_seconds));
-        fields.insert("graph_policy".into(), json!(self.graph_policy));
-        fields.insert(
-            "decode_graph_batch_sizes".into(),
-            json!(self.decode_graph_batch_sizes),
-        );
-        fields.insert("prefill_cuda_graph".into(), json!(self.prefill_cuda_graph));
-        fields.insert("prefill_outputs".into(), json!(self.prefill_outputs));
-        fields.insert(
-            "prefill_graph_token_sizes".into(),
-            json!(self.prefill_graph_token_sizes),
-        );
-        fields.insert("flow_cuda_graph".into(), json!(self.flow_cuda_graph));
-        fields.insert(
-            "flow_graph_batch_sizes".into(),
-            json!(self.flow_graph_batch_sizes),
-        );
-        fields.insert("flow_graph_shapes".into(), json!(self.flow_graph_shapes));
-        fields.insert(
-            "video_text_capacities".into(),
-            json!(self.video_text_capacities),
-        );
-        fields.insert(
-            "canvas_sampling".into(),
-            serde_json::to_value(self.canvas_sampling)?,
-        );
-        fields.insert(
-            "flashinfer_workspace_size".into(),
-            json!(self.flashinfer_workspace_size),
-        );
-        fields.insert(
-            "flashinfer_use_tensor_core".into(),
-            json!(self.flashinfer_use_tensor_core),
-        );
-        fields.insert(
-            "flashinfer_decode_backend".into(),
-            json!(self.flashinfer_decode_backend.as_str()),
-        );
-        fields.insert(
-            "flashinfer_prefill_backend".into(),
-            json!(self.flashinfer_prefill_backend.as_str()),
-        );
-        fields.insert(
-            "flashinfer_decode_split_tile_size".into(),
-            json!(self.flashinfer_decode_split_tile_size),
-        );
-        fields.insert(
-            "flashinfer_prefill_split_tile_size".into(),
-            json!(self.flashinfer_prefill_split_tile_size),
-        );
-        fields.insert(
-            "flashinfer_disable_split_kv".into(),
-            json!(self.flashinfer_disable_split_kv),
-        );
-        Ok(Value::Object(fields))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        Ok(LaunchDescriptor {
+            worker_id: self.worker_id.clone(),
+            registration_address: registration.to_owned(),
+            // The placement decides the mechanism and the rank names the
+            // endpoint: a rank on the head's host can offer shared storage,
+            // a rank elsewhere cannot, and only the head knows where a rank
+            // was placed.
+            channel_transport: self.channel_transport(rank).to_owned(),
+            // A rank cannot name the ranks that read what it publishes: it
+            // knows its own component, not which component consumes its
+            // products. The head states a product's readers on the call that
+            // produces it and gives the rank its own acknowledgment slot here.
+            acknowledgment_slot: self.transfer.acknowledgment_slot(&self.worker_id, rank),
+            // Which of those slots are on this rank's host decides the
+            // mechanism a host product is published over.
+            host_slots: self.transfer.host_slots(&self.worker_id, rank),
+            // Readiness is a producer synchronize only where an interprocess
+            // event cannot carry it, which is where a consumer is on another
+            // host. Only the placement knows that.
+            products_cross_hosts: self.transfer.products_cross_hosts(&self.worker_id, rank),
+            queue_depth: depth,
+            ipc_payload_cap: max_payload,
+            model: self.model.clone(),
+            base_model: self.base_model.as_deref().map(path),
+            device: self.ranks[rank as usize].device.clone(),
+            rank,
+            local_rank: self.host_slot(rank)?.0,
+            world_size: self.world_size(),
+            components: self.components.clone(),
+            deployment_components: deployment,
+            // `None` lets the worker serve every capability group it
+            // implements.
+            supported_calls: (!self.capability_groups.is_empty())
+                .then(|| self.capability_groups.join(",")),
+            transfer_backends: names(&transfer_backends),
+            export_backends: names(&export_backends),
+            // Every rank of a group meets its peers at this address. The
+            // group's first rank accepts them on the socket it inherits at
+            // the named descriptor rather than binding the port itself; a
+            // first rank placed elsewhere has the number filled in by the
+            // launcher that holds its host's reservation.
+            rendezvous_address: rendezvous.map(str::to_owned),
+            rendezvous_listen_fd,
+            // A replica sharing its experts joins the expert-parallel union
+            // at the address the union's rank 0 accepts on, through the
+            // socket it inherits; the other ranks receive only the address.
+            expert_parallel: self
+                .expert_parallel
+                .as_ref()
+                .map(|placement| -> anyhow::Result<_> {
+                    Ok(ExpertParallelDescriptor {
+                        rank: placement.rank + rank,
+                        size: placement.size,
+                        attention_ranks: placement.attention_ranks,
+                        address: placement.address.clone(),
+                        listen_fd: expert_listen_fd,
+                        exchange: serde_name(&placement.exchange)?,
+                    })
+                })
+                .transpose()?,
+            role: serde_name(&self.role)?,
+            expert_microbatches: self.expert_microbatches,
+            distributed_backend: self.distributed_backend.clone(),
+            mesh: self.mesh.clone(),
+            lane: self.lanes.clone(),
+            // The worker refuses `no_model` without `allow_stub`, so a stub
+            // launch states both.
+            no_model: self.stub,
+            allow_stub: self.stub,
+            load_format: self.load_format.clone(),
+            download_dir: self.download_dir.as_deref().map(path),
+            load_threads: self.load_threads,
+            checksum_manifest: self.checksum_manifest.as_deref().map(path),
+            model_dtype: self.model_dtype.as_str().to_owned(),
+            quantization_config: self.quantization_config.clone(),
+            kv_cache_dtype: self
+                .kv_cache_dtype
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            kv_memory_fraction: self.kv_storage_fraction,
+            kv_token_capacity: self.kv_token_capacity,
+            attention_backend: self.attention_backend.as_name(),
+            block_size: self.block_size,
+            max_batch_calls: self.max_batch_calls,
+            max_batch_tokens: self.max_batch_tokens,
+            max_request_pool_size: self.max_request_pool_size,
+            max_model_len: self.max_model_len,
+            max_video_seconds: self.max_video_seconds,
+            max_condition_rows: self.max_condition_rows,
+            ffmpeg: path(&self.ffmpeg),
+            min_video_seconds: self.min_video_seconds,
+            graph_policy: self.graph_policy.clone(),
+            decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
+            prefill_cuda_graph: self.prefill_cuda_graph,
+            prefill_outputs: self.prefill_outputs,
+            prefill_graph_token_sizes: self.prefill_graph_token_sizes.clone(),
+            flow_cuda_graph: self.flow_cuda_graph,
+            flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
+            flow_graph_shapes: self.flow_graph_shapes.clone(),
+            video_text_capacities: self.video_text_capacities.clone(),
+            canvas_sampling: self.canvas_sampling,
+            flashinfer_workspace_size: self.flashinfer_workspace_size,
+            flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),
+            flashinfer_decode_backend: self.flashinfer_decode_backend.as_str().to_owned(),
+            flashinfer_prefill_backend: self.flashinfer_prefill_backend.as_str().to_owned(),
+            flashinfer_decode_split_tile_size: self.flashinfer_decode_split_tile_size,
+            flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
+            flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
+        })
+    }
+}
+
+/// The serialized name of a unit enum variant, as the descriptor carries it.
+fn serde_name(value: &impl Serialize) -> anyhow::Result<String> {
+    match serde_json::to_value(value)? {
+        Value::String(name) => Ok(name),
+        other => bail!("expected a named variant, found {other}"),
     }
 }
 
@@ -585,8 +524,21 @@ const ALLOCATOR_VARIABLES: [&str; 2] = ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLO
 /// its CPU allocator on aarch64 Linux.
 const HOST_ALLOCATOR_THP_VARIABLE: &str = "MIMALLOC_ALLOW_THP";
 
-/// Returns the allocator variables every rank is launched with, given a
-/// lookup into the head's environment.
+/// Variables a rank's CUDA and NCCL libraries read before their first use,
+/// with the value a rank runs with unless the head sets the variable itself.
+///
+/// - `CUDA_MODULE_LOADING=EAGER`: lazy module loading synchronizes the
+///   context when a kernel is first used, which can deadlock against a
+///   collective another stream is waiting in for a peer.
+/// - `NCCL_RUNTIME_CONNECT=0`: deferred peer handshakes would allocate
+///   connection buffers after the rank sealed its device storage.
+const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
+    ("CUDA_MODULE_LOADING", "EAGER"),
+    ("NCCL_RUNTIME_CONNECT", "0"),
+];
+
+/// Returns the variables every rank is launched with, given a lookup into
+/// the head's environment.
 ///
 /// Every rank serves varying shapes from expandable caching-allocator
 /// segments, unless the head's environment already configures the caching
@@ -603,11 +555,15 @@ const HOST_ALLOCATOR_THP_VARIABLE: &str = "MIMALLOC_ALLOW_THP";
 /// thread. With the option off, mimalloc disables transparent huge pages
 /// for the rank process.
 ///
+/// The [`RUNTIME_DEFAULTS`] are stated in the environment rather than set by
+/// the rank, so they precede any CUDA or NCCL initialization whatever the
+/// rank imports first; the head's own values win.
+///
 /// The variables are set explicitly on each rank's command, even where a
 /// local child would inherit them, because a launcher on another host
 /// receives only the variables the command sets and applies them over its
 /// own environment.
-fn allocator_environment(
+fn worker_environment(
     head: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<(&'static str, std::ffi::OsString)> {
     let mut configured: Vec<_> = ALLOCATOR_VARIABLES
@@ -621,6 +577,9 @@ fn allocator_environment(
         HOST_ALLOCATOR_THP_VARIABLE,
         head(HOST_ALLOCATOR_THP_VARIABLE).unwrap_or_else(|| "0".into()),
     ));
+    for (name, value) in RUNTIME_DEFAULTS {
+        configured.push((name, head(name).unwrap_or_else(|| value.into())));
+    }
     configured
 }
 
@@ -672,7 +631,7 @@ impl PendingRank {
 
         let mut cmd = Command::new(&args.python);
         cmd.arg("-m")
-            .arg("uniserve_worker.main")
+            .arg("uniserve_models.worker")
             .arg("--worker-id")
             .arg(&args.worker_id)
             .arg("--rank")
@@ -690,9 +649,9 @@ impl PendingRank {
             .env("LOCAL_RANK", local_rank.to_string())
             .env("LOCAL_WORLD_SIZE", local_world_size.to_string());
 
-        // The allocator settings are stated even for a local child, which
+        // The environment is stated even for a local child, which
         // would inherit them, so that a remote launch carries them as well.
-        cmd.envs(allocator_environment(|name| std::env::var_os(name)));
+        cmd.envs(worker_environment(|name| std::env::var_os(name)));
 
         // The engine's working directory leads the worker's import path.
         if let Ok(cwd) = std::env::current_dir() {
@@ -719,7 +678,7 @@ impl PendingRank {
             rendezvous_listen_fd,
             expert_listen_fd,
         )?;
-        std::fs::write(&descriptor_path, serde_json::to_vec_pretty(&descriptor)?)
+        std::fs::write(&descriptor_path, descriptor.to_json()?)
             .context("writing the worker launch descriptor")?;
 
         // A rank placed on another host is started by that host's launcher,
@@ -1492,7 +1451,7 @@ impl Drop for RankProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaneConfig, WorkerProcessArgs, allocator_environment};
+    use super::{LaneConfig, WorkerProcessArgs, worker_environment};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
@@ -1508,13 +1467,16 @@ mod tests {
         let descriptor = args
             .launch_descriptor(0, "127.0.0.1:1", None, None, None)
             .expect("descriptor");
-        assert!(descriptor.get("base_model").is_none());
+        assert_eq!(descriptor.base_model, None);
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&descriptor.to_json().expect("encoded")).expect("json");
+        assert!(encoded.get("base_model").is_none());
 
         args.base_model = Some("/models/MiniMax-H3".into());
         let descriptor = args
             .launch_descriptor(0, "127.0.0.1:1", None, None, None)
             .expect("descriptor");
-        assert_eq!(descriptor["base_model"], "/models/MiniMax-H3");
+        assert_eq!(descriptor.base_model.as_deref(), Some("/models/MiniMax-H3"));
     }
 
     /// `--lane` accepts only the fields the worker applies, so a misspelled
@@ -1534,7 +1496,7 @@ mod tests {
             .launch_descriptor(0, "127.0.0.1:1", None, None, None)
             .expect("descriptor");
         assert_eq!(
-            descriptor["lane"][0]["call_kinds"],
+            serde_json::to_value(&descriptor.lane[0].call_kinds).expect("kinds"),
             serde_json::json!(["decode", "verify", "token_denoising"])
         );
 
@@ -1570,8 +1532,9 @@ mod tests {
     fn ranks_run_with_the_heads_allocator_configuration() {
         let resolve = |head: &[(&'static str, &str)]| {
             let head: BTreeMap<_, _> = head.iter().copied().collect();
-            allocator_environment(|name| head.get(name).map(OsString::from))
+            worker_environment(|name| head.get(name).map(OsString::from))
                 .into_iter()
+                .filter(|(name, _)| !name.starts_with("CUDA_") && !name.starts_with("NCCL_"))
                 .collect::<BTreeMap<_, _>>()
         };
         let expected = |variables: &[(&'static str, &str)]| {
@@ -1608,6 +1571,36 @@ mod tests {
             expected(&[
                 ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
                 ("MIMALLOC_ALLOW_THP", "1"),
+            ])
+        );
+    }
+
+    /// Eager CUDA module loading and connect-at-startup NCCL precede any
+    /// CUDA or NCCL use in every rank, unless the head sets either itself.
+    #[test]
+    fn runtime_defaults_yield_to_the_heads_values() {
+        let resolve = |head: &[(&'static str, &str)]| {
+            let head: BTreeMap<_, _> = head.iter().copied().collect();
+            worker_environment(|name| head.get(name).map(OsString::from))
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("CUDA_") || name.starts_with("NCCL_"))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            resolve(&[]),
+            BTreeMap::from([
+                ("CUDA_MODULE_LOADING", OsString::from("EAGER")),
+                ("NCCL_RUNTIME_CONNECT", OsString::from("0")),
+            ])
+        );
+        assert_eq!(
+            resolve(&[
+                ("CUDA_MODULE_LOADING", "LAZY"),
+                ("NCCL_RUNTIME_CONNECT", "1")
+            ]),
+            BTreeMap::from([
+                ("CUDA_MODULE_LOADING", OsString::from("LAZY")),
+                ("NCCL_RUNTIME_CONNECT", OsString::from("1")),
             ])
         );
     }
