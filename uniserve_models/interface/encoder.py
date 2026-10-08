@@ -30,6 +30,10 @@ Vision (``PatchEncoder``) functions:
 
 - ``encode(images, out) -> shapes``: encode unpacked images, one product
   region per image.
+- ``encode_patches(rows, grids, out) -> shapes``: encode vision blocks
+  whose patch rows are already packed (a product region holding every
+  block's rows back to back), one ``[time, height, width]`` patch grid and
+  one product region per block.
 - ``prepare_resident(image, tower, signed_unit) -> prepared``: prepare a
   resident image product (a region) for encoding.
 - Packed encoders (``max_patches`` set) bind ``pixels`` ``[slots *
@@ -69,6 +73,7 @@ call's capacity, into ``tokens``.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from math import prod
 from typing import Any, cast
 
 import torch
@@ -193,9 +198,9 @@ def _device_pixels(image: PreparedImage, device: torch.device) -> torch.Tensor:
 
 
 def _device_grid(
-    shape: tuple[int, int] | None, device: torch.device
+    shape: tuple[int, ...] | None, device: torch.device
 ) -> torch.Tensor | None:
-    """The ``[1, 2]`` int64 patch grid of a packed image on ``device``.
+    """The ``[1, axes]`` int64 patch grid of a packed sample on ``device``.
 
     Built in page-locked memory first, so the copy does not synchronize the
     host with the stream.
@@ -251,8 +256,31 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
                 for value, region in zip(features, out, strict=True)
             ]
 
+    def encode_patches(rows, grids: Sequence, out: Sequence) -> list:
+        shapes = [tuple(int(extent) for extent in grid) for grid in grids]
+        if len(shapes) != len(out):
+            raise ValueError("vision blocks and products must align")
+        with calls.scope(context):
+            # Each block is one packed sample: its patch rows and its grid,
+            # which the encoder also takes as a [1, 3] device tensor.
+            samples = regions.view(products, rows).split(
+                [prod(shape) for shape in shapes]
+            )
+            features = encoder.encode(
+                VisionInput(
+                    tuple(samples),
+                    tuple(_device_grid(shape, device) for shape in shapes),
+                    tuple(shapes),
+                )
+            )
+            return [
+                calls.write(regions.view(products, region), value)
+                for value, region in zip(features, out, strict=True)
+            ]
+
     steps: dict[str, Callable[..., Any]] = {
         "encode": encode,
+        "encode_patches": encode_patches,
         "prepare_resident": _resident(loaded, context, products),
     }
     if encoder.max_patches is None:

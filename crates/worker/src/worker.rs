@@ -41,15 +41,18 @@ use crate::capacity::device::{DeviceBudget, total_bytes};
 use crate::capacity::plan::{
     LatentPlan, Plan, Report, TokenFacts, TokenLayout, page_size, product_bytes,
 };
+use crate::capacity::video::VideoCapacity;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
+use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::{DType, Handle, Record};
 use crate::launch::Endpoint;
 use crate::model::components::Capability;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
+use crate::model::video::{VideoModel, placed_denoiser};
 use crate::model::{
     ComponentMesh, Description, ExpertPartition, LoadedModel, ModelFacts, sequence_kind,
 };
@@ -59,7 +62,7 @@ use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
 use crate::runner::{GraphStorage, graph_storage_budget_bytes};
 use crate::service::Service;
-use crate::storage::{GroupShape, KVCache, KVPlan};
+use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
 use crate::stream::{CUDAStream, EventPool};
 use crate::transfer::{Capacity, TransportKind, TransportOptions, Transports};
 use crate::warmup::{Scenarios, WarmupHooks};
@@ -211,6 +214,13 @@ impl Worker {
         )
         .map_err(phase("load"))?;
         let facts = model.facts(&interface, &launch).map_err(phase("load"))?;
+        let video = if model.video_decoder {
+            let denoiser = placed_denoiser(&model.declarations, &config.deployment_components)
+                .map_err(phase("load"))?;
+            Some(VideoModel::new(&interface, model.handle(), denoiser).map_err(phase("load"))?)
+        } else {
+            None
+        };
         drop(loading);
         if launch.stub {
             // The stub encodes many small images in tests.
@@ -231,7 +241,7 @@ impl Worker {
         };
 
         let planning = range(c"uniserve.worker.plan", None);
-        let plan = plan(
+        let (plan, video_capacity) = plan(
             &launch,
             &interface,
             &mut config,
@@ -241,6 +251,7 @@ impl Worker {
             budget.as_ref(),
             &components,
             lanes.lanes().len().max(1),
+            video.as_ref(),
         )
         .map_err(phase("capacity"))?;
         if let Some(budget) = &budget {
@@ -253,11 +264,55 @@ impl Worker {
             .map_err(|error| phase("capacity")(Error::Invariant(error.to_string())))?;
         log_capacity(&config, &plan);
 
-        let storage = allocate_storage(&launch, &interface, &config, &plan, &lanes)
-            .map_err(phase("storage"))?;
+        let storage =
+            allocate_storage(&launch, &interface, &config, &plan, &lanes, video.is_some())
+                .map_err(phase("storage"))?;
+        let budgets = devices
+            .iter()
+            .filter_map(|device| device.cuda_index())
+            .map(|index| {
+                Ok((
+                    index,
+                    graph_storage_budget_bytes(total_bytes(index)? as i64),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+            .map_err(phase("capacity"))?;
+        let mut graphs = GraphStorage::new(budgets);
+        let mut lanes = lanes;
+        let runtime = match (video, video_capacity) {
+            (Some(video), Some(capacity)) => Some(
+                VideoRuntime::create(RuntimeSetup {
+                    interface: &interface,
+                    loaded: model.handle(),
+                    model: video,
+                    capacity,
+                    info: &info,
+                    config: &config,
+                    components: &components,
+                    lanes: &mut lanes,
+                    graphs: &mut graphs,
+                    attention: facts.attention_backend.clone(),
+                    products: storage
+                        .products
+                        .as_ref()
+                        .zip(config.primary_device().cuda_index())
+                        .map(|(store, index)| store.arena(crate::ffi::Device::Cuda(index)))
+                        .transpose()
+                        .map_err(phase("storage"))?,
+                })
+                .map_err(phase("storage"))?,
+            ),
+            _ => None,
+        };
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
-        backend.add_storage(Box::new(storage));
+        backend.set_rank_storage(storage);
+        let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
+        if let Some(runtime) = runtime {
+            backend.set_video(runtime);
+            hooks.push(Box::new(VideoWarmup));
+        }
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
             .map(|profile| {
@@ -284,17 +339,6 @@ impl Worker {
         )
         .map_err(|error| error.with_phase("executor"))?;
 
-        let budgets = devices
-            .iter()
-            .filter_map(|device| device.cuda_index())
-            .map(|index| {
-                Ok((
-                    index,
-                    graph_storage_budget_bytes(total_bytes(index)? as i64),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()
-            .map_err(phase("capacity"))?;
         tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", facts.model_name);
         Ok(Self {
             launch,
@@ -306,9 +350,9 @@ impl Worker {
             world: Some(world),
             budget,
             lanes,
-            graphs: GraphStorage::new(budgets),
+            graphs,
             executor: Some(executor),
-            hooks: Vec::new(),
+            hooks,
             context,
             warmed: false,
             closed: false,
@@ -636,6 +680,13 @@ impl Worker {
                 .add(&label, &binding.device.to_string(), &kernels)
                 .map_err(phase("warmup"))?;
         }
+        if let Some(video) = executor.backend_mut().video_mut() {
+            for (label, kernels) in video.kernels().map_err(phase("warmup"))? {
+                records
+                    .add(&label, &self.config.device, &kernels)
+                    .map_err(phase("warmup"))?;
+            }
+        }
         records.log("startup", self.config.rank, &self.config.device);
         let choices: i64 = self
             .interface
@@ -671,6 +722,7 @@ fn allocate_storage(
     config: &WorkerConfig,
     plan: &Plan,
     lanes: &Lanes,
+    media: bool,
 ) -> Result<RankStorage> {
     let events = EventPool::new();
     let kinds = launch
@@ -729,7 +781,46 @@ fn allocate_storage(
             .transpose()?,
         None => None,
     };
-    Ok(RankStorage::new(events, transports, kv, release_stream))
+    let products = if media {
+        Some(Arc::new(product_store(config, plan, &events)?))
+    } else {
+        None
+    };
+    Ok(RankStorage::new(
+        events,
+        transports,
+        kv,
+        products,
+        release_stream,
+    ))
+}
+
+/// The product store of a media rank: one buffer-pool arena on the rank's
+/// device holding the products it publishes or reads (compactly placed when
+/// its arena is smaller than the logical pool the engine allocates in), and
+/// relay lanes for completion scalars.
+fn product_store(
+    config: &WorkerConfig,
+    plan: &Plan,
+    events: &Arc<EventPool>,
+) -> Result<TensorStore> {
+    let device = match config.primary_device() {
+        Device::Cuda(index) => crate::ffi::Device::Cuda(index),
+        Device::Cpu => crate::ffi::Device::Cpu,
+    };
+    let logical = plan.info.buffer_pool_bytes;
+    let physical = plan.physical_buffer_pool_bytes.max(1);
+    let pool = BufferPool::allocate(physical, physical < logical, &[device])?;
+    TensorStore::new(
+        plan.arena.tensor_store,
+        plan.arena.device_product_bytes as usize,
+        1,
+        vec![device],
+        plan.info.request_slots as usize,
+        plan.info.max_unresolved_calls as usize + 1,
+        pool,
+        Arc::clone(events),
+    )
 }
 
 /// Block-table width that holds the longest admitted sequence in every
@@ -804,7 +895,8 @@ fn plan(
     budget: Option<&DeviceBudget>,
     components: &Components,
     unit_columns: usize,
-) -> Result<Plan> {
+    video: Option<&VideoModel>,
+) -> Result<(Plan, Option<VideoCapacity>)> {
     let device = config.primary_device();
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
         config.pool_storage_bytes =
@@ -827,11 +919,6 @@ fn plan(
         &world.host,
     )?;
     config.block_size = Some(block_size);
-    if model.video_decoder || declarations.has(Capability::VideoPostprocessor) {
-        return Err(Error::Unsupported(
-            "video models are planned and served by the video runtime".into(),
-        ));
-    }
 
     let dedicated = config.role == "experts";
     let held: Vec<&str> = launch.components.keys().map(String::as_str).collect();
@@ -858,6 +945,26 @@ fn plan(
             .filter(|(kind, _)| supported.contains(&CallKind::Media(*kind)))
             .collect()
     };
+    let capacity = match video {
+        Some(video) => {
+            let denoising = components.get(&video.denoiser).is_some();
+            let decoding = components
+                .placed()
+                .iter()
+                .any(|placed| placed.has(Capability::VideoDecoder));
+            Some(crate::capacity::video::plan(
+                video,
+                config,
+                &facts.outputs,
+                denoising,
+                decoding,
+            )?)
+        }
+        None => None,
+    };
+    let outputs = capacity
+        .as_ref()
+        .map_or(&facts.outputs, |capacity| &capacity.outputs);
     let infos: Vec<ComponentInfo> = launch
         .components
         .iter()
@@ -865,7 +972,7 @@ fn plan(
             |(name, config): (&String, &ComponentConfig)| ComponentInfo {
                 name: name.clone(),
                 config: config.clone(),
-                outputs: facts.outputs.get(name).cloned().unwrap_or_default(),
+                outputs: outputs.get(name).cloned().unwrap_or_default(),
             },
         )
         .collect();
@@ -886,6 +993,20 @@ fn plan(
         weight_formats: facts.weight_formats.clone(),
         activation_formats: facts.activation_formats.clone(),
     };
+    if let (Some(video), Some(capacity)) = (video, capacity) {
+        let plan = video_layout(
+            report,
+            config,
+            launch,
+            declarations,
+            components,
+            video,
+            &capacity,
+            budget,
+            &world.host,
+        )?;
+        return Ok((plan, Some(capacity)));
+    }
 
     let element_bytes = DType::from_name(&config.model_dtype)
         .map(DType::bytes)
@@ -951,5 +1072,67 @@ fn plan(
     } else {
         None
     };
-    Ok(layout.finish(config, cache))
+    Ok((layout.finish(config, cache), None))
+}
+
+/// The layout of a video rank: request slots sized by every rank's storage
+/// for that many resident requests, agreed over the group.
+#[allow(clippy::too_many_arguments)]
+fn video_layout(
+    report: Report,
+    config: &mut WorkerConfig,
+    launch: &WorkerLaunch,
+    declarations: &crate::model::components::Declarations,
+    components: &Components,
+    video: &VideoModel,
+    capacity: &VideoCapacity,
+    budget: Option<&DeviceBudget>,
+    group: &crate::parallel::host::HostGroup,
+) -> Result<Plan> {
+    let queue_depth = launch.ipc.queue_depth;
+    let deployment: Vec<&str> = if config.deployment_components.is_empty() {
+        launch.components.keys().map(String::as_str).collect()
+    } else {
+        config
+            .deployment_components
+            .iter()
+            .map(String::as_str)
+            .collect()
+    };
+    let routes = declarations.routes(&deployment)?;
+    let held: std::collections::BTreeSet<String> = components
+        .placed()
+        .iter()
+        .map(|placed| placed.name.clone())
+        .collect();
+    let local = crate::capacity::video::local_product_bytes(&capacity.outputs, &routes, &held);
+    let codec_ranks = launch
+        .components
+        .get("video_codec")
+        .map(|component| component.ranks.len());
+    if let (Device::Cuda(index), Some(budget)) = (config.primary_device(), budget) {
+        let available = budget.budget(index, config.kv_storage_fraction)?.available;
+        let maximum = config.max_request_pool_size;
+        let minimum = config.min_request_pool_size.min(maximum).max(1);
+        let facts = capacity.facts(video, maximum, local, codec_ranks)?;
+        let requirements = crate::capacity::plan::slot_requirements(
+            config,
+            queue_depth,
+            &facts,
+            minimum,
+            maximum,
+        )?;
+        let slots = crate::capacity::plan::request_slots(&requirements, minimum, available, group)?;
+        config.max_request_pool_size = slots;
+        config.max_batch_calls = config.max_batch_calls.min(slots);
+        config.max_batch_tokens = config.max_batch_tokens.min(slots);
+    }
+    let facts = capacity.facts(video, config.max_request_pool_size, local, codec_ranks)?;
+    crate::capacity::plan::request_layout(
+        report,
+        config,
+        queue_depth,
+        &facts,
+        components.holds_host(),
+    )
 }

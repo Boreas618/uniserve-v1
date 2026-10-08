@@ -9,6 +9,7 @@
 //! been integrated reports its call kind as unsupported, which fails the
 //! batch with `UnsupportedSetup` and leaves the rank serving.
 
+pub(crate) mod batch;
 pub(crate) mod canvas;
 pub(crate) mod experts;
 pub(crate) mod image;
@@ -59,20 +60,33 @@ pub(crate) fn execute(
         Forward(ForwardMode::TokenDenoising) => canvas::execute(backend, batch, kind),
         Transfer(_) => transfer::execute(backend, batch, kind),
         Media(MediaReading | VideoEncoding | AudioEncoding | Muxing) => {
-            media::execute(backend, batch, kind)
+            let (plan, state) = batch.media_parts();
+            let mut parts = backend.media_parts()?;
+            media::execute(&mut parts, plan, state)
         }
-        Media(VisionEncoding | ImageDecoding) => image::execute(backend, batch, kind),
-        Media(VideoDecoding | AudioDecoding) => video::execute(backend, batch, kind),
+        Media(ImageDecoding) => image::execute(backend, batch, kind),
+        Media(VideoDecoding | AudioDecoding) => {
+            let (plan, state) = batch.media_parts();
+            let mut parts = backend.media_parts()?;
+            video::execute(&mut parts, plan, state)
+        }
         // Encoders and denoisers serve both image and video models; the
         // component's model decides.
-        Media(TextEncoding | LatentEncoding | LatentPreparation | Denoising) => {
+        Media(VisionEncoding | TextEncoding | LatentEncoding | LatentPreparation | Denoising) => {
             if backend.video_model(batch) {
-                video::execute(backend, batch, kind)
+                let (plan, state) = batch.media_parts();
+                let mut parts = backend.media_parts()?;
+                video::execute(&mut parts, plan, state)
             } else {
                 image::execute(backend, batch, kind)
             }
         }
     }
+}
+
+/// Whether a batch of `route` runs as a media batch of the video runtime.
+pub(crate) fn media_route(route: Option<CallKind>, video: bool) -> bool {
+    video && matches!(route, Some(CallKind::Media(_)))
 }
 
 /// Whether a component's model decodes video.
