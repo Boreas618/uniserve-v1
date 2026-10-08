@@ -10,7 +10,8 @@
 
 use uniserve_cuda::{CopyBatch, SourceOrder};
 
-use super::batch::{TokenBatch, lock};
+use super::super::launch::lock;
+use super::batch::TokenBatch;
 use super::calls;
 use super::step::Stepped;
 use crate::storage::{LogprobLayout, ProductBuffer, Scalar};
@@ -258,7 +259,7 @@ impl TokenBatch<'_> {
         let runner = &self.runtime.runners[self.runner];
         runner.commit(commits).map_err(fatal)?;
         self.install_prompt_tails().map_err(fatal)?;
-        self.runtime.ordered(stream).map_err(fatal)?;
+        self.runtime.order.record(stream).map_err(fatal)?;
         self.requests.add_pending(&pending).map_err(fatal)
     }
 
