@@ -238,6 +238,12 @@ class Layer(PhasedLayer):
         # A checkpoint value per layer, in the model's weight dtype.
         self.layer_scalar = nn.Parameter(torch.ones(1), requires_grad=False)
 
+    @property
+    def state_widths(self) -> tuple[int, int]:
+        """``attend`` returns the stream and the attention output."""
+        size = self.input_norm.weight.shape[0]
+        return (size, size)
+
     def attend(
         self,
         hidden: torch.Tensor,
