@@ -43,6 +43,7 @@ use uniserve_ipc::{
 use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
 use super::launch::{HostStage, Launched, error_code, failed_output};
 use crate::error::WorkerError;
+use crate::executor::forward::token::warmup::with_scratch;
 use crate::executor::lifecycle::RequestStorage;
 use crate::executor::{BatchResult, PendingOutput, Submission};
 use crate::ffi::Device;
@@ -52,8 +53,9 @@ use crate::model::image::{ImageModel, ImagePolicy};
 use crate::request::diffusion::Trajectories;
 use crate::runner::GraphPool;
 use crate::runner::decoder::{DecodeImage, DecoderRunner};
-use crate::runner::diffusion::image::ImageDiffusion;
+use crate::runner::diffusion::image::{DenoiseRow, ImageDiffusion};
 use crate::runner::encoder::{EncoderRunner, PreparedImage, Tower};
+use crate::storage::KVCache;
 use crate::storage::memory::StorageView;
 use crate::storage::{OutputPool, UnitColumn};
 use crate::{Error, Outcome, Result};
@@ -82,6 +84,10 @@ pub(crate) struct ImageRuntime {
     units: Option<UnitColumn>,
     /// Graph pools of packed vision encoders, by encoder.
     pools: HashMap<usize, Arc<GraphPool<Handle>>>,
+    /// The denoising steps captured at startup, largest first, and their
+    /// graph pool; empty when flow graphs are off.
+    flow: Vec<start::FlowShape>,
+    flow_pool: Option<Arc<GraphPool<Handle>>>,
     /// Output words of a decoding batch's pixels at most.
     max_pixel_words: usize,
     outputs: OutputPool,
@@ -170,14 +176,81 @@ impl ImageRuntime {
         Ok(())
     }
 
-    /// Capture every packed vision encoder's graphs into its pool.
-    pub(crate) fn capture(&mut self) -> Result<()> {
+    /// Capture every packed vision encoder's graphs into its pool, then
+    /// the image denoiser's configured steps over scratch KV of `kv`.
+    pub(crate) fn capture(&mut self, kv: Option<&mut KVCache>) -> Result<()> {
         for (index, runner) in self.encoders.iter_mut().enumerate() {
             if let Some(pool) = self.pools.get(&index) {
                 runner.capture(Some(pool), &mut || Ok(()))?;
             }
         }
+        let (Some(pool), Some(kv)) = (self.flow_pool.clone(), kv) else {
+            return Ok(());
+        };
+        let shapes = self.flow.clone();
+        for shape in &shapes {
+            self.capture_flow(shape, &pool, kv)?;
+        }
+        if let Some((_, diffusion)) = &self.diffusion {
+            if let Some(stream) = diffusion.stream() {
+                stream.synchronize()?;
+            }
+            tracing::info!(
+                target: "uniserve_worker.warmup",
+                "captured {} image denoising graphs",
+                diffusion.captured()
+            );
+        }
         Ok(())
+    }
+
+    /// Capture one denoising step: `shape.images` images placed in the
+    /// step workspace as serving places them (consecutive whole pages from
+    /// its start), each evaluating `shape.branches` guidance branches over
+    /// one scratch slot's prefix.
+    fn capture_flow(
+        &mut self,
+        shape: &start::FlowShape,
+        pool: &Arc<GraphPool<Handle>>,
+        kv: &mut KVCache,
+    ) -> Result<()> {
+        let latents = self.latents()?;
+        let page_units = latents.pool.page_units() as u32;
+        let workspace = latents.workspace()?.clone();
+        let Some((_, diffusion)) = &mut self.diffusion else {
+            return Ok(());
+        };
+        let units = diffusion.layout().latent_rows(shape.height, shape.width)?;
+        let padded = units.div_ceil(page_units) * page_units;
+        let stream = diffusion
+            .stream()
+            // SAFETY: the lanes own the stream for the runtime's lifetime.
+            .map(|stream| unsafe { uniserve_cuda::Stream::borrowed(stream.device(), stream.raw()) })
+            .transpose()?;
+        // Captured samples start from zeros, as fresh scratch pages do.
+        workspace
+            .narrow(0, 0, i64::from(padded) * shape.images as i64)?
+            .zero(stream.as_ref())?;
+        let prefix = start::CAPTURE_PREFIX;
+        let mut rows = Vec::with_capacity(shape.images * shape.branches);
+        for image in 0..shape.images {
+            for _ in 0..shape.branches {
+                rows.push(DenoiseRow {
+                    sample: image as u32 * padded,
+                    units,
+                    height: shape.height,
+                    width: shape.width,
+                    slot: image as u32 + 1,
+                    prefix: prefix as u32,
+                    temporal: prefix as u64,
+                    timestep: 0.5,
+                });
+            }
+        }
+        let lengths = vec![prefix; shape.images];
+        with_scratch(kv, &lengths, stream.as_ref(), |kv| {
+            diffusion.capture(&rows, kv.tables(), pool, &mut || Ok(()))
+        })
     }
 
     /// The product arena of `device`.

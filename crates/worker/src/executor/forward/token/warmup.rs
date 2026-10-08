@@ -60,7 +60,7 @@ impl WarmupHooks for TextWarmup {
 
 /// Install scratch tables of `lengths` tokens for slots `1..`, run
 /// `operation`, then clear the tables and reset the scratch units.
-fn with_scratch<T>(
+pub(crate) fn with_scratch<T>(
     kv: &mut KVCache,
     lengths: &[usize],
     stream: Option<&uniserve_cuda::Stream>,

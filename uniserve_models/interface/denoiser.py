@@ -218,8 +218,8 @@ def bind(
                 workspace={},
             )
 
-    def evaluate(rows, batch, features=None) -> None:
-        """Run the network over the rows and write their predictions."""
+    def bind_rows(rows, batch, features=None):
+        """The network's typed input over the rows' column views."""
         latents = []
         for index, (offset, units, *_) in enumerate(rows):
             values = (
@@ -228,7 +228,7 @@ def bind(
                 else regions.view(products, features[index])
             )
             latents.append(LatentInput(values, timesteps[index : index + 1]))
-        typed = denoiser.bind_inputs(
+        return denoiser.bind_inputs(
             latents={"image": tuple(latents)},
             sizes=tuple(image.Config(row[2], row[3]) for row in rows),
             step=step,
@@ -238,6 +238,9 @@ def bind(
             sequence_lengths=tuple(row[5] for row in rows),
             attention=batch,
         )
+
+    def run(rows, typed) -> None:
+        """Evaluate the network and write each row's prediction."""
         result = denoiser(
             typed,
             state={},
@@ -251,6 +254,10 @@ def bind(
             if prediction is not None:
                 target.copy_(prediction.tensor.reshape(target.shape))
             pipeline.broadcast(target, src=pipeline.size - 1)
+
+    def evaluate(rows, batch, features=None) -> None:
+        """Run the network over the rows and write their predictions."""
+        run(rows, bind_rows(rows, batch, features))
 
     def batch(layout_args, writes: bool):
         """The attention batch the rows read (never causal)."""
@@ -301,6 +308,9 @@ def bind(
             context.bind_attention(inputs_batch, replay=False)
 
         def body():
+            # The denoiser binds its inputs inside the step: whatever it
+            # derives from the samples (SenseNova's conditioning pixels)
+            # must follow each replay's samples.
             with context.activate():
                 evaluate(rows, inputs_batch)
 

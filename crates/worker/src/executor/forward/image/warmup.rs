@@ -6,8 +6,11 @@
 //! posterior draws from the device's default generator there as serving
 //! startup always has. Every packed vision encoder then captures its slot
 //! counts `capacity..=1` into the graph pool reserved for it at startup
-//! (largest first, so smaller captures reuse pool blocks). Serving replays
-//! them; the image denoiser runs eagerly.
+//! (largest first, so smaller captures reuse pool blocks), and the image
+//! denoiser captures the configured denoising steps (image sizes, batch
+//! sizes and guidance branch counts that fit its columns and the latent
+//! pool), largest footprint first, over scratch KV. Serving replays an exact
+//! step and runs any other eagerly.
 
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
@@ -27,10 +30,12 @@ impl WarmupHooks for ImageWarmup {
     }
 
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
-        let Some(runtime) = backend.image_mut() else {
+        let parts = backend.parts();
+        let Some(runtime) = parts.image else {
             return Ok(());
         };
-        runtime.capture().map_err(|error| {
+        let kv = parts.storage.and_then(|storage| storage.kv.as_mut());
+        runtime.capture(kv).map_err(|error| {
             WorkerError::classify(error, Some("image graph capture")).with_phase("warmup")
         })
     }

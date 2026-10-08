@@ -19,11 +19,13 @@
 //! the latent pool's step workspace, into which the caller gathers each
 //! trajectory's committed pages.
 //!
-//! Graphs: each captured step evaluates a fixed number of rows of one image
-//! size at the configured attention widths ([`DiffusionShape`]); its host
-//! prefix lengths are rebound per replay. Startup captures the configured
-//! shapes largest first; serving replays an exact shape and runs any other
-//! eagerly. Solver updates always run eagerly.
+//! Graphs: each captured step evaluates a fixed set of rows of one image
+//! size at the configured attention widths ([`DiffusionShape`]): the rows'
+//! sample offsets fix where it reads latents, and rows pack their tokens
+//! and predictions in order. Host prefix lengths are rebound per replay.
+//! Startup captures the configured shapes largest first; serving replays an
+//! exact shape and runs any other eagerly. Solver updates always run
+//! eagerly.
 
 use std::sync::Arc;
 
@@ -44,12 +46,27 @@ use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable};
 use crate::{Error, Result};
 
-/// The geometry of a captured denoising step: its rows of one image size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// The geometry of a captured denoising step: its rows of one image size,
+/// by the first sample row each reads (rows of one image share it).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DiffusionShape {
-    pub rows: usize,
     pub height: u32,
     pub width: u32,
+    pub samples: Vec<u32>,
+}
+
+impl DiffusionShape {
+    /// The shape `rows` evaluate, when they share one image size.
+    pub fn of(rows: &[DenoiseRow]) -> Option<Self> {
+        let first = rows.first()?;
+        rows.iter()
+            .all(|row| (row.height, row.width) == (first.height, first.width))
+            .then(|| Self {
+                height: first.height,
+                width: first.width,
+                samples: rows.iter().map(|row| row.sample).collect(),
+            })
+    }
 }
 
 /// One denoising row: a guidance branch of one image.
@@ -505,17 +522,9 @@ impl ImageDiffusion {
             })
             .collect();
 
-        // One image size per evaluation can replay a captured shape.
-        let shape = rows.first().map(|first| DiffusionShape {
-            rows: rows.len(),
-            height: first.height,
-            width: first.width,
-        });
-        let uniform = rows.iter().all(|row| {
-            Some((row.height, row.width)) == shape.map(|shape| (shape.height, shape.width))
-        });
-        let graph = match shape {
-            Some(shape) if self.capturing && uniform && self.graphs.contains(&shape, None) => {
+        // A captured shape replays when the rows match it exactly.
+        let graph = match DiffusionShape::of(rows) {
+            Some(shape) if self.capturing && self.graphs.contains(&shape, None) => {
                 match self.graphs.lookup(&shape, None)? {
                     Lookup::Replay(graph) => Some(graph.clone()),
                     Lookup::Capture => None,
@@ -614,17 +623,20 @@ impl ImageDiffusion {
             .invoke(&[(&described).into(), (&plans).into()])
     }
 
-    /// Capture `shape` after an eager evaluation of `rows` (its warmup),
+    /// Capture the shape of `rows` after an eager evaluation of them (its
+    /// warmup),
     /// which gathered the geometry the graph reads. `check` runs after the
     /// capture (the graph storage budget); a failed check releases it.
     pub fn capture(
         &mut self,
-        shape: DiffusionShape,
         rows: &[DenoiseRow],
         tables: &BlockTables,
         pool: &Arc<GraphPool<Handle>>,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let shape = DiffusionShape::of(rows).ok_or_else(|| {
+            Error::Invalid("a captured denoising step evaluates rows of one image size".into())
+        })?;
         if self.graphs.contains(&shape, None) {
             return Ok(());
         }
@@ -673,6 +685,17 @@ impl ImageDiffusion {
         self.graphs.insert(shape, None, graph)?;
         self.capturing = true;
         Ok(())
+    }
+
+    /// Graphs captured so far.
+    pub fn captured(&self) -> usize {
+        self.graphs.len()
+    }
+
+    /// The graph pool's identity: the address of the runner's positions
+    /// column, which no other runner shares.
+    pub fn graph_key(&self) -> usize {
+        self.positions.address() as usize
     }
 
     /// Refuse further captures: serving replays what startup captured.
