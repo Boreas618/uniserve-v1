@@ -55,6 +55,7 @@ from uniserve_models.model import (
     ConditionRole,
     LatentInput,
     PatchEncoder,
+    TextEncoder,
     VideoDecoder,
     VideoDenoiser,
     VideoEncoder,
@@ -242,6 +243,7 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
     video_encoder = _unique(root, VideoEncoder)
     audio_encoder = _unique(root, AudioEncoder)
     vision = _unique(root, PatchEncoder)
+    text = _unique(root, TextEncoder)
     entries = loaded.description.entries
 
     def describe() -> dict[str, Any]:
@@ -383,13 +385,16 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
     def audio_latent_frames(samples: int) -> int:
         return int(audio.latent_frames(int(samples)))
 
-    def outputs(frames: int, tokens: int, rows: int) -> dict[str, Any]:
+    def outputs(
+        frames: int, tokens: int, rows: int, dtype: str
+    ) -> dict[str, Any]:
         """Products the model's components publish, bounded for any request.
 
         ``frames`` is the longest admitted video, ``tokens`` the prompt
-        capacity and ``rows`` the condition capacity (zero without
-        conditioned tasks). Each video product bounds the video of
-        ``frames`` frames at every canvas the deployment prepares.
+        capacity, ``rows`` the condition capacity (zero without conditioned
+        tasks) and ``dtype`` the model dtype the text encoder runs at. Each
+        video product bounds the video of ``frames`` frames at every canvas
+        the deployment prepares.
         """
         frames = int(frames)
         sizes = [
@@ -446,6 +451,12 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
                     "raster_axes": [2, 3],
                 },
             )
+        if text is not None:
+            layouts = text.output_layout(
+                int(tokens), getattr(torch, str(dtype).removeprefix("torch."))
+            )
+            for name, layout in layouts.items():
+                add(_owner(loaded, TextEncoder), _output(name, layout))
         track = audio.output_layout(track_samples(frames))["audio"]
         add(_owner(loaded, AudioDecoder), _output("audio_samples", track))
 
@@ -542,6 +553,20 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
             "reader_outputs": reader_outputs,
         }
     )
+
+
+def _replayer(stream: torch.cuda.Stream) -> Callable[[Any], None]:
+    """Replay a captured graph on the binding's stream.
+
+    A CUDA graph launches on the current stream; the worker orders its
+    inputs and outputs on the binding's stream, so replay must join it.
+    """
+
+    def replay(graph) -> None:
+        with torch.cuda.stream(stream):
+            graph.replay()
+
+    return replay
 
 
 def _translated(functions: dict[str, Any]) -> dict[str, Any]:
@@ -862,7 +887,7 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
         "release_layout": release_layout,
         "step": run,
         "capture": capture,
-        "replay": lambda graph: graph.replay(),
+        "replay": _replayer(context.stream),
         "release": lambda graph: graph.release(),
         "prepare_request": prepare_request,
         "encode_conditions": encode_conditions,
@@ -1128,7 +1153,6 @@ def bind_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
             "warm_segment": warm_segment,
             "warm_unit": warm_unit,
             "capture_segment": capture_segment,
-            "replay": lambda graph: graph.replay(),
             "release": lambda graph: graph.release(),
             "decode_unit": decode_unit,
             "kernels": kernels,

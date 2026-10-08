@@ -630,17 +630,19 @@ fn bind_rows(
     Ok(write)
 }
 
-/// Publish a call's written output and export it to its readers.
+/// Publish a call's output, written at `shape` from its leading elements,
+/// and export it to its readers.
 fn publish(
     parts: &Parts<'_>,
     batch: &mut MediaBatch,
     call: &Call,
     index: usize,
     write: &crate::ProductBuffer,
+    shape: &[u64],
 ) -> Result<()> {
     let owners = parts.owners();
     let stream = stream_of(batch)?;
-    owners.store.produced(write, &[], Some(&stream), None)?;
+    owners.store.produced(write, shape, Some(&stream), None)?;
     let (exported, locations) = export(
         owners,
         call,
@@ -650,7 +652,7 @@ fn publish(
         None,
         Some(&stream),
     )?;
-    batch.calls[index].exports.extend(locations);
+    batch.calls[index].exports.push((write.id(), locations));
     batch.calls[index].products.push(exported);
     Ok(())
 }
@@ -730,7 +732,14 @@ fn encode_text(
             "prompt features disagree with the request's prompt and the conditioning width".into(),
         ));
     }
-    publish(parts, batch, call, index, &write)
+    publish(
+        parts,
+        batch,
+        call,
+        index,
+        &write,
+        &[tokens.len() as u64, width],
+    )
 }
 
 /// Encode the vision blocks of a request's condition media into one
@@ -820,7 +829,7 @@ fn encode_vision(
             "vision features disagree with the request's placeholders".into(),
         ));
     }
-    publish(parts, batch, call, index, &write)
+    publish(parts, batch, call, index, &write, &[tokens, width])
 }
 
 /// Initialize a request's trajectory: its prepared sources, its refined
@@ -1073,7 +1082,7 @@ fn denoise(
         owners.store.write(&write, sample, Some(&stream), None)?;
         let (exported, locations) =
             export(owners, call, output, &write, false, None, Some(&stream))?;
-        batch.calls[index].exports.extend(locations);
+        batch.calls[index].exports.push((write.id(), locations));
         batch.calls[index].products.push(exported);
     }
     Ok(())
@@ -1204,7 +1213,7 @@ fn decode_video(
         None,
         Some(&stream),
     )?;
-    batch.calls[index].exports.extend(locations);
+    batch.calls[index].exports.push((write.id(), locations));
     batch.calls[index].products.push(exported);
     Ok(())
 }
@@ -1297,7 +1306,7 @@ fn decode_audio(
         None,
         Some(&stream),
     )?;
-    batch.calls[index].exports.extend(locations);
+    batch.calls[index].exports.push((write.id(), locations));
     batch.calls[index].products.push(exported);
     Ok(())
 }
@@ -1441,7 +1450,7 @@ fn encode_conditions(
                 None,
                 Some(&stream),
             )?;
-            batch.calls[index].exports.extend(locations);
+            batch.calls[index].exports.push((write.id(), locations));
             batch.calls[index].products.push(exported);
         }
         "condition_audio_latents" => {
@@ -1492,7 +1501,9 @@ fn encode_conditions(
                     "encoded audio tracks disagree with their planned rows".into(),
                 ));
             }
-            owners.store.produced(&write, &[], Some(&stream), None)?;
+            owners
+                .store
+                .produced(&write, &[rows, width], Some(&stream), None)?;
             let (exported, locations) = export(
                 owners,
                 call,
@@ -1502,7 +1513,7 @@ fn encode_conditions(
                 None,
                 Some(&stream),
             )?;
-            batch.calls[index].exports.extend(locations);
+            batch.calls[index].exports.push((write.id(), locations));
             batch.calls[index].products.push(exported);
         }
         other => {

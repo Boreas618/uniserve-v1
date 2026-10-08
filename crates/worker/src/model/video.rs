@@ -508,6 +508,7 @@ impl VideoModel {
         frames: u32,
         tokens: u32,
         rows: u32,
+        dtype: &str,
     ) -> Result<BTreeMap<String, Vec<OutputInfo>>> {
         let record = Record::new(
             "video.model.outputs",
@@ -515,6 +516,7 @@ impl VideoModel {
                 Any::from(i64::from(frames)),
                 Any::from(i64::from(tokens)),
                 Any::from(i64::from(rows)),
+                Any::from(tvm_ffi::String::from(dtype)),
             ])?,
         )?;
         let mut result = BTreeMap::new();
