@@ -285,6 +285,33 @@ impl KVCache {
         Ok(())
     }
 
+    /// Clear guidance prefix slots `slots` of `request` on `stream`
+    /// (ordered after every batch that read them) and forget them.
+    pub fn release_prefixes(
+        &mut self,
+        request: RequestKey,
+        slots: &[u32],
+        stream: Option<&Stream>,
+    ) -> Result<()> {
+        let slots = self.tables.release_slots(slots)?;
+        self.storage.clear(&slots, stream)?;
+        self.tables.release_prefixes(request, &slots);
+        Ok(())
+    }
+
+    /// Clear every guidance prefix slot `request` still holds.
+    pub fn release_request_prefixes(
+        &mut self,
+        request: RequestKey,
+        stream: Option<&Stream>,
+    ) -> Result<()> {
+        let slots = self.tables.prefix_slots(request);
+        if slots.is_empty() {
+            return Ok(());
+        }
+        self.release_prefixes(request, &slots, stream)
+    }
+
     /// Export a slot's visible KV extent (see [`kv_export::export`]).
     #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
     pub fn export(

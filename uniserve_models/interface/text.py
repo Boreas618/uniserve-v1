@@ -33,7 +33,12 @@ from typing import Any
 
 import torch
 
-from uniserve_models.model import Logits, TextInput, VocabShard
+from uniserve_models.model import (
+    EmbeddingReplacement,
+    Logits,
+    TextInput,
+    VocabShard,
+)
 from uniserve_models.nn.attention import (
     AttentionBatch,
     BlockTable,
@@ -266,7 +271,9 @@ def bind(
             ``start_pages``, ``cache_lengths``, ``query_lengths``,
             ``causal_values``, ``query_offsets``, ``prefix_offsets``,
             ``write_indices``, ``logit_rows``, ``draws``, ``params``,
-            ``tasks``, ``commit``), the outputs (``logits``, optional
+            ``tasks``, ``commit``; a multimodal binding also
+            ``input_embeddings`` and ``embedding_mask``), the outputs
+            (``logits``, optional
             ``hidden``, ``completion``, ``continuation``, ``tagged``,
             ``points``, ``transition``, ``logprobs``, ``prompt_tail``) and the
             per-slot state (``slot.unit_tables``, ``slot.start_pages``,
@@ -317,12 +324,25 @@ def bind(
                 with torch.cuda.stream(computation):
                     yield
 
-    def views(rows, tokens, queries, prefixes, starts, causal, writes, widths):
+    def views(
+        rows,
+        tokens,
+        queries,
+        prefixes,
+        starts,
+        causal,
+        writes,
+        widths,
+        axes=1,
+        embedded=False,
+    ):
         """Attention and token views of the fixed columns for one call.
 
         ``causal`` holds each row's causality; when the rows differ, the
         worker staged them in ``causal_values`` for readers that consume the
-        device column.
+        device column. ``axes`` is the rotary position axes the worker
+        staged (1, or 3 for prompts placing vision blocks); ``embedded``
+        replaces the masked tokens' embeddings with ``input_embeddings``.
         """
         query = SequenceLengths(
             values=b["query_lengths"][:rows],
@@ -370,10 +390,19 @@ def bind(
                     query.values[:, None].expand(-1, max(query.host or (1,))),
                     True,
                 )
+        embeddings = None
+        if embedded:
+            embeddings = EmbeddingReplacement(
+                b["input_embeddings"][:tokens],
+                b["embedding_mask"][:tokens].view(torch.bool),
+            )
         return TextInput(
             b["input_ids"][:tokens],
-            b["positions"][0, :tokens],
+            b["positions"][0, :tokens]
+            if int(axes) == 1
+            else b["positions"][: int(axes), :tokens],
             AttentionBatch(entries, query),
+            embeddings,
         )
 
     def project(hidden, indices, count, out=None):
@@ -651,6 +680,8 @@ def bind(
         sampling: Sequence[int],
         greedy_finish: int,
         prompt: Sequence[int],
+        axes: int = 1,
+        embedded: int = 0,
     ) -> None:
         """Evaluate one invocation; see the module documentation.
 
@@ -659,13 +690,25 @@ def bind(
         ``logit_count`` rows are projected for a non-decode invocation, at
         the ``logit_rows`` token positions or, with ``all_last``, at every
         row's last query token; a decode invocation's candidates are its
-        live rows' final-position logits.
+        live rows' final-position logits. ``axes`` is the rotary position
+        axes the worker staged (3 for prompts placing vision blocks) and
+        ``embedded`` replaces the masked tokens' embeddings with the staged
+        vision features; such invocations run eagerly.
         """
         rows, live, tokens = int(rows), int(live), int(tokens)
         with torch.inference_mode(), context.activate():
             gather(indexed, rows, live, tokens, widths)
             inputs = views(
-                rows, tokens, queries, prefixes, starts, causal, writes, widths
+                rows,
+                tokens,
+                queries,
+                prefixes,
+                starts,
+                causal,
+                writes,
+                widths,
+                axes,
+                bool(embedded),
             )
             context.bind_attention(inputs.attention, replay=graph is not None)
             hidden = None

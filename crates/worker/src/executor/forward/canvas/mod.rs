@@ -288,6 +288,7 @@ impl CanvasRuntime {
                     started,
                     stats,
                     timer: "canvas_materialize",
+                    host: None,
                 })
             }
             Err(failure) if failure.committed => Err(failure),

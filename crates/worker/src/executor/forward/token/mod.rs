@@ -24,6 +24,7 @@
 mod batch;
 mod calls;
 mod commit;
+mod context;
 pub(crate) mod start;
 mod step;
 pub(crate) mod warmup;
@@ -32,20 +33,25 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use uniserve_cuda::Stream;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferId, CallKind, ForwardMode, ForwardStats, RequestKey, Wake,
 };
 
 use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
 use super::launch::{Launched, StreamOrder, error_code, failed_output};
-use crate::Result;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
 use crate::executor::lifecycle::RequestStorage;
 use crate::request::decode_state::DecodeState;
+use crate::runner::TokenSelection;
 use crate::runner::graphs::GraphMode;
 use crate::runner::text::TextRunner;
+use crate::runner::text::{Executed, RowSource, StepContext, StepRequest, TokenRow};
+use crate::storage::{BlockTables, KVCacheManager};
 use crate::storage::{OutputPool, UnitColumn};
+use crate::transfer::Retirement;
+use crate::{Error, Result};
 
 use batch::TokenBatch;
 use commit::Failure;
@@ -86,6 +92,97 @@ impl TextRuntime {
     /// reading what text batches write (their KV) wait on it.
     pub(crate) fn order(&self) -> &StreamOrder {
         &self.order
+    }
+
+    /// The order of this runtime's batches, for other runtimes that also
+    /// write what text batches read (guidance prefixes, latent images'
+    /// K/V).
+    pub(crate) fn order_mut(&mut self) -> &mut StreamOrder {
+        &mut self.order
+    }
+
+    /// The device, stream and payload words of work that reads or writes
+    /// `component`'s K/V beside its text batches: its prefill runner's.
+    pub(crate) fn placement(
+        &self,
+        component: &str,
+    ) -> Result<(Option<i32>, Option<Stream>, usize)> {
+        let runner = self
+            .route(component, CallKind::Forward(ForwardMode::Prefill))
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "component {component:?} has no text prefill binding"
+                ))
+            })?;
+        let runner = &self.runners[runner];
+        let stream = runner
+            .stream()
+            // SAFETY: the lanes own the stream for the runtime's lifetime.
+            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
+            .transpose()?;
+        Ok((runner.device(), stream, 0))
+    }
+
+    /// Write the K/V of token prefixes, each from position zero of its
+    /// slot, with `component`'s prefill runner: guidance prefixes of image
+    /// trajectories. The prefixes are evaluated causally and only their K/V
+    /// is kept; slot continuation state is unchanged. The caller installed
+    /// the slots' block tables and retains their extents.
+    pub(crate) fn prefill_cache(
+        &mut self,
+        component: &str,
+        prefixes: &[(u32, &[u32])],
+        tables: &BlockTables,
+        cache: &mut KVCacheManager<Arc<Retirement>>,
+    ) -> Result<Executed> {
+        let runner = self
+            .route(component, CallKind::Forward(ForwardMode::Prefill))
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "component {component:?} has no text prefill binding"
+                ))
+            })?;
+        let rows: Vec<TokenRow> = prefixes
+            .iter()
+            .map(|&(slot, tokens)| {
+                Ok(TokenRow {
+                    slot,
+                    source: RowSource::Host {
+                        tokens: tokens.to_vec(),
+                        position: 0,
+                    },
+                    prefix: 0,
+                    query: u32::try_from(tokens.len())
+                        .map_err(|_| Error::Invalid("prefix exceeds the token range".into()))?,
+                    selection: TokenSelection::Cache,
+                    gated: false,
+                    force_finish: false,
+                    causal: true,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let stream = self.runners[runner]
+            .stream()
+            // SAFETY: the lanes own the stream for the runtime's lifetime.
+            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
+            .transpose()?;
+        self.order.wait(stream.as_ref())?;
+        let executed = self.runners[runner].execute(
+            &StepRequest {
+                decode: false,
+                rows: &rows,
+                sampling: None,
+                prompt: &[],
+                embeddings: &[],
+            },
+            &mut StepContext {
+                tables,
+                cache,
+                state: &self.state,
+            },
+        )?;
+        self.order.record(stream.as_ref())?;
+        Ok(executed)
     }
 
     pub(crate) fn set_wake(&self, _wake: Option<Wake>) {}
@@ -201,6 +298,7 @@ fn run(parts: Parts<'_>, plan: &BatchPlan) -> std::result::Result<Option<Launche
     };
     let mut batch = TokenBatch::open(
         runtime,
+        parts.image,
         storage,
         parts.requests,
         parts.info,
@@ -227,6 +325,7 @@ fn run(parts: Parts<'_>, plan: &BatchPlan) -> std::result::Result<Option<Launche
                 started,
                 stats,
                 timer: "text_materialize",
+                host: None,
             }))
         }
         Err(failure) if failure.committed => Err(failure),
