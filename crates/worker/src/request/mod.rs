@@ -1,5 +1,7 @@
 //! Request slots, call dependencies, and accepted execution progress.
 
+pub(crate) mod decode_state;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
