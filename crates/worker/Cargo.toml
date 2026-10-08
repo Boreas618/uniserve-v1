@@ -20,6 +20,16 @@ tvm-ffi.workspace = true
 uniserve-core.workspace = true
 uniserve-cuda.workspace = true
 uniserve-ipc.workspace = true
+uuid.workspace = true
+
+# A TVM-FFI library that Python GPU tests load to drive the native KV owners
+# with the real numerical interface (tests/python/integration/storage).
+[[example]]
+name = "storage_harness"
+crate-type = ["cdylib"]
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

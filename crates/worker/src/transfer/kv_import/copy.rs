@@ -7,8 +7,8 @@ use crate::{Completion, Error, HostAction, HostTask, Outcome};
 
 use super::{KVImport, KVImporter};
 
-/// Numerical copies and completion observers supplied by a language binding.
-/// Workspace admission, cancellation and physical retirement remain native.
+/// The copy work of one import. Workspace admission, cancellation and
+/// physical retirement belong to the importer.
 pub trait ImportBackend: Send + Sync + 'static {
     type Error: Send + Sync;
     type Callback: Send + Sync;
@@ -58,7 +58,7 @@ impl<B: ImportBackend> HostAction for ImportCopy<B> {
     type Output = ();
     type Error = B::Error;
     type Callback = Box<dyn FnOnce() + Send>;
-    type Wake = Box<dyn Fn() + Send + Sync>;
+    type Wake = uniserve_ipc::Wake;
 
     fn ready(&self) -> Result<bool, Self::Error> {
         Ok(true)
@@ -79,11 +79,10 @@ impl<B: ImportBackend> HostAction for ImportCopy<B> {
             self.importer
                 .require_active(&self.write)
                 .map_err(B::error)?;
+            // Transport reads run on other streams, but each records its
+            // handoff on the workspace stream after this reset, and every
+            // transport copy waits on its handoff before writing.
             self.backend.reset(&workspace)?;
-
-            // Transport reads use other streams. Reset the destination before
-            // those streams can start writing it.
-            self.backend.drain(&workspace)?;
             self.backend.copy(&workspace)
         })();
 
@@ -128,7 +127,7 @@ impl<B: ImportBackend> HostAction for ImportCopy<B> {
     }
 
     fn wake(wake: &Self::Wake) {
-        wake();
+        wake.wake();
     }
 
     fn error(error: Error) -> Self::Error {
