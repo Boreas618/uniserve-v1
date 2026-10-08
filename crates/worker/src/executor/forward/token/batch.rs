@@ -41,7 +41,8 @@ pub(super) struct CallState {
     /// The call's input index among the invocation's sampled tasks.
     pub(super) task: Option<usize>,
     pub(super) metadata: Option<SamplingMetadata>,
-    pub(super) prompt: Option<super::step::PromptScore>,
+    /// The call's prompt chunks, in order.
+    pub(super) prompt: Vec<super::step::PromptScore>,
 }
 
 /// A token batch's borrowed owners and the resources it reserved.
@@ -130,7 +131,7 @@ impl<'a> TokenBatch<'a> {
                 completion_write: None,
                 task: None,
                 metadata: None,
-                prompt: None,
+                prompt: Vec::new(),
             });
         }
 
