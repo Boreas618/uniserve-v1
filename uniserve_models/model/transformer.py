@@ -70,6 +70,16 @@ class PhasedLayer(nn.Module):
     def write_cache(self, hidden, residual, positions, attention) -> None:
         raise NotImplementedError
 
+    @property
+    def state_widths(self) -> tuple[int, ...]:
+        """Per-token widths of the tensors ``attend`` returns, in order.
+
+        Every state tensor is ``[tokens, width]`` in the layer's stream
+        dtype, so a caller can hold the state of a bounded token count in
+        storage it allocates before any evaluation.
+        """
+        raise NotImplementedError
+
 
 class TransformerDecoder(nn.Module):
     """Traverse resident layers, carrying a separate residual stream.
@@ -271,6 +281,22 @@ class TransformerDecoder(nn.Module):
         else:
             state = (hidden,) if residual is None else (hidden, residual)
         return tuple(traversal.partition.gather(value) for value in state)
+
+    @property
+    def attend_widths(self) -> tuple[int, ...]:
+        """Per-token widths of the final stage's ``attend`` state, in order.
+
+        The final layer's ``PhasedLayer.state_widths`` when it splits,
+        otherwise its ``(hidden, residual)`` streams (one stream for
+        complete-stream layers). Each state tensor is ``[tokens, width]``
+        in the stream dtype.
+        """
+        layer = next(reversed(self.layers.values()))
+        if isinstance(layer, PhasedLayer):
+            return layer.state_widths
+        if self.separate_residual:
+            return (self.hidden_size, self.hidden_size)
+        return (self.hidden_size,)
 
     def finish(
         self, state: tuple[torch.Tensor, ...], rows: torch.Tensor

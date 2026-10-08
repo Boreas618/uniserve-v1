@@ -49,8 +49,8 @@ follow the pinned Transformers ``DiffusionGemmaGenerationMixin``:
   word 0).
 
 The CPU path composes the portable primitives of
-``uniserve_models.diffusion.tokens`` and matches the reference's arithmetic. CUDA
-calls run the fused kernels of ``uniserve_kernels.diffusion.canvas`` and
+``uniserve_models.diffusion.tokens`` and matches the reference's arithmetic.
+CUDA calls run the fused kernels of ``uniserve_kernels.diffusion.canvas`` and
 raise when no kernel accepts the operands. The kernels reproduce the
 Philox draws, the renoise and initial tokens, the argmax and the Gumbel
 comparison exactly (up to near-ties of perturbed scores within FP32
@@ -78,6 +78,7 @@ __all__ = [
     "CanvasState",
     "CanvasWorkspace",
     "advance_canvas",
+    "commit_rows",
     "condition_canvas",
     "denoise_canvas",
     "score_canvas",
@@ -615,3 +616,25 @@ def denoise_canvas(
         scores, state, sampling, decision=decision, vocab_size=logits.shape[-1]
     )
     condition_canvas(workspace, embedding, embedding_scale, state)
+
+
+def commit_rows(
+    bank: torch.Tensor, slots: torch.Tensor, values: torch.Tensor
+) -> None:
+    """Write row ``i`` of ``values`` to row ``slots[i]`` of ``bank``.
+
+    ``bank`` holds one row per slot along its leading axis; row zero is a
+    padding sentinel that no commit writes, so a zero slot skips its row.
+    ``values`` has one row per entry of the int64 ``slots`` column and the
+    shape of a bank row after it (a bank row may be wider along its leading
+    stride, as a shortened history view is). Positive slots are distinct.
+    Nothing is read on the host on CUDA, so a CUDA graph may capture the
+    commit.
+    """
+    if values.shape[0] != slots.shape[0]:
+        raise ValueError("a commit writes one value row per slot")
+    if bank.is_cuda:
+        _kernels().commit_rows(bank, slots, values)
+        return
+    selected = slots > 0
+    bank[slots[selected]] = values[selected]
