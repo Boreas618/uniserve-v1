@@ -1836,6 +1836,26 @@ impl TensorStore {
         Ok(())
     }
 
+    /// The persistent product arena of `device` as one `uint8` dimension:
+    /// every persistent product placed on the device is a window of it, so
+    /// numerical bindings can receive it once and name products by region
+    /// (`ffi::Region`).
+    pub fn arena(&self, device: Device) -> Result<StorageView> {
+        let memory = lock(&self.buffer_pool)
+            .backing(&device_name(device))
+            .cloned()
+            .ok_or_else(|| {
+                Error::Invalid(format!("the product store has no arena on {device:?}"))
+            })?;
+        let bytes = crate::ffi::Backing::len(memory.as_ref());
+        StorageView::contiguous(
+            memory as Arc<dyn crate::ffi::Backing>,
+            0,
+            DType::U8,
+            &[bytes as i64],
+        )
+    }
+
     /// Bytes of relay arenas allocated on `device`.
     pub fn resident_bytes(&self, device: Device) -> usize {
         let name = device_name(device);

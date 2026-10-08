@@ -5,6 +5,7 @@ pub(crate) mod forward;
 mod inputs;
 pub mod lifecycle;
 mod pending;
+pub(crate) mod products;
 
 pub use inputs::{BatchInputs, InputReady, InputWait};
 pub use pending::{BatchResult, PendingOutput, request_output};

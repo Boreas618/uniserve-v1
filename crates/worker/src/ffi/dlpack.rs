@@ -31,8 +31,12 @@ impl Device {
                 device_type: DLDeviceType::kDLCPU,
                 device_id: 0,
             },
+            // Page-locked memory crosses as CPU memory: torch imports no
+            // `kDLCUDAHost` tensor, and it recognizes the pages as pinned
+            // from the pointer itself, so non-blocking copies stay
+            // asynchronous.
             Self::CudaHost => DLDevice {
-                device_type: DLDeviceType::kDLCUDAHost,
+                device_type: DLDeviceType::kDLCPU,
                 device_id: 0,
             },
             Self::Cuda(device) => DLDevice {

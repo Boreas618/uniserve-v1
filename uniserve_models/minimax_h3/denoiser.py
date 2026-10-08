@@ -103,9 +103,9 @@ def schedules(
     """Build the checkpoint's video and audio schedules.
 
     The uniform grid follows the released diffusers schedule
-    (``uniserve_models.diffusion.uniform_grid``); a DMD ladder shifts its trained
-    rungs once per modality (``ladder``); a PDD grid evaluates its block
-    nodes (``block_grid``).
+    (``uniserve_models.diffusion.uniform_grid``); a DMD ladder shifts its
+    trained rungs once per modality (``ladder``); a PDD grid evaluates its
+    block nodes (``block_grid``).
     """
     schedule = config.schedule
     result = {}
@@ -615,7 +615,13 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             text_features=text_features,
         )
 
-    def _sequence_group(self):
+    def sequence_group(self):
+        """The process group whose ranks shard the denoiser's samples.
+
+        Each rank holds one contiguous range of a sample's canonical rows,
+        the ranges in group rank order; a group of size one holds them all.
+        Library callers gather the final samples over it before decoding.
+        """
         # The sequence group spans the mesh axes that shard the token
         # dimension of the attention input. Resident layers are
         # TransformerLayers whose merged attention branches are
@@ -640,7 +646,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             num_text_tokens=size.num_text_tokens,
             num_frames=size.num_frames,
             canvas=size.canvas,
-            token_multiple=64 * math.lcm(4, self._sequence_group().size),
+            token_multiple=64 * math.lcm(4, self.sequence_group().size),
             text_rows=None if layout is None else layout.num_text_tokens,
         )
 
@@ -651,7 +657,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             canvas=layout.canvas,
             text_rows=layout.num_text_tokens,
             condition_rows=layout.condition_rows,
-            token_multiple=128 * self._sequence_group().size,
+            token_multiple=128 * self.sequence_group().size,
         )
 
     def _region_packing(self, layout: DenoiserSize) -> RegionPacking:
@@ -662,7 +668,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             text_rows=layout.num_text_tokens,
             condition_rows=layout.condition_rows,
             tile=self._tile,
-            token_multiple=self._tile * self._sequence_group().size,
+            token_multiple=self._tile * self.sequence_group().size,
         )
 
     def _padded_tokens(self, layout: DenoiserSize) -> int:
@@ -673,7 +679,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return self._tile_packing(layout).padded_tokens
 
     def _token_slice(self, padded_tokens: int) -> slice:
-        group = self._sequence_group()
+        group = self.sequence_group()
         width = padded_tokens // group.size
         return slice(group.rank * width, (group.rank + 1) * width)
 
@@ -810,7 +816,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         width = self._rotary_width()
         if self.dense:
             packing = self._dense_packing(size)
-            rows = packing.padded_tokens // self._sequence_group().size
+            rows = packing.padded_tokens // self.sequence_group().size
             return {
                 **samples,
                 "prefix_index": BufferConfig((rows,), torch.int64),
@@ -823,7 +829,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         if self.regional:
             packing = self._region_packing(size)
             rows = packing.padded_tokens
-            local = rows // self._sequence_group().size
+            local = rows // self.sequence_group().size
             tiles = rows // packing.tile
             return {
                 **samples,
@@ -1265,7 +1271,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
             attention = SequenceInput(
                 self._token_slice(tokens),
-                self._sequence_group(),
+                self.sequence_group(),
                 VisibleInput(
                     lengths,
                     lengths,
@@ -1283,7 +1289,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             tokens = packing.padded_tokens
             attention = RegionInput(
                 self._token_slice(tokens),
-                self._sequence_group(),
+                self.sequence_group(),
                 vsa.Regions(
                     packing.tile,
                     tokens,
@@ -1302,7 +1308,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             attention = AttentionInput(
                 tiles,
                 self._token_slice(tokens),
-                self._sequence_group(),
+                self.sequence_group(),
                 vsa.Input(
                     tiles.padded_tokens,
                     tiles.prefix_tiles,

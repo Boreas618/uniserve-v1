@@ -169,6 +169,11 @@ impl<A> BufferPool<A> {
         self.arenas.values().map(|arena| &arena.backing)
     }
 
+    /// The arena of `device` (a locator name such as `cuda:0`), if any.
+    pub fn backing(&self, device: &str) -> Option<&A> {
+        self.arenas.get(device).map(|arena| &arena.backing)
+    }
+
     /// After physical accesses retire, return arena owners for destruction
     /// outside the pool lock. Existing views retain their storage.
     pub fn close(&mut self) -> Vec<A> {
