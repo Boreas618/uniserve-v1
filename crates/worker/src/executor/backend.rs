@@ -297,6 +297,24 @@ impl WorkerBackend {
         }
     }
 
+    /// Install (or clear) the service's completion wake on every storage
+    /// owner.
+    pub fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
+        for owner in &self.storage {
+            owner.set_wake(wake.clone());
+        }
+    }
+
+    /// Close every storage owner, newest first, after the executor drained;
+    /// returns the first failure.
+    pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
+        let mut result = Ok(());
+        while let Some(mut owner) = self.storage.pop() {
+            result = result.and(owner.close(aborted));
+        }
+        result
+    }
+
     /// Release request references after the executor drained its work.
     pub fn close(&mut self) {
         self.requests.close();

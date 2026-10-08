@@ -283,16 +283,16 @@ impl LoadedModel {
         ModelFacts::from_record(&record)
     }
 
-    /// The KV layout for `block_size`-token pages of the widest rows.
-    /// `kv_dtype` is empty for the compute dtype.
+    /// The KV layout for `block_size`-token pages of the widest rows, as
+    /// `model.cache_plan` returns it. `kv_dtype` is `None` for the compute
+    /// dtype.
     pub fn cache_plan(
         &self,
         interface: &Interface,
         block_size: usize,
         kv_dtype: Option<&str>,
-    ) -> Result<crate::capacity::plan::CachePlan> {
-        let function = interface.function("model.cache_plan")?;
-        let value = function.call_values(&[
+    ) -> Result<Any> {
+        let value = interface.function("model.cache_plan")?.call_values(&[
             self.handle.to_any(),
             Any::from(block_size as i64),
             Any::from(tvm_ffi::String::from(kv_dtype.unwrap_or(""))),
@@ -302,7 +302,17 @@ impl LoadedModel {
                 "model.cache_plan describes no cache for a causal LM".into(),
             ));
         }
-        crate::capacity::plan::CachePlan::from_record(&Record::new("model.cache_plan", value)?)
+        Ok(value)
+    }
+
+    /// Whether the attention `backend` reads every resident layer's pages
+    /// of a `cache_plan` layout.
+    pub fn reads_pages(&self, interface: &Interface, backend: &str, plan: &Any) -> Result<bool> {
+        interface.function("model.reads_pages")?.call_as(&[
+            self.handle.view(),
+            (&Any::from(tvm_ffi::String::from(backend))).into(),
+            plan.into(),
+        ])
     }
 }
 

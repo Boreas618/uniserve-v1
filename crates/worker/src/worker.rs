@@ -22,15 +22,19 @@
 //! world, then deferred device memory.
 
 mod lanes;
+mod storage;
 
 pub use lanes::{Lane, Lanes};
+pub use storage::RankStorage;
 
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
 use tvm_ffi::Any;
 use uniserve_core::ComponentConfig;
-use uniserve_cuda::{DeviceId, HandleType, PrimaryContext};
-use uniserve_ipc::{CallKind, ComponentInfo, WorkerEndpoint, WorkerInfo};
+
+use uniserve_cuda::{DeviceId, HandleType, PrimaryContext, Stream};
+use uniserve_ipc::{CallKind, ComponentInfo, ForwardMode, WorkerEndpoint, WorkerInfo};
 
 use crate::capacity::checks;
 use crate::capacity::device::{DeviceBudget, total_bytes};
@@ -55,6 +59,9 @@ use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
 use crate::runner::{GraphStorage, graph_storage_budget_bytes};
 use crate::service::Service;
+use crate::storage::{GroupShape, KVCache, KVPlan};
+use crate::stream::{CUDAStream, EventPool};
+use crate::transfer::{Capacity, TransportKind, TransportOptions, Transports};
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
 
@@ -233,6 +240,7 @@ impl Worker {
             &world,
             budget.as_ref(),
             &components,
+            lanes.lanes().len().max(1),
         )
         .map_err(phase("capacity"))?;
         if let Some(budget) = &budget {
@@ -245,8 +253,11 @@ impl Worker {
             .map_err(|error| phase("capacity")(Error::Invariant(error.to_string())))?;
         log_capacity(&config, &plan);
 
+        let storage = allocate_storage(&launch, &interface, &config, &plan, &lanes)
+            .map_err(phase("storage"))?;
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
+        backend.add_storage(Box::new(storage));
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
             .map(|profile| {
@@ -433,7 +444,12 @@ impl Worker {
             .executor
             .as_mut()
             .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
-        Service::new(executor, endpoint.server(), info, experts).run()
+        executor
+            .backend()
+            .set_storage_wake(Some(endpoint.completion_wake()));
+        let served = Service::new(executor, endpoint.server(), info, experts).run();
+        executor.backend().set_storage_wake(None);
+        served
     }
 
     /// Release every owner in dependency order. An aborted close never
@@ -464,6 +480,8 @@ impl Worker {
                 record(executor.close());
             }
             let closed = executor.backend_mut().components_mut().close(aborted);
+            record(closed.map_err(WorkerError::from));
+            let closed = executor.backend_mut().close_storage(aborted);
             record(closed.map_err(WorkerError::from));
             if aborted {
                 // Batches may still reference device work.
@@ -644,6 +662,88 @@ impl Drop for Worker {
     }
 }
 
+/// Allocate the storage owners on the plan: device events, the product
+/// transports and the KV cache of a text model, whose planes are reset on
+/// the device's preparation stream.
+fn allocate_storage(
+    launch: &WorkerLaunch,
+    interface: &Interface,
+    config: &WorkerConfig,
+    plan: &Plan,
+    lanes: &Lanes,
+) -> Result<RankStorage> {
+    let events = EventPool::new();
+    let kinds = launch
+        .data_plane
+        .backends
+        .iter()
+        .map(|name| TransportKind::parse(name))
+        .collect::<Result<Vec<_>>>()?;
+    let capacity = Arc::new(Capacity::new(
+        plan.arena.transfer_bytes,
+        plan.arena.transfer_tickets,
+        storage::notify,
+    )?);
+    let options = TransportOptions {
+        source: plan.info.endpoint.clone(),
+        acknowledgment_slot: launch.ipc.acknowledgment_slot as usize,
+        host_slots: launch
+            .ipc
+            .host_slots
+            .iter()
+            .map(|&slot| slot as usize)
+            .collect(),
+        cross_host_consumers: launch.ipc.products_cross_hosts,
+        vmm_pool_bytes: plan.arena.transfer_bytes,
+    };
+    let transports = Transports::new(&kinds, capacity, Arc::clone(&events), &options)?;
+
+    let device = config.primary_device().cuda_index();
+    let preparation = device.and_then(|index| lanes.preparation(DeviceId(index)));
+    let kv = match (&plan.cache, &plan.info.kv_cache) {
+        (Some(cache), Some(info)) => Some(KVCache::new(
+            Arc::clone(cache),
+            info.num_units,
+            plan.info.request_slots,
+            cache_width(&cache.group_shapes()?, config.max_sequence_tokens),
+            plan.info.max_unresolved_calls as usize,
+            device,
+            preparation.map(CUDAStream::stream).transpose()?,
+            &interface.function("cache.bind_units")?,
+            &interface.function("cache.bind_conversion")?,
+        )?),
+        _ => None,
+    };
+    if let Some(stream) = preparation {
+        stream.synchronize()?;
+    }
+    // Slot releases order after the token batches that read them.
+    let release_stream = match device {
+        Some(index) => lanes
+            .stream_for(CallKind::Forward(ForwardMode::Decode), DeviceId(index))
+            .map(|stream| -> Result<Stream> {
+                // SAFETY: the lanes own the stream and close after the
+                // storage owners (see `Worker::close`).
+                Ok(unsafe { Stream::borrowed(DeviceId(index), stream.handle()?) }?)
+            })
+            .transpose()?,
+        None => None,
+    };
+    Ok(RankStorage::new(events, transports, kv, release_stream))
+}
+
+/// Block-table width that holds the longest admitted sequence in every
+/// group.
+fn cache_width(shapes: &[GroupShape], max_sequence_tokens: usize) -> u32 {
+    shapes
+        .iter()
+        .map(|shape| shape.resident_width(max_sequence_tokens as u64))
+        .max()
+        .unwrap_or(1)
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
 /// Report the planned capacity once, for operators.
 fn log_capacity(config: &WorkerConfig, plan: &Plan) {
     let info = &plan.info;
@@ -703,6 +803,7 @@ fn plan(
     world: &World,
     budget: Option<&DeviceBudget>,
     components: &Components,
+    unit_columns: usize,
 ) -> Result<Plan> {
     let device = config.primary_device();
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
@@ -717,9 +818,8 @@ fn plan(
         config.block_size,
         |size| {
             if text {
-                Ok(model
-                    .cache_plan(interface, size, kv_dtype.as_deref())?
-                    .readable)
+                let plan = model.cache_plan(interface, size, kv_dtype.as_deref())?;
+                model.reads_pages(interface, &facts.attention_backend, &plan)
             } else {
                 Ok(true)
             }
@@ -825,13 +925,29 @@ fn plan(
             .iter()
             .any(|placed| placed.has(Capability::CausalLm))
     {
-        let cache = model.cache_plan(interface, block_size, kv_dtype.as_deref())?;
+        let cache =
+            KVPlan::decode(model.cache_plan(interface, block_size, kv_dtype.as_deref())?)?;
         let total = match device {
             Device::Cuda(index) => total_bytes(index)?,
             Device::Cpu => 0,
         };
-        layout.fit_cache(&cache, config, total, &world.host)?;
-        Some(cache)
+        // The cache's fixed storage beside its units: block tables, import
+        // scratch and one unit index column per import worker and lane.
+        let shapes = cache.group_shapes()?;
+        let width = cache_width(&shapes, config.max_sequence_tokens);
+        let import_capacity = layout.info().max_unresolved_calls as usize;
+        let fixed = KVCache::fixed_bytes(
+            &cache,
+            0,
+            layout.info().request_slots,
+            width,
+            import_capacity,
+            unit_columns,
+        )?;
+        layout.reserve(&config.device, fixed);
+        let columns = KVCache::import_workers(import_capacity) + unit_columns;
+        layout.fit_cache(&cache, 8 * columns as u64, config, total, &world.host)?;
+        Some(Arc::new(cache))
     } else {
         None
     };
