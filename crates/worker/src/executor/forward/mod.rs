@@ -5,15 +5,20 @@
 //! image, video, host media (`media`), transfers (`transfer`); expert-only
 //! ranks participate in expert steps through `experts`. These modules are
 //! the integration seam of the capability runtimes: each owns its runners,
-//! input preparation and result materialization. A runtime that has not
-//! been integrated reports its call kind as unsupported, which fails the
-//! batch with `UnsupportedSetup` and leaves the rank serving.
+//! its own input preparation and result materialization. Inputs imported
+//! from other ranks and workers are prepared for every runtime alike
+//! (`inputs`), and products are published to them alike (`products`). A
+//! runtime that has not been integrated reports its call kind as
+//! unsupported, which fails the batch with `UnsupportedSetup` and leaves
+//! the rank serving.
 
 pub(crate) mod canvas;
 pub(crate) mod experts;
 pub(crate) mod image;
+pub(crate) mod inputs;
 pub(crate) mod launch;
 pub(crate) mod media;
+pub(crate) mod products;
 pub(crate) mod token;
 pub(crate) mod transfer;
 pub(crate) mod video;
