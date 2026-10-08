@@ -45,6 +45,10 @@ use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
+use crate::executor::forward::canvas::warmup::CanvasWarmup;
+use crate::executor::forward::canvas::{
+    CanvasRuntime, Startup as CanvasStartup, reserved_bytes as canvas_bytes,
+};
 use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::token::start::{Startup, TextBounds, reserved_bytes};
 use crate::executor::forward::token::warmup::TextWarmup;
@@ -300,12 +304,32 @@ impl Worker {
             preparation,
         })
         .map_err(phase("bind"))?;
+        let canvas = CanvasRuntime::start(CanvasStartup {
+            interface: &interface,
+            config: &config,
+            request_slots: info.request_slots as usize,
+            queue_depth: launch.ipc.queue_depth,
+            max_payload_bytes: launch.ipc.max_payload_bytes,
+            model: &model,
+            experts: expert_exchange(&launch),
+            lanes: &lanes,
+            kv: storage.kv.as_ref(),
+            components: &mut components,
+            workspaces: &mut workspaces,
+            graphs: &mut graphs,
+            preparation,
+        })
+        .map_err(phase("bind"))?;
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
         backend.set_rank_storage(storage);
         let text_warmup = text.is_some();
         if let Some(text) = text {
             backend.set_text(text);
+        }
+        let canvas_warmup = canvas.is_some();
+        if let Some(canvas) = canvas {
+            backend.set_canvas(canvas);
         }
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
@@ -340,6 +364,9 @@ impl Worker {
                     .min(config.max_batch_tokens)
                     .max(1),
             }));
+        }
+        if canvas_warmup {
+            hooks.push(Box::new(CanvasWarmup));
         }
 
         tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", facts.model_name);
@@ -528,7 +555,7 @@ impl Worker {
                 record(executor.close());
             }
             // Graphs and steps release before the bindings they run.
-            let closed = executor.backend_mut().close_text(aborted);
+            let closed = executor.backend_mut().close_runtimes(aborted);
             record(closed.map_err(WorkerError::from));
             let closed = executor.backend_mut().components_mut().close(aborted);
             record(closed.map_err(WorkerError::from));
@@ -686,6 +713,14 @@ impl Worker {
             records
                 .add(&label, &binding.device.to_string(), &kernels)
                 .map_err(phase("warmup"))?;
+        }
+        if let Some(canvas) = executor.backend_mut().canvas_mut() {
+            for (label, kernels) in canvas.kernels().map_err(phase("warmup"))? {
+                records
+                    .add(&label, &self.config.device, &kernels)
+                    .map_err(phase("warmup"))?;
+            }
+            canvas.seal();
         }
         records.log("startup", self.config.rank, &self.config.device);
         if let Some(text) = executor.backend_mut().text_mut() {
@@ -1044,6 +1079,20 @@ fn plan(
                 unit_columns,
             )?,
         );
+        // The canvas runners' buffers and the resident canvas banks.
+        layout.reserve(
+            &config.device,
+            canvas_bytes(
+                interface,
+                model,
+                components,
+                expert_exchange(launch),
+                config,
+                layout.info().request_slots as usize,
+                &cache,
+                unit_columns,
+            )?,
+        );
         let columns = KVCache::import_workers(import_capacity) + unit_columns;
         layout.fit_cache(&cache, 8 * columns as u64, config, total, &world.host)?;
         Some(Arc::new(cache))
@@ -1064,4 +1113,19 @@ fn plan(
         plan.bound_graph_calls(prefill, decode);
     }
     Ok(plan)
+}
+
+/// Whether routed experts use an expert exchange, and the attention ranks of
+/// a disaggregated expert union (zero when every rank holds its experts).
+fn expert_exchange(launch: &WorkerLaunch) -> (bool, usize) {
+    launch.expert_parallel.as_ref().map_or((false, 0), |union| {
+        (
+            true,
+            if union.disaggregated() {
+                union.attention_ranks
+            } else {
+                0
+            },
+        )
+    })
 }
