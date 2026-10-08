@@ -65,8 +65,16 @@ def prepare(loaded, request: Mapping[str, Any]) -> list[Any]:
     path = str(request["path"])
     module = loaded.module.get_submodule(path) if path else loaded.module
     stream = int(request["stream"])
+    device = int(request.get("device", -1))
+    # A stream of the binding's device places a module without parameters
+    # (such as a pixel-space image decoder) on that device.
+    execution = (
+        torch.cuda.ExternalStream(stream, device=torch.device("cuda", device))
+        if stream and device >= 0
+        else (stream or None)
+    )
     options = {
-        "stream": stream if stream else None,
+        "stream": execution,
         "cache": request.get("cache"),
         "attention": str(request["attention"])
         if str(request["attention"]) != "auto"
