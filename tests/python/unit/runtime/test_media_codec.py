@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from uniserve.nn.video import blend_decoded_overlap
+from uniserve_models.nn.video import blend_decoded_overlap
 
 pytestmark = pytest.mark.unit
 

@@ -27,8 +27,8 @@ use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use uniserve_worker_ipc::{Batch, DEFAULT_COMPONENT, WorkerInfo, WorkerRequest, WorkerResponse};
-use uniserve_worker_ipc::{Frame, Outstanding, RankChannel};
+use uniserve_ipc::{Batch, DEFAULT_COMPONENT, WorkerInfo, WorkerRequest, WorkerResponse};
+use uniserve_ipc::{Frame, Outstanding, RankChannel};
 
 /// How long the head waits for a rank's socket channel to accept.
 ///
@@ -74,7 +74,7 @@ const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// without a death watcher.
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use uniserve_worker_ipc::LaneConfig;
+pub use uniserve_ipc::LaneConfig;
 
 /// FlashInfer implementation selected in [`WorkerProcessArgs`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,7 +150,7 @@ impl Default for WorkerProcessArgs {
             // row reserve a runtime keeps outside it.
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
                 + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
-            attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
+            attention_backend: uniserve_ipc::AttentionBackend::Auto,
             capability_groups: Vec::new(),
             transfer: Default::default(),
             load_format: "auto".to_string(),
@@ -226,9 +226,9 @@ impl WorkerProcessArgs {
     /// elsewhere has none to offer and serves a socket.
     fn channel_transport(&self, rank: u32) -> &'static str {
         if self.ranks[rank as usize].node == self.host {
-            uniserve_worker_ipc::SHARED_STORAGE_CHANNEL
+            uniserve_ipc::SHARED_STORAGE_CHANNEL
         } else {
-            uniserve_worker_ipc::SOCKET_CHANNEL
+            uniserve_ipc::SOCKET_CHANNEL
         }
     }
 
@@ -1025,7 +1025,7 @@ impl RankProcess {
         loop {
             let pending = match self.client.send_request_attempt(req) {
                 Ok(pending) => Some(pending),
-                Err(uniserve_worker_ipc::IpcError::WouldBlock) => None,
+                Err(uniserve_ipc::IpcError::WouldBlock) => None,
                 Err(error) => return Err(error.into()),
             };
             // An unconnected shared-storage request reaches no one; it drops at
@@ -1082,7 +1082,7 @@ impl RankProcess {
     /// Returns how many responses were routed and the wakes drained before
     /// the scan. A transport, execution, or routing error stops the scan and
     /// is returned; responses routed before it stay in `ready`.
-    fn drain_ready(&mut self) -> anyhow::Result<(usize, uniserve_worker_ipc::WakeEvents)> {
+    fn drain_ready(&mut self) -> anyhow::Result<(usize, uniserve_ipc::WakeEvents)> {
         let wakes = self.client.drain_wakes()?;
         let ids = self.pending.keys().copied().collect::<Vec<_>>();
         let mut drained = 0usize;
@@ -1215,7 +1215,7 @@ impl RankProcess {
         req.set_call_id(Some(message_id));
         let pending = match self.client.send_request_attempt(&req) {
             Ok(pending) => pending,
-            Err(uniserve_worker_ipc::IpcError::WouldBlock) => {
+            Err(uniserve_ipc::IpcError::WouldBlock) => {
                 return Err(BatchSubmitError::WouldBlock(match req {
                     WorkerRequest::Submit { batch, .. } => batch,
                     _ => unreachable!(),

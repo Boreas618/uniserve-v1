@@ -13,7 +13,7 @@
 //! time `resolve` runs.
 
 use super::*;
-use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
+use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 /// How one understanding token ends or continues its request
 /// (`Scheduler::und_token_outcome`).
@@ -248,7 +248,7 @@ impl Scheduler {
     pub(super) fn resolve_decode_text(
         &mut self,
         id: RequestId,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_ipc::RequestOutput,
     ) {
         self.activate_request_tables(id);
 
@@ -368,7 +368,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: Call,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_ipc::RequestOutput,
         media: Option<&SharedMedia>,
     ) {
         let call_variant = call.code;

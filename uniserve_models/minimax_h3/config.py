@@ -20,8 +20,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
-from uniserve.media import image
-from uniserve.nn.functional import Rounding
+from uniserve_models.media import image
+from uniserve_models.nn.functional import Rounding
 
 from . import audio_vae, output, video_vae
 from .checkpoint import (

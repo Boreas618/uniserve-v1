@@ -12,9 +12,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.diffusion import NoiseScale
-from uniserve.nn.linear import Linear
-from uniserve.nn.timestep import TimestepEmbedding
+from uniserve_models.diffusion import NoiseScale
+from uniserve_models.nn.linear import Linear
+from uniserve_models.nn.timestep import TimestepEmbedding
 
 
 @dataclass(frozen=True)
@@ -212,7 +212,7 @@ class Velocity(nn.Module):
     def forward(
         self, hidden: torch.Tensor, timestep: torch.Tensor, patches
     ) -> torch.Tensor:
-        from uniserve.nn.functional import patchify
+        from uniserve_models.nn.functional import patchify
 
         pixels = patches.pixels
         if pixels.ndim != 4 or pixels.shape[:2] != (1, 3):

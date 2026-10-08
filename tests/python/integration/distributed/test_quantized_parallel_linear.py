@@ -10,17 +10,17 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve import loading
-from uniserve.distributed import DeviceMesh
-from uniserve.loading import checkpoint, weights
-from uniserve.model import TextSize
-from uniserve.nn import (
+from uniserve_models import loading
+from uniserve_models.distributed import DeviceMesh
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.model import TextSize
+from uniserve_models.nn import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve.quantization import QuantizationConfig, Quantizer
-from uniserve.runtime import (
+from uniserve_models.quantization import QuantizationConfig, Quantizer
+from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,

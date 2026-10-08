@@ -21,12 +21,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve.model import TextSize
-from uniserve.nn.functional import sandwich_rms_norm
-from uniserve.runtime import CUDAStream, ExecutionContext
-from uniserve.runtime.backends import moe as backends
-from uniserve.runtime.cuda_graph import CUDAGraph
-from uniserve_models import loading as models
+from uniserve_models.model import TextSize
+from uniserve_models.nn.functional import sandwich_rms_norm
+from uniserve_models.runtime import CUDAStream, ExecutionContext
+from uniserve_models.backends import moe as backends
+from uniserve_models.runtime.cuda_graph import CUDAGraph
+from uniserve_models import catalog as models
 
 pytestmark = [
     pytest.mark.integration,

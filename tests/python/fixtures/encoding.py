@@ -6,14 +6,14 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve.model import (
+from uniserve_models.model import (
     ComponentEntry,
     Encoder,
     EntryPoint,
     TextEncoder,
     TransformerDecoder,
 )
-from uniserve.nn.attention import (
+from uniserve_models.nn.attention import (
     Attention,
     AttentionBatch,
     SequenceLengths,

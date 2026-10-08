@@ -5,16 +5,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.nn.linear import (
+from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.nn.linear import (
     ColumnParallelLinear,
     Linear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve.nn.mlp import GatedMLP
-from uniserve.quantization import Quantizer
+from uniserve_models.nn.mlp import GatedMLP
+from uniserve_models.quantization import Quantizer
 
 pytestmark = pytest.mark.unit
 
@@ -29,8 +29,8 @@ pytestmark = pytest.mark.unit
 def test_unsharded_row_projection_preserves_dense_affine_rounding(
     dtype, large, device
 ):
-    from uniserve.model import TextSize
-    from uniserve.runtime import ExecutionContext
+    from uniserve_models.model import TextSize
+    from uniserve_models.runtime import ExecutionContext
 
     layer = RowParallelLinear(2, 1, device=device, dtype=dtype)
     layer.weight.copy_(torch.tensor([[large, 1]], device=device, dtype=dtype))
@@ -244,7 +244,7 @@ def test_invalid_contraction_width_is_rejected_for_empty_inputs(shape):
 
 
 def test_merged_projection_rejects_bias_outside_its_branch_channels():
-    from uniserve.nn.functional import merged_linear
+    from uniserve_models.nn.functional import merged_linear
 
     with pytest.raises(ValueError, match="bias.*channels"):
         merged_linear(

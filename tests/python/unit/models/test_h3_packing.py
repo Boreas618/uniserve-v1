@@ -17,8 +17,8 @@ from diffusers.modular_pipelines.minimax_h3.before_denoise import (
     MiniMaxH3SetTimestepsStep,
 )
 
-from uniserve.media import image, video
-from uniserve.model import Condition, ConditionRole
+from uniserve_models.media import image, video
+from uniserve_models.model import Condition, ConditionRole
 from uniserve_models.minimax_h3.packing import (
     AUDIO_CONDITION_GROUP,
     AUDIO_GROUP,

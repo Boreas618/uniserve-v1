@@ -12,8 +12,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(feature = "testing", test))]
-use uniserve_worker_ipc::DEFAULT_COMPONENT;
-use uniserve_worker_ipc::ForwardMode;
+use uniserve_ipc::DEFAULT_COMPONENT;
+use uniserve_ipc::ForwardMode;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,7 +38,7 @@ use uniserve_core::{
     CommandWaker, ComponentConfig, GenerationLimits, ModelDtype, ParallelConfig, Request,
     RequestId, RuntimeFamily,
 };
-use uniserve_worker_ipc::WorkerInfo;
+use uniserve_ipc::WorkerInfo;
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -848,8 +848,8 @@ impl EngineCore {
         self.info.supported_calls.iter().any(|mode| {
             matches!(
                 mode,
-                uniserve_worker_ipc::CallKind::Forward(ForwardMode::Decode)
-                    | uniserve_worker_ipc::CallKind::Forward(ForwardMode::Verify)
+                uniserve_ipc::CallKind::Forward(ForwardMode::Decode)
+                    | uniserve_ipc::CallKind::Forward(ForwardMode::Verify)
             )
         })
     }

@@ -5,7 +5,7 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve.model import ComponentEntry, EntryPoint
+from uniserve_models.model import ComponentEntry, EntryPoint
 from uniserve_models.minimax_h3 import audio_vae
 from uniserve_models.minimax_h3.decoding import AudioDecoder
 

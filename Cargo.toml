@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/foundation/*",
-    "crates/worker-ipc",
-    "crates/worker-ipc-py",
+    "crates/core",
+    "crates/observability",
+    "crates/observability-derive",
+    "crates/ipc",
     "crates/worker",
     "crates/engine",
     "crates/server",
@@ -13,17 +14,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-uniserve-core = { path = "crates/foundation/core" }
-uniserve-observability = { path = "crates/foundation/observability" }
-uniserve-observability-derive = { path = "crates/foundation/observability-derive" }
-uniserve-worker-ipc = { path = "crates/worker-ipc" }
+uniserve-core = { path = "crates/core" }
+uniserve-observability = { path = "crates/observability" }
+uniserve-observability-derive = { path = "crates/observability-derive" }
+uniserve-ipc = { path = "crates/ipc" }
 uniserve-worker = { path = "crates/worker" }
 uniserve-engine = { path = "crates/engine" }
 uniserve-server = { path = "crates/server" }
@@ -66,12 +67,6 @@ minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 proc-macro2 = "1.0.106"
 prometheus-client = "0.24.0"
 png = "0.18.1"
-# `pyo3/extension-module` is injected by setuptools-rust when the wheel builds
-# the `_uniserve_ipc` cdylib (see `_binding_features` for PyO3 bindings); it is
-# deliberately NOT a workspace feature so `cargo test -p uniserve-ipc-py` can
-# link libpython and run tests against an embedded interpreter.
-pyo3 = { version = "0.29.0" }
-pythonize = "0.29.0"
 quote = "1.0.46"
 # Image URL fetching shares the rustls/webpki TLS backend `hf-hub` already uses.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }

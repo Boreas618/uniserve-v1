@@ -5,8 +5,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from uniserve.nn import Linear, RMSNorm
-from uniserve.nn.timestep import timestep_embedding
+from uniserve_models.nn import Linear, RMSNorm
+from uniserve_models.nn.timestep import timestep_embedding
 
 from .config import TransformerConfig
 

@@ -6,10 +6,10 @@ The overlap is consumed on every replay.
 import pytest
 import torch
 
-from uniserve.media import image, video
-from uniserve.model.video import VideoPostprocessor
-from uniserve.runtime import CUDAGraph, ExecutionContext
-from uniserve.tensors import OutputLayout, TensorOutput
+from uniserve_models.media import image, video
+from uniserve_models.model.video import VideoPostprocessor
+from uniserve_models.runtime import CUDAGraph, ExecutionContext
+from uniserve_models.tensors import OutputLayout, TensorOutput
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

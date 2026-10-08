@@ -18,7 +18,7 @@
 //! inspects media.
 
 use uniserve_core::{Canvas, DiffusionRequest, VideoTask};
-use uniserve_worker_ipc::MediaCall;
+use uniserve_ipc::MediaCall;
 
 /// Product names, as the worker's components declare their outputs.
 pub(crate) mod product {

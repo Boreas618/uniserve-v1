@@ -10,18 +10,18 @@ from __future__ import annotations
 
 import torch
 
-from uniserve.diffusion import (
+from uniserve_models.diffusion import (
     AdditiveGuidance,
     EulerSolver,
     NoiseScale,
     make_schedule,
 )
-from uniserve.model import (
+from uniserve_models.model import (
     ImageDenoiser,
     TransformerDecoder,
 )
-from uniserve.nn.attention import Attention
-from uniserve.tensors import OutputLayout, TensorOutput
+from uniserve_models.nn.attention import Attention
+from uniserve_models.tensors import OutputLayout, TensorOutput
 
 from .config import Config
 from .inputs import DenoiserInput

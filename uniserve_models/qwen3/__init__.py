@@ -1,6 +1,6 @@
 """Qwen3 numerical models and checkpoint definitions.
 
-``uniserve_models.loading`` selects this package for ``Qwen3ForCausalLM`` and
+``uniserve_models.catalog`` selects this package for ``Qwen3ForCausalLM`` and
 ``Qwen3MoeForCausalLM`` checkpoints and reads the names exported here as its
 model package contract: configuration normalization, the model class, its
 entry points, checkpoint sources and mappings, and precision presets. The

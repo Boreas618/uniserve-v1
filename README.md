@@ -198,11 +198,11 @@ For decision-session replay, use the `systemone` dataset with a non-empty `sessi
 ## Repository layout
 
 ```text
-crates/foundation/core/                  Shared values and the engine-process codec
-crates/foundation/observability/         Runtime metrics and process registry
-crates/foundation/observability-derive/  Metrics proc-macro
-crates/worker-ipc/                       Worker messages, serialization, and iceoryx endpoints
-crates/worker-ipc-py/                    Python worker IPC extension
+crates/core/                  Shared values and the engine-process codec
+crates/observability/         Runtime metrics and process registry
+crates/observability-derive/  Metrics proc-macro
+crates/ipc/                       Worker messages, serialization, and iceoryx endpoints
+crates/ipc-py/                    Python worker IPC extension
 crates/engine/                           Scheduler, executors, and engine process
 crates/server/                           Model profiles, serving funnel, HTTP API, and engine clients
 crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints

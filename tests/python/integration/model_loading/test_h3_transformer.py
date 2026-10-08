@@ -14,11 +14,11 @@ from torch.nn import functional as F
 
 from tests.python.fixtures.h3 import dmd_denoiser
 from tests.python.fixtures.vsa import reference_attention
-from uniserve import loading
-from uniserve.distributed import DeviceMesh
-from uniserve.loading import checkpoint, weights
-from uniserve.nn.attention import vsa
-from uniserve.runtime import CUDAGraph, ExecutionContext, TensorBuffers
+from uniserve_models import loading
+from uniserve_models.distributed import DeviceMesh
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.nn.attention import vsa
+from uniserve_models.runtime import CUDAGraph, ExecutionContext, TensorBuffers
 from uniserve_models.minimax_h3 import (
     AttentionInput,
     TilePacking,

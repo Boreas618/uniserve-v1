@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.loading import checkpoint, weights
-from uniserve.quantization import QuantizationConfig, Quantizer
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.quantization import QuantizationConfig, Quantizer
 
 from .config import Config
 
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 checkpoint_sources = (checkpoint.Config(name="primary"),)
 
 # Named presets that load_model accepts; a calibrated ModelOpt checkpoint
-# offers none. With no "default" entry, uniserve_models.loading.read_config
+# offers none. With no "default" entry, uniserve_models.catalog.read_config
 # starts from "bf16".
 _PRECISIONS = MappingProxyType(
     {"bf16": weights.Config(), "fp16": weights.Config(dtype=torch.float16)}
@@ -135,8 +135,8 @@ def expert_sources(config: Config) -> Mapping[str, str]:
 def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     """Declare how the resident parameters of ``model`` load from ``primary``.
 
-    ``uniserve_models.loading.read_config`` calls this on the complete meta
-    skeleton, and ``uniserve.loading.load_model`` calls it again after
+    ``uniserve_models.catalog.read_config`` calls this on the complete meta
+    skeleton, and ``uniserve_models.loading.load_model`` calls it again after
     ``parallelize_`` has bound the pipeline stage, so ``model`` may lack
     layers, the embedding or the head. Checkpoint tensors of those absent
     parameters are declared nonresident rather than unexpected. A parameter

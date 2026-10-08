@@ -1,6 +1,6 @@
 """Head-shard relayout kernels for the Ulysses head exchange.
 
-``uniserve.distributed.tokens.HeadExchange`` trades a member's token shard
+``uniserve_models.distributed.tokens.HeadExchange`` trades a member's token shard
 of every head for every token of its own heads. ``pack_head_shards`` writes
 the outgoing payload destination-major: up to three ``[tokens, heads, dim]``
 sources (query, key and value) become one ``[members, tokens, slots, dim]``

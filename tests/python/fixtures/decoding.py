@@ -6,10 +6,10 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve.media import video
-from uniserve.model import ComponentEntry, EntryPoint, VideoDecoder
-from uniserve.nn.vae import LatentDecoder
-from uniserve.tensors import BufferConfig, OutputLayout
+from uniserve_models.media import video
+from uniserve_models.model import ComponentEntry, EntryPoint, VideoDecoder
+from uniserve_models.nn.vae import LatentDecoder
+from uniserve_models.tensors import BufferConfig, OutputLayout
 
 
 @dataclass(frozen=True)

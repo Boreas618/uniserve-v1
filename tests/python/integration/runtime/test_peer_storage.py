@@ -4,9 +4,9 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve.distributed import DeviceMesh
-from uniserve.runtime import initialize_process_groups
-from uniserve.runtime._peer_storage import (
+from uniserve_models.distributed import DeviceMesh
+from uniserve_models.runtime import initialize_process_groups
+from uniserve_models.runtime._peer_storage import (
     allocate_peer_tensor,
     allocate_symmetric_storage,
 )

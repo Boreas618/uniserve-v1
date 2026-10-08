@@ -30,7 +30,7 @@ use super::registration::RankRegistry;
 use super::{BatchSubmitError, PendingRank, RankProcess};
 use crate::executor::{WorkerExecError, WorkerFailure};
 use anyhow::Context;
-use uniserve_worker_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
+use uniserve_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
 use crate::worker::WorkerProcessArgs;
 
@@ -261,7 +261,7 @@ pub struct WorkerGroup {
     process_args: WorkerProcessArgs,
     /// Which component serves each media call across every worker of the
     /// deployment; the executor states it once all workers have reported.
-    media_routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    media_routing: BTreeMap<uniserve_ipc::MediaCall, String>,
     /// Requests that may hold state on the ranks: added by a submitted call
     /// or `Start` command, removed when a batch carrying their `Finish`
     /// command is joined as done. Recovery reports them as lost.
@@ -310,12 +310,12 @@ impl FailureDomain {
 
 /// A call's identity across request epochs: engine identifier, request
 /// identifier, request epoch, and call identifier, in that order.
-type CallIdentity = (u64, u64, u64, uniserve_worker_ipc::CallId);
+type CallIdentity = (u64, u64, u64, uniserve_ipc::CallId);
 
 /// The worker routed to each component reading a call's products, keyed by
 /// the call's request and call identifiers (`RequestPlacement::readers`).
 pub type CallReaders =
-    HashMap<(RequestKey, uniserve_worker_ipc::CallId), BTreeMap<String, crate::WorkerId>>;
+    HashMap<(RequestKey, uniserve_ipc::CallId), BTreeMap<String, crate::WorkerId>>;
 
 /// A physical batch and its participating ranks share one retirement lifetime.
 struct PendingBatch {
@@ -339,8 +339,8 @@ struct RankResult {
 
 /// Returns the request and call identifiers carried by a worker call.
 fn call_identity(
-    request: uniserve_worker_ipc::RequestKey,
-    call_id: uniserve_worker_ipc::CallId,
+    request: uniserve_ipc::RequestKey,
+    call_id: uniserve_ipc::CallId,
 ) -> CallIdentity {
     (
         request.engine_id,
@@ -362,9 +362,9 @@ pub(crate) fn refuse_shared_storage_off_head(
     head: &str,
     ranks: &[crate::WorkerRank],
     components: &BTreeMap<String, crate::executor::ComponentConfig>,
-    media_components: &BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    media_components: &BTreeMap<uniserve_ipc::MediaCall, String>,
 ) -> anyhow::Result<()> {
-    use uniserve_worker_ipc::MediaCall;
+    use uniserve_ipc::MediaCall;
 
     for (call, work, object) in [
         (
@@ -1208,8 +1208,8 @@ impl WorkerGroup {
 /// replica on another host would make each product cross hosts unread.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn media_consumer_slots(
-    consuming: &[uniserve_worker_ipc::MediaCall],
-    routing: &BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    consuming: &[uniserve_ipc::MediaCall],
+    routing: &BTreeMap<uniserve_ipc::MediaCall, String>,
     routed: &BTreeMap<String, crate::WorkerId>,
     worker: &str,
     components: &BTreeMap<String, crate::ComponentConfig>,
@@ -1285,21 +1285,21 @@ impl WorkerGroup {
     /// of the rank's transfer edges.
     fn consumer_slots(
         &self,
-        call: &uniserve_worker_ipc::Call,
+        call: &uniserve_ipc::Call,
         routed: Option<&BTreeMap<String, crate::WorkerId>>,
         members: &[usize],
         rank: usize,
     ) -> Vec<u32> {
         let transfer = &self.process_args.transfer;
         let worker = &self.process_args.worker_id;
-        let consuming: Vec<uniserve_worker_ipc::MediaCall> = match (routed, call.code) {
+        let consuming: Vec<uniserve_ipc::MediaCall> = match (routed, call.code) {
             (Some(readers), _) => self
                 .media_routing
                 .iter()
                 .filter(|(_, component)| readers.contains_key(*component))
                 .map(|(media_call, _)| *media_call)
                 .collect(),
-            (None, uniserve_worker_ipc::CallKind::Media(media_call)) => {
+            (None, uniserve_ipc::CallKind::Media(media_call)) => {
                 match crate::scheduler::generation_consuming_calls(media_call) {
                     Some(consuming) => consuming.to_vec(),
                     None => return transfer.product_consumers(worker, rank as u32),
@@ -1333,7 +1333,7 @@ impl WorkerGroup {
     }
 
     /// States the deployment-wide media routing once every worker reported.
-    pub fn set_media_routing(&mut self, routing: BTreeMap<uniserve_worker_ipc::MediaCall, String>) {
+    pub fn set_media_routing(&mut self, routing: BTreeMap<uniserve_ipc::MediaCall, String>) {
         self.media_routing = routing;
     }
 }
@@ -1345,7 +1345,7 @@ fn rank_projection(
     batch: &Batch,
     components: &BTreeMap<String, crate::ComponentConfig>,
     rank_count: usize,
-    consumer_slots: impl Fn(&uniserve_worker_ipc::Call, &[usize], usize) -> Vec<u32>,
+    consumer_slots: impl Fn(&uniserve_ipc::Call, &[usize], usize) -> Vec<u32>,
 ) -> anyhow::Result<Vec<(usize, Batch)>> {
     let members = batch
         .calls
@@ -1656,7 +1656,7 @@ fn validate_and_order_rank_report(
             })?;
         let completion = report.results.swap_remove(index);
         anyhow::ensure!(
-            completion.output.status != uniserve_worker_ipc::CallStatus::Predicated
+            completion.output.status != uniserve_ipc::CallStatus::Predicated
                 || report.products.iter().all(|export| {
                     export.product.request_key != completion.output.request_key
                         || export.product.producer_call_id != completion.output.call_id
@@ -1664,8 +1664,8 @@ fn validate_and_order_rank_report(
             "predicated call published a tensor"
         );
         if planned.code
-            == uniserve_worker_ipc::CallKind::Transfer(uniserve_worker_ipc::TransferMode::KvExport)
-            && completion.output.status == uniserve_worker_ipc::CallStatus::Ok
+            == uniserve_ipc::CallKind::Transfer(uniserve_ipc::TransferMode::KvExport)
+            && completion.output.status == uniserve_ipc::CallStatus::Ok
         {
             let export = completion
                 .output
@@ -1677,7 +1677,7 @@ fn validate_and_order_rank_report(
                 "KV export differs from its declared output"
             );
             let bytes = export.tensors().try_fold(0_u64, |sum, tensor| {
-                Ok::<_, uniserve_worker_ipc::ValidationError>(
+                Ok::<_, uniserve_ipc::ValidationError>(
                     sum.saturating_add(tensor.validate()?),
                 )
             })?;
@@ -1814,7 +1814,7 @@ impl WorkerGroup {
     }
 
     /// Exposes accepted calls not yet joined into a published result.
-    pub(crate) fn inflight_calls(&self) -> impl Iterator<Item = &uniserve_worker_ipc::Call> {
+    pub(crate) fn inflight_calls(&self) -> impl Iterator<Item = &uniserve_ipc::Call> {
         self.pending_batches.values().flat_map(|pending| {
             pending.batch.calls.iter().filter(|call| {
                 pending
@@ -2083,7 +2083,7 @@ mod tests {
     use crate::WorkerRank;
     use crate::executor::ComponentConfig;
     use std::collections::BTreeMap;
-    use uniserve_worker_ipc::MediaCall;
+    use uniserve_ipc::MediaCall;
 
     fn placement(nodes: &[&str]) -> Vec<WorkerRank> {
         nodes

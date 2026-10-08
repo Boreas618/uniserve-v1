@@ -7,7 +7,7 @@
 //! executor only when the step made no progress.
 
 use super::*;
-use uniserve_worker_ipc::{ForwardMode, MediaCall};
+use uniserve_ipc::{ForwardMode, MediaCall};
 
 /// Intersects model requirements with capacities actually loaded by the worker.
 ///

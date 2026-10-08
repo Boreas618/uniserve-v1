@@ -5,7 +5,7 @@ import io
 import pytest
 import torch
 
-from uniserve.quantization import (
+from uniserve_models.quantization import (
     QuantizedTensor,
     Quantizer,
     RowOrder,
@@ -340,7 +340,7 @@ def test_row_orders_describe_only_stacked_block_scaled_rows():
 
 @pytest.mark.parametrize("format", [None, "fp8"])
 def test_linear_consumes_logical_operands_and_preserves_output_storage(format):
-    from uniserve.nn.functional import linear
+    from uniserve_models.nn.functional import linear
 
     x = torch.full((3, 32), 2.0)
     weight = torch.stack((torch.ones(32), torch.full((32,), -0.5)))
@@ -367,7 +367,7 @@ def test_linear_consumes_logical_operands_and_preserves_output_storage(format):
 def test_merged_projections_preserve_independent_branch_scale_domains(
     quantized, device
 ):
-    from uniserve.nn.functional import merged_linear
+    from uniserve_models.nn.functional import merged_linear
 
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     x = torch.full((3, 32), 2.0, device=device, dtype=dtype)
@@ -443,7 +443,7 @@ def test_cuda_fp8_encoding_matches_the_portable_encoding(
 def test_cuda_row_fp8_of_single_rank_column_shards_matches_unsharded():
     from torch.distributed.tensor import Shard
 
-    from uniserve.distributed import DeviceMesh, Distribution
+    from uniserve_models.distributed import DeviceMesh, Distribution
 
     mesh = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0)
     source = torch.randn((16, 4096), device="cuda").to(torch.bfloat16)

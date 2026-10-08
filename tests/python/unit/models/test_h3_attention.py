@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from uniserve.distributed import Communicator
-from uniserve.nn.attention import SequenceLengths, VisibleInput
+from uniserve_models.distributed import Communicator
+from uniserve_models.nn.attention import SequenceLengths, VisibleInput
 from uniserve_models.minimax_h3.attention import Dense
 from uniserve_models.minimax_h3.config import TransformerConfig
 from uniserve_models.minimax_h3.inputs import SequenceInput

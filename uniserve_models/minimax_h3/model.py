@@ -7,7 +7,7 @@ from types import MappingProxyType
 
 from torch import nn
 
-from uniserve.model import ComponentEntry, EntryPoint
+from uniserve_models.model import ComponentEntry, EntryPoint
 
 from .config import Config
 from .decoding import AudioDecoder, VideoDecoder

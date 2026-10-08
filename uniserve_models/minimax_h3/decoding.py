@@ -15,10 +15,10 @@ from collections.abc import Mapping
 
 import torch
 
-from uniserve.media import video
-from uniserve.model import AudioDecoder as BaseAudioDecoder
-from uniserve.model import VideoDecoder as BaseVideoDecoder
-from uniserve.tensors import BufferConfig, OutputLayout
+from uniserve_models.media import video
+from uniserve_models.model import AudioDecoder as BaseAudioDecoder
+from uniserve_models.model import VideoDecoder as BaseVideoDecoder
+from uniserve_models.tensors import BufferConfig, OutputLayout
 
 from . import audio_vae, video_vae
 from .config import Attention, DenseAttention

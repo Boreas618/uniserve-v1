@@ -18,7 +18,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::JoinHandle;
 
-    use uniserve_worker_ipc::Wake;
+    use uniserve_ipc::Wake;
 
     /// How long each `poll()` blocks before re-checking the stop flag, bounding
     /// how long teardown waits to join this thread when the worker is still
@@ -118,7 +118,7 @@ mod imp {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use uniserve_worker_ipc::Wake;
+    use uniserve_ipc::Wake;
 
     pub(crate) struct DeathWatcher;
 

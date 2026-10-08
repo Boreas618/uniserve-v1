@@ -29,28 +29,28 @@ from tests.python.fixtures.checkpoints import (
     diffusion_gemma_checkpoint,
     load_diffusion_gemma,
 )
-from uniserve.diffusion.tokens import self_conditioning_embedding
-from uniserve.distributed import Communicator
-from uniserve.loading import weights
-from uniserve.model import (
+from uniserve_models.diffusion.tokens import self_conditioning_embedding
+from uniserve_models.distributed import Communicator
+from uniserve_models.loading import weights
+from uniserve_models.model import (
     CanvasInput,
     EmbeddingReplacement,
     TextInput,
     TextSize,
     VisionInput,
 )
-from uniserve.nn.attention import (
+from uniserve_models.nn.attention import (
     AttentionBatch,
     BlockTable,
     PagedInput,
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.nn.functional import patchify
-from uniserve.nn.moe import FusedMoE
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve.runtime.prefix_cache import plan_units
-from uniserve_models import loading as models
+from uniserve_models.nn.functional import patchify
+from uniserve_models.nn.moe import FusedMoE
+from uniserve_models.runtime import ExecutionContext, PrefixCache
+from uniserve_models.runtime.prefix_cache import plan_units
+from uniserve_models import catalog as models
 
 pytestmark = pytest.mark.integration
 
@@ -543,8 +543,8 @@ def test_disagreeing_layer_scalars_are_rejected(tmp_path):
 
 
 def _pipeline_stage(rank, rendezvous, root):
-    from uniserve.distributed import DeviceMesh
-    from uniserve.runtime import initialize_process_groups
+    from uniserve_models.distributed import DeviceMesh
+    from uniserve_models.runtime import initialize_process_groups
 
     with initialize_process_groups(
         rank=rank,

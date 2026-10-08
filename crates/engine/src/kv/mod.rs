@@ -46,7 +46,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use uniserve_core::{HashAlgo, KvCacheGroup, Modality, UnitId};
-use uniserve_worker_ipc::WorkerEndpoint;
+use uniserve_ipc::WorkerEndpoint;
 
 mod encoder_cache;
 mod freeq;
@@ -1382,7 +1382,7 @@ mod tests {
     use super::*;
 
     fn endpoint() -> Arc<WorkerEndpoint> {
-        Arc::new(uniserve_worker_ipc::WorkerInfo::default().endpoint)
+        Arc::new(uniserve_ipc::WorkerInfo::default().endpoint)
     }
 
     fn full(page_tokens: usize, units_per_page: usize) -> GroupShape {

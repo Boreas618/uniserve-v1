@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     Batch as BatchPlan, IpcError, RankServer, RequestKind, WorkerInfo, WorkerRequest,
     WorkerResponse, WorkerResponseError,
 };

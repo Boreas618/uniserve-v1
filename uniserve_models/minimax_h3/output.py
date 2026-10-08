@@ -12,9 +12,9 @@ from dataclasses import dataclass
 
 import torch
 
-from uniserve.media import video
-from uniserve.model import VideoPostprocessor as BaseVideoPostprocessor
-from uniserve.tensors import BufferConfig, OutputLayout
+from uniserve_models.media import video
+from uniserve_models.model import VideoPostprocessor as BaseVideoPostprocessor
+from uniserve_models.tensors import BufferConfig, OutputLayout
 
 
 @dataclass(frozen=True, slots=True)

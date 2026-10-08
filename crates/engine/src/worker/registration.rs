@@ -28,7 +28,7 @@ const ACCEPT_INTERVAL: Duration = Duration::from_millis(20);
 /// Deadline for one accepted connection to deliver its report line.
 const REPORT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 // The two channel mechanisms a rank may report; `collect` refuses any other.
-use uniserve_worker_ipc::{RankReport, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL};
+use uniserve_ipc::{RankReport, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL};
 
 /// A worker group's collective rendezvous.
 pub(crate) struct Rendezvous {

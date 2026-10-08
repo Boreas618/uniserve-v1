@@ -16,9 +16,9 @@ from typing import cast
 import torch
 from torch import nn
 
-from uniserve.loading import weights
-from uniserve.model import TextConditioner
-from uniserve.nn import (
+from uniserve_models.loading import weights
+from uniserve_models.model import TextConditioner
+from uniserve_models.nn import (
     ColumnParallelLinear,
     GatedMLP,
     Linear,
@@ -26,7 +26,7 @@ from uniserve.nn import (
     RMSNorm,
     RowParallelLinear,
 )
-from uniserve.nn.attention import (
+from uniserve_models.nn.attention import (
     Attention,
     AttentionBatch,
     DenseInput,

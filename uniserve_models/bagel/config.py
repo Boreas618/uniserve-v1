@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from uniserve import loading
-from uniserve.loading import checkpoint
+from uniserve_models import loading
+from uniserve_models.loading import checkpoint
 from uniserve_models import siglip
 
 from . import vae

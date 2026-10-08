@@ -14,8 +14,8 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve.runtime.backends.deepep import DeepEP
-from uniserve.runtime.process_groups import initialize_process_groups
+from uniserve_models.backends.deepep import DeepEP
+from uniserve_models.runtime.process_groups import initialize_process_groups
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

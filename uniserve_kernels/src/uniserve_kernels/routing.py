@@ -1,7 +1,7 @@
 """Softmax top-k expert routing in one launch (CUDA).
 
 The kernel in ``csrc/topk_softmax.cu`` backs
-``uniserve.nn.functional.topk_softmax``, which defines the numbers with its
+``uniserve_models.nn.functional.topk_softmax``, which defines the numbers with its
 tensor composition, allocates the outputs and raises on CUDA with the reason
 :func:`unsupported` reports. One warp routes one token and reproduces the
 composition's FP32 arithmetic and order: PyTorch's warp softmax over the

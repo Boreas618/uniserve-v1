@@ -160,7 +160,7 @@ impl Budget {
     /// Reserves `bytes`; `false` when the request total would be exceeded.
     fn take(&self, bytes: u64) -> bool {
         self.0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 remaining.checked_sub(bytes)
             })
             .is_ok()
