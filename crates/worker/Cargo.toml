@@ -20,6 +20,10 @@ tvm-ffi.workspace = true
 uniserve-core.workspace = true
 uniserve-cuda.workspace = true
 uniserve-ipc.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

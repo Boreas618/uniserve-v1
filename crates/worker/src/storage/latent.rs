@@ -147,8 +147,8 @@ impl<C> LatentExport<C> {
 }
 
 /// Own scheduler-assigned pages, committed trajectories and transfer access.
-/// I and S retain import/export objects at stable addresses, as Arc does. The
-/// numerical backend owns tensor allocation, views, copies and stream waits.
+/// I and S retain import/export objects at stable addresses, as Arc does.
+/// [`LatentStorage`](super::LatentStorage) holds the pages' memory.
 pub struct LatentPool<I, S> {
     request_pool_size: usize,
     num_pages: usize,

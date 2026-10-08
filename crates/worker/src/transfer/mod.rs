@@ -1,4 +1,10 @@
-//! Transfer admission, readable results, and physical retirement.
+//! Transfer admission, transports, readable results, and physical retirement.
+//!
+//! The generic cores ([`TransferCapacity`], [`TransferTicket`],
+//! [`TransferPool`], [`BufferRegistry`], [`KVImporter`]) own admission,
+//! cancellation and retirement rules; the native layer instantiates them with
+//! Rust-owned storage ([`Spans`] of [`crate::storage::memory::StorageView`]s),
+//! driver copies and the shared [`EventPool`].
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -9,22 +15,57 @@ use uniserve_cuda::{DeviceGuard, DeviceId, Event, Stream};
 
 use crate::{Completion, Error, EventPool, Outcome, Result};
 
+mod cuda_vmm;
 mod descriptor_grants;
+mod endpoint;
+pub mod exports;
+pub mod fetch;
+pub mod kv_export;
 mod kv_import;
+mod peer;
 mod pool;
+mod read;
 mod registry;
 mod shared_buffer;
+mod source;
+mod spans;
+mod transport;
 pub mod vmm_pool;
 
 pub use descriptor_grants::{DescriptorGrants, fetch_descriptor};
-pub use kv_import::{ImportBackend, ImportCopy, KVImport, KVImporter};
+pub(crate) use kv_import::{CacheImporter, ImportTask, KVImportBackend, Retired};
+pub use kv_import::{
+    ImportBackend, ImportCopy, ImportEntry, ImportWorkspace, KVImport, KVImporter,
+};
+pub use peer::{PeerExchange, PeerStorage};
+pub use read::{Read, ReadRef};
 pub use registry::{BufferRegistry, RegisteredBuffer};
 pub use shared_buffer::{SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead};
+pub use spans::{Spans, copy_on_host, copy_planner, submit_copy};
+pub use transport::{Transport, TransportKind, TransportOptions, Transports};
 
 pub use pool::{ReadBackend, TransferPool, TransferRead};
 
+/// A completion or readiness observer. Observers only notify (wake a
+/// submission or the service loop); they never block or call back into the
+/// owner that notifies them.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
+
+/// The physical retirement signal of an export, a read or a KV import.
+pub type Retirement = Completion<Error, Notify>;
+
+/// A rank's shared transfer byte budget and read credits.
+pub type Capacity = TransferCapacity<Notify>;
+
+/// Run observers returned by a completion, after its owner unlocked.
+pub fn notify(callbacks: Vec<Notify>) {
+    for callback in callbacks {
+        callback();
+    }
+}
+
 /// One source's contribution to a logical tensor fetch, in source-local and
-/// destination-local coordinates. The numerical backend borrows those views.
+/// destination-local coordinates.
 pub struct ReadRegion {
     pub location: usize,
     pub source: Vec<Range<u64>>,
@@ -225,12 +266,6 @@ impl<C> TransferCapacity<C> {
 
         state.waiters.push(callback);
         None
-    }
-
-    /// Trace retained backend callbacks. The visitor must not invoke user
-    /// code or re-enter the capacity while its lock is held.
-    pub fn visit<R>(&self, visitor: impl FnOnce(&[C]) -> R) -> R {
-        visitor(&self.state().waiters)
     }
 }
 
@@ -437,20 +472,11 @@ impl<V, E, C> TransferTicket<V, E, C> {
 
     /// Capture writes made before submission. Later work on the submitting
     /// stream must not become a dependency of the transport copy.
-    pub fn prepare_copy<O>(
-        &mut self,
-        pool: &mut EventPool<O>,
-        device: i32,
-        stream: usize,
-    ) -> Result<()> {
+    pub fn prepare_copy(&mut self, pool: &EventPool, stream: &Stream) -> Result<()> {
         let ReadAccess::Copy { handoff } = &mut self.access else {
             return Err(Error::State("a borrowed transfer cannot copy into storage"));
         };
-        let _device = DeviceGuard::new(DeviceId(device))?;
-        let event = pool.acquire(device, false, false)?;
-        pool.record(&event, device, stream)?;
-        pool.retain(&event, device, 1)?;
-        *handoff = Some(event);
+        *handoff = Some(pool.fence(stream, false)?);
         Ok(())
     }
 
@@ -465,18 +491,13 @@ impl<V, E, C> TransferTicket<V, E, C> {
         Ok(())
     }
 
-    /// Order a borrowed numerical stream and remember its storage access.
-    /// The numerical backend separately records views with its allocator.
-    pub fn consume(&mut self, device: i32, stream: usize) -> Result<()> {
+    /// Order a consuming stream after the producer and, for borrowed reads,
+    /// remember it so close can fence its access to the source.
+    pub fn consume(&mut self, stream: &Stream) -> Result<()> {
         if let Some(producer) = &self.producer {
-            // A default-stream handle resolves against the current context.
-            let _device = DeviceGuard::new(DeviceId(device))?;
-            // SAFETY: the numerical backend consumes on this live stream of
-            // `device`; it is borrowed only for this wait.
-            unsafe { Stream::borrowed(DeviceId(device), stream) }?.wait_event(producer)?;
-
+            stream.wait_event(producer)?;
             if let ReadAccess::Borrowed { streams, .. } = &mut self.access {
-                streams.insert((device, stream));
+                streams.insert((stream.device().0, stream.raw()));
             }
         }
         Ok(())
@@ -488,14 +509,14 @@ impl<V, E, C> TransferTicket<V, E, C> {
 
     /// Fence each consumer at the end of borrowed access. The caller transfers
     /// these retained event references to deferred source release.
-    pub fn record_consumers<O>(&mut self, pool: &mut EventPool<O>) -> Result<()> {
+    pub fn record_consumers(&mut self, pool: &EventPool) -> Result<()> {
         if let ReadAccess::Borrowed { streams, events } = &mut self.access {
             for &(device, stream) in streams.iter() {
                 let _device = DeviceGuard::new(DeviceId(device))?;
-                let event = pool.acquire(device, false, false)?;
-                pool.record(&event, device, stream)?;
-                pool.retain(&event, device, 1)?;
-                events.push(event);
+                // SAFETY: consumers keep their streams alive until they close
+                // the borrowed read, which records this fence.
+                let stream = unsafe { Stream::borrowed(DeviceId(device), stream) }?;
+                events.push(pool.fence(&stream, false)?);
             }
             streams.clear();
         }
@@ -552,11 +573,5 @@ impl<V, E, C> TransferTicket<V, E, C> {
 
     pub fn error(&self) -> Option<&E> {
         self.error.as_deref()
-    }
-
-    /// Trace result references and pending readiness observers. Physical
-    /// retirement observers are traced through their shared Completion.
-    pub fn visit<R>(&self, visitor: impl FnOnce(Option<&V>, Option<&E>, &[C]) -> R) -> R {
-        visitor(self.value(), self.error(), &self.callbacks)
     }
 }

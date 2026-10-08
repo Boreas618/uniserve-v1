@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::{Completion, Error, Outcome, Result};
 
-/// Numerical work and language-runtime observers supplied to a host task.
+/// Work and completion observers supplied to a host task.
 /// The lane owns admission, scheduling, results, and input retirement.
 pub trait HostAction: Send + Sync + Sized + 'static {
     type Output: Send + Sync;
@@ -245,26 +245,6 @@ impl<A: HostAction> HostTask<A> {
         let mut lane = lane.lock().unwrap_or_else(PoisonError::into_inner);
         lane.tasks.remove(&(Arc::as_ptr(self) as usize));
         lane.wake.clone()
-    }
-
-    /// Visit an unshared action for language-runtime garbage collection.
-    /// A worker borrowing the action is an external owner of its references.
-    pub fn visit_action<R>(&self, visitor: impl FnOnce(&A) -> R) -> Option<R> {
-        let state = self.state();
-        state
-            .action
-            .as_ref()
-            .filter(|action| Arc::strong_count(action) == 1)
-            .map(|action| visitor(action))
-    }
-
-    /// Drop references from an unreachable, uniquely owned language wrapper.
-    pub fn clear(&mut self) {
-        self.state = Mutex::new(TaskState {
-            phase: Phase::Finished,
-            action: None,
-        });
-        self.completion = Completion::default();
     }
 }
 

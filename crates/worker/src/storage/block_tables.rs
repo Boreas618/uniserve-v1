@@ -9,8 +9,10 @@ use uniserve_ipc::{BlockTable, KvTransfer, RequestKey};
 use crate::{Error, Result};
 
 mod attention;
+mod storage;
 
 pub use attention::{AttentionRow, TablePages, table_pages};
+pub use storage::BlockTableStorage;
 
 /// Page dimensions needed to address one KV cache group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -111,8 +113,9 @@ impl GroupTable {
     }
 }
 
-/// Changed rows and lengths to copy to the numerical backend in one batch.
-/// Rows are unpadded; the consumer clears their tail through the table width.
+/// Changed rows and lengths to write to the device tables in one batch.
+/// Rows are unpadded; [`BlockTableStorage::install`] writes them at full
+/// width, which clears the tail of a longer previous row.
 pub struct BlockTableUpdate {
     pub rows: Vec<Vec<u32>>,
     pub row_tables: Vec<usize>,

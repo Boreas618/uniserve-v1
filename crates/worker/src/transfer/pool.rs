@@ -1,16 +1,12 @@
 //! Read tasks, physical credit returns and per-thread copy streams.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
-use std::thread::ThreadId;
-
-use uniserve_cuda::{DeviceId, Stream};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::{Error, HostAction, HostLane, HostTask, Outcome, Result};
 
 use super::{ReadReservation, TransferCapacity, TransferTicket};
 
-/// Numerical read execution and observers supplied by the language binding.
+/// Read execution and completion observers of one read.
 /// `read` returns after physical access ends. If completion cannot be established,
 /// it marks its ticket undrained and returns an error.
 /// Ticket access is serialized without invoking numerical code or observers.
@@ -97,7 +93,6 @@ impl<B: ReadBackend> HostAction for TransferRead<B> {
 }
 
 struct PoolState<B: ReadBackend> {
-    streams: HashMap<(ThreadId, i32), Arc<Stream>>,
     error: Option<Arc<B::Error>>,
     unretired: Vec<Arc<B>>,
     wake: Option<Arc<B::Callback>>,
@@ -123,7 +118,6 @@ impl<B: ReadBackend> TransferPool<B> {
             capacity,
             lane: HostLane::new(limit, workers.min(limit), name)?,
             state: Mutex::new(PoolState {
-                streams: HashMap::new(),
                 error: None,
                 unretired: Vec::new(),
                 wake: None,
@@ -266,18 +260,6 @@ impl<B: ReadBackend> TransferPool<B> {
         }
     }
 
-    pub fn stream(&self, device: i32) -> Result<Arc<Stream>> {
-        let key = (std::thread::current().id(), device);
-        let mut state = self.state();
-        if let Some(stream) = state.streams.get(&key) {
-            return Ok(Arc::clone(stream));
-        }
-
-        let stream = Arc::new(Stream::new(DeviceId(device))?);
-        state.streams.insert(key, Arc::clone(&stream));
-        Ok(stream)
-    }
-
     pub fn error(&self) -> Option<Arc<B::Error>> {
         self.state().error.clone()
     }
@@ -292,30 +274,12 @@ impl<B: ReadBackend> TransferPool<B> {
             if state.error.is_none() {
                 state.error = first.clone();
             }
-            state.streams.clear();
             state.error.clone()
         };
         for cleanup in errors {
             B::report(cleanup);
         }
         error
-    }
-
-    /// Trace only idle pool-owned references during language-runtime GC.
-    pub fn visit<T>(
-        &self,
-        visitor: impl FnOnce(Option<&B::Error>, Option<&B::Callback>, &[Arc<B>]) -> T,
-    ) -> Option<T> {
-        let state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(TryLockError::WouldBlock) => return None,
-        };
-        Some(visitor(
-            state.error.as_deref(),
-            state.wake.as_deref(),
-            &state.unretired,
-        ))
     }
 }
 

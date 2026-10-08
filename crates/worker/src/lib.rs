@@ -44,14 +44,17 @@ pub use sampling::{
 };
 pub use service::{Service, ServiceBackend};
 pub use storage::{
-    AttentionRow, BlockTableUpdate, BlockTables, BufferBinding, BufferPool, GroupShape, GroupTable,
-    HostBuffers, KVCacheManager, LatentExport, LatentImport, LatentPool, LatentUpdate,
-    LogprobLayout, OutputBuffer, OutputPool, OutputStorage, TablePages, table_pages,
+    AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, BufferBinding, BufferPool,
+    GroupShape, GroupTable, HostBuffers, KVCache, KVCacheManager, KVPlan, KVPlanes, LatentExport,
+    LatentImport, LatentPool, LatentStorage, LatentUpdate, LogprobLayout, OutputBuffer, OutputPool,
+    OutputStorage, ProductBuffer, ProductRead, RequestSlots, TablePages, TensorStore, UnitColumn,
+    Workspaces, table_pages,
 };
-pub use stream::{CUDAStream, EventPool};
+pub use stream::{CUDAStream, Deferred, EventPool};
 pub use transfer::{
-    BufferRegistry, DescriptorGrants, ImportBackend, ImportCopy, KVImport, KVImporter, ReadBackend,
-    ReadRegion, ReadReservation, RegisteredBuffer, SHM_HEADER_BYTES, SharedBuffer, SharedMapping,
-    SharedRead, TransferCapacity, TransferPool, TransferRead, TransferTicket, fetch_descriptor,
+    BufferRegistry, DescriptorGrants, ImportBackend, ImportCopy, KVImport, KVImporter, PeerStorage,
+    Read, ReadBackend, ReadRegion, ReadReservation, RegisteredBuffer, SHM_HEADER_BYTES,
+    SharedBuffer, SharedMapping, SharedRead, Spans, TransferCapacity, TransferPool, TransferRead,
+    TransferTicket, Transport, TransportKind, TransportOptions, Transports, fetch_descriptor,
     plan_reads,
 };
