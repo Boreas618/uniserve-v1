@@ -338,10 +338,7 @@ struct RankResult {
 }
 
 /// Returns the request and call identifiers carried by a worker call.
-fn call_identity(
-    request: uniserve_ipc::RequestKey,
-    call_id: uniserve_ipc::CallId,
-) -> CallIdentity {
+fn call_identity(request: uniserve_ipc::RequestKey, call_id: uniserve_ipc::CallId) -> CallIdentity {
     (
         request.engine_id,
         request.request_id.0,
@@ -1663,8 +1660,7 @@ fn validate_and_order_rank_report(
                 }),
             "predicated call published a tensor"
         );
-        if planned.code
-            == uniserve_ipc::CallKind::Transfer(uniserve_ipc::TransferMode::KvExport)
+        if planned.code == uniserve_ipc::CallKind::Transfer(uniserve_ipc::TransferMode::KvExport)
             && completion.output.status == uniserve_ipc::CallStatus::Ok
         {
             let export = completion
@@ -1677,9 +1673,7 @@ fn validate_and_order_rank_report(
                 "KV export differs from its declared output"
             );
             let bytes = export.tensors().try_fold(0_u64, |sum, tensor| {
-                Ok::<_, uniserve_ipc::ValidationError>(
-                    sum.saturating_add(tensor.validate()?),
-                )
+                Ok::<_, uniserve_ipc::ValidationError>(sum.saturating_add(tensor.validate()?))
             })?;
             anyhow::ensure!(
                 bytes <= planned.bounds.max_transfer_bytes,
