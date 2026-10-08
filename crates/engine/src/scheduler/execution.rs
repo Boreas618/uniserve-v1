@@ -2296,11 +2296,7 @@ impl Scheduler {
     ///
     /// A reclaim with no active credit is logged as an accounting defect and
     /// changes no counter.
-    pub(super) fn reclaim_domain_credit(
-        &self,
-        computation: uniserve_ipc::CallKind,
-        failed: bool,
-    ) {
+    pub(super) fn reclaim_domain_credit(&self, computation: uniserve_ipc::CallKind, failed: bool) {
         let stats = self.stats.domains.get(computation);
         let active = stats.active_credits.load(Ordering::Relaxed);
         if active == 0 {
