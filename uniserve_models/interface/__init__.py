@@ -24,6 +24,8 @@ _AREAS = (
     "binding",
     "distributed",
     "graphs",
+    "image",
+    "encoder",
     "memory",
     "kernels",
     "profiling",

@@ -1,5 +1,6 @@
 //! Routing and homogeneous batches for the worker's numerical runners.
 
+pub(crate) mod encoder;
 mod graph_shapes;
 mod graph_storage;
 pub(crate) mod graphs;

@@ -42,6 +42,11 @@ pub use parallel::{
     ExpertExchange, Microbatches, StreamCommunicator, WeightPrefetch, yield_microbatch,
 };
 pub use request::{Request, RequestPool, RequestProgress};
+pub use runner::encoder::{
+    Encoded, EncoderConfig, EncoderGraph, EncoderInfo, EncoderRunner, LatentEncoder,
+    MAX_PACKED_IMAGES, PreparedImage, PromptVision, TextEncoder, Tower, VisionEncoder,
+    packed_grids, prepare_input, text_capacity,
+};
 pub use runner::graphs::{
     Capacity, GraphCounts, GraphMode, GraphTable, Lookup, bucket, capture_order, reserve_pools,
 };
