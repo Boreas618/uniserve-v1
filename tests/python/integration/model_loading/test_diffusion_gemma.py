@@ -31,6 +31,7 @@ from tests.python.fixtures.checkpoints import (
 )
 from uniserve_models import catalog as models
 from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.cache.units import UnitPool, plan_units
 from uniserve_models.diffusion.tokens import self_conditioning_embedding
 from uniserve_models.distributed import Communicator
 from uniserve_models.loading import weights
@@ -50,8 +51,6 @@ from uniserve_models.nn.attention import (
 )
 from uniserve_models.nn.functional import patchify
 from uniserve_models.nn.moe import FusedMoE
-from uniserve_models.runtime import PrefixCache
-from uniserve_models.runtime.prefix_cache import plan_units
 
 pytestmark = pytest.mark.integration
 
@@ -177,7 +176,7 @@ def _canvas(model, context, canvas, prefix, soft=None):
 def _session(model):
     config = model.text.cache_config
     tables = len(plan_units(config, block_size=BLOCK_SIZE).tables)
-    cache = PrefixCache(
+    cache = UnitPool.allocate(
         config,
         num_units=tables * PAGES,
         block_size=BLOCK_SIZE,
@@ -210,7 +209,7 @@ def test_prompt_cache_and_canvas_match_transformers(tmp_path, prompt_length):
 
     model = load_diffusion_gemma(tmp_path)
     cache, context = _session(model)
-    with cache, context:
+    with context:
         context.prepare(TextSize(32, 1))
         middle = prompt_length // 2
         prompt_logits = _prompt(
@@ -273,7 +272,7 @@ def test_self_conditioning_matches_transformers(tmp_path):
         torch.tensor(math.sqrt(HIDDEN)),
     )
     cache, context = _session(model)
-    with cache, context:
+    with context:
         context.prepare(TextSize(32, 1))
         _prompt(model, context, prompt, ((0, 12, True),))
         torch.testing.assert_close(
@@ -368,7 +367,7 @@ def test_image_features_and_blocks_match_transformers(tmp_path):
         assert torch.equal(actual, wanted.to(torch.bfloat16))
 
     cache, context = _session(model)
-    with cache, context:
+    with context:
         context.prepare(TextSize(32, 1))
         prompt_logits = _prompt(
             model,
@@ -430,7 +429,7 @@ def test_stacked_and_per_expert_checkpoints_load_identically(tmp_path):
     for root in (stacked, split):
         model = load_diffusion_gemma(root)
         cache, context = _session(model)
-        with cache, context:
+        with context:
             context.prepare(TextSize(32, 1))
             results.append(
                 (
@@ -544,56 +543,79 @@ def test_disagreeing_layer_scalars_are_rejected(tmp_path):
 
 
 def _pipeline_stage(rank, rendezvous, root):
-    from uniserve_models.distributed import DeviceMesh
-    from uniserve_models.runtime import initialize_process_groups
+    import torch.distributed as dist
 
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=2,
+    from uniserve_models.interface import distributed
+
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2
+    )
+    world = distributed.World(
+        rank,
+        2,
+        torch.device("cpu"),
+        "gloo",
+        Communicator((0, 1), rank, "instance", "cpu", dist.group.WORLD),
+        Communicator(),
+        [dist.group.WORLD],
+    )
+    try:
+        mesh = distributed.mesh(
+            world,
+            {
+                "rank": rank,
+                "ranks": [0, 1],
+                "shape": [2],
+                "axes": ["pp"],
+                "groups": {
+                    "pp": {"members": [0, 1], "group": dist.group.WORLD},
+                    "local": {"members": [rank]},
+                },
+            },
+        )
+        _pipeline_forward(rank, mesh, root)
+    finally:
+        distributed.destroy(world)
+
+
+def _pipeline_forward(rank, mesh, root):
+    """Run the prompt and a canvas through this rank's pipeline stage."""
+    model = models.load_model(
+        models.read_config(root),
         device="cpu",
-        init_method=rendezvous,
-    ) as owner:
-        mesh = owner.bind(
-            DeviceMesh(ranks=(0, 1), shape=(2,), axes=("pp",), rank=rank),
-            device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+        meshes={"": mesh},
+    ).model
+    prompt, canvas, expected_prompt, expected_canvas = torch.load(
+        root / "expected.pt", weights_only=True
+    )
+    count = prompt.numel()
+    cache, context = _session(model)
+    with context:
+        context.prepare(TextSize(32, 1))
+        batch = _paged(cache, queries=count, prefix=0, causal=True)
+        context.bind_attention(batch)
+        hidden = model.text(TextInput(prompt, torch.arange(count), batch))
+        prompt_logits = model.text.compute_logits(
+            hidden, token_indices=torch.arange(count)
         )
-        model = models.load_model(
-            models.read_config(root),
-            device="cpu",
-            weights=weights.Config(dtype=torch.float32),
-            meshes={"": mesh},
-        ).model
-        prompt, canvas, expected_prompt, expected_canvas = torch.load(
-            root / "expected.pt", weights_only=True
+        if rank == 0:
+            # The first stage forwards its stream and holds no head, for
+            # either capability.
+            assert prompt_logits is None
+            assert model.text.lm_head is None
+            assert model.denoiser.lm_head is None
+            assert _canvas_stage(model, context, canvas, count) is None
+            return
+        torch.testing.assert_close(
+            prompt_logits.gather(), expected_prompt, rtol=1e-5, atol=1e-6
         )
-        count = prompt.numel()
-        cache, context = _session(model)
-        with cache, context:
-            context.prepare(TextSize(32, 1))
-            batch = _paged(cache, queries=count, prefix=0, causal=True)
-            context.bind_attention(batch)
-            hidden = model.text(TextInput(prompt, torch.arange(count), batch))
-            prompt_logits = model.text.compute_logits(
-                hidden, token_indices=torch.arange(count)
-            )
-            if rank == 0:
-                # The first stage forwards its stream and holds no head, for
-                # either capability.
-                assert prompt_logits is None
-                assert model.text.lm_head is None
-                assert model.denoiser.lm_head is None
-                assert _canvas_stage(model, context, canvas, count) is None
-                return
-            torch.testing.assert_close(
-                prompt_logits.gather(), expected_prompt, rtol=1e-5, atol=1e-6
-            )
-            torch.testing.assert_close(
-                _canvas_stage(model, context, canvas, count).gather(),
-                expected_canvas,
-                rtol=1e-5,
-                atol=1e-6,
-            )
+        torch.testing.assert_close(
+            _canvas_stage(model, context, canvas, count).gather(),
+            expected_canvas,
+            rtol=1e-5,
+            atol=1e-6,
+        )
 
 
 def _canvas_stage(model, context, canvas, prefix):
@@ -732,14 +754,14 @@ def _native_pass(root, device, attention, tokens, calls, images, canvases):
     ).model
     config = model.text.cache_config
     tables = len(plan_units(config, block_size=NATIVE_BLOCK_SIZE).tables)
-    cache = PrefixCache(
+    cache = UnitPool.allocate(
         config,
         num_units=1 + tables * NATIVE_PAGES,
         block_size=NATIVE_BLOCK_SIZE,
         device=device,
     )
     context = ExecutionContext(model, cache=cache, attention=attention)
-    with cache, context, torch.inference_mode():
+    with context, torch.inference_mode():
         context.prepare(TextSize(128, 4))
         rows, grids = images
         features = torch.cat(
