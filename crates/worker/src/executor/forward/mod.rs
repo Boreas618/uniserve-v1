@@ -50,6 +50,38 @@ pub(crate) fn abandon(
     Ok(launch::abandon(backend.requests_mut(), launched)?)
 }
 
+/// Fail every call of a batch whose execution failed before any runtime
+/// committed work: a fatal failure stops the rank, any other completes the
+/// batch with its calls failed under the failure's code.
+pub(crate) fn fail(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    error: Error,
+    context: &str,
+) -> std::result::Result<(), WorkerError> {
+    let error = WorkerError::classify(error, Some(context));
+    if error.fatal {
+        return Err(error);
+    }
+    let plan = batch.shared_plan();
+    tracing::warn!(
+        target: "uniserve_worker.execution",
+        "batch {} failed: {error}",
+        plan.batch_id
+    );
+    let output = launch::failed_output(
+        backend.requests(),
+        plan,
+        batch.predecessors(),
+        launch::error_code(error.code),
+    )?;
+    batch.complete(BatchResult {
+        output,
+        media: Vec::new(),
+    });
+    Ok(())
+}
+
 /// The error of a call kind whose runtime is not available on this rank.
 pub(crate) fn unsupported(kind: CallKind, runtime: &str) -> WorkerError {
     WorkerError::classify(
