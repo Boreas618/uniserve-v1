@@ -123,6 +123,20 @@ impl TextRuntime {
         Ok((runner.device(), stream, 0))
     }
 
+    /// The unit reset column of `component`'s prefill runner stream (see
+    /// [`Self::placement`]), for work that assigns K/V units beside its
+    /// text batches.
+    pub(crate) fn unit_column(&self, component: &str) -> Result<&UnitColumn> {
+        let runner = self
+            .route(component, CallKind::Forward(ForwardMode::Prefill))
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "component {component:?} has no text prefill binding"
+                ))
+            })?;
+        Ok(&self.columns[runner])
+    }
+
     /// Write the K/V of token prefixes, each from position zero of its
     /// slot, with `component`'s prefill runner: guidance prefixes of image
     /// trajectories. The prefixes are evaluated causally and only their K/V

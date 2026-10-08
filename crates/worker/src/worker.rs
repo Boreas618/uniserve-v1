@@ -57,6 +57,7 @@ use crate::executor::forward::image::warmup::ImageWarmup;
 use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::token::start::{Startup, TextBounds, reserved_bytes};
 use crate::executor::forward::token::warmup::TextWarmup;
+use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
 use crate::launch::Endpoint;
@@ -357,6 +358,20 @@ impl Worker {
         if let Some(canvas) = canvas {
             backend.set_canvas(canvas);
         }
+        let cuda: Vec<i32> = devices
+            .iter()
+            .filter_map(|device| device.cuda_index())
+            .collect();
+        backend.set_transfer(
+            TransferRuntime::start(
+                &lanes,
+                &cuda,
+                &CallKind::ALL,
+                launch.ipc.queue_depth,
+                info.max_batch_calls as usize,
+            )
+            .map_err(phase("bind"))?,
+        );
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
             .map(|profile| {
@@ -818,7 +833,15 @@ fn allocate_storage(
         cross_host_consumers: launch.ipc.products_cross_hosts,
         vmm_pool_bytes: plan.arena.transfer_bytes,
     };
-    let transports = Transports::new(&kinds, capacity, Arc::clone(&events), &options)?;
+    let exports = launch
+        .data_plane
+        .exports
+        .iter()
+        .map(|name| TransportKind::parse(name))
+        .collect::<Result<Vec<_>>>()?;
+    let transports = Arc::new(
+        Transports::new(&kinds, capacity, Arc::clone(&events), &options)?.with_exports(&exports)?,
+    );
 
     // Products: scheduler-placed buffers in the buffer pool and scalar relay
     // lanes, one per request slot and unresolved call.
@@ -1073,13 +1096,17 @@ fn plan(
             .sum(),
     };
     let mut layout = TokenLayout::new(report, config, launch.ipc.queue_depth, &token_facts)?;
-    let cache = if text
-        && !dedicated
-        && components
-            .placed()
+    // Every rank of a worker holding a causal LM component keeps the same
+    // KV pool, including ranks that hold only its other components: the
+    // worker advertises token work for all of its ranks, and they agree on
+    // one pool capacity.
+    let holds_text = held.iter().any(|name| {
+        declarations
+            .calls(name)
             .iter()
-            .any(|placed| placed.has(Capability::CausalLm))
-    {
+            .any(|call| call.is(Capability::CausalLm))
+    });
+    let cache = if text && !dedicated && holds_text {
         let cache =
             KVPlan::decode(model.cache_plan(interface, block_size, kv_dtype.as_deref())?)?;
         let total = match device {
