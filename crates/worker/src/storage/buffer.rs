@@ -165,6 +165,11 @@ impl<A> BufferPool<A> {
         Ok(())
     }
 
+    /// The arena of `device`, if the pool holds one there.
+    pub fn backing(&self, device: &str) -> Option<&A> {
+        self.arenas.get(device).map(|arena| &arena.backing)
+    }
+
     pub fn backings(&self) -> impl Iterator<Item = &A> {
         self.arenas.values().map(|arena| &arena.backing)
     }
