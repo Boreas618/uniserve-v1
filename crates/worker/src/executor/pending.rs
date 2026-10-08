@@ -213,7 +213,7 @@ impl PendingOutput {
         });
     }
 
-    pub fn validate_output<A>(&self, buffer: &OutputBuffer<A>, call: &Call) -> Result<()> {
+    pub fn validate_output(&self, buffer: &OutputBuffer, call: &Call) -> Result<()> {
         let sampled = self.logprob_range.as_slice();
         let bytes =
             buffer.logprob_bytes(sampled)? + buffer.logprob_bytes(&self.prompt_logprob_ranges)?;
@@ -253,11 +253,7 @@ impl PendingOutput {
     /// The caller has completed host actions and made the buffer readable.
     /// Invalid sampling distributions become error results; malformed captures
     /// return an error so the executor can report the failed computation.
-    pub fn resolve<A>(
-        &mut self,
-        parent: RequestProgress,
-        buffer: &mut OutputBuffer<A>,
-    ) -> Result<()> {
+    pub fn resolve(&mut self, parent: RequestProgress, buffer: &mut OutputBuffer) -> Result<()> {
         if self.resolved {
             return Ok(());
         }
@@ -314,7 +310,7 @@ impl PendingOutput {
         Ok(())
     }
 
-    fn decode<A>(&mut self, buffer: &mut OutputBuffer<A>) -> Result<()> {
+    fn decode(&mut self, buffer: &mut OutputBuffer) -> Result<()> {
         if let Some((offset, count)) = self.canvas_range {
             let Some((&outcome, tokens)) = buffer.read_tokens(offset, count)?.split_first() else {
                 return Err(Error::State("canvas completion has no step outcome"));

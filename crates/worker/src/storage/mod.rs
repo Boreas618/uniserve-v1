@@ -4,17 +4,34 @@
 mod block_tables;
 mod buffer;
 mod host_buffers;
+mod kv;
 mod kv_cache;
+mod kv_plan;
+mod kv_planes;
 mod latent;
+mod latent_storage;
 pub mod memory;
 mod output;
+mod request_slots;
 pub mod tensor;
+mod tensor_store;
+mod workspace;
 
 pub use block_tables::{
-    AttentionRow, BlockTableUpdate, BlockTables, GroupShape, GroupTable, TablePages, table_pages,
+    AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
+    TablePages, table_pages,
 };
 pub use buffer::{BufferBinding, BufferPool};
 pub use host_buffers::HostBuffers;
+pub use kv::{KVCache, PendingImport, ScratchUnits};
 pub use kv_cache::KVCacheManager;
+pub use kv_plan::{GroupAxis, KVGroupPlan, KVPlan};
+pub use kv_planes::{FIELDS, KVPlanes, UnitColumn, UnitSnapshot, tensor_map};
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
-pub use output::{LogprobLayout, OutputBuffer, OutputPool, OutputStorage};
+pub use latent_storage::LatentStorage;
+pub use output::{LogprobLayout, OutputBuffer, OutputLease, OutputPool, OutputStorage};
+pub use request_slots::{RequestSlots, SlotField};
+pub use tensor_store::{
+    Metadata, OutputPlacement, ProductBuffer, ProductRead, Scalar, TensorStore, ValueRange,
+};
+pub use workspace::{WorkspaceRequest, Workspaces};

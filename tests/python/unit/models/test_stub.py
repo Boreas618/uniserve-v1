@@ -5,11 +5,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.cache.units import UnitPool
 from uniserve_models.media import image
 from uniserve_models.model import LatentInput, TextInput, TextSize, VisionInput
 from uniserve_models.nn.attention import AttentionBatch, PagedInput
-from uniserve_models.runtime import PrefixCache
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.stub import DenoiserInput, Model
 
 pytestmark = pytest.mark.unit
@@ -30,50 +30,50 @@ def test_token_cycle_projects_selected_rows_and_writes_only_supplied_slots():
         device="cpu",
     )
     inputs = TextInput(tokens, torch.arange(10), AttentionBatch.single(batch))
-    with PrefixCache(
+    cache = UnitPool.allocate(
         model.cache_config, num_units=1, block_size=16, device="cpu"
-    ) as cache:
-        state = cache.state(next(iter(model.cache_config.layers)))
-        state.key.fill_(7)
-        state.value.fill_(7)
-        with ExecutionContext(model, cache=cache, attention="torch") as context:
-            context.prepare(TextSize(10, 1))
-            hidden = model(inputs)
-            logits = model.compute_logits(
-                hidden, token_indices=torch.arange(10)
-            ).gather()
-            expected = torch.tensor(
-                [1000, 1001, 151670, 1002, 1003, 1004, 1005, 1006, 1007, 151645]
-            )
-            torch.testing.assert_close(logits.argmax(-1), expected)
-            selected = torch.tensor([9, 0, 3])
+    )
+    state = cache.state(next(iter(model.cache_config.layers)))
+    state.key.fill_(7)
+    state.value.fill_(7)
+    with ExecutionContext(model, cache=cache, attention="torch") as context:
+        context.prepare(TextSize(10, 1))
+        hidden = model(inputs)
+        logits = model.compute_logits(
+            hidden, token_indices=torch.arange(10)
+        ).gather()
+        expected = torch.tensor(
+            [1000, 1001, 151670, 1002, 1003, 1004, 1005, 1006, 1007, 151645]
+        )
+        torch.testing.assert_close(logits.argmax(-1), expected)
+        selected = torch.tensor([9, 0, 3])
+        torch.testing.assert_close(
+            model.compute_logits(hidden, token_indices=selected).gather(),
+            logits[selected],
+        )
+        assert model.compute_logits(
+            hidden, token_indices=selected[:0]
+        ).values.shape == (
+            0,
+            151671,
+        )
+        for value in (state.key, state.value):
             torch.testing.assert_close(
-                model.compute_logits(hidden, token_indices=selected).gather(),
-                logits[selected],
+                value[0, :10], torch.zeros_like(value[0, :10])
             )
-            assert model.compute_logits(
-                hidden, token_indices=selected[:0]
-            ).values.shape == (
-                0,
-                151671,
+            torch.testing.assert_close(
+                value[0, 10:], torch.full_like(value[0, 10:], 7)
             )
-            for value in (state.key, state.value):
-                torch.testing.assert_close(
-                    value[0, :10], torch.zeros_like(value[0, :10])
-                )
-                torch.testing.assert_close(
-                    value[0, 10:], torch.full_like(value[0, 10:], 7)
-                )
-            state.key.fill_(3)
-            model(
-                replace(
-                    inputs,
-                    attention=AttentionBatch.single(
-                        replace(batch, write_indices=None)
-                    ),
-                )
+        state.key.fill_(3)
+        model(
+            replace(
+                inputs,
+                attention=AttentionBatch.single(
+                    replace(batch, write_indices=None)
+                ),
             )
-            torch.testing.assert_close(state.key, torch.full_like(state.key, 3))
+        )
+        torch.testing.assert_close(state.key, torch.full_like(state.key, 3))
 
 
 @torch.inference_mode()

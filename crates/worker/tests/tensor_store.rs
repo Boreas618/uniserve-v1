@@ -1,0 +1,408 @@
+//! Product storage lifetimes, imports and exports on host memory.
+
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::Arc;
+
+use uniserve_core::{CallId, RequestId};
+use uniserve_ipc::{
+    BufferAllocation, BufferId, Call, CallKind, DType as WireDType, DimBound, MediaCall,
+    RequestKey, ShapeBound, TensorRef, TransferHandle, WorkerEndpoint,
+};
+use uniserve_worker::ffi::Device;
+use uniserve_worker::storage::memory::StorageView;
+use uniserve_worker::storage::{OutputPlacement, Scalar};
+use uniserve_worker::transfer::{Capacity, TransportKind, TransportOptions, Transports, notify};
+use uniserve_worker::{BufferPool, EventPool, ProductBuffer, Result, TensorStore};
+
+const CPU: Device = Device::Cpu;
+
+fn request() -> RequestKey {
+    RequestKey::new(1, RequestId(1), 1)
+}
+
+fn reference(call: u32, output_index: u16, dtype: WireDType, dims: &[u32]) -> TensorRef {
+    TensorRef {
+        request_key: request(),
+        producer_call_id: CallId::new(1, call),
+        output_index,
+        generation: 1,
+        dtype,
+        shape_bound: ShapeBound {
+            dims: dims
+                .iter()
+                .map(|&extent| DimBound::Static(extent))
+                .collect(),
+        },
+    }
+}
+
+fn allocation(product: &TensorRef, offset: u64, bytes: u64) -> BufferAllocation {
+    BufferAllocation {
+        buffer: product.buffer_id(),
+        offset,
+        bytes,
+    }
+}
+
+fn store(
+    pool_bytes: u64,
+    compact: bool,
+    request_capacity: usize,
+    relay_depth: usize,
+) -> Result<TensorStore> {
+    TensorStore::new(
+        4,
+        1024,
+        1024,
+        vec![CPU],
+        request_capacity,
+        relay_depth,
+        BufferPool::allocate(pool_bytes, compact, &[CPU])?,
+        EventPool::new(),
+    )
+}
+
+fn transports(bytes: u64) -> Result<Transports> {
+    let options = TransportOptions {
+        source: WorkerEndpoint {
+            worker_id: "worker".into(),
+            rank: 0,
+            node: "node".into(),
+            address_space: "process".into(),
+            incarnation: "incarnation".into(),
+        },
+        acknowledgment_slot: 0,
+        host_slots: HashSet::new(),
+        cross_host_consumers: false,
+        vmm_pool_bytes: 1 << 20,
+    };
+    Transports::new(
+        &[TransportKind::Local],
+        Arc::new(Capacity::new(bytes, 8, notify)?),
+        EventPool::new(),
+        &options,
+    )
+}
+
+fn fill(view: &StorageView, values: &[f32]) {
+    assert!(view.is_contiguous() && view.numel() as usize == values.len());
+    // SAFETY: host test storage reserved for this product, without readers.
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.as_ptr(), view.address() as *mut f32, values.len());
+    }
+}
+
+fn read(view: &StorageView) -> Vec<f32> {
+    assert!(view.is_contiguous());
+    // SAFETY: host test storage; every write completed.
+    unsafe {
+        std::slice::from_raw_parts(view.address() as *const f32, view.numel() as usize).to_vec()
+    }
+}
+
+fn persistent(
+    store: &TensorStore,
+    product: &TensorRef,
+    allocation: BufferAllocation,
+    region: Option<Vec<Range<u64>>>,
+) -> Result<ProductBuffer> {
+    let allocations = HashMap::from([(product.buffer_id(), allocation)]);
+    let regions: HashMap<BufferId, Vec<Range<u64>>> = region
+        .into_iter()
+        .map(|region| (product.buffer_id(), region))
+        .collect();
+    let mut buffers = store.bind_outputs(
+        &[(product.clone(), CPU)],
+        OutputPlacement {
+            allocations: Some(&allocations),
+            regions: Some(&regions),
+            ..OutputPlacement::default()
+        },
+    )?;
+    Ok(buffers.remove(0))
+}
+
+/// Write `values` into a bound product and commit it.
+fn publish(
+    store: &TensorStore,
+    buffer: &ProductBuffer,
+    values: &[f32],
+    shape: &[u64],
+) -> Result<()> {
+    fill(&store.producer_view(buffer)?, values);
+    store.produced(buffer, shape, None, None)?;
+    store.commit_writes(std::slice::from_ref(buffer))
+}
+
+#[test]
+fn released_storage_returns_only_after_its_last_reader() -> Result<()> {
+    let store = store(256, false, 0, 0)?;
+    let product = reference(1, 0, WireDType::F32, &[2, 3]);
+    let buffer = persistent(&store, &product, allocation(&product, 0, 24), None)?;
+    publish(&store, &buffer, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])?;
+
+    let lease = store.consume(&product, CallId::new(2, 0), Some(CPU), None)?;
+    assert_eq!(read(lease.value()), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    store.release_calls(&[(request(), product.producer_call_id)]);
+    assert!(
+        store
+            .consume(&product, CallId::new(3, 0), Some(CPU), None)
+            .is_err()
+    );
+
+    // The released range stays occupied while the lease is open.
+    let next = reference(4, 0, WireDType::F32, &[2, 3]);
+    assert!(persistent(&store, &next, allocation(&next, 0, 24), None).is_err());
+    let ready = |store: &TensorStore| {
+        store.retirement_ready(
+            &HashSet::from([product.buffer_id()]),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+    };
+    assert!(!ready(&store)?);
+
+    store.complete_reads(&[Arc::clone(&lease)], None, &[])?;
+    assert!(ready(&store)?);
+    let reused = persistent(&store, &next, allocation(&next, 0, 24), None)?;
+    assert_eq!(reused.view().address(), buffer.view().address());
+    // The completed lease's view still reads its value.
+    assert!(lease.complete());
+    Ok(())
+}
+
+#[test]
+fn compact_pools_place_products_in_the_first_aligned_gap() -> Result<()> {
+    let store = store(1024, true, 0, 0)?;
+    let first = reference(1, 0, WireDType::F32, &[4]);
+    let second = reference(1, 1, WireDType::F32, &[4]);
+    let a = persistent(&store, &first, allocation(&first, 4096, 512), None)?;
+    let b = persistent(&store, &second, allocation(&second, 8192, 512), None)?;
+    assert_eq!(b.view().address() - a.view().address(), 256);
+
+    store.abandon_writes(std::slice::from_ref(&a))?;
+    let third = reference(2, 0, WireDType::F32, &[4]);
+    let c = persistent(&store, &third, allocation(&third, 0, 16), None)?;
+    assert_eq!(c.view().address(), a.view().address());
+    Ok(())
+}
+
+#[test]
+fn deferred_writes_stay_undiscoverable_until_produced_and_committed() -> Result<()> {
+    let store = store(256, false, 0, 0)?;
+    let product = reference(1, 0, WireDType::F32, &[2]);
+    let buffer = persistent(&store, &product, allocation(&product, 0, 8), None)?;
+    store.defer_write(&buffer)?;
+    assert!(buffer.deferred());
+    store.commit_writes(std::slice::from_ref(&buffer))?;
+    assert!(
+        store
+            .consume(&product, CallId::new(2, 0), None, None)
+            .is_err()
+    );
+
+    publish(&store, &buffer, &[7.0, 8.0], &[2])?;
+    let lease = store.consume(&product, CallId::new(2, 0), None, None)?;
+    assert_eq!(read(lease.value()), vec![7.0, 8.0]);
+    Ok(())
+}
+
+#[test]
+fn a_failed_group_binding_releases_every_group_of_the_call() -> Result<()> {
+    let store = store(256, false, 2, 1)?;
+    let product = reference(1, 0, WireDType::F32, &[2]);
+    let scalar = reference(1, 1, WireDType::I32, &[]);
+    let allocations = HashMap::from([(product.buffer_id(), allocation(&product, 0, 8))]);
+    // The relay output names no request slot.
+    let slots = HashMap::new();
+    let groups = vec![vec![(product.clone(), CPU)], vec![(scalar, CPU)]];
+    let placement = OutputPlacement {
+        request_slots: Some(&slots),
+        allocations: Some(&allocations),
+        ..OutputPlacement::default()
+    };
+    assert!(store.bind_output_groups(&groups, placement).is_err());
+
+    // The first group's range was returned.
+    persistent(&store, &product, allocation(&product, 0, 8), None)?;
+    Ok(())
+}
+
+#[test]
+fn relay_lanes_are_bounded_by_the_unresolved_window() -> Result<()> {
+    let store = store(256, false, 2, 1)?;
+    let slots = HashMap::from([(request(), 1)]);
+    let placement = OutputPlacement {
+        request_slots: Some(&slots),
+        ..OutputPlacement::default()
+    };
+    let first = reference(1, 0, WireDType::I32, &[]);
+    let buffer = store
+        .bind_outputs(&[(first.clone(), CPU)], placement)?
+        .remove(0);
+    store.write_scalar(&buffer, Scalar::Int(-3), None)?;
+    store.commit_writes(std::slice::from_ref(&buffer))?;
+    // One element per (slot + 1) x depth of one int32 field.
+    assert_eq!(store.resident_bytes(CPU), 3 * 4);
+
+    let lease = store.consume(&first, CallId::new(5, 0), None, None)?;
+    // SAFETY: host relay element written above.
+    assert_eq!(unsafe { *(lease.value().address() as *const i32) }, -3);
+
+    let second = reference(2, 0, WireDType::I32, &[]);
+    assert!(
+        store
+            .bind_outputs(&[(second.clone(), CPU)], placement)
+            .is_err()
+    );
+    store.complete_reads(&[lease], None, &[])?;
+    store.release_calls(&[(request(), first.producer_call_id)]);
+    store.release_requests(&HashSet::new(), &HashSet::new())?;
+    store.bind_outputs(&[(second, CPU)], placement)?;
+    Ok(())
+}
+
+fn call(consumers: Vec<u32>) -> Call {
+    Call {
+        request_key: request(),
+        call_id: CallId::new(1, 0),
+        coordinates: Default::default(),
+        component: "image".into(),
+        code: CallKind::Media(MediaCall::ImageDecoding),
+        bounds: Default::default(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        consumer_slots: consumers,
+        token_input: None,
+        token_output: None,
+        vision_inputs: Vec::new(),
+        latent_feature_input: None,
+        encoder_output: None,
+        latent_input: None,
+        latent_output: None,
+        image_input: None,
+        image_output: None,
+        completion_output: None,
+        transition_output: None,
+        predicate: None,
+        rng: None,
+        sampling_state: None,
+        input_token_ids: Vec::new(),
+        readout: None,
+        canvas: None,
+        input_image: None,
+        kv_input: None,
+        kv_output: None,
+    }
+}
+
+#[test]
+fn shard_exports_carry_their_logical_origin_and_failures_return_bytes() -> Result<()> {
+    let store = store(1024, false, 0, 0)?;
+    let transports = transports(64)?;
+    let product = reference(1, 0, WireDType::F32, &[4, 3]);
+    // A shard holding rows [2, 4) of the logical [4, 3] tensor.
+    let buffer = persistent(
+        &store,
+        &product,
+        allocation(&product, 0, 24),
+        Some(vec![2..4, 0..3]),
+    )?;
+    publish(&store, &buffer, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])?;
+
+    let (export, locations) = store.export_buffer(
+        &call(vec![]),
+        &product,
+        &buffer,
+        &transports,
+        false,
+        None,
+        None,
+    )?;
+    let TransferHandle::DeviceProduct { tensor, .. } = &export.value else {
+        panic!("a product exports as a device product");
+    };
+    assert_eq!(tensor.shape, vec![4, 3]);
+    assert_eq!(tensor.locations[0].offset, vec![2, 0]);
+    assert_eq!(tensor.locations[0].shape, vec![2, 3]);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(transports.capacity().used(), 24);
+
+    // The second region does not fit the remaining bytes: the first
+    // accepted export is revoked and its bytes return.
+    let regions = vec![vec![0..2, 0..3], vec![0..2, 0..3]];
+    assert!(
+        store
+            .export_buffer(
+                &call(vec![]),
+                &product,
+                &buffer,
+                &transports,
+                false,
+                Some(&regions),
+                None
+            )
+            .is_err()
+    );
+    assert_eq!(transports.capacity().used(), 24);
+    uniserve_worker::transfer::exports::release(&locations)?;
+    assert_eq!(transports.capacity().used(), 0);
+    Ok(())
+}
+
+#[test]
+fn imports_share_pending_reads_and_widen_resident_shards() -> Result<()> {
+    let producer = store(1024, false, 0, 0)?;
+    let consumer = store(1024, false, 0, 0)?;
+    let transports = transports(1024)?;
+    let product = reference(1, 0, WireDType::F32, &[4, 3]);
+    let values: Vec<f32> = (0..12).map(|value| value as f32).collect();
+    let source = persistent(&producer, &product, allocation(&product, 0, 48), None)?;
+    publish(&producer, &source, &values, &[4, 3])?;
+    let (export, _locations) = producer.export_buffer(
+        &call(vec![]),
+        &product,
+        &source,
+        &transports,
+        false,
+        None,
+        None,
+    )?;
+    let TransferHandle::DeviceProduct { tensor, .. } = &export.value else {
+        panic!("a product exports as a device product");
+    };
+
+    // The consumer holds rows [0, 2) and its allocation covers the tensor.
+    let shard = persistent(
+        &consumer,
+        &product,
+        allocation(&product, 0, 48),
+        Some(vec![0..2, 0..3]),
+    )?;
+    publish(&consumer, &shard, &values[..6], &[2, 3])?;
+
+    let allocations = HashMap::from([(product.buffer_id(), allocation(&product, 0, 48))]);
+    let placement = OutputPlacement {
+        allocations: Some(&allocations),
+        ..OutputPlacement::default()
+    };
+    let first =
+        consumer.import_tensor(&product, tensor, CPU, &transports, placement, None, None)?;
+    let second =
+        consumer.import_tensor(&product, tensor, CPU, &transports, placement, None, None)?;
+    assert_eq!(first.value().address(), second.value().address());
+    // Only the missing rows are read.
+    assert_eq!(first.reads().len(), 1);
+    for read in first.reads() {
+        read.wait_ready();
+    }
+    consumer.complete_import(&first, None)?;
+    assert_eq!(read(first.value()), values);
+
+    consumer.complete_reads(&[first, second], None, &[])?;
+    let lease = consumer.consume(&product, CallId::new(2, 0), None, None)?;
+    assert_eq!(lease.value().shape(), &[4, 3]);
+    assert_eq!(read(lease.value()), values);
+    Ok(())
+}

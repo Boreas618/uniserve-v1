@@ -1,36 +1,44 @@
-//! Host input buffers retained until their asynchronous copies complete.
+//! Host staging rings retained until their asynchronous copies complete.
 
-use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
+use std::sync::Arc;
 
+use uniserve_cuda::{Event, EventFlags, Stream};
+
+use super::memory::Memory;
 use crate::{Error, Result};
 
-/// A fixed ring of host copy sources.
+/// A fixed ring of host copy sources: page-locked for a CUDA device,
+/// pageable for a CPU lane.
 ///
-/// The numerical backend allocates and fills the buffers. After enqueueing a
-/// copy, it records that slot on the copy stream before acquiring it again.
-/// Acquiring a slot waits only for its previous copy; unrelated device work
-/// does not prevent reuse. Slots are round-robin, not individually leased.
-pub struct HostBuffers<T> {
-    buffers: Vec<T>,
+/// The owner fills a slot and enqueues its copy, then records the slot on
+/// the copy stream before acquiring it again. Acquiring a slot waits only
+/// for that slot's previous copy; unrelated device work does not prevent
+/// reuse. Slots are round-robin, not individually leased.
+pub struct HostBuffers {
+    buffers: Vec<Arc<Memory>>,
     events: Vec<Event>,
     device: Option<i32>,
     cursor: usize,
 }
 
-impl<T> HostBuffers<T> {
-    pub fn new(buffers: Vec<T>, device: Option<i32>) -> Result<Self> {
-        if buffers.is_empty() {
+impl HostBuffers {
+    /// `depth` slots of `bytes` each, pinned for `device`'s copies.
+    pub fn allocate(device: Option<i32>, bytes: usize, depth: usize) -> Result<Self> {
+        if depth == 0 {
             return Err(Error::Invalid("host buffer depth must be positive".into()));
         }
-
+        let buffers = (0..depth)
+            .map(|_| match device {
+                Some(device) => Memory::pinned(device, bytes.max(1)),
+                None => Ok(Memory::host(bytes.max(1))),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let events = match device {
-            Some(_) => buffers
-                .iter()
+            Some(_) => (0..depth)
                 .map(|_| Event::new(EventFlags::default()))
                 .collect(),
             None => Vec::new(),
         };
-
         Ok(Self {
             buffers,
             events,
@@ -39,16 +47,17 @@ impl<T> HostBuffers<T> {
         })
     }
 
+    /// Host bytes of a ring.
+    pub fn bytes(bytes: usize, depth: usize) -> u64 {
+        (bytes.max(1) * depth) as u64
+    }
+
     pub fn device(&self) -> Option<i32> {
         self.device
     }
 
-    pub fn buffers(&self) -> &[T] {
-        &self.buffers
-    }
-
-    /// Wait for the next slot's last copy before returning its source buffer.
-    pub fn acquire(&mut self) -> Result<(usize, &T)> {
+    /// Wait for the next slot's last copy, then lend its buffer.
+    pub fn acquire(&mut self) -> Result<(usize, &Arc<Memory>)> {
         if self.buffers.is_empty() {
             return Err(Error::State("host buffers are closed"));
         }
@@ -64,28 +73,21 @@ impl<T> HostBuffers<T> {
         Ok((slot, &self.buffers[slot]))
     }
 
-    /// Fence the copy just submitted from `slot` on the supplied CUDA stream.
-    /// Non-CUDA buffers do not need copy fences.
+    /// Fence the copy just submitted from `slot` on `stream`. Host rings
+    /// need no fence: their copies complete before the call returns.
     #[expect(
         clippy::mem_forget,
         reason = "failed copy fencing cannot release its source allocations"
     )]
-    pub fn record_copy(&mut self, slot: usize, stream: usize) -> Result<()> {
-        let Some(device) = self.device else {
+    pub fn record_copy(&mut self, slot: usize, stream: &Stream) -> Result<()> {
+        if self.device.is_none() {
             return Ok(());
-        };
+        }
         let event = self
             .events
             .get(slot)
             .ok_or_else(|| Error::Invalid("host buffer slot is outside its ring".into()))?;
-
-        // A default-stream handle resolves against the current context.
-        let result = DeviceGuard::new(DeviceId(device)).and_then(|_device| {
-            // SAFETY: the numerical backend submitted the copy on this live
-            // stream of `device`; it is borrowed only for this record.
-            let stream = unsafe { Stream::borrowed(DeviceId(device), stream) }?;
-            event.record(&stream)
-        });
+        let result = event.record(stream);
         if result.is_err() {
             // The copy was submitted before this fence. If recording fails,
             // its sources must neither be reused nor released as completed.
@@ -95,23 +97,20 @@ impl<T> HostBuffers<T> {
         result.map_err(Error::Cuda)
     }
 
-    /// Drain copies and return their source allocations for release.
-    ///
-    /// Bindings drop these allocations outside their owner lock, since a
-    /// foreign tensor destructor can call back into the runtime.
-    pub fn close(&mut self) -> Result<Vec<T>> {
+    /// Drain copies and release the ring.
+    pub fn close(&mut self) -> Result<()> {
         for event in &self.events {
             if !event.query()? {
                 event.synchronize()?;
             }
         }
-
         self.events.clear();
-        Ok(std::mem::take(&mut self.buffers))
+        self.buffers.clear();
+        Ok(())
     }
 }
 
-impl<T> Drop for HostBuffers<T> {
+impl Drop for HostBuffers {
     #[expect(
         clippy::mem_forget,
         reason = "unknown device completion must retain its source allocations"
@@ -119,8 +118,26 @@ impl<T> Drop for HostBuffers<T> {
     fn drop(&mut self) {
         if self.close().is_err() {
             // A failed CUDA wait cannot establish that the source is reusable.
-            // Keep its allocation alive rather than free memory still in use.
             std::mem::forget(std::mem::take(&mut self.buffers));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi::Backing;
+
+    #[test]
+    fn host_rings_cycle_their_slots() -> Result<()> {
+        let mut ring = HostBuffers::allocate(None, 16, 2)?;
+        let (first, memory) = ring.acquire()?;
+        let first_address = memory.address();
+        let (second, _) = ring.acquire()?;
+        let (third, memory) = ring.acquire()?;
+        assert_eq!((first, second, third), (0, 1, 0));
+        assert_eq!(memory.address(), first_address);
+        assert!(HostBuffers::allocate(None, 16, 0).is_err());
+        Ok(())
     }
 }
