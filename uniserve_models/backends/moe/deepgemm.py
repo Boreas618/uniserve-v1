@@ -12,10 +12,17 @@ import torch.distributed as dist
 from torch import nn
 
 from uniserve_models.quantization import QuantizedTensor, RowOrder, ScaleLayout
-from uniserve_models.runtime._peer_storage import allocate_collective_buffer
-from uniserve_models.runtime.microbatches import yield_microbatch
 
 from . import Operator
+
+
+def _yield_microbatch() -> None:
+    """Hand the device to the next active microbatch, if any."""
+    # The experts runtime supplies microbatch rotation; import it at use so
+    # the provider loads without that runtime.
+    from uniserve_models.runtime.microbatches import yield_microbatch
+
+    yield_microbatch()
 
 
 class Buffer:
@@ -137,6 +144,11 @@ class Buffer:
                 format == "nvfp4",
             )
         )
+        # The experts runtime supplies collective symmetric storage.
+        from uniserve_models.runtime._peer_storage import (
+            allocate_collective_buffer,
+        )
+
         self.storage = allocate_collective_buffer(
             (byte_count,), dtype=torch.int8, device=self.device
         )
@@ -409,7 +421,7 @@ class _SplitOperator(Operator):
                 buffer.expert(self)
             else:
                 buffer.step.launch(self)
-            yield_microbatch()
+            _yield_microbatch()
             return hidden.new_empty((0, buffer.hidden_size))
 
         if count:
@@ -437,7 +449,7 @@ class _SplitOperator(Operator):
         # external_quant consumes the encoded buffer, so hidden's argument
         # only supplies the BF16 shape expected by the native launch contract.
         buffer.attention(output, output, topk_ids, topk_weights, phase=1)
-        yield_microbatch()
+        _yield_microbatch()
         buffer.attention(output, output, topk_ids, topk_weights, phase=2)
         # Strip physical channel padding before exposing numerical rows.
         return output[:, : buffer.hidden_size].contiguous()

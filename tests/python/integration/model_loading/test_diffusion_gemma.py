@@ -29,6 +29,8 @@ from tests.python.fixtures.checkpoints import (
     diffusion_gemma_checkpoint,
     load_diffusion_gemma,
 )
+from uniserve_models import catalog as models
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.diffusion.tokens import self_conditioning_embedding
 from uniserve_models.distributed import Communicator
 from uniserve_models.loading import weights
@@ -48,9 +50,8 @@ from uniserve_models.nn.attention import (
 )
 from uniserve_models.nn.functional import patchify
 from uniserve_models.nn.moe import FusedMoE
-from uniserve_models.runtime import ExecutionContext, PrefixCache
+from uniserve_models.runtime import PrefixCache
 from uniserve_models.runtime.prefix_cache import plan_units
-from uniserve_models import catalog as models
 
 pytestmark = pytest.mark.integration
 

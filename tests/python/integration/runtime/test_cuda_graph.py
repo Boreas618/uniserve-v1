@@ -4,10 +4,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
-
-from uniserve_models.nn import Linear
-from uniserve_models.runtime import CUDAStream, ExecutionContext
 from uniserve_models.runtime.cuda_graph import CUDAGraph, CUDAGraphError
+
+from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.nn import Linear
+from uniserve_models.runtime import CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

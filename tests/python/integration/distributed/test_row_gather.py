@@ -6,6 +6,7 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh, parallelize_
 from uniserve_models.model import TextSize
 from uniserve_models.nn import ColumnParallelLinear
@@ -14,7 +15,6 @@ from uniserve_models.quantization import Quantizer
 from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
-    ExecutionContext,
     initialize_process_groups,
 )
 

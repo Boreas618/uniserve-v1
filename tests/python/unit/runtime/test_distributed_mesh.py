@@ -5,7 +5,7 @@ import torch
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from uniserve_models.distributed import Communicator, DeviceMesh, Distribution
-from uniserve_models.runtime.process_groups import initialize_process_groups
+from uniserve_models.interface.distributed import initialize
 
 pytestmark = pytest.mark.unit
 
@@ -17,8 +17,16 @@ def test_launch_rejects_unavailable_rank_device(monkeypatch):
         ValueError,
         match=r"cuda device cuda:1 is outside the 1 visible CUDA device",
     ):
-        initialize_process_groups(
-            rank=1, local_rank=1, world_size=2, device="cuda"
+        initialize(
+            {
+                "rank": 1,
+                "local_rank": 1,
+                "world_size": 2,
+                "device": "cuda",
+                "backend": None,
+                "store": None,
+                "union": None,
+            }
         )
 
 

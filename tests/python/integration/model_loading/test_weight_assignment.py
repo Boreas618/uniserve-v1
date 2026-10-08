@@ -19,7 +19,11 @@ from uniserve_models.nn.linear import (
     Linear,
     MergedColumnParallelLinear,
 )
-from uniserve_models.quantization import QuantizationConfig, QuantizedTensor, Quantizer
+from uniserve_models.quantization import (
+    QuantizationConfig,
+    QuantizedTensor,
+    Quantizer,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -184,8 +188,8 @@ def test_post_load_can_derive_constants_without_hiding_unused_sources(
 def test_merged_parameter_updates_are_visible_across_execution_contexts(
     tmp_path, quantizer
 ):
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import ExecutionContext
 
     first = torch.arange(32).reshape(8, 4).float().sin()
     second = torch.arange(32).reshape(8, 4).float().cos() * 20

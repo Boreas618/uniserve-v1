@@ -8,13 +8,13 @@ from types import MappingProxyType
 
 import torch
 
+from uniserve_models.bindings.context import TensorBuffers
 from uniserve_models.distributed.mesh import Communicator
 from uniserve_models.nn.attention._parallel import (
     AttentionBuffers,
     OutputBuffers,
     ParallelAttention,
 )
-from uniserve_models.runtime.tensor_buffers import TensorBuffers
 from uniserve_models.tensors import BufferConfig
 
 
@@ -79,29 +79,66 @@ def allocate_output_storage(
         composes_peer_rows = layer.context_group.size > 1
         key = (group, composes_peer_rows)
         if key not in allocations:
-            allocation = TensorBuffers.allocate(
-                schema,
-                device=group.device,
-                symmetric=(
-                    {"output": group, "receive": group}
-                    if composes_peer_rows
-                    else {}
-                ),
+            allocations[key] = _output_allocation(
+                schema, group, composes_peer_rows
             )
-            # Each rank seeds its own sync slot for the peer rendezvous.
-            allocation.view(schema)["sync_input"].fill_(group.rank)
-            allocations[key] = allocation
 
-        allocation = allocations[key]
+        allocation, peers = allocations[key]
         views = allocation.view(schema)
         bindings[layer] = OutputBuffers(
-            allocation.peers("output") if composes_peer_rows else (),
+            peers,
             views["output"],
             views["receive"],
             views["sync_input"],
             views["sync_output"],
         )
-    return OutputStorage(tuple(allocations.values()), bindings)
+    return OutputStorage(
+        tuple(allocation for allocation, _ in allocations.values()), bindings
+    )
+
+
+def _output_allocation(
+    schema: Mapping[str, BufferConfig],
+    group: Communicator,
+    symmetric: bool,
+) -> tuple[TensorBuffers, tuple[torch.Tensor, ...]]:
+    """Back one output schema, peer-addressable when ``symmetric``.
+
+    Returns the backing and, for symmetric storage, every peer's output view
+    in the group's logical order.
+    """
+    if not symmetric:
+        allocation = TensorBuffers.allocate(schema, device=group.device)
+        peers: tuple[torch.Tensor, ...] = ()
+    else:
+        # Peer-addressable storage comes from the parallel runtime, which
+        # maps every rank's allocation; import it only where it is needed.
+        from uniserve_models.runtime._peer_storage import (
+            allocate_symmetric_storage,
+        )
+
+        plain = {
+            name: config
+            for name, config in schema.items()
+            if name not in ("output", "receive")
+        }
+        tensors = dict(
+            TensorBuffers.allocate(plain, device=group.device).view(plain)
+        )
+        shared = {
+            name: allocate_symmetric_storage(
+                group, schema[name].shape, schema[name].dtype
+            )
+            for name in ("output", "receive")
+        }
+        tensors.update(
+            {name: storage.local for name, storage in shared.items()}
+        )
+        allocation = TensorBuffers.from_tensors(tensors)
+        peers = tuple(shared["output"].peers)
+    # Each rank seeds its own sync slot for the peer rendezvous.
+    allocation.view(schema)["sync_input"].fill_(group.rank)
+    return allocation, peers
 
 
 def allocate_attention_context(
