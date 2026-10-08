@@ -41,9 +41,21 @@ pub use host::{HostAction, HostLane, HostTask};
 pub use parallel::{
     ExpertExchange, Microbatches, StreamCommunicator, WeightPrefetch, yield_microbatch,
 };
+pub use request::diffusion::{
+    Branch, BranchSet, BranchSource, Coordinates, ForwardSlot, GuidancePlan, ImageTrajectory,
+    Prefix, PrefixFill, Trajectories,
+};
 pub use request::{Request, RequestPool, RequestProgress};
+pub use runner::encoder::{
+    Encoded, EncoderConfig, EncoderGraph, EncoderInfo, EncoderRunner, LatentEncoder,
+    MAX_PACKED_IMAGES, PreparedImage, PromptVision, TextEncoder, Tower, VisionEncoder,
+    packed_grids, prepare_input, text_capacity,
+};
 pub use runner::graphs::{
     Capacity, GraphCounts, GraphMode, GraphTable, Lookup, bucket, capture_order, reserve_pools,
+};
+pub use runner::vision::{
+    BlockPositions, FeatureInjection, FeatureLayout, PositionLayout, VisionBlock,
 };
 pub use runner::{
     GraphPool, GraphPools, GraphStorage, ModelBatch, ModelRunners, PrefillShape, TextShapes,
