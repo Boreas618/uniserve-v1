@@ -708,14 +708,14 @@ impl TextRunner {
                     // its stream.
                     unsafe { uniserve_cuda::memset_d8(address, value, count, stream) }?;
                 }
-                let mut copies = CopyBatch::new(SourceOrder::Stream);
                 for &(destination, source, size) in &features {
-                    copies.push(destination, source, size);
+                    // One copy per block: a batched device-to-device copy
+                    // faults on streams of SM partitions (green contexts).
+                    // SAFETY: rows of the binding's embedding column; the
+                    // features are leased products whose producers this
+                    // stream waited on.
+                    unsafe { uniserve_cuda::memcpy_async(destination, source, size, stream) }?;
                 }
-                // SAFETY: rows of the binding's embedding column; the
-                // features are leased products whose producers this stream
-                // waited on.
-                unsafe { copies.submit(stream) }?;
             }
             None => {
                 for &(address, value, count) in &masks {
