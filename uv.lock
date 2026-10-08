@@ -2867,7 +2867,7 @@ gpu = [
     { name = "flashinfer-python" },
     { name = "ninja" },
     { name = "requests", extra = ["socks"] },
-    { name = "uniserve-kernels", extra = ["flash-attn-4", "megamoe", "peer-storage", "sparse-attention"] },
+    { name = "uniserve-kernels", extra = ["flash-attn-4", "host-memory", "megamoe", "sparse-attention"] },
 ]
 test = [
     { name = "ninja" },
@@ -2903,7 +2903,7 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.57.1" },
     { name = "uniserve-eval", extras = ["datasets"], marker = "extra == 'bench'", editable = "uniserve_eval" },
     { name = "uniserve-kernels", editable = "uniserve_kernels" },
-    { name = "uniserve-kernels", extras = ["peer-storage", "sparse-attention", "flash-attn-4", "megamoe"], marker = "extra == 'gpu'", editable = "uniserve_kernels" },
+    { name = "uniserve-kernels", extras = ["host-memory", "sparse-attention", "flash-attn-4", "megamoe"], marker = "extra == 'gpu'", editable = "uniserve_kernels" },
 ]
 provides-extras = ["test", "dev", "bench", "gpu"]
 
@@ -2944,12 +2944,12 @@ flash-attn-4 = [
     { name = "flash-attn-4", extra = ["cu13"] },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
 ]
+host-memory = [
+    { name = "ninja" },
+]
 megamoe = [
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
     { name = "nvshmem4py-cu13" },
-]
-peer-storage = [
-    { name = "ninja" },
 ]
 sparse-attention = [
     { name = "ninja" },
@@ -2958,14 +2958,14 @@ sparse-attention = [
 [package.metadata]
 requires-dist = [
     { name = "flash-attn-4", extras = ["cu13"], marker = "extra == 'flash-attn-4'", specifier = "==4.0.0b30" },
-    { name = "ninja", marker = "extra == 'peer-storage'", specifier = ">=1.13" },
+    { name = "ninja", marker = "extra == 'host-memory'", specifier = ">=1.13" },
     { name = "ninja", marker = "extra == 'sparse-attention'", specifier = ">=1.13" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'flash-attn-4'", specifier = "==4.6.2" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'megamoe'", specifier = "==4.6.2" },
     { name = "nvshmem4py-cu13", marker = "extra == 'megamoe'", specifier = "==0.4.0" },
     { name = "torch", specifier = ">=2.13,<2.14" },
 ]
-provides-extras = ["peer-storage", "sparse-attention", "flash-attn-4", "megamoe"]
+provides-extras = ["host-memory", "sparse-attention", "flash-attn-4", "megamoe"]
 
 [[package]]
 name = "urllib3"

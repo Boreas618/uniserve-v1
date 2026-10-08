@@ -47,11 +47,14 @@ __all__ = ["Backend", "MegaMoEBuffer"]
 _NVSHMEM_GROUP: Communicator | None = None
 
 
-def _initialize_nvshmem(group: Communicator, device: torch.device) -> None:
+def _initialize_nvshmem(
+    group: Communicator, bootstrap, device: torch.device
+) -> None:
     """Join NVSHMEM with the expert group's ranks, once per process.
 
-    Rank 0 creates the unique id and broadcasts it over the group's host
-    backend; every rank then initializes NVSHMEM as its group rank.
+    Rank 0 creates the unique id and broadcasts it with the group's host
+    collectives (``bootstrap``); every rank then initializes NVSHMEM as its
+    group rank.
     """
     global _NVSHMEM_GROUP
     if _NVSHMEM_GROUP is not None:
@@ -66,16 +69,17 @@ def _initialize_nvshmem(group: Communicator, device: torch.device) -> None:
 
     import numpy as np
     import nvshmem.core
-    import torch.distributed as dist
     from cuda.core import Device
 
     index = device.index if device.index is not None else 0
     cuda_device = Device(index)
     cuda_device.set_current()
     uid = nvshmem.core.get_unique_id(empty=group.rank != 0)
-    payload = torch.from_numpy(uid._data.view(np.uint8).copy())
-    dist.broadcast(payload, src=group.ranks[0], group=group._require())
-    uid._data[:] = payload.numpy().view(uid._data.dtype)
+    payload = bootstrap.bcast(
+        uid._data.view(np.uint8).tobytes() if group.rank == 0 else None,
+        root=0,
+    )
+    uid._data[:] = np.frombuffer(payload, dtype=np.uint8).view(uid._data.dtype)
     nvshmem.core.init(
         device=cuda_device,
         uid=uid,
@@ -89,10 +93,11 @@ def _initialize_nvshmem(group: Communicator, device: torch.device) -> None:
 class MegaMoEBuffer:
     """One worker's MegaMoE symmetric buffers and kernel for an expert group.
 
-    Construction is collective over ``group``: NVSHMEM initialization and
-    the symmetric allocation run on every rank at the same point of its
-    startup. ``max_tokens`` bounds the tokens one rank supplies per call;
-    ``intermediate`` is each expert's gated width ``I`` and ``activation``
+    Construction is collective over ``group``: NVSHMEM initialization (its
+    unique id travels through ``bootstrap``) and the symmetric allocation
+    run on every rank at the same point of its startup. ``max_tokens``
+    bounds the tokens one rank supplies per call; ``intermediate`` is each
+    expert's gated width ``I`` and ``activation``
     the experts' gate nonlinearity. The kernel compiles at the first call,
     which must precede any capture on every rank.
     """
@@ -100,6 +105,7 @@ class MegaMoEBuffer:
     def __init__(
         self,
         group: Communicator,
+        bootstrap,
         *,
         max_tokens: int,
         num_experts: int,
@@ -109,7 +115,7 @@ class MegaMoEBuffer:
         activation: str,
         device: torch.device,
     ) -> None:
-        _initialize_nvshmem(group, device)
+        _initialize_nvshmem(group, bootstrap, device)
         from uniserve_kernels.megamoe import get_symm_buffer_for_mega_moe
 
         self.group = group

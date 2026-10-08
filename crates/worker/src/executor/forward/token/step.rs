@@ -10,11 +10,14 @@
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
+use super::StepParts;
 use super::batch::TokenBatch;
 use super::calls;
+use crate::runner::graphs::GraphMode;
 use crate::runner::text::{
-    Executed, RowSource, SamplingColumns, StepContext, StepRequest, TokenRow, logit_layout,
+    Executed, RowSource, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };
+use crate::sampling::SamplingMetadata;
 use crate::sampling::plan::{
     SampleTask, SamplingPlan, greedy_finish_words, logprob_request, logprob_words,
 };
@@ -39,22 +42,82 @@ pub(super) struct PromptScore {
     pub(super) layout: Option<LogprobLayout>,
 }
 
-/// What a step produced, for capture and commit.
-pub(super) struct Stepped {
-    pub(super) executed: Executed,
+/// One microbatch's invocation, as it ran.
+pub(super) struct Invoked {
+    /// The runner that ran it.
+    pub(super) runner: usize,
     /// The tasks' plan; absent for greedy decode and unsampled calls.
     pub(super) sampling: Option<SamplingPlan>,
     pub(super) tasks: usize,
+}
+
+impl Invoked {
+    /// A task's column in this invocation's selection outputs.
+    pub(super) fn position(&self, task: usize) -> usize {
+        self.sampling
+            .as_ref()
+            .map_or(task, |plan| plan.position(task))
+    }
+}
+
+/// What a step produced, for capture and commit.
+pub(super) struct Stepped {
+    /// Every populated microbatch's invocation, in microbatch order.
+    pub(super) invocations: Vec<Invoked>,
+    /// How the step ran: the populated invocations' tokens summed, and
+    /// their mode (any capture, else any replay, else eager).
+    pub(super) executed: Executed,
     pub(super) rows: usize,
     pub(super) drafts: u64,
 }
 
 impl Stepped {
-    /// A task's column in the selection outputs.
-    pub(super) fn position(&self, task: usize) -> usize {
-        self.sampling
-            .as_ref()
-            .map_or(task, |plan| plan.position(task))
+    /// The invocation of microbatch runner `runner`.
+    pub(super) fn invocation(&self, runner: usize) -> Result<&Invoked> {
+        self.invocations
+            .iter()
+            .find(|invoked| invoked.runner == runner)
+            .ok_or_else(|| Error::Invariant("a sampled call's microbatch did not run".into()))
+    }
+}
+
+/// One microbatch's invocation before it runs.
+struct Planned {
+    runner: usize,
+    rows: Vec<TokenRow>,
+    sampling: Option<SamplingPlan>,
+    greedy: Vec<i64>,
+    prompt: Vec<i64>,
+    tasks: usize,
+}
+
+impl Planned {
+    fn request(&self, decode: bool) -> StepRequest<'_> {
+        let columns = if !self.greedy.is_empty() {
+            Some(SamplingColumns {
+                words: &self.greedy,
+                draws: &[],
+                params: &[],
+                slots: &[],
+                gates: &[],
+                greedy: true,
+            })
+        } else {
+            self.sampling.as_ref().map(|plan| SamplingColumns {
+                words: &plan.words,
+                draws: &plan.draws,
+                params: &plan.params,
+                slots: &plan.slots,
+                gates: &plan.gates,
+                greedy: false,
+            })
+        };
+        StepRequest {
+            decode,
+            rows: &self.rows,
+            sampling: columns,
+            prompt: &self.prompt,
+        }
     }
 }
 
@@ -78,10 +141,17 @@ impl PromptScore {
 }
 
 impl TokenBatch<'_> {
-    /// Build the invocation of the active calls and run it.
+    /// Build the active calls' invocations, one per microbatch, and run
+    /// them as one step.
+    ///
+    /// Active calls split into contiguous microbatches of
+    /// `[i * R / P, (i + 1) * R / P)` rows for `R` rows and `P`
+    /// microbatches; each microbatch runner samples and scores its own
+    /// rows.
     pub(super) fn step(&mut self) -> Result<Stepped> {
         let plan = self.plan;
-        let indexed = self.runtime.runners[self.runner].indexed();
+        let peers = self.runtime.groups[self.group].clone();
+        let indexed = self.runtime.runners[peers[0]].indexed();
         let kv = self
             .storage
             .kv
@@ -117,6 +187,96 @@ impl TokenBatch<'_> {
             state.prepared = Some(prepared);
             params[index] = Some((admitted, finish));
         }
+
+        let count = peers.len();
+        let total = active.len();
+        let mut planned = Vec::with_capacity(count);
+        let mut metadata = Vec::new();
+        for (index, &runner) in peers.iter().enumerate() {
+            let range = index * total / count..(index + 1) * total / count;
+            if range.is_empty() {
+                planned.push(None);
+                continue;
+            }
+            planned.push(Some(self.plan_invocation(
+                runner,
+                &active[range.clone()],
+                rows[range].to_vec(),
+                &params,
+                &mut metadata,
+            )?));
+        }
+
+        let decode = self.mode == ForwardMode::Decode;
+        let requests: Vec<Option<StepRequest<'_>>> = planned
+            .iter()
+            .map(|planned| planned.as_ref().map(|planned| planned.request(decode)))
+            .collect();
+        let kv = self
+            .storage
+            .kv
+            .as_mut()
+            .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
+        let (tables, cache) = kv.split();
+        let executed = self.runtime.invoke(
+            self.experts,
+            self.group,
+            &requests,
+            &mut StepParts { tables, cache },
+            None,
+        )?;
+        drop(requests);
+        for (index, controls) in metadata {
+            self.calls[index].metadata = Some(controls);
+        }
+
+        let mut invocations = Vec::new();
+        let mut summary = Executed {
+            mode: GraphMode::Eager,
+            live_tokens: 0,
+            padded_tokens: 0,
+        };
+        for (planned, executed) in planned.into_iter().zip(executed) {
+            let (Some(planned), Some(executed)) = (planned, executed) else {
+                continue;
+            };
+            summary.live_tokens += executed.live_tokens;
+            summary.padded_tokens += executed.padded_tokens;
+            summary.mode = match (summary.mode, executed.mode) {
+                (GraphMode::Capture, _) | (_, GraphMode::Capture) => GraphMode::Capture,
+                (GraphMode::Replay, _) | (_, GraphMode::Replay) => GraphMode::Replay,
+                _ => GraphMode::Eager,
+            };
+            invocations.push(Invoked {
+                runner: planned.runner,
+                sampling: planned.sampling,
+                tasks: planned.tasks,
+            });
+        }
+        Ok(Stepped {
+            invocations,
+            executed: summary,
+            rows: rows.len(),
+            drafts: rows
+                .iter()
+                .map(|row| u64::from(row.query.saturating_sub(1)))
+                .sum(),
+        })
+    }
+
+    /// Plan one microbatch's invocation of `active` calls with input
+    /// `rows`: its sampling tasks and prompt scoring. Each call's
+    /// microbatch, task and prompt state is recorded; its sampling
+    /// metadata is appended to `metadata` for after the step.
+    fn plan_invocation(
+        &mut self,
+        runner: usize,
+        active: &[usize],
+        mut rows: Vec<TokenRow>,
+        params: &[Option<(SamplingParams, Vec<u32>)>],
+        metadata: &mut Vec<(usize, SamplingMetadata)>,
+    ) -> Result<Planned> {
+        let plan = self.plan;
         // An all-indexed decode gathers on the device; mixed calls read the
         // indexed rows' tokens and positions from the slot state.
         if !rows.iter().all(|row| row.source == RowSource::Indexed) {
@@ -129,13 +289,14 @@ impl TokenBatch<'_> {
 
         let layout = logit_layout(&rows);
         let vocab = self.runtime.vocab;
-        let dimensions = self.runtime.runners[self.runner].dimensions();
-        let mut metadata = Vec::new();
+        let dimensions = self.runtime.runners[runner].dimensions();
+        let mut sampled = Vec::new();
         let mut greedy = self.mode == ForwardMode::Decode;
         let mut prompts: Vec<(usize, (usize, usize), usize, bool)> = Vec::new();
         for (position, &index) in active.iter().enumerate() {
             let call = &plan.calls[index];
             let state = &mut self.calls[index];
+            state.microbatch = runner;
             let (admitted, finish) = params[index]
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("active call lost its parameters".into()))?;
@@ -181,10 +342,10 @@ impl TokenBatch<'_> {
                 let token = rows[..position].iter().map(|row| row.query as usize).sum();
                 prompts.push((index, (first, count), token, continued));
             }
-            state.task = Some(metadata.len());
-            metadata.push((index, controls, draws, row, prepared.tagged));
+            state.task = Some(sampled.len());
+            sampled.push((index, controls, draws, row, prepared.tagged));
         }
-        let tasks: Vec<SampleTask<'_>> = metadata
+        let tasks: Vec<SampleTask<'_>> = sampled
             .iter()
             .map(|(index, controls, draws, row, gated)| {
                 Ok(SampleTask {
@@ -264,58 +425,20 @@ impl TokenBatch<'_> {
         } else {
             Vec::new()
         };
-        let columns = if greedy {
-            Some(SamplingColumns {
-                words: &greedy_words,
-                draws: &[],
-                params: &[],
-                slots: &[],
-                gates: &[],
-                greedy: true,
-            })
-        } else {
-            sampling.as_ref().map(|plan| SamplingColumns {
-                words: &plan.words,
-                draws: &plan.draws,
-                params: &plan.params,
-                slots: &plan.slots,
-                gates: &plan.gates,
-                greedy: false,
-            })
-        };
-        let kv = self
-            .storage
-            .kv
-            .as_mut()
-            .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
-        let (tables, cache) = kv.split();
-        let executed = self.runtime.runners[self.runner].execute(
-            &StepRequest {
-                decode: self.mode == ForwardMode::Decode,
-                rows: &rows,
-                sampling: columns,
-                prompt: &prompt_words,
-            },
-            &mut StepContext {
-                tables,
-                cache,
-                state: &self.runtime.state,
-            },
-        )?;
         let task_count = tasks.len();
         drop(tasks);
-        for (index, controls, ..) in metadata {
-            self.calls[index].metadata = Some(controls);
-        }
-        Ok(Stepped {
-            executed,
+        metadata.extend(
+            sampled
+                .into_iter()
+                .map(|(index, controls, ..)| (index, controls)),
+        );
+        Ok(Planned {
+            runner,
+            rows,
             sampling,
+            greedy: greedy_words,
+            prompt: prompt_words,
             tasks: task_count,
-            rows: rows.len(),
-            drafts: rows
-                .iter()
-                .map(|row| u64::from(row.query.saturating_sub(1)))
-                .sum(),
         })
     }
 }

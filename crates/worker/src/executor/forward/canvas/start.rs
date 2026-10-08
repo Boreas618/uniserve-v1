@@ -37,6 +37,8 @@ use crate::storage::{GroupShape, KVCache, KVPlan, OutputPool};
 use crate::worker::Lanes;
 use crate::{Error, Result};
 
+use super::super::experts::ExpertRuntime;
+
 /// The call kind every canvas runner serves.
 pub(crate) const CANVAS_KIND: CallKind = CallKind::Forward(ForwardMode::TokenDenoising);
 
@@ -232,6 +234,13 @@ pub(crate) struct Startup<'a> {
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The device's startup stream, which zeroes new storage.
     pub(crate) preparation: Option<&'a Stream>,
+    /// The worker's ranks, across which symmetric workspaces are mapped.
+    pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
+    /// The expert runtime, when canvas invocations are expert steps: the
+    /// binding exchanges through its transport on its stream.
+    pub(crate) expert_runtime: Option<&'a mut ExpertRuntime>,
+    /// The distributed expert weights' prefetch object, with DWDP.
+    pub(crate) weights: Option<&'a Handle>,
 }
 
 /// The token denoiser components placed on this rank: name, module path
@@ -327,12 +336,28 @@ impl CanvasRuntime {
                 .call_values(&[tvm_ffi::Any::from(kv.layout()?), views])?,
         );
 
+        let mut experts = startup.expert_runtime;
+        if let Some(experts) = experts.as_ref()
+            && experts.microbatches() > 1
+        {
+            return Err(Error::Unsupported(
+                "token denoisers run expert steps without microbatches".into(),
+            ));
+        }
+
         // Prepare every binding before binding any, so shared workspaces
         // hold the largest of them.
         let mut prepared = Vec::new();
         let mut targets = Vec::new();
         for (component, path, device) in &denoisers {
             for stream in streams(startup.lanes, *device)? {
+                if let Some(experts) = experts.as_ref()
+                    && stream.as_ref().map(Stream::raw) != Some(experts.stream(0).raw())
+                {
+                    return Err(Error::Unsupported(
+                        "expert parallelism runs every forward on one execution lane".into(),
+                    ));
+                }
                 prepared.push(bind::prepare(
                     startup.interface,
                     startup.model.handle(),
@@ -348,15 +373,37 @@ impl CanvasRuntime {
                         // The loaded model resolved its attention backend.
                         backends: Backends::default(),
                         derive_host_lengths: false,
-                        experts: None,
-                        weights: None,
+                        experts: experts.as_ref().map(|experts| experts.transport(0).clone()),
+                        weights: startup.weights.cloned(),
                         cache: Some(pool.clone()),
                     },
                 )?);
                 targets.push((component.clone(), *device, stream));
             }
         }
-        let bindings = bind::bind(startup.interface, startup.workspaces, prepared)?;
+        let bindings = bind::bind(
+            startup.interface,
+            startup.workspaces,
+            prepared,
+            startup.peers,
+        )?;
+        let mut collectives = Vec::new();
+        if let Some(peers) = startup.peers {
+            for ((_, _, stream), binding) in targets.iter().zip(&bindings) {
+                let owner = stream
+                    .as_ref()
+                    .and_then(|stream| startup.lanes.owner(stream.raw()));
+                collectives.extend(peers.bind_collectives(startup.interface, binding, owner)?);
+            }
+        }
+        // Idle ranks join expert steps through a binding of the model's
+        // expert layers; a text binding may already provide it.
+        if let Some(experts) = experts.as_deref_mut()
+            && !experts.has_joins()
+            && let Some(binding) = bindings.first()
+        {
+            experts.bind_joins(&[binding.prepared()])?;
+        }
 
         let create_pool = startup.interface.function("graphs.pool")?;
         let mut runners = Vec::new();
@@ -396,6 +443,12 @@ impl CanvasRuntime {
                 }
                 _ => None,
             };
+            if let Some(experts) = experts.as_deref_mut()
+                && !experts.has_pools()
+                && let Some(pool) = &pool
+            {
+                experts.set_pools(vec![pool.clone()]);
+            }
             if routes.insert(component.clone(), runners.len()).is_some() {
                 return Err(Error::Invalid(format!(
                     "computation {component}.{} has multiple lane bindings",
@@ -434,6 +487,7 @@ impl CanvasRuntime {
         }
         Ok(Some(Self {
             runners,
+            collectives,
             routes,
             sampling,
             outputs,
