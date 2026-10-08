@@ -449,6 +449,8 @@ pub struct EncoderRunner {
     tokens: Option<StorageView>,
     text_capacities: Vec<usize>,
     graphs: Option<GraphTable<EncoderGraph>>,
+    /// Releases a captured graph the storage check refused.
+    release: Option<Function>,
     /// Capture is enabled: graph pools were supplied at startup.
     capturing: bool,
     /// Buffers bound to the Python binding, retained for its lifetime.
@@ -623,7 +625,10 @@ impl EncoderRunner {
         text_capacities.sort_unstable();
         text_capacities.dedup();
         Ok(Self {
-            graphs: release.map(|release| GraphTable::new(owner.clone(), release)),
+            graphs: release
+                .clone()
+                .map(|release| GraphTable::new(owner.clone(), release)),
+            release,
             owner,
             info,
             device,
@@ -966,17 +971,19 @@ impl EncoderRunner {
         if crate::ffi::is_none(&graph) {
             return Ok(());
         }
-        let table = self
-            .graphs
-            .as_mut()
-            .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?;
         let graph = Handle::new(graph);
         if let Err(error) = check() {
-            // Not yet in the table: release it here.
-            let _ = table.insert(key, None, graph);
+            if let Some(release) = &self.release
+                && let Err(cleanup) = release.invoke(&[graph.view()])
+            {
+                tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
+            }
             return Err(error);
         }
-        table.insert(key, None, graph)
+        self.graphs
+            .as_mut()
+            .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
+            .insert(key, None, graph)
     }
 
     /// Refuse further captures: serving replays what startup captured.
