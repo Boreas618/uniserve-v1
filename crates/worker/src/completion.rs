@@ -128,13 +128,6 @@ impl<E, C, T: Clone> Completion<E, C, T> {
         self.ready.notify_all();
         (true, callbacks)
     }
-
-    /// Trace backend references for garbage collection. The visitor must not
-    /// invoke user code or re-enter this completion while the lock is held.
-    pub fn visit<R>(&self, visitor: impl FnOnce(Option<&Outcome<E, T>>, &[C]) -> R) -> R {
-        let state = self.state();
-        visitor(state.outcome.as_ref(), &state.callbacks)
-    }
 }
 
 #[cfg(test)]

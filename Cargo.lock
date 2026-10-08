@@ -9641,11 +9641,13 @@ dependencies = [
  "libc",
  "nvtx",
  "rustix 1.1.4",
+ "serde_json",
  "thiserror 2.0.18",
  "tvm-ffi",
  "uniserve-core",
  "uniserve-cuda",
  "uniserve-ipc",
+ "uuid",
 ]
 
 [[package]]

@@ -1,25 +1,53 @@
 //! Bounded host output storage and per-batch readback lifetimes.
+//!
+//! A lane's batch results are copied device-to-host into one page-locked
+//! word buffer per batch: integer token columns from the front, raw byte
+//! captures from the back. The copies are ordered on the producing streams
+//! and fenced by events; the host reads the words only after those fences
+//! complete, widening narrower token columns to 64 bits on the host.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use uniserve_core::TokenLogprob;
+use uniserve_cuda::{Event, SourceOrder, Stream};
 
-use uniserve_cuda::{DeviceGuard, DeviceId, Event};
-
+use crate::ffi::{Backing, DType, Device};
+use crate::storage::memory::{Memory, StorageView};
+use crate::transfer::{Spans, copy_on_host, copy_planner};
 use crate::{Error, EventPool, Result};
 
 mod logprobs;
 
 pub use logprobs::LogprobLayout;
 
-/// The numerical backend supplies the host allocation. Only storage is reused;
-/// each batch receives a distinct OutputBuffer and completion signal.
-pub struct OutputStorage<A> {
-    pub value: A,
-    pub words: usize,
-    pub pinned: bool,
+/// One batch's host words: page-locked for CUDA lanes, pageable for CPU
+/// lanes. Only storage is reused; each batch receives a distinct
+/// [`OutputBuffer`] and completion signal.
+pub struct OutputStorage {
+    memory: Arc<Memory>,
+    words: usize,
+}
+
+impl OutputStorage {
+    /// Host storage for `words` 64-bit words, pinned for `device`'s copies.
+    pub fn allocate(device: Option<i32>, words: usize) -> Result<Self> {
+        let bytes = words.max(1) * size_of::<i64>();
+        let memory = match device {
+            Some(device) => Memory::pinned(device, bytes)?,
+            None => Memory::host(bytes),
+        };
+        Ok(Self { memory, words })
+    }
+
+    pub fn words(&self) -> usize {
+        self.words
+    }
+
+    fn address(&self) -> u64 {
+        self.memory.address()
+    }
 }
 
 struct DeviceEvents {
@@ -30,13 +58,16 @@ struct DeviceEvents {
 }
 
 /// A batch's readback ranges, device fences and row/CPU-reader lifetime.
-/// Mutations are serialized by its owner; no numerical backend is required to
-/// query CUDA completion or decide whether the allocation can be recycled.
-pub struct OutputBuffer<A> {
-    storage: Option<OutputStorage<A>>,
+/// Mutations are serialized by its owner.
+pub struct OutputBuffer {
+    storage: Option<OutputStorage>,
     rows: Vec<bool>,
     remaining: usize,
     tokens: usize,
+    /// Token captures narrower than 64 bits: `(word offset, count, dtype)`.
+    /// Their raw elements are packed at the start of their reserved words and
+    /// widened on readback.
+    narrow: Vec<(usize, usize, DType)>,
     readback: Option<Vec<i64>>,
     logprob_layouts: HashMap<(usize, usize), LogprobLayout>,
     logprobs: HashMap<(usize, usize), HashMap<usize, Vec<TokenLogprob>>>,
@@ -55,13 +86,14 @@ pub struct OutputBuffer<A> {
     timing: Option<[u64; 4]>,
 }
 
-impl<A> OutputBuffer<A> {
-    pub fn new(storage: OutputStorage<A>, rows: usize, devices: &[i32], timing: bool) -> Self {
+impl OutputBuffer {
+    pub fn new(storage: OutputStorage, rows: usize, devices: &[i32], timing: bool) -> Self {
         Self {
             storage: Some(storage),
             rows: vec![false; rows],
             remaining: rows,
             tokens: 0,
+            narrow: Vec::new(),
             readback: None,
             logprob_layouts: HashMap::new(),
             logprobs: HashMap::new(),
@@ -93,10 +125,112 @@ impl<A> OutputBuffer<A> {
         self.sealed
     }
 
-    pub fn storage(&self) -> Result<&OutputStorage<A>> {
+    pub fn storage(&self) -> Result<&OutputStorage> {
         self.storage
             .as_ref()
             .ok_or_else(|| Error::Invariant("output storage has retired".into()))
+    }
+
+    /// Copy an integer token column into the next token words, on `stream`
+    /// for a device column. Returns the capture's `(word offset, count)`.
+    ///
+    /// The source holds `int64`, `int32` or `uint32` tokens in any layout;
+    /// narrower values are widened when read back. The producing stream must
+    /// remain alive until the buffer is sealed.
+    pub fn capture(
+        &mut self,
+        source: &StorageView,
+        stream: Option<&Stream>,
+        events: &EventPool,
+    ) -> Result<(usize, usize)> {
+        let dtype = source.dtype();
+        if !matches!(dtype, DType::I64 | DType::I32 | DType::U32) {
+            return Err(Error::Invalid(format!(
+                "token captures require 32- or 64-bit integers, not {dtype:?}"
+            )));
+        }
+        let count = source.numel() as usize;
+        let offset = self.reserve_tokens(count)?;
+        let address = self.storage()?.address() + (offset * size_of::<i64>()) as u64;
+        self.copy(source, address, stream, events)?;
+        if dtype != DType::I64 {
+            self.narrow.push((offset, count, dtype));
+        }
+        Ok((offset, count))
+    }
+
+    /// Copy a `uint8` tensor into the byte region at the back of the buffer
+    /// and return the host view of the captured bytes, readable once the
+    /// buffer's fences completed and retained by the caller as a CPU reader.
+    pub fn capture_bytes(
+        &mut self,
+        source: &StorageView,
+        stream: Option<&Stream>,
+        events: &EventPool,
+    ) -> Result<StorageView> {
+        if source.dtype() != DType::U8 {
+            return Err(Error::Invalid(
+                "byte captures require a uint8 tensor".into(),
+            ));
+        }
+        let count = source.numel() as usize;
+        let offset = self.reserve_bytes(count)?;
+        let memory: Arc<dyn Backing> = Arc::clone(&self.storage()?.memory) as Arc<dyn Backing>;
+        let capture = StorageView::contiguous(memory, offset, DType::U8, source.shape())?;
+        self.copy(source, capture.address(), stream, events)?;
+        Ok(capture)
+    }
+
+    /// Copy `source` into host storage at `address`: on `stream` for a
+    /// device source (after fencing its device for timing), on this thread
+    /// for host memory.
+    fn copy(
+        &mut self,
+        source: &StorageView,
+        address: u64,
+        stream: Option<&Stream>,
+        events: &EventPool,
+    ) -> Result<()> {
+        let memory: Arc<dyn Backing> = Arc::clone(&self.storage()?.memory) as Arc<dyn Backing>;
+        let base = memory.address();
+        let target = StorageView::contiguous(
+            memory,
+            (address - base) as usize,
+            source.dtype(),
+            source.shape(),
+        )?;
+        let target = Spans::single(target)?;
+        let source_spans = Spans::single(source.clone())?;
+
+        match source.device() {
+            Device::Cuda(device) => {
+                let stream = stream.ok_or_else(|| {
+                    Error::Invalid("a device capture requires its producing stream".into())
+                })?;
+                if stream.device().0 != device {
+                    return Err(Error::Invalid(
+                        "a capture stream must belong to its source device".into(),
+                    ));
+                }
+                self.begin_copy(Some(device), stream, events)?;
+                let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
+                target.plan_copy(&source_spans, &mut plan)?;
+                // SAFETY: the pinned destination stays allocated until the
+                // seal fences complete; the source is the producer's storage,
+                // which the producer keeps until its stream passes this copy.
+                unsafe { plan.submit(stream) }?;
+            }
+            Device::Cpu | Device::CudaHost => {
+                self.register_device(None)?;
+                self.copying.get_or_insert_with(Instant::now);
+                let mut plan = copy_planner(None, SourceOrder::Stream)?;
+                target.plan_copy(&source_spans, &mut plan)?;
+                // SAFETY: both operands are host memory; the reserved words
+                // belong to this buffer and no device copy writes them.
+                unsafe { copy_on_host(&plan) };
+            }
+        }
+        Ok(())
     }
 
     /// Reserve opposing word and byte ranges before submitting a copy. A failed
@@ -141,10 +275,10 @@ impl<A> OutputBuffer<A> {
         Ok(())
     }
 
-    /// Snapshot completed words once, before the pinned allocation can be
-    /// recycled. The backend reads exactly `count` initialized int64 words;
-    /// byte captures retain their separate CPU-reader lifetime.
-    pub fn readback(&mut self, read: impl FnOnce(&A, usize) -> Vec<i64>) -> Result<()> {
+    /// Snapshot completed words once, before the host allocation can be
+    /// recycled. Token captures narrower than 64 bits are widened here; byte
+    /// captures retain their separate CPU-reader lifetime.
+    pub fn readback(&mut self) -> Result<()> {
         if self.readback.is_some() {
             return Ok(());
         }
@@ -154,7 +288,38 @@ impl<A> OutputBuffer<A> {
             ));
         }
 
-        self.readback = Some(read(&self.storage()?.value, self.tokens));
+        let storage = self.storage()?;
+        let mut words = vec![0_i64; self.tokens];
+        // SAFETY: every copy writing these words completed (`ready_at`), and
+        // the buffer's mutex prevents recycling the storage while it is read.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                storage.address() as *const i64,
+                words.as_mut_ptr(),
+                self.tokens,
+            );
+        }
+        for &(offset, count, dtype) in &self.narrow {
+            // The capture packed `count` 4-byte values at its first word.
+            let packed: Vec<u32> = words[offset..offset + count.div_ceil(2)]
+                .iter()
+                .flat_map(|word| {
+                    let bytes = word.to_ne_bytes();
+                    [
+                        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                        u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                    ]
+                })
+                .take(count)
+                .collect();
+            for (word, value) in words[offset..offset + count].iter_mut().zip(packed) {
+                *word = match dtype {
+                    DType::I32 => i64::from(value as i32),
+                    _ => i64::from(value),
+                };
+            }
+        }
+        self.readback = Some(words);
         Ok(())
     }
 
@@ -226,11 +391,12 @@ impl<A> OutputBuffer<A> {
         Ok(())
     }
 
-    pub fn begin_device<O>(
+    /// Fence the start of `device`'s work for timing, once per batch.
+    pub fn begin_device(
         &mut self,
         device: Option<i32>,
-        stream: usize,
-        pool: &mut EventPool<O>,
+        stream: &Stream,
+        pool: &EventPool,
     ) -> Result<()> {
         self.register_device(device)?;
         self.started.get_or_insert_with(Instant::now);
@@ -242,16 +408,16 @@ impl<A> OutputBuffer<A> {
                 .find(|events| events.device == device)
             && events.start.is_none()
         {
-            events.start = Some(record(pool, device, stream, true)?);
+            events.start = Some(record(pool, stream, true)?);
         }
         Ok(())
     }
 
-    pub fn begin_copy<O>(
+    pub fn begin_copy(
         &mut self,
         device: Option<i32>,
-        stream: usize,
-        pool: &mut EventPool<O>,
+        stream: &Stream,
+        pool: &EventPool,
     ) -> Result<()> {
         self.register_device(device)?;
         self.copying.get_or_insert_with(Instant::now);
@@ -264,27 +430,30 @@ impl<A> OutputBuffer<A> {
                 .find(|events| events.device == device)
                 && events.copy.is_none()
             {
-                events.copy = Some(record(pool, device, stream, true)?);
+                events.copy = Some(record(pool, stream, true)?);
             }
         }
         Ok(())
     }
 
-    /// Record all producer fences once. The caller transfers their pool
-    /// references to deferred release and calls copies_finished after it drains.
-    pub fn seal<O>(
+    /// Record all producer fences once, one per declared device on that
+    /// device's stream. The caller transfers their pool references to
+    /// deferred release and calls `copies_finished` after they complete.
+    pub fn seal(
         &mut self,
-        streams: &[(i32, usize)],
-        pool: &mut EventPool<O>,
+        streams: &[&Stream],
+        pool: &EventPool,
     ) -> Result<Option<Vec<Arc<Event>>>> {
         if self.sealed {
             return Ok(None);
         }
 
-        for &(device, stream) in streams {
+        for stream in streams {
+            let device = stream.device().0;
             if self.timing_events {
                 self.begin_copy(Some(device), stream, pool)?;
             }
+            let timing = self.timing_events;
             let events = self
                 .devices
                 .iter_mut()
@@ -293,7 +462,7 @@ impl<A> OutputBuffer<A> {
                     Error::Invariant("output fence uses an undeclared CUDA device".into())
                 })?;
             if events.end.is_none() {
-                events.end = Some(record(pool, device, stream, self.timing_events)?);
+                events.end = Some(record(pool, stream, timing)?);
             }
         }
 
@@ -433,36 +602,35 @@ fn micros(end: Instant, start: Instant) -> u64 {
     end.saturating_duration_since(start).as_micros() as u64
 }
 
-fn record<O>(
-    pool: &mut EventPool<O>,
-    device: i32,
-    stream: usize,
-    timing: bool,
-) -> Result<Arc<Event>> {
-    // Default-stream handles do not identify a device. Select its context
-    // before the driver resolves that stream and records the fence.
-    let _device = DeviceGuard::new(DeviceId(device))?;
+fn record(pool: &EventPool, stream: &Stream, timing: bool) -> Result<Arc<Event>> {
+    let device = stream.device().0;
     let event = pool.acquire(device, timing, false)?;
     pool.retain(&event, device, 1)?;
-    pool.record(&event, device, stream)?;
+    pool.record(&event, stream)?;
     Ok(event)
 }
 
-type Lease<A> = Arc<Mutex<OutputBuffer<A>>>;
+/// A batch's output buffer, shared by its pending results and the pool.
+pub type OutputLease = Arc<Mutex<OutputBuffer>>;
 
-/// Owners retain language-side views until their lease retires. Reaping returns
-/// those owners for destruction outside the pool lock; it recycles only storage.
-pub struct OutputPool<A, O> {
+/// Bounded output storage of one lane. Storage is reused only after every
+/// lease using it retired: its copies finished, every row was observed or
+/// the batch abandoned, and no CPU reader holds a byte capture.
+pub struct OutputPool {
+    device: Option<i32>,
     capacity: usize,
     max_words: usize,
-    active: Vec<(Lease<A>, O)>,
-    available: Vec<OutputStorage<A>>,
+    active: Vec<OutputLease>,
+    available: Vec<OutputStorage>,
     closed: bool,
 }
 
-impl<A, O> OutputPool<A, O> {
-    pub fn new(capacity: usize, max_words: usize) -> Self {
+impl OutputPool {
+    /// `capacity` leases of at most `max_words` words, pinned for `device`
+    /// copies (pageable for a CPU lane).
+    pub fn new(device: Option<i32>, capacity: usize, max_words: usize) -> Self {
         Self {
+            device,
             capacity,
             max_words,
             active: Vec::new(),
@@ -479,12 +647,12 @@ impl<A, O> OutputPool<A, O> {
         self.max_words
     }
 
-    pub fn reap(&mut self) -> Vec<O> {
-        let mut retired = Vec::new();
+    /// Recycle the storage of retired leases; returns how many retired.
+    pub fn reap(&mut self) -> usize {
+        let mut retired = 0;
         let mut index = 0;
         while index < self.active.len() {
             let mut buffer = self.active[index]
-                .0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if !buffer.retired() {
@@ -498,13 +666,21 @@ impl<A, O> OutputPool<A, O> {
             // its consumed lease. Timing and decoded values remain per lease.
             buffer.devices.clear();
             drop(buffer);
-            retired.push(self.active.swap_remove(index).1);
+            self.active.swap_remove(index);
+            retired += 1;
         }
         retired
     }
 
-    /// The caller serializes taking storage, numerical allocation and insertion.
-    pub fn take(&mut self, rows: usize, words: usize) -> Result<Option<OutputStorage<A>>> {
+    /// Lease storage for a batch of `rows` result rows and `words` capture
+    /// words, reusing retired storage or allocating the lane's maximum.
+    pub fn lease(
+        &mut self,
+        rows: usize,
+        words: usize,
+        devices: &[i32],
+        timing: bool,
+    ) -> Result<OutputLease> {
         if self.closed {
             return Err(Error::Resource("output pool is closed"));
         }
@@ -518,34 +694,35 @@ impl<A, O> OutputPool<A, O> {
                 "completion row count exceeds pinned output capacity",
             ));
         }
+        self.reap();
         if self.active.len() >= self.capacity {
             return Err(Error::Resource("all lane output leases are active"));
         }
-        Ok(self.available.pop())
+
+        let storage = match self.available.pop() {
+            Some(storage) => storage,
+            None => OutputStorage::allocate(self.device, self.max_words)?,
+        };
+        let lease = Arc::new(Mutex::new(OutputBuffer::new(
+            storage, rows, devices, timing,
+        )));
+        self.active.push(Arc::clone(&lease));
+        Ok(lease)
     }
 
-    pub fn insert(&mut self, buffer: Lease<A>, owner: O) {
-        self.active.push((buffer, owner));
-    }
-
-    pub fn owners(&self) -> impl Iterator<Item = &O> {
-        self.active.iter().map(|(_, owner)| owner)
-    }
-
-    pub fn storages(&self) -> impl Iterator<Item = &OutputStorage<A>> {
-        self.available.iter()
+    /// Host bytes held by allocated storage, for capacity accounting.
+    pub fn bytes(capacity: usize, max_words: usize) -> u64 {
+        (capacity * max_words.max(1) * size_of::<i64>()) as u64
     }
 
     pub fn begin_close(&mut self) {
         self.closed = true;
     }
 
-    /// Release owners only after shutdown has drained their device writes.
-    /// A failed drain leaves them retained for the caller's error handling.
-    pub fn finish_close(&mut self) -> (Vec<O>, Vec<OutputStorage<A>>) {
-        (
-            self.active.drain(..).map(|(_, owner)| owner).collect(),
-            std::mem::take(&mut self.available),
-        )
+    /// Release storage only after shutdown has drained its device writes.
+    /// Leases still referenced by results keep their own storage alive.
+    pub fn finish_close(&mut self) {
+        self.active.clear();
+        self.available.clear();
     }
 }
