@@ -2,6 +2,7 @@
 
 mod graph_shapes;
 mod graph_storage;
+pub(crate) mod graphs;
 
 pub use graph_shapes::{PrefillShape, TextShapes, prefill_shapes, prefill_units};
 pub use graph_storage::{GraphPool, GraphPools, GraphStorage, graph_storage_budget_bytes};

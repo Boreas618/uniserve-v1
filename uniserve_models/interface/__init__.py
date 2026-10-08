@@ -23,6 +23,7 @@ _AREAS = (
     "cache",
     "binding",
     "distributed",
+    "graphs",
     "memory",
     "kernels",
     "profiling",

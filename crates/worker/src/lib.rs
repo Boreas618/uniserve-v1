@@ -42,6 +42,9 @@ pub use parallel::{
     ExpertExchange, Microbatches, StreamCommunicator, WeightPrefetch, yield_microbatch,
 };
 pub use request::{Request, RequestPool, RequestProgress};
+pub use runner::graphs::{
+    Capacity, GraphCounts, GraphMode, GraphTable, Lookup, bucket, capture_order, reserve_pools,
+};
 pub use runner::{
     GraphPool, GraphPools, GraphStorage, ModelBatch, ModelRunners, PrefillShape, TextShapes,
     TokenSelection, graph_storage_budget_bytes, prefill_shapes, prefill_units,
