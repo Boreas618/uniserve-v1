@@ -420,11 +420,6 @@ impl ImageRuntime {
                             "an image denoiser lost its storage".into(),
                         ));
                     };
-                    if storage_device(target.device) != latents.workspace()?.device() {
-                        return Err(Error::Unsupported(
-                            "image trajectories on a separate generation device".into(),
-                        ));
-                    }
                     let samples = latents.workspace()?.clone();
                     let slot_tables = kv
                         .storage()
@@ -454,14 +449,13 @@ impl ImageRuntime {
                         layout,
                         capacity,
                         DiffusionStorage {
-                            inputs: samples.clone(),
                             samples,
                             slot_timesteps: latents.storage.timesteps().clone(),
                             products,
                             slot_tables,
                             layout: table_layout,
                         },
-                        (borrow(&target.stream)?, borrow(&target.stream)?),
+                        borrow(&target.stream)?,
                     )?;
                     units = Some(kv.bind_units(
                         &interface.function("cache.bind_units")?,
@@ -495,9 +489,11 @@ impl ImageRuntime {
         }
         startup.components.add_bindings(bindings);
 
-        // The configured denoising steps capture at warmup into one pool.
+        // The configured denoising steps capture at warmup into one pool
+        // per device the denoiser's modules run on: its own and a
+        // generation tower's, reached through transfers.
         let mut flow = Vec::new();
-        let mut flow_pool = None;
+        let mut flow_pools = Vec::new();
         if let (Some((_, runner)), Some(latents)) = (&diffusion, &latents)
             && config.graph_policy != "off"
             && config.flow_cuda_graph
@@ -511,16 +507,22 @@ impl ImageRuntime {
                 latents.pool.capacity_units(),
             );
             if !flow.is_empty() {
-                flow_pool = reserve_pools(
+                let mut devices = vec![ordinal];
+                devices.extend(
+                    config
+                        .devices()
+                        .filter_map(|name| Device::parse(name, "device").ok())
+                        .filter_map(Device::cuda_index)
+                        .filter(|&device| device != ordinal),
+                );
+                flow_pools = reserve_pools(
                     startup.graphs,
                     &interface.function("graphs.pool")?,
                     runner.graph_key(),
                     "image:denoiser".to_owned(),
-                    &[ordinal],
+                    &devices,
                     None,
-                )?
-                .into_iter()
-                .next();
+                )?;
             }
         }
 
@@ -576,7 +578,7 @@ impl ImageRuntime {
             units,
             pools,
             flow,
-            flow_pool,
+            flow_pools,
             max_pixel_words,
             outputs,
             host,
