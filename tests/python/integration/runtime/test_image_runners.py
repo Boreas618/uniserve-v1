@@ -1,8 +1,7 @@
 """The image runners drive the stub model through the numerical interface.
 
-The worker's image harness (``crates/worker/examples/image_harness.rs``,
-built with ``cargo build -p uniserve-worker --example image_harness``)
-binds one component on the host, runs one runner operation and returns its
+The worker's image harness (``tests.python.fixtures.image_harness``) binds
+one component on the host, runs one runner operation and returns its
 Rust-owned results, which these tests compare with direct library
 computation.
 """
@@ -11,8 +10,6 @@ from __future__ import annotations
 
 import base64
 import io
-import os
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -20,6 +17,7 @@ import torch
 import tvm_ffi
 from PIL import Image
 
+from tests.python.fixtures.image_harness import image_harness
 from tests.python.fixtures.stub import load_stub
 from uniserve_models import interface
 from uniserve_models.media import image
@@ -27,22 +25,6 @@ from uniserve_models.media.pixels import prepare_host_image, quantize_image_hwc
 from uniserve_models.model import VisionInput
 
 pytestmark = pytest.mark.integration
-
-
-def _harness():
-    root = Path(__file__).resolve().parents[4]
-    path = Path(
-        os.environ.get(
-            "UNISERVE_IMAGE_HARNESS",
-            root / "target" / "debug" / "examples" / "libimage_harness.so",
-        )
-    )
-    if not path.exists():
-        pytest.fail(
-            f"{path} is missing: build it with "
-            "`cargo build -p uniserve-worker --example image_harness`"
-        )
-    return tvm_ffi.load_module(str(path))
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +44,7 @@ def _payload(height: int, width: int, seed: int) -> str:
 
 def _encode(stub, component, root, path, tower, payloads):
     table, model = stub
-    *results, counts = _harness().encode(
+    *results, counts = image_harness().encode(
         tvm_ffi.convert(
             {
                 "table": table,
@@ -122,7 +104,7 @@ def test_decoded_images_stage_quantized_pixels_across_sub_batches(stub):
     latents = latents.to(torch.bfloat16)
     sizes = [[32, 32], [32, 64], [32, 32]]
     # Staging holds one 32x64 image, so the batch decodes in three calls.
-    results = _harness().decode(
+    results = image_harness().decode(
         tvm_ffi.convert(
             {
                 "table": table,
