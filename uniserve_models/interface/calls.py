@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-__all__ = ["module", "scope", "tensors", "write"]
+__all__ = ["local", "module", "scope", "tensors", "write"]
 
 
 def module(prepared, path: str):
@@ -50,6 +50,17 @@ def write(target: torch.Tensor, value: torch.Tensor) -> list[int]:
     if value.numel() > target.numel():
         raise ValueError("a result exceeds its product bound")
     target.reshape(-1)[: value.numel()].view(value.shape).copy_(
-        value.detach(), non_blocking=True
+        local(value.detach(), target.device), non_blocking=True
     )
     return shape
+
+
+def local(value: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``value`` on ``device``, for a copy into worker storage there.
+
+    A value computed on another device (a generation tower) moves into
+    allocator storage of ``device`` first: the worker's storage is mapped
+    for its own device only, and a cross-device copy runs on the source
+    device.
+    """
+    return value.to(device, non_blocking=True)

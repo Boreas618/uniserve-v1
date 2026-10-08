@@ -65,15 +65,19 @@ def prepare(loaded, request: Mapping[str, Any]) -> list[Any]:
     path = str(request["path"])
     module = loaded.module.get_submodule(path) if path else loaded.module
     stream = int(request["stream"])
-    device = int(request.get("device", -1))
-    # A stream of the binding's device places a module without parameters
-    # (such as a pixel-space image decoder) on that device.
+    ordinal = int(request.get("device", -1))
+    # The binding's stream and buffers are on its device: a module without
+    # parameters (such as a pixel-space image decoder) runs there, and
+    # modules placed on a generation tower compute on the tower between the
+    # stream's steps (see ``ExecutionContext``).
+    device = torch.device("cuda", ordinal) if ordinal >= 0 else None
     execution = (
-        torch.cuda.ExternalStream(stream, device=torch.device("cuda", device))
-        if stream and device >= 0
+        torch.cuda.ExternalStream(stream, device=device)
+        if stream and device is not None
         else (stream or None)
     )
     options = {
+        "device": device,
         "stream": execution,
         "cache": request.get("cache"),
         "attention": str(request["attention"])

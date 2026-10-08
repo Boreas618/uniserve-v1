@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use uniserve_core::ComponentConfig;
-use uniserve_ipc::{CallKind, MediaCall};
+use uniserve_ipc::CallKind;
 
 use crate::Result;
 use crate::config::Device;
@@ -25,9 +25,9 @@ pub struct Placed {
     /// Declared calls; empty for a host component.
     pub calls: Vec<CallDecl>,
     pub kinds: BTreeSet<CallKind>,
-    /// The device the component computes on: the generation device for
-    /// latent encoding and image decoding when a tower placement splits the
-    /// model, the primary device otherwise.
+    /// The device the component's bindings compute on: the rank's primary
+    /// device. Modules a tower placement puts on a generation device run
+    /// there through the bindings' transfers.
     pub device: Device,
     /// The component's numerical mesh (a `DeviceMesh` handle), if bound.
     pub mesh: Option<Handle>,
@@ -65,7 +65,6 @@ impl Components {
         placements: &std::collections::BTreeMap<String, ComponentConfig>,
         rank: usize,
         primary: Device,
-        generation: Option<Device>,
         mut meshes: impl FnMut(&str) -> (Option<Handle>, Option<Handle>),
     ) -> Self {
         let placed = placements
@@ -73,18 +72,13 @@ impl Components {
             .filter(|(_, config)| config.ranks.contains(&rank))
             .map(|(name, config)| {
                 let kinds = declarations.component_kinds(name);
-                let generative = kinds.contains(&CallKind::Media(MediaCall::LatentEncoding))
-                    || kinds.contains(&CallKind::Media(MediaCall::ImageDecoding));
                 let (mesh, units) = meshes(name);
                 Placed {
                     name: name.clone(),
                     config: config.clone(),
                     calls: declarations.calls(name).to_vec(),
                     kinds,
-                    device: match generation {
-                        Some(device) if generative => device,
-                        _ => primary,
-                    },
+                    device: primary,
                     mesh,
                     units,
                 }

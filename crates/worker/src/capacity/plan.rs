@@ -341,28 +341,22 @@ impl TokenLayout {
             info.latent_pages = narrow(plan.num_pages, "latent pages")?;
         }
 
-        let devices: Vec<String> = config.devices().map(str::to_owned).collect();
+        // Products, their buffer pool and the latent pool live on the primary
+        // device, beside every binding; a generation tower holds only the
+        // module weights placed on it.
         let arena = ArenaCapacity::for_tokens(
             queue_depth,
             config.max_batch_calls,
             config.max_request_pool_size,
-            devices.len(),
             product_scalar_bytes(),
             latent_bytes,
             feature_bytes,
         )?;
         let mut fixed = BTreeMap::new();
-        for device in &devices {
-            fixed.insert(
-                device.clone(),
-                info.buffer_pool_bytes + arena.device_product_bytes / devices.len() as u64,
-            );
-        }
-        let generation = config
-            .generation_device
-            .clone()
-            .unwrap_or_else(|| config.device.clone());
-        *fixed.entry(generation).or_default() += latent_bytes;
+        fixed.insert(
+            config.device.clone(),
+            info.buffer_pool_bytes + arena.device_product_bytes + latent_bytes,
+        );
         info.host_lane_capacity = narrow(arena.host_lane_inflight, "host lane capacity")?;
         Ok(Self {
             info,
