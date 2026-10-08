@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
-use uniserve_worker_ipc::{Call, CallKind, ForwardMode, MediaCall};
+use uniserve_ipc::{Call, CallKind, ForwardMode, MediaCall};
 
 use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
@@ -1958,7 +1958,7 @@ fn admission_carries_the_request_input_image_count() {
             .expect("the request is admitted");
         if let BatchEvent::Submitted(batch) = event
             && let Some(admission) = batch.commands.iter().find_map(|command| match command {
-                uniserve_worker_ipc::BatchCommand::Start { request } => Some(request.clone()),
+                uniserve_ipc::BatchCommand::Start { request } => Some(request.clone()),
                 _ => None,
             })
         {
@@ -3075,7 +3075,7 @@ impl Executor for LosableExecutor {
         self.inner.has_capacity(worker)
     }
 
-    fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
+    fn command_has_capacity(&self, command: &uniserve_ipc::BatchCommand) -> bool {
         self.inner.command_has_capacity(command)
     }
 

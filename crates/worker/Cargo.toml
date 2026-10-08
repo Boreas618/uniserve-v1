@@ -13,7 +13,7 @@ nvtx.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
 uniserve-core.workspace = true
-uniserve-worker-ipc.workspace = true
+uniserve-ipc.workspace = true
 
 [lints]
 workspace = true

@@ -14,18 +14,18 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from uniserve.nn.attention import Attention as ScaledAttention
-from uniserve.nn.attention import (
+from uniserve_models.nn.attention import Attention as ScaledAttention
+from uniserve_models.nn.attention import (
     AttentionBatch,
     SequenceLengths,
     VarlenInput,
 )
-from uniserve.nn.functional import patchify, qk_norm_rope
-from uniserve.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
-from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.norm import RMSNorm
-from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
+from uniserve_models.nn.functional import patchify, qk_norm_rope
+from uniserve_models.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
+from uniserve_models.nn.mlp import GatedMLP
+from uniserve_models.nn.norm import RMSNorm
+from uniserve_models.nn.rope import RotaryEmbedding
+from uniserve_models.nn.vision.position import build_abs_positions_from_grid_hw
 
 from .config import VisionConfig
 

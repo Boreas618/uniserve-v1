@@ -2,7 +2,7 @@
 
 The magnitude variants in ``uniserve_kernels.norm.residual`` (one partial per
 row) and ``uniserve_kernels.activation`` (one partial per program) write FP32
-absolute-maximum partials. ``uniserve.nn.functional`` then calls
+absolute-maximum partials. ``uniserve_models.nn.functional`` then calls
 :func:`absmax` to reduce them to one scalar on the device.
 """
 

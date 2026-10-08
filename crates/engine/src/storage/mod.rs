@@ -16,7 +16,7 @@
 //! to the `BlockPool` when its tables drop.
 
 use uniserve_core::{ByteAllocator, HashAlgo};
-use uniserve_worker_ipc::{RequestKey, WorkerInfo};
+use uniserve_ipc::{RequestKey, WorkerInfo};
 
 pub(crate) use crate::kv::KvAllocation;
 use crate::kv::{BlockPool, GroupShape, KvCacheCoordinator};

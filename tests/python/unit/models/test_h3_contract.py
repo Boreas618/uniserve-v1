@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve.loading import Config as IOConfig
-from uniserve.nn.functional import Rounding
+from uniserve_models.loading import Config as IOConfig
+from uniserve_models.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     DenseAttention,
     Model,

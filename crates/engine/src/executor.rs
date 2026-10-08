@@ -23,13 +23,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(test)]
-use uniserve_worker_ipc::VideoDenoiserInfo;
-use uniserve_worker_ipc::{ForwardMode, MediaCall};
+use uniserve_ipc::VideoDenoiserInfo;
+use uniserve_ipc::{ForwardMode, MediaCall};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, WorkerInfo,
 };
 
@@ -73,7 +73,7 @@ impl ExecutorInfo {
             "executor info must contain at least one pool"
         );
         let mut ids = std::collections::HashSet::new();
-        let mut components: BTreeMap<&str, &uniserve_worker_ipc::ComponentInfo> = BTreeMap::new();
+        let mut components: BTreeMap<&str, &uniserve_ipc::ComponentInfo> = BTreeMap::new();
         let model_name = &pools[0].1.model_name;
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
@@ -432,7 +432,7 @@ fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
 #[derive(Debug, Clone)]
 pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
-    pub output: uniserve_worker_ipc::RequestOutput,
+    pub output: uniserve_ipc::RequestOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
     pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, String>,
 }
@@ -449,7 +449,7 @@ pub struct WorkerResult {
     /// Worker-reported execution duration in microseconds, when reported.
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported.
-    pub forward_stats: Option<uniserve_worker_ipc::ForwardStats>,
+    pub forward_stats: Option<uniserve_ipc::ForwardStats>,
 }
 
 impl WorkerResult {
@@ -467,7 +467,7 @@ impl WorkerResult {
                     .media_output
                     .take()
                     .map(|media| {
-                        let uniserve_worker_ipc::ArtifactHandle::PosixShm { name } = media.handle;
+                        let uniserve_ipc::ArtifactHandle::PosixShm { name } = media.handle;
                         // SAFETY: export transfers immutable storage after the writer closes.
                         // The mapping owns the bytes even if this result is rejected downstream.
                         unsafe { uniserve_core::SharedMedia::open(&name, media.bytes) }
@@ -527,7 +527,7 @@ pub struct BatchResult {
     /// Per-worker execution durations in microseconds.
     pub worker_exec_us: Vec<u64>,
     /// Per-worker model-forward statistics.
-    pub forward_stats: Vec<uniserve_worker_ipc::ForwardStats>,
+    pub forward_stats: Vec<uniserve_ipc::ForwardStats>,
 }
 
 /// Converts one physical result into the scheduler-facing [`BatchResult`].
@@ -1015,9 +1015,9 @@ impl TransferConfig {
     /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
-        products: &mut [uniserve_worker_ipc::TensorExport],
-        kv_inputs: &mut [uniserve_worker_ipc::KvTransfer],
-        destination: &uniserve_worker_ipc::WorkerEndpoint,
+        products: &mut [uniserve_ipc::TensorExport],
+        kv_inputs: &mut [uniserve_ipc::KvTransfer],
+        destination: &uniserve_ipc::WorkerEndpoint,
     ) -> Result<(), UnroutableInputs> {
         let mut unroutable = Vec::new();
         for payload in products.iter_mut() {
@@ -1052,10 +1052,10 @@ impl TransferConfig {
     /// `bind_inputs` selects them, and reports whether any remain.
     fn bind_locations(
         &self,
-        tensor: &mut uniserve_worker_ipc::TensorTransfer,
-        destination: &uniserve_worker_ipc::WorkerEndpoint,
+        tensor: &mut uniserve_ipc::TensorTransfer,
+        destination: &uniserve_ipc::WorkerEndpoint,
     ) -> bool {
-        use uniserve_worker_ipc::TransferTransport;
+        use uniserve_ipc::TransferTransport;
 
         // A product's location chose the mechanism it was published on, so a
         // location is kept where the edge carries that mechanism for either
@@ -1225,7 +1225,7 @@ pub(crate) struct UnroutableInputs {
     /// The consuming rank, as `worker:rank`.
     pub(crate) destination: String,
     /// The products left without a location the consumer can read.
-    pub(crate) buffers: Vec<uniserve_worker_ipc::BufferId>,
+    pub(crate) buffers: Vec<uniserve_ipc::BufferId>,
 }
 
 /// Error returned for an invalid transfer-transport mapping.
@@ -1263,7 +1263,7 @@ pub struct WorkerExecError {
     /// belongs to a batch with calls (see `WorkerResponseError::route`).
     pub route: Option<String>,
     /// Calls affected by the worker failure.
-    pub calls: Vec<uniserve_worker_ipc::ErrorCallIdentity>,
+    pub calls: Vec<uniserve_ipc::ErrorCallIdentity>,
 }
 
 /// Terminal work abandoned by one Worker, with the exact invalidated ownership.
@@ -1273,13 +1273,13 @@ pub struct WorkerFailure {
     /// Logical instance reporting the failure.
     pub worker_id: WorkerId,
     /// Invalidated incarnations; empty when the instance retains its allocations.
-    pub endpoints: Vec<uniserve_worker_ipc::WorkerEndpoint>,
+    pub endpoints: Vec<uniserve_ipc::WorkerEndpoint>,
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
     /// Accepted logical calls that will no longer produce a device completion.
     pub retired: Vec<(u64, RequestKey, CallId)>,
     /// Buffers whose published locations no longer cover their complete logical value.
-    pub buffers: Vec<uniserve_worker_ipc::BufferId>,
+    pub buffers: Vec<uniserve_ipc::BufferId>,
     /// Classified execution failure, if the ranks returned one before retirement.
     pub execution: Option<WorkerExecError>,
     /// Human-readable failure description.
@@ -1342,7 +1342,7 @@ mod tests {
             .map(|(_, component)| *component)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .map(|name| uniserve_worker_ipc::ComponentInfo {
+            .map(|name| uniserve_ipc::ComponentInfo {
                 name: name.to_owned(),
                 config: ComponentConfig::parallel(vec![0], ParallelConfig::default()),
                 outputs: Vec::new(),
@@ -1605,7 +1605,7 @@ mod tests {
 
     #[test]
     fn a_device_only_edge_refuses_a_product_published_as_host_bytes() {
-        use uniserve_worker_ipc::{
+        use uniserve_ipc::{
             CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
             TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
         };

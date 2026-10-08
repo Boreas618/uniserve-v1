@@ -7,8 +7,8 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve.nn.linear import Linear
-from uniserve.quantization import Quantizer
+from uniserve_models.nn.linear import Linear
+from uniserve_models.quantization import Quantizer
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -53,7 +53,7 @@ def test_fp8_projection_and_reused_encoding(dtype):
 @torch.inference_mode()
 @pytest.mark.parametrize("operand", ["input", "weight"])
 def test_one_fp8_operand_preserves_the_other_operand_values(operand):
-    from uniserve.nn.functional import linear
+    from uniserve_models.nn.functional import linear
 
     device = torch.device("cuda", 0)
     generator = torch.Generator(device=device).manual_seed(13)

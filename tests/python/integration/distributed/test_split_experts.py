@@ -10,18 +10,18 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve.distributed import Communicator, partition_experts
-from uniserve.model import TextSize
-from uniserve.nn.moe import FusedMoE
-from uniserve.quantization import Quantizer
-from uniserve.runtime import (
+from uniserve_models.distributed import Communicator, partition_experts
+from uniserve_models.model import TextSize
+from uniserve_models.nn.moe import FusedMoE
+from uniserve_models.quantization import Quantizer
+from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,
     Microbatches,
 )
-from uniserve.runtime.expert_exchange import ExpertExchange
-from uniserve.runtime.process_groups import initialize_process_groups
+from uniserve_models.runtime.expert_exchange import ExpertExchange
+from uniserve_models.runtime.process_groups import initialize_process_groups
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

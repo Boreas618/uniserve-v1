@@ -7,7 +7,7 @@ physical allocations whose shareable handles other processes can import,
 the mapping of those handles into tensors, and strided host/device DMA.
 
 The primitives own no transfer policy. Callers such as
-``uniserve.runtime._peer_storage``, ``uniserve_worker.transport.cuda_vmm``
+``uniserve_models.runtime._peer_storage``, ``uniserve_worker.transport.cuda_vmm``
 and ``uniserve_worker.storage.buffer_pool`` decide how handles travel between
 processes, when grants are withdrawn, and when storage retires.
 """

@@ -21,8 +21,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve.nn.rng import philox4x32_10, sampling_key, sampling_uniform
-from uniserve.sampling import sample_categorical
+from uniserve_models.nn.rng import philox4x32_10, sampling_key, sampling_uniform
+from uniserve_models.sampling import sample_categorical
 
 pytestmark = pytest.mark.unit
 

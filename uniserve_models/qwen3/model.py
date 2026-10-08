@@ -5,13 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from uniserve.model import (
+from uniserve_models.model import (
     DEFAULT_COMPONENT,
     CausalLM,
     ComponentEntry,
     EntryPoint,
 )
-from uniserve.nn.linear import VocabParallelHead
+from uniserve_models.nn.linear import VocabParallelHead
 
 from .config import Config
 from .transformer import Transformer

@@ -8,7 +8,7 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve.model import (
+from uniserve_models.model import (
     DEFAULT_COMPONENT,
     CanvasTokens,
     CausalLM,
@@ -18,9 +18,9 @@ from uniserve.model import (
     SelfConditioning,
     TokenDenoiser,
 )
-from uniserve.nn.linear import VocabParallelHead
-from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.norm import RMSNorm
+from uniserve_models.nn.linear import VocabParallelHead
+from uniserve_models.nn.mlp import GatedMLP
+from uniserve_models.nn.norm import RMSNorm
 
 from . import vision
 from .config import Config

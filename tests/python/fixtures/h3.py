@@ -4,9 +4,9 @@ from dataclasses import replace
 
 from torch import nn
 
-from uniserve.media import image
-from uniserve.model import ComponentEntry, EntryPoint
-from uniserve.nn.functional import Rounding
+from uniserve_models.media import image
+from uniserve_models.model import ComponentEntry, EntryPoint
+from uniserve_models.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     Config,
     DenoiserConfig,

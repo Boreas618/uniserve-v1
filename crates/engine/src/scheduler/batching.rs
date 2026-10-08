@@ -24,7 +24,7 @@
 //! canvas rows, stay within the rows a worker stages per call (`PassRows`).
 
 use super::*;
-use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode, VisionInput};
+use uniserve_ipc::{ForwardMode, MediaCall, TransferMode, VisionInput};
 
 /// Forward rows a pass may still add to its numerical calls, within the rows
 /// a worker stages per call: canvas rows across its token-denoising calls,

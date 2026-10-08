@@ -10,14 +10,14 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve.model import TextSize
-from uniserve.nn import functional
-from uniserve.nn.moe import FusedMoE
-from uniserve.quantization import Quantizer, ScaleLayout
-from uniserve.runtime import CUDAStream, ExecutionContext
-from uniserve.runtime.backends import moe as moe_backends
-from uniserve.runtime.cuda_graph import CUDAGraph
-from uniserve.runtime.tensor_buffers import TensorBuffers
+from uniserve_models.model import TextSize
+from uniserve_models.nn import functional
+from uniserve_models.nn.moe import FusedMoE
+from uniserve_models.quantization import Quantizer, ScaleLayout
+from uniserve_models.runtime import CUDAStream, ExecutionContext
+from uniserve_models.backends import moe as moe_backends
+from uniserve_models.runtime.cuda_graph import CUDAGraph
+from uniserve_models.runtime.tensor_buffers import TensorBuffers
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -730,7 +730,7 @@ def test_native_experts_prepare_after_the_portable_reference_is_loaded():
     A process may evaluate CPU experts, which loads the portable provider,
     before it prepares GPU experts.
     """
-    from uniserve.runtime.backends.moe import resolve
+    from uniserve_models.backends.moe import resolve
 
     reference = FusedMoE(4, 16, 16, top_k=2, activation="silu")
     resolve("auto", module=reference, device=torch.device("cpu"))

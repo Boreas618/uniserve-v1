@@ -9,7 +9,7 @@ from tests.python.fixtures.device_storage import (
     DeviceStorage,
     install_device_storage,
 )
-from uniserve.runtime.device import device_storage_budget
+from uniserve_models.runtime.device import device_storage_budget
 
 pytestmark = pytest.mark.unit
 

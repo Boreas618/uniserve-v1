@@ -155,8 +155,8 @@ impl ExecutionDomainStats {
     ///
     /// The returned index addresses the array from `groups`, so the two must
     /// keep the same order.
-    pub(super) const fn index(computation: uniserve_worker_ipc::CallKind) -> usize {
-        use uniserve_worker_ipc::{CallKind, ForwardMode, MediaCall};
+    pub(super) const fn index(computation: uniserve_ipc::CallKind) -> usize {
+        use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
         match computation {
             CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify) => 1,
             CallKind::Forward(ForwardMode::TokenDenoising) => 3,
@@ -180,7 +180,7 @@ impl ExecutionDomainStats {
     }
 
     /// Returns the public metrics counters for an actual computation.
-    pub fn get(&self, computation: uniserve_worker_ipc::CallKind) -> &DomainStats {
+    pub fn get(&self, computation: uniserve_ipc::CallKind) -> &DomainStats {
         self.groups()[Self::index(computation)].1
     }
 }

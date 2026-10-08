@@ -7,17 +7,17 @@ import torch
 import torch.multiprocessing as mp
 from torch.nn import functional as F
 
-from uniserve.cache import Config, mha
-from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.model import TextSize
-from uniserve.nn.attention import (
+from uniserve_models.cache import Config, mha
+from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.model import TextSize
+from uniserve_models.nn.attention import (
     Attention,
     AttentionBatch,
     AttentionParallelConfig,
     PagedInput,
     Ulysses,
 )
-from uniserve.runtime import (
+from uniserve_models.runtime import (
     CUDAStream,
     ExecutionContext,
     PrefixCache,
@@ -123,13 +123,13 @@ def test_ulysses_paged_attention_values(tmp_path):
 
 
 def _context(rank, rendezvous, gpu):
-    from uniserve.nn.attention import (
+    from uniserve_models.nn.attention import (
         ContextParallelConfig,
         SegmentedInput,
         SequenceLengths,
         VarlenInput,
     )
-    from uniserve.runtime import CUDAGraph
+    from uniserve_models.runtime import CUDAGraph
 
     device = torch.device("cuda", rank) if gpu else torch.device("cpu")
     if gpu:

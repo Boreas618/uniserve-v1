@@ -2,7 +2,7 @@
 
 ``VisionTower`` packs the patches of several images and video blocks into one
 ``[patches, tubelet_pixels]`` sequence in the processor's merge-block order
-(``uniserve.nn.vision.merged_grid_coordinates``). Each patch receives a
+(``uniserve_models.nn.vision.merged_grid_coordinates``). Each patch receives a
 learned position bilinearly resampled to its grid and a 2D rotary position
 (row, column). Attention never crosses a time step: every temporal patch of
 every grid is its own sequence. After the blocks, ``PatchMerger`` merges each
@@ -17,17 +17,17 @@ from math import prod
 import torch
 from torch import nn
 
-from uniserve.nn.activation import get_act_fn
-from uniserve.nn.attention import Attention as ScaledAttention
-from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
-from uniserve.nn.functional import apply_rotary
-from uniserve.nn.linear import (
+from uniserve_models.nn.activation import get_act_fn
+from uniserve_models.nn.attention import Attention as ScaledAttention
+from uniserve_models.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
+from uniserve_models.nn.functional import apply_rotary
+from uniserve_models.nn.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vision import (
+from uniserve_models.nn.rope import RotaryEmbedding
+from uniserve_models.nn.vision import (
     PositionEmbedding,
     TubeletEmbed,
     merged_grid_coordinates,

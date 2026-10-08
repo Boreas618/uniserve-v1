@@ -1,12 +1,12 @@
 """Named H3 weight and activation representations at their numerical owners.
 
 ``weight_config`` expands a named preset, optionally with per-component
-overrides, into a ``uniserve.loading.weights.Config`` whose ``dtypes`` and
+overrides, into a ``uniserve_models.loading.weights.Config`` whose ``dtypes`` and
 ``quantization`` mappings are keyed by module path and resolved by longest
 prefix; the paths cover the denoisers the checkpoint holds. ``precisions``
 lists every complete preset selectable by name at load time, and
 ``checkpoint_precision`` is the dense base for a calibrated ModelOpt
-checkpoint, onto which ``uniserve_models.loading`` overlays the checkpoint's
+checkpoint, onto which ``uniserve_models.catalog`` overlays the checkpoint's
 own quantized modules.
 """
 
@@ -15,8 +15,8 @@ from types import MappingProxyType
 
 import torch
 
-from uniserve.loading import weights
-from uniserve.quantization import QuantizationConfig, Quantizer
+from uniserve_models.loading import weights
+from uniserve_models.quantization import QuantizationConfig, Quantizer
 
 from .config import Config, TransformerConfig
 from .video_vae import Config as VideoConfig
@@ -169,7 +169,7 @@ def weight_config(
 
 
 def precisions(config: Config) -> Mapping[str, weights.Config]:
-    """Complete presets ``uniserve_models.loading.load_model`` accepts by name.
+    """Complete presets ``uniserve_models.catalog.load_model`` accepts by name.
 
     These apply to a dense checkpoint; a calibrated ModelOpt checkpoint offers
     none. ``read_config`` takes the "default" entry as a dense checkpoint's

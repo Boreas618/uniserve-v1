@@ -16,9 +16,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from uniserve import loading
-from uniserve.loading import checkpoint
-from uniserve.nn.rope import ProportionalScaling
+from uniserve_models import loading
+from uniserve_models.loading import checkpoint
+from uniserve_models.nn.rope import ProportionalScaling
 from uniserve_models.rotary import Rotary, read_rotary
 
 __all__ = [

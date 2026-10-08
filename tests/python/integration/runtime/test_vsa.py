@@ -11,21 +11,21 @@ import torch
 from uniserve_kernels.attention.vsa_rows import pack_sparse_input_rows
 
 from tests.python.fixtures.vsa import reference_attention
-from uniserve.nn.attention import vsa
-from uniserve.runtime import (
+from uniserve_models.nn.attention import vsa
+from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,
     TensorBuffers,
 )
-from uniserve.runtime.backends.attention import vsa as providers
+from uniserve_models.backends.attention import vsa as providers
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 @pytest.fixture
 def provider(request):
-    from uniserve.runtime.backends.attention import vsa as providers
+    from uniserve_models.backends.attention import vsa as providers
 
     name = request.param
     if not import_module(f"{providers.__name__}.{name}").available(
@@ -253,7 +253,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
 
     # The reference normalizes and rotates the projections up front with the
     # public functional, then attends the prepared chunks.
-    from uniserve.nn.functional import qk_norm_rope
+    from uniserve_models.nn.functional import qk_norm_rope
 
     normalized_q, normalized_k = qk_norm_rope(
         q,

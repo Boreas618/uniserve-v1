@@ -17,14 +17,14 @@ import torch
 import torch.multiprocessing as mp
 from torch.nn import functional as F
 
-from uniserve.distributed import partition_experts
-from uniserve.model import TextSize
-from uniserve.nn import functional
-from uniserve.nn.moe import FusedMoE
-from uniserve.quantization import Quantizer, ScaleLayout
-from uniserve.runtime import CUDAGraph, CUDAStream, ExecutionContext
-from uniserve.runtime.expert_exchange import ExpertExchange, JoinGraphs
-from uniserve.runtime.process_groups import (
+from uniserve_models.distributed import partition_experts
+from uniserve_models.model import TextSize
+from uniserve_models.nn import functional
+from uniserve_models.nn.moe import FusedMoE
+from uniserve_models.quantization import Quantizer, ScaleLayout
+from uniserve_models.runtime import CUDAGraph, CUDAStream, ExecutionContext
+from uniserve_models.runtime.expert_exchange import ExpertExchange, JoinGraphs
+from uniserve_models.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
 )

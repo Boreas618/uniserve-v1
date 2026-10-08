@@ -4,7 +4,7 @@ SenseNova denoises in pixel space. A sample is one image stored as canonical
 patch rows ``[tokens, 3 * stride**2]``, where ``stride`` is the vision patch
 size times the vision downsampling factor, so every row is one backbone token
 and holds that token's ``stride x stride`` RGB block in pixel, then channel
-order (``uniserve.nn.functional.patchify``). There is no VAE: the model's
+order (``uniserve_models.nn.functional.patchify``). There is no VAE: the model's
 ``ImageDecoder`` only unfolds the patch rows back into pixels.
 
 Each step re-encodes the current sample through this module's own
@@ -20,18 +20,18 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from uniserve.diffusion import (
+from uniserve_models.diffusion import (
     AdditiveGuidance,
     EulerSolver,
     Renorm,
     make_schedule,
 )
-from uniserve.model import ImageDenoiser
-from uniserve.nn.functional import unpatchify
-from uniserve.nn.linear import Linear
-from uniserve.nn.routing import RouteSpan
-from uniserve.nn.timestep import TimestepEmbedding
-from uniserve.tensors import OutputLayout, TensorOutput
+from uniserve_models.model import ImageDenoiser
+from uniserve_models.nn.functional import unpatchify
+from uniserve_models.nn.linear import Linear
+from uniserve_models.nn.routing import RouteSpan
+from uniserve_models.nn.timestep import TimestepEmbedding
+from uniserve_models.tensors import OutputLayout, TensorOutput
 
 from . import flow, vision
 from .config import Config
@@ -297,7 +297,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             inputs.images,
             strict=True,
         ):
-            from uniserve.nn.functional import unpatchify
+            from uniserve_models.nn.functional import unpatchify
 
             # The conditioning pixels feed the network, while the velocity's
             # origin is always the solver sample ``latent.tensor``.

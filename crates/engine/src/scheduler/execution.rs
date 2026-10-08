@@ -28,7 +28,7 @@
 //! single-tick driver for tests and examples.
 
 use super::*;
-use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
+use uniserve_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
 
 impl Scheduler {
     /// Dispatches queued work while preserving order at every shared destination.
@@ -1298,7 +1298,7 @@ impl Scheduler {
             request_pool_idx: Some(request_pool_idx),
             block_tables: Vec::new(),
             new_cache_units: Vec::new(),
-            forward: uniserve_worker_ipc::ForwardBatch::default(),
+            forward: uniserve_ipc::ForwardBatch::default(),
             latent,
             decode,
             buffers,
@@ -1707,7 +1707,7 @@ impl Scheduler {
     /// Returns the KV buffer the request's next call is conditioned on: the
     /// `kv_output` of its latest in-flight call that publishes one, otherwise
     /// the accepted `image_conditioning` of the running request.
-    pub(super) fn kv_conditioning(&self, id: RequestId) -> Option<uniserve_worker_ipc::BufferId> {
+    pub(super) fn kv_conditioning(&self, id: RequestId) -> Option<uniserve_ipc::BufferId> {
         self.inflight
             .pending_calls
             .get(&id)
@@ -2248,7 +2248,7 @@ impl Scheduler {
     }
 
     /// Counts one backpressure event against the metrics domain of `computation`.
-    pub(super) fn record_domain_backpressure(&self, computation: uniserve_worker_ipc::CallKind) {
+    pub(super) fn record_domain_backpressure(&self, computation: uniserve_ipc::CallKind) {
         self.stats
             .domains
             .get(computation)
@@ -2275,7 +2275,7 @@ impl Scheduler {
     /// the metrics domain of `computation`.
     pub(super) fn record_domain_completion(
         &self,
-        computation: uniserve_worker_ipc::CallKind,
+        computation: uniserve_ipc::CallKind,
         status: CallStatus,
     ) {
         let stats = self.stats.domains.get(computation);
@@ -2298,7 +2298,7 @@ impl Scheduler {
     /// changes no counter.
     pub(super) fn reclaim_domain_credit(
         &self,
-        computation: uniserve_worker_ipc::CallKind,
+        computation: uniserve_ipc::CallKind,
         failed: bool,
     ) {
         let stats = self.stats.domains.get(computation);
@@ -2333,7 +2333,7 @@ impl Scheduler {
     /// through `Inflight::take_ready_completions`.
     pub(super) fn queue_completion(
         &mut self,
-        mut record: uniserve_worker_ipc::RequestOutput,
+        mut record: uniserve_ipc::RequestOutput,
         media: Result<Option<Arc<SharedMedia>>, String>,
     ) {
         let id = record.request_key.request_id;
@@ -2371,7 +2371,7 @@ impl Scheduler {
                     self.emit(id, event);
                 }
                 record.status = CallStatus::Error;
-                record.error_code = Some(uniserve_worker_ipc::ErrorCode::ResourceExhausted);
+                record.error_code = Some(uniserve_ipc::ErrorCode::ResourceExhausted);
                 None
             }
         };
@@ -2408,7 +2408,7 @@ impl Scheduler {
         call: Call,
         latent: Option<LatentParams>,
         decode: Option<DecodeRange>,
-        record: uniserve_worker_ipc::RequestOutput,
+        record: uniserve_ipc::RequestOutput,
         media: Option<Arc<SharedMedia>>,
     ) {
         let id = record.request_key.request_id;
@@ -2692,7 +2692,7 @@ impl Scheduler {
     /// pending there is an accounting defect that latches engine-fatal.
     pub(super) fn free_buffers(
         &mut self,
-        buffers: impl IntoIterator<Item = uniserve_worker_ipc::BufferId>,
+        buffers: impl IntoIterator<Item = uniserve_ipc::BufferId>,
     ) {
         let mut released = HashSet::new();
         for buffer in buffers {

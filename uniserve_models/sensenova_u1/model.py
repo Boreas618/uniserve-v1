@@ -7,7 +7,7 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve.model import (
+from uniserve_models.model import (
     DEFAULT_COMPONENT,
     CausalLM,
     ComponentEntry,
@@ -15,8 +15,8 @@ from uniserve.model import (
     ImageDecoder,
     PatchEncoder,
 )
-from uniserve.nn.linear import VocabParallelHead
-from uniserve.nn.vae.patch import RGBDecoder
+from uniserve_models.nn.linear import VocabParallelHead
+from uniserve_models.nn.vae.patch import RGBDecoder
 
 from . import vision
 from .config import Config

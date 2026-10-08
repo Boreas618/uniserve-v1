@@ -7,8 +7,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.loading import checkpoint, weights
-from uniserve.nn.vae.layers import (
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.nn.vae.layers import (
     AttentionBlock,
     DiagonalGaussian,
     Downsample,

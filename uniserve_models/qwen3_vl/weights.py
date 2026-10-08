@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from uniserve.loading import checkpoint, weights
+from uniserve_models.loading import checkpoint, weights
 from uniserve_models.qwen3.weights import parameter_sources
 
 if TYPE_CHECKING:

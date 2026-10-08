@@ -11,24 +11,24 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.cache import Config, mha
-from uniserve.model import TextSize
-from uniserve.nn import Linear, MergedColumnParallelLinear
-from uniserve.nn.attention import (
+from uniserve_models.cache import Config, mha
+from uniserve_models.model import TextSize
+from uniserve_models.nn import Linear, MergedColumnParallelLinear
+from uniserve_models.nn.attention import (
     Attention,
     AttentionBatch,
     DenseInput,
     PagedInput,
 )
-from uniserve.quantization import Quantizer
-from uniserve.runtime import (
+from uniserve_models.quantization import Quantizer
+from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,
     PrefixCache,
     Scratch,
 )
-from uniserve.tensors import BufferConfig
+from uniserve_models.tensors import BufferConfig
 
 pytestmark = pytest.mark.integration
 

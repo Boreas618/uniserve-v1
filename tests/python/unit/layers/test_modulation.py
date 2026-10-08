@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve.nn.functional import (
+from uniserve_models.nn.functional import (
     Rounding,
     gated_residual,
     gated_residual_rms_norm,
@@ -14,7 +14,7 @@ from uniserve.nn.functional import (
     value_first_swiglu,
     value_first_swiglu_fp8,
 )
-from uniserve.quantization import Quantizer
+from uniserve_models.quantization import Quantizer
 
 pytestmark = [
     pytest.mark.unit,

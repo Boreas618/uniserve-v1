@@ -14,9 +14,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from uniserve import loading
-from uniserve.loading import checkpoint
-from uniserve.nn.rope import RoPEScaling, YaRNScaling
+from uniserve_models import loading
+from uniserve_models.loading import checkpoint
+from uniserve_models.nn.rope import RoPEScaling, YaRNScaling
 
 from ..rotary import read_rotary
 

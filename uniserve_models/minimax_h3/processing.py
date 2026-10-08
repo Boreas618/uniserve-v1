@@ -40,7 +40,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
 
-from uniserve.media import image
+from uniserve_models.media import image
 
 from .config import (
     CANVAS_SHORT_EDGE,

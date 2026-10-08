@@ -4,7 +4,7 @@ The kernel is ``SparseAttentionSm100`` from ``_vsa_cute_kernel``, a cuDNN
 frontend block-64 kernel with its own correction epilogue. Callers pass
 channel-contiguous ``[rows, heads, 128]`` tensors; this module views them as
 ``[1, heads, rows, 128]`` without copying. Among the backends in
-``uniserve.runtime.backends.attention.vsa``, ``cute`` uses it for every call
+``uniserve_models.backends.attention.vsa``, ``cute`` uses it for every call
 and ``sm100`` uses it for row production and for the complete-call shapes
 :func:`should_use` selects.
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use uniserve_core::{CallId, RequestId};
 use uniserve_worker::{Completion, LatentExport, LatentImport, LatentPool, LatentUpdate, Result};
-use uniserve_worker_ipc::{BufferId, LatentParams, RequestKey};
+use uniserve_ipc::{BufferId, LatentParams, RequestKey};
 
 type Signal = Arc<Completion<&'static str, ()>>;
 type Pool = LatentPool<Arc<LatentImport<Signal>>, Arc<LatentExport<Signal>>>;

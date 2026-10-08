@@ -18,13 +18,13 @@ import torch
 from torch import nn
 from torchvision.transforms.v2 import functional as tvF
 
-from uniserve.model import (
+from uniserve_models.model import (
     EmbeddingReplacement,
     PatchEncoder,
     TransformerDecoder,
 )
-from uniserve.model import TextEncoder as BaseTextEncoder
-from uniserve.tensors import OutputLayout
+from uniserve_models.model import TextEncoder as BaseTextEncoder
+from uniserve_models.tensors import OutputLayout
 
 from .config import PixelConfig, VisionConfig
 from .positions import rope_index
@@ -134,7 +134,7 @@ class TextEncoder(BaseTextEncoder):
 
     ``network`` is the language decoder, with the M-RoPE sections of the
     checkpoint, and ``retained_layers`` the decoder layers this encoder
-    runs (``uniserve.model.TextEncoder``). ``vision`` is a ``PatchEncoder``
+    runs (``uniserve_models.model.TextEncoder``). ``vision`` is a ``PatchEncoder``
     over ``VisionTower``: it encodes ``VisionInput`` samples of packed
     tubelet rows with their ``(time, height, width)`` grids into
     ``[time * height * width / merge**2, vision.feature_size]`` rows of

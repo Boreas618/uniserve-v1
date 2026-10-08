@@ -4,7 +4,7 @@ import cProfile
 
 import pytest
 
-from uniserve.sanitizer.calls import analyze
+from uniserve_eval.sanitizer.calls import analyze
 
 pytestmark = pytest.mark.unit
 

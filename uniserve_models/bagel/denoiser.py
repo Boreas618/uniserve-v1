@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import torch
 
-from uniserve.diffusion import (
+from uniserve_models.diffusion import (
     EulerSolver,
     NestedGuidance,
     NoiseScale,
     Renorm,
     make_schedule,
 )
-from uniserve.media import image
-from uniserve.model import ImageDenoiser
-from uniserve.nn.linear import Linear
-from uniserve.nn.routing import RouteSpan
-from uniserve.nn.timestep import TimestepEmbedding
-from uniserve.nn.vision import PositionEmbedding
-from uniserve.processing import BranchSource
-from uniserve.tensors import OutputLayout, TensorOutput
+from uniserve_models.media import image
+from uniserve_models.model import ImageDenoiser
+from uniserve_models.nn.linear import Linear
+from uniserve_models.nn.routing import RouteSpan
+from uniserve_models.nn.timestep import TimestepEmbedding
+from uniserve_models.nn.vision import PositionEmbedding
+from uniserve_models.processing import BranchSource
+from uniserve_models.tensors import OutputLayout, TensorOutput
 
 from .config import Config
 from .inputs import DenoiserInput

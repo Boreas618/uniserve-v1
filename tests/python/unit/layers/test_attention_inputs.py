@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from uniserve.nn.attention import (
+from uniserve_models.nn.attention import (
     AttentionBatch,
     AttentionParallelConfig,
     BlockTable,

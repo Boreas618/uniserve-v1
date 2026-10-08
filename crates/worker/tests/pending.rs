@@ -5,7 +5,7 @@ use uniserve_worker::{
     BatchResult, Completion, LatentExport, LatentImport, LatentPool, LatentUpdate, PendingOutput,
     RequestProgress,
 };
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     BatchOutput, Call, CallKind, DType, LatentParams, Locator, MAX_TRANSFER_HANDLE_BYTES,
     MediaCall, RequestKey, ShapeBound, TensorExport, TensorRef, TensorTransfer, TransferHandle,
     TransferTransport, WorkerInfo,

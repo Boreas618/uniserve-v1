@@ -1,12 +1,12 @@
 """Packed input layouts and row-wise compression epilogues for VSA.
 
-The VSA layer (``uniserve.nn.attention.vsa``) receives projected Q/K/V as
+The VSA layer (``uniserve_models.nn.attention.vsa``) receives projected Q/K/V as
 tile-aligned row intervals that may arrive out of order.
 ``pack_sparse_input_rows`` and ``prepare_sparse_input_rows`` publish each
 interval into one caller-owned ``packed`` buffer holding all three components;
 ``compose_attention`` adds the gated per-tile compression to the provider's
 attention output and routes the composed rows into row-owner destinations.
-The runtime VSA operators under ``uniserve.runtime.backends.attention.vsa``
+The runtime VSA operators under ``uniserve_models.backends.attention.vsa``
 (``_Rows.prepare`` and ``_flashinfer.prepare_rows``) read the layer's
 ``packed`` buffer (FlashInfer's BSR path receives a head-major copy of it), or
 pack their own inputs when given none, and compose their attention output with
@@ -696,7 +696,7 @@ def prepare_sparse_input_rows(
 
     One read of the projections yields the packed row-major input layout of
     ``pack_sparse_input_rows`` with Q and K normalized and rotated as
-    ``uniserve.nn.functional.qk_norm_rope`` computes them for one normalized
+    ``uniserve_models.nn.functional.qk_norm_rope`` computes them for one normalized
     domain with a partially rotated prefix, the gate rows copied into
     ``packed_gate`` at their packed rows, and the per-tile means
     ``vsa_tiles.pool_qkv_means`` computes from stored projections, written

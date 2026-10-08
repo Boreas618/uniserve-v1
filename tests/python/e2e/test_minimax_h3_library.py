@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve_models import loading as models
+from uniserve_models import catalog as models
 from uniserve_models.minimax_h3 import processing, weight_config
 from uniserve_models.minimax_h3.generation import generate
 

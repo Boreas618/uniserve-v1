@@ -30,7 +30,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from uniserve_models.loading import Base
+from uniserve_models.catalog import Base
 
 # Inference contract schema every FastVideo MiniMax-H3 export publishes.
 INFERENCE_SCHEMA = "fasth3-inference-contract-v1"

@@ -6,7 +6,7 @@ reproduces attention over their union. Providers report the LSE in different
 bases: FlashAttention-4 and the portable SDPA path use the natural logarithm,
 while TensorRT-LLM and FlashInfer kernels report base-2 values. Callers state
 the base of the states they pass; both states share it. The FlashAttention-4
-provider in ``uniserve.runtime.backends.attention.flash_attn_4`` merges its
+provider in ``uniserve_models.backends.attention.flash_attn_4`` merges its
 current window with its paged prefix this way.
 """
 

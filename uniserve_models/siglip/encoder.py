@@ -5,7 +5,7 @@ one ``[total_patches, patch_features]`` sequence. Each image attends only to
 its own patches through non-causal varlen attention, and each patch adds the
 learned position of its ``(row, column)`` in a fixed square table; grids
 smaller than the table select a subset of positions without interpolation.
-Patch rows use the order ``uniserve.nn.functional.patchify`` produces: pixel
+Patch rows use the order ``uniserve_models.nn.functional.patchify`` produces: pixel
 row, pixel column, then channel within each patch.
 """
 
@@ -14,21 +14,21 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from uniserve.model import TransformerEncoder
-from uniserve.nn.attention import Attention as ScaledAttention
-from uniserve.nn.attention import (
+from uniserve_models.model import TransformerEncoder
+from uniserve_models.nn.attention import Attention as ScaledAttention
+from uniserve_models.nn.attention import (
     AttentionBatch,
     SequenceLengths,
     VarlenInput,
 )
-from uniserve.nn.functional import patchify
-from uniserve.nn.linear import (
+from uniserve_models.nn.functional import patchify
+from uniserve_models.nn.linear import (
     ColumnParallelLinear,
     Linear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
+from uniserve_models.nn.vision.position import build_abs_positions_from_grid_hw
 
 from .config import Config, TransformerConfig
 

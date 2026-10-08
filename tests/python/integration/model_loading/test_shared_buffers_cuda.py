@@ -5,9 +5,9 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from uniserve import loading
-from uniserve.loading import checkpoint, weights
-from uniserve.nn.linear import Linear
+from uniserve_models import loading
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.nn.linear import Linear
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

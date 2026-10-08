@@ -22,12 +22,12 @@ use super::{EncoderCachePin, FlowPrefixState, Phase, RequestAllocations, Termina
 use crate::kv::{BlockTable, KvAllocation};
 
 use std::collections::HashSet;
-use uniserve_worker_ipc::{ForwardMode, LatentParams, MediaCall, TransferMode};
+use uniserve_ipc::{ForwardMode, LatentParams, MediaCall, TransferMode};
 
 use uniserve_core::{
     GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput, RequestId, SamplingParams,
 };
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, DrawLayout,
     Readout, RequestKey, RequestOutput, Rng, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
@@ -1543,7 +1543,7 @@ pub(crate) struct RequestState {
     /// Solver progress of the current image's latent trajectory.
     pub(super) denoising: super::Denoising,
     /// Exact generations retained for conditioning, denoising, and feedback.
-    pub(super) image_conditioning: Option<uniserve_worker_ipc::BufferId>,
+    pub(super) image_conditioning: Option<uniserve_ipc::BufferId>,
     /// Next feedback encoder of the generated image.
     pub(super) feedback_encoder_index: usize,
     /// Device image product of the last image decode, when feedback reads

@@ -32,7 +32,7 @@ pub enum BatchSubmitError {
     /// The batch is handed back unchanged so the caller can resubmit it
     /// later; nothing was recorded or sent for it.
     #[error("worker run queue is full")]
-    WouldBlock(Box<uniserve_worker_ipc::Batch>),
+    WouldBlock(Box<uniserve_ipc::Batch>),
     /// Reports a terminal transport or execution failure.
     #[error(transparent)]
     Failed(anyhow::Error),
@@ -101,7 +101,7 @@ pub struct WorkerProcessArgs {
     /// storage takes this as the largest pool it may choose.
     pub max_request_pool_size: u32,
     /// Attention implementation selected for model execution.
-    pub attention_backend: uniserve_worker_ipc::AttentionBackend,
+    pub attention_backend: uniserve_ipc::AttentionBackend,
     /// Optional public worker capability selectors; empty uses the model default.
     /// Startup resolves each selector to its concrete computation set.
     pub capability_groups: Vec<String>,

@@ -18,7 +18,7 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uniserve-core.workspace = true
-uniserve-worker-ipc.workspace = true
+uniserve-ipc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

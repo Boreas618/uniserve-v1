@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve.nn import Modulation
+from uniserve_models.nn import Modulation
 
 pytestmark = pytest.mark.unit
 

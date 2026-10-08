@@ -12,21 +12,21 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from uniserve.model import PhasedLayer, TransformerDecoder
-from uniserve.nn.attention import Attention as ScaledAttention
-from uniserve.nn.attention import AttentionBatch
-from uniserve.nn.functional import qk_norm_rope, sandwich_rms_norm
-from uniserve.nn.linear import (
+from uniserve_models.model import PhasedLayer, TransformerDecoder
+from uniserve_models.nn.attention import Attention as ScaledAttention
+from uniserve_models.nn.attention import AttentionBatch
+from uniserve_models.nn.functional import qk_norm_rope, sandwich_rms_norm
+from uniserve_models.nn.linear import (
     Linear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.moe import FusedMoE, Routes, TopK
-from uniserve.nn.norm import RMSNorm
-from uniserve.nn.rope import RotaryEmbedding
+from uniserve_models.nn.mlp import GatedMLP
+from uniserve_models.nn.moe import FusedMoE, Routes, TopK
+from uniserve_models.nn.norm import RMSNorm
+from uniserve_models.nn.rope import RotaryEmbedding
 
 from .config import LayerAttention, TextConfig
 

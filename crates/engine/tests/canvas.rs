@@ -27,7 +27,7 @@ use uniserve_engine::{
     BatchEvent, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig, SimEngine,
     SimExecutor, SpecialTokenIds, sim_canvas_stop_step, sim_text_token,
 };
-use uniserve_worker_ipc::{Call, CallKind, ForwardBatch, ForwardMode};
+use uniserve_ipc::{Call, CallKind, ForwardBatch, ForwardMode};
 
 /// Tokens of one block.
 const CANVAS: u32 = 16;

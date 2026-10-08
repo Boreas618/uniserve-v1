@@ -14,8 +14,8 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 )
 from safetensors.torch import save_file
 
-from uniserve import loading
-from uniserve.loading import checkpoint, weights
+from uniserve_models import loading
+from uniserve_models.loading import checkpoint, weights
 from uniserve_models.minimax_h3 import TransformerConfig
 from uniserve_models.minimax_h3.conditioning import Conditioner, assignments
 from uniserve_models.minimax_h3.modulation import TimestepEmbedding

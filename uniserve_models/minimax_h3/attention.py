@@ -9,7 +9,7 @@ unrotated), attends, and projects back. The attention itself is one of:
 * ``Dense``: full bidirectional attention over the packed sequence
   (``packing.DensePacking``); under Ulysses each rank exchanges its token
   shard for a head shard of the whole sequence.
-* ``Sparse``: video sparse attention (``uniserve.nn.attention.vsa``) over
+* ``Sparse``: video sparse attention (``uniserve_models.nn.attention.vsa``) over
   the tile packing (``packing.TilePacking``): text and audio query tiles
   attend every valid key tile, video query tiles attend the dense prefix
   plus a selected subset of video key tiles, and a gated attention over
@@ -17,7 +17,7 @@ unrotated), attends, and projects back. The attention itself is one of:
 * ``RegionSparse``: the same sparse attention over the region packing
   (``packing.RegionPacking``), where every reference video is a region of
   its own whose tiles each video query selects independently
-  (``uniserve.nn.attention.vsa.RegionAttention``).
+  (``uniserve_models.nn.attention.vsa.RegionAttention``).
 """
 
 from __future__ import annotations
@@ -29,16 +29,16 @@ from typing import cast
 import torch
 from torch import nn
 
-from uniserve.distributed import DeviceMesh
-from uniserve.nn import (
+from uniserve_models.distributed import DeviceMesh
+from uniserve_models.nn import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RMSNorm,
     RowParallelLinear,
     functional,
 )
-from uniserve.nn.attention import Attention, AttentionBatch, vsa
-from uniserve.tensors import BufferConfig
+from uniserve_models.nn.attention import Attention, AttentionBatch, vsa
+from uniserve_models.tensors import BufferConfig
 
 from .config import TransformerConfig
 from .inputs import AttentionInput, RegionInput, SequenceInput

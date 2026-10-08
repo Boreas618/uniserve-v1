@@ -12,15 +12,15 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from tests.python.fixtures.h3 import WIDE
-from uniserve.diffusion import DenoisingStep, normal_noise
-from uniserve.distributed import DeviceMesh, communication_axes
-from uniserve.model import LatentInput, TextSize
-from uniserve.nn.attention import (
+from uniserve_models.diffusion import DenoisingStep, normal_noise
+from uniserve_models.distributed import DeviceMesh, communication_axes
+from uniserve_models.model import LatentInput, TextSize
+from uniserve_models.nn.attention import (
     AttentionParallelConfig,
     ContextParallelConfig,
     Ulysses,
 )
-from uniserve.runtime import (
+from uniserve_models.runtime import (
     CUDAGraph,
     ExecutionContext,
     TensorBuffers,
@@ -34,7 +34,7 @@ from uniserve_eval.types import (
     TaskName,
     VideoConfig,
 )
-from uniserve_models import loading as models
+from uniserve_models import catalog as models
 from uniserve_models.minimax_h3 import (
     DenoiserInput,
     weight_config,

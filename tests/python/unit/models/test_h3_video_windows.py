@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.h3 import WIDE
-from uniserve.media import video
+from uniserve_models.media import video
 from uniserve_models.minimax_h3 import video_vae
 from uniserve_models.minimax_h3.config import DenseAttention, SparseAttention
 from uniserve_models.minimax_h3.decoding import VideoDecoder

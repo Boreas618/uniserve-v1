@@ -24,7 +24,7 @@ use uniserve_engine::{
     RequestPlacement, Scheduler, SimEngine, SimExecutor, SpecialTokenIds, VideoDenoiserInfo,
     WorkerId,
 };
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes, ShapeBound,
 };
 
@@ -417,7 +417,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
             && batch
                 .commands
                 .iter()
-                .any(|command| matches!(command, uniserve_worker_ipc::BatchCommand::Finish { .. }))
+                .any(|command| matches!(command, uniserve_ipc::BatchCommand::Finish { .. }))
         {
             break;
         }
@@ -922,7 +922,7 @@ fn call_indices(served: &Served, request: RequestId, media_call: MediaCall) -> V
 }
 
 /// The static leading extent of a product.
-fn leading(product: &uniserve_worker_ipc::TensorRef) -> u32 {
+fn leading(product: &uniserve_ipc::TensorRef) -> u32 {
     match product.shape_bound.dims[0] {
         DimBound::Static(extent) => extent,
         DimBound::Device { .. } => panic!("an admitted product has its exact extent"),

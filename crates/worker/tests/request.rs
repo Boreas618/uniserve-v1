@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use uniserve_core::{CallId, DiffusionSamplingParams, RequestId, SamplingParams, VideoTask};
 use uniserve_worker::{RequestPool, RequestProgress};
-use uniserve_worker_ipc::{ArRequestParams, CallStatus, NewRequest, RequestKey, VideoAdmission};
+use uniserve_ipc::{ArRequestParams, CallStatus, NewRequest, RequestKey, VideoAdmission};
 
 fn admission(id: u64, epoch: u64, slot: u32) -> NewRequest {
     NewRequest {
@@ -132,7 +132,7 @@ fn observers_keep_the_retired_epoch_after_slot_reuse() -> uniserve_worker::Resul
 
 #[test]
 fn canvas_steps_follow_submission_and_restart_on_slot_reuse() -> uniserve_worker::Result<()> {
-    use uniserve_worker_ipc::CanvasStep;
+    use uniserve_ipc::CanvasStep;
 
     let mut pool = RequestPool::new(1)?;
     let first = admission(7, 1, 1);

@@ -8,11 +8,11 @@ import pytest
 import torch
 
 from tests.python.fixtures.h3 import WIDE, base_denoiser, dmd_denoiser
-from uniserve.diffusion import normal_noise
-from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.media import image
-from uniserve.nn.attention import AttentionParallelConfig, Ulysses
-from uniserve.runtime import TensorBuffers
+from uniserve_models.diffusion import normal_noise
+from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.media import image
+from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
+from uniserve_models.runtime import TensorBuffers
 from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.inputs import DenoiserSize
 

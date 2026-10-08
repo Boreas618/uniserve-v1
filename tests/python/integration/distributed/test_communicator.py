@@ -5,9 +5,9 @@ import torch
 import torch.multiprocessing as mp
 from torch.distributed.tensor import Replicate, Shard
 
-from uniserve.distributed import DeviceMesh, Distribution
-from uniserve.quantization import Quantizer
-from uniserve.runtime.process_groups import initialize_process_groups
+from uniserve_models.distributed import DeviceMesh, Distribution
+from uniserve_models.quantization import Quantizer
+from uniserve_models.runtime.process_groups import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 

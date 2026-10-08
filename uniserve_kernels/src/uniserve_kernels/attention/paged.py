@@ -8,7 +8,7 @@ call's K/V write, also scatters those rows into the paged cache. The same
 launch can zero a scheduler's ticket counter (``semaphore``) for the
 attention launch that follows it on the stream, as the causal prefix-block
 kernel requires; a caller that needs no length columns omits them. The
-caller is ``uniserve.runtime.backends.attention._paged_inputs``.
+caller is ``uniserve_models.backends.attention._paged_inputs``.
 
 A block table whose rows begin at a per-row start page (retired history
 pages) is read from its first column: the key lengths are then counted from

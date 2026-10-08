@@ -24,7 +24,7 @@ use uniserve_engine::{
     BatchEvent, ComponentConfig, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig,
     SchedulerStats, SimEngine, SimExecutor, SpecialTokenIds, sim_candidate_logprob,
 };
-use uniserve_worker_ipc::{Call, CallKind, ComponentInfo, ForwardMode, MediaCall};
+use uniserve_ipc::{Call, CallKind, ComponentInfo, ForwardMode, MediaCall};
 
 /// Canvas token that marks an answer slot.
 const MASK: u32 = 4;
@@ -183,7 +183,7 @@ fn events(mut receiver: EventRx) -> Vec<EngineCoreOutput> {
 fn calls_of(
     batches: &[ExecutionBatch],
     request: u64,
-) -> Vec<(Call, uniserve_worker_ipc::ForwardBatch)> {
+) -> Vec<(Call, uniserve_ipc::ForwardBatch)> {
     batches
         .iter()
         .flat_map(|batch| &batch.requests)
@@ -487,7 +487,7 @@ fn vision_image(hash: u64, position: u32, tokens: u32) -> ImageInput {
 fn context_prefills(
     batches: &[ExecutionBatch],
     request: u64,
-) -> Vec<(Call, uniserve_worker_ipc::ForwardBatch)> {
+) -> Vec<(Call, uniserve_ipc::ForwardBatch)> {
     calls_of(batches, request)
         .into_iter()
         .filter(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill))

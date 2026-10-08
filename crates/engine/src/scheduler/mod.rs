@@ -52,7 +52,7 @@ pub use stats::{
     SchedulerStats, TimingStats, WorkerStats,
 };
 pub use stats_report::SchedulerStatsReporter;
-use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
+use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 mod admission;
 mod allocation;
@@ -96,7 +96,7 @@ use uniserve_core::{
 };
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
     DimBound, ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState,
@@ -466,11 +466,11 @@ fn now() -> f64 {
 /// `None`.
 fn worker_float_dtype(
     value: Option<uniserve_core::ModelDtype>,
-) -> Option<uniserve_worker_ipc::DType> {
+) -> Option<uniserve_ipc::DType> {
     match value {
-        Some(uniserve_core::ModelDtype::Float16) => Some(uniserve_worker_ipc::DType::F16),
-        Some(uniserve_core::ModelDtype::BFloat16) => Some(uniserve_worker_ipc::DType::BF16),
-        Some(uniserve_core::ModelDtype::Float32) => Some(uniserve_worker_ipc::DType::F32),
+        Some(uniserve_core::ModelDtype::Float16) => Some(uniserve_ipc::DType::F16),
+        Some(uniserve_core::ModelDtype::BFloat16) => Some(uniserve_ipc::DType::BF16),
+        Some(uniserve_core::ModelDtype::Float32) => Some(uniserve_ipc::DType::F32),
         None => None,
     }
 }
@@ -594,7 +594,7 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 /// `Scheduler::output_window_ready` charges this for every in-flight call; the
 /// per-kind counts must stay in step with `Scheduler::next_output_bound`,
 /// which charges the same events before the call is planned.
-fn call_output_bound(code: CallKind, bounds: &uniserve_worker_ipc::Bounds) -> usize {
+fn call_output_bound(code: CallKind, bounds: &uniserve_ipc::Bounds) -> usize {
     match code {
         CallKind::Forward(ForwardMode::Verify) => (bounds.max_tokens as usize)
             .saturating_mul(2)

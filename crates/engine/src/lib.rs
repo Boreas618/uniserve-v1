@@ -53,6 +53,6 @@ pub use crate::worker::{
     BatchSubmitError, CallReaders, ExpertExchange, ExpertParallelPlacement, FlashInferBackend,
     FlashInferBackendParseError, LaneConfig, WorkerExecutor, WorkerGroup, WorkerProcessArgs,
 };
-pub use uniserve_worker_ipc::{
+pub use uniserve_ipc::{
     AttentionBackend, ConditionTiles, DEFAULT_COMPONENT, VideoDenoiserInfo,
 };

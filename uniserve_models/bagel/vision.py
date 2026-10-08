@@ -3,7 +3,7 @@
 BAGEL's vision path runs the ``uniserve_models.siglip`` tower, projects its
 features to the language model's hidden width, and then adds a second
 position table at that width. ``Model`` wraps this network in
-``uniserve.model.PatchEncoder``, which packs image samples and splits the
+``uniserve_models.model.PatchEncoder``, which packs image samples and splits the
 result back per image.
 """
 
@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from torch import nn
 
-from uniserve.nn.vision import MLPConnector, PositionEmbedding
-from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
+from uniserve_models.nn.vision import MLPConnector, PositionEmbedding
+from uniserve_models.nn.vision.position import build_abs_positions_from_grid_hw
 from uniserve_models import siglip
 
 from .config import Config

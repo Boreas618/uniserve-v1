@@ -12,10 +12,10 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.nn import ColumnParallelLinear
-from uniserve.nn.attention import AttentionParallelConfig, Ulysses
-from uniserve.runtime import (
+from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.nn import ColumnParallelLinear
+from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
+from uniserve_models.runtime import (
     CUDAStream,
     ExecutionContext,
     initialize_process_groups,

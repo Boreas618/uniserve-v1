@@ -17,8 +17,8 @@ from tests.python.fixtures.h3 import (
     dmd_denoiser,
     omniref_denoiser,
 )
-from uniserve.media import image, video
-from uniserve.model import Condition, ConditionRole
+from uniserve_models.media import image, video
+from uniserve_models.model import Condition, ConditionRole
 from uniserve_models.minimax_h3 import TransformerConfig
 from uniserve_models.minimax_h3.denoiser import Denoiser
 from uniserve_models.minimax_h3.inputs import DenoiserSize

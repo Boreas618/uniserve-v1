@@ -29,10 +29,10 @@ from diffusers.modular_pipelines.minimax_h3.encoders import (
 from safetensors import safe_open
 from torch.nn import functional as F
 
-from uniserve import loading
-from uniserve.loading import checkpoint, weights
-from uniserve.media import image, video
-from uniserve.runtime import ExecutionContext
+from uniserve_models import loading
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.media import image, video
+from uniserve_models.runtime import ExecutionContext
 from uniserve_models.minimax_h3 import audio_vae, video_vae
 from uniserve_models.minimax_h3.encoding import AudioEncoder, VideoEncoder
 

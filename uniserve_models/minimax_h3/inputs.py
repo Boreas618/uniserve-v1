@@ -6,11 +6,11 @@ from dataclasses import dataclass
 
 import torch
 
-from uniserve.distributed import Communicator
-from uniserve.media import image
-from uniserve.model import Condition
-from uniserve.model import DenoiserInput as BaseDenoiserInput
-from uniserve.nn.attention import VisibleInput, vsa
+from uniserve_models.distributed import Communicator
+from uniserve_models.media import image
+from uniserve_models.model import Condition
+from uniserve_models.model import DenoiserInput as BaseDenoiserInput
+from uniserve_models.nn.attention import VisibleInput, vsa
 
 from .packing import TilePacking, latent_raster, video_latent_frames
 

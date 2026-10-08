@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from uniserve.loading import checkpoint, weights
+from uniserve_models.loading import checkpoint, weights
 
 if TYPE_CHECKING:
     from .encoder import Encoder

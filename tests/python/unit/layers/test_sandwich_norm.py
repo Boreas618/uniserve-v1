@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve.nn.functional import rms_norm, sandwich_rms_norm
+from uniserve_models.nn.functional import rms_norm, sandwich_rms_norm
 
 pytestmark = pytest.mark.unit
 
@@ -187,7 +187,7 @@ def test_cuda_sandwich_stores_a_normalization_in_its_consumer_encoding(width):
     same call; the other outputs are unchanged. Rows include an all-zero
     K16 block and one whose block scale saturates.
     """
-    from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
+    from uniserve_models.quantization import QuantizedTensor, Quantizer, ScaleLayout
 
     torch.manual_seed(11)
     device, dtype = "cuda", torch.bfloat16

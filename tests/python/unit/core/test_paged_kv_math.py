@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve.cache.paged import paged_kv_write
+from uniserve_models.cache.paged import paged_kv_write
 
 pytestmark = pytest.mark.unit
 

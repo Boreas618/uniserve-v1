@@ -9,7 +9,7 @@ from. Audio conditions are encoded whole as channel-major stereo rows.
 import pytest
 import torch
 
-from uniserve.media import image, video
+from uniserve_models.media import image, video
 from uniserve_models.minimax_h3 import audio_vae, video_vae
 from uniserve_models.minimax_h3.encoding import AudioEncoder, VideoEncoder
 from uniserve_models.minimax_h3.packing import video_latent_frames

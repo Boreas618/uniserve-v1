@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use uniserve_worker_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
+use uniserve_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
 
 use anyhow::Context as _;
 use uniserve_core::{
@@ -39,7 +39,7 @@ use uniserve_engine::{
     CallReaders, EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup,
     WorkerProcessArgs,
 };
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, CacheUnitAllocation, Call, CallId,
     CallKind, CallStatus, DType, DimBound, ErrorCode, ForwardBatch, Locator, NewRequest,
     RequestKey, ShapeBound, TensorExport, TensorRef, TransferHandle, TransferTransport,
@@ -184,7 +184,7 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
     encode.collective_seq = 3;
     encode
         .buffer_allocations
-        .push(uniserve_worker_ipc::BufferAllocation {
+        .push(uniserve_ipc::BufferAllocation {
             buffer: feature.buffer_id(),
             offset: 0,
             bytes: feature.max_bytes(),
@@ -295,7 +295,7 @@ with socket.create_connection((host, int(port)), timeout=60) as connection:
 
 #[test]
 fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
-    use uniserve_worker_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
+    use uniserve_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
 
     // Each launch names its own endpoint and reports it here, so a graceful
     // exit is observable as the next launch registering and serving again.
@@ -441,7 +441,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
 
 #[test]
 fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Result<()> {
-    use uniserve_worker_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
+    use uniserve_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let descriptor_directory = tempfile::tempdir()?;
@@ -877,7 +877,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
 fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() -> anyhow::Result<()>
 {
     use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
-    use uniserve_worker_ipc::{BufferAllocation, DiffusionSamplingParams};
+    use uniserve_ipc::{BufferAllocation, DiffusionSamplingParams};
 
     let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?;
     let mut args = rank_group_args(1 << 20, 8 << 20);
@@ -954,7 +954,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             width: 1344,
             height: 768,
         },
-        uniserve_worker_ipc::VideoAdmission {
+        uniserve_ipc::VideoAdmission {
             task: uniserve_core::VideoTask::T2va,
             text_tags: vec![1],
             conditions: Vec::new(),
@@ -1143,7 +1143,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
 #[test]
 fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<()> {
     use uniserve_engine::{ExecutionBatch, RequestPlacement, WorkerExecutor, WorkerId};
-    use uniserve_worker_ipc::{BufferAllocation, TensorTransfer, WorkerEndpoint};
+    use uniserve_ipc::{BufferAllocation, TensorTransfer, WorkerEndpoint};
 
     // Two one-rank instances whose products cross only over shared storage.
     // A product whose one location is in its producer's own address space
@@ -1983,7 +1983,7 @@ fn qualify_kv_rank_locations(executor: &mut WorkerGroup) -> anyhow::Result<()> {
 
     // The export locates the request's cache through the same block
     // tables the prefill wrote it with.
-    let buffer = uniserve_worker_ipc::BufferId {
+    let buffer = uniserve_ipc::BufferId {
         owner: request_key,
         producer_call_id: CallId::new(10, 0),
         output_index: 0,
@@ -2249,7 +2249,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
-        attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
+        attention_backend: uniserve_ipc::AttentionBackend::TorchSdpa,
         // `publisher` is the worker id `SlowShmExport` names as the
         // source of its segment.
         transfer: uniserve_engine::TransferConfig::parse("publisher->worker=shm")?,
@@ -2384,7 +2384,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     let mut batch = Batch::new(3, vec![admission], vec![call]);
     batch.buffer_allocations = [(&input, 0), (&output, 256)]
         .into_iter()
-        .map(|(product, offset)| uniserve_worker_ipc::BufferAllocation {
+        .map(|(product, offset)| uniserve_ipc::BufferAllocation {
             buffer: product.buffer_id(),
             offset,
             bytes: product.max_bytes(),
@@ -2710,7 +2710,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     let mut encode = Batch::new(8, Vec::new(), vec![encode]);
     encode
         .buffer_allocations
-        .push(uniserve_worker_ipc::BufferAllocation {
+        .push(uniserve_ipc::BufferAllocation {
             buffer: feature.buffer_id(),
             offset: 0,
             bytes: 8192,
@@ -2800,7 +2800,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         coordinates: CallCoordinates::default(),
         token_input: None,
         token_output: None,
-        vision_inputs: vec![uniserve_worker_ipc::VisionInput {
+        vision_inputs: vec![uniserve_ipc::VisionInput {
             offset: 0,
             feature: feature.clone(),
         }],
@@ -2842,7 +2842,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     // address on encoder-0 is independent and must not collide with the new
     // output that this call writes at offset zero in encoder-0's address space.
     retained.buffer_allocations.extend([
-        uniserve_worker_ipc::BufferAllocation {
+        uniserve_ipc::BufferAllocation {
             buffer: retained.calls[0]
                 .encoder_output
                 .as_ref()
@@ -2851,7 +2851,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
             offset: 0,
             bytes: 8192,
         },
-        uniserve_worker_ipc::BufferAllocation {
+        uniserve_ipc::BufferAllocation {
             buffer: feature.buffer_id(),
             offset: 8192,
             bytes: 8192,
@@ -3009,10 +3009,10 @@ impl SlowShmExport {
             height: 0,
             width: 0,
             value_range: String::new(),
-            tensor: uniserve_worker_ipc::TensorTransfer {
+            tensor: uniserve_ipc::TensorTransfer {
                 shape: vec![1],
                 locations: vec![Locator {
-                    source: uniserve_worker_ipc::WorkerEndpoint {
+                    source: uniserve_ipc::WorkerEndpoint {
                         worker_id: "publisher".into(),
                         rank: 0,
                         node: self.node.clone(),
@@ -3119,7 +3119,7 @@ fn rank_group_args(
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
-        attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
+        attention_backend: uniserve_ipc::AttentionBackend::TorchSdpa,
         transfer: Default::default(),
         ..config
     }
@@ -3265,7 +3265,7 @@ fn text_admission(
 
 /// The coordinates a call entering after `output` executes at, as the engine
 /// derives them from the completion it observed.
-fn coordinates_after(output: &uniserve_worker_ipc::RequestOutput) -> CallCoordinates {
+fn coordinates_after(output: &uniserve_ipc::RequestOutput) -> CallCoordinates {
     CallCoordinates {
         logical_position: output.position,
         kv_visible_len: output.kv_visible_len,

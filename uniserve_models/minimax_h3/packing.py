@@ -25,8 +25,8 @@ from enum import StrEnum
 import numpy as np
 import torch
 
-from uniserve.media import image
-from uniserve.model import Condition, ConditionRole
+from uniserve_models.media import image
+from uniserve_models.model import Condition, ConditionRole
 
 __all__ = [
     "AUDIO_CHANNELS",
@@ -1084,7 +1084,7 @@ class RegionTables:
         valid_sizes: [tiles] int32 rows of each tile; zero for a tile the
             request leaves empty.
         tile_regions: [tiles] int32 video region of each tile, ``-1`` for a
-            dense or empty tile (``uniserve.nn.attention.vsa.Regions``).
+            dense or empty tile (``uniserve_models.nn.attention.vsa.Regions``).
         region_starts: [tiles] int32 tiles below each region index.
         region_keep: [tiles] int32 key tiles a video query keeps of each
             region.

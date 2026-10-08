@@ -13,22 +13,22 @@ import torch.multiprocessing as mp
 from safetensors.torch import load_file, save_file
 
 from tests.python.fixtures.checkpoints import qwen_moe_checkpoint
-from uniserve.distributed import Communicator, DeviceMesh
-from uniserve.loading import weights
-from uniserve.model import TextInput, TextSize
-from uniserve.nn.attention import AttentionBatch, PagedInput
-from uniserve.nn.moe import FusedMoE
-from uniserve.quantization import QuantizationConfig, Quantizer
-from uniserve.runtime import (
+from uniserve_models.distributed import Communicator, DeviceMesh
+from uniserve_models.loading import weights
+from uniserve_models.model import TextInput, TextSize
+from uniserve_models.nn.attention import AttentionBatch, PagedInput
+from uniserve_models.nn.moe import FusedMoE
+from uniserve_models.quantization import QuantizationConfig, Quantizer
+from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,
     Microbatches,
     PrefixCache,
 )
-from uniserve.runtime.expert_exchange import ExpertExchange
-from uniserve.runtime.process_groups import initialize_process_groups
-from uniserve_models import loading as models
+from uniserve_models.runtime.expert_exchange import ExpertExchange
+from uniserve_models.runtime.process_groups import initialize_process_groups
+from uniserve_models import catalog as models
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

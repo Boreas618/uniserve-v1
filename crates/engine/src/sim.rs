@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::thread::JoinHandle;
 use std::time::Duration;
-use uniserve_worker_ipc::{ForwardMode, MediaCall, TransferMode};
+use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::executor::{
     BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerId,
@@ -33,7 +33,7 @@ use uniserve_core::{
     CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, TokenLogprob,
     try_apply_sampling_counts,
 };
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     BatchOutput, Call, CallKind, CallStatus, DrawLayout, ErrorCode, FinishFlags, NewRequest,
     RequestOutput, SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
@@ -61,7 +61,7 @@ pub struct SimExecutor {
     to_worker: Sender<Job>,
     /// Each batch's result paired with the lifecycle commands it was submitted
     /// with, which `poll` needs to interpret the command receipts.
-    from_worker: Receiver<anyhow::Result<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>>,
+    from_worker: Receiver<anyhow::Result<(BatchResult, Vec<uniserve_ipc::BatchCommand>)>>,
     /// Capacity-one wake channel: a `command_waker` post makes a blocked
     /// `poll` return early, and posts beyond the first coalesce.
     progress_tx: Sender<()>,
@@ -75,7 +75,7 @@ pub struct SimExecutor {
     handle: Option<JoinHandle<()>>,
     /// Requests admitted by a submitted batch whose `Finish` has not been
     /// acknowledged through `poll`.
-    admissions: HashSet<uniserve_worker_ipc::RequestKey>,
+    admissions: HashSet<uniserve_ipc::RequestKey>,
     /// Products declared by submitted calls that no acknowledged `Free` or
     /// `Finish` has released yet.
     products: HashSet<TensorRef>,
@@ -190,7 +190,7 @@ impl SimExecutor {
     fn poll_batch(
         &mut self,
         timeout: Duration,
-    ) -> anyhow::Result<Option<(BatchResult, Vec<uniserve_worker_ipc::BatchCommand>)>> {
+    ) -> anyhow::Result<Option<(BatchResult, Vec<uniserve_ipc::BatchCommand>)>> {
         // A closed simulator produces no results, but the poll still blocks
         // until the timeout or a command wake, as an open one does.
         if self.handle.is_none() {
@@ -241,8 +241,8 @@ impl Executor for SimExecutor {
     /// tracked product, or any other command whose request is not admitted)
     /// targets no physical state and always has capacity. A command with an
     /// owner needs an open simulator with a free in-flight slot.
-    fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
-        use uniserve_worker_ipc::BatchCommand;
+    fn command_has_capacity(&self, command: &uniserve_ipc::BatchCommand) -> bool {
+        use uniserve_ipc::BatchCommand;
         let has_owner = match command {
             BatchCommand::Free { buffer } => self
                 .products
@@ -326,11 +326,11 @@ impl Executor for SimExecutor {
             let command = commands
                 .iter()
                 .filter(|command| {
-                    !matches!(command, uniserve_worker_ipc::BatchCommand::Start { .. })
+                    !matches!(command, uniserve_ipc::BatchCommand::Start { .. })
                 })
                 .nth(receipt.command_index as usize)
                 .expect("logical command has its registered payload");
-            use uniserve_worker_ipc::BatchCommand;
+            use uniserve_ipc::BatchCommand;
             match command {
                 BatchCommand::Free { buffer } => self
                     .products
@@ -406,10 +406,10 @@ struct SimRequestState {
     /// The latest state-advancing call that completed with status OK, or the
     /// admission root: the call a later chained call follows, as a rank
     /// derives it from its own request state.
-    state_call_id: uniserve_worker_ipc::CallId,
+    state_call_id: uniserve_ipc::CallId,
     /// The generation canvas step the request's next canvas call must run:
     /// blocks stopped so far and steps run on the current block.
-    canvas: uniserve_worker_ipc::CanvasStep,
+    canvas: uniserve_ipc::CanvasStep,
 }
 
 impl SimRequestState {
@@ -435,8 +435,8 @@ impl SimRequestState {
             flow_step: 0,
             predicate_values: HashMap::new(),
             penalty_counts: BTreeMap::new(),
-            state_call_id: uniserve_worker_ipc::CallId::new(0, 0),
-            canvas: uniserve_worker_ipc::CanvasStep::default(),
+            state_call_id: uniserve_ipc::CallId::new(0, 0),
+            canvas: uniserve_ipc::CanvasStep::default(),
         }
     }
 
@@ -664,7 +664,7 @@ impl SimEngine {
             if request.positions_from_model {
                 request.logical_position = stated.logical_position;
             }
-            let held = uniserve_worker_ipc::CallCoordinates {
+            let held = uniserve_ipc::CallCoordinates {
                 logical_position: request.logical_position,
                 kv_visible_len: request.kv_visible_len,
                 kv_computed_len: request.kv_visible_len,
@@ -878,7 +878,7 @@ impl SimEngine {
                                 }
                             })
                             .collect();
-                        request.canvas = uniserve_worker_ipc::CanvasStep {
+                        request.canvas = uniserve_ipc::CanvasStep {
                             block: step.block + 1,
                             step: 0,
                         };
@@ -1138,7 +1138,7 @@ fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
 ///
 /// The object is left in place under its generated name; the engine claims it
 /// by that name and unlinks it when it opens the result.
-fn publish_media(prefix: &str, bytes: &[u8]) -> anyhow::Result<uniserve_worker_ipc::MediaOutput> {
+fn publish_media(prefix: &str, bytes: &[u8]) -> anyhow::Result<uniserve_ipc::MediaOutput> {
     use std::io::Write;
 
     let mut storage = tempfile::Builder::new()
@@ -1152,8 +1152,8 @@ fn publish_media(prefix: &str, bytes: &[u8]) -> anyhow::Result<uniserve_worker_i
         .ok_or_else(|| anyhow::anyhow!("shared-storage artifact has no printable name"))?
         .to_owned();
 
-    Ok(uniserve_worker_ipc::MediaOutput {
-        handle: uniserve_worker_ipc::ArtifactHandle::PosixShm { name },
+    Ok(uniserve_ipc::MediaOutput {
+        handle: uniserve_ipc::ArtifactHandle::PosixShm { name },
         bytes: bytes.len() as u64,
     })
 }
@@ -1216,7 +1216,7 @@ impl SimEngine {
             .commands
             .iter()
             .filter_map(|control| match control {
-                uniserve_worker_ipc::BatchCommand::Finish { request_key, .. } => Some(*request_key),
+                uniserve_ipc::BatchCommand::Finish { request_key, .. } => Some(*request_key),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1239,7 +1239,7 @@ impl SimEngine {
         }
 
         for command in &batch.commands {
-            if let uniserve_worker_ipc::BatchCommand::Free { buffer } = command
+            if let uniserve_ipc::BatchCommand::Free { buffer } = command
                 && let Some(request) = self.requests.get_mut(&buffer.owner.request_id)
             {
                 request
@@ -1362,7 +1362,7 @@ impl SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_worker_ipc::{
+    use uniserve_ipc::{
         ArRequestParams, Bounds, CallId, DType, ForwardBatch, RequestKey, ShapeBound, TensorRef,
     };
 
@@ -1405,7 +1405,7 @@ mod tests {
         let admission = admission();
         let call = Call {
             consumer_slots: Vec::new(),
-            coordinates: uniserve_worker_ipc::CallCoordinates::default(),
+            coordinates: uniserve_ipc::CallCoordinates::default(),
             token_input: None,
 
             token_output: Some(token_output(CallId::new(batch_id, request_index))),
@@ -1455,7 +1455,7 @@ mod tests {
                     readers: Default::default(),
                 },
             )],
-            vec![uniserve_worker_ipc::BatchCommand::Start {
+            vec![uniserve_ipc::BatchCommand::Start {
                 request: Box::new(admission),
             }],
             Vec::new(),
@@ -1469,7 +1469,7 @@ mod tests {
         let mut successor = batch(1, 4).requests.remove(0);
         // The selected prompt covers two positions, so its successor in the
         // same batch enters where it left off.
-        successor.0.coordinates = uniserve_worker_ipc::CallCoordinates {
+        successor.0.coordinates = uniserve_ipc::CallCoordinates {
             logical_position: 2,
             kv_visible_len: 2,
             kv_computed_len: 2,

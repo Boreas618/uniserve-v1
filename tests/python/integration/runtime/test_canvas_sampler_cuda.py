@@ -1,7 +1,7 @@
 """The SM100 canvas sampler kernels follow the portable sampler step.
 
 Comparisons use the numerical error bounds of
-``uniserve.diffusion.canvas``:
+``uniserve_models.diffusion.canvas``:
 
 - R1: Philox draws (initial and re-noise tokens) and block starts match
   bitwise.
@@ -27,7 +27,7 @@ import pytest
 import torch
 from uniserve_kernels.diffusion import canvas as kernels
 
-from uniserve.diffusion import canvas, tokens
+from uniserve_models.diffusion import canvas, tokens
 
 pytestmark = [
     pytest.mark.integration,

@@ -15,9 +15,9 @@ from diffusers.modular_pipelines.minimax_h3.encoders import (
 )
 from safetensors.torch import save_file
 
-from uniserve import loading
-from uniserve.loading import checkpoint, weights
-from uniserve.media import image, video
+from uniserve_models import loading
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.media import image, video
 from uniserve_models.minimax_h3 import video_vae
 from uniserve_models.minimax_h3.encoding import VideoEncoder
 

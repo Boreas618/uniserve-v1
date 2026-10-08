@@ -22,8 +22,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.distributed import DeviceMesh
-from uniserve.nn import (
+from uniserve_models.distributed import DeviceMesh
+from uniserve_models.nn import (
     ColumnParallelLinear,
     GatedMLP,
     Linear,
@@ -31,7 +31,7 @@ from uniserve.nn import (
     RMSNorm,
     functional,
 )
-from uniserve.quantization import Quantizer
+from uniserve_models.quantization import Quantizer
 
 from . import config as configs
 from .attention import Dense, RegionSparse, Sparse
@@ -255,7 +255,7 @@ class StepProjection(nn.Module):
 
     A parallel-decoding student predicts one head per fine-grid interval; an
     evaluation applies its block's heads fused with their normalized
-    integration weights (``uniserve.diffusion.fuse_heads``). Loading fuses
+    integration weights (``uniserve_models.diffusion.fuse_heads``). Loading fuses
     every block once (``weights._prepare_heads``) into ``weight`` [steps,
     out, in] and ``bias`` [steps, out], and a call gathers the step's head
     on the device, so one captured evaluation serves every step.

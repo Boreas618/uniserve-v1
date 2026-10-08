@@ -30,9 +30,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve.nn import functional
-from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
-from uniserve.nn.functional import (
+from uniserve_models.nn import functional
+from uniserve_models.nn.attention import Attention, AttentionBatch, DenseInput
+from uniserve_models.nn.functional import (
     qk_bias_rms_norm_rope_,
     scaled_residual_,
     scaled_residual_layer_norm,
@@ -45,16 +45,16 @@ from uniserve.nn.functional import (
     weighted_rms_norm,
     weighted_rms_norm_absmax,
 )
-from uniserve.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
-from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vae import (
+from uniserve_models.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
+from uniserve_models.nn.mlp import GatedMLP
+from uniserve_models.nn.rope import RotaryEmbedding
+from uniserve_models.nn.vae import (
     LatentDecoder,
     LatentEncoder,
     SpatialDecoder,
     SpatialEncoder,
 )
-from uniserve.quantization import QuantizedTensor
+from uniserve_models.quantization import QuantizedTensor
 
 # The VAE's pixel convention: RGB over [0, 1], normalized per channel by the
 # ImageNet statistics, for both encoder input and decoder output.
@@ -752,7 +752,7 @@ class Model(LatentDecoder):
 
 def assignments(model: Decoder | Model, reader):
     """Map native VAE tensors, splitting value-first feed-forward branches."""
-    from uniserve.loading import weights
+    from uniserve_models.loading import weights
 
     decoder = model.decoder if isinstance(model, Model) else model
     available = frozenset(reader.names())
@@ -1101,7 +1101,7 @@ def encoder_assignments(model: Encoder | LatentEncoder, reader):
     The checkpoint's ``encoder.*`` and ``quant_conv.*`` tensors become
     resident; its decoder half belongs to ``assignments``.
     """
-    from uniserve.loading import weights
+    from uniserve_models.loading import weights
 
     encoder = model.encoder if isinstance(model, LatentEncoder) else model
     available = frozenset(reader.names())

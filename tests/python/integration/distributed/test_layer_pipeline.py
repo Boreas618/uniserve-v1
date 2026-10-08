@@ -8,16 +8,16 @@ import torch
 import torch.multiprocessing as mp
 from torch import nn
 
-from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.model import TransformerDecoder
-from uniserve.nn.attention import (
+from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.model import TransformerDecoder
+from uniserve_models.nn.attention import (
     AttentionBatch,
     AttentionParallelConfig,
     SequenceLengths,
     Ulysses,
     VarlenInput,
 )
-from uniserve.runtime import initialize_process_groups
+from uniserve_models.runtime import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 

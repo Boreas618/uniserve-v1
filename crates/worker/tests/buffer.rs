@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use uniserve_core::{CallId, RequestId};
 use uniserve_worker::{BufferPool, Error, Result};
-use uniserve_worker_ipc::{BufferAllocation, BufferId, RequestKey};
+use uniserve_ipc::{BufferAllocation, BufferId, RequestKey};
 
 fn allocation(output_index: u16, offset: u64, bytes: u64) -> BufferAllocation {
     BufferAllocation {

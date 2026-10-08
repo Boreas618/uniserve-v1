@@ -4,9 +4,9 @@ A BAGEL checkpoint stores the language model, denoiser heads, vision tower
 and connector in one ``primary`` file (``ema.safetensors`` when present,
 otherwise ``model.safetensors``) and the FLUX autoencoder in a separate
 ``autoencoder`` file (``ae.safetensors``). ``checkpoint_mappings`` translates
-UniServe module paths to those tensor names. ``uniserve_models.loading``
+UniServe module paths to those tensor names. ``uniserve_models.catalog``
 calls it on the complete meta-device model to choose sources;
-``uniserve.loading.load_model`` calls it again after binding parallel
+``uniserve_models.loading.load_model`` calls it again after binding parallel
 partitions; under pipeline parallelism only the rank's resident layers and
 terminal modules then remain.
 """
@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from uniserve.loading import checkpoint, weights
-from uniserve.model import TransformerDecoder
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.model import TransformerDecoder
 from uniserve_models import siglip
 
 from . import vae
@@ -65,7 +65,7 @@ def precisions(config) -> Mapping[str, weights.Config]:
 def checkpoint_precision(config) -> weights.Config:
     """Dense base for a calibrated ModelOpt checkpoint.
 
-    ``read_config`` in ``uniserve_models.loading`` overlays the checkpoint's
+    ``read_config`` in ``uniserve_models.catalog`` overlays the checkpoint's
     packed NVFP4 modules onto it and offers no runtime presets.
     """
     return _PRECISIONS["bf16"]

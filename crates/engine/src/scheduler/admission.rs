@@ -18,7 +18,7 @@
 //! its route.
 
 use super::*;
-use uniserve_worker_ipc::ForwardMode;
+use uniserve_ipc::ForwardMode;
 
 /// One product a video request reserves: its declared name, the component
 /// output it is reserved under, and its request-sized shape.
@@ -320,7 +320,7 @@ impl Scheduler {
     /// codecs for the video decoder's chosen worker, the video codec's
     /// candidates are further limited to those.
     fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::WorkerId>> {
-        use uniserve_worker_ipc::MediaCall;
+        use uniserve_ipc::MediaCall;
 
         let mut required = graph
             .calls()
@@ -434,7 +434,7 @@ impl Scheduler {
         if !self
             .info
             .media_components
-            .contains_key(&uniserve_worker_ipc::MediaCall::Muxing)
+            .contains_key(&uniserve_ipc::MediaCall::Muxing)
         {
             reject(
                 RejectionKind::Invalid,
@@ -620,7 +620,7 @@ impl Scheduler {
                 request_pool_idx,
                 submission.request.prompt_token_ids.clone(),
                 submission.request.sampling,
-                uniserve_worker_ipc::VideoAdmission {
+                uniserve_ipc::VideoAdmission {
                     task: submission.request.task,
                     text_tags: submission.request.text_tags.clone(),
                     conditions: submission.request.conditions.clone(),
@@ -1178,7 +1178,7 @@ impl Scheduler {
 /// Resources a token request holds from the moment admission commits it.
 pub(super) struct AdmissionReservation {
     /// The prefill worker's endpoint, which keys its prefix-cache residency.
-    source: uniserve_worker_ipc::WorkerEndpoint,
+    source: uniserve_ipc::WorkerEndpoint,
     request_slot: RequestSlot,
     kv: KvAllocation,
 }
@@ -1193,7 +1193,7 @@ fn acquire_cached_prefix(
     state: &mut RequestState,
     pool: &BlockPool,
     stats: &SchedulerStats,
-    source: &uniserve_worker_ipc::WorkerEndpoint,
+    source: &uniserve_ipc::WorkerEndpoint,
 ) -> Result<(), &'static str> {
     let prompt = state.req.prompt_token_ids.clone();
     let has_context_images = state.has_context_images();
