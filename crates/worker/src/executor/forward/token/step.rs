@@ -11,9 +11,13 @@ use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::batch::TokenBatch;
-use super::calls;
+use super::calls::{self, Prepared};
+use super::context::{self, Sources};
+use crate::runner::diffusion::image::ConditionRow;
+use crate::runner::graphs::GraphMode;
 use crate::runner::text::{
-    Executed, RowSource, SamplingColumns, StepContext, StepRequest, TokenRow, logit_layout,
+    Embeddings, Executed, RowSource, SamplingColumns, StepContext, StepRequest, TokenRow,
+    logit_layout,
 };
 use crate::sampling::plan::{
     SampleTask, SamplingPlan, greedy_finish_words, logprob_request, logprob_words,
@@ -92,12 +96,24 @@ impl TokenBatch<'_> {
         let active: Vec<usize> = (0..plan.calls.len())
             .filter(|&index| self.calls[index].active)
             .collect();
+        let mut forward_rows: Vec<Vec<usize>> = vec![Vec::new(); plan.calls.len()];
+        for (row, &call) in plan.forward.call_indices.iter().enumerate() {
+            if let Some(rows) = forward_rows.get_mut(call as usize) {
+                rows.push(row);
+            }
+        }
         let mut params: Vec<Option<(SamplingParams, Vec<u32>)>> = vec![None; plan.calls.len()];
         let mut rows: Vec<TokenRow> = Vec::with_capacity(active.len());
+        // Each call's last row, from which it samples.
+        let mut last_rows: Vec<Option<usize>> = vec![None; plan.calls.len()];
+        let mut embeddings: Vec<Embeddings> = Vec::new();
+        let mut conditions: Vec<ConditionRow> = Vec::new();
+        let mut reads = Vec::new();
         for &index in &active {
             let call = &plan.calls[index];
             let request = self.requests.get(call.request_key.request_id.0)?;
             let admitted = calls::parameters(request.admission())?.clone();
+            let input_images = request.admission().input_images;
             let finish = request
                 .admission()
                 .ar
@@ -105,18 +121,78 @@ impl TokenBatch<'_> {
                 .map(|ar| ar.finish_token_ids.clone())
                 .unwrap_or_default();
             let state = &mut self.calls[index];
-            let prepared = calls::prepare(
-                call,
-                &state.output,
-                &admitted,
-                state.slot as u32,
-                tables,
-                indexed,
-            )?;
-            rows.push(prepared.row.clone());
+            let prepared = if call.writes_context() || call.writes_visual_state() {
+                if admitted.prompt_logprobs_requested() {
+                    return Err(Error::Unsupported(
+                        "prompt scoring of image prompts is not served".into(),
+                    ));
+                }
+                let sources = Sources {
+                    tensors: &self.storage.tensors,
+                    image: self.image.as_deref(),
+                    tables,
+                    device: self.device,
+                    stream: self.stream.as_ref(),
+                    input_images,
+                };
+                let slot = state.slot as u32;
+                let (row, media) = if call.writes_context() {
+                    context::context(
+                        &sources,
+                        call,
+                        &state.output,
+                        slot,
+                        &forward_rows[index],
+                        &plan.forward,
+                    )?
+                } else {
+                    context::visual(&sources, call, &state.output, slot)?
+                };
+                Prepared {
+                    row,
+                    media: Some(media),
+                    scores: false,
+                    drafts: Vec::new(),
+                    tagged: false,
+                }
+            } else {
+                calls::prepare(
+                    call,
+                    &state.output,
+                    &admitted,
+                    state.slot as u32,
+                    tables,
+                    indexed,
+                )?
+            };
+            match &prepared.media {
+                Some(media) => {
+                    reads.extend(media.reads.iter().cloned());
+                    if let Some(condition) = &media.latent {
+                        // The image denoiser writes this call's K/V.
+                        conditions.push(condition.clone());
+                    } else {
+                        let base: usize = rows.iter().map(|row| row.query as usize).sum();
+                        for (token, values) in &media.embeddings {
+                            embeddings.push(Embeddings {
+                                token: base + token,
+                                values: values.clone(),
+                            });
+                        }
+                        rows.extend(media.rows.iter().cloned());
+                        last_rows[index] = Some(rows.len());
+                        rows.push(prepared.row.clone());
+                    }
+                }
+                None => {
+                    last_rows[index] = Some(rows.len());
+                    rows.push(prepared.row.clone());
+                }
+            }
             state.prepared = Some(prepared);
             params[index] = Some((admitted, finish));
         }
+        self.reads.extend(reads);
         // An all-indexed decode gathers on the device; mixed calls read the
         // indexed rows' tokens and positions from the slot state.
         if !rows.iter().all(|row| row.source == RowSource::Indexed) {
@@ -126,6 +202,9 @@ impl TokenBatch<'_> {
                 }
             }
         }
+        if !conditions.is_empty() {
+            self.condition_latents(&conditions)?;
+        }
 
         let layout = logit_layout(&rows);
         let vocab = self.runtime.vocab;
@@ -133,7 +212,7 @@ impl TokenBatch<'_> {
         let mut metadata = Vec::new();
         let mut greedy = self.mode == ForwardMode::Decode;
         let mut prompts: Vec<(usize, (usize, usize), usize, bool)> = Vec::new();
-        for (position, &index) in active.iter().enumerate() {
+        for &index in &active {
             let call = &plan.calls[index];
             let state = &mut self.calls[index];
             let (admitted, finish) = params[index]
@@ -163,6 +242,8 @@ impl TokenBatch<'_> {
                 state.token_write.is_some(),
                 state.transition_write.is_some(),
             );
+            let position = last_rows[index]
+                .ok_or_else(|| Error::Invalid("a call sampling a token has no text row".into()))?;
             let (first, count) = layout[position];
             // A verification samples every candidate row; the others their
             // last projected row.
@@ -289,19 +370,29 @@ impl TokenBatch<'_> {
             .as_mut()
             .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
         let (tables, cache) = kv.split();
-        let executed = self.runtime.runners[self.runner].execute(
-            &StepRequest {
-                decode: self.mode == ForwardMode::Decode,
-                rows: &rows,
-                sampling: columns,
-                prompt: &prompt_words,
-            },
-            &mut StepContext {
-                tables,
-                cache,
-                state: &self.runtime.state,
-            },
-        )?;
+        let executed = if rows.is_empty() {
+            // Only latent conditionings, which the image denoiser wrote.
+            Executed {
+                mode: GraphMode::Eager,
+                live_tokens: 0,
+                padded_tokens: 0,
+            }
+        } else {
+            self.runtime.runners[self.runner].execute(
+                &StepRequest {
+                    decode: self.mode == ForwardMode::Decode,
+                    rows: &rows,
+                    sampling: columns,
+                    prompt: &prompt_words,
+                    embeddings: &embeddings,
+                },
+                &mut StepContext {
+                    tables,
+                    cache,
+                    state: &self.runtime.state,
+                },
+            )?
+        };
         let task_count = tasks.len();
         drop(tasks);
         for (index, controls, ..) in metadata {
@@ -317,5 +408,36 @@ impl TokenBatch<'_> {
                 .map(|row| u64::from(row.query.saturating_sub(1)))
                 .sum(),
         })
+    }
+}
+
+impl TokenBatch<'_> {
+    /// Write the K/V of latent images inserted as conditioning, through the
+    /// image denoiser on its stream, ordered between this batch's text
+    /// work.
+    fn condition_latents(&mut self, rows: &[ConditionRow]) -> Result<()> {
+        let image = self.image.as_deref_mut().ok_or_else(|| {
+            Error::Unsupported("latent conditioning requires the image runtime".into())
+        })?;
+        let diffusion = image.diffusion_mut().ok_or_else(|| {
+            Error::Unsupported("latent conditioning requires an image denoiser".into())
+        })?;
+        let stream = diffusion
+            .stream()
+            // SAFETY: the lanes own the stream for the runtime's lifetime.
+            .map(|stream| unsafe { uniserve_cuda::Stream::borrowed(stream.device(), stream.raw()) })
+            .transpose()?;
+        let kv = self
+            .storage
+            .kv
+            .as_mut()
+            .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
+        let (tables, cache) = kv.split();
+        self.runtime.order(stream.as_ref())?;
+        diffusion.condition(rows, tables, |table, prefix, query| {
+            cache.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
+        })?;
+        self.runtime.ordered(stream.as_ref())?;
+        self.runtime.order(self.stream.as_ref())
     }
 }

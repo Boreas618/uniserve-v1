@@ -34,6 +34,9 @@ Vision (``PatchEncoder``) functions:
   region per image.
 - ``prepare_resident(image, tower, signed_unit) -> prepared``: prepare a
   resident image product (a region) for encoding.
+- ``warm(side)``: encode a black ``side`` x ``side`` image through the
+  model's input transform and discard the result (startup warmup of
+  unpacked encoders).
 - Packed encoders (``max_patches`` set) bind ``pixels`` ``[slots *
   max_patches, row]``, ``grids`` ``[2 * slots, 2]`` int64 and
   ``features`` ``[slots * tokens, output_size]``, where ``tokens`` is
@@ -46,8 +49,9 @@ Vision (``PatchEncoder``) functions:
   for ``slots`` slots; ``release(graph)`` drops it.
 
 Latent (``PatchAutoencoder``) functions: ``encode(images, out) -> shapes``
-encodes images of one pixel shape into latent patch rows, and
-``prepare_resident`` as above.
+encodes images of one pixel shape into latent patch rows; ``warm`` and
+``prepare_resident`` as above. A latent encoder that samples its posterior
+draws from the device's default generator, as every encode does.
 
 Text (``TextEncoder``) functions bind ``tokens`` ``[capacity]`` int64,
 ``features`` ``[capacity, hidden]`` and, for an encoder that places vision
@@ -230,6 +234,27 @@ def _device_grid(
     return grid.to(device, non_blocking=True)
 
 
+def _warm(loaded, context, tower: str, run):
+    """The ``warm`` step: ``run`` one black image prepared for ``tower``."""
+
+    def warm(side: int) -> None:
+        processor = getattr(loaded, "image_processor", None)
+        if processor is None:
+            raise ValueError("the model declares no image processing")
+        side = int(side)
+        with calls.scope(context):
+            prepared = prepare_tensor_image(
+                processor,
+                tower,
+                torch.zeros((3, side, side)),
+                device=context.device,
+                signed_unit=False,
+            )
+            run(prepared)
+
+    return warm
+
+
 def _resident(loaded, context, products):
     """The ``prepare_resident`` step of an image encoder."""
 
@@ -254,20 +279,22 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
     products = tensors["products"]
     device = context.device
 
+    def run(images: Sequence[PreparedImage]):
+        return encoder.encode(
+            VisionInput(
+                tuple(_device_pixels(image, device) for image in images),
+                tuple(
+                    _device_grid(image.grid_shape, device) for image in images
+                ),
+                tuple(image.grid_shape for image in images),
+            )
+        )
+
     def encode(images: Sequence[PreparedImage], out: Sequence) -> list:
         if len(images) != len(out):
             raise ValueError("vision images and products must align")
         with calls.scope(context):
-            features = encoder.encode(
-                VisionInput(
-                    tuple(_device_pixels(image, device) for image in images),
-                    tuple(
-                        _device_grid(image.grid_shape, device)
-                        for image in images
-                    ),
-                    tuple(image.grid_shape for image in images),
-                )
-            )
+            features = run(images)
             return [
                 calls.write(regions.view(products, region), value)
                 for value, region in zip(features, out, strict=True)
@@ -276,6 +303,7 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
     steps: dict[str, Callable[..., Any]] = {
         "encode": encode,
         "prepare_resident": _resident(loaded, context, products),
+        "warm": _warm(loaded, context, "vit", lambda image: run((image,))),
     }
     if encoder.max_patches is None:
         return steps
@@ -356,14 +384,17 @@ def _latent(autoencoder: PatchAutoencoder, loaded, context, tensors):
     products = tensors["products"]
     device = context.device
 
+    def run(images: Sequence[PreparedImage]):
+        pixels = torch.stack(
+            tuple(_device_pixels(image, device) for image in images)
+        )
+        return autoencoder.encode(pixels).unbind(0)
+
     def encode(images: Sequence[PreparedImage], out: Sequence) -> list:
         if len(images) != len(out):
             raise ValueError("latent images and products must align")
         with calls.scope(context):
-            pixels = torch.stack(
-                tuple(_device_pixels(image, device) for image in images)
-            )
-            latents = autoencoder.encode(pixels).unbind(0)
+            latents = run(images)
             return [
                 calls.write(regions.view(products, region), value)
                 for value, region in zip(latents, out, strict=True)
@@ -372,6 +403,7 @@ def _latent(autoencoder: PatchAutoencoder, loaded, context, tensors):
     return {
         "encode": encode,
         "prepare_resident": _resident(loaded, context, products),
+        "warm": _warm(loaded, context, "vae", lambda image: run((image,))),
     }
 
 
