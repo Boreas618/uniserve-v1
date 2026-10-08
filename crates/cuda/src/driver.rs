@@ -179,6 +179,8 @@ driver_table! {
         ctx_push = "cuCtxPushCurrent_v2": fn(Handle);
         ctx_pop = "cuCtxPopCurrent_v2": fn(*mut Handle);
         thread_exchange_capture_mode = "cuThreadExchangeStreamCaptureMode": fn(*mut i32);
+        profiler_start = "cuProfilerStart": fn();
+        profiler_stop = "cuProfilerStop": fn();
 
         stream_create_with_priority = "cuStreamCreateWithPriority": fn(*mut Handle, u32, i32);
         stream_get_priority = "cuStreamGetPriority": fn(Handle, *mut i32);
