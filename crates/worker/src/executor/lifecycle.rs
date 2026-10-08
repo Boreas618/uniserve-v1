@@ -114,7 +114,7 @@ impl Retirement {
     }
 
     /// Revoke explicitly freed products before the batch waits for storage.
-    pub fn admit(&self, storage: &mut [Box<dyn RequestStorage>]) -> Result<()> {
+    pub fn admit(&self, storage: &mut [&mut dyn RequestStorage]) -> Result<()> {
         if self.buffers.is_empty() {
             return Ok(());
         }
@@ -128,7 +128,7 @@ impl Retirement {
     pub fn begin(
         &mut self,
         requests: &RequestPool,
-        storage: &mut [Box<dyn RequestStorage>],
+        storage: &mut [&mut dyn RequestStorage],
     ) -> Result<()> {
         if self.requests.is_empty() && self.buffers.is_empty() {
             self.complete = true;
@@ -157,7 +157,7 @@ impl Retirement {
     pub fn poll(
         &mut self,
         requests: &mut RequestPool,
-        storage: &mut [Box<dyn RequestStorage>],
+        storage: &mut [&mut dyn RequestStorage],
     ) -> Result<bool> {
         if self.complete {
             return Ok(true);

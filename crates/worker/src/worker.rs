@@ -45,8 +45,13 @@ use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
+use crate::executor::forward::token::TextRuntime;
+use crate::executor::forward::token::start::{Startup, TextBounds, reserved_bytes};
+use crate::executor::forward::token::warmup::TextWarmup;
+use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
 use crate::launch::Endpoint;
+use crate::model::bind::StreamWorkspaces;
 use crate::model::components::Capability;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
@@ -59,7 +64,7 @@ use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
 use crate::runner::{GraphStorage, graph_storage_budget_bytes};
 use crate::service::Service;
-use crate::storage::{GroupShape, KVCache, KVPlan};
+use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
 use crate::stream::{CUDAStream, EventPool};
 use crate::transfer::{Capacity, TransportKind, TransportOptions, Transports};
 use crate::warmup::{Scenarios, WarmupHooks};
@@ -110,6 +115,8 @@ pub struct Worker {
     budget: Option<DeviceBudget>,
     lanes: Lanes,
     graphs: GraphStorage<String, Handle>,
+    /// Shared workspaces of every binding, by stream.
+    workspaces: StreamWorkspaces,
     executor: Option<Executor<WorkerBackend>>,
     hooks: Vec<Box<dyn WarmupHooks>>,
     /// Retained for the rank's lifetime: torch, the driver owners and the
@@ -253,11 +260,53 @@ impl Worker {
             .map_err(|error| phase("capacity")(Error::Invariant(error.to_string())))?;
         log_capacity(&config, &plan);
 
+        let budgets = devices
+            .iter()
+            .filter_map(|device| device.cuda_index())
+            .map(|index| {
+                Ok((
+                    index,
+                    graph_storage_budget_bytes(total_bytes(index)? as i64),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+            .map_err(phase("capacity"))?;
+        let mut graphs = GraphStorage::new(budgets);
+        let mut workspaces = StreamWorkspaces::default();
+
         let storage = allocate_storage(&launch, &interface, &config, &plan, &lanes)
             .map_err(phase("storage"))?;
+        let mut components = components;
+        let preparation = device
+            .cuda_index()
+            .and_then(|index| lanes.preparation(DeviceId(index)));
+        let preparation = preparation
+            .map(CUDAStream::stream)
+            .transpose()
+            .map_err(phase("bind"))?;
+        let text = TextRuntime::start(Startup {
+            interface: &interface,
+            config: &config,
+            request_slots: info.request_slots as usize,
+            queue_depth: launch.ipc.queue_depth,
+            max_payload_bytes: launch.ipc.max_payload_bytes,
+            model: &model,
+            facts: &facts,
+            lanes: &lanes,
+            kv: storage.kv.as_ref(),
+            components: &mut components,
+            workspaces: &mut workspaces,
+            graphs: &mut graphs,
+            preparation,
+        })
+        .map_err(phase("bind"))?;
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
-        backend.add_storage(Box::new(storage));
+        backend.set_rank_storage(storage);
+        let text_warmup = text.is_some();
+        if let Some(text) = text {
+            backend.set_text(text);
+        }
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
             .map(|profile| {
@@ -283,18 +332,16 @@ impl Worker {
             collective,
         )
         .map_err(|error| error.with_phase("executor"))?;
+        let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
+        if text_warmup {
+            hooks.push(Box::new(TextWarmup {
+                row_tokens: config
+                    .max_sequence_tokens
+                    .min(config.max_batch_tokens)
+                    .max(1),
+            }));
+        }
 
-        let budgets = devices
-            .iter()
-            .filter_map(|device| device.cuda_index())
-            .map(|index| {
-                Ok((
-                    index,
-                    graph_storage_budget_bytes(total_bytes(index)? as i64),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()
-            .map_err(phase("capacity"))?;
         tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", facts.model_name);
         Ok(Self {
             launch,
@@ -306,9 +353,10 @@ impl Worker {
             world: Some(world),
             budget,
             lanes,
-            graphs: GraphStorage::new(budgets),
+            graphs,
+            workspaces,
             executor: Some(executor),
-            hooks: Vec::new(),
+            hooks,
             context,
             warmed: false,
             closed: false,
@@ -479,6 +527,9 @@ impl Worker {
             if !aborted {
                 record(executor.close());
             }
+            // Graphs and steps release before the bindings they run.
+            let closed = executor.backend_mut().close_text(aborted);
+            record(closed.map_err(WorkerError::from));
             let closed = executor.backend_mut().components_mut().close(aborted);
             record(closed.map_err(WorkerError::from));
             let closed = executor.backend_mut().close_storage(aborted);
@@ -637,6 +688,10 @@ impl Worker {
                 .map_err(phase("warmup"))?;
         }
         records.log("startup", self.config.rank, &self.config.device);
+        if let Some(text) = executor.backend_mut().text_mut() {
+            text.seal();
+        }
+        self.workspaces.seal();
         let choices: i64 = self
             .interface
             .kernel_choices
@@ -698,6 +753,33 @@ fn allocate_storage(
     };
     let transports = Transports::new(&kinds, capacity, Arc::clone(&events), &options)?;
 
+    // Products: scheduler-placed buffers in the buffer pool and scalar relay
+    // lanes, one per request slot and unresolved call.
+    let devices: Vec<StorageDevice> = config
+        .devices()
+        .map(|name| {
+            let device =
+                Device::parse(name, "device").map_err(|error| Error::Invalid(error.to_string()))?;
+            Ok(match device {
+                Device::Cuda(index) => StorageDevice::Cuda(index),
+                Device::Cpu => StorageDevice::Cpu,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let physical = plan.physical_buffer_pool_bytes.max(1);
+    let buffer_pool =
+        BufferPool::allocate(physical, physical < plan.info.buffer_pool_bytes, &devices)?;
+    let tensors = TensorStore::new(
+        plan.arena.tensor_store,
+        plan.arena.device_product_bytes.max(1) as usize,
+        plan.info.encoder_entry_bytes.max(1) as usize,
+        devices,
+        plan.info.request_slots as usize,
+        plan.info.max_unresolved_calls as usize + 1,
+        buffer_pool,
+        Arc::clone(&events),
+    )?;
+
     let device = config.primary_device().cuda_index();
     let preparation = device.and_then(|index| lanes.preparation(DeviceId(index)));
     let kv = match (&plan.cache, &plan.info.kv_cache) {
@@ -729,7 +811,13 @@ fn allocate_storage(
             .transpose()?,
         None => None,
     };
-    Ok(RankStorage::new(events, transports, kv, release_stream))
+    Ok(RankStorage::new(
+        events,
+        tensors,
+        transports,
+        kv,
+        release_stream,
+    ))
 }
 
 /// Block-table width that holds the longest admitted sequence in every
@@ -945,11 +1033,35 @@ fn plan(
             unit_columns,
         )?;
         layout.reserve(&config.device, fixed);
+        // The text runners' columns and the slot continuation state.
+        layout.reserve(
+            &config.device,
+            reserved_bytes(
+                config,
+                layout.info().request_slots as usize,
+                &cache,
+                facts,
+                unit_columns,
+            )?,
+        );
         let columns = KVCache::import_workers(import_capacity) + unit_columns;
         layout.fit_cache(&cache, 8 * columns as u64, config, total, &world.host)?;
         Some(Arc::new(cache))
     } else {
         None
     };
-    Ok(layout.finish(config, cache))
+    let mut plan = layout.finish(config, cache);
+    if let (Some(cache), Some(info)) = (&plan.cache, &plan.info.kv_cache) {
+        // Batches never exceed the largest captured graph bucket.
+        let bounds = TextBounds::new(
+            config,
+            plan.info.request_slots as usize,
+            cache,
+            Some(info.num_units),
+            device.is_cuda(),
+        )?;
+        let (prefill, decode) = bounds.graph_calls();
+        plan.bound_graph_calls(prefill, decode);
+    }
+    Ok(plan)
 }

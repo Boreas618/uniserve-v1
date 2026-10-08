@@ -7,6 +7,7 @@ pub(crate) mod encoder;
 mod graph_shapes;
 mod graph_storage;
 pub(crate) mod graphs;
+pub(crate) mod text;
 pub(crate) mod vision;
 
 pub use graph_shapes::{PrefillShape, TextShapes, prefill_shapes, prefill_units};
