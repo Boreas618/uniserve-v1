@@ -322,22 +322,27 @@ impl Worker {
             preparation,
         })
         .map_err(phase("bind"))?;
-        let image = ImageRuntime::start(ImageStartup {
-            interface: &interface,
-            config: &config,
-            request_slots: info.request_slots as usize,
-            queue_depth: launch.ipc.queue_depth,
-            host_capacity: info.host_lane_capacity as usize,
-            model: &model,
-            lanes: &lanes,
-            storage: &storage,
-            latent: plan.latent,
-            components: &mut components,
-            workspaces: &mut workspaces,
-            graphs: &mut graphs,
-            preparation,
-        })
-        .map_err(phase("bind"))?;
+        // A video model's encoders and denoiser run in the video runtime.
+        let image = if video.is_some() {
+            None
+        } else {
+            ImageRuntime::start(ImageStartup {
+                interface: &interface,
+                config: &config,
+                request_slots: info.request_slots as usize,
+                queue_depth: launch.ipc.queue_depth,
+                host_capacity: info.host_lane_capacity as usize,
+                model: &model,
+                lanes: &lanes,
+                storage: &storage,
+                latent: plan.latent,
+                components: &mut components,
+                workspaces: &mut workspaces,
+                graphs: &mut graphs,
+                preparation,
+            })
+            .map_err(phase("bind"))?
+        };
         let canvas = CanvasRuntime::start(CanvasStartup {
             interface: &interface,
             config: &config,
