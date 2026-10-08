@@ -103,6 +103,10 @@ pub trait Backing: Send + Sync + 'static {
     /// otherwise.
     fn address(&self) -> u64;
     fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[repr(C)]
@@ -196,7 +200,9 @@ pub fn export(
         Any::from_raw_ffi_any(tvm_ffi::TVMFFIAny {
             type_index: tvm_ffi::TypeIndex::kTVMFFITensor as i32,
             small_str_len: 0,
-            data_union: std::mem::transmute::<u64, _>(handle as u64),
+            data_union: std::mem::transmute::<u64, tvm_ffi::tvm_ffi_sys::TVMFFIAnyDataUnion>(
+                handle as u64,
+            ),
         })
     };
     Tensor::try_from(any).map_err(|error| Error::numerical("tensor export", &error))
@@ -220,7 +226,9 @@ fn check_bounds(
         return if offset <= len {
             Ok(())
         } else {
-            Err(Error::Invariant("an empty view starts past its backing".to_owned()))
+            Err(Error::Invariant(
+                "an empty view starts past its backing".to_owned(),
+            ))
         };
     }
     let last = shape

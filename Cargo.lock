@@ -9639,12 +9639,12 @@ dependencies = [
  "crossbeam-channel",
  "indexmap 2.14.0",
  "libc",
- "libloading 0.8.9",
  "nvtx",
  "rustix 1.1.4",
  "thiserror 2.0.18",
  "tvm-ffi",
  "uniserve-core",
+ "uniserve-cuda",
  "uniserve-ipc",
 ]
 

@@ -13,12 +13,12 @@ crate-type = ["rlib", "cdylib"]
 crossbeam-channel.workspace = true
 indexmap.workspace = true
 libc.workspace = true
-libloading.workspace = true
 nvtx.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
 tvm-ffi.workspace = true
 uniserve-core.workspace = true
+uniserve-cuda.workspace = true
 uniserve-ipc.workspace = true
 
 [lints]

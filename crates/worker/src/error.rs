@@ -5,8 +5,9 @@
 pub enum Error {
     #[error("{0}")]
     Transport(String),
-    #[error("{0}")]
-    Cuda(String),
+    /// A CUDA driver or NCCL call failed.
+    #[error(transparent)]
+    Cuda(#[from] uniserve_cuda::Error),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]

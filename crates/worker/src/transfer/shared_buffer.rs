@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use uniserve_core::SharedMemory;
+use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, HostRegistration, Stream};
 
-use crate::cuda::{self, DeviceGuard, Event, Stream};
 use crate::{Error, Result};
 
 pub const SHM_HEADER_BYTES: usize = 512;
@@ -90,6 +90,8 @@ impl Drop for SharedMapping {
 /// keeps the device stream alive through close and retains this buffer until
 /// all granted readers have acknowledged it.
 pub struct SharedBuffer {
+    // Declared before the mapping: the registration ends while it is mapped.
+    registration: Option<HostRegistration>,
     // Some tensor consumers retain only the exporter, not a Py_buffer lease.
     // Keep this reference even after close has unlinked the allocation.
     mapping: Arc<SharedMapping>,
@@ -102,30 +104,41 @@ pub struct SharedBuffer {
 }
 
 impl SharedBuffer {
-    pub fn new(
-        bytes: usize,
-        consumers: Vec<usize>,
-        device: Option<(i32, usize)>,
-    ) -> std::result::Result<Self, String> {
+    pub fn new(bytes: usize, consumers: Vec<usize>, device: Option<(i32, usize)>) -> Result<Self> {
         if consumers.iter().any(|slot| *slot >= ACK_SLOTS) {
-            return Err("shared buffer acknowledgment slot is out of range".into());
+            return Err(Error::Invalid(
+                "shared buffer acknowledgment slot is out of range".into(),
+            ));
         }
 
         let size = SHM_HEADER_BYTES
             .checked_add(bytes.max(1))
-            .ok_or("shared buffer is too large")?;
-        let (storage, file) = SharedMemory::create(size).map_err(|error| error.to_string())?;
-        let mapping = Arc::new(SharedMapping::new(&file, size).map_err(|error| error.to_string())?);
+            .ok_or_else(|| Error::Invalid("shared buffer is too large".into()))?;
+        let (storage, file) =
+            SharedMemory::create(size).map_err(|error| Error::Transport(error.to_string()))?;
+        let mapping = Arc::new(
+            SharedMapping::new(&file, size).map_err(|error| Error::Transport(error.to_string()))?,
+        );
 
         // Fresh POSIX storage is zero-filled: readiness is PENDING and all
         // reader slots are unclaimed before any locator can escape.
-        if let Some((device, _)) = device {
-            let _device = DeviceGuard::new(device)?;
-            // SAFETY: the mapping owns this full range through unregister.
-            unsafe { cuda::register_host(mapping.address(), mapping.size())? };
-        }
+        let registration = match device {
+            Some((device, _)) => {
+                // SAFETY: the mapping owns this full range. Close unregisters
+                // it before releasing the storage; a failed close retains both.
+                Some(unsafe {
+                    HostRegistration::new(
+                        DeviceId(device),
+                        mapping.address() as *mut u8,
+                        mapping.size(),
+                    )
+                }?)
+            }
+            None => None,
+        };
 
         Ok(Self {
+            registration,
             mapping,
             storage: Some(storage),
             consumers,
@@ -136,16 +149,16 @@ impl SharedBuffer {
         })
     }
 
-    pub fn mapping(&self) -> std::result::Result<Arc<SharedMapping>, String> {
+    pub fn mapping(&self) -> Result<Arc<SharedMapping>> {
         self.name()?;
         Ok(Arc::clone(&self.mapping))
     }
 
-    pub fn name(&self) -> std::result::Result<&str, String> {
+    pub fn name(&self) -> Result<&str> {
         self.storage
             .as_ref()
             .map(SharedMemory::name)
-            .ok_or_else(|| "shared buffer is closed".into())
+            .ok_or(Error::State("shared buffer is closed"))
     }
 
     pub fn nbytes(&self) -> usize {
@@ -161,17 +174,19 @@ impl SharedBuffer {
     /// memory; it neither enters Python nor calls CUDA.
     /// The caller submits exactly one copy sequence per buffer and must not
     /// modify its payload after announcing readiness.
-    pub fn mark_ready(&mut self) -> std::result::Result<(), String> {
+    pub fn mark_ready(&mut self) -> Result<()> {
         let mapping = self.mapping()?;
 
         if let Some((device, stream)) = self.device {
+            let device = DeviceId(device);
+            // A default-stream handle resolves against the current context.
             let _device = DeviceGuard::new(device)?;
-            cuda::launch(stream, move || {
-                mapping.word(0).store(READY, Ordering::Release)
-            })?;
+            // SAFETY: the caller keeps the producer stream alive through close.
+            let stream = unsafe { Stream::borrowed(device, stream) }?;
+            stream.launch_host_fn(move || mapping.word(0).store(READY, Ordering::Release))?;
 
-            let completion = Event::new(device, false, false);
-            completion.record(stream)?;
+            let completion = Event::new(EventFlags::default());
+            completion.record(&stream)?;
             self.completion = Some(completion);
             Ok(())
         } else {
@@ -200,33 +215,34 @@ impl SharedBuffer {
 
     /// Shutdown and failed submission must finish DMA even if readiness was
     /// never scheduled. Normal retirement observes READY and does not wait.
-    pub fn synchronize(&self) -> std::result::Result<(), String> {
+    pub fn synchronize(&self) -> Result<()> {
         if self.submitted
             && let Some((device, stream)) = self.device
             && self.mapping.word(0).load(Ordering::Acquire) == PENDING
         {
-            let _device = DeviceGuard::new(device)?;
             if let Some(completion) = &self.completion {
-                completion.wait()?;
+                completion.synchronize()?;
             } else {
                 // Submission failed before its completion event was recorded.
-                Stream::borrowed(stream).wait()?;
+                let device = DeviceId(device);
+                let _device = DeviceGuard::new(device)?;
+                // SAFETY: the caller keeps the producer stream alive through close.
+                unsafe { Stream::borrowed(device, stream) }?.synchronize()?;
             }
         }
 
         Ok(())
     }
 
-    pub fn close(&mut self) -> std::result::Result<(), String> {
+    pub fn close(&mut self) -> Result<()> {
         if self.storage.is_none() {
             return Ok(());
         }
 
         self.synchronize()?;
-        if let Some((device, _)) = self.device {
-            let _device = DeviceGuard::new(device)?;
-            // SAFETY: producer DMA has stopped and the mapping is still live.
-            unsafe { cuda::unregister_host(self.mapping.address())? };
+        if let Some(registration) = self.registration.take() {
+            // Producer DMA has stopped and the mapping is still live.
+            registration.unregister()?;
         }
 
         self.device = None;
@@ -242,6 +258,7 @@ impl Drop for SharedBuffer {
     )]
     fn drop(&mut self) {
         if self.close().is_err() {
+            std::mem::forget(self.registration.take());
             std::mem::forget(Arc::clone(&self.mapping));
             std::mem::forget(self.storage.take());
         }

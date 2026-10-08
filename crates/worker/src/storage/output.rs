@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use uniserve_core::TokenLogprob;
 
-use crate::cuda::{DeviceGuard, Event};
+use uniserve_cuda::{DeviceGuard, DeviceId, Event};
+
 use crate::{Error, EventPool, Result};
 
 mod logprobs;
@@ -323,7 +324,7 @@ impl<A> OutputBuffer<A> {
         }
 
         for event in self.fences() {
-            if !event.ready().map_err(Error::Cuda)? {
+            if !event.query()? {
                 return Ok(None);
             }
         }
@@ -410,13 +411,10 @@ impl<A> OutputBuffer<A> {
                 {
                     // CUDA reports milliseconds; output statistics use microseconds.
                     device = device.max(
-                        (start.elapsed_time(producer).map_err(Error::Cuda)? as f64 * 1000.0)
-                            .round_ties_even() as u64,
+                        (start.elapsed_ms(producer)? as f64 * 1000.0).round_ties_even() as u64,
                     );
-                    copy = copy.max(
-                        (producer.elapsed_time(end).map_err(Error::Cuda)? as f64 * 1000.0)
-                            .round_ties_even() as u64,
-                    );
+                    copy = copy
+                        .max((producer.elapsed_ms(end)? as f64 * 1000.0).round_ties_even() as u64);
                 }
             }
         }
@@ -443,7 +441,7 @@ fn record<O>(
 ) -> Result<Arc<Event>> {
     // Default-stream handles do not identify a device. Select its context
     // before the driver resolves that stream and records the fence.
-    let _device = DeviceGuard::new(device).map_err(Error::Cuda)?;
+    let _device = DeviceGuard::new(DeviceId(device))?;
     let event = pool.acquire(device, timing, false)?;
     pool.retain(&event, device, 1)?;
     pool.record(&event, device, stream)?;

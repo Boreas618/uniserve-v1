@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use indexmap::IndexMap;
+use uniserve_cuda::{CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, SourceOrder, Stream};
 
-use crate::cuda::{CopyBatch, DeviceGuard, Event, Stream};
 use crate::{Error, Result};
 
 #[derive(Default)]
@@ -27,7 +27,7 @@ struct State<T> {
 /// views. Calls serialize on their execution stream. External events protect
 /// both copy-before-read and read-before-overwrite across CUDA graph segments.
 pub struct WeightPrefetch<T> {
-    device: i32,
+    device: DeviceId,
     layers: HashMap<usize, usize>,
     copies: Vec<CopyBatch>,
     stream: Stream,
@@ -51,17 +51,24 @@ impl<T> WeightPrefetch<T> {
             ));
         }
 
+        let external = || {
+            Event::new(EventFlags {
+                external: true,
+                ..EventFlags::default()
+            })
+        };
+
         Ok(Self {
-            device,
+            device: DeviceId(device),
             layers: layers
                 .into_iter()
                 .enumerate()
                 .map(|(i, layer)| (layer, i))
                 .collect(),
             copies: copies.into_iter().map(plan).collect(),
-            stream: Stream::new(device).map_err(Error::Cuda)?,
-            ready: std::array::from_fn(|_| Event::external(device)),
-            consumed: std::array::from_fn(|_| Event::external(device)),
+            stream: Stream::new(DeviceId(device))?,
+            ready: std::array::from_fn(|_| external()),
+            consumed: std::array::from_fn(|_| external()),
             state: Mutex::new(State {
                 backing: Some(backing),
                 calls: Vec::new(),
@@ -72,6 +79,13 @@ impl<T> WeightPrefetch<T> {
 
     fn state(&self) -> MutexGuard<'_, State<T>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Borrows the caller's compute stream for one operation.
+    fn compute(&self, handle: usize) -> Result<Stream> {
+        // SAFETY: expert calls submit on a live compute stream of this device,
+        // which the caller keeps alive through the call.
+        Ok(unsafe { Stream::borrowed(self.device, handle) }?)
     }
 
     pub fn contains(&self, module: usize) -> bool {
@@ -103,7 +117,7 @@ impl<T> WeightPrefetch<T> {
             .ok_or(Error::State("DWDP expert call requires an active context"))?
             .last;
         if let Some(last) = last {
-            self.ready[last % 2].wait_on(compute).map_err(Error::Cuda)?;
+            self.compute(compute)?.wait_event(&self.ready[last % 2])?;
         }
         Ok(())
     }
@@ -128,10 +142,12 @@ impl<T> WeightPrefetch<T> {
             (started, call.queued)
         };
 
-        let _device = DeviceGuard::new(self.device).map_err(Error::Cuda)?;
+        // A default-stream handle resolves against the current context.
+        let _device = DeviceGuard::new(self.device)?;
+        let compute = self.compute(compute)?;
         if !started {
             for event in &self.consumed {
-                event.record(compute).map_err(Error::Cuda)?;
+                event.record(&compute)?;
             }
         }
 
@@ -141,9 +157,7 @@ impl<T> WeightPrefetch<T> {
             return Ok(Err(error));
         }
 
-        self.ready[index % 2]
-            .wait_on(compute)
-            .map_err(Error::Cuda)?;
+        compute.wait_event(&self.ready[index % 2])?;
 
         let next = (index + 1 < self.copies.len()).then_some(index + 1);
         self.state()
@@ -174,9 +188,8 @@ impl<T> WeightPrefetch<T> {
 
     pub fn after(&self, module: usize, compute: usize) -> Result<()> {
         let index = self.index(module)?;
-        self.consumed[index % 2]
-            .record(compute)
-            .map_err(Error::Cuda)
+        self.consumed[index % 2].record(&self.compute(compute)?)?;
+        Ok(())
     }
 
     /// Replay a recorded peer read, preserving the same two-slot dependencies
@@ -190,13 +203,12 @@ impl<T> WeightPrefetch<T> {
             .copies
             .get(index)
             .ok_or_else(|| Error::Invalid("expert layer is outside the copy plan".into()))?;
-        let _device = DeviceGuard::new(self.device).map_err(Error::Cuda)?;
-        let stream = self.stream.handle();
-        self.consumed[index % 2]
-            .wait_on(stream)
-            .map_err(Error::Cuda)?;
-        copy.copy_on(stream).map_err(Error::Cuda)?;
-        self.ready[index % 2].record(stream).map_err(Error::Cuda)
+        self.stream.wait_event(&self.consumed[index % 2])?;
+        // SAFETY: `backing` retains every source mapping and destination view
+        // until close drains this stream.
+        unsafe { copy.submit(&self.stream) }?;
+        self.ready[index % 2].record(&self.stream)?;
+        Ok(())
     }
 
     /// The caller retires numerical readers first. Drain the copy stream and
@@ -212,7 +224,7 @@ impl<T> WeightPrefetch<T> {
         state.closed = true;
         drop(state);
 
-        self.stream.wait().map_err(Error::Cuda)?;
+        self.stream.synchronize()?;
         Ok(self.state().backing.take())
     }
 
@@ -252,9 +264,11 @@ fn plan(copies: Vec<(usize, usize, usize, usize)>) -> CopyBatch {
     }
 
     let rounds = peers.values().map(Vec::len).max().unwrap_or(0);
-    CopyBatch::new((0..rounds).flat_map(|round| {
-        peers
-            .values()
-            .filter_map(move |peer| peer.get(round).copied())
-    }))
+    let mut batch = CopyBatch::new(SourceOrder::Stream);
+    for round in 0..rounds {
+        for &(destination, source, bytes) in peers.values().filter_map(|peer| peer.get(round)) {
+            batch.push(destination as u64, source as u64, bytes);
+        }
+    }
+    batch
 }

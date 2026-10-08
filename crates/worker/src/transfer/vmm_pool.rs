@@ -3,7 +3,11 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use crate::cuda::{self, CopyBatch, DeviceGuard, Event, PinnedBuffer, Stream};
+use uniserve_cuda::{
+    CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream,
+    memset_d32,
+};
+
 use crate::{DescriptorGrants, Error, Result};
 
 pub const ACK_SLOTS: usize = 64;
@@ -46,7 +50,7 @@ impl Drop for Allocation {
 /// completed snapshot and never waits for device work on the host.
 pub struct VmmPool<B> {
     backing: Option<B>,
-    device: i32,
+    device: DeviceId,
     address: usize,
     capacity: usize,
     watermark: usize,
@@ -70,14 +74,14 @@ impl<B> VmmPool<B> {
     pub unsafe fn new(backing: B, device: i32, address: usize, capacity: usize) -> Result<Self> {
         Ok(Self {
             backing: Some(backing),
-            device,
+            device: DeviceId(device),
             address,
             capacity,
             watermark: 0,
             allocations: BTreeMap::new(),
             initializers: HashSet::new(),
-            stream: Stream::new(device).map_err(Error::Cuda)?,
-            completion: Event::new(device, false, false),
+            stream: Stream::new(DeviceId(device))?,
+            completion: Event::new(EventFlags::default()),
             observed: Vec::new(),
             readback: Vec::new(),
             readback_slot: 0,
@@ -130,14 +134,19 @@ impl<B> VmmPool<B> {
             },
         );
 
-        let _device = DeviceGuard::new(self.device).map_err(Error::Cuda)?;
+        // A default-stream handle resolves against the current context.
+        let _device = DeviceGuard::new(self.device)?;
         self.initializers.insert(stream);
-        // SAFETY: this reservation owns all 64 aligned header words. Later
-        // payload copies and the export's readiness event use this same stream.
-        if let Err(error) = unsafe { cuda::fill_words(self.address + offset, 0, ACK_SLOTS, stream) }
-        {
+        let device = self.device;
+        let header = (self.address + offset) as u64;
+        // SAFETY: producer streams stay valid through close (see new). This
+        // reservation owns all 64 aligned header words. Later payload copies
+        // and the export's readiness event use this same stream.
+        let filled = unsafe { Stream::borrowed(device, stream) }
+            .and_then(|stream| unsafe { memset_d32(header, 0, ACK_SLOTS, &stream) });
+        if let Err(error) = filled {
             self.failed = true;
-            return Err(Error::Cuda(error));
+            return Err(error.into());
         }
         Ok(Some(chunk))
     }
@@ -207,7 +216,7 @@ impl<B> VmmPool<B> {
             return Ok(());
         }
 
-        if readers == 0 && producer.ready().map_err(Error::Cuda)? {
+        if readers == 0 && producer.query()? {
             if let Some((grants, export)) = grant {
                 grants.release(&export);
             }
@@ -218,10 +227,7 @@ impl<B> VmmPool<B> {
         // Enqueue this dependency now, before the event pool can reuse the
         // producer event. A later snapshot must not observe the header before
         // its initialization or outlive the producer's final payload write.
-        let _device = DeviceGuard::new(self.device).map_err(Error::Cuda)?;
-        producer
-            .wait_on(self.stream.handle())
-            .map_err(Error::Cuda)?;
+        self.stream.wait_event(producer)?;
         allocation.readers = Some(readers);
         allocation.grant = grant;
         Ok(())
@@ -251,9 +257,8 @@ impl<B> VmmPool<B> {
         reason = "each snapshot retains its retired ranges and pinned destination"
     )]
     fn poll(&mut self) -> Result<()> {
-        let _device = DeviceGuard::new(self.device).map_err(Error::Cuda)?;
         if !self.observed.is_empty() {
-            if !self.completion.ready().map_err(Error::Cuda)? {
+            if !self.completion.query()? {
                 return Ok(());
             }
             let mut index = 0;
@@ -264,7 +269,7 @@ impl<B> VmmPool<B> {
                     self.remove(offset);
                     continue;
                 }
-                let address = self.readback[self.readback_slot].address();
+                let address = self.readback[self.readback_slot].address() as usize;
                 // SAFETY: the completed snapshot contains this chunk's full
                 // header, and no DMA writes this pinned allocation until the
                 // next snapshot is submitted below.
@@ -308,31 +313,33 @@ impl<B> VmmPool<B> {
             self.readback_slot = match self
                 .readback
                 .iter()
-                .position(|buffer| buffer.size() >= bytes)
+                .position(|buffer| buffer.len() >= bytes)
             {
                 Some(slot) => slot,
                 None => {
                     self.readback
-                        .push(PinnedBuffer::new(bytes.next_power_of_two()).map_err(Error::Cuda)?);
+                        .push(PinnedBuffer::new(self.device, bytes.next_power_of_two())?);
                     self.readback.len() - 1
                 }
             };
             self.readback[self.readback_slot].address()
         };
-        let copies = CopyBatch::new(watched.iter().enumerate().map(|(index, offset)| {
-            (
-                destination + index * HEADER_BYTES,
-                self.address + offset,
+        let mut copies = CopyBatch::new(SourceOrder::Stream);
+        for (index, offset) in watched.iter().enumerate() {
+            copies.push(
+                destination + (index * HEADER_BYTES) as u64,
+                (self.address + offset) as u64,
                 HEADER_BYTES,
-            )
-        }));
+            );
+        }
         // Retain the observed ranges even if a copy or fence submission fails.
         // Shutdown drains this stream before either mapping can be destroyed.
         self.observed = observed;
-        copies.copy_on(self.stream.handle()).map_err(Error::Cuda)?;
-        self.completion
-            .record(self.stream.handle())
-            .map_err(Error::Cuda)
+        // SAFETY: the observed headers stay mapped and the pinned destination
+        // stays allocated until the completion event below has been observed.
+        unsafe { copies.submit(&self.stream) }?;
+        self.completion.record(&self.stream)?;
+        Ok(())
     }
 
     fn remove(&mut self, offset: usize) {
@@ -348,12 +355,14 @@ impl<B> VmmPool<B> {
         if self.backing.is_none() {
             return Ok(None);
         }
-        let _device = DeviceGuard::new(self.device).map_err(Error::Cuda)?;
+        // A default-stream initializer resolves against the current context.
+        let _device = DeviceGuard::new(self.device)?;
         for &stream in &self.initializers {
-            Stream::borrowed(stream).wait().map_err(Error::Cuda)?;
+            // SAFETY: producer streams stay valid through close (see new).
+            unsafe { Stream::borrowed(self.device, stream) }?.synchronize()?;
         }
         self.initializers.clear();
-        self.stream.wait().map_err(Error::Cuda)?;
+        self.stream.synchronize()?;
         self.observed.clear();
         self.readback.clear();
         self.allocations.clear();

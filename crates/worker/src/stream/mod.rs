@@ -6,15 +6,18 @@ pub use events::EventPool;
 
 use std::sync::Arc;
 
-use crate::cuda::{DeviceGuard, Event, Stream};
+use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
+
+use crate::{Error, Result};
 
 /// An execution stream, its SM allocation and bounded submission fences.
 ///
 /// Callers serialize context use across streams sharing an SM partition.
-/// Output fences may be borrowed until their ring slot is reused; forks
-/// independently retain an owned SM partition.
+/// Output fences may be borrowed until their ring slot is reused; each fence
+/// retains the context (primary or SM partition) it was recorded in, so it
+/// may outlive this stream. Forks independently retain an owned SM partition.
 pub struct CUDAStream {
-    device: i32,
+    device: DeviceId,
     stream: Option<Stream>,
     sm_count: u32,
     partitioned: bool,
@@ -24,46 +27,64 @@ pub struct CUDAStream {
 }
 
 impl CUDAStream {
-    fn new(device: i32, stream: Stream, event_slots: usize) -> Result<Self, String> {
+    fn new(device: DeviceId, stream: Stream, event_slots: usize) -> Result<Self> {
         if event_slots == 0 {
-            return Err("CUDA stream requires a positive event bound".into());
+            return Err(Error::Invalid(
+                "CUDA stream requires a positive event bound".into(),
+            ));
         }
 
         let sm_count = stream.sm_count()?;
-        let partitioned = stream.partitioned()?;
-        let outputs = (0..event_slots)
-            .map(|_| Arc::new(stream.event(device)))
-            .collect();
+        let partitioned = stream.is_partitioned()?;
+        let fences = || {
+            (0..event_slots)
+                .map(|_| Arc::new(Event::new(EventFlags::default())))
+                .collect()
+        };
 
         Ok(Self {
             device,
             stream: Some(stream),
             sm_count,
             partitioned,
-            ingress: (0..event_slots)
-                .map(|_| Arc::new(Event::new(device, false, false)))
-                .collect(),
-            outputs,
+            ingress: fences(),
+            outputs: fences(),
             cursor: 0,
         })
     }
 
     /// Borrow an existing numerical stream; its creator retains the handle.
-    pub fn borrowed(device: i32, handle: usize, event_slots: usize) -> Result<Self, String> {
+    ///
+    /// # Safety
+    /// `handle` is a live stream on `device`. Its creator keeps the stream and
+    /// its context alive while this value, its forks and its fences are used.
+    pub unsafe fn borrowed(device: DeviceId, handle: usize, event_slots: usize) -> Result<Self> {
+        // The legacy default stream (handle 0) names no context of its own;
+        // the driver resolves it against the calling thread's current context.
         let _device = DeviceGuard::new(device)?;
-        Self::new(device, Stream::borrowed(handle), event_slots)
+        // SAFETY: forwarded from the caller.
+        let stream = unsafe { Stream::borrowed(device, handle) }?;
+        Self::new(device, stream, event_slots)
     }
 
     /// Own an independent stream in the origin's borrowed CUDA context.
-    pub fn sibling(device: i32, origin: usize, event_slots: usize) -> Result<Self, String> {
+    ///
+    /// # Safety
+    /// `origin` is a live stream on `device` whose creator keeps its context
+    /// (or SM partition) alive while the returned stream is used.
+    pub unsafe fn sibling(device: DeviceId, origin: usize, event_slots: usize) -> Result<Self> {
         let _device = DeviceGuard::new(device)?;
-        Self::new(device, Stream::sibling(origin)?, event_slots)
+        // SAFETY: forwarded from the caller.
+        let origin = unsafe { Stream::borrowed(device, origin) }?;
+        Self::new(device, origin.fork()?, event_slots)
     }
 
     /// Allocate the configured SM partitions from one disjoint split tree.
-    pub fn partition(device: i32, counts: &[u32], slots: &[usize]) -> Result<Vec<Self>, String> {
+    pub fn partition(device: DeviceId, counts: &[u32], slots: &[usize]) -> Result<Vec<Self>> {
         if counts.len() != slots.len() || slots.contains(&0) {
-            return Err("each CUDA stream requires a positive event-slot count".into());
+            return Err(Error::Invalid(
+                "each CUDA stream requires a positive event-slot count".into(),
+            ));
         }
 
         Stream::partition(device, counts)?
@@ -73,12 +94,11 @@ impl CUDAStream {
             .collect()
     }
 
-    pub fn fork(&self) -> Result<Self, String> {
-        let _device = DeviceGuard::new(self.device)?;
+    pub fn fork(&self) -> Result<Self> {
         Self::new(self.device, self.stream()?.fork()?, self.ingress.len())
     }
 
-    pub fn device(&self) -> i32 {
+    pub fn device(&self) -> DeviceId {
         self.device
     }
 
@@ -94,53 +114,55 @@ impl CUDAStream {
         self.stream.is_none()
     }
 
-    pub fn handle(&self) -> Result<usize, String> {
-        Ok(self.stream()?.handle())
+    pub fn handle(&self) -> Result<usize> {
+        Ok(self.stream()?.raw())
     }
 
-    fn stream(&self) -> Result<&Stream, String> {
+    pub fn stream(&self) -> Result<&Stream> {
         self.stream
             .as_ref()
-            .ok_or_else(|| "CUDA stream is closed".into())
+            .ok_or(Error::State("CUDA stream is closed"))
     }
 
     /// Enqueue a device dependency without waiting for the producer on the host.
-    pub fn wait(&self, producer: usize) -> Result<(), String> {
-        let stream = self.handle()?;
-        if stream == producer {
+    pub fn wait(&self, producer: &Stream) -> Result<()> {
+        let stream = self.stream()?;
+        if stream.raw() == producer.raw() {
             return Ok(());
         }
 
+        // A default-stream producer records in the thread's current context.
         let _device = DeviceGuard::new(self.device)?;
         let event = &self.ingress[self.cursor];
         event.record(producer)?;
-        event.wait_on(stream)
+        stream.wait_event(event)?;
+        Ok(())
     }
 
     /// Fence one submission for later joins, preserving independent lane overlap.
     /// Consumers enqueue their waits before this ring slot is reused.
-    pub fn record(&mut self, consumer: usize) -> Result<Option<Arc<Event>>, String> {
-        let stream = self.handle()?;
-        if stream == consumer {
+    pub fn record(&mut self, consumer: usize) -> Result<Option<Arc<Event>>> {
+        let stream = self.stream()?;
+        if stream.raw() == consumer {
             return Ok(None);
         }
 
-        let _device = DeviceGuard::new(self.device)?;
         let event = &self.outputs[self.cursor];
         event.record(stream)?;
+        let event = Arc::clone(event);
         self.cursor = (self.cursor + 1) % self.outputs.len();
-        Ok(Some(Arc::clone(event)))
+        Ok(Some(event))
     }
 
-    pub fn synchronize(&self) -> Result<(), String> {
-        let _device = DeviceGuard::new(self.device)?;
-        self.stream()?.wait()
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream()?.synchronize()?;
+        Ok(())
     }
 
     /// Drain submitted work before releasing the stream and its SM partition.
     /// Failed collective execution retains resources until process exit.
     #[allow(clippy::mem_forget)]
-    pub fn close(&mut self, aborted: bool) -> Result<(), String> {
+    pub fn close(&mut self, aborted: bool) -> Result<()> {
         if aborted {
             std::mem::forget(self.stream.take());
             std::mem::forget(std::mem::take(&mut self.ingress));
@@ -149,8 +171,7 @@ impl CUDAStream {
         }
 
         if let Some(stream) = &self.stream {
-            let _device = DeviceGuard::new(self.device)?;
-            stream.wait()?;
+            stream.synchronize()?;
         }
 
         self.ingress.clear();

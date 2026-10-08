@@ -1,6 +1,7 @@
 //! Host input buffers retained until their asynchronous copies complete.
 
-use crate::cuda::{DeviceGuard, Event};
+use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
+
 use crate::{Error, Result};
 
 /// A fixed ring of host copy sources.
@@ -23,9 +24,9 @@ impl<T> HostBuffers<T> {
         }
 
         let events = match device {
-            Some(device) => buffers
+            Some(_) => buffers
                 .iter()
-                .map(|_| Event::new(device, false, false))
+                .map(|_| Event::new(EventFlags::default()))
                 .collect(),
             None => Vec::new(),
         };
@@ -54,9 +55,9 @@ impl<T> HostBuffers<T> {
 
         let slot = self.cursor;
         if let Some(event) = self.events.get(slot)
-            && !event.ready().map_err(Error::Cuda)?
+            && !event.query()?
         {
-            event.wait().map_err(Error::Cuda)?;
+            event.synchronize()?;
         }
 
         self.cursor = (slot + 1) % self.buffers.len();
@@ -78,7 +79,13 @@ impl<T> HostBuffers<T> {
             .get(slot)
             .ok_or_else(|| Error::Invalid("host buffer slot is outside its ring".into()))?;
 
-        let result = DeviceGuard::new(device).and_then(|_device| event.record(stream));
+        // A default-stream handle resolves against the current context.
+        let result = DeviceGuard::new(DeviceId(device)).and_then(|_device| {
+            // SAFETY: the numerical backend submitted the copy on this live
+            // stream of `device`; it is borrowed only for this record.
+            let stream = unsafe { Stream::borrowed(DeviceId(device), stream) }?;
+            event.record(&stream)
+        });
         if result.is_err() {
             // The copy was submitted before this fence. If recording fails,
             // its sources must neither be reused nor released as completed.
@@ -94,8 +101,8 @@ impl<T> HostBuffers<T> {
     /// foreign tensor destructor can call back into the runtime.
     pub fn close(&mut self) -> Result<Vec<T>> {
         for event in &self.events {
-            if !event.ready().map_err(Error::Cuda)? {
-                event.wait().map_err(Error::Cuda)?;
+            if !event.query()? {
+                event.synchronize()?;
             }
         }
 
