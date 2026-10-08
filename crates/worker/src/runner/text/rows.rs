@@ -18,12 +18,14 @@ pub(crate) enum RowSource {
     /// One token, its position and the slot's verified KV length gathered on
     /// the device by the decode gather: a decode row of an all-indexed call.
     Indexed,
-    /// Host tokens with explicit rotary positions on every axis (temporal,
-    /// row, column): a vision block, or text of a prompt holding one, whose
-    /// positions do not follow from the token count.
+    /// Host tokens with explicit rotary positions (temporal, row, column):
+    /// a vision block, or text of a prompt holding one, whose positions do
+    /// not follow from the token count. Without `spatial`, only the
+    /// temporal axis is meaningful and the model reads one axis.
     Placed {
         tokens: Vec<u32>,
         positions: [Vec<i64>; 3],
+        spatial: bool,
     },
 }
 
@@ -58,7 +60,9 @@ impl TokenRow {
             RowSource::Host { tokens, .. } => tokens.len(),
             RowSource::Relay { drafts, .. } => drafts.len() + 1,
             RowSource::Resident | RowSource::Indexed => 1,
-            RowSource::Placed { tokens, positions } => {
+            RowSource::Placed {
+                tokens, positions, ..
+            } => {
                 if positions.iter().any(|axis| axis.len() != tokens.len()) {
                     return Err(Error::Invalid(
                         "placed row positions disagree with its tokens".into(),

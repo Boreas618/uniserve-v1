@@ -29,7 +29,7 @@ use crate::model::image::ROPE_ADVANCE;
 use crate::runner::TokenSelection;
 use crate::runner::diffusion::image::ConditionRow;
 use crate::runner::text::{RowSource, TokenRow};
-use crate::runner::vision::BlockPositions;
+use crate::runner::vision::{BlockPositions, PositionLayout};
 use crate::storage::memory::StorageView;
 use crate::storage::{BlockTables, Metadata, ProductRead, TensorStore};
 use crate::{Error, Result};
@@ -63,6 +63,22 @@ pub(super) struct Sources<'a> {
     pub(super) stream: Option<&'a Stream>,
     /// The request's admitted input images.
     pub(super) input_images: u32,
+}
+
+impl Sources<'_> {
+    /// Whether rows carry three rotary axes: models with an image denoiser
+    /// (whose sequences place latent images spatially) and models placing
+    /// vision features spatially. Others read one temporal axis.
+    fn spatial(&self) -> bool {
+        self.image.is_some_and(|image| {
+            image.facts().denoiser.is_some()
+                || image
+                    .facts()
+                    .processing
+                    .and_then(|processing| processing.injection)
+                    .is_some_and(|injection| injection.positions == PositionLayout::TemporalSpatial)
+        })
+    }
 }
 
 /// One consumed feature and its image dimensions.
@@ -115,6 +131,7 @@ fn text_row(
     prefix: u64,
     position: u64,
     selection: TokenSelection,
+    spatial: bool,
 ) -> Result<TokenRow> {
     let count = tokens.len();
     let start = position as i64;
@@ -127,6 +144,7 @@ fn text_row(
                 vec![0; count],
                 vec![0; count],
             ],
+            spatial,
         },
         prefix: narrow(prefix)?,
         query: narrow(count as u64)?,
@@ -203,7 +221,11 @@ fn vision_row(
     Ok((
         TokenRow {
             slot,
-            source: RowSource::Placed { tokens, positions },
+            source: RowSource::Placed {
+                tokens,
+                positions,
+                spatial: sources.spatial(),
+            },
             prefix: narrow(prefix)?,
             query: narrow(count as u64)?,
             selection,
@@ -254,7 +276,14 @@ pub(super) fn context(
             } else {
                 TokenSelection::Cache
             };
-            let row = text_row(slot, &tokens[begin..end], visible, position, selection)?;
+            let row = text_row(
+                slot,
+                &tokens[begin..end],
+                visible,
+                position,
+                selection,
+                sources.spatial(),
+            )?;
             position += (end - begin) as u64;
             visible += (end - begin) as u64;
             offset += row.query as usize;
@@ -379,6 +408,7 @@ pub(super) fn visual(
             source: RowSource::Placed {
                 tokens: vec![0; query as usize],
                 positions: layout.conditioning_positions(feature.height, feature.width, start)?,
+                spatial: true,
             },
             prefix: narrow(visible)?,
             query,
