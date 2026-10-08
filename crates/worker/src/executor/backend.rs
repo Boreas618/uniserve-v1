@@ -718,9 +718,13 @@ impl Backend for WorkerBackend {
             return Ok(());
         };
 
-        // Imported products become resident before the runtime consumes
-        // them like local ones.
-        forward::inputs::complete(self, batch)?;
+        // Imported values become resident before the runtime consumes them
+        // like local ones; an import that failed fails the batch's calls.
+        if let Err(error) = forward::inputs::complete(self, batch) {
+            forward::fail(self, batch, error, "input import")?;
+            self.release_predecessors(batch, true)?;
+            return Ok(());
+        }
 
         // Each executed batch with calls is one profiler step.
         let mut profiler = self.profiler.take();

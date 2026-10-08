@@ -5,7 +5,9 @@
 //!   product (local, or imported from another rank or worker before the
 //!   batch executed, see [`super::inputs`]) into its one output product and
 //!   publishes the copy through the rank's export mechanisms, so other
-//!   components, ranks and workers can import it ([`tensor`]).
+//!   components, ranks and workers can import it ([`tensor`]). A call with
+//!   a latent input and output publishes its request's committed trajectory
+//!   version from the latent pool instead ([`latents`]).
 //! - **KV export** (`TransferMode::KvExport`): each call publishes its
 //!   request's visible KV extent ([`kv`]). On a rank with an image runtime
 //!   the image runtime serves it as an image's conditioning in its own
@@ -37,9 +39,8 @@ use uniserve_ipc::{
 
 use super::super::backend::{WorkerBackend, WorkerBatch};
 use super::inputs::{Inputs, component_device};
-use super::launch::{Launched, error_code, failed_output};
+use super::launch::Launched;
 use crate::error::WorkerError;
-use crate::executor::BatchResult;
 use crate::executor::lifecycle::RequestStorage;
 use crate::ffi::Device;
 use crate::storage::OutputPool;
@@ -165,39 +166,20 @@ pub(crate) fn execute(
         return super::image::execute(backend, batch, kind);
     }
     let plan = Arc::clone(batch.shared_plan());
-    let predecessors = batch.predecessors().to_vec();
-    let failure = match run(backend, &plan, batch.inputs(), kind) {
+    match run(backend, &plan, batch.inputs(), kind) {
         Ok(launched) => {
             batch.launch(launched);
-            return Ok(());
+            Ok(())
         }
-        Err(failure) => failure,
-    };
-    let mut error = WorkerError::classify(failure.error, Some("transfer batch"));
-    if failure.committed {
-        // Products, KV directories and pending calls may already be
-        // visible; the rank cannot roll them back.
-        error.fatal = true;
+        Err(failure) if failure.committed => {
+            // Products, KV directories and pending calls may already be
+            // visible; the rank cannot roll them back.
+            let mut error = WorkerError::classify(failure.error, Some("transfer batch"));
+            error.fatal = true;
+            Err(error)
+        }
+        Err(failure) => super::fail(backend, batch, failure.error, "transfer batch"),
     }
-    if error.fatal {
-        return Err(error);
-    }
-    tracing::warn!(
-        target: "uniserve_worker.execution",
-        "transfer batch {} failed: {error}",
-        plan.batch_id
-    );
-    let output = failed_output(
-        backend.requests(),
-        &plan,
-        &predecessors,
-        error_code(error.code),
-    )?;
-    batch.complete(BatchResult {
-        output,
-        media: Vec::new(),
-    });
-    Ok(())
 }
 
 /// Reserve, transfer and commit one batch.
