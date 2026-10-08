@@ -1,9 +1,9 @@
 """Per-call-site preparation of numerical operators within an execution context.
 
 Each binding owns the prepared operators, plans and borrowed backing of one
-numerical layer. :class:`uniserve_models.runtime.ExecutionContext` creates bindings
-for the layers it prepares, publishes them to the layers' call scope and
-releases them.
+numerical layer. :class:`uniserve_models.bindings.context.ExecutionContext`
+creates bindings for the layers it prepares, publishes them to the layers'
+call scope and releases them.
 """
 
 import torch

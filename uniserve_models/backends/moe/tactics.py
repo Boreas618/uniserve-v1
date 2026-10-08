@@ -307,8 +307,8 @@ def measure(provider, module, tokens: int, args, generator) -> dict:
     the medians of the tactic and of the default per routing, and how many
     candidates ran, failed and mismatched the default's outputs.
     """
+    from uniserve_models.bindings.context import TensorBuffers
     from uniserve_models.model.inputs import TextSize
-    from uniserve_models.runtime.tensor_buffers import TensorBuffers
 
     device = module.up_gate.weight.device
     routings = {

@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from uniserve_models.bindings.context import ExecutionContext, Scratch
 from uniserve_models.cache import Config, mha
 from uniserve_models.model import TextSize
 from uniserve_models.nn import Linear, MergedColumnParallelLinear
@@ -21,13 +22,7 @@ from uniserve_models.nn.attention import (
     PagedInput,
 )
 from uniserve_models.quantization import Quantizer
-from uniserve_models.runtime import (
-    CUDAGraph,
-    CUDAStream,
-    ExecutionContext,
-    PrefixCache,
-    Scratch,
-)
+from uniserve_models.runtime import CUDAGraph, CUDAStream, PrefixCache
 from uniserve_models.tensors import BufferConfig
 
 pytestmark = pytest.mark.integration

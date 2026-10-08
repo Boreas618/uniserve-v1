@@ -65,10 +65,11 @@ def test_block_encoding_and_scale_repacking_preserve_native_values(format):
 @pytest.mark.parametrize("format", ["fp8", "mxfp8", "nvfp4"])
 @torch.inference_mode()
 def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
     from uniserve_models.nn import Linear
     from uniserve_models.nn.functional import linear
-    from uniserve_models.runtime import CUDAGraph, ExecutionContext
+    from uniserve_models.runtime import CUDAGraph
 
     x = torch.full((128, 256), 2.0, dtype=torch.bfloat16, device="cuda:0")
     weight = torch.ones((128, 256), dtype=torch.bfloat16, device="cuda:0")
@@ -107,9 +108,10 @@ def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
 def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
     format, branch_width
 ):
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
     from uniserve_models.nn import MergedColumnParallelLinear
-    from uniserve_models.runtime import CUDAGraph, ExecutionContext
+    from uniserve_models.runtime import CUDAGraph
 
     device = torch.device("cuda:0")
     generator = torch.Generator(device=device).manual_seed(718)

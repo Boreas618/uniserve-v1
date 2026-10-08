@@ -15,10 +15,9 @@ from torch.nn import functional as F
 from tests.python.fixtures.h3 import dmd_denoiser
 from tests.python.fixtures.vsa import reference_attention
 from uniserve_models import loading
+from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
 from uniserve_models.distributed import DeviceMesh
 from uniserve_models.loading import checkpoint, weights
-from uniserve_models.nn.attention import vsa
-from uniserve_models.runtime import CUDAGraph, ExecutionContext, TensorBuffers
 from uniserve_models.minimax_h3 import (
     AttentionInput,
     TilePacking,
@@ -31,6 +30,8 @@ from uniserve_models.minimax_h3.denoiser import (
     schedules,
 )
 from uniserve_models.minimax_h3.weights import transformer_component
+from uniserve_models.nn.attention import vsa
+from uniserve_models.runtime import CUDAGraph
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

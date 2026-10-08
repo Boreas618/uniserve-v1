@@ -27,22 +27,37 @@ each layer's view and the stacked allocation of each field are the
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import gcd
 from typing import Self
 
 import torch
 
+from uniserve_models.bindings.context import TensorBuffers
 from uniserve_models.cache import Config, State, mha
 from uniserve_models.cache.state import _blocks
 from uniserve_models.quantization import Quantizer
 from uniserve_models.tensors import BufferConfig
 
-from .device import async_tensor_h2d
-from .tensor_buffers import TensorBuffers
-
 _FIELDS = ("key", "value")
+
+
+def async_tensor_h2d(
+    values: Sequence[int], *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Copy host integers into a new tensor on ``device`` without a host wait.
+
+    On CUDA the values are written to pinned memory from PyTorch's caching
+    host allocator and copied non-blocking on the current stream. The
+    allocator reuses that pinned block only after the copy completes, so the
+    calling thread never waits for device work queued ahead of the copy, and
+    the result is ordered before every later operation on the stream. Other
+    devices receive an ordinary copy.
+    """
+    pinned = device.type == "cuda"
+    host = torch.tensor(values, dtype=dtype, pin_memory=pinned)
+    return host.to(device, non_blocking=pinned)
 
 
 @dataclass(frozen=True, slots=True)

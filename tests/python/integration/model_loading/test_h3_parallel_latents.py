@@ -12,20 +12,6 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from tests.python.fixtures.h3 import WIDE
-from uniserve_models.diffusion import DenoisingStep, normal_noise
-from uniserve_models.distributed import DeviceMesh, communication_axes
-from uniserve_models.model import LatentInput, TextSize
-from uniserve_models.nn.attention import (
-    AttentionParallelConfig,
-    ContextParallelConfig,
-    Ulysses,
-)
-from uniserve_models.runtime import (
-    CUDAGraph,
-    ExecutionContext,
-    TensorBuffers,
-    initialize_process_groups,
-)
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
 from uniserve_eval.types import (
     BenchmarkPoint,
@@ -35,6 +21,9 @@ from uniserve_eval.types import (
     VideoConfig,
 )
 from uniserve_models import catalog as models
+from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
+from uniserve_models.diffusion import DenoisingStep, normal_noise
+from uniserve_models.distributed import DeviceMesh, communication_axes
 from uniserve_models.minimax_h3 import (
     DenoiserInput,
     weight_config,
@@ -45,6 +34,13 @@ from uniserve_models.minimax_h3.packing import (
     unpatchify_video,
     video_latent_frames,
 )
+from uniserve_models.model import LatentInput, TextSize
+from uniserve_models.nn.attention import (
+    AttentionParallelConfig,
+    ContextParallelConfig,
+    Ulysses,
+)
+from uniserve_models.runtime import CUDAGraph, initialize_process_groups
 
 pytestmark = [
     pytest.mark.integration,

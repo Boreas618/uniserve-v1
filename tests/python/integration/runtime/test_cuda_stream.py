@@ -7,12 +7,8 @@ import pytest
 import torch
 
 from tests.python.fixtures.cuda_stream import blocked_stream
-from uniserve_models.runtime import (
-    CUDAGraph,
-    CUDAStream,
-    ExecutionContext,
-    partition_streams,
-)
+from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.runtime import CUDAGraph, CUDAStream, partition_streams
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
