@@ -2912,6 +2912,143 @@ fn a_converting_cache_installs_kv_another_worker_exported() -> anyhow::Result<()
     Ok(())
 }
 
+/// A real model's request continues on another worker from the KV it
+/// installed: the target's greedy continuation of a prompt equals the
+/// source's token for token, since the installed pages hold the source's
+/// bytes. `UNISERVE_KV_INSTALL_MODEL` names the checkpoint and
+/// `UNISERVE_KV_INSTALL_PROMPT` the prompt's token ids (a JSON list).
+#[test]
+#[ignore = "requires a CUDA device and the checkpoint UNISERVE_KV_INSTALL_MODEL names"]
+fn a_model_continues_greedily_from_installed_kv() -> anyhow::Result<()> {
+    use uniserve_engine::{WorkerExecutor, WorkerId};
+
+    let model = std::env::var("UNISERVE_KV_INSTALL_MODEL")?;
+    let prompt: Vec<u32> = serde_json::from_str(&std::env::var("UNISERVE_KV_INSTALL_PROMPT")?)?;
+    // Shared memory reaches the target on this host.
+    let edges = "source->target=shm";
+    let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
+        let mut args = single_rank_args(worker_id, QUEUE_DEPTH);
+        for rank in &mut args.ranks {
+            rank.device = "cuda:0".into();
+        }
+        // The model's own page size, attention selection and component.
+        args.stub = false;
+        args.model = model.clone();
+        args.block_size = None;
+        args.max_batch_tokens = 8192;
+        args.attention_backend = uniserve_ipc::AttentionBackend::Auto;
+        args.components = WorkerConfig::single_component("model", 1);
+        args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
+        WorkerGroup::spawn(args)
+    };
+    let mut executor = WorkerExecutor::try_new(
+        vec![
+            (WorkerId("source".into()), spawn("source")?),
+            (WorkerId("target".into()), spawn("target")?),
+        ],
+        uniserve_engine::TransferConfig::parse(edges)?,
+    )?;
+    let admission = text_admission(101, 1, 1)?;
+    let key = admission.request_key;
+    let n = prompt.len() as u32;
+    let prefill = token_batch(
+        1,
+        1,
+        key,
+        Some(admission.clone()),
+        CallId::new(1, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &prompt,
+        UnitId(1),
+        0,
+    );
+    let tables = prefill.block_tables.clone();
+    executor.submit(place(prefill, "source", Vec::new()))?;
+    let prefilled = poll_logical(&mut executor)?.context("source prefill did not complete")?;
+    let first = prefilled.results[0].output.committed_tokens[0];
+
+    let exported = uniserve_ipc::BufferId {
+        owner: key,
+        producer_call_id: CallId::new(2, 0),
+        output_index: 0,
+        generation: 2,
+    };
+    let mut export = Call::new(
+        key,
+        CallId::new(2, 0),
+        CallKind::Transfer(TransferMode::KvExport),
+    );
+    export.coordinates = coordinates_after(&prefilled.results[0].output);
+    export.kv_output = Some(exported);
+    export.bounds.max_transfer_bytes = 1 << 30;
+    let mut publish = Batch::new(2, Vec::new(), vec![export]);
+    publish.block_tables = tables;
+    executor.submit(place(publish, "source", Vec::new()))?;
+    let published = poll_logical(&mut executor)?.context("KV export did not complete")?;
+    assert_eq!(published.results[0].output.status, CallStatus::Ok);
+
+    let mut install = Call::new(
+        key,
+        CallId::new(3, 0),
+        CallKind::Transfer(TransferMode::KvInstall),
+    );
+    install.kv_input = Some(exported);
+    install.kv_output = Some(uniserve_ipc::BufferId {
+        owner: key,
+        producer_call_id: CallId::new(3, 0),
+        output_index: 0,
+        generation: 3,
+    });
+    install.bounds.max_transfer_bytes = 1 << 30;
+    let mut target = Batch::new(3, vec![admission], vec![install]);
+    target.block_tables = vec![BlockTable {
+        request_pool_idx: 1,
+        group_id: 0,
+        start_page: 0,
+        unit_ids: vec![UnitId(7)],
+        allocated_tokens: n,
+    }];
+    target.new_cache_units = vec![CacheUnitAllocation {
+        request_pool_idx: 1,
+        group_id: 0,
+        unit_ids: vec![UnitId(7)],
+    }];
+    executor.submit(place(target, "target", Vec::new()))?;
+    let installed = poll_logical(&mut executor)?.context("KV install did not complete")?;
+    assert_eq!(installed.results[0].output.status, CallStatus::Ok);
+
+    // Greedy continuations of the same prefix on both workers.
+    let mut tokens = std::collections::BTreeMap::new();
+    for (worker, unit, base) in [("source", 1, 10), ("target", 7, 20)] {
+        let mut token = first;
+        let mut sequence = Vec::new();
+        for step in 0..4_u32 {
+            let batch_id = u64::from(base + step);
+            let mut decode = token_batch(
+                batch_id,
+                batch_id,
+                key,
+                None,
+                CallId::new(batch_id, 0),
+                CallKind::Forward(ForwardMode::Decode),
+                &[token],
+                UnitId(unit),
+                n + step,
+            );
+            decode.calls[0].coordinates.logical_position = n + step;
+            executor.submit(place(decode, worker, Vec::new()))?;
+            let decoded = poll_logical(&mut executor)?.context("decode did not complete")?;
+            assert_eq!(decoded.results[0].output.status, CallStatus::Ok);
+            token = decoded.results[0].output.committed_tokens[0];
+            sequence.push(token);
+        }
+        tokens.insert(worker, sequence);
+    }
+    assert_eq!(tokens["source"], tokens["target"]);
+    executor.close()?;
+    Ok(())
+}
+
 /// Launch arguments of a one-rank stub worker on the first visible CUDA
 /// device, with a cache of `kv_cache_dtype` (the model's dtype by default)
 /// and the transfer `edges`.
@@ -3234,6 +3371,68 @@ fn media_rank() -> anyhow::Result<()> {
     }
 }
 
+/// An external input whose producer failed fails the calls that read it,
+/// as a completed batch, and the group keeps serving.
+#[test]
+fn a_failed_external_input_fails_the_calls_reading_it() -> anyhow::Result<()> {
+    let mut args = rank_group_args(1 << 20, 8 << 20);
+    args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=shm")?;
+    let mut executor = WorkerGroup::spawn(args)?;
+
+    let admission = text_admission(34, 1, 1)?;
+    let mut gated = token_batch(
+        1,
+        1,
+        admission.request_key,
+        Some(admission.clone()),
+        CallId::new(1, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[6],
+        UnitId(1),
+        0,
+    );
+    let predicate = TensorRef {
+        request_key: admission.request_key,
+        producer_call_id: CallId::new(91, 0),
+        output_index: 0,
+        generation: 91,
+        dtype: DType::U8,
+        shape_bound: ShapeBound::default(),
+    };
+    let export = SlowShmExport::start(executor.info().endpoint.node.clone())?;
+    gated.calls[0].predicate = Some(predicate.clone());
+    gated.input_products.push(uniserve_ipc::TensorExport {
+        product: predicate,
+        value: export.descriptor()?,
+    });
+    executor.submit_batch(gated, &CallReaders::new())?;
+    export.fail()?;
+    let failed = executor
+        .poll_batch(Duration::from_secs(30))?
+        .context("the gated batch did not complete")?;
+    assert_eq!(failed.batch_id, 1);
+    assert_eq!(failed.results[0].output.status, CallStatus::Error);
+    assert!(failed.results[0].output.committed_tokens.is_empty());
+
+    let independent = text_admission(35, 1, 2)?;
+    let independent = token_batch(
+        2,
+        2,
+        independent.request_key,
+        Some(independent),
+        CallId::new(2, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[9],
+        UnitId(2),
+        0,
+    );
+    let served = execute(&mut executor, independent)?;
+    assert_eq!(served.results[0].output.status, CallStatus::Ok);
+    assert_eq!(served.results[0].output.committed_tokens, vec![1000]);
+    executor.close()?;
+    Ok(())
+}
+
 /// The components the stub model declares, each on its own rank of a
 /// two-rank group: the language backbone on rank 1 and the patch encoder on
 /// rank 0.
@@ -3468,6 +3667,7 @@ struct SlowShmExport {
 const SEGMENT_HEADER_BYTES: u64 = 512;
 const SEGMENT_STATE_OFFSET: u64 = 0;
 const SEGMENT_READY: u32 = 1;
+const SEGMENT_FAILED: u32 = 2;
 
 impl SlowShmExport {
     fn start(node: String) -> anyhow::Result<Self> {
@@ -3514,6 +3714,15 @@ impl SlowShmExport {
         self.file
             .write_all_at(&SEGMENT_READY.to_ne_bytes(), SEGMENT_STATE_OFFSET)?;
         self.published.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Mark the segment failed: its producer will never write it.
+    fn fail(&self) -> anyhow::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+
+        self.file
+            .write_all_at(&SEGMENT_FAILED.to_ne_bytes(), SEGMENT_STATE_OFFSET)?;
         Ok(())
     }
 
