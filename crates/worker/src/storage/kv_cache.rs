@@ -203,14 +203,14 @@ impl<C> KVCacheManager<C> {
         released
     }
 
-    /// Forget a retired request after its physical accesses have drained.
-    pub fn drop_request(&mut self, request_id: u64) {
-        self.resident
-            .retain(|buffer, _| buffer.owner.request_id.0 != request_id);
+    /// Forget a retired request epoch after its physical accesses have
+    /// drained; other epochs of its request id keep their entries.
+    pub fn drop_request(&mut self, request: RequestKey) {
+        self.resident.retain(|buffer, _| buffer.owner != request);
         self.destination_bases
-            .retain(|(request, _), _| request.request_id.0 != request_id);
+            .retain(|(owner, _), _| *owner != request);
         self.installed_bases
-            .retain(|(request, _), _| request.request_id.0 != request_id);
+            .retain(|(owner, _), _| *owner != request);
     }
 
     /// Forget transfer descriptions and bases when the cache owner closes.
@@ -678,7 +678,7 @@ mod tests {
         );
         cache.validate_install(&next)?;
         assert!(cache.validate_install(&first).is_err());
-        cache.drop_request(first.source.owner.request_id.0);
+        cache.drop_request(first.source.owner);
         cache.validate_install(&first)?;
         assert!(cache.validate_install(&next).is_err());
         assert_eq!(cache.resident(local), None);

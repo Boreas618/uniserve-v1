@@ -16,13 +16,13 @@ use std::time::Instant;
 
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
-    Batch as BatchPlan, BufferAllocation, BufferId, CallStatus, DType, KvTransfer, RequestKey,
-    TensorRef,
+    Batch as BatchPlan, BufferAllocation, BufferId, CallStatus, DType, RequestKey, TensorRef,
 };
 
 use super::super::launch::{read_flag, reports_output, seal as seal_lease};
+use super::super::products::Publications;
+use super::super::transfer::kv::{self, Published};
 use super::ImageRuntime;
-use super::conditioning::Published;
 use super::host::ImageTask;
 use crate::executor::PendingOutput;
 use crate::ffi::Device;
@@ -105,6 +105,12 @@ pub(super) struct ImageBatch<'a> {
     pub(super) encodings: Vec<Encoding>,
     /// Conditioning KV exports, resident once the batch commits.
     pub(super) published: Vec<Published>,
+    /// Product exports (encoder features, trajectory versions),
+    /// registered once the batch commits.
+    pub(super) publications: Publications,
+    /// Trajectory versions exported from the latent pool, released from it
+    /// if the batch fails before committing.
+    pub(super) latent_exports: Vec<BufferId>,
     /// Signals the physical end of the batch's KV accesses.
     pub(super) retirement: Arc<Retirement>,
     /// The batch uses the latent pool on its stream (see
@@ -194,6 +200,8 @@ impl<'a> ImageBatch<'a> {
             updates: Vec::new(),
             encodings: Vec::new(),
             published: Vec::new(),
+            publications: Publications::default(),
+            latent_exports: Vec::new(),
             retirement: Arc::new(Retirement::default()),
             latents_entered: false,
             started,
@@ -302,19 +310,8 @@ impl<'a> ImageBatch<'a> {
         if !updates.is_empty() {
             self.runtime.latents()?.pool.validate_updates(&updates)?;
         }
-        let exported: Vec<(BufferId, KvTransfer)> = self
-            .published
-            .iter()
-            .map(|export| (export.buffer, export.transfer.clone()))
-            .collect();
-        if !exported.is_empty() {
-            self.storage
-                .kv
-                .as_mut()
-                .ok_or_else(|| Error::Unsupported("KV export requires a KV cache".into()))?
-                .manager()
-                .validate_exports(&exported, &[])?;
-        }
+        kv::validate(self.storage, &self.published, &[])?;
+        self.publications.validate(&self.storage.tensors)?;
         self.leave_latents()?;
         self.seal()?;
         for state in &mut self.calls {
@@ -344,25 +341,14 @@ impl<'a> ImageBatch<'a> {
             for transfer in cancelled {
                 // Released trajectories' pending imports end; their pages
                 // retire with the transfer.
-                crate::transfer::notify(transfer.cancel().1);
+                transfer.read().cancel().map_err(fatal)?;
             }
         }
-        if !exported.is_empty() {
-            let kv = self
-                .storage
-                .kv
-                .as_mut()
-                .ok_or_else(|| Error::Unsupported("KV export requires a KV cache".into()))
-                .map_err(fatal)?;
-            kv.manager().apply_exports(exported, Vec::new());
-            for export in std::mem::take(&mut self.published) {
-                // Revoked with the export buffer's release.
-                self.storage
-                    .tensors
-                    .register_exports(export.buffer, export.locations)
-                    .map_err(fatal)?;
-            }
-        }
+        let published = std::mem::take(&mut self.published);
+        kv::apply(self.storage, published, Vec::new()).map_err(fatal)?;
+        self.publications
+            .register(&self.storage.tensors)
+            .map_err(fatal)?;
         self.requests.add_pending(&pending).map_err(fatal)
     }
 
@@ -389,7 +375,14 @@ impl<'a> ImageBatch<'a> {
     /// storage returns once the fences recorded here complete.
     pub(super) fn discard(&mut self) -> Result<()> {
         let left = self.leave_latents();
-        let revoked = self.revoke_conditioning();
+        let revoked = self.revoke_conditioning().and(self.publications.revoke());
+        let exported = std::mem::take(&mut self.latent_exports);
+        if !exported.is_empty()
+            && let Ok(latents) = self.runtime.latents()
+        {
+            // The versions retire once their transports drop them.
+            latents.pool.release_exports(&exported);
+        }
         let stream = self.stream.as_ref();
         let reads = std::mem::take(&mut self.reads);
         let completed = self.storage.tensors.complete_reads(&reads, stream, &[]);
