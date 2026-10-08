@@ -10,8 +10,16 @@ from uniserve_models.quantization import QuantizedTensor, RowOrder
 
 from ..backends import moe as moe_backend
 from ..backends import record_kernel_choice
-from ..runtime.microbatches import yield_microbatch
 from . import capturing
+
+
+def _yield_microbatch() -> None:
+    """Hand the device to the next active microbatch, if any."""
+    # The experts runtime supplies microbatch rotation; import it at use so
+    # bindings load without that runtime.
+    from ..runtime.microbatches import yield_microbatch
+
+    yield_microbatch()
 
 
 class MoEBinding:
@@ -240,7 +248,7 @@ class MoEBinding:
                 topk_weights,
                 invalid_expert=self._invalid_expert,
             )
-            yield_microbatch()
+            _yield_microbatch()
             # The local experts combine their routes into this rank's
             # partial sums, and the exchange sums the ranks' partials (FP32,
             # one BF16 rounding).

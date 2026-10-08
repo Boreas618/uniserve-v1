@@ -6,11 +6,10 @@ from safetensors.torch import save_file
 from torch import nn
 from transformers import SiglipVisionConfig, SiglipVisionModel
 
-from uniserve_models import loading
+from uniserve_models import loading, siglip
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.model import PatchEncoder, VisionInput
 from uniserve_models.nn.functional import patchify
-from uniserve_models import siglip
 
 pytestmark = pytest.mark.integration
 
@@ -110,8 +109,9 @@ def test_variable_image_grids_match_independent_encoder(tmp_path):
 @pytest.mark.gpu
 @torch.inference_mode()
 def test_image_encoding_replay_reads_updated_pixels():
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import CUDAGraph, ExecutionContext
+    from uniserve_models.runtime import CUDAGraph
 
     torch.manual_seed(987)
     config = siglip.Config(

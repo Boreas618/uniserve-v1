@@ -11,6 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve_models import loading
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.model import TextSize
@@ -23,7 +24,6 @@ from uniserve_models.quantization import QuantizationConfig, Quantizer
 from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
-    ExecutionContext,
     initialize_process_groups,
 )
 

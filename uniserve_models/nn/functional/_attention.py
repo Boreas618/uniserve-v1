@@ -14,11 +14,11 @@ def attention(
     Persistent cache writes use Attention bound through ExecutionContext.
     ``window`` bounds the visible history as documented on ``Attention``.
     """
-    from uniserve_models.model.inputs import TextSize
-    from uniserve_models.nn.attention.inputs import DenseInput
     from uniserve_models.backends.attention import resolve
     from uniserve_models.backends.attention._sequences import host_lengths
-    from uniserve_models.runtime.tensor_buffers import TensorBuffers
+    from uniserve_models.bindings.context import TensorBuffers
+    from uniserve_models.model.inputs import TextSize
+    from uniserve_models.nn.attention.inputs import DenseInput
 
     if q.ndim not in {3, 4}:
         raise ValueError("attention requires packed THD or dense BHTD tensors")

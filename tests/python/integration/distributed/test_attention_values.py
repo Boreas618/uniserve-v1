@@ -7,6 +7,7 @@ import torch
 import torch.multiprocessing as mp
 from torch.nn import functional as F
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.cache import Config, mha
 from uniserve_models.distributed import DeviceMesh, parallelize_
 from uniserve_models.model import TextSize
@@ -19,7 +20,6 @@ from uniserve_models.nn.attention import (
 )
 from uniserve_models.runtime import (
     CUDAStream,
-    ExecutionContext,
     PrefixCache,
     initialize_process_groups,
 )
