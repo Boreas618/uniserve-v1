@@ -128,6 +128,7 @@ fn rows(
             selection,
             gated: false,
             force_finish: false,
+            causal: true,
         })
         .collect()
 }
@@ -233,6 +234,7 @@ fn step(
                 rows,
                 sampling: None,
                 prompt: &[],
+                embeddings: &[],
             },
             &mut StepContext {
                 tables,

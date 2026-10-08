@@ -28,9 +28,8 @@ use uniserve_ipc::{
 
 use super::batch::{MediaBatch, request_slots};
 use crate::error::WorkerError;
-use crate::executor::Submission;
-use crate::executor::products::{
-    OutputShape, Placement, ProductOwners, bind_completion, bind_outputs, export,
+use crate::executor::forward::placement::{
+    OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export, skipped,
 };
 use crate::ffi::Region;
 use crate::ffi::{DType, Device, Function, Handle};
@@ -405,90 +404,47 @@ impl VideoRuntime {
     }
 }
 
-/// Inputs a host codec reads in place: units a video encoding call reads
-/// from a shared-memory export on this host, and every muxing input.
-fn borrowed(call: &Call, export: &uniserve_ipc::TensorExport, node: &str) -> bool {
-    match call.code {
-        CallKind::Media(MediaCall::Muxing) => true,
-        CallKind::Media(MediaCall::VideoEncoding) => export.value.tensors().iter().all(|tensor| {
-            tensor.locations.iter().any(|location| {
-                matches!(
-                    location.transport,
-                    uniserve_ipc::TransferTransport::PosixShm { .. }
-                ) && location.source.node == node
-            })
-        }),
-        _ => false,
-    }
-}
-
-/// Prepare a media batch's inputs: open its state and submit its imports.
-/// Returns whether its inputs are ready.
-pub(crate) fn prepare_inputs(
+/// Open a video batch: its output lease on the stream of its kind, its
+/// calls' pending results, and the calls its false predicates skip.
+/// `borrowed` names the inputs host codecs read in place.
+pub(crate) fn open<'b>(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
-    state: &mut Option<MediaBatch>,
-) -> Result<bool> {
-    let Some(first) = plan.calls.first() else {
-        return Ok(true);
-    };
-    let kind = media_kind(first);
-    if state.is_none() {
-        let (device, stream) = parts.video.placement(kind, &first.component)?;
-        *state = Some(MediaBatch::new(
-            device,
-            stream,
-            &mut parts.video.outputs,
-            plan.calls.len(),
-        )?);
-    }
-    let Some(batch) = state.as_mut() else {
-        return Err(Error::Invariant("media batch state was not opened".into()));
-    };
-    if !batch.inputs.submitted() {
-        let slots = request_slots(plan, parts.requests)?;
-        let node = parts.info.endpoint.node.clone();
-        let owners = parts.owners();
-        let device = batch.device;
-        let stream = batch.stream.as_ref().map(|stream| {
-            // SAFETY: a view of the batch's borrowed stream for this call.
-            unsafe { Stream::borrowed(stream.device(), stream.raw()) }
-        });
-        let stream = stream.transpose()?;
-        batch.inputs.submit(
-            plan,
-            owners,
-            &slots,
-            device,
-            stream.as_ref(),
-            |call, export| borrowed(call, export, &node),
-            &mut parts.video.outputs,
-        )?;
-    }
-    batch.inputs.ready()
-}
-
-/// Wake the executor when a media batch's inputs arrive.
-pub(crate) fn await_inputs(state: &Option<MediaBatch>, submission: &Arc<Submission>) {
-    if let Some(batch) = state {
-        batch.inputs.wait(submission);
-    }
+    borrowed: HashSet<BufferId>,
+    state: &'b mut Option<MediaBatch>,
+) -> Result<&'b mut MediaBatch> {
+    let first = plan
+        .calls
+        .first()
+        .ok_or_else(|| Error::Invariant("a video batch has calls".into()))?;
+    let (device, stream) = parts.video.placement(media_kind(first), &first.component)?;
+    let batch = state.insert(MediaBatch::new(
+        device,
+        stream,
+        &mut parts.video.outputs,
+        plan.calls.len(),
+        Reads::new(borrowed),
+    )?);
+    let video = &*parts.video;
+    batch.open_calls(plan, parts.requests, |component| video.reports(component))?;
+    let skipped = skipped(
+        &parts.storage.tensors,
+        plan,
+        batch.device,
+        batch.stream.as_ref(),
+    )?;
+    batch.skip(&skipped);
+    Ok(batch)
 }
 
 /// Execute a batch of device video calls and commit it.
 pub(crate) fn execute(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
+    borrowed: HashSet<BufferId>,
     state: &mut Option<MediaBatch>,
 ) -> std::result::Result<(), WorkerError> {
-    let batch = state
-        .as_mut()
-        .ok_or_else(|| Error::Invariant("a media batch executes before its inputs".into()))?;
-    let video = &*parts.video;
-    let output_ranks = |component: &str| video.reports(component);
-    batch.open_calls(plan, parts.requests, output_ranks)?;
-    let skipped = batch.inputs.predicated()?;
-    batch.skip(&skipped);
+    let batch = open(parts, plan, borrowed, state)?;
 
     let slots = request_slots(plan, parts.requests)?;
     let allocations: HashMap<BufferId, BufferAllocation> = plan
@@ -652,8 +608,7 @@ fn publish(
         None,
         Some(&stream),
     )?;
-    batch.calls[index].exports.push((write.id(), locations));
-    batch.calls[index].products.push(exported);
+    batch.calls[index].publish(write.id(), locations, exported)?;
     Ok(())
 }
 
@@ -1082,8 +1037,7 @@ fn denoise(
         owners.store.write(&write, sample, Some(&stream), None)?;
         let (exported, locations) =
             export(owners, call, output, &write, false, None, Some(&stream))?;
-        batch.calls[index].exports.push((write.id(), locations));
-        batch.calls[index].products.push(exported);
+        batch.calls[index].publish(write.id(), locations, exported)?;
     }
     Ok(())
 }
@@ -1213,8 +1167,7 @@ fn decode_video(
         None,
         Some(&stream),
     )?;
-    batch.calls[index].exports.push((write.id(), locations));
-    batch.calls[index].products.push(exported);
+    batch.calls[index].publish(write.id(), locations, exported)?;
     Ok(())
 }
 
@@ -1306,8 +1259,7 @@ fn decode_audio(
         None,
         Some(&stream),
     )?;
-    batch.calls[index].exports.push((write.id(), locations));
-    batch.calls[index].products.push(exported);
+    batch.calls[index].publish(write.id(), locations, exported)?;
     Ok(())
 }
 
@@ -1450,8 +1402,7 @@ fn encode_conditions(
                 None,
                 Some(&stream),
             )?;
-            batch.calls[index].exports.push((write.id(), locations));
-            batch.calls[index].products.push(exported);
+            batch.calls[index].publish(write.id(), locations, exported)?;
         }
         "condition_audio_latents" => {
             // The audio call is one unit, the component's first rank's.
@@ -1513,8 +1464,7 @@ fn encode_conditions(
                 None,
                 Some(&stream),
             )?;
-            batch.calls[index].exports.push((write.id(), locations));
-            batch.calls[index].products.push(exported);
+            batch.calls[index].publish(write.id(), locations, exported)?;
         }
         other => {
             return Err(Error::Invalid(format!(
@@ -1812,8 +1762,11 @@ impl VideoRuntime {
                     device: device_index(device)?,
                     stream,
                     attention: attention.clone(),
+                    dtype: crate::runner::text::model_dtype(&config.model_dtype)?,
                     config: EncoderConfig {
                         max_images: info.max_batch_calls.max(1) as usize,
+                        // Vision blocks encode one sample per call.
+                        row_budget: config.max_batch_tokens.max(1),
                         text_capacities: plan
                             .text_capacities
                             .iter()

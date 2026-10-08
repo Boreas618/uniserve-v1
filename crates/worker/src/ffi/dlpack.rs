@@ -25,6 +25,14 @@ pub enum Device {
 }
 
 impl Device {
+    /// The CUDA ordinal of device memory.
+    pub fn cuda_index(self) -> Option<i32> {
+        match self {
+            Self::Cuda(index) => Some(index),
+            Self::Cpu | Self::CudaHost => None,
+        }
+    }
+
     fn to_dlpack(self) -> DLDevice {
         match self {
             Self::Cpu => DLDevice {

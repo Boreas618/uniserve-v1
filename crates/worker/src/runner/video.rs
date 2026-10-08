@@ -18,9 +18,9 @@ use uniserve_core::Canvas;
 use uniserve_cuda::Stream;
 
 use crate::ffi::{Backing, DType, Fields, Function, Functions, Handle};
-use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize};
+use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces};
 use crate::runner::GraphPool;
-use crate::runner::encoder::{EncoderConfig, EncoderRunner};
+use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::graphs::{GraphMode, GraphTable, Lookup};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::storage::{RequestSlots, SlotField};
@@ -456,6 +456,8 @@ pub(crate) struct TextSetup<'a> {
     /// Whether the component also encodes condition media with its vision
     /// tower.
     pub(crate) vision: bool,
+    /// The model dtype the encoders compute in.
+    pub(crate) dtype: DType,
 }
 
 /// One rank's text encoder: the component binding, the prompt encoder and,
@@ -484,7 +486,19 @@ impl TextEncoding {
             config,
             products,
             vision,
+            dtype,
         } = setup;
+        let text_info = EncoderInfo::describe(interface, loaded, path, dtype)?;
+        let vision_info = if vision {
+            Some(EncoderInfo::describe(
+                interface,
+                loaded,
+                &format!("{path}.vision"),
+                dtype,
+            )?)
+        } else {
+            None
+        };
         let prepared = crate::model::bind::prepare(
             interface,
             loaded,
@@ -495,16 +509,7 @@ impl TextEncoding {
                 stream: stream.raw(),
                 // Prompts run one at a time, padded to at most the largest
                 // capacity; the operators' workspaces are declared for it.
-                size: Some(TextSize {
-                    tokens: config
-                        .text_capacities
-                        .iter()
-                        .copied()
-                        .max()
-                        .unwrap_or(config.max_text_tokens)
-                        .max(1),
-                    rows: 1,
-                }),
+                size: text_info.binding_size(&config),
                 backends: Backends {
                     attention,
                     ..Backends::default()
@@ -529,23 +534,25 @@ impl TextEncoding {
             &binding,
             loaded,
             "",
+            text_info,
             &config,
             products.clone(),
             Some(borrowed()?),
         )?;
-        let vision = if vision {
-            Some(EncoderRunner::bind(
-                interface,
-                &binding,
-                loaded,
-                "vision",
-                &config,
-                products,
-                Some(borrowed()?),
-            )?)
-        } else {
-            None
-        };
+        let vision = vision_info
+            .map(|info| {
+                EncoderRunner::bind(
+                    interface,
+                    &binding,
+                    loaded,
+                    "vision",
+                    info,
+                    &config,
+                    products,
+                    Some(borrowed()?),
+                )
+            })
+            .transpose()?;
         Ok(Self {
             binding,
             workspaces,

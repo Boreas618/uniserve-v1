@@ -9637,10 +9637,12 @@ dependencies = [
 name = "uniserve-worker"
 version = "2.0.0"
 dependencies = [
+ "base64 0.22.1",
  "crossbeam-channel",
  "indexmap 2.14.0",
  "libc",
  "nvtx",
+ "png",
  "rustix 1.1.4",
  "serde",
  "serde_json",

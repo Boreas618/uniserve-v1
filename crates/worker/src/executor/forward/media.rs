@@ -8,7 +8,7 @@
 //! condition products, the encoded unit rows) or delivers the finished MP4
 //! before its result is sent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +20,7 @@ use uniserve_ipc::{
 use super::batch::{MediaBatch, Publication, request_slots};
 use super::video::{Parts, units};
 use crate::error::WorkerError;
-use crate::executor::products::{OutputShape, Placement, bind_outputs, supplied};
+use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, supplied};
 use crate::ffi::Device;
 use crate::host::HostTask;
 use crate::host::mux::read_unit;
@@ -33,13 +33,10 @@ use crate::{Error, ProductBuffer, Result};
 pub(crate) fn execute(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
+    borrowed: HashSet<BufferId>,
     state: &mut Option<MediaBatch>,
 ) -> std::result::Result<(), WorkerError> {
-    let batch = state
-        .as_mut()
-        .ok_or_else(|| Error::Invariant("a media batch executes before its inputs".into()))?;
-    let video = &*parts.video;
-    batch.open_calls(plan, parts.requests, |component| video.reports(component))?;
+    let batch = super::video::open(parts, plan, borrowed, state)?;
     let slots = request_slots(plan, parts.requests)?;
     let allocations: HashMap<BufferId, BufferAllocation> = plan
         .buffer_allocations
@@ -221,7 +218,7 @@ fn borrow_unit(
 ) -> Result<UnitFrames> {
     let export = supplied(plan, product)
         .ok_or_else(|| Error::Invalid("a borrowed media input has no export".into()))?;
-    let tensor = crate::executor::products::tensor(export)?;
+    let tensor = crate::executor::forward::placement::tensor(export)?;
     let transport = parts
         .storage
         .transports
@@ -400,7 +397,7 @@ fn read_rows(parts: &Parts<'_>, plan: &BatchPlan, product: &TensorRef) -> Result
     let export = supplied(plan, product).ok_or_else(|| {
         Error::Invalid("artifact assembly input has no transfer locations".into())
     })?;
-    let tensor = crate::executor::products::tensor(export)?;
+    let tensor = crate::executor::forward::placement::tensor(export)?;
     if tensor.shape.len() != 2
         || tensor
             .locations

@@ -165,13 +165,13 @@ impl<A> BufferPool<A> {
         Ok(())
     }
 
-    pub fn backings(&self) -> impl Iterator<Item = &A> {
-        self.arenas.values().map(|arena| &arena.backing)
-    }
-
-    /// The arena of `device` (a locator name such as `cuda:0`), if any.
+    /// The arena of `device`, if the pool holds one there.
     pub fn backing(&self, device: &str) -> Option<&A> {
         self.arenas.get(device).map(|arena| &arena.backing)
+    }
+
+    pub fn backings(&self) -> impl Iterator<Item = &A> {
+        self.arenas.values().map(|arena| &arena.backing)
     }
 
     /// After physical accesses retire, return arena owners for destruction

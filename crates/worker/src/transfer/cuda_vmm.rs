@@ -160,7 +160,11 @@ impl CudaExports {
                         return Ok(None);
                     };
                     state.allocation = Some((Arc::clone(&pool.pool), Arc::clone(&chunk)));
-                    let backing = Arc::clone(lock(&pool.pool).backing()?) as Arc<dyn Backing>;
+                    let memory = Arc::clone(lock(&pool.pool).backing()?);
+                    // Readers map the whole allocation, whose length the
+                    // driver rounded up to its granularity.
+                    let storage_bytes = memory.len() as u64;
+                    let backing = memory as Arc<dyn Backing>;
                     let shape: Vec<i64> =
                         source.shape().iter().map(|&extent| extent as i64).collect();
                     let payload = Spans::single(StorageView::contiguous(
@@ -180,7 +184,7 @@ impl CudaExports {
                     (
                         payload,
                         pool.handle.clone(),
-                        self.pool_bytes as u64,
+                        storage_bytes,
                         chunk.payload_offset() as u64,
                     )
                 }

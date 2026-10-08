@@ -5,15 +5,22 @@
 //! image, video, host media (`media`), transfers (`transfer`); expert-only
 //! ranks participate in expert steps through `experts`. These modules are
 //! the integration seam of the capability runtimes: each owns its runners,
-//! input preparation and result materialization. A runtime that has not
-//! been integrated reports its call kind as unsupported, which fails the
-//! batch with `UnsupportedSetup` and leaves the rank serving.
+//! its own input preparation and result materialization. Inputs imported
+//! from other ranks and workers are prepared for every runtime alike
+//! (`inputs`), and products are published to them alike (`products`). A
+//! runtime that has not been integrated reports its call kind as
+//! unsupported, which fails the batch with `UnsupportedSetup` and leaves
+//! the rank serving.
 
 pub(crate) mod batch;
 pub(crate) mod canvas;
 pub(crate) mod experts;
 pub(crate) mod image;
+pub(crate) mod inputs;
+pub(crate) mod launch;
 pub(crate) mod media;
+pub(crate) mod placement;
+pub(crate) mod products;
 pub(crate) mod token;
 pub(crate) mod transfer;
 pub(crate) mod video;
@@ -26,31 +33,55 @@ use super::backend::{WorkerBackend, WorkerBatch};
 use crate::Error;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
-
-/// A capability runtime's launched batch awaiting materialization.
-pub(crate) enum Running {
-    Token(token::Launched),
-}
+use crate::model::components::Capability;
 
 /// Materialize launched work whose device results are ready.
 pub(crate) fn poll(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
-    running: &mut Running,
+    launched: &mut launch::Launched,
 ) -> std::result::Result<Option<BatchResult>, WorkerError> {
-    match running {
-        Running::Token(launched) => token::poll(backend, plan, launched),
-    }
+    Ok(launch::materialize(backend.requests_mut(), plan, launched)?)
 }
 
 /// Cancel launched work that will not be materialized.
 pub(crate) fn abandon(
     backend: &mut WorkerBackend,
-    running: Running,
+    launched: launch::Launched,
 ) -> std::result::Result<(), WorkerError> {
-    match running {
-        Running::Token(launched) => token::abandon(backend, launched),
+    Ok(launch::abandon(backend.requests_mut(), launched)?)
+}
+
+/// Fail every call of a batch whose execution failed before any runtime
+/// committed work: a fatal failure stops the rank, any other completes the
+/// batch with its calls failed under the failure's code.
+pub(crate) fn fail(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    error: Error,
+    context: &str,
+) -> std::result::Result<(), WorkerError> {
+    let error = WorkerError::classify(error, Some(context));
+    if error.fatal {
+        return Err(error);
     }
+    let plan = batch.shared_plan();
+    tracing::warn!(
+        target: "uniserve_worker.execution",
+        "batch {} failed: {error}",
+        plan.batch_id
+    );
+    let output = launch::failed_output(
+        backend.requests(),
+        plan,
+        batch.predecessors(),
+        launch::error_code(error.code),
+    )?;
+    batch.complete(BatchResult {
+        output,
+        media: Vec::new(),
+    });
+    Ok(())
 }
 
 /// The error of a call kind whose runtime is not available on this rank.
@@ -88,23 +119,23 @@ pub(crate) fn execute(
         Forward(ForwardMode::TokenDenoising) => canvas::execute(backend, batch, kind),
         Transfer(_) => transfer::execute(backend, batch, kind),
         Media(MediaReading | VideoEncoding | AudioEncoding | Muxing) => {
-            let (plan, state) = batch.media_parts();
+            let (plan, borrowed, state) = batch.media_parts();
             let mut parts = backend.media_parts()?;
-            media::execute(&mut parts, plan, state)
+            media::execute(&mut parts, plan, borrowed, state)
         }
         Media(ImageDecoding) => image::execute(backend, batch, kind),
         Media(VideoDecoding | AudioDecoding) => {
-            let (plan, state) = batch.media_parts();
+            let (plan, borrowed, state) = batch.media_parts();
             let mut parts = backend.media_parts()?;
-            video::execute(&mut parts, plan, state)
+            video::execute(&mut parts, plan, borrowed, state)
         }
         // Encoders and denoisers serve both image and video models; the
         // rank's model decides.
         Media(VisionEncoding | TextEncoding | LatentEncoding | LatentPreparation | Denoising) => {
             if backend.serves_video() {
-                let (plan, state) = batch.media_parts();
+                let (plan, borrowed, state) = batch.media_parts();
                 let mut parts = backend.media_parts()?;
-                video::execute(&mut parts, plan, state)
+                video::execute(&mut parts, plan, borrowed, state)
             } else {
                 image::execute(backend, batch, kind)
             }
@@ -112,7 +143,12 @@ pub(crate) fn execute(
     }
 }
 
-/// Whether a batch of `route` runs as a media batch of the video runtime.
-pub(crate) fn media_route(route: Option<CallKind>, video: bool) -> bool {
-    video && matches!(route, Some(CallKind::Media(_)))
+/// Whether a component's model decodes video.
+pub(crate) fn decodes_video(capabilities: impl IntoIterator<Item = Capability>) -> bool {
+    capabilities.into_iter().any(|capability| {
+        matches!(
+            capability,
+            Capability::VideoDenoiser | Capability::VideoPostprocessor
+        )
+    })
 }
