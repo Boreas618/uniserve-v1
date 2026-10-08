@@ -1,4 +1,5 @@
-//! Native profiler scopes. No language callback or device operation is involved.
+//! NVTX ranges of the `uniserve.worker` domain, enabled by `UNISERVE_NVTX`.
+//! No language callback or device operation is involved.
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -11,12 +12,7 @@ pub(crate) fn range(name: &'static CStr, batch_id: Option<u64>) -> Option<LocalR
     static DOMAIN: OnceLock<Option<Domain>> = OnceLock::new();
 
     let domain = DOMAIN.get_or_init(|| {
-        let enabled = std::env::var("UNISERVE_NVTX").is_ok_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        });
+        let enabled = super::flag(std::env::var("UNISERVE_NVTX").ok().as_deref());
         enabled.then(|| Domain::new(c"uniserve.worker"))
     });
 

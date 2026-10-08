@@ -9,10 +9,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from uniserve_models.backends.attention import resolve
+from uniserve_models.bindings.context import TensorBuffers
 from uniserve_models.model import TextSize
 from uniserve_models.nn.attention import SequenceLengths, VisibleInput
-from uniserve_models.runtime import TensorBuffers
-from uniserve_models.backends.attention import resolve
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

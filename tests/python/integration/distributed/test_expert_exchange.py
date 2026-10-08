@@ -16,18 +16,19 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 from torch.nn import functional as F
-
-from uniserve_models.distributed import partition_experts
-from uniserve_models.model import TextSize
-from uniserve_models.nn import functional
-from uniserve_models.nn.moe import FusedMoE
-from uniserve_models.quantization import Quantizer, ScaleLayout
-from uniserve_models.runtime import CUDAGraph, CUDAStream, ExecutionContext
 from uniserve_models.runtime.expert_exchange import ExpertExchange, JoinGraphs
 from uniserve_models.runtime.process_groups import (
     Rendezvous,
     initialize_process_groups,
 )
+
+from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.distributed import partition_experts
+from uniserve_models.model import TextSize
+from uniserve_models.nn import functional
+from uniserve_models.nn.moe import FusedMoE
+from uniserve_models.quantization import Quantizer, ScaleLayout
+from uniserve_models.runtime import CUDAGraph, CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

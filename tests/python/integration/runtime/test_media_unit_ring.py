@@ -117,8 +117,9 @@ def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
 
     import torch.distributed as dist
 
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.distributed import Communicator
-    from uniserve_models.runtime import CUDAStream, ExecutionContext
+    from uniserve_models.runtime import CUDAStream
 
     expected = pickle.loads(expected_bytes)
     model = _postprocessor().to(device)

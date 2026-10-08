@@ -11,14 +11,10 @@ import torch
 from uniserve_kernels.attention.vsa_rows import pack_sparse_input_rows
 
 from tests.python.fixtures.vsa import reference_attention
-from uniserve_models.nn.attention import vsa
-from uniserve_models.runtime import (
-    CUDAGraph,
-    CUDAStream,
-    ExecutionContext,
-    TensorBuffers,
-)
 from uniserve_models.backends.attention import vsa as providers
+from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
+from uniserve_models.nn.attention import vsa
+from uniserve_models.runtime import CUDAGraph, CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

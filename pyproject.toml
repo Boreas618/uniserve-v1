@@ -1,5 +1,12 @@
 [build-system]
-requires = ["setuptools>=70", "wheel", "setuptools-rust>=1.7"]
+# The worker library links libtvm_ffi; its build script locates it through the
+# `tvm-ffi-config` script of the pinned apache-tvm-ffi release.
+requires = [
+    "setuptools>=70",
+    "wheel",
+    "setuptools-rust>=1.7",
+    "apache-tvm-ffi==0.1.14.post1",
+]
 build-backend = "setuptools.build_meta"
 
 [project]

@@ -4,7 +4,7 @@ UniServe's execution sanitizer reads profiler captures and produces hints about 
 
 ## Capture and inspect a CUDA timeline
 
-Set `UNISERVE_NVTX=1` before starting the worker. The native executor emits synchronous ranges named `uniserve.worker.admit`, `prepare`, `inputs`, `execute`, `retire`, `poll`, `result` and `close`, with the batch ID as a numeric payload. Shared resource reclamation uses `uniserve.worker.reap` without a batch payload. The switch is read on first native use. Python numerical ranges remain nested within those stages. Native ranges use the NVIDIA NVTX SDK directly and issue no Python callbacks or CUDA operations.
+Set `UNISERVE_NVTX=1` before starting the worker. The native executor emits synchronous ranges named `uniserve.worker.admit`, `prepare`, `inputs`, `execute`, `retire`, `poll`, `result` and `close`, with the batch ID as a numeric payload. Shared resource reclamation uses `uniserve.worker.reap` without a batch payload. Startup phases emit `uniserve.worker.describe`, `load`, `plan`, `bind`, `warmup` and `capture` without a payload. The switch is read on first native use. Python numerical ranges remain nested within those stages. Native ranges use the NVIDIA NVTX SDK directly and issue no Python callbacks or CUDA operations.
 
 Capture a representative workload with Nsight Systems. `CAPTURE` is an output prefix and `WORKLOAD` is the caller's Python entry point; select both explicitly. For serving, replace the Python command with the normal `uniserve serve` command and run the fixed workload against it.
 
