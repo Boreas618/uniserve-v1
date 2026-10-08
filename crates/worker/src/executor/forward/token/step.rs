@@ -433,11 +433,11 @@ impl TokenBatch<'_> {
             .as_mut()
             .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
         let (tables, cache) = kv.split();
-        self.runtime.order(stream.as_ref())?;
+        self.runtime.order().wait(stream.as_ref())?;
         diffusion.condition(rows, tables, |table, prefix, query| {
             cache.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
         })?;
-        self.runtime.ordered(stream.as_ref())?;
-        self.runtime.order(self.stream.as_ref())
+        self.runtime.order_mut().record(stream.as_ref())?;
+        self.runtime.order().wait(self.stream.as_ref())
     }
 }

@@ -15,6 +15,7 @@ use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::TextRuntime;
 use crate::config::{Device, PREFILL_ROW_BUCKETS, WorkerConfig};
+use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::{DType, Handle};
 use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
 use crate::model::components::RunnerKind;
@@ -452,7 +453,7 @@ impl TextRuntime {
             state,
             outputs,
             vocab,
-            order: None,
+            order: StreamOrder::default(),
         }))
     }
 }

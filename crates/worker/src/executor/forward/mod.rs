@@ -12,8 +12,8 @@
 pub(crate) mod canvas;
 pub(crate) mod experts;
 pub(crate) mod image;
+pub(crate) mod launch;
 pub(crate) mod media;
-pub(crate) mod products;
 pub(crate) mod token;
 pub(crate) mod transfer;
 pub(crate) mod video;
@@ -28,33 +28,21 @@ use crate::error::WorkerError;
 use crate::executor::BatchResult;
 use crate::model::components::Capability;
 
-/// A capability runtime's launched batch awaiting materialization.
-pub(crate) enum Running {
-    Token(token::Launched),
-    Image(image::Launched),
-}
-
 /// Materialize launched work whose device results are ready.
 pub(crate) fn poll(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
-    running: &mut Running,
+    launched: &mut launch::Launched,
 ) -> std::result::Result<Option<BatchResult>, WorkerError> {
-    match running {
-        Running::Token(launched) => token::poll(backend, plan, launched),
-        Running::Image(launched) => image::poll(backend, plan, launched),
-    }
+    Ok(launch::materialize(backend.requests_mut(), plan, launched)?)
 }
 
 /// Cancel launched work that will not be materialized.
 pub(crate) fn abandon(
     backend: &mut WorkerBackend,
-    running: Running,
+    launched: launch::Launched,
 ) -> std::result::Result<(), WorkerError> {
-    match running {
-        Running::Token(launched) => token::abandon(backend, launched),
-        Running::Image(launched) => image::abandon(backend, launched),
-    }
+    Ok(launch::abandon(backend.requests_mut(), launched)?)
 }
 
 /// The error of a call kind whose runtime is not available on this rank.

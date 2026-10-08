@@ -9,13 +9,13 @@
 //! failure before the commit point.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::Instant;
 
 use uniserve_cuda::Stream;
 use uniserve_ipc::{Batch as BatchPlan, CallStatus, DType, ForwardMode, RequestKey, TensorRef};
 
-use super::super::products::{read_flag, reports_output};
+use super::super::launch::{lock, read_flag, reports_output, seal};
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, TextRuntime};
 use crate::executor::PendingOutput;
@@ -23,9 +23,7 @@ use crate::executor::forward::image::ImageRuntime;
 use crate::ffi::Device;
 use crate::request::RequestPool;
 use crate::sampling::SamplingMetadata;
-use crate::storage::{
-    OutputBuffer, OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar,
-};
+use crate::storage::{OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar};
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
 use crate::{Error, Result};
@@ -68,10 +66,6 @@ pub(super) struct TokenBatch<'a> {
     /// Signals the physical end of the batch's KV accesses.
     pub(super) retirement: Arc<Retirement>,
     pub(super) started: Instant,
-}
-
-pub(super) fn lock(buffer: &OutputLease) -> MutexGuard<'_, OutputBuffer> {
-    buffer.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl<'a> TokenBatch<'a> {
@@ -142,11 +136,11 @@ impl<'a> TokenBatch<'a> {
 
         // Host-gated predicates resolve before any storage is reserved; a
         // false one skips its call.
-        runtime.order(stream.as_ref())?;
+        runtime.order.wait(stream.as_ref())?;
         for (call, state) in plan.calls.iter().zip(&mut calls) {
             if let Some(predicate) = &call.predicate
                 && predicate.dtype == DType::U8
-                && !read_flag(storage, call, predicate, device, stream.as_ref())?
+                && !read_flag(&storage.tensors, call, predicate, device, stream.as_ref())?
             {
                 state.active = false;
                 state.output.output.status = CallStatus::Predicated;
@@ -409,26 +403,11 @@ impl<'a> TokenBatch<'a> {
     /// Seal the lease on the batch's stream and retire its KV accesses and
     /// output storage once the fences complete; wake the service then.
     pub(super) fn seal(&self) -> Result<()> {
-        let streams: Vec<&Stream> = self.stream.iter().collect();
-        let events = lock(&self.buffer)
-            .seal(&streams, &self.storage.events)?
-            .unwrap_or_default();
-        let fences: Vec<_> = lock(&self.buffer).fences().cloned().collect();
-        for event in fences {
-            self.storage.events.wake_after(&event)?;
-        }
-        let lease = Arc::clone(&self.buffer);
-        let retirement = Arc::clone(&self.retirement);
-        self.storage.events.defer(
-            events,
-            Box::new(move || {
-                lease
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .copies_finished();
-                crate::transfer::notify(retirement.complete(Ok(()))?);
-                Ok(())
-            }),
+        seal(
+            &self.storage.events,
+            &self.buffer,
+            self.stream.as_ref(),
+            &self.retirement,
         )
     }
 

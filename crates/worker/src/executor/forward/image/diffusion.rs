@@ -324,7 +324,7 @@ impl ImageBatch<'_> {
         if let Some(text) = text.as_deref() {
             // Conditioning K/V and earlier prefixes were written by text
             // batches, possibly on another stream.
-            text.order(stream.as_ref())?;
+            text.order().wait(stream.as_ref())?;
         }
         let descriptors = self.reserve_rows(&active)?;
 
@@ -501,7 +501,7 @@ impl ImageBatch<'_> {
                     .map(|(_, slot, tokens)| (*slot, &tokens[..]))
                     .collect();
                 text.prefill_cache(&component, &prefixes, tables, manager)?;
-                text.order(stream.as_ref())?;
+                text.order().wait(stream.as_ref())?;
                 for (position, slot, tokens) in &fills {
                     let (trajectory, _) = &trajectories[*position];
                     let key = plan.calls[trajectory.index].request_key;
@@ -642,7 +642,7 @@ impl ImageBatch<'_> {
             kv.release_prefixes(key, &slots, stream.as_ref())?;
         }
         if let Some(text) = text {
-            text.ordered(stream.as_ref())?;
+            text.order_mut().record(stream.as_ref())?;
         }
         Ok(stats)
     }
