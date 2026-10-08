@@ -11,7 +11,7 @@
 //! fatal.
 
 use std::collections::HashMap;
-use std::sync::{Arc, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::Instant;
 
 use uniserve_cuda::Stream;
@@ -20,7 +20,7 @@ use uniserve_ipc::{
     TensorRef,
 };
 
-use super::super::products::{read_flag, reports_output};
+use super::super::launch::{read_flag, reports_output, seal as seal_lease};
 use super::ImageRuntime;
 use super::conditioning::Published;
 use super::host::ImageTask;
@@ -29,7 +29,7 @@ use crate::ffi::Device;
 use crate::host::HostTask;
 use crate::request::RequestPool;
 use crate::storage::{
-    LatentUpdate, OutputBuffer, OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar,
+    LatentUpdate, OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar,
 };
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
@@ -73,9 +73,7 @@ pub(super) fn fatal(error: Error) -> Failure {
     }
 }
 
-pub(super) fn lock(buffer: &OutputLease) -> MutexGuard<'_, OutputBuffer> {
-    buffer.lock().unwrap_or_else(PoisonError::into_inner)
-}
+pub(super) use super::super::launch::lock;
 
 /// A batch's persistent buffer allocations by buffer.
 pub(super) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocation> {
@@ -165,7 +163,7 @@ impl<'a> ImageBatch<'a> {
         for (call, state) in plan.calls.iter().zip(&mut calls) {
             if let Some(predicate) = &call.predicate
                 && predicate.dtype == DType::U8
-                && !read_flag(storage, call, predicate, device, stream.as_ref())?
+                && !read_flag(&storage.tensors, call, predicate, device, stream.as_ref())?
             {
                 state.active = false;
                 state.output.output.status = CallStatus::Predicated;
@@ -371,26 +369,11 @@ impl<'a> ImageBatch<'a> {
     /// Seal the lease on the batch's stream and retire its KV accesses and
     /// output storage once the fences complete; wake the service then.
     pub(super) fn seal(&self) -> Result<()> {
-        let streams: Vec<&Stream> = self.stream.iter().collect();
-        let events = lock(&self.buffer)
-            .seal(&streams, &self.storage.events)?
-            .unwrap_or_default();
-        let fences: Vec<_> = lock(&self.buffer).fences().cloned().collect();
-        for event in fences {
-            self.storage.events.wake_after(&event)?;
-        }
-        let lease = Arc::clone(&self.buffer);
-        let retirement = Arc::clone(&self.retirement);
-        self.storage.events.defer(
-            events,
-            Box::new(move || {
-                lease
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .copies_finished();
-                crate::transfer::notify(retirement.complete(Ok(()))?);
-                Ok(())
-            }),
+        seal_lease(
+            &self.storage.events,
+            &self.buffer,
+            self.stream.as_ref(),
+            &self.retirement,
         )
     }
 

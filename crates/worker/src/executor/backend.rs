@@ -18,7 +18,7 @@ use uniserve_ipc::{
     WorkerInfo, WorkerResponseError,
 };
 
-use super::forward::{self, Running};
+use super::forward::{self, launch::Launched};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
@@ -53,6 +53,8 @@ pub struct WorkerBackend {
     /// The image runtime, on ranks holding encoders, image denoisers or
     /// image decoders of a model that is not a video model.
     image: Option<forward::image::ImageRuntime>,
+    /// The canvas runtime, on ranks holding a token denoiser.
+    canvas: Option<forward::canvas::CanvasRuntime>,
     /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
@@ -68,14 +70,16 @@ pub(crate) struct Parts<'a> {
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut forward::token::TextRuntime>,
     pub image: Option<&'a mut forward::image::ImageRuntime>,
+    pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, then the
-/// text and image runtimes, then the other runtimes' owners.
+/// text, image and canvas runtimes, then the other runtimes' owners.
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<forward::token::TextRuntime>,
     image: &'a mut Option<forward::image::ImageRuntime>,
+    canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
     others: &'a mut [Box<dyn RequestStorage>],
 ) -> Vec<&'a mut dyn RequestStorage> {
     let mut owners: Vec<&'a mut dyn RequestStorage> = Vec::new();
@@ -87,6 +91,9 @@ fn owners<'a>(
     }
     if let Some(image) = image {
         owners.push(image);
+    }
+    if let Some(canvas) = canvas {
+        owners.push(canvas);
     }
     owners.extend(
         others
@@ -103,7 +110,7 @@ pub struct WorkerBatch {
     predecessors: Vec<Option<CallId>>,
     retirement: Retirement,
     /// A capability runtime's launched work awaiting materialization.
-    running: Option<Running>,
+    running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
     image_inputs: Option<forward::image::Inputs>,
     output: Option<BatchResult>,
@@ -158,7 +165,7 @@ impl WorkerBatch {
     }
 
     /// Hand launched work to materialization by [`Backend::poll`].
-    pub(crate) fn launch(&mut self, running: Running) {
+    pub(crate) fn launch(&mut self, running: Launched) {
         self.running = Some(running);
     }
 
@@ -184,6 +191,7 @@ impl WorkerBackend {
             rank_storage: None,
             text: None,
             image: None,
+            canvas: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -242,6 +250,15 @@ impl WorkerBackend {
         self.image.as_mut()
     }
 
+    /// Install the canvas runtime.
+    pub(crate) fn set_canvas(&mut self, canvas: forward::canvas::CanvasRuntime) {
+        self.canvas = Some(canvas);
+    }
+
+    pub(crate) fn canvas_mut(&mut self) -> Option<&mut forward::canvas::CanvasRuntime> {
+        self.canvas.as_mut()
+    }
+
     /// Register another runtime's storage owner taking part in request
     /// lifecycles.
     pub fn add_storage(&mut self, storage: Box<dyn RequestStorage>) {
@@ -257,6 +274,7 @@ impl WorkerBackend {
             storage: self.rank_storage.as_mut(),
             text: self.text.as_mut(),
             image: self.image.as_mut(),
+            canvas: self.canvas.as_mut(),
         }
     }
 
@@ -309,6 +327,7 @@ impl WorkerBackend {
                 &mut self.rank_storage,
                 &mut self.text,
                 &mut self.image,
+                &mut self.canvas,
                 &mut self.storage,
             ) {
                 owner.admit_slots(&admitted)?;
@@ -438,13 +457,16 @@ impl WorkerBackend {
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, the image
-    /// and text runtimes, then rank storage), after the executor drained;
-    /// returns the first failure.
+    /// Close every storage owner, newest first (other runtimes, the canvas,
+    /// image and text runtimes, then rank storage), after the executor
+    /// drained; returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
+        }
+        if let Some(mut canvas) = self.canvas.take() {
+            result = result.and(canvas.close(aborted));
         }
         if let Some(mut image) = self.image.take() {
             result = result.and(image.close(aborted));
@@ -458,18 +480,23 @@ impl WorkerBackend {
         result
     }
 
-    /// Close the image and text runtimes (graphs, then steps) before the
-    /// bindings they run close.
-    pub fn close_text(&mut self, aborted: bool) -> Result<()> {
-        let image = match self.image.take() {
-            Some(mut image) => image.close(aborted),
-            None => Ok(()),
-        };
-        let text = match self.text.take() {
-            Some(mut text) => text.close(aborted),
-            None => Ok(()),
-        };
-        image.and(text)
+    /// Close the canvas, image and text runtimes (graphs, then steps)
+    /// before the bindings they run close; attempts every one before
+    /// returning the first failure.
+    pub fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
+        let canvas = self
+            .canvas
+            .take()
+            .map_or(Ok(()), |mut canvas| canvas.close(aborted));
+        let image = self
+            .image
+            .take()
+            .map_or(Ok(()), |mut image| image.close(aborted));
+        let text = self
+            .text
+            .take()
+            .map_or(Ok(()), |mut text| text.close(aborted));
+        canvas.and(image).and(text)
     }
 
     /// Release the outputs of the predecessors this batch's calls follow.
@@ -573,6 +600,7 @@ impl Backend for WorkerBackend {
             &mut self.rank_storage,
             &mut self.text,
             &mut self.image,
+            &mut self.canvas,
             &mut self.storage,
         );
         batch.retirement.admit(&mut owners)?;
@@ -651,6 +679,7 @@ impl Backend for WorkerBackend {
             &mut self.rank_storage,
             &mut self.text,
             &mut self.image,
+            &mut self.canvas,
             &mut self.storage,
         );
         batch.retirement.begin(&self.requests, &mut owners)?;
@@ -674,6 +703,7 @@ impl Backend for WorkerBackend {
             &mut self.rank_storage,
             &mut self.text,
             &mut self.image,
+            &mut self.canvas,
             &mut self.storage,
         );
         let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
@@ -706,6 +736,7 @@ impl Backend for WorkerBackend {
             &mut self.rank_storage,
             &mut self.text,
             &mut self.image,
+            &mut self.canvas,
             &mut self.storage,
         ) {
             owner.reap()?;

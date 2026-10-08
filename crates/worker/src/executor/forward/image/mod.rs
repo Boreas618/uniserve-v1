@@ -36,15 +36,15 @@ use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use uniserve_ipc::{
-    Batch as BatchPlan, BatchOutput, BufferId, CallKind, CallStatus, ErrorCode, ForwardStats,
-    MediaCall, RequestKey, TransferMode, Wake,
+    Batch as BatchPlan, BufferId, CallKind, CallStatus, ErrorCode, ForwardStats, MediaCall,
+    RequestKey, TransferMode, Wake,
 };
 
 use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
-use super::Running;
+use super::launch::{HostStage, Launched, error_code, failed_output};
 use crate::error::WorkerError;
 use crate::executor::lifecycle::RequestStorage;
-use crate::executor::{BatchResult, PendingOutput, Submission, request_output};
+use crate::executor::{BatchResult, PendingOutput, Submission};
 use crate::ffi::Device;
 use crate::ffi::Handle;
 use crate::host::{HostLane, HostTask};
@@ -58,7 +58,7 @@ use crate::storage::memory::StorageView;
 use crate::storage::{OutputPool, UnitColumn};
 use crate::{Error, Outcome, Result};
 
-use batch::{Failure, ImageBatch, lock};
+use batch::{Failure, ImageBatch};
 use host::{ImageResult, ImageTask, ImageWork};
 use latents::ImageLatents;
 
@@ -397,17 +397,6 @@ pub(crate) fn prepare_inputs(
     Ok(ready)
 }
 
-/// An image batch launched on the device, awaiting its fences and host
-/// encodings.
-pub(crate) struct Launched {
-    outputs: Vec<PendingOutput>,
-    buffer: crate::storage::OutputLease,
-    encodings: Vec<batch::Encoding>,
-    submitted: bool,
-    started: Instant,
-    stats: ForwardStats,
-}
-
 /// Execute a batch of `kind` calls.
 pub(crate) fn execute(
     backend: &mut WorkerBackend,
@@ -419,7 +408,7 @@ pub(crate) fn execute(
     let inputs = batch.take_image_inputs();
     let failure = match run(backend.parts(), &plan, kind, inputs) {
         Ok(Some(launched)) => {
-            batch.launch(Running::Image(launched));
+            batch.launch(launched);
             return Ok(());
         }
         Ok(None) => return Err(super::unsupported(kind, "image")),
@@ -441,15 +430,12 @@ pub(crate) fn execute(
             .map(|trace| format!("\n{trace}"))
             .unwrap_or_default()
     );
-    let code = match error.code {
-        crate::ErrorCode::ResourceError => ErrorCode::ResourceExhausted,
-        crate::ErrorCode::ComputeError => ErrorCode::ComputeError,
-        crate::ErrorCode::InvariantViolation | crate::ErrorCode::FatalWorkerFailure => {
-            ErrorCode::Internal
-        }
-        _ => ErrorCode::InvalidCall,
-    };
-    let output = failed_output(backend, &plan, &predecessors, code)?;
+    let output = failed_output(
+        backend.requests(),
+        &plan,
+        &predecessors,
+        error_code(error.code),
+    )?;
     batch.complete(BatchResult {
         output,
         media: Vec::new(),
@@ -473,6 +459,7 @@ fn run(
         storage,
         text,
         image,
+        ..
     } = parts;
     let (Some(runtime), Some(storage)) = (image, storage) else {
         return Ok(None);
@@ -507,7 +494,7 @@ fn run(
         }
     };
     if let (CallKind::Transfer(_), Some(text)) = (kind, text.as_deref()) {
-        text.order(stream.as_ref())?;
+        text.order().wait(stream.as_ref())?;
     }
     let mut batch = ImageBatch::open(
         runtime, storage, requests, info, rank, plan, device, stream, words, started,
@@ -532,13 +519,19 @@ fn run(
         Ok(mut stats) => {
             let elapsed = batch.started.elapsed().as_micros() as u64;
             stats.component_us.insert("image_execute".into(), elapsed);
+            let encodings = std::mem::take(&mut batch.encodings);
             Ok(Some(Launched {
                 outputs: batch.calls.into_iter().map(|state| state.output).collect(),
+                host: (!encodings.is_empty()).then(|| {
+                    Box::new(Encodings {
+                        encodings,
+                        submitted: false,
+                    }) as Box<dyn HostStage>
+                }),
                 buffer: batch.buffer,
-                encodings: batch.encodings,
-                submitted: false,
                 started,
                 stats,
+                timer: "image_materialize",
             }))
         }
         Err(failure) if failure.committed => Err(failure),
@@ -554,156 +547,67 @@ fn run(
     }
 }
 
-/// Every call fails with `code`, reporting its accepted progress.
-fn failed_output(
-    backend: &WorkerBackend,
-    plan: &BatchPlan,
-    predecessors: &[Option<uniserve_core::CallId>],
-    code: ErrorCode,
-) -> Result<BatchOutput> {
-    let requests = backend.requests();
-    let completions = plan
-        .calls
-        .iter()
-        .zip(predecessors)
-        .map(|(call, predecessor)| {
-            let key = call.request_key;
-            let progress = requests
-                .peek(key.request_id.0)
-                .filter(|request| request.key() == key && predecessor.is_some())
-                .map(|request| request.progress())
-                .transpose()?
-                .unwrap_or_default();
-            let mut output = request_output(key, call.call_id, call.code, progress)?;
-            output.status = CallStatus::Error;
-            output.error_code = Some(code);
-            Ok(output)
-        })
-        .collect::<Result<_>>()?;
-    Ok(BatchOutput {
-        batch_id: plan.batch_id,
-        completions,
-        products: Vec::new(),
-        worker_exec_us: None,
-        forward_stats: None,
-    })
+/// The PNG encodings of a decoding batch's images, run once their pixels
+/// reached the host.
+struct Encodings {
+    encodings: Vec<batch::Encoding>,
+    submitted: bool,
 }
 
-/// Materialize a launched batch once its fences completed and its decoded
-/// images were encoded.
-pub(crate) fn poll(
-    backend: &mut WorkerBackend,
-    plan: &BatchPlan,
-    launched: &mut Launched,
-) -> std::result::Result<Option<BatchResult>, WorkerError> {
-    if lock(&launched.buffer).ready_at()?.is_none() {
-        return Ok(None);
-    }
-    if !launched.submitted {
-        // The pixels are on the host: encode them.
-        for encoding in &launched.encodings {
-            encoding.task.submit()?;
+impl HostStage for Encodings {
+    fn poll(&mut self) -> Result<bool> {
+        if !self.submitted {
+            // The output fences completed: the pixels are on the host.
+            for encoding in &self.encodings {
+                encoding.task.submit()?;
+            }
+            self.submitted = true;
         }
-        launched.submitted = true;
+        Ok(self
+            .encodings
+            .iter()
+            .all(|encoding| encoding.task.completion.done()))
     }
-    if !launched
-        .encodings
-        .iter()
-        .all(|encoding| encoding.task.completion.done())
-    {
-        return Ok(None);
-    }
-    for encoding in std::mem::take(&mut launched.encodings) {
-        let output = &mut launched.outputs[encoding.call];
-        match encoding.task.completion.outcome() {
-            Some(Outcome::Success(result)) => {
-                if let ImageResult::Encoded(bytes) = &*result
-                    && output.reports_output
-                {
-                    let source = uniserve_core::MediaSource::publish(bytes).map_err(|error| {
-                        Error::Invalid(format!("publishing an encoded image failed: {error}"))
-                    })?;
-                    output.set_media(source)?;
+
+    fn finish(&mut self, outputs: &mut [PendingOutput]) -> Result<()> {
+        for encoding in std::mem::take(&mut self.encodings) {
+            let output = outputs
+                .get_mut(encoding.call)
+                .ok_or_else(|| Error::Invariant("an image encoding names no call".into()))?;
+            match encoding.task.completion.outcome() {
+                Some(Outcome::Success(result)) => {
+                    if let ImageResult::Encoded(bytes) = &*result
+                        && output.reports_output
+                    {
+                        let source =
+                            uniserve_core::MediaSource::publish(bytes).map_err(|error| {
+                                Error::Invalid(format!(
+                                    "publishing an encoded image failed: {error}"
+                                ))
+                            })?;
+                        output.set_media(source)?;
+                    }
+                }
+                Some(Outcome::Failed(error)) => {
+                    tracing::error!(
+                        target: "uniserve_worker.execution",
+                        "image encoding failed: {error}"
+                    );
+                    output.output.status = CallStatus::Error;
+                    output.output.error_code = Some(ErrorCode::InvalidCall);
+                }
+                Some(Outcome::Cancelled) | None => {
+                    output.output.status = CallStatus::Error;
+                    output.output.error_code = Some(ErrorCode::Internal);
                 }
             }
-            Some(Outcome::Failed(error)) => {
-                tracing::error!(
-                    target: "uniserve_worker.execution",
-                    "image encoding failed: {error}"
-                );
-                output.output.status = CallStatus::Error;
-                output.output.error_code = Some(ErrorCode::InvalidCall);
-            }
-            Some(Outcome::Cancelled) | None => {
-                output.output.status = CallStatus::Error;
-                output.output.error_code = Some(ErrorCode::Internal);
-            }
         }
+        Ok(())
     }
-    lock(&launched.buffer).readback()?;
-    let mut completions = Vec::with_capacity(launched.outputs.len());
-    let mut media = Vec::new();
-    for output in &mut launched.outputs {
-        let key = output.output.request_key;
-        let parent = backend
-            .requests()
-            .peek(key.request_id.0)
-            .filter(|request| request.key() == key)
-            .map(|request| request.progress())
-            .transpose()?
-            .unwrap_or_default();
-        let mut buffer = lock(&launched.buffer);
-        if let Err(error) = output.resolve(parent, &mut buffer) {
-            tracing::error!(
-                target: "uniserve_worker.execution",
-                "image result materialization failed: {error}"
-            );
-            output.output.status = CallStatus::Error;
-            output.output.error_code = Some(ErrorCode::ComputeError);
-            output.progress = parent;
-            buffer.discard(output.row);
-            completions.push(output.output.clone());
-            continue;
-        }
-        completions.push(output.result()?.clone());
-        media.extend(output.take_media());
-    }
-    for output in &launched.outputs {
-        if output.resolved() {
-            output.accept(backend.requests_mut())?;
-        } else {
-            output.cancel(backend.requests_mut())?;
-        }
-    }
-    let mut stats = std::mem::take(&mut launched.stats);
-    let elapsed = launched.started.elapsed().as_micros() as u64;
-    stats
-        .component_us
-        .insert("image_materialize".into(), elapsed);
-    Ok(Some(BatchResult {
-        output: BatchOutput {
-            batch_id: plan.batch_id,
-            completions,
-            products: Vec::new(),
-            worker_exec_us: Some(elapsed),
-            forward_stats: Some(stats),
-        },
-        media,
-    }))
-}
 
-/// Cancel a launched batch's unresolved calls and pending encodings; its
-/// storage retires through the fences it recorded.
-pub(crate) fn abandon(
-    backend: &mut WorkerBackend,
-    launched: Launched,
-) -> std::result::Result<(), WorkerError> {
-    for output in &launched.outputs {
-        output.cancel(backend.requests_mut())?;
+    fn cancel(&mut self) {
+        for encoding in &self.encodings {
+            let _ = encoding.task.cancel(false);
+        }
     }
-    for encoding in &launched.encodings {
-        let _ = encoding.task.cancel(false);
-    }
-    lock(&launched.buffer).abandon();
-    Ok(())
 }

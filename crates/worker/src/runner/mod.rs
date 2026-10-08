@@ -1,6 +1,7 @@
 //! Routing and homogeneous batches for the worker's numerical runners.
 
 pub(crate) mod attention;
+pub(crate) mod canvas;
 pub(crate) mod decoder;
 pub(crate) mod diffusion;
 pub(crate) mod encoder;
