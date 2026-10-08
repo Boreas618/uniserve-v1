@@ -5,8 +5,10 @@ serves one encoder call of a bound component: the module at ``path``
 within the binding's root (``""`` for the root itself, ``"vision"`` for a
 text encoder's vision tower bound with it). Two table entries serve it:
 
-- ``encoder.describe(prepared, loaded, path)`` reports the facts the
-  worker sizes the encoder's buffers and plans its calls with.
+- ``encoder.describe(loaded, path, dtype)`` reports, before the encoder's
+  component is bound, the facts the worker sizes the binding, the
+  encoder's buffers and its calls with (``path`` is the module's path in
+  the model).
 - ``encoder.bind(prepared, loaded, path, buffers)`` binds the worker's
   buffers once and returns the encoder's step functions.
 
@@ -76,6 +78,7 @@ import torch
 from uniserve_models.media.pixels import PreparedImage, prepare_tensor_image
 from uniserve_models.model import PatchEncoder, TextEncoder, VisionInput
 from uniserve_models.nn.vae import PatchAutoencoder
+from uniserve_models.processing import PatchTransform
 
 from . import calls, graphs, regions
 from .errors import translate
@@ -103,16 +106,34 @@ def _defines(module, method: str, base: type) -> bool:
     return getattr(type(module), method) is not getattr(base, method)
 
 
-def describe(prepared, loaded, path: str) -> dict[str, Any]:
-    """Facts of the encoder at ``path``.
+def _max_patches(processor, patch_size: int) -> int:
+    """Patch rows of the largest image the processor's vit tower admits."""
+    transform = None if processor is None else processor.vit
+    if transform is None:
+        return 0
+    pixels = (
+        transform.pixel_bound()
+        if isinstance(transform, PatchTransform)
+        else min(transform.resize.max_pixels, transform.resize.max_size**2)
+    )
+    return pixels // patch_size**2
+
+
+def describe(loaded, path: str, dtype: str) -> dict[str, Any]:
+    """Facts of the encoder at module ``path`` of the loaded model.
+
+    ``dtype`` is the deployment's model dtype, which a text encoder's hidden
+    states carry. Planned before the encoder's component is bound.
 
     Returns:
         ``kind`` (``"vision"``, ``"latent"`` or ``"text"``) and:
 
         - vision: ``patch_size``, ``downsample`` (input patches per feature
           on each axis), ``output_size``, ``output_dtype``, ``max_patches``
-          (0 for an unpacked encoder), ``row_width`` (values per packed
-          patch row) and ``pixel_dtype`` (the image policy's output dtype).
+          (patch rows of one packed slot, 0 for an unpacked encoder),
+          ``image_patches`` (patch rows of the largest image the image
+          policy admits), ``row_width`` (values per packed patch row) and
+          ``pixel_dtype`` (the image policy's output dtype).
         - latent: ``downsample`` (pixels per latent patch on each axis),
           ``width`` (values per latent patch row) and ``output_dtype``.
         - text: ``hidden_size``, ``output_dtype`` and ``positions``
@@ -122,7 +143,8 @@ def describe(prepared, loaded, path: str) -> dict[str, Any]:
     Raises:
         UnsupportedCall: The module has no worker encoder binding.
     """
-    module = calls.module(prepared, path)
+    path = str(path)
+    module = loaded.module.get_submodule(path) if path else loaded.module
     kind = _kind(module)
     if kind == "vision":
         encoder = cast(PatchEncoder, module)
@@ -138,6 +160,7 @@ def describe(prepared, loaded, path: str) -> dict[str, Any]:
             "output_size": int(layout.shape[1]),
             "output_dtype": str(layout.dtype).removeprefix("torch."),
             "max_patches": encoder.max_patches or 0,
+            "image_patches": _max_patches(processor, encoder.patch_size),
             "row_width": 3 * encoder.patch_size**2,
             "pixel_dtype": str(pixel_dtype).removeprefix("torch."),
         }
@@ -152,7 +175,6 @@ def describe(prepared, loaded, path: str) -> dict[str, Any]:
             ),
         }
     encoder = cast(TextEncoder, module)
-    dtype = prepared.context.dtype
     return {
         "kind": kind,
         "hidden_size": int(encoder.network.hidden_size),
