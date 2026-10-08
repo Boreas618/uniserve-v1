@@ -143,11 +143,9 @@ pub struct DiffusionCapacity {
 
 /// What a runner binds beside its own columns.
 pub struct DiffusionStorage {
-    /// The latent pool's step workspace `[units, width]`.
+    /// The latent pool's step workspace `[units, width]`, on the
+    /// denoiser's device.
     pub samples: StorageView,
-    /// The samples the network reads, on the denoiser's device: the step
-    /// workspace, or a mirror of it.
-    pub inputs: StorageView,
     /// The latent pool's per-slot timesteps `[slots + 1, 1]` float32.
     pub slot_timesteps: StorageView,
     /// The denoiser device's product arena (`uint8`).
@@ -172,7 +170,6 @@ pub struct ImageDiffusion {
     layout: ImageDenoiserLayout,
     device: Device,
     stream: Option<Stream>,
-    sample_stream: Option<Stream>,
     steps: Steps,
     capacity: DiffusionCapacity,
     attention: AttentionColumns,
@@ -209,9 +206,8 @@ fn bytes<T: Copy>(values: &[T]) -> &[u8] {
 
 impl ImageDiffusion {
     /// Allocate the runner's columns and bind the denoiser at `path` of
-    /// `binding`. `stream` borrows the binding's stream and
-    /// `sample_stream` the latent pool's (the same stream when the pool
-    /// shares the denoiser's device).
+    /// `binding`. `stream` borrows the binding's stream, on which every
+    /// step and sample update runs.
     #[expect(
         clippy::too_many_arguments,
         reason = "the binding's complete resources"
@@ -224,7 +220,7 @@ impl ImageDiffusion {
         layout: ImageDenoiserLayout,
         capacity: DiffusionCapacity,
         storage: DiffusionStorage,
-        streams: (Option<Stream>, Option<Stream>),
+        stream: Option<Stream>,
     ) -> Result<Self> {
         let owner = if path.is_empty() {
             binding.component.clone()
@@ -232,8 +228,7 @@ impl ImageDiffusion {
             format!("{}.{path}", binding.component)
         };
         let device = binding.device;
-        let (stream, sample_stream) = streams;
-        if device.is_cuda() != stream.is_some() || stream.is_some() != sample_stream.is_some() {
+        if device.is_cuda() != stream.is_some() {
             return Err(Error::Invariant(
                 "an image denoiser runs on streams exactly on CUDA devices".into(),
             ));
@@ -280,7 +275,6 @@ impl ImageDiffusion {
             ("predictions", predictions),
             ("step", step),
             ("samples", storage.samples),
-            ("inputs", storage.inputs),
             ("slot_timesteps", storage.slot_timesteps),
             ("products", storage.products),
         ];
@@ -296,8 +290,6 @@ impl ImageDiffusion {
         }
         let tensors = attention.tensors(tensors)?;
         let function = interface.function("denoiser.bind")?;
-        let handle =
-            |stream: &Option<Stream>| stream.as_ref().map_or(0, |stream| stream.raw() as i64);
         let functions = Functions::new(
             function.name(),
             function.call_values(&[
@@ -306,7 +298,6 @@ impl ImageDiffusion {
                 Any::from(tvm_ffi::String::from(path)),
                 tensors.into_any(),
                 Any::from(storage.layout),
-                Any::from(handle(&sample_stream)),
             ])?,
         )?;
         let steps = Steps {
@@ -325,7 +316,6 @@ impl ImageDiffusion {
             layout,
             device,
             stream,
-            sample_stream,
             steps,
             capacity,
             attention,
@@ -347,11 +337,6 @@ impl ImageDiffusion {
     /// The binding's stream; `None` on the host.
     pub fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
-    }
-
-    /// The latent pool's stream; `None` on the host.
-    pub fn sample_stream(&self) -> Option<&Stream> {
-        self.sample_stream.as_ref()
     }
 
     pub fn capacity(&self) -> &DiffusionCapacity {
@@ -624,14 +609,16 @@ impl ImageDiffusion {
     }
 
     /// Capture the shape of `rows` after an eager evaluation of them (its
-    /// warmup),
-    /// which gathered the geometry the graph reads. `check` runs after the
-    /// capture (the graph storage budget); a failed check releases it.
+    /// warmup), which gathered the geometry the graph reads. `pools` holds
+    /// the owner's allocator pool on the runner's device and one on each
+    /// other device the network's modules run on (a generation tower).
+    /// `check` runs after the capture (the graph storage budget); a failed
+    /// check releases it.
     pub fn capture(
         &mut self,
         rows: &[DenoiseRow],
         tables: &BlockTables,
-        pool: &Arc<GraphPool<Handle>>,
+        pools: &[Arc<GraphPool<Handle>>],
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
         let shape = DiffusionShape::of(rows).ok_or_else(|| {
@@ -671,10 +658,27 @@ impl ImageDiffusion {
             (&Self::described(&described)).into(),
             (&geometry.to_any()).into(),
         ])?;
+        let ordinal = self.device.cuda_index();
+        let pool = pools
+            .iter()
+            .find(|pool| Some(pool.device) == ordinal)
+            .ok_or_else(|| Error::Invariant("a denoiser graph has no pool on its device".into()))?;
+        let peers = list(
+            pools
+                .iter()
+                .filter(|pool| Some(pool.device) != ordinal)
+                .map(|pool| {
+                    Any::from(list([
+                        Any::from(i64::from(pool.device)),
+                        pool.value.to_any(),
+                    ]))
+                }),
+        );
         let graph = Handle::new(self.steps.capture.call_values(&[
             Self::described(&described),
             geometry.to_any(),
             pool.value.to_any(),
+            Any::from(peers),
         ])?);
         if let Err(error) = check() {
             if let Err(cleanup) = self.release.invoke(&[graph.view()]) {

@@ -85,9 +85,11 @@ pub(crate) struct ImageRuntime {
     /// Graph pools of packed vision encoders, by encoder.
     pools: HashMap<usize, Arc<GraphPool<Handle>>>,
     /// The denoising steps captured at startup, largest first, and their
-    /// graph pool; empty when flow graphs are off.
+    /// graph pools: one on the denoiser's device and one on each other
+    /// device its modules run on (a generation tower). Empty when flow
+    /// graphs are off.
     flow: Vec<start::FlowShape>,
-    flow_pool: Option<Arc<GraphPool<Handle>>>,
+    flow_pools: Vec<Arc<GraphPool<Handle>>>,
     /// Output words of a decoding batch's pixels at most.
     max_pixel_words: usize,
     outputs: OutputPool,
@@ -184,12 +186,13 @@ impl ImageRuntime {
                 runner.capture(Some(pool), &mut || Ok(()))?;
             }
         }
-        let (Some(pool), Some(kv)) = (self.flow_pool.clone(), kv) else {
+        let Some(kv) = kv.filter(|_| !self.flow_pools.is_empty()) else {
             return Ok(());
         };
+        let pools = self.flow_pools.clone();
         let shapes = self.flow.clone();
         for shape in &shapes {
-            self.capture_flow(shape, &pool, kv)?;
+            self.capture_flow(shape, &pools, kv)?;
         }
         if let Some((_, diffusion)) = &self.diffusion {
             if let Some(stream) = diffusion.stream() {
@@ -211,7 +214,7 @@ impl ImageRuntime {
     fn capture_flow(
         &mut self,
         shape: &start::FlowShape,
-        pool: &Arc<GraphPool<Handle>>,
+        pools: &[Arc<GraphPool<Handle>>],
         kv: &mut KVCache,
     ) -> Result<()> {
         let latents = self.latents()?;
@@ -249,7 +252,7 @@ impl ImageRuntime {
         }
         let lengths = vec![prefix; shape.images];
         with_scratch(kv, &lengths, stream.as_ref(), |kv| {
-            diffusion.capture(&rows, kv.tables(), pool, &mut || Ok(()))
+            diffusion.capture(&rows, kv.tables(), pools, &mut || Ok(()))
         })
     }
 
