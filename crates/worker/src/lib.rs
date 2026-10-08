@@ -12,6 +12,7 @@ pub mod config;
 pub mod cuda;
 mod error;
 mod executor;
+pub mod ffi;
 mod host;
 pub mod nccl;
 mod parallel;
