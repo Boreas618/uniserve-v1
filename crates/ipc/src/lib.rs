@@ -10,9 +10,10 @@
 //! [`Header`]. The engine reaches a rank on the head's host through
 //! [`iceoryx`] shared storage and a rank on another host through a [`socket`]
 //! stream; both carry the same frames, and [`channel`] presents either one as
-//! a [`RankChannel`] (engine side) or [`RankServer`] (rank side). The Python
-//! worker binds [`RankServer`] through the `worker-ipc-py` extension, so the
-//! engine and that extension must be built with the same [`IPC_VERSION`].
+//! a [`RankChannel`] (engine side) or [`RankServer`] (rank side). The rank
+//! runtime (`uniserve-worker`) binds [`RankServer`] and is started with a
+//! [`LaunchDescriptor`]; the engine and the worker library must be built with
+//! the same [`IPC_VERSION`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -83,6 +84,8 @@ pub mod channel;
 pub mod codec;
 /// Shared-storage rank transport for ranks on the head's host.
 pub mod iceoryx;
+/// The launch descriptor shared by the engine, `uniserve-host` and the rank.
+pub mod launch;
 /// Stream-socket rank transport for ranks on other hosts.
 pub mod socket;
 #[allow(missing_docs, warnings)]
@@ -99,6 +102,7 @@ pub use iceoryx::{
     Frame, Header, IPC_VERSION, IpcError, IpcResult, Pending, ServerEndpoint, WakeEvents,
     WakeSender, header_for_request, header_for_response, is_supported_ipc_version, service_name,
 };
+pub use launch::{ExpertParallelDescriptor, LaunchDescriptor};
 pub use socket::{SocketClient, SocketServer};
 
 // Message types are split by concern and re-exported flat at the crate root;
