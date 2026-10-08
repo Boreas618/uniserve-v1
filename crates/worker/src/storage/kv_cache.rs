@@ -481,15 +481,6 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> KVCacheManager<C> {
         Ok(())
     }
 
-    /// Backend handles retained by the manager, for language-runtime tracing.
-    pub fn completions(&self) -> impl Iterator<Item = &C> {
-        self.executions
-            .values()
-            .map(|execution| &execution.completion)
-            .chain(self.exports.values().flat_map(|export| &export.retirements))
-            .chain(self.imports.values().map(|import| &import.retirement))
-    }
-
     fn execution_keys(&self, spans: &[(u32, u32, u32)]) -> HashSet<usize> {
         spans
             .iter()

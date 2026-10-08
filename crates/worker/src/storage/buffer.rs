@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use uniserve_ipc::{BufferAllocation, BufferId};
 
+use crate::ffi::Device;
+use crate::storage::memory::{Memory, device_name};
 use crate::{Error, Result};
 
-/// One pool-issued physical range. Numerical views retain their allocation;
-/// this handle identifies the occupied range until all accesses retire.
+/// One pool-issued physical range. Views retain their allocation; this
+/// handle identifies the occupied range until all accesses retire.
 pub struct BufferBinding {
     buffer: BufferId,
     device: String,
@@ -39,8 +41,8 @@ struct Arena<A> {
     active: HashMap<BufferId, Arc<BufferBinding>>,
 }
 
-/// Bind nonoverlapping views into fixed arenas supplied by the backend.
-/// The owner serializes binding, numerical view creation and release.
+/// Bind nonoverlapping ranges of fixed per-device arenas.
+/// The owner serializes binding, view creation and release.
 pub struct BufferPool<A> {
     byte_capacity: u64,
     compact: bool,
@@ -168,7 +170,7 @@ impl<A> BufferPool<A> {
     }
 
     /// After physical accesses retire, return arena owners for destruction
-    /// outside the pool lock. Existing numerical views retain their storage.
+    /// outside the pool lock. Existing views retain their storage.
     pub fn close(&mut self) -> Vec<A> {
         self.arenas
             .drain()
@@ -208,4 +210,26 @@ fn compact_offset<A>(arena: &Arena<A>, extent: u64, capacity: u64) -> Result<u64
 /// Match the 256-byte product alignment used by startup capacity accounting.
 fn align(bytes: u64) -> Option<u64> {
     bytes.checked_add(255).map(|bytes| bytes / 256 * 256)
+}
+
+impl BufferPool<Arc<Memory>> {
+    /// Allocate one arena of `byte_capacity` bytes per device, keyed by its
+    /// locator name (`cuda:<index>` or `cpu`). Device arenas are exportable
+    /// allocations, so CUDA VMM exports of persistent products are made in
+    /// place; host arenas serve CPU lanes. Contents are uninitialized.
+    pub fn allocate(byte_capacity: u64, compact: bool, devices: &[Device]) -> Result<Self> {
+        let bytes = usize::try_from(byte_capacity)
+            .map_err(|_| Error::Invalid("buffer pool capacity overflows".into()))?;
+        let arenas = devices
+            .iter()
+            .map(|&device| {
+                let arena = match device {
+                    Device::Cuda(index) => Memory::exportable(index, bytes, &[])?,
+                    Device::Cpu | Device::CudaHost => Memory::host(bytes),
+                };
+                Ok((device_name(device), arena))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self::new(byte_capacity, compact, arenas))
+    }
 }

@@ -142,8 +142,8 @@ def test_facts_report_text_geometry_and_formats(loaded):
 def test_cache_plan_describes_pages_of_the_requested_size(loaded):
     table, model = loaded
     plan = table["model.cache_plan"](model, 32, "")
-    assert plan["readable"] is True
-    assert plan["stored_dtype"] == "bfloat16"
+    assert table["model.reads_pages"](model, "torch", plan) is True
+    assert plan["dtype"] == "bfloat16"
     (group,) = plan["groups"]
     assert group["page_tokens"] == 32
     assert group["layers"] == ["backbone.layers.0.attention"]

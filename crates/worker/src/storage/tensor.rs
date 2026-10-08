@@ -1,8 +1,11 @@
-//! Cross-call tensor storage, read leases and physical retirement.
+//! Cross-call tensor storage state: write states, read leases and physical
+//! retirement.
 //!
-//! The store serializes changes to its buffers. Numerical backends retain
-//! buffer and import handles, and fixed arenas. Handles borrow native state
-//! directly; their foreign owners never decide when storage can be reused.
+//! [`StoreState`] is the bookkeeping core of the rank's tensor store
+//! (`super::tensor_store::TensorStore`), which serializes changes to it.
+//! Buffer and import handles share their state with read leases; only
+//! physical completion (events, transfer and export retirement) decides when
+//! storage can be reused.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -54,7 +57,7 @@ pub struct Fence {
 
 /// One allocation-backed value. The owning store protects mutations, while
 /// read handles retain the same buffer through logical release and reuse.
-/// T and C retain transfers and exports and borrow their native completions.
+/// T and C retain transfers and exports and borrow their completions.
 pub struct Buffer<T, C> {
     pub id: BufferId,
     pub device: String,
@@ -225,8 +228,8 @@ impl<B, T> TensorImport<B, T> {
     }
 }
 
-/// One consumer's access. The numerical caller keeps a stable tensor view
-/// even when another import extends the buffer's resident coverage.
+/// One consumer's access. The consumer keeps a stable tensor view even when
+/// another import extends the buffer's resident coverage.
 pub struct TensorRead<B, I> {
     pub buffer: B,
     pub consumer: Option<CallId>,
@@ -264,9 +267,9 @@ struct Lane {
     fields: HashSet<(String, usize)>,
 }
 
-/// Rank-local values and bounded scalar relay lanes. B and I retain the
-/// numerical owners of native buffers and imports; A holds an arena or view.
-pub struct TensorStore<B, I, A> {
+/// Rank-local values and bounded scalar relay lanes. B and I are buffer and
+/// import handles; A holds an arena or a relay lane's view.
+pub struct StoreState<B, I, A> {
     pub capacity: usize,
     pub byte_capacity: usize,
     pub request_capacity: usize,
@@ -281,7 +284,7 @@ pub struct TensorStore<B, I, A> {
     call_lanes: HashMap<RelayCall, usize>,
 }
 
-impl<B, I, A> TensorStore<B, I, A> {
+impl<B, I, A> StoreState<B, I, A> {
     pub fn new(
         capacity: usize,
         byte_capacity: usize,
@@ -305,11 +308,11 @@ impl<B, I, A> TensorStore<B, I, A> {
     }
 }
 
-impl<B, I, A, T, C> TensorStore<B, I, A>
+impl<B, I, A, T, C> StoreState<B, I, A>
 where
     B: Deref<Target = Mutex<Buffer<T, C>>>,
 {
-    /// Check the whole allocation group before the backend creates any views.
+    /// Check the whole allocation group before any view is created.
     pub fn validate_bindings(&self, bindings: &[(BufferId, String)], feature: bool) -> Result<()> {
         let mut seen = HashSet::new();
         let mut counts = HashMap::<String, usize>::new();
@@ -340,7 +343,7 @@ where
         Ok(())
     }
 
-    /// Capacity is committed only after numerical allocation succeeds.
+    /// Capacity is committed only after the arena allocation succeeds.
     pub fn arena_capacity(&self, bytes: usize) -> Result<usize> {
         self.allocated_bytes
             .checked_add(bytes)
@@ -492,7 +495,7 @@ where
     }
 
     /// Return retired owners and their backing only after the full query pass.
-    /// The backend releases pool bindings and event references after this call.
+    /// The caller releases pool bindings and event references after this call.
     pub fn reclaim<TE, TC, CE, CC>(&mut self) -> Result<Vec<(B, Backing)>>
     where
         T: Deref<Target = Completion<TE, TC>>,
@@ -576,7 +579,7 @@ where
     }
 
     /// After physical accesses drain, return owners for destruction outside
-    /// the store lock. Existing numerical reads retain their tensor views.
+    /// the store lock. Existing reads retain their views.
     pub fn close(&mut self) -> Self {
         let empty = Self::new(
             self.capacity,
