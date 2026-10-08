@@ -19,6 +19,7 @@ use super::super::launch::{lock, read_flag, reports_output, seal};
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, TextRuntime};
 use crate::executor::PendingOutput;
+use crate::executor::forward::image::ImageRuntime;
 use crate::ffi::Device;
 use crate::request::RequestPool;
 use crate::sampling::SamplingMetadata;
@@ -46,6 +47,8 @@ pub(super) struct CallState {
 /// A token batch's borrowed owners and the resources it reserved.
 pub(super) struct TokenBatch<'a> {
     pub(super) runtime: &'a mut TextRuntime,
+    /// The image runtime, for prompts placing image features.
+    pub(super) image: Option<&'a mut ImageRuntime>,
     pub(super) storage: &'a mut RankStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
@@ -67,8 +70,10 @@ pub(super) struct TokenBatch<'a> {
 
 impl<'a> TokenBatch<'a> {
     /// Bind the batch's outputs and lease its output storage.
+    #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(super) fn open(
         runtime: &'a mut TextRuntime,
+        image: Option<&'a mut ImageRuntime>,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
         info: &uniserve_ipc::WorkerInfo,
@@ -161,6 +166,7 @@ impl<'a> TokenBatch<'a> {
         }
         Ok(Self {
             runtime,
+            image,
             storage,
             requests,
             plan,
@@ -213,33 +219,40 @@ impl<'a> TokenBatch<'a> {
             kv.recycle(&units, &self.runtime.columns[self.runner], stream)?;
         }
 
-        // Each active call has one forward row on its own slot. A queued
-        // token relay declares a capacity bound: its device state decides the
-        // visible length when it executes.
+        // Each active call has one forward row on its own slot; a context
+        // prefill has one per prompt run and vision block (checked against
+        // its rows when they are built). A queued token relay declares a
+        // capacity bound: its device state decides the visible length when
+        // it executes.
         let forward = &plan.forward;
-        let mut rows: Vec<Option<usize>> = vec![None; plan.calls.len()];
+        let mut rows: Vec<Vec<usize>> = vec![Vec::new(); plan.calls.len()];
         for (row, &call) in forward.call_indices.iter().enumerate() {
-            let entry = rows
-                .get_mut(call as usize)
-                .ok_or_else(|| Error::Invalid("forward row names no call".into()))?;
-            if entry.replace(row).is_some() {
+            rows.get_mut(call as usize)
+                .ok_or_else(|| Error::Invalid("forward row names no call".into()))?
+                .push(row);
+        }
+        for ((call, state), call_rows) in plan.calls.iter().zip(&self.calls).zip(&rows) {
+            if !state.active {
+                continue;
+            }
+            let (&first, rest) = call_rows
+                .split_first()
+                .ok_or_else(|| Error::Invalid("a token call has no forward row".into()))?;
+            if !rest.is_empty() && !call.writes_context() {
                 return Err(Error::Invalid(
                     "a token call has exactly one forward row".into(),
                 ));
             }
-        }
-        for ((call, state), row) in plan.calls.iter().zip(&self.calls).zip(rows) {
-            if !state.active {
-                continue;
-            }
-            let row = row
-                .ok_or_else(|| Error::Invalid("a token call has exactly one forward row".into()))?;
-            if forward.request_pool_indices[row] as usize != state.slot {
+            if call_rows
+                .iter()
+                .any(|&row| forward.request_pool_indices[row] as usize != state.slot)
+            {
                 return Err(Error::Invalid(
                     "a token call's forward row reads another slot".into(),
                 ));
             }
-            let declared = u64::from(forward.seq_lens[row].saturating_sub(forward.query_lens[row]));
+            let declared =
+                u64::from(forward.seq_lens[first].saturating_sub(forward.query_lens[first]));
             let visible = state.output.progress.kv_visible_len;
             let relayed = call
                 .predicate
@@ -250,24 +263,29 @@ impl<'a> TokenBatch<'a> {
                     "forward row sequence length disagrees with execution state".into(),
                 ));
             }
-            // Readers retain their prefix, writers also their query tokens;
-            // a windowed group starts at its first resident page.
-            let length = u64::from(if forward.write_kv[row] {
-                forward.seq_lens[row]
-            } else {
-                forward.seq_lens[row] - forward.query_lens[row]
-            });
-            let mut spans = Vec::new();
-            let tables = kv.tables();
-            for group in 0..tables.groups().len() as u32 {
-                let table = tables.table(state.slot as u32, group)?;
-                let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
-                if length > start {
-                    spans.extend(table.spans(start, length - start)?);
+            for &row in call_rows {
+                // Readers retain their prefix, writers also their query
+                // tokens; a windowed group starts at its first resident page.
+                let length = u64::from(if forward.write_kv[row] {
+                    forward.seq_lens[row]
+                } else {
+                    forward.seq_lens[row] - forward.query_lens[row]
+                });
+                let mut spans = Vec::new();
+                let tables = kv.tables();
+                for group in 0..tables.groups().len() as u32 {
+                    let table = tables.table(state.slot as u32, group)?;
+                    let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
+                    if length > start {
+                        spans.extend(table.spans(start, length - start)?);
+                    }
                 }
+                kv.manager().retain_execution(
+                    call.request_key,
+                    &spans,
+                    Arc::clone(&self.retirement),
+                );
             }
-            kv.manager()
-                .retain_execution(call.request_key, &spans, Arc::clone(&self.retirement));
         }
 
         self.bind_products()?;
@@ -294,12 +312,6 @@ impl<'a> TokenBatch<'a> {
             {
                 return Err(Error::Unsupported(
                     "token calls publish no tensor products besides their relays".into(),
-                ));
-            }
-            if !call.vision_inputs.is_empty() || call.latent_feature_input.is_some() {
-                return Err(Error::Unsupported(
-                    "context prefill with media features is served by the multimodal runtime"
-                        .into(),
                 ));
             }
             for scalar in [

@@ -1,10 +1,15 @@
 //! Routing and homogeneous batches for the worker's numerical runners.
 
+pub(crate) mod attention;
 pub(crate) mod canvas;
+pub(crate) mod decoder;
+pub(crate) mod diffusion;
+pub(crate) mod encoder;
 mod graph_shapes;
 mod graph_storage;
 pub(crate) mod graphs;
 pub(crate) mod text;
+pub(crate) mod vision;
 
 pub use graph_shapes::{PrefillShape, TextShapes, prefill_shapes, prefill_units};
 pub use graph_storage::{GraphPool, GraphPools, GraphStorage, graph_storage_budget_bytes};

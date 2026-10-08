@@ -30,6 +30,8 @@
 //! | `tagged`, `points` | i64 | `[R]` | steps: relay value, emitted tokens |
 //! | `logprobs` | i64 | `[L]` | steps: packed logprob words |
 //! | `prompt_tail` | model | `[R, vocab]` | steps: last logits of scored chunks |
+//! | `input_embeddings` | model | `[T, hidden]` | Rust: vision features (multimodal) |
+//! | `embedding_mask` | u8 | `[T]` | Rust: tokens whose embedding is replaced (multimodal) |
 
 use std::sync::Arc;
 
@@ -63,6 +65,9 @@ pub(crate) struct Dimensions {
     pub(crate) hidden: usize,
     /// Allocate the prefill graph output.
     pub(crate) hidden_output: bool,
+    /// Allocate precomputed embeddings replacing token embeddings (vision
+    /// features of multimodal prompts).
+    pub(crate) embeddings: bool,
     pub(crate) dtype: DType,
 }
 
@@ -115,6 +120,14 @@ impl Dimensions {
         ];
         if self.hidden_output {
             columns.push(("hidden", self.dtype, vec![tokens, self.hidden as i64]));
+        }
+        if self.embeddings {
+            columns.push((
+                "input_embeddings",
+                self.dtype,
+                vec![tokens, self.hidden as i64],
+            ));
+            columns.push(("embedding_mask", DType::U8, vec![tokens]));
         }
         columns
     }

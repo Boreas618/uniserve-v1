@@ -8,6 +8,7 @@
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{Call, CallKind, DType, ForwardMode};
 
+use super::context::Media;
 use crate::executor::PendingOutput;
 use crate::runner::TokenSelection;
 use crate::runner::text::{RowSource, TokenRow};
@@ -23,7 +24,10 @@ pub(super) const CACHE: i64 = 3;
 
 /// A call's input row and how it uses the row's logits.
 pub(super) struct Prepared {
+    /// The call's last row: the one it samples from.
     pub(super) row: TokenRow,
+    /// The rows and positions of a call placing image features.
+    pub(super) media: Option<Media>,
     /// The call scores its prompt chunk.
     pub(super) scores: bool,
     /// Draft tokens of a verification.
@@ -119,7 +123,7 @@ pub(super) fn prepare(
         }
     };
     let query = match &source {
-        RowSource::Host { tokens, .. } => tokens.len(),
+        RowSource::Host { tokens, .. } | RowSource::Placed { tokens, .. } => tokens.len(),
         RowSource::Relay { drafts, .. } => drafts.len() + 1,
         RowSource::Resident | RowSource::Indexed => 1,
     };
@@ -133,6 +137,7 @@ pub(super) fn prepare(
         Vec::new()
     };
     Ok(Prepared {
+        media: None,
         row: TokenRow {
             slot,
             source,
@@ -146,6 +151,7 @@ pub(super) fn prepare(
                 .sampling_state
                 .as_ref()
                 .is_some_and(|state| state.force_finish),
+            causal: true,
         },
         scores,
         drafts,
@@ -164,6 +170,9 @@ pub(super) fn sample_positions(
     start: u64,
 ) -> Result<Option<Vec<u64>>> {
     let mode = kind(call)?;
+    if let Some(media) = &prepared.media {
+        return Ok(call.token_output.is_some().then(|| vec![media.sample]));
+    }
     Ok(match mode {
         ForwardMode::Prefill if call.token_output.is_none() => None,
         ForwardMode::Prefill | ForwardMode::Decode => {
@@ -224,6 +233,24 @@ pub(super) fn finish(
     let slot = i64::from(row.slot);
     let start = output.progress.logical_position;
     let rng = output.progress.rng_counter;
+    if let Some(media) = &prepared.media {
+        // A call placing image features advances to explicit positions.
+        let length = written_length(tables, row, u64::from(row.query))?;
+        output.advance_tokens(0, Some(length), Some(media.position), task.is_some());
+        return Ok(match task {
+            None => [slot, CACHE, -1, length as i64, 0, 0, 0, 0],
+            Some(task) => [
+                slot,
+                EXPLICIT,
+                task as i64,
+                length as i64,
+                media.continued as i64,
+                output.progress.rng_counter as i64,
+                0,
+                i64::from(penalties),
+            ],
+        });
+    }
     match (mode, task) {
         (ForwardMode::Prefill, None) => {
             let length = written_length(tables, row, u64::from(row.query))?;
