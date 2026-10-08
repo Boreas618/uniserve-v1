@@ -82,6 +82,12 @@ impl TextRuntime {
         }
     }
 
+    /// The order of this runtime's batches across streams; other runtimes
+    /// reading what text batches write (their KV) wait on it.
+    pub(crate) fn order(&self) -> &StreamOrder {
+        &self.order
+    }
+
     pub(crate) fn set_wake(&self, _wake: Option<Wake>) {}
 
     /// Release graphs, steps and output storage after the lanes drained.
