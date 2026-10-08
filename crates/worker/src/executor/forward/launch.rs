@@ -207,6 +207,7 @@ pub(crate) fn materialize(
     }
     lock(&launched.buffer).readback()?;
     let mut completions = Vec::with_capacity(launched.outputs.len());
+    let mut products = Vec::new();
     let mut media = Vec::new();
     for output in &mut launched.outputs {
         let key = output.output.request_key;
@@ -231,7 +232,12 @@ pub(crate) fn materialize(
             completions.push(output.output.clone());
             continue;
         }
-        completions.push(output.result()?.clone());
+        let completion = output.result()?;
+        // Only a successful call publishes its products.
+        if completion.status == CallStatus::Ok {
+            products.extend_from_slice(output.products());
+        }
+        completions.push(completion.clone());
         media.extend(output.take_media());
     }
     for output in &launched.outputs {
@@ -248,7 +254,7 @@ pub(crate) fn materialize(
         output: BatchOutput {
             batch_id: plan.batch_id,
             completions,
-            products: Vec::new(),
+            products,
             worker_exec_us: Some(elapsed),
             forward_stats: Some(stats),
         },

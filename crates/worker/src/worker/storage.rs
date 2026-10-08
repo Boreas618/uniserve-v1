@@ -30,7 +30,8 @@ pub(super) fn notify(callbacks: Vec<Notify>) {
 pub struct RankStorage {
     pub events: Arc<EventPool>,
     pub tensors: TensorStore,
-    pub transports: Transports,
+    /// Shared with the KV import copy tasks that read through them.
+    pub transports: Arc<Transports>,
     pub kv: Option<KVCache>,
     /// Stream that orders slot releases after the batches reading them: the
     /// stream serving token calls. A borrowed view of a stream the worker's
@@ -47,7 +48,7 @@ impl RankStorage {
     pub fn new(
         events: Arc<EventPool>,
         tensors: TensorStore,
-        transports: Transports,
+        transports: Arc<Transports>,
         kv: Option<KVCache>,
         release_stream: Option<Stream>,
     ) -> Self {
@@ -140,6 +141,9 @@ impl RequestStorage for RankStorage {
             kv.release_slots(&slots, self.release_stream.as_ref())?;
             for request in std::mem::take(&mut self.retired_prefixes) {
                 kv.release_request_prefixes(request, self.release_stream.as_ref())?;
+                // A later epoch of the request id starts without the
+                // retired epoch's resident transfers and accepted bases.
+                kv.manager().drop_request(request);
             }
         }
         Ok(())
@@ -173,11 +177,18 @@ impl RequestStorage for RankStorage {
             std::mem::forget(self.kv.take());
             return Ok(());
         }
-        let mut result = Ok(());
+        // Revoke every published product, stop the imports reading through
+        // the transports, then close the transports, which retires the
+        // exports they still register (the KV cache requires its exports
+        // retired before it closes).
+        let mut result = self.tensors.revoke_exports();
+        if let Some(kv) = &mut self.kv {
+            result = result.and(kv.stop_imports());
+        }
+        result = result.and(self.transports.close());
         if let Some(kv) = &mut self.kv {
             result = result.and(kv.close());
         }
-        result = result.and(self.transports.close());
         self.tensors.close();
         result.and(self.events.close())
     }
