@@ -18,7 +18,7 @@ use uniserve_ipc::{
     WorkerInfo, WorkerResponseError,
 };
 
-use super::forward::{self, Running};
+use super::forward::{self, launch::Launched};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
@@ -50,6 +50,8 @@ pub struct WorkerBackend {
     rank_storage: Option<RankStorage>,
     /// The text runtime, on ranks holding a causal language model.
     text: Option<forward::token::TextRuntime>,
+    /// The canvas runtime, on ranks holding a token denoiser.
+    canvas: Option<forward::canvas::CanvasRuntime>,
     /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
@@ -64,13 +66,15 @@ pub(crate) struct Parts<'a> {
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut forward::token::TextRuntime>,
+    pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, then the
-/// text runtime, then the other runtimes' owners.
+/// text and canvas runtimes, then the other runtimes' owners.
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<forward::token::TextRuntime>,
+    canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
     others: &'a mut [Box<dyn RequestStorage>],
 ) -> Vec<&'a mut dyn RequestStorage> {
     let mut owners: Vec<&'a mut dyn RequestStorage> = Vec::new();
@@ -79,6 +83,9 @@ fn owners<'a>(
     }
     if let Some(text) = text {
         owners.push(text);
+    }
+    if let Some(canvas) = canvas {
+        owners.push(canvas);
     }
     owners.extend(
         others
@@ -95,7 +102,7 @@ pub struct WorkerBatch {
     predecessors: Vec<Option<CallId>>,
     retirement: Retirement,
     /// A capability runtime's launched work awaiting materialization.
-    running: Option<Running>,
+    running: Option<Launched>,
     output: Option<BatchResult>,
 }
 
@@ -147,7 +154,7 @@ impl WorkerBatch {
     }
 
     /// Hand launched work to materialization by [`Backend::poll`].
-    pub(crate) fn launch(&mut self, running: Running) {
+    pub(crate) fn launch(&mut self, running: Launched) {
         self.running = Some(running);
     }
 }
@@ -160,6 +167,7 @@ impl WorkerBackend {
             rank,
             rank_storage: None,
             text: None,
+            canvas: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -209,6 +217,15 @@ impl WorkerBackend {
         self.text.as_mut()
     }
 
+    /// Install the canvas runtime.
+    pub(crate) fn set_canvas(&mut self, canvas: forward::canvas::CanvasRuntime) {
+        self.canvas = Some(canvas);
+    }
+
+    pub(crate) fn canvas_mut(&mut self) -> Option<&mut forward::canvas::CanvasRuntime> {
+        self.canvas.as_mut()
+    }
+
     /// Register another runtime's storage owner taking part in request
     /// lifecycles.
     pub fn add_storage(&mut self, storage: Box<dyn RequestStorage>) {
@@ -223,6 +240,7 @@ impl WorkerBackend {
             requests: &mut self.requests,
             storage: self.rank_storage.as_mut(),
             text: self.text.as_mut(),
+            canvas: self.canvas.as_mut(),
         }
     }
 
@@ -271,7 +289,12 @@ impl WorkerBackend {
         })();
         // Reset every admitted slot even when a later Start failed.
         if !admitted.is_empty() {
-            for owner in owners(&mut self.rank_storage, &mut self.text, &mut self.storage) {
+            for owner in owners(
+                &mut self.rank_storage,
+                &mut self.text,
+                &mut self.canvas,
+                &mut self.storage,
+            ) {
                 owner.admit_slots(&admitted)?;
             }
         }
@@ -396,13 +419,16 @@ impl WorkerBackend {
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, the text
-    /// runtime, then rank storage), after the executor drained; returns the
-    /// first failure.
+    /// Close every storage owner, newest first (other runtimes, the canvas
+    /// and text runtimes, then rank storage), after the executor drained;
+    /// returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
+        }
+        if let Some(mut canvas) = self.canvas.take() {
+            result = result.and(canvas.close(aborted));
         }
         if let Some(mut text) = self.text.take() {
             result = result.and(text.close(aborted));
@@ -413,13 +439,19 @@ impl WorkerBackend {
         result
     }
 
-    /// Close the text runtime (graphs, then steps) before the bindings it
-    /// runs close.
-    pub fn close_text(&mut self, aborted: bool) -> Result<()> {
-        match self.text.take() {
-            Some(mut text) => text.close(aborted),
-            None => Ok(()),
-        }
+    /// Close the canvas and text runtimes (graphs, then steps) before the
+    /// bindings they run close; attempts both before returning the first
+    /// failure.
+    pub fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
+        let canvas = self
+            .canvas
+            .take()
+            .map_or(Ok(()), |mut canvas| canvas.close(aborted));
+        let text = self
+            .text
+            .take()
+            .map_or(Ok(()), |mut text| text.close(aborted));
+        canvas.and(text)
     }
 
     /// Release the outputs of the predecessors this batch's calls follow.
@@ -519,7 +551,12 @@ impl Backend for WorkerBackend {
     fn admit(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
         // Explicit revocation must not wait behind an allocation-dependent
         // batch; existing readers retain their leases.
-        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        let mut owners = owners(
+            &mut self.rank_storage,
+            &mut self.text,
+            &mut self.canvas,
+            &mut self.storage,
+        );
         batch.retirement.admit(&mut owners)?;
         Ok(())
     }
@@ -587,7 +624,12 @@ impl Backend for WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<(), WorkerError> {
-        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        let mut owners = owners(
+            &mut self.rank_storage,
+            &mut self.text,
+            &mut self.canvas,
+            &mut self.storage,
+        );
         batch.retirement.begin(&self.requests, &mut owners)?;
         Ok(())
     }
@@ -605,7 +647,12 @@ impl Backend for WorkerBackend {
         if batch.output.is_none() {
             return Ok((advanced, false));
         }
-        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        let mut owners = owners(
+            &mut self.rank_storage,
+            &mut self.text,
+            &mut self.canvas,
+            &mut self.storage,
+        );
         let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
         Ok((advanced || retired, retired))
     }
@@ -632,7 +679,12 @@ impl Backend for WorkerBackend {
     }
 
     fn reap(&mut self) -> std::result::Result<(), WorkerError> {
-        for owner in owners(&mut self.rank_storage, &mut self.text, &mut self.storage) {
+        for owner in owners(
+            &mut self.rank_storage,
+            &mut self.text,
+            &mut self.canvas,
+            &mut self.storage,
+        ) {
             owner.reap()?;
         }
         Ok(())

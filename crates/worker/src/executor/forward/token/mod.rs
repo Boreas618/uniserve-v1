@@ -17,8 +17,9 @@
 //!    and pending calls together. A failure before the commit point retires
 //!    everything the batch reserved and reports every call as failed; a
 //!    failure after it is fatal.
-//! 4. **Materialization** ([`poll`]): once the lease's device fences
-//!    complete, decode each call's result and accept its progress.
+//! 4. **Materialization** ([`super::launch::materialize`]): once the
+//!    lease's device fences complete, decode each call's result and accept
+//!    its progress.
 
 mod batch;
 mod calls;
@@ -31,24 +32,22 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use uniserve_cuda::{Event, EventFlags, Stream};
 use uniserve_ipc::{
-    Batch as BatchPlan, BatchOutput, BufferId, CallKind, CallStatus, ErrorCode, ForwardMode,
-    ForwardStats, RequestKey, Wake,
+    Batch as BatchPlan, BufferId, CallKind, ForwardMode, ForwardStats, RequestKey, Wake,
 };
 
 use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
-use super::Running;
+use super::launch::{Launched, StreamOrder, error_code, failed_output};
 use crate::Result;
 use crate::error::WorkerError;
+use crate::executor::BatchResult;
 use crate::executor::lifecycle::RequestStorage;
-use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::request::decode_state::DecodeState;
 use crate::runner::graphs::GraphMode;
 use crate::runner::text::TextRunner;
-use crate::storage::{OutputLease, OutputPool, UnitColumn};
+use crate::storage::{OutputPool, UnitColumn};
 
-use batch::{TokenBatch, lock};
+use batch::TokenBatch;
 use commit::Failure;
 use step::Stepped;
 
@@ -68,7 +67,7 @@ pub(crate) struct TextRuntime {
     vocab: usize,
     /// Orders slot state across runner streams: recorded after each text
     /// batch's last write, waited on by the next batch on another stream.
-    order: Option<(usize, Event)>,
+    order: StreamOrder,
 }
 
 impl TextRuntime {
@@ -81,16 +80,6 @@ impl TextRuntime {
         for runner in &mut self.runners {
             runner.seal();
         }
-    }
-
-    /// Order `stream` after the previous text batch on another stream.
-    fn order(&self, stream: Option<&Stream>) -> Result<()> {
-        wait_order(&self.order, stream)
-    }
-
-    /// Record the end of this stream's text work for other streams.
-    fn ordered(&mut self, stream: Option<&Stream>) -> Result<()> {
-        record_order(&mut self.order, stream)
     }
 
     pub(crate) fn set_wake(&self, _wake: Option<Wake>) {}
@@ -109,39 +98,14 @@ impl TextRuntime {
     }
 }
 
-fn wait_order(order: &Option<(usize, Event)>, stream: Option<&Stream>) -> Result<()> {
-    let Some(stream) = stream else {
-        return Ok(());
-    };
-    if let Some((previous, event)) = order
-        && *previous != stream.raw()
-    {
-        stream.wait_event(event)?;
-    }
-    Ok(())
-}
-
-fn record_order(order: &mut Option<(usize, Event)>, stream: Option<&Stream>) -> Result<()> {
-    let Some(stream) = stream else {
-        return Ok(());
-    };
-    let event = match order.take() {
-        Some((_, event)) => event,
-        None => Event::new(EventFlags::default()),
-    };
-    event.record(stream)?;
-    *order = Some((stream.raw(), event));
-    Ok(())
-}
-
 impl RequestStorage for TextRuntime {
     fn admit_slots(&mut self, slots: &[usize]) -> Result<()> {
         // Reset on the first runner's stream; other streams order after it
         // before their next batch.
         let stream = self.runners.first().and_then(TextRunner::stream);
-        wait_order(&self.order, stream)?;
+        self.order.wait(stream)?;
         self.state.reset(slots, stream)?;
-        record_order(&mut self.order, stream)
+        self.order.record(stream)
     }
 
     fn release_buffers(&mut self, _buffers: &HashSet<BufferId>) -> Result<()> {
@@ -175,14 +139,6 @@ impl RequestStorage for TextRuntime {
     }
 }
 
-/// A token batch launched on the device, awaiting its output fences.
-pub(crate) struct Launched {
-    outputs: Vec<PendingOutput>,
-    buffer: OutputLease,
-    started: Instant,
-    stats: ForwardStats,
-}
-
 /// Execute a batch of `kind` calls.
 pub(crate) fn execute(
     backend: &mut WorkerBackend,
@@ -193,7 +149,7 @@ pub(crate) fn execute(
     let predecessors = batch.predecessors().to_vec();
     let failure = match run(backend.parts(), &plan) {
         Ok(Some(launched)) => {
-            batch.launch(Running::Token(launched));
+            batch.launch(launched);
             return Ok(());
         }
         Ok(None) => return Err(super::unsupported(kind, "text")),
@@ -217,15 +173,12 @@ pub(crate) fn execute(
             .map(|trace| format!("\n{trace}"))
             .unwrap_or_default()
     );
-    let code = match error.code {
-        crate::ErrorCode::ResourceError => ErrorCode::ResourceExhausted,
-        crate::ErrorCode::ComputeError => ErrorCode::ComputeError,
-        crate::ErrorCode::InvariantViolation | crate::ErrorCode::FatalWorkerFailure => {
-            ErrorCode::Internal
-        }
-        _ => ErrorCode::InvalidCall,
-    };
-    let output = failed_output(backend, &plan, &predecessors, code)?;
+    let output = failed_output(
+        backend.requests(),
+        &plan,
+        &predecessors,
+        error_code(error.code),
+    )?;
     batch.complete(BatchResult {
         output,
         media: Vec::new(),
@@ -267,6 +220,7 @@ fn run(parts: Parts<'_>, plan: &BatchPlan) -> std::result::Result<Option<Launche
                 buffer: batch.buffer,
                 started,
                 stats,
+                timer: "text_materialize",
             }))
         }
         Err(failure) if failure.committed => Err(failure),
@@ -333,117 +287,4 @@ fn statistics(batch: &TokenBatch<'_>, stepped: Option<&Stepped>) -> ForwardStats
         stats.spec_verify_draft_tokens += stepped.drafts;
     }
     stats
-}
-
-/// Every call fails with `code`, reporting its accepted progress.
-fn failed_output(
-    backend: &WorkerBackend,
-    plan: &BatchPlan,
-    predecessors: &[Option<uniserve_core::CallId>],
-    code: ErrorCode,
-) -> Result<BatchOutput> {
-    let requests = backend.requests();
-    let completions = plan
-        .calls
-        .iter()
-        .zip(predecessors)
-        .map(|(call, predecessor)| {
-            let key = call.request_key;
-            // A failed first call has no accepted parent; a stale epoch never
-            // reports a replacement request's progress.
-            let progress = requests
-                .peek(key.request_id.0)
-                .filter(|request| request.key() == key && predecessor.is_some())
-                .map(|request| request.progress())
-                .transpose()?
-                .unwrap_or_default();
-            let mut output = request_output(key, call.call_id, call.code, progress)?;
-            output.status = CallStatus::Error;
-            output.error_code = Some(code);
-            Ok(output)
-        })
-        .collect::<Result<_>>()?;
-    Ok(BatchOutput {
-        batch_id: plan.batch_id,
-        completions,
-        products: Vec::new(),
-        worker_exec_us: None,
-        forward_stats: None,
-    })
-}
-
-/// Materialize a launched batch once its output fences completed.
-pub(crate) fn poll(
-    backend: &mut WorkerBackend,
-    plan: &BatchPlan,
-    launched: &mut Launched,
-) -> std::result::Result<Option<BatchResult>, WorkerError> {
-    {
-        let mut buffer = lock(&launched.buffer);
-        if buffer.ready_at()?.is_none() {
-            return Ok(None);
-        }
-        buffer.readback()?;
-    }
-    let mut completions = Vec::with_capacity(launched.outputs.len());
-    for output in &mut launched.outputs {
-        let key = output.output.request_key;
-        let parent = backend
-            .requests()
-            .peek(key.request_id.0)
-            .filter(|request| request.key() == key)
-            .map(|request| request.progress())
-            .transpose()?
-            .unwrap_or_default();
-        let mut buffer = lock(&launched.buffer);
-        if let Err(error) = output.resolve(parent, &mut buffer) {
-            // A malformed capture fails its call only.
-            tracing::error!(
-                target: "uniserve_worker.execution",
-                "text result materialization failed: {error}"
-            );
-            output.output.status = CallStatus::Error;
-            output.output.error_code = Some(ErrorCode::ComputeError);
-            output.progress = parent;
-            buffer.discard(output.row);
-            completions.push(output.output.clone());
-            continue;
-        }
-        completions.push(output.result()?.clone());
-    }
-    for output in &launched.outputs {
-        if output.resolved() {
-            output.accept(backend.requests_mut())?;
-        } else {
-            output.cancel(backend.requests_mut())?;
-        }
-    }
-    let mut stats = std::mem::take(&mut launched.stats);
-    let elapsed = launched.started.elapsed().as_micros() as u64;
-    stats
-        .component_us
-        .insert("text_materialize".into(), elapsed);
-    Ok(Some(BatchResult {
-        output: BatchOutput {
-            batch_id: plan.batch_id,
-            completions,
-            products: Vec::new(),
-            worker_exec_us: Some(elapsed),
-            forward_stats: Some(stats),
-        },
-        media: Vec::new(),
-    }))
-}
-
-/// Cancel a launched batch's unresolved calls; its storage retires through
-/// the fences it recorded.
-pub(crate) fn abandon(
-    backend: &mut WorkerBackend,
-    launched: Launched,
-) -> std::result::Result<(), WorkerError> {
-    for output in &launched.outputs {
-        output.cancel(backend.requests_mut())?;
-    }
-    lock(&launched.buffer).abandon();
-    Ok(())
 }
