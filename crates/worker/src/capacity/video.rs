@@ -49,7 +49,8 @@ const EDGES: [(MediaCall, MediaCall); 10] = [
 ];
 
 /// The products every component of the deployment publishes: the model's
-/// own (`facts` outputs, then the media timeline's), the video codec's
+/// own (the media timeline's and the text conditioning, beside the `facts`
+/// outputs of the components this rank loads), the video codec's
 /// encoded unit rows and, for conditioned tasks, the media reader's
 /// condition media. Every rank plans them all, whichever components it
 /// holds, because the engine places a request's products in one logical
@@ -58,13 +59,20 @@ pub(crate) fn outputs(
     model: &VideoModel,
     media: &MediaPlan,
     facts: &BTreeMap<String, Vec<OutputInfo>>,
+    dtype: &str,
 ) -> Result<BTreeMap<String, Vec<OutputInfo>>> {
     let frames = media.max_frames();
     let mut result = facts.clone();
     for (component, outputs) in
-        model.outputs(frames, media.max_text_tokens, media.condition_rows)?
+        model.outputs(frames, media.max_text_tokens, media.condition_rows, dtype)?
     {
-        result.entry(component).or_default().extend(outputs);
+        let declared = result.entry(component).or_default();
+        for output in outputs {
+            // A loaded component's facts already declare its products.
+            if !declared.iter().any(|known| known.name == output.name) {
+                declared.push(output);
+            }
+        }
     }
     result
         .entry("video_codec".into())
@@ -199,7 +207,7 @@ pub(crate) fn plan(
     } else {
         0
     };
-    let outputs = outputs(model, &media, facts)?;
+    let outputs = outputs(model, &media, facts, &config.model_dtype)?;
     Ok(VideoCapacity {
         media,
         pages,
