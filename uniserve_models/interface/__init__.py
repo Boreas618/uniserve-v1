@@ -26,6 +26,7 @@ _AREAS = (
     "graphs",
     "image",
     "encoder",
+    "decoder",
     "memory",
     "kernels",
     "profiling",
