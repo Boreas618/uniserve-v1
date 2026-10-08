@@ -1,6 +1,9 @@
 //! Bounded batch execution shared by direct callers and the rank service.
 
+pub mod backend;
+pub(crate) mod forward;
 mod inputs;
+pub mod lifecycle;
 mod pending;
 
 pub use inputs::{BatchInputs, InputReady, InputWait};
@@ -293,18 +296,14 @@ impl<B: Backend> Executor<B> {
         &self.backend
     }
 
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
     /// The rank service supplies its channel wake for newly admitted batches.
     /// Direct callers drive progress through advance and poll themselves.
     pub(crate) fn set_completion_wake(&mut self, wake: Option<Wake>) {
         self.completion_wake = wake;
-    }
-
-    /// Borrow backend resources and retained failures for language runtimes
-    /// that must trace their foreign references during garbage collection.
-    pub fn batches(&self) -> impl Iterator<Item = (&B::Batch, Option<&B::Error>)> {
-        self.batches
-            .values()
-            .map(|batch| (&batch.data, batch.error.as_ref()))
     }
 
     pub fn has_work(&self) -> bool {

@@ -1,0 +1,108 @@
+//! The numerical interface table Python hands the worker at startup.
+//!
+//! `uniserve_models.interface.table()` maps `<area>.<verb>` names to
+//! functions. [`Interface`] resolves the entries startup needs into typed
+//! fields once, failing startup with the name of any missing entry, and
+//! keeps every entry so capability runtimes can resolve their own
+//! (`text.bind`, `canvas.bind`, ...) by name.
+
+use std::collections::BTreeMap;
+
+use tvm_ffi::Map;
+
+use crate::ffi::Function;
+use crate::{Error, Result};
+
+/// Startup and lifecycle entries of the interface table.
+pub struct Interface {
+    /// Read the checkpoint configuration and describe the meta skeleton.
+    pub describe: Function,
+    /// Narrow the checkpoint to this rank's modules and weight choices.
+    pub resolve: Function,
+    /// Materialize this rank's modules on their meshes.
+    pub load: Function,
+    /// Model-derived quantities for capacity, reporting and warmup.
+    pub facts: Function,
+    /// Declare a component call set's workspace requirements.
+    pub prepare: Function,
+    /// Bind Rust-allocated workspaces to a prepared component.
+    pub bind: Function,
+    /// Join the torch process world for numerical collectives.
+    pub initialize: Function,
+    /// Create torch groups on the Rust plan.
+    pub create_groups: Function,
+    /// Build a `DeviceMesh` bound to created groups.
+    pub mesh: Function,
+    /// Destroy the process world's groups in reverse creation order.
+    pub destroy: Function,
+    /// Caching-allocator statistics of one device.
+    pub memory_stats: Function,
+    /// Return cached allocator blocks to the device.
+    pub release_cached: Function,
+    /// A counter that changes whenever a kernel provider choice changes.
+    pub kernel_choices: Function,
+    /// Start a profiler window.
+    pub profiler_start: Function,
+    /// Stop a profiler window and export its trace.
+    pub profiler_stop: Function,
+    /// Collect, freeze and disable the Python garbage collector.
+    pub freeze_gc: Function,
+    entries: BTreeMap<String, Function>,
+}
+
+impl Interface {
+    /// Resolve the typed entries of `table`.
+    pub fn from_table(table: Map<tvm_ffi::String, tvm_ffi::Function>) -> Result<Self> {
+        let entries: BTreeMap<String, Function> = table
+            .iter()
+            .map(|(name, function)| {
+                let name = name.as_str().to_owned();
+                (name.clone(), Function::new(name, function))
+            })
+            .collect();
+        let require = |name: &str| {
+            entries.get(name).cloned().ok_or_else(|| {
+                Error::Interface(format!(
+                    "the numerical interface table has no `{name}` entry"
+                ))
+            })
+        };
+        Ok(Self {
+            describe: require("model.describe")?,
+            resolve: require("model.resolve")?,
+            load: require("model.load")?,
+            facts: require("model.facts")?,
+            prepare: require("component.prepare")?,
+            bind: require("component.bind")?,
+            initialize: require("distributed.initialize")?,
+            create_groups: require("distributed.create_groups")?,
+            mesh: require("distributed.mesh")?,
+            destroy: require("distributed.destroy")?,
+            memory_stats: require("memory.stats")?,
+            release_cached: require("memory.release_cached")?,
+            kernel_choices: require("kernels.choices")?,
+            profiler_start: require("profiling.start")?,
+            profiler_stop: require("profiling.stop")?,
+            freeze_gc: require("runtime.freeze_gc")?,
+            entries,
+        })
+    }
+
+    /// A capability runtime's entry. Fails naming the missing entry.
+    pub fn function(&self, name: &str) -> Result<Function> {
+        self.optional(name).ok_or_else(|| {
+            Error::Interface(format!(
+                "the numerical interface table has no `{name}` entry"
+            ))
+        })
+    }
+
+    pub fn optional(&self, name: &str) -> Option<Function> {
+        self.entries.get(name).cloned()
+    }
+
+    /// Every entry name, sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+}

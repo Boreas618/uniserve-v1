@@ -34,6 +34,7 @@ uniserve-server = { path = "crates/server" }
 # ---- engine third-party deps ----
 crossbeam-channel = "0.5"
 sha2 = "0.10"
+signal-hook-registry = "1.4.8"
 
 # ---- server third-party deps ----
 anyhow = "1.0.100"
