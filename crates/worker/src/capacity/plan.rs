@@ -16,12 +16,12 @@
 //! its whole media state.
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
 
-use uniserve_core::{KvCacheDtype, KvCacheGroup, KvGroupKind};
+use std::sync::Arc;
+
 use uniserve_ipc::{
-    CallKind, ComponentInfo, DType, KvCacheInfo, MediaCall, OutputInfo, VideoDenoiserInfo,
-    WorkerEndpoint, WorkerInfo,
+    CallKind, ComponentInfo, DType, MediaCall, OutputInfo, VideoDenoiserInfo, WorkerEndpoint,
+    WorkerInfo,
 };
 
 use super::{
@@ -29,10 +29,9 @@ use super::{
     request_tensor_window,
 };
 use crate::config::{WorkerConfig, graph_padding_block_count};
-use crate::ffi::Record;
 use crate::parallel::host::HostGroup;
 use crate::runner::graph_storage_budget_bytes;
-use crate::storage::GroupShape;
+use crate::storage::KVPlan;
 use crate::{Error, Result};
 
 /// Product scalar banks keep one value of every protocol dtype per slot.
@@ -60,151 +59,6 @@ pub fn product_bytes(outputs: &[OutputInfo]) -> u64 {
             (output.shape_bound.max_elements() * output.dtype.element_bytes()).div_ceil(256) * 256
         })
         .sum()
-}
-
-/// One cache group of the KV plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheGroup {
-    /// History window of sliding-window layers.
-    pub window: Option<u32>,
-    pub page_tokens: u32,
-    pub units_per_page: u32,
-    /// Resident layer names, configuration order.
-    pub layers: Vec<String>,
-    /// Global cache-layer ids of the resident layers.
-    pub layer_ids: Vec<u32>,
-    pub num_kv_heads: u32,
-    pub total_kv_heads: u32,
-    pub kv_head_offset: u32,
-    pub head_dim: u32,
-    /// Stored element dtype of the group.
-    pub dtype: String,
-}
-
-/// The rank's KV unit pool layout for one page size (`model.cache_plan`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachePlan {
-    /// Every resident layer's attention reads pages of this layout.
-    pub readable: bool,
-    pub columns: u32,
-    pub plane_bytes: u64,
-    pub quantized: bool,
-    /// Bytes of one unit: every column plane plus per-unit metadata.
-    pub unit_bytes: u64,
-    pub stored_dtype: KvCacheDtype,
-    pub groups: Vec<CacheGroup>,
-}
-
-impl CachePlan {
-    pub fn from_record(record: &Record) -> Result<Self> {
-        let narrow = |value: usize, name: &str| {
-            u32::try_from(value)
-                .map_err(|_| Error::Interface(format!("model.cache_plan `{name}` exceeds u32")))
-        };
-        let stored = record.string("stored_dtype")?;
-        let groups = record
-            .records("groups")?
-            .iter()
-            .map(|group| {
-                let window = group.get::<i64>("window")?;
-                Ok(CacheGroup {
-                    window: (window >= 0)
-                        .then(|| u32::try_from(window))
-                        .transpose()
-                        .map_err(|_| {
-                            Error::Interface("model.cache_plan window exceeds u32".into())
-                        })?,
-                    page_tokens: narrow(group.count("page_tokens")?, "page_tokens")?,
-                    units_per_page: narrow(group.count("units_per_page")?, "units_per_page")?,
-                    layers: group.strings("layers")?,
-                    layer_ids: group
-                        .shape("layer_ids")?
-                        .into_iter()
-                        .map(|id| {
-                            u32::try_from(id).map_err(|_| {
-                                Error::Interface("model.cache_plan layer id is invalid".into())
-                            })
-                        })
-                        .collect::<Result<_>>()?,
-                    num_kv_heads: narrow(group.count("num_kv_heads")?, "num_kv_heads")?,
-                    total_kv_heads: narrow(group.count("total_kv_heads")?, "total_kv_heads")?,
-                    kv_head_offset: narrow(group.count("kv_head_offset")?, "kv_head_offset")?,
-                    head_dim: narrow(group.count("head_dim")?, "head_dim")?,
-                    dtype: group.string("dtype")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if groups.is_empty() {
-            return Err(Error::Unsupported(
-                "the worker K/V protocol requires resident cache layers".into(),
-            ));
-        }
-        Ok(Self {
-            readable: record.flag("readable")?,
-            columns: narrow(record.count("columns")?, "columns")?,
-            plane_bytes: record.count("plane_bytes")? as u64,
-            quantized: record.flag("quantized")?,
-            unit_bytes: record.count("unit_bytes")? as u64,
-            stored_dtype: KvCacheDtype::from_str(&stored).map_err(|_| {
-                Error::Unsupported(format!("KV storage dtype {stored:?} has no protocol name"))
-            })?,
-            groups,
-        })
-    }
-
-    /// `(tokens per page, units per page)` of every group.
-    pub fn pages(&self) -> Vec<(u32, u32)> {
-        self.groups
-            .iter()
-            .map(|group| (group.page_tokens, group.units_per_page))
-            .collect()
-    }
-
-    pub fn shapes(&self) -> Vec<GroupShape> {
-        self.groups
-            .iter()
-            .map(|group| GroupShape {
-                page_tokens: group.page_tokens,
-                units_per_page: group.units_per_page,
-                window: group.window,
-            })
-            .collect()
-    }
-
-    /// Block-table width that holds the longest admitted sequence.
-    pub fn resident_width(&self, max_sequence_tokens: u64) -> u64 {
-        self.shapes()
-            .iter()
-            .map(|shape| shape.resident_width(max_sequence_tokens))
-            .max()
-            .unwrap_or(1)
-    }
-
-    /// The protocol description of a pool of `num_units` units.
-    pub fn info(&self, num_units: u32) -> KvCacheInfo {
-        KvCacheInfo {
-            num_units,
-            unit_bytes: self.unit_bytes,
-            dtype: self.stored_dtype,
-            groups: self
-                .groups
-                .iter()
-                .map(|group| KvCacheGroup {
-                    kind: match group.window {
-                        None => KvGroupKind::Full,
-                        Some(window) => KvGroupKind::SlidingWindow { window, sink: 0 },
-                    },
-                    page_tokens: group.page_tokens,
-                    units_per_page: group.units_per_page,
-                    layer_ids: group.layer_ids.clone(),
-                    num_kv_heads: group.num_kv_heads,
-                    total_kv_heads: group.total_kv_heads,
-                    kv_head_offset: group.kv_head_offset,
-                    head_dim: group.head_dim,
-                })
-                .collect(),
-        }
-    }
 }
 
 /// The largest page size of at most 64 tokens that every resident layer's
@@ -363,7 +217,6 @@ pub struct TokenFacts {
 }
 
 /// The resolved capacity of a rank.
-#[derive(Debug, Clone)]
 pub struct Plan {
     pub info: WorkerInfo,
     pub arena: ArenaCapacity,
@@ -373,7 +226,7 @@ pub struct Plan {
     pub physical_buffer_pool_bytes: u64,
     pub latent: Option<LatentPlan>,
     /// The KV layout, with the agreed unit count in `info.kv_cache`.
-    pub cache: Option<CachePlan>,
+    pub cache: Option<Arc<KVPlan>>,
 }
 
 impl Plan {
@@ -535,25 +388,33 @@ impl TokenLayout {
     /// of the device), the widest default graph padding of every group, and
     /// the fixed storage, in whole units. A configured token capacity sizes
     /// it instead. `total_bytes` is the device's total memory, zero on CPU.
+    /// `unit_overhead` is device storage other owners keep per unit (unit
+    /// index columns), charged with each unit.
     pub fn fit_cache(
         &mut self,
-        cache: &CachePlan,
+        cache: &KVPlan,
+        unit_overhead: u64,
         config: &WorkerConfig,
         total_bytes: u64,
         group: &HostGroup,
     ) -> Result<KVCapacity> {
-        let pages = cache.pages();
+        let unit_bytes = cache.unit_bytes + unit_overhead;
+        let pages: Vec<(u32, u32)> = cache
+            .groups
+            .iter()
+            .map(|group| (group.page_tokens, group.units_per_page))
+            .collect();
         let mut reserved_units = 0;
         for &(tokens, units) in &pages {
             reserved_units += graph_padding_block_count(tokens as usize) as u64 * u64::from(units);
         }
-        reserved_units += graph_storage_budget_bytes(total_bytes as i64).div_ceil(cache.unit_bytes);
+        reserved_units += graph_storage_budget_bytes(total_bytes as i64).div_ceil(unit_bytes);
         reserved_units += self
             .fixed
             .get(&config.device)
             .copied()
             .unwrap_or(0)
-            .div_ceil(cache.unit_bytes);
+            .div_ceil(unit_bytes);
 
         let cuda = config.primary_device().is_cuda();
         let tokens = config.kv_token_capacity.map(|tokens| tokens as u64);
@@ -566,7 +427,7 @@ impl TokenLayout {
         let mut capacity = KVCapacity::derive(
             &pages,
             tokens,
-            cache.unit_bytes,
+            unit_bytes,
             available,
             1,
             DEFAULT_NUM_UNITS,
@@ -588,7 +449,7 @@ impl TokenLayout {
         Ok(capacity)
     }
 
-    pub fn finish(self, config: &WorkerConfig, cache: Option<CachePlan>) -> Plan {
+    pub fn finish(self, config: &WorkerConfig, cache: Option<Arc<KVPlan>>) -> Plan {
         let physical_buffer_pool_bytes = self.info.buffer_pool_bytes;
         let mut plan = Plan {
             info: self.info,
@@ -711,6 +572,8 @@ pub fn slot_requirements(
 mod tests {
     use uniserve_ipc::{DimBound, ShapeBound};
 
+    use crate::ffi::Fields;
+
     use super::*;
 
     fn group() -> HostGroup {
@@ -739,27 +602,34 @@ mod tests {
         }
     }
 
-    fn cache() -> CachePlan {
-        CachePlan {
-            readable: true,
-            columns: 1,
-            plane_bytes: 64 * 1024,
-            quantized: false,
-            unit_bytes: 2 * (64 * 1024 + 1),
-            stored_dtype: KvCacheDtype::BFloat16,
-            groups: vec![CacheGroup {
-                window: None,
-                page_tokens: 64,
-                units_per_page: 2,
-                layers: vec!["layers.0".into(), "layers.1".into()],
-                layer_ids: vec![0, 1],
-                num_kv_heads: 4,
-                total_kv_heads: 8,
-                kv_head_offset: 4,
-                head_dim: 128,
-                dtype: "bfloat16".into(),
-            }],
-        }
+    /// A two-layer, one-column bfloat16 pool with 64-token pages, as
+    /// `model.cache_plan` describes it.
+    fn cache() -> KVPlan {
+        let ints = |values: &[i64]| crate::ffi::integer_list(values.iter().copied());
+        let group = Fields::new()
+            .with("window", -1i64)
+            .with("page_tokens", 64i64)
+            .with("units_per_page", 2i64)
+            .with("layers", crate::ffi::strings(["layers.0", "layers.1"]))
+            .with("layer_ids", ints(&[0, 1]))
+            .with("axis_layers", ints(&[0, 1]))
+            .with("num_kv_heads", 4i64)
+            .with("total_kv_heads", 8i64)
+            .with("kv_head_offset", 4i64)
+            .with("head_dim", 128i64)
+            .text("dtype", "bfloat16")
+            .text("compute_dtype", "bfloat16")
+            .into_any();
+        let plane_bytes = 64 * 4 * 128 * 2;
+        let plan = Fields::new()
+            .with("columns", 1i64)
+            .with("plane_bytes", plane_bytes)
+            .with("quantized", false)
+            .with("unit_bytes", 2 * (plane_bytes + 1))
+            .text("dtype", "bfloat16")
+            .with("groups", crate::ffi::list([group]))
+            .into_any();
+        KVPlan::decode(plan).unwrap()
     }
 
     #[test]
@@ -825,7 +695,7 @@ mod tests {
         layout.reserve("cuda:0", gib);
         let cache = cache();
         let capacity = layout
-            .fit_cache(&cache, &config, 100 * gib, &group())
+            .fit_cache(&cache, 0, &config, 100 * gib, &group())
             .unwrap();
 
         let unit = cache.unit_bytes;
@@ -833,7 +703,7 @@ mod tests {
             + (10 * gib).div_ceil(unit)
             + (fixed_before + gib).div_ceil(unit);
         assert_eq!(capacity.num_units, 20 * gib / unit - reserved);
-        let plan = layout.finish(&config, Some(cache));
+        let plan = layout.finish(&config, Some(Arc::new(cache)));
         let info = plan.info.kv_cache.as_ref().unwrap();
         assert_eq!(u64::from(info.num_units), capacity.num_units);
         assert_eq!(info.groups[0].kv_head_offset, 4);
@@ -868,9 +738,9 @@ mod tests {
             product_bytes: 256,
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
-        let capacity = layout.fit_cache(&cache(), &config, 0, &group()).unwrap();
+        let capacity = layout.fit_cache(&cache(), 0, &config, 0, &group()).unwrap();
         assert_eq!(capacity.num_units, DEFAULT_NUM_UNITS);
-        let plan = layout.finish(&config, Some(cache()));
+        let plan = layout.finish(&config, Some(Arc::new(cache())));
         assert_eq!(plan.info.max_batch_calls, 4);
         assert_eq!(plan.info.encoder_entry_bytes, 1024);
         assert_eq!(plan.info.buffer_pool_bytes, 257 * 1024 + 8 * 256);
