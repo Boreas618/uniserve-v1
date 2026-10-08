@@ -24,6 +24,7 @@ in request order.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -253,7 +254,9 @@ class Requirement:
 
     ``role`` names a shared scratch area (one backing per stream, sized for
     every binding prepared on it); ``None`` marks persistent storage owned
-    by this binding alone.
+    by this binding alone. ``symmetric`` lists the group members (process
+    ranks, in member order) across which a persistent field must be
+    peer-mapped; ``None`` for local storage.
     """
 
     name: str
@@ -262,6 +265,26 @@ class Requirement:
     shape: tuple[int, ...]
     host: bool
     device: torch.device
+    symmetric: tuple[int, ...] | None = None
+
+
+# Peer views of a symmetric field ``{prefix}/{field}`` are served as
+# ``{prefix}/{field}.peer{index}``, one per group member in member order.
+def _peer_name(name: str, index: int) -> str:
+    return f"{name}.peer{index}"
+
+
+def _split(requirement) -> tuple[dict, dict]:
+    """Local and symmetric fields of an attention storage requirement."""
+    local = {
+        name: config
+        for name, config in requirement.fields.items()
+        if name not in requirement.symmetric
+    }
+    symmetric = {
+        name: requirement.fields[name] for name in requirement.symmetric
+    }
+    return local, symmetric
 
 
 class StandaloneWorkspace:
@@ -271,6 +294,8 @@ class StandaloneWorkspace:
         self._owns_scratch = scratch is None
         self._scratch = Scratch() if scratch is None else scratch
         self._allocations: list[TensorBuffers] = []
+        # Peer-mapped allocations, retained until release.
+        self._symmetric: list[Any] = []
 
     def scratch(self, role, requirements, device):
         return self._scratch.view(role, requirements, device)
@@ -280,12 +305,38 @@ class StandaloneWorkspace:
         self._allocations.append(allocation)
         return allocation.view(requirements)
 
+    def storage(self, requirement):
+        """Back one attention storage requirement on its group's device.
+
+        Returns the local tensor of every field and, for each symmetric
+        field, every member's peer-mapped view in member order.
+        """
+        local, symmetric = _split(requirement)
+        tensors = dict(self.allocate(local, requirement.group.device))
+        peers = {}
+        if symmetric:
+            # Peer-mapped storage comes from the parallel runtime, which maps
+            # every member's allocation; import it only where it is needed.
+            from uniserve_models.runtime._peer_storage import (
+                allocate_symmetric_storage,
+            )
+
+            for name, config in symmetric.items():
+                shared = allocate_symmetric_storage(
+                    requirement.group, config.shape, config.dtype
+                )
+                self._symmetric.append(shared)
+                tensors[name] = shared.local
+                peers[name] = tuple(shared.peers)
+        return tensors, peers
+
     def release(self) -> None:
         """Release persistent allocations; shared scratch survives sizes."""
         actions = [
             allocation.close for allocation in reversed(self._allocations)
         ]
         self._allocations.clear()
+        self._symmetric.clear()
         close_resources(*actions)
 
     def close(self) -> None:
@@ -317,6 +368,29 @@ class DeclaredWorkspace:
         prefix = f"{self._sequence:04d}"
         self._sequence += 1
         return self._record(prefix, None, requirements, device)
+
+    def storage(self, requirement):
+        """Record an attention storage requirement as persistent fields.
+
+        Symmetric fields carry the group's members, so the allocator maps
+        each member's allocation into every other member.
+        """
+        prefix = f"{self._sequence:04d}"
+        self._sequence += 1
+        members = tuple(requirement.group.ranks)
+        tensors = dict(
+            self._record(
+                prefix, None, requirement.fields, requirement.group.device
+            )
+        )
+        peers = {}
+        for name in requirement.symmetric:
+            key = f"{prefix}/{name}"
+            self._requirements[key] = dataclasses.replace(
+                self._requirements[key], symmetric=members
+            )
+            peers[name] = tuple(tensors[name] for _ in members)
+        return tensors, peers
 
     def _record(self, prefix, role, requirements, device):
         device = torch.device(device)
@@ -373,6 +447,31 @@ class BoundWorkspace:
         prefix = f"{self._sequence:04d}"
         self._sequence += 1
         return self._serve(prefix, requirements)
+
+    def storage(self, requirement):
+        """Serve an attention storage requirement from its declared names.
+
+        A symmetric field's peer views are served as
+        ``{prefix}/{field}.peer{index}`` in member order.
+        """
+        prefix = f"{self._sequence:04d}"
+        self._sequence += 1
+        tensors = dict(self._serve(prefix, requirement.fields))
+        peers = {}
+        for name in requirement.symmetric:
+            config = requirement.fields[name]
+            named = {
+                _peer_name(f"{prefix}/{name}", index): config
+                for index in range(requirement.group.size)
+            }
+            try:
+                views = self._buffers.view(named)
+            except ValueError as error:
+                raise ValueError(
+                    f"bound workspace has no peer views of {prefix}/{name}"
+                ) from error
+            peers[name] = tuple(views[key] for key in named)
+        return tensors, peers
 
     def _serve(self, prefix, requirements):
         named = {
@@ -483,18 +582,6 @@ def _layer_representation(module, inherited):
     return inherited
 
 
-def _registered_output(parallel, *, rows, heads, head_dim, dtype):
-    from uniserve_models.runtime.attention_storage import (
-        allocate_output_storage,
-    )
-
-    outputs = allocate_output_storage(
-        (parallel,), rows=rows, heads=heads, head_dim=head_dim, dtype=dtype
-    )
-    buffers = outputs.views[parallel]
-    return buffers, outputs.allocations, (buffers.local, buffers.receive)
-
-
 def _devices(module: nn.Module, kind: str) -> set[torch.device]:
     return {
         value.device for value in getattr(module, kind)() if not value.is_meta
@@ -596,6 +683,13 @@ class _Call:
         close_resources(*actions)
 
 
+# The activation whose transfer hooks own module calls. Hooks registered by
+# other (nested or concurrent) activations of shared modules stay inert.
+_ACTIVE_TRANSFERS: contextvars.ContextVar[_TransferScope | None] = (
+    contextvars.ContextVar("uniserve_transfers", default=None)
+)
+
+
 class _TransferScope:
     """Forward hooks that move one activation's tensors across devices."""
 
@@ -606,9 +700,7 @@ class _TransferScope:
         self.calls: list[_Call] = []
 
     def __enter__(self) -> _TransferScope:
-        from uniserve_models.runtime._transfers import _ACTIVE
-
-        self.token = _ACTIVE.set(self)
+        self.token = _ACTIVE_TRANSFERS.set(self)
         try:
             for module, _ in self.owner.modules.values():
                 self.hooks.append(
@@ -630,26 +722,22 @@ class _TransferScope:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        from uniserve_models.runtime._transfers import _ACTIVE
-
         calls, self.calls = self.calls, []
         hooks, self.hooks = self.hooks, []
         token, self.token = self.token, None
         actions = [call.close for call in reversed(calls)]
         actions += [hook.remove for hook in reversed(hooks)]
         if token is not None:
-            actions.append(lambda: _ACTIVE.reset(token))
+            actions.append(lambda: _ACTIVE_TRANSFERS.reset(token))
         close_resources(*actions)
 
     def _active(self) -> bool:
-        from uniserve_models.runtime._transfers import _ACTIVE
-
-        return _ACTIVE.get() is self
+        return _ACTIVE_TRANSFERS.get() is self
 
     def prepare(self, module, args, kwargs):
         if not self._active():
             return None
-        from uniserve_models.runtime._transfers import _copy_inputs
+        from uniserve_models.distributed.transfers import copy_inputs
 
         entry = self.owner.modules.get(id(module))
         if entry is None:
@@ -667,7 +755,7 @@ class _TransferScope:
                 call.scopes.append(scope)
         # Traversal returns the origin while moving the inputs, so discovery
         # does not reconstruct every dataclass and container twice.
-        inputs, call.target = _copy_inputs(args, kwargs, device)
+        inputs, call.target = copy_inputs(args, kwargs, device)
         return inputs
 
     def finish(self, module, args, kwargs, result):
@@ -675,14 +763,14 @@ class _TransferScope:
             return None
         if self.calls[-1].module != id(module):
             return None
-        from uniserve_models.runtime._transfers import _copy_outputs
+        from uniserve_models.distributed.transfers import copy_outputs
 
         call = self.calls.pop()
         try:
             copied = (
                 result
                 if call.target is None or result is None
-                else _copy_outputs(result, call.target, call.out)
+                else copy_outputs(result, call.target, call.out)
             )
         except BaseException as error:
             try:
@@ -794,20 +882,32 @@ class ExecutionContext:
         self._max_tokens: int | None = None
         self._clear_bindings()
 
+    # Binding tables an activation installs into context variables. They are
+    # cleared in place, so an activation entered before ``prepare`` sees the
+    # bindings that preparation creates.
+    _BINDINGS = (
+        "_operators",
+        "_merged",
+        "_attention",
+        "_vsa",
+        "_vsa_operators",
+        "_moe",
+        "_vsa_output",
+        "_vsa_context",
+        "_context_backing",
+        "_vsa_transport",
+        "_exchange",
+        "_chunks",
+        "_gather_pools",
+    )
+
     def _clear_bindings(self) -> None:
-        self._operators: dict = {}
-        self._merged: dict = {}
-        self._attention: dict = {}
-        self._vsa: dict = {}
-        self._vsa_operators: dict = {}
-        self._moe: dict = {}
-        self._vsa_output: dict = {}
-        self._vsa_context: dict = {}
-        self._context_backing: dict = {}
-        self._vsa_transport: dict = {}
-        self._exchange: dict = {}
-        self._chunks: dict = {}
-        self._gather_pools: dict = {}
+        for name in self._BINDINGS:
+            table = self.__dict__.get(name)
+            if table is None:
+                setattr(self, name, {})
+            else:
+                table.clear()
 
     @property
     def device(self) -> torch.device:
@@ -886,11 +986,37 @@ class ExecutionContext:
         )
         self._exchange[id(layer)] = ExchangeBuffers(views)
 
-    def _context_transport(self, layer, rows, dtype):
-        from uniserve_models.runtime.attention_storage import (
-            allocate_context_storage,
+    def _bind_output(self, parallel, **options):
+        """Back and bind one layer's Ulysses output storage."""
+        from uniserve_models.nn.attention.storage import (
+            bind_output_storage,
+            output_requirements,
         )
 
+        requirements = output_requirements((parallel,), **options)
+        tensors, peers = {}, {}
+        for key, requirement in requirements.items():
+            tensors[key], fields = self.workspace.storage(requirement)
+            peers[key] = fields.get("output", ())
+        return bind_output_storage(requirements, tensors, peers)[parallel]
+
+    def _bind_context(self, parallel, **options):
+        """Back and bind one layer's context K/V storage, if it needs any."""
+        from uniserve_models.nn.attention.storage import (
+            bind_context_storage,
+            context_requirements,
+        )
+
+        requirements = context_requirements((parallel,), **options)
+        if not requirements:
+            return None
+        tensors = {
+            key: self.workspace.storage(requirement)[0]
+            for key, requirement in requirements.items()
+        }
+        return bind_context_storage(requirements, tensors)[parallel]
+
+    def _context_transport(self, layer, rows, dtype):
         parallel = layer.context_parallel
         group = parallel.context_group
         context_size = group.size
@@ -908,24 +1034,19 @@ class ExecutionContext:
         key = (parallel.key_group, rows, heads, head_dim, dtype)
         buffers = self._context_backing.get(key)
         if buffers is None:
-            buffers = allocate_context_storage(
-                (parallel,),
+            buffers = self._bind_context(
+                parallel,
                 rows=rows,
                 heads=heads,
                 head_dim=head_dim,
                 dtype=dtype,
                 block_size=1,
-            )[parallel]
+            )
             self._context_backing[key] = buffers
         self._vsa_context[parallel] = buffers
         return buffers
 
     def _vsa_exchange(self, layer, rows, heads, head_dim, dtype):
-        from uniserve_models.runtime.attention_storage import (
-            allocate_context_storage,
-            allocate_output_storage,
-        )
-
         parallel = getattr(layer, "parallel", None)
         if parallel is None:
             return None
@@ -956,13 +1077,10 @@ class ExecutionContext:
             # Registered symmetric windows belong to stream-bound
             # communicators, which the parallel runtime supplies; independent
             # buffers use the ordinary collective path.
-            allocated = allocate_output_storage((parallel,), **options)
-            output = allocated.views[parallel]
-            context = allocate_context_storage(
-                (parallel,), **options, block_size=64
-            ).get(parallel)
-            self._vsa_transport[key] = (output, context, allocated)
-        output, context, _ = self._vsa_transport[key]
+            output = self._bind_output(parallel, **options)
+            context = self._bind_context(parallel, **options, block_size=64)
+            self._vsa_transport[key] = (output, context)
+        output, context = self._vsa_transport[key]
         self._vsa_output[parallel] = output
         if context is not None:
             self._vsa_context[parallel] = context
@@ -1293,11 +1411,6 @@ class ExecutionContext:
         actions += [binding.close for binding in self._vsa.values()]
         actions += [pair[1].close for pair in self._vsa_operators.values()]
         actions += [binding.close for binding in self._moe.values()]
-        actions += [
-            allocation.close
-            for _, _, storage in self._vsa_transport.values()
-            for allocation in storage.allocations
-        ]
         actions.append(self.workspace.release)
         try:
             close_resources(*actions)

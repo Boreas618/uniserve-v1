@@ -138,3 +138,40 @@ def test_shared_scratch_is_declared_once_per_role_at_its_largest_extent():
         "matmul", {"work": BufferConfig((4, 3), torch.uint8)}, "cpu"
     )["work"]
     assert view.shape == (4, 3)
+
+
+def test_attention_storage_declares_symmetric_fields_with_their_members():
+    from uniserve_models.distributed import Communicator
+    from uniserve_models.nn.attention.storage import StorageRequirement
+
+    requirement = StorageRequirement(
+        Communicator((3, 5), 0, "ulysses"),
+        {
+            "output": BufferConfig((2, 4), torch.float32),
+            "sync_input": BufferConfig((1,), torch.int32),
+        },
+        ("output",),
+        (),
+    )
+    declared = DeclaredWorkspace()
+    tensors, peers = declared.storage(requirement)
+    assert set(tensors) == {"output", "sync_input"}
+    assert len(peers["output"]) == 2
+    assert {item.name: item.symmetric for item in declared.requirements} == {
+        "0000/output": (3, 5),
+        "0000/sync_input": None,
+    }
+
+    # The bound walk serves the local tensors and every member's peer view.
+    supplied = {
+        "0000/output": torch.zeros((2, 4)),
+        "0000/output.peer0": torch.zeros((2, 4)),
+        "0000/output.peer1": torch.ones((2, 4)),
+        "0000/sync_input": torch.zeros(1, dtype=torch.int32),
+    }
+    tensors, peers = BoundWorkspace(supplied).storage(requirement)
+    assert tensors["output"].data_ptr() == supplied["0000/output"].data_ptr()
+    assert [peer.data_ptr() for peer in peers["output"]] == [
+        supplied["0000/output.peer0"].data_ptr(),
+        supplied["0000/output.peer1"].data_ptr(),
+    ]

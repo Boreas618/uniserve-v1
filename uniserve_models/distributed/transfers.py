@@ -1,15 +1,17 @@
-"""Numerical tensor copies for execution-owned device transfers."""
+"""Tensor copies around a module placed on another device.
+
+A module placed on a device other than its caller's receives its tensor
+arguments on its own device and returns its results to the caller's device,
+or into caller-provided output storage. These copies are the numerical part
+of cross-device module placement; the worker owns streams and ordering.
+"""
 
 from collections.abc import Mapping
-from contextvars import ContextVar
 from dataclasses import fields, is_dataclass, replace
 
 import torch
 
-# Native activation scopes select hooks independently for shared modules.
-_ACTIVE: ContextVar[object | None] = ContextVar(
-    "uniserve_transfers", default=None
-)
+__all__ = ["copy_inputs", "copy_outputs"]
 
 
 def _map(value, function):
@@ -48,7 +50,7 @@ def _copy_out(value, out):
     )
 
 
-def _copy_inputs(args, kwargs, device):
+def copy_inputs(args, kwargs, device):
     """Move tensor arguments and return their caller's first device."""
     target = None
 
@@ -61,7 +63,7 @@ def _copy_inputs(args, kwargs, device):
     return _map((args, kwargs), copy), target
 
 
-def _copy_outputs(value, target, out):
+def copy_outputs(value, target, out):
     """Copy module results into caller storage or back to its input device."""
     if out is not None:
         return _copy_out(value, out)

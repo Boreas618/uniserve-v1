@@ -1,26 +1,33 @@
+use std::sync::Arc;
+
 use uniserve_core::TokenLogprob;
+use uniserve_worker::ffi::{Backing, DType};
+use uniserve_worker::storage::memory::{Memory, StorageView};
 use uniserve_worker::{EventPool, LogprobLayout, OutputBuffer, OutputStorage, Result};
 
-fn buffer(words: Vec<i64>) -> Result<OutputBuffer<Vec<i64>>> {
-    let count = words.len();
-    let mut buffer = OutputBuffer::new(
-        OutputStorage {
-            value: words,
-            words: count,
-            pinned: false,
-        },
-        1,
-        &[],
-        false,
-    );
-    buffer.reserve_tokens(count)?;
+/// A host column holding `values`, as a CPU lane's sampler produces it.
+fn column<T: Copy>(values: &[T], dtype: DType) -> Result<StorageView> {
+    let memory = Memory::host(size_of_val(values));
+    // SAFETY: fresh host memory of exactly this size, owned by the test.
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.as_ptr(), memory.address() as *mut T, values.len());
+    }
+    StorageView::contiguous(memory as Arc<dyn Backing>, 0, dtype, &[values.len() as i64])
+}
+
+/// An output buffer whose token words are a host capture of `words`.
+fn buffer(words: Vec<i64>) -> Result<OutputBuffer> {
+    let mut buffer = OutputBuffer::new(OutputStorage::allocate(None, words.len())?, 1, &[], false);
+    let (offset, count) =
+        buffer.capture(&column(&words, DType::I64)?, None, &EventPool::default())?;
+    assert_eq!((offset, count), (0, words.len()));
     Ok(buffer)
 }
 
-fn complete(buffer: &mut OutputBuffer<Vec<i64>>) -> Result<()> {
-    buffer.seal(&[], &mut EventPool::<()>::default())?;
+fn complete(buffer: &mut OutputBuffer) -> Result<()> {
+    buffer.seal(&[], &EventPool::default())?;
     buffer.copies_finished();
-    buffer.readback(|words, count| words[..count].to_vec())
+    buffer.readback()
 }
 
 fn score(value: f32) -> i64 {
@@ -111,11 +118,7 @@ fn selected_score_needs_no_top_or_requested_columns() -> Result<()> {
 #[test]
 fn readback_rejects_unfinished_copies_and_out_of_range_reads() -> Result<()> {
     let mut output = buffer(vec![3, 7])?;
-    assert!(
-        output
-            .readback(|words, count| words[..count].to_vec())
-            .is_err()
-    );
+    assert!(output.readback().is_err());
     complete(&mut output)?;
 
     assert_eq!(output.read_tokens(1, 1)?, [7]);
@@ -149,5 +152,54 @@ fn score_layout_must_fit_its_capture_and_row_widths() -> Result<()> {
                 .is_err()
         );
     }
+    Ok(())
+}
+
+#[test]
+fn narrow_token_columns_widen_on_readback() -> Result<()> {
+    let mut output = OutputBuffer::new(OutputStorage::allocate(None, 8)?, 1, &[], false);
+    let events = EventPool::default();
+    let (signed, signed_count) =
+        output.capture(&column(&[-3_i32, 7, i32::MIN], DType::I32)?, None, &events)?;
+    let (unsigned, unsigned_count) =
+        output.capture(&column(&[u32::MAX, 1], DType::U32)?, None, &events)?;
+    let (wide, wide_count) = output.capture(&column(&[i64::MAX], DType::I64)?, None, &events)?;
+    assert!(
+        output
+            .capture(&column(&[1.0_f32], DType::F32)?, None, &events)
+            .is_err()
+    );
+    complete(&mut output)?;
+
+    assert_eq!(
+        output.read_tokens(signed, signed_count)?,
+        [-3, 7, i64::from(i32::MIN)]
+    );
+    assert_eq!(
+        output.read_tokens(unsigned, unsigned_count)?,
+        [i64::from(u32::MAX), 1]
+    );
+    assert_eq!(output.read_tokens(wide, wide_count)?, [i64::MAX]);
+    Ok(())
+}
+
+#[test]
+fn byte_captures_fill_from_the_back_and_bound_token_capacity() -> Result<()> {
+    let mut output = OutputBuffer::new(OutputStorage::allocate(None, 2)?, 1, &[], false);
+    let events = EventPool::default();
+    let bytes = output.capture_bytes(&column(&[1_u8, 2, 3], DType::U8)?, None, &events)?;
+    // Three bytes from the back leave one whole token word.
+    output.capture(&column(&[9_i64], DType::I64)?, None, &events)?;
+    assert!(
+        output
+            .capture(&column(&[9_i64], DType::I64)?, None, &events)
+            .is_err()
+    );
+    complete(&mut output)?;
+
+    // SAFETY: the capture is host memory that no copy writes any more.
+    let captured = unsafe { std::slice::from_raw_parts(bytes.address() as *const u8, 3) };
+    assert_eq!(captured, [1, 2, 3]);
+    assert_eq!(output.read_tokens(0, 1)?, [9]);
     Ok(())
 }
