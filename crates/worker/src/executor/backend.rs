@@ -50,6 +50,9 @@ pub struct WorkerBackend {
     rank_storage: Option<RankStorage>,
     /// The text runtime, on ranks holding a causal language model.
     text: Option<forward::token::TextRuntime>,
+    /// The image runtime, on ranks holding encoders, image denoisers or
+    /// image decoders of a model that is not a video model.
+    image: Option<forward::image::ImageRuntime>,
     /// The canvas runtime, on ranks holding a token denoiser.
     canvas: Option<forward::canvas::CanvasRuntime>,
     /// Other capability runtimes' request storage.
@@ -66,14 +69,16 @@ pub(crate) struct Parts<'a> {
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut forward::token::TextRuntime>,
+    pub image: Option<&'a mut forward::image::ImageRuntime>,
     pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, then the
-/// text and canvas runtimes, then the other runtimes' owners.
+/// text, image and canvas runtimes, then the other runtimes' owners.
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<forward::token::TextRuntime>,
+    image: &'a mut Option<forward::image::ImageRuntime>,
     canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
     others: &'a mut [Box<dyn RequestStorage>],
 ) -> Vec<&'a mut dyn RequestStorage> {
@@ -83,6 +88,9 @@ fn owners<'a>(
     }
     if let Some(text) = text {
         owners.push(text);
+    }
+    if let Some(image) = image {
+        owners.push(image);
     }
     if let Some(canvas) = canvas {
         owners.push(canvas);
@@ -103,6 +111,8 @@ pub struct WorkerBatch {
     retirement: Retirement,
     /// A capability runtime's launched work awaiting materialization.
     running: Option<Launched>,
+    /// The host preparation of an image encoding batch's inline images.
+    image_inputs: Option<forward::image::Inputs>,
     output: Option<BatchResult>,
 }
 
@@ -114,6 +124,7 @@ impl WorkerBatch {
             predecessors: Vec::new(),
             retirement,
             running: None,
+            image_inputs: None,
             output: None,
         }
     }
@@ -157,6 +168,18 @@ impl WorkerBatch {
     pub(crate) fn launch(&mut self, running: Launched) {
         self.running = Some(running);
     }
+
+    pub(crate) fn image_inputs(&self) -> Option<&forward::image::Inputs> {
+        self.image_inputs.as_ref()
+    }
+
+    pub(crate) fn set_image_inputs(&mut self, inputs: forward::image::Inputs) {
+        self.image_inputs = Some(inputs);
+    }
+
+    pub(crate) fn take_image_inputs(&mut self) -> Option<forward::image::Inputs> {
+        self.image_inputs.take()
+    }
 }
 
 impl WorkerBackend {
@@ -167,6 +190,7 @@ impl WorkerBackend {
             rank,
             rank_storage: None,
             text: None,
+            image: None,
             canvas: None,
             storage: Vec::new(),
             components,
@@ -217,6 +241,15 @@ impl WorkerBackend {
         self.text.as_mut()
     }
 
+    /// Install the image runtime.
+    pub(crate) fn set_image(&mut self, image: forward::image::ImageRuntime) {
+        self.image = Some(image);
+    }
+
+    pub(crate) fn image_mut(&mut self) -> Option<&mut forward::image::ImageRuntime> {
+        self.image.as_mut()
+    }
+
     /// Install the canvas runtime.
     pub(crate) fn set_canvas(&mut self, canvas: forward::canvas::CanvasRuntime) {
         self.canvas = Some(canvas);
@@ -240,6 +273,7 @@ impl WorkerBackend {
             requests: &mut self.requests,
             storage: self.rank_storage.as_mut(),
             text: self.text.as_mut(),
+            image: self.image.as_mut(),
             canvas: self.canvas.as_mut(),
         }
     }
@@ -292,6 +326,7 @@ impl WorkerBackend {
             for owner in owners(
                 &mut self.rank_storage,
                 &mut self.text,
+                &mut self.image,
                 &mut self.canvas,
                 &mut self.storage,
             ) {
@@ -414,14 +449,17 @@ impl WorkerBackend {
         if let Some(text) = &self.text {
             text.set_wake(wake.clone());
         }
+        if let Some(image) = &self.image {
+            image.set_wake(wake.clone());
+        }
         for owner in &self.storage {
             owner.set_wake(wake.clone());
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, the canvas
-    /// and text runtimes, then rank storage), after the executor drained;
-    /// returns the first failure.
+    /// Close every storage owner, newest first (other runtimes, the canvas,
+    /// image and text runtimes, then rank storage), after the executor
+    /// drained; returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
@@ -429,6 +467,9 @@ impl WorkerBackend {
         }
         if let Some(mut canvas) = self.canvas.take() {
             result = result.and(canvas.close(aborted));
+        }
+        if let Some(mut image) = self.image.take() {
+            result = result.and(image.close(aborted));
         }
         if let Some(mut text) = self.text.take() {
             result = result.and(text.close(aborted));
@@ -439,19 +480,23 @@ impl WorkerBackend {
         result
     }
 
-    /// Close the canvas and text runtimes (graphs, then steps) before the
-    /// bindings they run close; attempts both before returning the first
-    /// failure.
+    /// Close the canvas, image and text runtimes (graphs, then steps)
+    /// before the bindings they run close; attempts every one before
+    /// returning the first failure.
     pub fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
         let canvas = self
             .canvas
             .take()
             .map_or(Ok(()), |mut canvas| canvas.close(aborted));
+        let image = self
+            .image
+            .take()
+            .map_or(Ok(()), |mut image| image.close(aborted));
         let text = self
             .text
             .take()
             .map_or(Ok(()), |mut text| text.close(aborted));
-        canvas.and(text)
+        canvas.and(image).and(text)
     }
 
     /// Release the outputs of the predecessors this batch's calls follow.
@@ -554,6 +599,7 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
+            &mut self.image,
             &mut self.canvas,
             &mut self.storage,
         );
@@ -576,11 +622,16 @@ impl Backend for WorkerBackend {
 
     fn prepare_inputs(
         &mut self,
-        _batch: &mut WorkerBatch,
-        _submission: &Arc<Submission>,
+        batch: &mut WorkerBatch,
+        submission: &Arc<Submission>,
     ) -> std::result::Result<bool, WorkerError> {
-        // Lifecycle batches read no inputs; a capability runtime's inputs
-        // are prepared when it executes the batch.
+        // Inline images of an image encoding batch are decoded on the image
+        // runtime's host lane while other batches execute; the batch
+        // launches once they are ready (the lane notifies `submission`).
+        // Other batches' inputs are prepared when their runtime executes.
+        if self.image.is_some() && !self.video_model(batch) {
+            return forward::image::prepare_inputs(self, batch, submission);
+        }
         Ok(true)
     }
 
@@ -627,6 +678,7 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
+            &mut self.image,
             &mut self.canvas,
             &mut self.storage,
         );
@@ -650,6 +702,7 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
+            &mut self.image,
             &mut self.canvas,
             &mut self.storage,
         );
@@ -682,6 +735,7 @@ impl Backend for WorkerBackend {
         for owner in owners(
             &mut self.rank_storage,
             &mut self.text,
+            &mut self.image,
             &mut self.canvas,
             &mut self.storage,
         ) {

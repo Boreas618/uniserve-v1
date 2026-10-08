@@ -5,7 +5,9 @@
 //! batch to materialization as a [`Launched`] value. Once the lease's device
 //! fences complete, [`materialize`] reads the words back, decodes every
 //! call's result and accepts its progress into the request pool. These
-//! steps are the same for every runtime that executes forward calls.
+//! steps are the same for every runtime that executes forward calls. A
+//! runtime whose results also need host work after the device finished
+//! (encoding decoded images) attaches it as a [`HostStage`].
 
 use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -33,6 +35,23 @@ pub(crate) struct Launched {
     pub(crate) stats: ForwardStats,
     /// The runtime's component timer name for materialization.
     pub(crate) timer: &'static str,
+    /// Host work that completes the calls' results after the device.
+    pub(crate) host: Option<Box<dyn HostStage>>,
+}
+
+/// Host work a launched batch finishes once its output fences completed,
+/// such as encoding generated media read back into its output lease.
+pub(crate) trait HostStage {
+    /// Advance the work after the fences completed; whether every call's
+    /// host result is ready.
+    fn poll(&mut self) -> Result<bool>;
+
+    /// Attach the finished host results to the calls' outputs (before they
+    /// resolve), returning nothing else.
+    fn finish(&mut self, outputs: &mut [PendingOutput]) -> Result<()>;
+
+    /// Withdraw work of a batch that will not be materialized.
+    fn cancel(&mut self);
 }
 
 /// Lock a batch's output buffer; a poisoned lock keeps its state.
@@ -176,14 +195,19 @@ pub(crate) fn materialize(
     plan: &BatchPlan,
     launched: &mut Launched,
 ) -> Result<Option<BatchResult>> {
-    {
-        let mut buffer = lock(&launched.buffer);
-        if buffer.ready_at()?.is_none() {
+    if lock(&launched.buffer).ready_at()?.is_none() {
+        return Ok(None);
+    }
+    if let Some(host) = &mut launched.host {
+        if !host.poll()? {
             return Ok(None);
         }
-        buffer.readback()?;
+        host.finish(&mut launched.outputs)?;
+        launched.host = None;
     }
+    lock(&launched.buffer).readback()?;
     let mut completions = Vec::with_capacity(launched.outputs.len());
+    let mut media = Vec::new();
     for output in &mut launched.outputs {
         let key = output.output.request_key;
         let parent = requests
@@ -208,6 +232,7 @@ pub(crate) fn materialize(
             continue;
         }
         completions.push(output.result()?.clone());
+        media.extend(output.take_media());
     }
     for output in &launched.outputs {
         if output.resolved() {
@@ -227,13 +252,16 @@ pub(crate) fn materialize(
             worker_exec_us: Some(elapsed),
             forward_stats: Some(stats),
         },
-        media: Vec::new(),
+        media,
     }))
 }
 
 /// Cancel a launched batch's unresolved calls; its storage retires through
 /// the fences it recorded.
-pub(crate) fn abandon(requests: &mut RequestPool, launched: Launched) -> Result<()> {
+pub(crate) fn abandon(requests: &mut RequestPool, mut launched: Launched) -> Result<()> {
+    if let Some(host) = &mut launched.host {
+        host.cancel();
+    }
     for output in &launched.outputs {
         output.cancel(requests)?;
     }
