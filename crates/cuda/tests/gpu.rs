@@ -1,0 +1,474 @@
+//! Behavior against a real driver. These tests need a CUDA device and use a
+//! few megabytes of memory on device 0; run them with
+//! `cargo test -p uniserve-cuda -- --ignored`.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use uniserve_cuda::nccl::{Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
+use uniserve_cuda::{
+    CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceId, Error, Event,
+    EventFlags, HandleType, Nvml, PeerMapping, PinnedBuffer, SourceOrder, Stream, StreamSignal,
+    Strided, StridedCopy, memcpy_async, memset_d8, memset_d32, reclaim,
+};
+
+const DEVICE: DeviceId = DeviceId(0);
+
+fn read(buffer: &PinnedBuffer) -> Vec<u8> {
+    // SAFETY: callers synchronize the stream that wrote the buffer first.
+    unsafe { buffer.as_slice() }.to_vec()
+}
+
+/// Blocks `stream` in a host function until the returned sender is used.
+fn block(stream: &Stream) -> mpsc::Sender<()> {
+    let (release, released) = mpsc::channel::<()>();
+    stream
+        .launch_host_fn(move || {
+            let _ = released.recv();
+        })
+        .unwrap();
+    release
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn device_queries_report_the_device() {
+    assert!(DeviceId::count().unwrap() > DEVICE.0);
+    assert!(uniserve_cuda::driver_version().unwrap() >= 12_080);
+    assert!(
+        DEVICE
+            .attribute(DeviceAttribute::MultiprocessorCount)
+            .unwrap()
+            > 0
+    );
+    assert!(DEVICE.uuid().unwrap().to_string().starts_with("GPU-"));
+
+    let memory = DEVICE.memory_info().unwrap();
+    assert!(memory.free <= memory.total && memory.total > 0);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn fills_and_copies_round_trip_through_device_memory() {
+    let stream = Stream::new(DEVICE).unwrap();
+    let first = DeviceAllocation::linear(DEVICE, 4096).unwrap();
+    let second = DeviceAllocation::linear(DEVICE, 4096).unwrap();
+    let mut host = PinnedBuffer::new(DEVICE, 4096).unwrap();
+
+    // SAFETY: every range lies inside the allocations above, which outlive the
+    // synchronization at the end of each block.
+    unsafe {
+        memset_d32(first.address(), 0xa5a5_a5a5, 1024, &stream).unwrap();
+        memset_d8(first.address() + 16, 7, 8, &stream).unwrap();
+        memcpy_async(second.address(), first.address(), 4096, &stream).unwrap();
+        memcpy_async(host.address(), second.address(), 4096, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    let bytes = read(&host);
+    assert!(bytes[..16].iter().all(|byte| *byte == 0xa5));
+    assert!(bytes[16..24].iter().all(|byte| *byte == 7));
+    assert!(bytes[24..].iter().all(|byte| *byte == 0xa5));
+
+    // SAFETY: no copy is pending on the buffer.
+    let pattern: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
+    unsafe { host.as_mut_slice() }.copy_from_slice(&pattern);
+    unsafe {
+        memcpy_async(first.address(), host.address(), 4096, &stream).unwrap();
+        memset_d8(host.address(), 0, 4096, &stream).unwrap();
+        memcpy_async(host.address(), first.address(), 4096, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), pattern);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn operations_need_no_current_context_on_the_calling_thread() {
+    let stream = Stream::new(DEVICE).unwrap();
+    let device = DeviceAllocation::linear(DEVICE, 256).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 256).unwrap();
+    let event = Event::new(EventFlags::default());
+
+    // A fresh thread has no current CUDA context.
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut batch = CopyBatch::new(SourceOrder::Stream);
+            batch.push(host.address(), device.address(), 256);
+            // SAFETY: both ranges outlive the synchronization below.
+            unsafe {
+                memset_d8(device.address(), 3, 256, &stream).unwrap();
+                batch.submit(&stream).unwrap();
+            }
+            event.record(&stream).unwrap();
+            event.synchronize().unwrap();
+            stream.synchronize().unwrap();
+        });
+    });
+
+    assert!(read(&host).iter().all(|byte| *byte == 3));
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn during_call_batches_read_host_sources_before_returning() {
+    let stream = Stream::new(DEVICE).unwrap();
+    let device = DeviceAllocation::linear(DEVICE, 64).unwrap();
+    let readback = PinnedBuffer::new(DEVICE, 64).unwrap();
+
+    // Hold the stream so that the copy cannot run before the source changes.
+    let release = block(&stream);
+    let mut source: Vec<u8> = (0..64).collect();
+    let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+    batch.push(device.address(), source.as_ptr() as u64, 64);
+    // SAFETY: the device range outlives the synchronization below; the
+    // pageable source is read before submit returns.
+    unsafe { batch.submit(&stream).unwrap() };
+    source.fill(0xff);
+
+    let mut back = CopyBatch::new(SourceOrder::Stream);
+    back.push(readback.address(), device.address(), 64);
+    // SAFETY: as above.
+    unsafe { back.submit(&stream).unwrap() };
+    release.send(()).unwrap();
+    stream.synchronize().unwrap();
+
+    assert_eq!(read(&readback), (0..64).collect::<Vec<u8>>());
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn strided_copies_match_the_reference_in_every_direction() {
+    // [layer, row, column] of u16: dense on the host, padded rows and layers
+    // on the device, so the plan is one 3D pitched copy.
+    let shape = [3_u64, 4, 6];
+    let host_strides = [24_i64, 6, 1];
+    let device_strides = [60_i64, 12, 1];
+    let stream = Stream::new(DEVICE).unwrap();
+    let device = DeviceAllocation::linear(DEVICE, 3 * 60 * 2).unwrap();
+    let staging = DeviceAllocation::linear(DEVICE, 3 * 60 * 2).unwrap();
+    let mut host = PinnedBuffer::new(DEVICE, 3 * 24 * 2).unwrap();
+    let pattern: Vec<u8> = (0..3 * 24 * 2).map(|index| (index * 5 + 1) as u8).collect();
+    // SAFETY: no copy is pending on the buffer.
+    unsafe { host.as_mut_slice() }.copy_from_slice(&pattern);
+
+    let operand = |address, strides| Strided {
+        address,
+        element_bytes: 2,
+        shape: &shape,
+        strides,
+    };
+    let host_operand = operand(host.address(), &host_strides[..]);
+
+    // SAFETY: every operand lies inside its allocation, all of which outlive
+    // the synchronization below.
+    unsafe {
+        memset_d8(device.address(), 0, device.len(), &stream).unwrap();
+
+        // Host to device, device to device, device back to host.
+        let mut upload = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
+        upload
+            .plan(&operand(device.address(), &device_strides), &host_operand)
+            .unwrap();
+        assert_eq!(upload.pitched().len(), 1);
+        assert_eq!(upload.pitched().copies()[0].depth, 3);
+        upload.submit(&stream).unwrap();
+
+        let mut copy = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
+        copy.plan(
+            &operand(staging.address(), &device_strides),
+            &operand(device.address(), &device_strides),
+        )
+        .unwrap();
+        copy.submit(&stream).unwrap();
+
+        memset_d8(host.address(), 0, host.len(), &stream).unwrap();
+        let mut download = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
+        download
+            .plan(&host_operand, &operand(staging.address(), &device_strides))
+            .unwrap();
+        download.submit(&stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), pattern);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn events_order_streams_and_measure_time() {
+    let producer = Stream::new(DEVICE).unwrap();
+    let consumer = producer.fork().unwrap();
+    let device = DeviceAllocation::linear(DEVICE, 1024).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 1024).unwrap();
+    let start = Event::new(EventFlags {
+        timing: true,
+        ..EventFlags::default()
+    });
+    let ready = Event::new(EventFlags {
+        timing: true,
+        ..EventFlags::default()
+    });
+    assert!(ready.query().unwrap(), "an unrecorded event is complete");
+
+    let release = block(&producer);
+    start.record(&producer).unwrap();
+    // SAFETY: the ranges outlive the synchronization below.
+    unsafe { memset_d8(device.address(), 9, 1024, &producer).unwrap() };
+    ready.record(&producer).unwrap();
+    consumer.wait_event(&ready).unwrap();
+    // SAFETY: as above.
+    unsafe { memcpy_async(host.address(), device.address(), 1024, &consumer).unwrap() };
+    let signal = StreamSignal::new().unwrap();
+    signal.schedule(&consumer).unwrap();
+
+    thread::sleep(Duration::from_millis(20));
+    assert!(!ready.query().unwrap());
+    assert!(!signal.consume().unwrap());
+
+    release.send(()).unwrap();
+    consumer.synchronize().unwrap();
+    assert!(ready.query().unwrap());
+    assert!(read(&host).iter().all(|byte| *byte == 9));
+    assert!(start.elapsed_ms(&ready).unwrap() >= 0.0);
+    // The host function runs on a driver thread shortly after the stream
+    // reaches it; synchronize only guarantees the device work.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !signal.consume().unwrap() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn interprocess_events_export_and_open() {
+    let stream = Stream::new(DEVICE).unwrap();
+    let event = Event::new(EventFlags {
+        interprocess: true,
+        ..EventFlags::default()
+    });
+    assert!(matches!(event.ipc_handle(), Err(Error::NotRecorded)));
+
+    event.record(&stream).unwrap();
+    let handle = event.ipc_handle().unwrap();
+    // Opening a handle in its own process is rejected by the driver; the
+    // export itself is what a peer receives.
+    assert_ne!(handle.0, [0; 64]);
+    stream.synchronize().unwrap();
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn exportable_memory_maps_through_imports_and_aliases() {
+    let granularity = DeviceAllocation::granularity(DEVICE).unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let first = DeviceAllocation::exportable(DEVICE, granularity / 2, &[]).unwrap();
+    let second = DeviceAllocation::exportable(DEVICE, granularity, &[]).unwrap();
+    assert_eq!(first.len(), granularity);
+    assert_eq!(
+        first.handle_type(),
+        Some(HandleType::probe(DEVICE).unwrap())
+    );
+    let host = PinnedBuffer::new(DEVICE, 2 * granularity).unwrap();
+
+    // SAFETY: the ranges outlive the synchronization below.
+    unsafe {
+        memset_d8(first.address(), 1, granularity, &stream).unwrap();
+        memset_d8(second.address(), 2, granularity, &stream).unwrap();
+    }
+
+    let exported = first.export().unwrap().expect("exportable memory exports");
+    let imported = PeerMapping::import(DEVICE, &exported, first.len()).unwrap();
+    let alias = PeerMapping::alias(&[&first, &second]).unwrap();
+    assert_eq!(alias.len(), 2 * granularity);
+
+    // SAFETY: as above.
+    unsafe {
+        memcpy_async(host.address(), imported.address(), granularity, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert!(read(&host)[..granularity].iter().all(|byte| *byte == 1));
+
+    // Writes through the alias land in the aliased allocations.
+    // SAFETY: as above.
+    unsafe {
+        memset_d8(alias.address() + granularity as u64, 5, 16, &stream).unwrap();
+        memcpy_async(host.address(), alias.address(), 2 * granularity, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let bytes = read(&host);
+    assert!(bytes[..granularity].iter().all(|byte| *byte == 1));
+    assert!(
+        bytes[granularity..granularity + 16]
+            .iter()
+            .all(|byte| *byte == 5)
+    );
+    assert!(bytes[granularity + 16..].iter().all(|byte| *byte == 2));
+
+    // Mappings keep their own references: they outlive the allocations.
+    drop((first, second));
+    // SAFETY: as above.
+    unsafe {
+        memcpy_async(host.address(), alias.address(), 16, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert!(read(&host)[..16].iter().all(|byte| *byte == 1));
+
+    assert!(linear_cannot_export());
+    drop((imported, alias, host));
+    reclaim::flush().unwrap();
+}
+
+fn linear_cannot_export() -> bool {
+    let linear = DeviceAllocation::linear(DEVICE, 256).unwrap();
+    linear.export().unwrap().is_none()
+        && matches!(
+            PeerMapping::alias(&[&linear]),
+            Err(Error::InvalidArgument(_))
+        )
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn capturing_streams_report_capture_and_reject_storage_operations() {
+    type BeginCapture = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
+    type EndCapture =
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32;
+    type DestroyGraph = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
+
+    // SAFETY: the signatures match cuda.h; relaxed mode (2) keeps the capture
+    // from interacting with other test threads.
+    let library = unsafe { libloading::Library::new("libcuda.so.1") }.unwrap();
+    let (begin, end, destroy) = unsafe {
+        (
+            *library
+                .get::<BeginCapture>(b"cuStreamBeginCapture_v2")
+                .unwrap(),
+            *library.get::<EndCapture>(b"cuStreamEndCapture").unwrap(),
+            *library.get::<DestroyGraph>(b"cuGraphDestroy").unwrap(),
+        )
+    };
+
+    let stream = Stream::new(DEVICE).unwrap();
+    let device = DeviceAllocation::linear(DEVICE, 256).unwrap();
+    assert_eq!(stream.capture_status().unwrap(), CaptureStatus::None);
+
+    // SAFETY: the stream is live and owned by this test.
+    assert_eq!(unsafe { begin(stream.raw() as *mut _, 2) }, 0);
+    assert_eq!(stream.capture_status().unwrap(), CaptureStatus::Active);
+
+    let mut batch = CopyBatch::new(SourceOrder::Stream);
+    batch.push(device.address(), device.address() + 128, 64);
+    // SAFETY: rejected before any copy is enqueued.
+    assert!(matches!(
+        unsafe { batch.submit(&stream) },
+        Err(Error::Capturing { .. })
+    ));
+    assert!(matches!(
+        stream.launch_host_fn(|| {}),
+        Err(Error::Capturing { .. })
+    ));
+    // Fills are capturable.
+    // SAFETY: the range lies inside the allocation.
+    unsafe { memset_d8(device.address(), 0, 256, &stream).unwrap() };
+
+    let mut graph = std::ptr::null_mut();
+    // SAFETY: ends the capture begun above and destroys the resulting graph.
+    unsafe {
+        assert_eq!(end(stream.raw() as *mut _, &mut graph), 0);
+        assert_eq!(destroy(graph), 0);
+    }
+    assert_eq!(stream.capture_status().unwrap(), CaptureStatus::None);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn sm_partitions_create_streams_of_the_requested_size() {
+    let total = DEVICE
+        .attribute(DeviceAttribute::MultiprocessorCount)
+        .unwrap() as u32;
+    let streams = Stream::partition(DEVICE, &[8, 16]).unwrap();
+
+    assert_eq!(streams.len(), 2);
+    assert_eq!(streams[0].sm_count().unwrap(), 8);
+    assert_eq!(streams[1].sm_count().unwrap(), 16);
+    assert!(streams[0].is_partitioned().unwrap());
+    let fork = streams[1].fork().unwrap();
+    assert!(fork.is_partitioned().unwrap());
+    assert_eq!(fork.sm_count().unwrap(), 16);
+
+    let full = Stream::new(DEVICE).unwrap();
+    assert!(!full.is_partitioned().unwrap());
+    assert_eq!(full.sm_count().unwrap(), total);
+    assert!(matches!(
+        Stream::partition(DEVICE, &[total + 1]),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires a CUDA device and NVML"]
+fn nvml_attributes_device_memory_to_this_process() {
+    let _allocation = DeviceAllocation::linear(DEVICE, 1 << 20).unwrap();
+    let nvml = Nvml::init().unwrap();
+
+    let memory = nvml.memory_info(DEVICE).unwrap();
+    assert!(memory.used <= memory.total);
+    match nvml.process_memory(DEVICE) {
+        Ok(bytes) => assert!(bytes >= 1 << 20),
+        // NVML lists host PIDs; a container without the host PID namespace
+        // cannot find itself.
+        Err(Error::ProcessNotFound { pid, .. }) => assert_eq!(pid, std::process::id()),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device and NCCL"]
+fn single_rank_communicators_run_collectives() {
+    let stream = Stream::new(DEVICE).unwrap();
+    let data = DeviceAllocation::linear(DEVICE, 16).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 16).unwrap();
+    let id = UniqueId::new().unwrap();
+    let mut communicator = Communicator::init(DEVICE, 1, 0, &id, CtaPolicy::Default).unwrap();
+    assert_eq!((communicator.rank(), communicator.size()), (0, 1));
+
+    // SAFETY: the buffers outlive the synchronization below.
+    unsafe {
+        memset_d32(data.address(), 41, 4, &stream).unwrap();
+        communicator
+            .all_reduce(
+                data.address(),
+                data.address(),
+                4,
+                DataType::Int32,
+                ReduceOp::Min,
+                &stream,
+            )
+            .unwrap();
+        communicator
+            .broadcast(
+                data.address(),
+                data.address(),
+                4,
+                DataType::Int32,
+                0,
+                &stream,
+            )
+            .unwrap();
+        memcpy_async(host.address(), data.address(), 16, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let words: Vec<u32> = read(&host)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_ne_bytes(*word))
+        .collect();
+    assert_eq!(words, [41; 4]);
+
+    communicator.destroy().unwrap();
+}
