@@ -26,7 +26,6 @@ use super::backend::{WorkerBackend, WorkerBatch};
 use crate::Error;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
-use crate::model::components::Capability;
 
 /// A capability runtime's launched batch awaiting materialization.
 pub(crate) enum Running {
@@ -100,9 +99,9 @@ pub(crate) fn execute(
             video::execute(&mut parts, plan, state)
         }
         // Encoders and denoisers serve both image and video models; the
-        // component's model decides.
+        // rank's model decides.
         Media(VisionEncoding | TextEncoding | LatentEncoding | LatentPreparation | Denoising) => {
-            if backend.video_model(batch) {
+            if backend.serves_video() {
                 let (plan, state) = batch.media_parts();
                 let mut parts = backend.media_parts()?;
                 video::execute(&mut parts, plan, state)
@@ -116,14 +115,4 @@ pub(crate) fn execute(
 /// Whether a batch of `route` runs as a media batch of the video runtime.
 pub(crate) fn media_route(route: Option<CallKind>, video: bool) -> bool {
     video && matches!(route, Some(CallKind::Media(_)))
-}
-
-/// Whether a component's model decodes video.
-pub(crate) fn decodes_video(capabilities: impl IntoIterator<Item = Capability>) -> bool {
-    capabilities.into_iter().any(|capability| {
-        matches!(
-            capability,
-            Capability::VideoDenoiser | Capability::VideoPostprocessor
-        )
-    })
 }

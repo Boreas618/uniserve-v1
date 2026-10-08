@@ -846,7 +846,12 @@ impl VideoDenoiser {
             .clone()
             .ok_or_else(|| Error::Unsupported("this rank holds no text conditioner".into()))?;
         let argument = Any::from(i64::from(capacity));
-        let mode = match self.conditioner_graphs.lookup(&capacity, None)? {
+        // Without a graph pool every capacity runs eagerly.
+        let lookup = match self.pool_handle {
+            Some(_) => self.conditioner_graphs.lookup(&capacity, None)?,
+            None => Lookup::Capture,
+        };
+        let mode = match lookup {
             Lookup::Replay(graph) => {
                 self.steps.replay.invoke(&[graph.view()])?;
                 GraphMode::Replay

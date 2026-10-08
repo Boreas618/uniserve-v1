@@ -15,7 +15,8 @@ use std::sync::{Arc, PoisonError};
 use uniserve_core::MediaSource;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
-    Batch as BatchPlan, BatchOutput, CallStatus, ErrorCode, RequestKey, TensorExport, TensorRef,
+    Batch as BatchPlan, BatchOutput, BufferId, CallStatus, ErrorCode, RequestKey, TensorExport,
+    TensorRef,
 };
 
 use crate::executor::pending::{BatchResult, PendingOutput};
@@ -62,8 +63,10 @@ pub(crate) struct CallState {
     pub(crate) writes: Vec<ProductBuffer>,
     /// The completion scalar a successor's predicate reads.
     pub(crate) completion: Option<ProductBuffer>,
-    /// Export locations, revoked when the batch fails before delivery.
-    pub(crate) exports: Vec<Location>,
+    /// Export locations by product: registered with the store on delivery,
+    /// so releasing the product revokes them, and revoked when the batch
+    /// fails before delivery.
+    pub(crate) exports: Vec<(BufferId, Vec<Location>)>,
     pub(crate) products: Vec<TensorExport>,
     pub(crate) latent: Option<LatentUpdate>,
     pub(crate) tasks: Vec<Arc<HostTask<MediaTask>>>,
@@ -278,8 +281,10 @@ impl MediaBatch {
             if let Some(source) = call.pending.take_media() {
                 media.push(source);
             }
-            // Delivered exports retire with their products.
-            call.exports.clear();
+            // Delivered exports are revoked with their products' release.
+            for (buffer, locations) in call.exports.drain(..) {
+                owners.store.register_exports(buffer, locations)?;
+            }
         }
         self.delivered = true;
         Ok(Some(BatchResult {
@@ -348,7 +353,7 @@ impl MediaBatch {
                     owners.store.commit_writes(std::slice::from_ref(&write))?;
                     let (exported, locations) =
                         export(owners, plan_call, &product, &write, true, None, None)?;
-                    call.exports.extend(locations);
+                    call.exports.push((write.id(), locations));
                     call.products.push(exported);
                 }
             }
@@ -382,7 +387,7 @@ impl MediaBatch {
                     Some(&regions),
                     None,
                 )?;
-                call.exports.extend(locations);
+                call.exports.push((write.id(), locations));
                 call.products.push(exported);
             }
             Some(Publication::Media) if call.pending.reports_output => {
@@ -418,8 +423,12 @@ impl MediaBatch {
                     tracing::warn!(target: "uniserve_worker.media", "withdrawing a host media task failed: {error}");
                 }
             }
-            result = result.and(exports::release(&call.exports));
-            call.exports.clear();
+            let locations: Vec<Location> = call
+                .exports
+                .drain(..)
+                .flat_map(|(_, locations)| locations)
+                .collect();
+            result = result.and(exports::release(&locations));
         }
         if self.committed {
             for call in &self.calls {

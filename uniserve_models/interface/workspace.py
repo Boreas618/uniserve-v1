@@ -36,7 +36,8 @@ class RuntimeWorkspace:
 
     ``allocate(name, role, dtype, shape, host)`` returns a tensor of exactly
     ``shape`` and ``dtype``: a fresh allocation for an empty ``role``, or a
-    view of the shared backing of field ``name`` otherwise. Allocations live
+    view of the shared backing ``role`` names otherwise; the provider names
+    each shared field's backing by the field's full name. Allocations live
     as long as the tensors referencing them.
     """
 
@@ -75,10 +76,12 @@ class RuntimeWorkspace:
                         "capture"
                     )
                 shape = tuple(config.capacity_shape or config.shape)
+                # A shared field's backing is keyed by its full name: the
+                # fields of one role are distinct memory.
                 backing = torch.from_dlpack(
                     self._allocate(
                         name,
-                        role,
+                        name if role else "",
                         str(config.dtype).removeprefix("torch."),
                         list(shape),
                         bool(config.host),

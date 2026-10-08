@@ -280,21 +280,10 @@ impl WorkerBackend {
         self.kernels = Some(watch);
     }
 
-    /// Whether the component of a batch belongs to a video model.
-    pub fn video_model(&self, batch: &WorkerBatch) -> bool {
-        batch
-            .plan
-            .calls
-            .first()
-            .and_then(|call| self.components.get(&call.component))
-            .is_some_and(|placed| {
-                forward::decodes_video(
-                    placed
-                        .calls
-                        .iter()
-                        .flat_map(|call| call.capabilities.iter().copied()),
-                )
-            })
+    /// Whether the rank serves a video model: its encoders and denoisers
+    /// run in the video runtime.
+    pub fn serves_video(&self) -> bool {
+        self.video.is_some()
     }
 
     /// Install every Start, then follow each call's predecessor.
