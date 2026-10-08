@@ -1,0 +1,102 @@
+//! Device storage accounting for startup planning.
+//!
+//! A rank's device budget is a fraction of the device's total memory minus
+//! what the process already holds, never more than the device has free. The
+//! process figure is NVML's per-process usage, which counts every allocation
+//! of the process's context: PyTorch's caching allocator (weights,
+//! activations, graph pools), Rust driver allocations (KV planes, arenas,
+//! workspaces), communicator buffers and loaded modules. The caching
+//! allocator first returns unused cached blocks, so reusable cache does not
+//! count against the grant.
+
+use uniserve_cuda::{DeviceId, Nvml};
+
+use crate::ffi::Function;
+use crate::{Error, Result};
+
+/// Per-process device storage measurements.
+pub struct DeviceBudget {
+    nvml: Nvml,
+    /// `memory.release_cached`: synchronize the device and empty PyTorch's
+    /// cache before a measurement.
+    release_cached: Function,
+}
+
+/// A device's storage grant and its free bytes, at one measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Bytes the rank may still allocate on the device.
+    pub available: u64,
+    /// Bytes the device reports free.
+    pub free: u64,
+    /// Bytes the process holds.
+    pub process: u64,
+    /// Total device bytes.
+    pub total: u64,
+}
+
+impl DeviceBudget {
+    pub fn new(release_cached: Function) -> Result<Self> {
+        Ok(Self {
+            nvml: Nvml::init()?,
+            release_cached,
+        })
+    }
+
+    /// Device memory this process holds on `device`, after PyTorch returns
+    /// its unused cached blocks.
+    ///
+    /// Fails when NVML attributes no usage on the device to this process, as
+    /// inside a PID namespace NVML does not report.
+    pub fn process_bytes(&self, device: i32) -> Result<u64> {
+        self.release_cached
+            .invoke(&[(&tvm_ffi::Any::from(i64::from(device))).into()])?;
+        self.nvml
+            .process_memory(DeviceId(device))
+            .map_err(|error| match error {
+                uniserve_cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
+                    "NVML reports no device storage for this process on cuda:{device}"
+                )),
+                error => Error::Cuda(error),
+            })
+    }
+
+    /// The storage grant on `device` for a rank allowed `fraction` of it.
+    pub fn budget(&self, device: i32, fraction: f64) -> Result<Budget> {
+        let process = self.process_bytes(device)?;
+        let memory = DeviceId(device).memory_info()?;
+        Ok(Budget {
+            available: grant(memory.total, fraction, process, memory.free),
+            free: memory.free,
+            process,
+            total: memory.total,
+        })
+    }
+}
+
+/// Total memory of a CUDA device, in bytes.
+pub fn total_bytes(device: i32) -> Result<u64> {
+    Ok(DeviceId(device).memory_info()?.total)
+}
+
+/// `min(max(0, ⌊total × fraction⌋ − process), free)`.
+pub fn grant(total: u64, fraction: f64, process: u64, free: u64) -> u64 {
+    let limit = (total as f64 * fraction) as u64;
+    limit.saturating_sub(process).min(free)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_grant_is_the_fraction_left_after_process_storage() {
+        let gib = 1 << 30;
+        // 70% of 100 GiB minus 20 GiB held, within 60 GiB free.
+        assert_eq!(grant(100 * gib, 0.7, 20 * gib, 60 * gib), 50 * gib);
+        // Free memory bounds the grant when other processes hold storage.
+        assert_eq!(grant(100 * gib, 0.7, 20 * gib, 30 * gib), 30 * gib);
+        // A process beyond its fraction has no grant left.
+        assert_eq!(grant(100 * gib, 0.5, 60 * gib, 40 * gib), 0);
+    }
+}

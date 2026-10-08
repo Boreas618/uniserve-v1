@@ -8,6 +8,7 @@ from typing import Generic, TypeVar
 import torch
 from torch import nn
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.diffusion import DenoisingStep, Schedule
 from uniserve_models.media import image, video
 from uniserve_models.model import (
@@ -24,7 +25,6 @@ from uniserve_models.model import (
 )
 from uniserve_models.model.logits import Logits
 from uniserve_models.nn.vae import PatchAutoencoder
-from uniserve_models.runtime import ExecutionContext
 from uniserve_models.tensors import TensorOutput
 
 ModelT = TypeVar("ModelT", bound=nn.Module)
@@ -70,13 +70,13 @@ class ModelRunner(Generic[ModelT, SizeT]):
         caller = None
         if owner is not None:
             caller = torch.cuda.current_stream(owner.device)
-            owner.wait(caller)
+            owner.wait_stream(caller)
 
         with self.context.activate():
             result = call(*args, **kwargs)
 
-        if owner is not None and caller is not None and caller != owner.stream:
-            caller.wait_stream(owner.stream)
+        if caller is not None and caller != owner:
+            caller.wait_stream(owner)
         return result
 
 

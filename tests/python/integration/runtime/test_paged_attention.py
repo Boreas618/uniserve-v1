@@ -7,10 +7,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from uniserve_models.backends.attention.flashinfer import Backend, Config
+from uniserve_models.bindings.context import TensorBuffers
 from uniserve_models.model import TextSize
 from uniserve_models.nn.attention import BlockTable, PagedInput, SequenceLengths
-from uniserve_models.runtime import TensorBuffers
-from uniserve_models.backends.attention.flashinfer import Backend, Config
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

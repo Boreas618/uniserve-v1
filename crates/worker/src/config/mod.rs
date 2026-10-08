@@ -1,8 +1,39 @@
-//! Immutable rank execution settings, independent of the numerical backend.
+//! Immutable rank settings resolved from the launch descriptor.
+//!
+//! [`resolve`] turns the descriptor into a [`WorkerLaunch`]; its
+//! [`WorkerConfig`] holds the execution settings shared by capacity planning,
+//! storage and the runners.
+
+mod device;
+mod launch;
+
+pub use device::{Device, generation_device};
+pub use launch::{
+    AttentionOptions, DataPlane, ExpertUnion, IpcConfig, LoadOptions, ModelSource,
+    RendezvousConfig, WorkerLaunch, resolve,
+};
 
 use uniserve_ipc::{CanvasSampling, LaneConfig};
 
 use crate::{Error, Result};
+
+/// A launch descriptor or argument the rank cannot run with. The process
+/// reports it as a usage error (exit status 2).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct DescriptorError(String);
+
+impl DescriptorError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl From<Error> for DescriptorError {
+    fn from(error: Error) -> Self {
+        Self(error.to_string())
+    }
+}
 
 /// Settings resolved before model loading and physical capacity fitting.
 /// Numerical backend options remain with their backend, outside this value.
@@ -138,6 +169,39 @@ pub fn graph_padding_block_count(block_size: usize) -> usize {
 }
 
 impl WorkerConfig {
+    /// The rank's primary device. `device` holds a canonical name produced by
+    /// [`resolve`]; an unparsable name means CPU only in hand-built configs.
+    pub fn primary_device(&self) -> Device {
+        Device::parse(&self.device, "--device").unwrap_or(Device::Cpu)
+    }
+
+    /// Bound request concurrency for a model that decodes resident media.
+    ///
+    /// Each resident media request keeps two unresolved outputs and one
+    /// retiring position, so it needs three queue positions; the rank serves
+    /// as many concurrent requests as the queue holds slots, at most
+    /// `max_batch_calls`, and at least two. Request storage is then sized
+    /// by those slots instead of the token pool.
+    pub fn for_media_slots(&self, queue_depth: usize) -> Result<Self> {
+        let slots = self.max_batch_calls.min(queue_depth / 3);
+        if slots < 2 {
+            return Err(Error::Unsupported(format!(
+                "resident media execution requires two slots of three queue positions each; queue depth {queue_depth} holds {}",
+                queue_depth / 3
+            )));
+        }
+        Ok(Self {
+            kv_token_capacity: None,
+            attention_backend: None,
+            generation_device: None,
+            max_batch_calls: slots,
+            max_batch_tokens: slots,
+            max_request_pool_size: slots,
+            min_request_pool_size: 2,
+            ..self.clone()
+        })
+    }
+
     /// Distinct execution devices whose resident storage belongs to this rank.
     pub fn devices(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.device.as_str()).chain(

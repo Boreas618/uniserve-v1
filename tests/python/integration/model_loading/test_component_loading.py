@@ -212,13 +212,9 @@ def test_shared_parameter_rejects_conflicting_placement_before_materialization(
 def test_contexts_deliver_cross_device_components_with_independent_graphs(
     component_checkpoint, stream_kind
 ):
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import (
-        CUDAGraph,
-        CUDAStream,
-        ExecutionContext,
-        partition_streams,
-    )
+    from uniserve_models.runtime import CUDAGraph, CUDAStream, partition_streams
 
     root, io = component_checkpoint
     model = _load(
@@ -294,8 +290,9 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
 def test_shared_components_deliver_independently_on_concurrent_contexts(
     component_checkpoint,
 ):
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import CUDAStream, ExecutionContext
+    from uniserve_models.runtime import CUDAStream
 
     root, io = component_checkpoint
     model = _load(
@@ -342,8 +339,8 @@ def test_cpu_context_unwinds_a_pending_gpu_call_without_waiting(
     component_checkpoint,
 ):
     from tests.python.fixtures.cuda_stream import blocked_stream
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import ExecutionContext
 
     root, io = component_checkpoint
     model = _load(root, io, device="cpu", devices={"decoder": "cuda:1"}).model
@@ -374,8 +371,8 @@ def test_component_delivery_preserves_nested_inputs_and_named_output_storage(
     source,
     destination,
 ):
+    from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import ExecutionContext
 
     @dataclass(frozen=True)
     class Residual:

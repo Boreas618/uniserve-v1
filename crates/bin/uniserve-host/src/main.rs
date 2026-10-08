@@ -91,7 +91,7 @@ struct Spawn {
     /// Interpreter that runs the worker module.
     python: String,
     /// The head's complete launch descriptor for this rank.
-    descriptor: serde_json::Value,
+    descriptor: Box<uniserve_ipc::LaunchDescriptor>,
     /// Environment variables the head set on its own spawn command for this
     /// rank. They are applied over the environment this launcher inherited; a
     /// variable the head's command removes arrives with an empty value and is
@@ -288,7 +288,7 @@ fn start_rank(
     let mut command = Command::new(&spawn.python);
     command
         .arg("-m")
-        .arg("uniserve_worker.main")
+        .arg("uniserve_models.worker")
         .arg("--worker-id")
         .arg(&spawn.worker_id)
         .arg("--rank")
@@ -303,17 +303,9 @@ fn start_rank(
     die_with_launcher(&mut command);
     if let Some(listener) = store_listener {
         let fd = uniserve_core::launch::inherit_listener(&mut command, listener);
-        spawn
-            .descriptor
-            .as_object_mut()
-            .context("the launch descriptor is not an object")?
-            .insert(
-                uniserve_core::launch::RENDEZVOUS_LISTEN_FD.to_owned(),
-                fd.into(),
-            );
+        spawn.descriptor.rendezvous_listen_fd = Some(fd);
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(&spawn.descriptor)?)
-        .context("writing the launch descriptor")?;
+    std::fs::write(&path, spawn.descriptor.to_json()?).context("writing the launch descriptor")?;
 
     let child = command
         .spawn()

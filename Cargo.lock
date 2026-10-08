@@ -9547,6 +9547,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uniserve-core",
+ "uniserve-ipc",
 ]
 
 [[package]]
@@ -9641,8 +9642,14 @@ dependencies = [
  "libc",
  "nvtx",
  "rustix 1.1.4",
+ "serde",
  "serde_json",
+ "signal-hook-registry",
+ "tempfile",
  "thiserror 2.0.18",
+ "time",
+ "tracing",
+ "tracing-subscriber",
  "tvm-ffi",
  "uniserve-core",
  "uniserve-cuda",

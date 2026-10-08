@@ -14,8 +14,14 @@ crossbeam-channel.workspace = true
 indexmap.workspace = true
 libc.workspace = true
 nvtx.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["pipe", "fs"] }
+serde.workspace = true
+serde_json.workspace = true
+signal-hook-registry.workspace = true
 thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 tvm-ffi.workspace = true
 uniserve-core.workspace = true
 uniserve-cuda.workspace = true
@@ -30,6 +36,7 @@ crate-type = ["cdylib"]
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

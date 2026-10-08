@@ -8,6 +8,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh, parallelize_
 from uniserve_models.nn import MergedColumnParallelLinear
 from uniserve_models.nn.attention import (
@@ -19,7 +20,6 @@ from uniserve_models.nn.attention import (
 from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
-    ExecutionContext,
     initialize_process_groups,
 )
 

@@ -5,11 +5,11 @@ from dataclasses import replace
 import pytest
 import torch
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.cache.units import UnitPool
 from uniserve_models.media import image
 from uniserve_models.model import LatentInput, TextInput, TextSize, VisionInput
 from uniserve_models.nn.attention import AttentionBatch, PagedInput
-from uniserve_models.runtime import ExecutionContext
 from uniserve_models.stub import DenoiserInput, Model
 
 pytestmark = pytest.mark.unit

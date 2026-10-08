@@ -7,7 +7,7 @@ wheels/
 *.egg-info
 
 # Compiled native extensions built in-tree by setuptools-rust (editable installs)
-uniserve_worker/_uniserve_ipc*.so
+uniserve_models/_worker*.so
 
 # Virtual environments
 .venv*

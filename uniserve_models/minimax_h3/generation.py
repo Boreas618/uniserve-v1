@@ -14,11 +14,11 @@ from dataclasses import dataclass
 
 import torch
 
+from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
 from uniserve_models.diffusion import normal_noise
 from uniserve_models.execution import DenoisingRunner
 from uniserve_models.media import image, video
 from uniserve_models.model import LatentInput, TextSize
-from uniserve_models.runtime import ExecutionContext, TensorBuffers
 
 from .inputs import DenoiserInput, DenoiserSize
 from .model import Model

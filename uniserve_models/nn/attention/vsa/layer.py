@@ -52,7 +52,7 @@ class BlockAttention(nn.Module):
             return
 
         from uniserve_models.backends.attention import vsa
-        from uniserve_models.runtime.tensor_buffers import TensorBuffers
+        from uniserve_models.bindings.context import TensorBuffers
 
         if q.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("bind and prepare VSA before CUDA graph capture")

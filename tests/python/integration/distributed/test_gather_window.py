@@ -12,14 +12,11 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
+from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh, parallelize_
 from uniserve_models.nn import ColumnParallelLinear
 from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
-from uniserve_models.runtime import (
-    CUDAStream,
-    ExecutionContext,
-    initialize_process_groups,
-)
+from uniserve_models.runtime import CUDAStream, initialize_process_groups
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

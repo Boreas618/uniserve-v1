@@ -100,9 +100,9 @@ pub(crate) struct RemoteLaunch<'a> {
     pub world_size: u32,
     pub python: &'a str,
     /// The launch descriptor the rank reads, as the head derived it for a
-    /// local spawn. The launcher adds the inherited store socket's number to
-    /// the first rank's copy, which only it knows.
-    pub descriptor: &'a serde_json::Value,
+    /// local spawn. The launcher sets the inherited rendezvous socket's
+    /// number in the first rank's copy, which only it knows.
+    pub descriptor: &'a uniserve_ipc::LaunchDescriptor,
     /// The variables the head's spawn command for this rank sets; one the
     /// command removes is sent with an empty value.
     pub environment: HashMap<String, String>,
@@ -520,7 +520,7 @@ impl RemoteHost<'_> {
         world_size: u32,
         python: &std::path::Path,
         worker_id: &str,
-        descriptor: &serde_json::Value,
+        descriptor: &uniserve_ipc::LaunchDescriptor,
         command: &std::process::Command,
     ) -> anyhow::Result<()> {
         let environment = command
@@ -678,7 +678,9 @@ mod tests {
             .await_hosts(&["b".to_owned()], Duration::from_secs(5))
             .expect("host b presents");
 
-        let descriptor = serde_json::json!({});
+        let descriptor = crate::WorkerProcessArgs::default()
+            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
+            .expect("a descriptor");
         let launch = || RemoteLaunch {
             rank: 5,
             worker_id: "model",
