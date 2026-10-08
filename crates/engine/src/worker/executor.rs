@@ -30,7 +30,7 @@ use crate::executor::{
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     BatchCommand, BufferAllocation, BufferId, Call, KvTransfer, NewRequest, RequestKey,
     TensorExport, TensorRef,
 };
@@ -44,7 +44,7 @@ struct PendingWorker {
     submitted: bool,
     /// Calls whose completion this worker has not yet returned, with the
     /// computation code the completion must carry.
-    calls: HashMap<(RequestKey, uniserve_worker_ipc::CallId), uniserve_worker_ipc::CallKind>,
+    calls: HashMap<(RequestKey, uniserve_ipc::CallId), uniserve_ipc::CallKind>,
 }
 
 /// Dispatch and receipts for one scheduler batch.
@@ -224,7 +224,7 @@ pub struct WorkerExecutor {
 /// Returns an empty map when the routing lacks a video decoding or a video
 /// encoding component.
 pub(crate) fn video_unit_codecs(
-    routing: &std::collections::BTreeMap<uniserve_worker_ipc::MediaCall, String>,
+    routing: &std::collections::BTreeMap<uniserve_ipc::MediaCall, String>,
     placements: &[(
         &WorkerId,
         &[crate::WorkerRank],
@@ -233,8 +233,8 @@ pub(crate) fn video_unit_codecs(
 ) -> anyhow::Result<std::collections::BTreeMap<WorkerId, std::collections::BTreeSet<WorkerId>>> {
     let mut pairings = std::collections::BTreeMap::new();
     let (Some(decoder), Some(encoder)) = (
-        routing.get(&uniserve_worker_ipc::MediaCall::VideoDecoding),
-        routing.get(&uniserve_worker_ipc::MediaCall::VideoEncoding),
+        routing.get(&uniserve_ipc::MediaCall::VideoDecoding),
+        routing.get(&uniserve_ipc::MediaCall::VideoEncoding),
     ) else {
         return Ok(pairings);
     };
@@ -1229,7 +1229,7 @@ impl WorkerExecutor {
         let failed_calls = report
             .results
             .iter()
-            .filter(|completion| completion.output.status == uniserve_worker_ipc::CallStatus::Error)
+            .filter(|completion| completion.output.status == uniserve_ipc::CallStatus::Error)
             .map(|completion| (completion.output.request_key, completion.output.call_id))
             .collect::<HashSet<_>>();
         if !failed_calls.is_empty() {
@@ -1240,7 +1240,7 @@ impl WorkerExecutor {
                 .results
                 .iter()
                 .filter(|completion| {
-                    completion.output.status == uniserve_worker_ipc::CallStatus::Error
+                    completion.output.status == uniserve_ipc::CallStatus::Error
                 })
                 .map(|completion| {
                     (
@@ -1922,7 +1922,7 @@ mod placement_tests {
     use crate::WorkerRank;
     use crate::executor::{ComponentConfig, WorkerId};
     use std::collections::BTreeMap;
-    use uniserve_worker_ipc::MediaCall;
+    use uniserve_ipc::MediaCall;
 
     fn rank(node: &str, device: &str) -> WorkerRank {
         WorkerRank {

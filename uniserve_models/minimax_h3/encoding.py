@@ -15,12 +15,12 @@ from collections.abc import Mapping
 import torch
 from torch.nn import functional as F
 
-from uniserve.diffusion import normal_noise
-from uniserve.media import image, video
-from uniserve.model import AudioEncoder as BaseAudioEncoder
-from uniserve.model import VideoEncoder as BaseVideoEncoder
-from uniserve.nn.vae import DiagonalGaussian, LatentEncoder
-from uniserve.tensors import OutputLayout
+from uniserve_models.diffusion import normal_noise
+from uniserve_models.media import image, video
+from uniserve_models.model import AudioEncoder as BaseAudioEncoder
+from uniserve_models.model import VideoEncoder as BaseVideoEncoder
+from uniserve_models.nn.vae import DiagonalGaussian, LatentEncoder
+from uniserve_models.tensors import OutputLayout
 
 from . import audio_vae, video_vae
 from .packing import patchify_video

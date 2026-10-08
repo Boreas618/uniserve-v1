@@ -1,6 +1,6 @@
 //! Immutable rank execution settings, independent of the numerical backend.
 
-use uniserve_worker_ipc::{CanvasSampling, LaneConfig};
+use uniserve_ipc::{CanvasSampling, LaneConfig};
 
 use crate::{Error, Result};
 

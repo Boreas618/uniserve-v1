@@ -14,8 +14,8 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from uniserve.loading import checkpoint, weights
-from uniserve.model import TransformerDecoder
+from uniserve_models.loading import checkpoint, weights
+from uniserve_models.model import TransformerDecoder
 
 if TYPE_CHECKING:
     from .model import Model
@@ -232,7 +232,7 @@ def precisions(config) -> Mapping[str, weights.Config]:
 def checkpoint_precision(config) -> weights.Config:
     """Base precision for a calibrated ModelOpt checkpoint.
 
-    ``uniserve_models.loading`` overlays the calibrated quantization, and
+    ``uniserve_models.catalog`` overlays the calibrated quantization, and
     every other module stays BF16.
     """
     return _PRECISIONS["bf16"]

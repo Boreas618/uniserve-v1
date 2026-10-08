@@ -4,9 +4,9 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from uniserve.cache import Config, mha
-from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
+from uniserve_models.cache import Config, mha
+from uniserve_models.quantization import Quantizer
+from uniserve_models.runtime import PrefixCache
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

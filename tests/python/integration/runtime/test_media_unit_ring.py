@@ -11,9 +11,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve.media import image, video
-from uniserve.model import VideoPostprocessor
-from uniserve.tensors import OutputLayout, TensorOutput
+from uniserve_models.media import image, video
+from uniserve_models.model import VideoPostprocessor
+from uniserve_models.tensors import OutputLayout, TensorOutput
 
 pytestmark = pytest.mark.integration
 
@@ -117,8 +117,8 @@ def _ring(rank: int, expected_bytes: bytes, device: torch.device) -> None:
 
     import torch.distributed as dist
 
-    from uniserve.distributed import Communicator
-    from uniserve.runtime import CUDAStream, ExecutionContext
+    from uniserve_models.distributed import Communicator
+    from uniserve_models.runtime import CUDAStream, ExecutionContext
 
     expected = pickle.loads(expected_bytes)
     model = _postprocessor().to(device)

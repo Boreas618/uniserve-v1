@@ -8,15 +8,15 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.nn import MergedColumnParallelLinear
-from uniserve.nn.attention import (
+from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.nn import MergedColumnParallelLinear
+from uniserve_models.nn.attention import (
     AttentionParallelConfig,
     ContextParallelConfig,
     Ulysses,
     vsa,
 )
-from uniserve.runtime import (
+from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,

@@ -8,7 +8,7 @@ from transformers.vision_utils import (
     get_vision_position_ids,
 )
 
-from uniserve.nn.vision import (
+from uniserve_models.nn.vision import (
     PatchEmbed,
     PositionEmbedding,
     TubeletEmbed,

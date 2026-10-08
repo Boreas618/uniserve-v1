@@ -1,6 +1,6 @@
 """Sandwich RMS normalization of a residual stream in one launch.
 
-The Triton kernel here backs ``uniserve.nn.functional.sandwich_rms_norm``,
+The Triton kernel here backs ``uniserve_models.nn.functional.sandwich_rms_norm``,
 which defines the numbers with its portable composition, allocates the
 outputs and raises on CUDA with the reason :func:`unsupported` reports. One
 program owns one contiguous row: it normalizes and sums the updates,
@@ -22,7 +22,7 @@ launch synchronizes nothing and CUDA graphs capture it.
 An update may also be given as routes: ``[rows, K, width]`` rows and
 ``[rows, K]`` FP32 weights whose update value is the FP32 fused
 multiply-add chain over ``k = 0 .. K - 1`` in order, from zero, rounded
-once to the row dtype (``uniserve.nn.functional.Routes``). The launch
+once to the row dtype (``uniserve_models.nn.functional.Routes``). The launch
 evaluates that value while reading the routes, so the combined rows are
 never stored.
 

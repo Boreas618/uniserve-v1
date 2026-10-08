@@ -4,8 +4,8 @@ import pytest
 import torch
 from torch.distributed.tensor import Partial, Replicate, Shard
 
-from uniserve.distributed import Communicator, DeviceMesh, Distribution
-from uniserve.runtime.process_groups import initialize_process_groups
+from uniserve_models.distributed import Communicator, DeviceMesh, Distribution
+from uniserve_models.runtime.process_groups import initialize_process_groups
 
 pytestmark = pytest.mark.unit
 

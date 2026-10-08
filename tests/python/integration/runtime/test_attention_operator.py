@@ -4,9 +4,9 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve.cache import Config, mha
-from uniserve.model import TextSize
-from uniserve.nn.attention import (
+from uniserve_models.cache import Config, mha
+from uniserve_models.model import TextSize
+from uniserve_models.nn.attention import (
     BlockTable,
     DenseInput,
     PagedInput,
@@ -15,9 +15,9 @@ from uniserve.nn.attention import (
     VarlenInput,
     VisibleInput,
 )
-from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
-from uniserve.runtime.backends.attention.torch import Backend
+from uniserve_models.quantization import Quantizer
+from uniserve_models.runtime import PrefixCache
+from uniserve_models.backends.attention.torch import Backend
 
 pytestmark = pytest.mark.integration
 

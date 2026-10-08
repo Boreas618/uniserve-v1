@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve.env import flag_from_value
-from uniserve.math import ceil_div
+from uniserve_models.env import flag_from_value
+from uniserve_models.math import ceil_div
 
 pytestmark = pytest.mark.unit
 

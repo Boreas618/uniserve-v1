@@ -14,17 +14,17 @@ from dataclasses import replace
 import torch
 from transformers import AutoTokenizer
 
-from uniserve.model import CanvasInput, TextInput, TextSize
-from uniserve.nn.attention import (
+from uniserve_models.model import CanvasInput, TextInput, TextSize
+from uniserve_models.nn.attention import (
     AttentionBatch,
     BlockTable,
     PagedInput,
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve.runtime import ExecutionContext, PrefixCache
-from uniserve.runtime.prefix_cache import plan_units
-from uniserve_models import loading
+from uniserve_models.runtime import ExecutionContext, PrefixCache
+from uniserve_models.runtime.prefix_cache import plan_units
+from uniserve_models import catalog
 
 
 @torch.inference_mode()

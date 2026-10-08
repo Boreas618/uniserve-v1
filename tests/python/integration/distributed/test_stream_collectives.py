@@ -12,13 +12,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
-from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.model import TextSize
-from uniserve.nn import ColumnParallelLinear
-from uniserve.nn.attention import AttentionParallelConfig, Ulysses
-from uniserve.runtime import CUDAGraph, ExecutionContext, partition_streams
-from uniserve.runtime.process_groups import initialize_process_groups
-from uniserve.runtime.stream import CUDAStream
+from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.model import TextSize
+from uniserve_models.nn import ColumnParallelLinear
+from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
+from uniserve_models.runtime import CUDAGraph, ExecutionContext, partition_streams
+from uniserve_models.runtime.process_groups import initialize_process_groups
+from uniserve_models.runtime.stream import CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

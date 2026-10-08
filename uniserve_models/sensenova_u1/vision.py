@@ -14,9 +14,9 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from uniserve.nn.functional import apply_rotary
-from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
+from uniserve_models.nn.functional import apply_rotary
+from uniserve_models.nn.rope import RotaryEmbedding
+from uniserve_models.nn.vision.position import build_abs_positions_from_grid_hw
 
 
 def _finite(value: object) -> bool:

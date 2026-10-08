@@ -1,6 +1,6 @@
 """Concrete numerical model packages and checkpoint metadata loading.
 
-``uniserve_models.loading`` maps the one architecture a checkpoint declares to
+``uniserve_models.catalog`` maps the one architecture a checkpoint declares to
 a package here and reads that package's module-level interface:
 ``read_config`` normalizes checkpoint metadata into a typed config and may
 read tensor headers through ``sources``, the loader's resolution of the

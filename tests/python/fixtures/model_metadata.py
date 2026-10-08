@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from uniserve import loading
+from uniserve_models import loading
 from uniserve_models import diffusion_gemma
 
 

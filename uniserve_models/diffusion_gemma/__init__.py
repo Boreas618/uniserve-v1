@@ -1,6 +1,6 @@
 """DiffusionGemma numerical model and checkpoint definitions.
 
-``uniserve_models.loading`` selects this package for
+``uniserve_models.catalog`` selects this package for
 ``DiffusionGemmaForBlockDiffusion`` checkpoints and reads the names exported
 here as its model package contract: configuration normalization, the model
 class, its entry points, checkpoint sources and mappings, precision

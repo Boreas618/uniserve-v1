@@ -13,10 +13,10 @@ import pytest
 import torch
 
 from tests.python.fixtures.model_metadata import neo_metadata
-from uniserve.loading import Config as IOConfig
-from uniserve.media import image
-from uniserve.model import LatentInput
-from uniserve.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
+from uniserve_models.loading import Config as IOConfig
+from uniserve_models.media import image
+from uniserve_models.model import LatentInput
+from uniserve_models.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
 
 pytestmark = pytest.mark.unit
 

@@ -755,7 +755,7 @@ mod tests {
             self.inner.has_capacity(worker)
         }
 
-        fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
+        fn command_has_capacity(&self, command: &uniserve_ipc::BatchCommand) -> bool {
             self.inner.command_has_capacity(command)
         }
 

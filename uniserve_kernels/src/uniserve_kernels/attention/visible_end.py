@@ -1,6 +1,6 @@
 """Per-query visible-end mask for FlashAttention-4 CuTe attention.
 
-``uniserve.runtime.backends.attention.flash_attn_4`` passes
+``uniserve_models.backends.attention.flash_attn_4`` passes
 :func:`visible_end_mask` as the FlashAttention-4 ``mask_mod`` together with
 one auxiliary tensor: an int32 ``[batch, query rows]`` table whose entry is
 the exclusive end of the key range each sequence-local query row may see.

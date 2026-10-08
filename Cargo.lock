@@ -1284,7 +1284,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d067ad48b8650848b989a59a86c6c36a995d02d2bf778d45c3c5d57bc2718f02"
 dependencies = [
  "smallvec",
- "target-lexicon 0.12.16",
+ "target-lexicon",
 ]
 
 [[package]]
@@ -6893,73 +6893,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pyo3"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd274650b21d4bfc26a0a47587962c1edb425f69287324355cd040c3ea66071c"
-dependencies = [
- "libc",
- "once_cell",
- "portable-atomic",
- "pyo3-build-config",
- "pyo3-ffi",
- "pyo3-macros",
-]
-
-[[package]]
-name = "pyo3-build-config"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5e2a7d2f0d013342f295c048ad19237add5154a55b1c5a254c0ec93d4109078"
-dependencies = [
- "target-lexicon 0.13.5",
-]
-
-[[package]]
-name = "pyo3-ffi"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca85c467da1bbc8d866eea5deff9cf29ea5f7785054a17da36e65bda9c05845b"
-dependencies = [
- "libc",
- "pyo3-build-config",
-]
-
-[[package]]
-name = "pyo3-macros"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ac53762fd065daa3194dd09337a38bd793a188100fd1a9304c4ab312d901771"
-dependencies = [
- "proc-macro2",
- "pyo3-macros-backend",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "pyo3-macros-backend"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ca3a1557399783172dc5bf39cfca835157732532cba56b71d2292161e53b362"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "pythonize"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ec376e1216e0c929a74964ce2020012a1a39f32d80e78aa688721219ea7fb89"
-dependencies = [
- "pyo3",
- "serde",
-]
-
-[[package]]
 name = "qoi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8458,12 +8391,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
-name = "target-lexicon"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
-
-[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9459,7 +9386,7 @@ dependencies = [
 
 [[package]]
 name = "uniserve"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -9480,7 +9407,7 @@ dependencies = [
 
 [[package]]
 name = "uniserve-core"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "bitflags 2.13.0",
  "libc",
@@ -9492,7 +9419,7 @@ dependencies = [
 
 [[package]]
 name = "uniserve-dynamo-worker"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -9513,7 +9440,7 @@ dependencies = [
 
 [[package]]
 name = "uniserve-engine"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9531,12 +9458,12 @@ dependencies = [
  "tracing-subscriber",
  "uniserve-core",
  "uniserve-engine",
- "uniserve-worker-ipc",
+ "uniserve-ipc",
 ]
 
 [[package]]
 name = "uniserve-host"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -9550,24 +9477,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "uniserve-ipc-py"
-version = "0.2.0"
+name = "uniserve-ipc"
+version = "2.0.0"
 dependencies = [
- "anyhow",
- "indexmap 2.14.0",
- "pyo3",
- "pythonize",
+ "flatbuffers",
+ "flatbuffers-build",
+ "flatc-fork",
+ "iceoryx2",
+ "iceoryx2-bb-elementary-traits",
+ "libc",
  "serde",
+ "serde_bytes",
  "serde_json",
+ "thiserror 2.0.18",
  "uniserve-core",
- "uniserve-worker",
- "uniserve-worker-ipc",
- "uuid",
 ]
 
 [[package]]
 name = "uniserve-observability"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "prometheus-client",
  "uniserve-observability-derive",
@@ -9575,7 +9503,7 @@ dependencies = [
 
 [[package]]
 name = "uniserve-observability-derive"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9584,7 +9512,7 @@ dependencies = [
 
 [[package]]
 name = "uniserve-server"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -9623,8 +9551,8 @@ dependencies = [
  "tracing-futures",
  "uniserve-core",
  "uniserve-engine",
+ "uniserve-ipc",
  "uniserve-observability",
- "uniserve-worker-ipc",
  "url",
  "uuid",
  "validator",
@@ -9633,7 +9561,7 @@ dependencies = [
 
 [[package]]
 name = "uniserve-worker"
-version = "0.2.0"
+version = "2.0.0"
 dependencies = [
  "crossbeam-channel",
  "indexmap 2.14.0",
@@ -9643,24 +9571,7 @@ dependencies = [
  "rustix 1.1.4",
  "thiserror 2.0.18",
  "uniserve-core",
- "uniserve-worker-ipc",
-]
-
-[[package]]
-name = "uniserve-worker-ipc"
-version = "0.2.0"
-dependencies = [
- "flatbuffers",
- "flatbuffers-build",
- "flatc-fork",
- "iceoryx2",
- "iceoryx2-bb-elementary-traits",
- "libc",
- "serde",
- "serde_bytes",
- "serde_json",
- "thiserror 2.0.18",
- "uniserve-core",
+ "uniserve-ipc",
 ]
 
 [[package]]

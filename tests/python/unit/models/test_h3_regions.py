@@ -19,10 +19,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve.media import image, video
-from uniserve.model import Condition, ConditionRole
-from uniserve.nn.attention import vsa
-from uniserve.nn.attention.vsa.regions import select
+from uniserve_models.media import image, video
+from uniserve_models.model import Condition, ConditionRole
+from uniserve_models.nn.attention import vsa
+from uniserve_models.nn.attention.vsa.regions import select
 from uniserve_models.minimax_h3.packing import (
     AUDIO_CONDITION_GROUP,
     AUDIO_GROUP,

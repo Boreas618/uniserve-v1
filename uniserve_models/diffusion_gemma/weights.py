@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from uniserve.loading import checkpoint, weights
+from uniserve_models.loading import checkpoint, weights
 
 from .config import Config
 
@@ -201,8 +201,8 @@ def _check_layer_scalars(reader: checkpoint.Reader, layers: int) -> None:
 def checkpoint_mappings(model: Model) -> tuple[weights.ModuleMapping, ...]:
     """Declare how the resident parameters of ``model`` load from ``primary``.
 
-    ``uniserve_models.loading.read_config`` calls this on the complete meta
-    skeleton, and ``uniserve.loading.load_model`` calls it again after
+    ``uniserve_models.catalog.read_config`` calls this on the complete meta
+    skeleton, and ``uniserve_models.loading.load_model`` calls it again after
     ``parallelize_`` has bound the pipeline stage, so ``model`` may lack
     layers, the embedding or the head. Checkpoint tensors of absent
     parameters are declared nonresident rather than unexpected. The

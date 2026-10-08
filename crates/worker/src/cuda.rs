@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use libloading::Library;
-use uniserve_worker_ipc::Wake;
+use uniserve_ipc::Wake;
 
 type Handle = *mut c_void;
 type Status = i32;

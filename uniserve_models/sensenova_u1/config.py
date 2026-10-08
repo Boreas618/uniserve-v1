@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from uniserve import loading
-from uniserve.diffusion import NoiseScale
-from uniserve.loading import checkpoint
-from uniserve.nn.rope import RoPEScaling
+from uniserve_models import loading
+from uniserve_models.diffusion import NoiseScale
+from uniserve_models.loading import checkpoint
+from uniserve_models.nn.rope import RoPEScaling
 
 from ..rotary import alias, read_rotary
 from . import flow, vision

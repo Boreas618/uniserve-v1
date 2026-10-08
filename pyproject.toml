@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uniserve"
-version = "0.2.0"
-description = "UniServe computation library, numerical models, and Python worker runtime."
+version = "2.0.0"
+description = "UniServe: Rust serving runtime with the uniserve_models numerical library."
 readme = "README.md"
 requires-python = ">=3.11"
 # Keep the CUDA-13 PyTorch and torchvision release lines aligned. The locked
 # Linux wheels bring their matching NCCL and NVSHMEM runtime dependencies.
 dependencies = [
+    # The Rust worker and the numerical library exchange functions and tensors
+    # only through TVM-FFI; the Rust crate pins the same release.
+    "apache-tvm-ffi==0.1.14.post1",
     "torch>=2.13,<2.14",
     "torchvision>=0.28,<0.29",
     "transformers>=4.57.1",
@@ -73,27 +76,26 @@ override-dependencies = [
     "nvidia-nccl-cu13==2.30.4; sys_platform == 'linux'",
 ]
 
-[project.scripts]
-uniserve-worker = "uniserve_worker.main:main"
-
 [tool.setuptools.packages.find]
 # UniServe kernels and the benchmark driver are packaged independently
 # (`uniserve_kernels/pyproject.toml`, `uniserve_eval/pyproject.toml`) so the
 # root serving distribution cannot mask a missing kernel install and does not
 # ship a console script whose dependencies it never declares.
-include = ["uniserve", "uniserve.*", "uniserve_models*", "uniserve_worker*"]
+include = ["uniserve_models*"]
 
 [tool.setuptools.package-data]
 # Grouped-expert providers read this fixed tactic catalog at preparation.
-uniserve = ["runtime/backends/moe/tactics.json"]
+uniserve_models = ["backends/moe/tactics.json"]
 
-# Native worker IPC extension (PyO3). Serving runs these native targets, so
-# they build with Cargo's release profile even for an editable install,
-# where setuptools-rust would otherwise choose a debug build.
+# Rust worker runtime. It is a TVM-FFI library rather than a Python extension
+# module: `uniserve_models.worker` loads it with `tvm_ffi.load_module`. Serving
+# runs these native targets, so they build with Cargo's release profile even
+# for an editable install, where setuptools-rust would otherwise choose a
+# debug build.
 [[tool.setuptools-rust.ext-modules]]
-target = "uniserve_worker._uniserve_ipc"
-path = "crates/worker-ipc-py/Cargo.toml"
-binding = "PyO3"
+target = "uniserve_models._worker"
+path = "crates/worker/Cargo.toml"
+binding = "NoBinding"
 debug = false
 
 # Server/scheduler binary, installed onto PATH as `uniserve`.
@@ -164,8 +166,8 @@ convention = "google"
 # Use the invoking Python version so installed dependency stubs match CI's runtime.
 # Source of truth for the type-check scope. Must match the explicit paths
 # passed by CI (.github/workflows/ci.yml) and the justfile `lint` target
-# (`mypy uniserve uniserve_models uniserve_worker uniserve_eval`) so bare/editor invocations agree with CI.
-files = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
+# (`mypy uniserve_models uniserve_eval`) so bare/editor invocations agree with CI.
+files = ["uniserve_models", "uniserve_eval"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -177,6 +179,6 @@ ignore_missing_imports = true
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Keep aligned with [tool.mypy].files and the CI/justfile type-check scope.
-include = ["uniserve", "uniserve_models", "uniserve_worker", "uniserve_eval"]
+include = ["uniserve_models", "uniserve_eval"]
 exclude = ["refs", "target", ".venv"]
 reportMissingImports = "warning"

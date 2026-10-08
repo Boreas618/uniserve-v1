@@ -9,7 +9,7 @@
 
 use super::WorkerId;
 use std::collections::BTreeMap;
-use uniserve_worker_ipc::{
+use uniserve_ipc::{
     Batch, BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorExport,
 };
@@ -67,7 +67,7 @@ pub struct ExecutionBatch {
     ///
     /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
     /// the worker-local batches it builds.
-    pub kv_inputs: Vec<uniserve_worker_ipc::KvTransfer>,
+    pub kv_inputs: Vec<uniserve_ipc::KvTransfer>,
 }
 
 impl ExecutionBatch {

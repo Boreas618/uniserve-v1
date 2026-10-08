@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from uniserve.media import image
-from uniserve.model import DenoiserInput as NumericalDenoiserInput
-from uniserve.nn.attention import AttentionBatch
+from uniserve_models.media import image
+from uniserve_models.model import DenoiserInput as NumericalDenoiserInput
+from uniserve_models.nn.attention import AttentionBatch
 
 
 @dataclass(frozen=True)

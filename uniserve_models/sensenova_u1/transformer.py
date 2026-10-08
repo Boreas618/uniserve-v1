@@ -18,8 +18,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from uniserve.model import TransformerDecoder
-from uniserve.nn.attention import (
+from uniserve_models.model import TransformerDecoder
+from uniserve_models.nn.attention import (
     Attention,
     AttentionBatch,
     AxialQKVProjection,
@@ -27,19 +27,19 @@ from uniserve.nn.attention import (
     PagedInput,
     SegmentedInput,
 )
-from uniserve.nn.linear import (
+from uniserve_models.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.norm import RMSNorm
-from uniserve.nn.rope import (
+from uniserve_models.nn.mlp import GatedMLP
+from uniserve_models.nn.norm import RMSNorm
+from uniserve_models.nn.rope import (
     DynamicScaling,
     LongRoPEScaling,
     RotaryEmbedding,
 )
-from uniserve.nn.routing import RoutedTensor, RouteSpan
+from uniserve_models.nn.routing import RoutedTensor, RouteSpan
 
 from .config import TransformerConfig
 

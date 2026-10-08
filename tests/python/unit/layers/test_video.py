@@ -7,10 +7,10 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve.media import image, video
-from uniserve.model import VideoPostprocessor
-from uniserve.nn.vae.spatial import SpatialDecoder
-from uniserve.tensors import OutputLayout, TensorOutput
+from uniserve_models.media import image, video
+from uniserve_models.model import VideoPostprocessor
+from uniserve_models.nn.vae.spatial import SpatialDecoder
+from uniserve_models.tensors import OutputLayout, TensorOutput
 
 pytestmark = pytest.mark.unit
 

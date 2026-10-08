@@ -9,7 +9,7 @@
 //! its buffer.
 
 use std::collections::{BTreeMap, HashMap};
-use uniserve_worker_ipc::TensorRef;
+use uniserve_ipc::TensorRef;
 
 struct Entry {
     product: TensorRef,
@@ -101,7 +101,7 @@ impl EncoderCacheManager {
     /// product reactivates them first.
     pub(crate) fn invalidate_buffers(
         &mut self,
-        buffers: &std::collections::HashSet<uniserve_worker_ipc::BufferId>,
+        buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
     ) -> Vec<TensorRef> {
         let revoked = self
             .entries
@@ -317,7 +317,7 @@ impl EncoderCacheManager {
 mod tests {
     use super::*;
     use uniserve_core::RequestId;
-    use uniserve_worker_ipc::{CallId, DType, RequestKey, ShapeBound};
+    use uniserve_ipc::{CallId, DType, RequestKey, ShapeBound};
 
     fn product(generation: u32) -> TensorRef {
         TensorRef {

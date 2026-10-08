@@ -15,8 +15,8 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve.distributed import Communicator
-from uniserve.model import (
+from uniserve_models.distributed import Communicator
+from uniserve_models.model import (
     DEFAULT_COMPONENT,
     CausalLM,
     ComponentEntry,
@@ -26,10 +26,10 @@ from uniserve.model import (
     TransformerDecoder,
     VocabShard,
 )
-from uniserve.nn.attention import Attention
-from uniserve.nn.functional import patchify
-from uniserve.nn.vae.layers import DiagonalGaussian
-from uniserve.nn.vae.patch import PatchAutoencoder, RGBDecoder
+from uniserve_models.nn.attention import Attention
+from uniserve_models.nn.functional import patchify
+from uniserve_models.nn.vae.layers import DiagonalGaussian
+from uniserve_models.nn.vae.patch import PatchAutoencoder, RGBDecoder
 
 from .config import Config
 from .denoiser import Denoiser

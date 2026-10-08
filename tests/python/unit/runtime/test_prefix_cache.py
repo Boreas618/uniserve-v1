@@ -5,10 +5,10 @@ from contextlib import ExitStack
 import pytest
 import torch
 
-from uniserve.cache import Config, State, mha
-from uniserve.quantization import Quantizer
-from uniserve.runtime import PrefixCache
-from uniserve.runtime.prefix_cache import CacheTable, plan_units
+from uniserve_models.cache import Config, State, mha
+from uniserve_models.quantization import Quantizer
+from uniserve_models.runtime import PrefixCache
+from uniserve_models.runtime.prefix_cache import CacheTable, plan_units
 
 pytestmark = pytest.mark.unit
 

@@ -5,7 +5,7 @@ Transformers checkpoints describe rotary positions under ``rope_scaling``
 may repeat ``rope_theta`` and ``partial_rotary_factor`` at the top level.
 ``read_rotary`` resolves those aliases once at the model-package loading
 boundary, so model constructors receive only a theta, a typed
-``uniserve.nn.rope`` recipe and a partial width.
+``uniserve_models.nn.rope`` recipe and a partial width.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from uniserve.nn.rope import (
+from uniserve_models.nn.rope import (
     DynamicScaling,
     LinearScaling,
     LlamaScaling,

@@ -19,9 +19,9 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils import parametrizations
 
-from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
-from uniserve.nn.vae import LatentEncoder
-from uniserve.nn.vae.decoder import LatentDecoder
+from uniserve_models.nn.attention import Attention, AttentionBatch, DenseInput
+from uniserve_models.nn.vae import LatentEncoder
+from uniserve_models.nn.vae.decoder import LatentDecoder
 
 __all__ = [
     "Config",
@@ -338,7 +338,7 @@ class Model(LatentDecoder):
 
 def assignments(model: Model, reader):
     """Map native decoder fields without retaining the checkpoint encoder."""
-    from uniserve.loading import weights
+    from uniserve_models.loading import weights
 
     available = frozenset(reader.names())
     values = []
@@ -563,7 +563,7 @@ def encoder_assignments(model: Encoder | LatentEncoder, reader):
     loads the query bias, the stored zero key bias and the value bias.
     ``logs_proj`` and the decoder half stay nonresident.
     """
-    from uniserve.loading import weights
+    from uniserve_models.loading import weights
 
     encoder = model.encoder if isinstance(model, LatentEncoder) else model
     available = frozenset(reader.names())

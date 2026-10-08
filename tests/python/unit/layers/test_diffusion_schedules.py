@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from uniserve.diffusion import block_grid, fuse_heads, uniform_grid
+from uniserve_models.diffusion import block_grid, fuse_heads, uniform_grid
 
 pytestmark = pytest.mark.unit
 

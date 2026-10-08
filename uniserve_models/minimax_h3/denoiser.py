@@ -34,23 +34,23 @@ from typing import cast
 
 import torch
 
-from uniserve.diffusion import (
+from uniserve_models.diffusion import (
     CleanSampleEulerSolver,
     Schedule,
     block_grid,
     ladder,
     uniform_grid,
 )
-from uniserve.media import image
-from uniserve.model import (
+from uniserve_models.media import image
+from uniserve_models.model import (
     Condition,
     ConditionTiles,
     LatentInput,
     VideoDenoiser,
 )
-from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
-from uniserve.nn.attention import SequenceLengths, VisibleInput, vsa
-from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
+from uniserve_models.nn import ColumnParallelLinear, RotaryEmbedding
+from uniserve_models.nn.attention import SequenceLengths, VisibleInput, vsa
+from uniserve_models.tensors import BufferConfig, OutputLayout, TensorOutput
 
 from .conditioning import Conditioner
 from .config import (
@@ -103,7 +103,7 @@ def schedules(
     """Build the checkpoint's video and audio schedules.
 
     The uniform grid follows the released diffusers schedule
-    (``uniserve.diffusion.uniform_grid``); a DMD ladder shifts its trained
+    (``uniserve_models.diffusion.uniform_grid``); a DMD ladder shifts its trained
     rungs once per modality (``ladder``); a PDD grid evaluates its block
     nodes (``block_grid``).
     """

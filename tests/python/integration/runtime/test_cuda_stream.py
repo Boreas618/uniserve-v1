@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.cuda_stream import blocked_stream
-from uniserve.runtime import (
+from uniserve_models.runtime import (
     CUDAGraph,
     CUDAStream,
     ExecutionContext,

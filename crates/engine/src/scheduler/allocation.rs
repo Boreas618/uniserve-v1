@@ -10,7 +10,7 @@
 //! have finished.
 
 use super::*;
-use uniserve_worker_ipc::BufferId;
+use uniserve_ipc::BufferId;
 
 /// Logical storage reservations and retained exports owned by the engine.
 pub(super) struct Storage {
@@ -33,7 +33,7 @@ pub(super) struct Storage {
     pub(super) media_storage: HashMap<crate::WorkerId, MediaStorage>,
     /// Spans whose ownership moved from their producing request to
     /// encoder-cache retention, keyed by the cached product's buffer.
-    pub(super) encoder_buffers: HashMap<uniserve_worker_ipc::BufferId, BufferSpan>,
+    pub(super) encoder_buffers: HashMap<uniserve_ipc::BufferId, BufferSpan>,
     /// Spans that left encoder-cache retention (or failed to enter it) and
     /// whose `Free` command is queued or in flight; the span returns to
     /// `buffer_pool` when `Scheduler::acknowledge_commands` sees that `Free`.
