@@ -28,6 +28,7 @@ __all__ = [
     "bind_units",
     "cache_plan",
     "functions",
+    "pool",
     "reads_pages",
 ]
 
@@ -427,6 +428,21 @@ def bind_conversion(
     return {"convert": convert}
 
 
+def pool(layout: Mapping, views: Mapping[str, torch.Tensor]) -> UnitPool:
+    """Bind the attention layers' view of the Rust-owned K/V unit pool.
+
+    Args:
+        layout: The ``cache_plan`` result plus ``"num_units"``.
+        views: The pool's unit fields; other entries (block tables) are
+            ignored.
+
+    Returns:
+        The pool object an execution context binds its attention layers to
+        (``component.prepare``'s ``cache``), an opaque handle to the worker.
+    """
+    return UnitPool.from_plan(layout, _fields(views))
+
+
 def functions() -> dict[str, Callable]:
     """Return this module's interface-table entries."""
     return {
@@ -434,4 +450,5 @@ def functions() -> dict[str, Callable]:
         "model.reads_pages": reads_pages,
         "cache.bind_units": bind_units,
         "cache.bind_conversion": bind_conversion,
+        "cache.pool": pool,
     }

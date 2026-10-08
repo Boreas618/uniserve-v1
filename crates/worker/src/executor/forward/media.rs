@@ -72,7 +72,7 @@ pub(crate) fn execute(
             }
         }
     }
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     batch.commit(plan, owners, parts.requests, None)?;
     Ok(())
 }
@@ -108,7 +108,7 @@ fn bind_host(
     region: Option<Vec<Range<u64>>>,
     placement: &Placement<'_>,
 ) -> Result<ProductBuffer> {
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     let write = bind_outputs(
         owners.store,
         &[OutputShape {
@@ -292,7 +292,7 @@ fn encode_units(
     let imported = if batch.inputs.borrowed(&call.inputs[0]) {
         None
     } else {
-        let store = parts.owners()?.store;
+        let store = parts.owners().store;
         Some(
             batch
                 .inputs
@@ -336,7 +336,7 @@ fn encode_units(
                     let _ = task.cancel(false);
                 }
                 parts
-                    .owners()?
+                    .owners()
                     .store
                     .abandon_writes(std::slice::from_ref(&write))?;
                 return Err(error);
@@ -367,7 +367,7 @@ fn encode_audio(
             "audio encoding requires one PCM input".into(),
         ));
     }
-    let store = parts.owners()?.store;
+    let store = parts.owners().store;
     let pcm = batch
         .inputs
         .read(store, &call.inputs[0], call.call_id, Device::Cpu, None)?;

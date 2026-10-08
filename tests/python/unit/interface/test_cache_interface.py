@@ -237,7 +237,8 @@ def test_interface_import_does_not_initialize_cuda():
         "import torch\n"
         "from uniserve_models.interface import cache\n"
         "assert set(cache.functions()) == {'model.cache_plan', "
-        "'model.reads_pages', 'cache.bind_units', 'cache.bind_conversion'}\n"
+        "'model.reads_pages', 'cache.bind_units', 'cache.bind_conversion', "
+        "'cache.pool'}\n"
         "assert not torch.cuda.is_initialized()\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)

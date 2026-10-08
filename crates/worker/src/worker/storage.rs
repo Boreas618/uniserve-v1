@@ -1,14 +1,15 @@
 //! The rank's storage owners and their part in request lifecycles.
 //!
 //! Startup allocates them on the capacity plan: the device event pool, the
-//! product transports and, for a text model, the KV cache (unit planes,
-//! block tables and import workspaces). Capability runtimes borrow them to
-//! execute calls; lifecycle commands release their request storage through
-//! [`RequestStorage`].
+//! product store (relay lanes and the buffer pool), the product transports
+//! and, for a text model, the KV cache (unit planes, block tables and import
+//! workspaces). Capability runtimes borrow them to execute calls; lifecycle
+//! commands release their request storage through [`RequestStorage`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use uniserve_core::CallId;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{BufferId, RequestKey, Wake};
 
@@ -28,10 +29,9 @@ pub(super) fn notify(callbacks: Vec<Notify>) {
 /// The storage owners of a rank.
 pub struct RankStorage {
     pub events: Arc<EventPool>,
+    pub tensors: TensorStore,
     pub transports: Transports,
     pub kv: Option<KVCache>,
-    /// The rank's cross-call products, on ranks that publish or read them.
-    pub products: Option<Arc<TensorStore>>,
     /// Stream that orders slot releases after the batches reading them: the
     /// stream serving token calls. A borrowed view of a stream the worker's
     /// lanes own; the lanes close after this owner.
@@ -41,18 +41,31 @@ pub struct RankStorage {
 impl RankStorage {
     pub fn new(
         events: Arc<EventPool>,
+        tensors: TensorStore,
         transports: Transports,
         kv: Option<KVCache>,
-        products: Option<Arc<TensorStore>>,
         release_stream: Option<Stream>,
     ) -> Self {
         Self {
             events,
+            tensors,
             transports,
             kv,
-            products,
             release_stream,
         }
+    }
+
+    /// Release the products (and KV exports) of finished calls.
+    pub fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        self.tensors.release_calls(calls);
+        if let Some(kv) = &mut self.kv {
+            let released = kv.manager().release_calls(calls);
+            kv.manager().release_exports(&released);
+        }
+        Ok(())
     }
 }
 
@@ -63,9 +76,7 @@ impl RequestStorage for RankStorage {
     }
 
     fn release_buffers(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
-        if let Some(products) = &self.products {
-            products.release_buffers(buffers)?;
-        }
+        self.tensors.release_buffers(buffers)?;
         if let Some(kv) = &mut self.kv {
             kv.release_imports(buffers)?;
             kv.manager()
@@ -79,9 +90,7 @@ impl RequestStorage for RankStorage {
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
     ) -> Result<()> {
-        if let Some(products) = &self.products {
-            products.release_requests(requests, retained)?;
-        }
+        self.tensors.release_requests(requests, retained)?;
         if let Some(kv) = &mut self.kv {
             kv.cancel_request_imports(requests, retained)?;
             let exports: Vec<BufferId> = kv
@@ -101,15 +110,11 @@ impl RequestStorage for RankStorage {
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
     ) -> Result<bool> {
-        if let Some(products) = &self.products
-            && !products.retirement_ready(buffers, requests, retained)?
-        {
-            return Ok(false);
-        }
-        Ok(self
-            .kv
-            .as_mut()
-            .is_none_or(|kv| kv.manager().retirement_ready(buffers, requests, retained)))
+        Ok(self.tensors.retirement_ready(buffers, requests, retained)?
+            && self
+                .kv
+                .as_mut()
+                .is_none_or(|kv| kv.manager().retirement_ready(buffers, requests, retained)))
     }
 
     fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
@@ -152,10 +157,8 @@ impl RequestStorage for RankStorage {
         if let Some(kv) = &mut self.kv {
             result = result.and(kv.close());
         }
-        if let Some(products) = self.products.take() {
-            products.close();
-        }
         result = result.and(self.transports.close());
+        self.tensors.close();
         result.and(self.events.close())
     }
 }
