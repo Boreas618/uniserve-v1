@@ -14,7 +14,7 @@
 //! until physical retirement, and reads hold a read credit plus their bytes
 //! until their copy drains.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -265,6 +265,13 @@ impl Transport {
             Backend::Cuda(cuda) => Some(&cuda.endpoint),
             Backend::Channel { .. } => None,
         }
+    }
+
+    /// Whether this mechanism reads `locator`: a location of its kind, which
+    /// for a POSIX segment must be on this rank's node.
+    pub fn reads(&self, locator: &Locator) -> bool {
+        TransportKind::of(locator) == self.kind()
+            && (self.kind() != TransportKind::Shm || locator.source.node == self.source.node)
     }
 
     /// Whether this mechanism reaches any of `consumers` (every mechanism
@@ -912,8 +919,13 @@ fn row_span(locator: &Locator, region: Option<&[Range<u64>]>) -> Result<(usize, 
 }
 
 /// The transports a rank configured, sharing one capacity and event pool.
+///
+/// Every configured mechanism reads other ranks' exports; a rank publishes
+/// its own products only over its export mechanisms (the outgoing edges of
+/// its placement), which default to all of them.
 pub struct Transports {
     transports: BTreeMap<TransportKind, Arc<Transport>>,
+    exports: BTreeSet<TransportKind>,
     capacity: Arc<Capacity>,
 }
 
@@ -940,16 +952,53 @@ impl Transports {
             .collect::<Result<_>>()?;
         Ok(Self {
             transports,
+            exports: kinds.iter().copied().collect(),
             capacity,
         })
+    }
+
+    /// Publish products only over `kinds`, each of which must be configured.
+    pub fn with_exports(mut self, kinds: &[TransportKind]) -> Result<Self> {
+        if let Some(kind) = kinds
+            .iter()
+            .find(|kind| !self.transports.contains_key(kind))
+        {
+            return Err(Error::Invalid(format!(
+                "export mechanism {} is not a configured transport",
+                kind.name()
+            )));
+        }
+        self.exports = kinds.iter().copied().collect();
+        Ok(self)
     }
 
     pub fn get(&self, kind: TransportKind) -> Option<&Arc<Transport>> {
         self.transports.get(&kind)
     }
 
+    /// The transport of `kind` when the rank publishes over it.
+    pub fn exporter(&self, kind: TransportKind) -> Option<&Arc<Transport>> {
+        self.exports
+            .contains(&kind)
+            .then(|| self.transports.get(&kind))
+            .flatten()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.transports.is_empty()
+    }
+
+    /// Whether the rank publishes over no mechanism.
+    pub fn exports_nothing(&self) -> bool {
+        self.exports.is_empty()
+    }
+
+    /// Whether the rank publishes over a mechanism other ranks can read:
+    /// anything but the process-local registry.
+    pub fn exports_remotely(&self) -> bool {
+        self.exports
+            .iter()
+            .any(|&kind| kind != TransportKind::Local)
     }
 
     pub fn capacity(&self) -> &Arc<Capacity> {

@@ -148,6 +148,11 @@ impl LatentStorage {
         self.num_pages
     }
 
+    /// The element type of latent values.
+    pub fn dtype(&self) -> DType {
+        self.pages.dtype()
+    }
+
     pub fn page_units(&self) -> u32 {
         self.page_units
     }

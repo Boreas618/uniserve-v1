@@ -57,12 +57,12 @@ use crate::runner::diffusion::image::{DenoiseRow, ImageDiffusion};
 use crate::runner::encoder::{EncoderRunner, PreparedImage, Tower};
 use crate::storage::KVCache;
 use crate::storage::memory::StorageView;
-use crate::storage::{OutputPool, UnitColumn};
+use crate::storage::{LatentStorage, OutputPool, UnitColumn};
 use crate::{Error, Outcome, Result};
 
 use batch::{Failure, ImageBatch};
 use host::{ImageResult, ImageTask, ImageWork};
-use latents::ImageLatents;
+use latents::{ImageLatents, Pool};
 
 /// The image runtime of a rank.
 pub(crate) struct ImageRuntime {
@@ -123,6 +123,23 @@ impl ImageRuntime {
         self.latents
             .as_mut()
             .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))
+    }
+
+    /// The latent pool and its storage, for trajectory transfers.
+    pub(crate) fn latent_pool(&mut self) -> Result<(&mut Pool, &LatentStorage)> {
+        let latents = self.latents_mut()?;
+        Ok((&mut latents.pool, &latents.storage))
+    }
+
+    /// Order work on `stream` that reads the latent pool's pages after the
+    /// pool's previous user; [`Self::leave_latents`] ends it.
+    pub(crate) fn enter_latents(&self, stream: Option<&uniserve_cuda::Stream>) -> Result<()> {
+        self.latents()?.enter(stream)
+    }
+
+    /// End work on `stream` that used the latent pool's pages.
+    pub(crate) fn leave_latents(&mut self, stream: Option<&uniserve_cuda::Stream>) -> Result<()> {
+        self.latents_mut()?.leave(stream)
     }
 
     /// The encoder serving `kind` calls of `component`.
@@ -319,14 +336,24 @@ impl RequestStorage for ImageRuntime {
     fn release_requests(
         &mut self,
         requests: &HashSet<RequestKey>,
-        _retained: &HashSet<BufferId>,
+        retained: &HashSet<BufferId>,
     ) -> Result<()> {
+        let mut result = Ok(());
         if let Some(latents) = &self.latents {
+            // Finished requests' published versions retire once their
+            // readers did, except retained ones.
+            let exports: Vec<BufferId> = latents
+                .pool
+                .exports()
+                .map(|source| source.buffer)
+                .filter(|buffer| requests.contains(&buffer.owner) && !retained.contains(buffer))
+                .collect();
+            latents.pool.release_exports(&exports);
             for transfer in latents.pool.cancel_imports(requests) {
-                crate::transfer::notify(transfer.cancel().1);
+                result = result.and(transfer.read().cancel());
             }
         }
-        Ok(())
+        result
     }
 
     fn retirement_ready(
@@ -346,7 +373,7 @@ impl RequestStorage for ImageRuntime {
         if let Some(latents) = &mut self.latents {
             let slots: Vec<i64> = slots.iter().map(|&slot| slot as i64).collect();
             for transfer in latents.pool.release_slots(&slots)? {
-                crate::transfer::notify(transfer.cancel().1);
+                transfer.read().cancel()?;
             }
         }
         Ok(())

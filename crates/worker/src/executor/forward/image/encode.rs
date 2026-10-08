@@ -135,7 +135,9 @@ impl ImageBatch<'_> {
         let borrowed: Vec<&PreparedImage> = images.iter().collect();
         let encoded = runner.encode(&borrowed, &regions)?;
 
-        for ((write, image), shape) in writes.iter().zip(&images).zip(&encoded.shapes) {
+        for (((write, image), shape), &index) in
+            writes.iter().zip(&images).zip(&encoded.shapes).zip(&active)
+        {
             let shape: Vec<u64> = shape.iter().map(|&extent| extent as u64).collect();
             self.storage.tensors.produced(
                 write,
@@ -145,6 +147,16 @@ impl ImageBatch<'_> {
                     height: image.height,
                     width: image.width,
                 }),
+            )?;
+            // Other ranks and workers import the feature from its export.
+            self.publications.export_feature(
+                &self.storage.tensors,
+                &self.storage.transports,
+                &plan.calls[index],
+                write,
+                self.reports,
+                self.stream.as_ref(),
+                &mut self.calls[index].output,
             )?;
         }
 

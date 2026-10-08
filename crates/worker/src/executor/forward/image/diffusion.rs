@@ -21,6 +21,7 @@ use super::ImageRuntime;
 use super::batch::ImageBatch;
 use super::latents::Scratch;
 use crate::executor::forward::token::TextRuntime;
+use crate::executor::forward::transfer::latents;
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::diffusion::image::{DenoiseRow, IntegrateRow};
 use crate::runner::graphs::GraphMode;
@@ -117,6 +118,44 @@ impl ImageBatch<'_> {
         Ok(coordinates.into())
     }
 
+    /// Export the version call `index` just wrote into `bank` (at solver
+    /// `step`) to other ranks and workers, when the rank publishes there
+    /// and reports the component's results. Readers on this rank use the
+    /// committed trajectory directly.
+    fn publish_latent(
+        &mut self,
+        index: usize,
+        bank: u8,
+        step: u32,
+        params: &LatentParams,
+        stream: Option<&Stream>,
+    ) -> Result<()> {
+        let call = &self.plan.calls[index];
+        let Some(product) = &call.latent_output else {
+            return Ok(());
+        };
+        if !self.reports || !self.storage.transports.exports_remotely() {
+            return Ok(());
+        }
+        let (pool, storage) = self.runtime.latent_pool()?;
+        let buffer = latents::export(
+            pool,
+            storage,
+            &self.storage.transports,
+            call,
+            product,
+            self.calls[index].slot,
+            params,
+            bank,
+            step,
+            stream,
+            &mut self.publications,
+            &mut self.calls[index].output,
+        )?;
+        self.latent_exports.push(buffer);
+        Ok(())
+    }
+
     /// Open the batch's use of the latent pool and place its trajectories.
     fn place(&mut self, trajectories: &[Trajectory]) -> Result<Vec<Scratch>> {
         let latents = self.runtime.latents()?;
@@ -206,6 +245,7 @@ impl ImageBatch<'_> {
                 semantic,
             )?;
             latents.scatter(1, scratch, stream.as_ref())?;
+            self.publish_latent(trajectory.index, 1, 0, &trajectory.params, stream.as_ref())?;
             self.runtime.trajectories.open(
                 trajectory.slot,
                 ImageTrajectory::new(
@@ -606,6 +646,14 @@ impl ImageBatch<'_> {
                 let bank = latents.pool.next_bank(trajectory.slot);
                 latents.pool.require_writable(bank, &scratch.pages)?;
                 latents.scatter(bank, scratch, stream.as_ref())?;
+                let params = &trajectory.params;
+                self.publish_latent(
+                    trajectory.index,
+                    bank,
+                    params.start_step + params.step_count,
+                    params,
+                    stream.as_ref(),
+                )?;
                 let call = &plan.calls[trajectory.index];
                 self.updates.push((
                     trajectory.index,
