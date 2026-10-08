@@ -37,6 +37,9 @@ pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 /// every member cannot deadlock.
 const INLINE_SEND_BYTES: usize = 32 << 10;
 
+/// The widest record [`HostGroup::all_gather_fixed`] carries.
+pub const FIXED_RECORD_BYTES: usize = 56;
+
 const CONNECT_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Where a group's members meet.
@@ -307,6 +310,54 @@ impl HostGroup {
         })
     }
 
+    /// Gather one fixed-width record from every member into `records`,
+    /// member-major, without allocating.
+    ///
+    /// Every member passes a record of the same width, at most
+    /// [`FIXED_RECORD_BYTES`]. Each record travels to each peer as one write
+    /// of its length prefix and payload, so a small record such as an expert
+    /// step agreement occupies one TCP segment per peer.
+    pub fn all_gather_fixed(&self, local: &[u8], records: &mut [u8]) -> Result<()> {
+        let width = local.len();
+        if width > FIXED_RECORD_BYTES || records.len() != width * self.size() {
+            return Err(Error::Invalid(format!(
+                "a fixed host gather carries at most {FIXED_RECORD_BYTES} bytes per member \
+                 into one record per member"
+            )));
+        }
+        let mut frame = [0_u8; 8 + FIXED_RECORD_BYTES];
+        frame[..8].copy_from_slice(&(width as u64).to_le_bytes());
+        frame[8..8 + width].copy_from_slice(local);
+        let frame = &frame[..8 + width];
+        // Records are far below the socket buffers, so every member writes
+        // to all peers before reading without risking a deadlock.
+        for mut stream in self.peers.iter().flatten().map(|stream| &**stream) {
+            stream
+                .write_all(frame)
+                .map_err(|error| transport("host group send", &error))?;
+        }
+        records[self.rank * width..(self.rank + 1) * width].copy_from_slice(local);
+        for (member, stream) in self.peers.iter().enumerate() {
+            let Some(stream) = stream.as_deref() else {
+                continue;
+            };
+            let mut reader = stream;
+            let mut length = [0; 8];
+            reader
+                .read_exact(&mut length)
+                .map_err(|error| transport("host group receive", &error))?;
+            if u64::from_le_bytes(length) != width as u64 {
+                return Err(Error::Transport(format!(
+                    "host group member {member} sent a record of another width"
+                )));
+            }
+            reader
+                .read_exact(&mut records[member * width..(member + 1) * width])
+                .map_err(|error| transport("host group receive", &error))?;
+        }
+        Ok(())
+    }
+
     /// `root`'s bytes on every member. Only `root` supplies `value`.
     pub fn broadcast_bytes(&self, value: Option<&[u8]>, root: usize) -> Result<Vec<u8>> {
         if root >= self.size() {
@@ -395,6 +446,22 @@ impl HostGroup {
             .get(member)
             .and_then(Option::as_deref)
             .ok_or_else(|| Error::Invariant(format!("host group has no connection to {member}")))
+    }
+}
+
+/// Peer-mapped storage (`crate::transfer::PeerStorage`) publishes its
+/// handles over the group's connections.
+impl crate::transfer::PeerExchange for HostGroup {
+    fn rank(&self) -> usize {
+        self.rank
+    }
+
+    fn all_gather(&self, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.all_gather_bytes(payload)
+    }
+
+    fn barrier(&self) -> Result<()> {
+        HostGroup::barrier(self)
     }
 }
 
@@ -591,6 +658,24 @@ mod tests {
             for (rank, value) in values.iter().enumerate() {
                 assert_eq!(value.len(), 4 << 20);
                 assert!(value.iter().all(|&byte| byte == rank as u8));
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_records_gather_in_member_order() {
+        let results = group(3, |group| {
+            let mut records = [0_u8; 3 * 24];
+            for round in 0..3_u8 {
+                group
+                    .all_gather_fixed(&[group.rank() as u8 + 10 * round; 24], &mut records)
+                    .unwrap();
+            }
+            records
+        });
+        for records in results {
+            for (member, record) in records.chunks(24).enumerate() {
+                assert!(record.iter().all(|&byte| byte == member as u8 + 20));
             }
         }
     }

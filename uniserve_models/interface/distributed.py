@@ -30,6 +30,7 @@ def functions() -> dict[str, Callable[..., Any]]:
         "distributed.create_groups": create_groups,
         "distributed.mesh": mesh,
         "distributed.destroy": destroy,
+        "distributed.bind_collectives": bind_collectives,
     }
 
 
@@ -257,3 +258,100 @@ def destroy(world: World) -> None:
         for group in reversed(groups)
     ]
     close_resources(*actions)
+
+
+class _Transfer:
+    """A started native collective; its consumer joins it on its stream."""
+
+    def __init__(self, wait: Callable[..., Any], token: int) -> None:
+        self._wait, self._token = wait, token
+
+    def block_current_stream(self) -> None:
+        token, self._token = self._token, None
+        if token is not None:
+            self._wait(token, torch.cuda.current_stream().cuda_stream)
+
+
+class NativeCollectives:
+    """One group's collectives on the worker's NCCL communicator.
+
+    The worker binds one communicator per binding stream and group; every
+    call enqueues on that stream (asynchronous ones on its transfer fork,
+    joined by the consumer). Members are ordered by ascending world rank,
+    the backend order ``Communicator`` assumes; roots and peers are world
+    ranks.
+    """
+
+    _REDUCTIONS = {"sum": 0, "max": 2, "min": 3}
+
+    def __init__(self, table: Mapping[str, Callable[..., Any]]) -> None:
+        self._table = table
+
+    def all_reduce(self, value: torch.Tensor, op: str = "sum") -> None:
+        self._table["all_reduce"](value, self._REDUCTIONS[op])
+
+    def all_gather(self, output: torch.Tensor, value: torch.Tensor) -> None:
+        self._table["all_gather"](output, value)
+
+    def start_all_gather(self, output, value) -> _Transfer:
+        return _Transfer(
+            self._table["wait"], self._table["start_all_gather"](output, value)
+        )
+
+    def start_all_to_all(self, output, value) -> _Transfer:
+        return _Transfer(
+            self._table["wait"], self._table["start_all_to_all"](output, value)
+        )
+
+    def all_to_all(self, output, value, output_splits, input_splits) -> None:
+        self._table["all_to_all"](
+            output, value, list(output_splits), list(input_splits)
+        )
+
+    def gather(self, outputs, value, root: int) -> None:
+        self._table["gather"](list(outputs or ()), value, int(root))
+
+    def broadcast(self, value: torch.Tensor, root: int) -> None:
+        self._table["broadcast"](value, int(root))
+
+    def reduce_scatter(self, output, value) -> None:
+        self._table["reduce_scatter"](output, value)
+
+    def send(self, value: torch.Tensor, peer: int) -> None:
+        self._table["send"](value, int(peer))
+
+    def recv(self, value: torch.Tensor, peer: int) -> None:
+        self._table["recv"](value, int(peer))
+
+    def send_recv(self, output, value, dst: int, src: int) -> None:
+        self._table["send_recv"](output, value, int(dst), int(src))
+
+    def close(self) -> None:
+        """The worker destroys the communicator."""
+
+
+def bind_collectives(prepared, tables: Mapping[str, Any]) -> None:
+    """Route a binding's collectives to the worker's stream communicators.
+
+    ``tables`` maps a communicator name (mesh axes joined by ``.``) to its
+    collective functions. Every multi-member communicator the binding uses
+    must have one: within an activation, a collective never falls back to
+    another stream.
+
+    Raises:
+        ValueError: A used communicator has no table.
+    """
+    context = prepared.context
+    if context is None:
+        raise ValueError("collectives bind to a bound component")
+    bound = {}
+    for group in context.groups:
+        if group.size == 1:
+            continue
+        table = tables.get(group.name)
+        if table is None:
+            raise ValueError(
+                f"communicator {group.name!r} has no stream collectives"
+            )
+        bound[group._require().group_name] = NativeCollectives(table)
+    context.collectives = bound

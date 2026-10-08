@@ -2,7 +2,7 @@
 
 Modules and subpackages group kernels by domain: norm, activation,
 reduction, rope, routing, patch, quantization, cache, attention, diffusion
-and peer_storage; ``jit`` builds the CUDA C++ extensions.
+and host_memory; ``jit`` builds the CUDA C++ extensions.
 Launchers consume device tensors. Many write caller-supplied outputs and pair
 with a separate eligibility check such as ``activation.unsupported``, which
 returns the first unmet condition as a reason. Callers such as the numerical

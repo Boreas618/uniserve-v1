@@ -9,22 +9,37 @@ resulting :class:`Graph` to Rust as an opaque handle; the binding's
 binding's fixed buffers, so a replay needs no copies.
 
 The interface entry ``graphs.pool`` creates the allocator pools Rust
-assigns to graph owners. Importing this module does not initialize CUDA.
+assigns to graph owners. ``graphs.begin_capture`` and ``graphs.end_capture``
+let Rust capture work it submits itself between them, possibly from several
+host threads on streams forked from the capturing one (expert joins of all
+microbatches); ``graphs.replay`` and ``graphs.release`` operate on such
+graphs. Importing this module does not initialize CUDA.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import (
+    AbstractContextManager,
+    ExitStack,
+    contextmanager,
+    nullcontext,
+)
 from typing import Any
 
 import torch
 
-__all__ = ["Graph", "capture", "functions", "pool"]
+__all__ = ["Capture", "Graph", "capture", "functions", "pool"]
 
 
 def functions() -> dict[str, Callable[..., Any]]:
-    return {"graphs.pool": pool}
+    return {
+        "graphs.pool": pool,
+        "graphs.begin_capture": begin_capture,
+        "graphs.end_capture": end_capture,
+        "graphs.replay": replay,
+        "graphs.release": release,
+    }
 
 
 def pool(device: int) -> list[Any]:
@@ -187,6 +202,75 @@ def _prepared(
         current.wait_stream(computation)
 
 
+class Capture:
+    """One graph capture in progress on a computation stream.
+
+    :meth:`begin` starts capturing work enqueued on ``stream`` (and on
+    streams that wait on it and are joined back before :meth:`end`);
+    :meth:`end` instantiates the :class:`Graph`. Both run on the same host
+    thread; work between them may be submitted from other threads.
+    """
+
+    def __init__(
+        self,
+        stream: torch.cuda.Stream,
+        pool: torch.cuda.MemPool | None = None,
+        generators: Iterable[torch.Generator] = (),
+    ) -> None:
+        self.device = stream.device
+        self.stream = stream
+        self.capture_stream = torch.cuda.Stream(device=self.device)
+        self.capture_stream.wait_stream(torch.cuda.current_stream(self.device))
+        self.segments = _Segments(
+            self.capture_stream,
+            stream,
+            None if pool is None else pool.id,
+            generators,
+        )
+        self._scopes = ExitStack()
+
+    def begin(self) -> None:
+        try:
+            for scope in (
+                torch.inference_mode(),
+                torch.cuda.device(self.device),
+                _prepared(self.device, self.stream),
+            ):
+                self._scopes.enter_context(scope)
+            self.segments.begin()
+        except BaseException:
+            self._scopes.close()
+            raise
+
+    def end(self, output: Any = None, failure: BaseException | None = None):
+        """End the capture; with ``failure`` discard it and raise.
+
+        Raises:
+            RuntimeError: Capture failed; every partial graph was reset and
+                the original error is the cause.
+        """
+        try:
+            try:
+                self.segments.end()
+            finally:
+                self._scopes.close()
+            if failure is not None:
+                raise failure
+            for graph in self.segments.graphs:
+                graph.instantiate()
+        except Exception as error:
+            self.segments.reset()
+            raise RuntimeError(
+                f"CUDA graph capture failed on {self.device}: {error}"
+            ) from error
+        return Graph(
+            self.segments.graphs,
+            self.segments.steps,
+            output,
+            self.capture_stream,
+        )
+
+
 def capture(
     body: Callable[[], Any],
     *,
@@ -227,29 +311,46 @@ def capture(
         RuntimeError: Capture failed; every partial graph was reset and the
             original error is the cause.
     """
-    device = stream.device
-    capture_stream = torch.cuda.Stream(device=device)
-    capture_stream.wait_stream(torch.cuda.current_stream(device))
-    pool_handle = None if pool is None else pool.id
-    recorded = _Segments(capture_stream, stream, pool_handle, generators)
-    scope = nullcontext() if segments is None else segments(recorded.submit)
+    recording = Capture(stream, pool, generators)
+    scope = (
+        nullcontext()
+        if segments is None
+        else segments(recording.segments.submit)
+    )
+    recording.begin()
     try:
-        with (
-            torch.inference_mode(),
-            torch.cuda.device(device),
-            _prepared(device, stream),
-        ):
-            recorded.begin()
-            try:
-                with scope, torch.cuda.stream(stream):
-                    output = body()
-            finally:
-                recorded.end()
-        for graph in recorded.graphs:
-            graph.instantiate()
+        with scope, torch.cuda.stream(stream):
+            output = body()
     except Exception as error:
-        recorded.reset()
-        raise RuntimeError(
-            f"CUDA graph capture failed on {device}: {error}"
-        ) from error
-    return Graph(recorded.graphs, recorded.steps, output, capture_stream)
+        recording.end(failure=error)
+        raise
+    return recording.end(output)
+
+
+def begin_capture(pool, stream: int, device: int) -> Capture:
+    """Begin capturing work Rust submits on ``stream`` into ``pool``."""
+    computation = torch.cuda.ExternalStream(
+        int(stream), device=torch.device("cuda", int(device))
+    )
+    recording = Capture(computation, pool)
+    recording.begin()
+    return recording
+
+
+def end_capture(recording: Capture) -> Graph:
+    """End a capture begun by :func:`begin_capture` and return its graph."""
+    return recording.end()
+
+
+def replay(graph: Graph, stream: int, device: int) -> None:
+    """Replay a graph on ``stream``."""
+    computation = torch.cuda.ExternalStream(
+        int(stream), device=torch.device("cuda", int(device))
+    )
+    with torch.cuda.device(computation.device), torch.cuda.stream(computation):
+        graph.replay()
+
+
+def release(graph: Graph) -> None:
+    """Release a graph after every stream replaying it drained."""
+    graph.release()
