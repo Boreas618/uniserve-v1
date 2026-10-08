@@ -271,7 +271,9 @@ def bind(
             ``start_pages``, ``cache_lengths``, ``query_lengths``,
             ``causal_values``, ``query_offsets``, ``prefix_offsets``,
             ``write_indices``, ``logit_rows``, ``draws``, ``params``,
-            ``tasks``, ``commit``), the outputs (``logits``, optional
+            ``tasks``, ``commit``; a multimodal binding also
+            ``input_embeddings`` and ``embedding_mask``), the outputs
+            (``logits``, optional
             ``hidden``, ``completion``, ``continuation``, ``tagged``,
             ``points``, ``transition``, ``logprobs``, ``prompt_tail``) and the
             per-slot state (``slot.unit_tables``, ``slot.start_pages``,
@@ -688,7 +690,10 @@ def bind(
         ``logit_count`` rows are projected for a non-decode invocation, at
         the ``logit_rows`` token positions or, with ``all_last``, at every
         row's last query token; a decode invocation's candidates are its
-        live rows' final-position logits.
+        live rows' final-position logits. ``axes`` is the rotary position
+        axes the worker staged (3 for prompts placing vision blocks) and
+        ``embedded`` replaces the masked tokens' embeddings with the staged
+        vision features; such invocations run eagerly.
         """
         rows, live, tokens = int(rows), int(live), int(tokens)
         with torch.inference_mode(), context.activate():

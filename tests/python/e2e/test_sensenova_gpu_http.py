@@ -28,6 +28,8 @@ pytestmark = [
 ]
 
 MODEL_ENV = "UNISERVE_SENSENOVA_MODEL"
+# Comma-separated CUDA devices the server ranks use, one rank per device.
+DEVICES_ENV = "UNISERVE_SENSENOVA_DEVICES"
 SERVED_MODEL = "SenseNova-U1"
 IMAGE_SIZE = (2048, 1152)
 
@@ -64,6 +66,7 @@ def production_server(
         pytest.fail(str(error))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
+    devices = os.environ.get(DEVICES_ENV, "0,1")
     args = [
         str(binary),
         "serve",
@@ -87,7 +90,7 @@ def production_server(
         "--graph-policy",
         graph_policy,
         "--worker-ranks",
-        "2",
+        str(len(devices.split(","))),
         "--log-stats",
         "false",
     ]
@@ -107,7 +110,7 @@ def production_server(
                 '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}',
             ]
         )
-    environment = {"CUDA_VISIBLE_DEVICES": "0,1"}
+    environment = {"CUDA_VISIBLE_DEVICES": devices}
     with server_process(
         args,
         base_url,
