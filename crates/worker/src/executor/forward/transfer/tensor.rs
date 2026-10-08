@@ -8,13 +8,20 @@
 //! relay lane, an encoder feature in a feature allocation with its spatial
 //! metadata, any other product in its scheduler allocation. A transfer
 //! never converts: the output declares the input's dtype.
+//!
+//! A trajectory transfer (a latent input and output) instead exports the
+//! committed version of the call's request trajectory from the latent pool
+//! as its output, which other ranks and workers import into their own
+//! pools ([`super::latents`]).
 
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
 use uniserve_ipc::{BufferAllocation, BufferId, DType as ProductDType, TensorRef};
 
+use super::super::image::ImageRuntime;
 use super::batch::TransferBatch;
+use super::latents;
 use crate::ffi::Device;
 use crate::storage::memory::parse_dtype;
 use crate::storage::{OutputPlacement, ProductBuffer};
@@ -33,8 +40,9 @@ enum Placement {
 
 impl TransferBatch<'_> {
     /// Copy every active call's input product into its output product and
-    /// publish the copy.
-    pub(super) fn copy_products(&mut self) -> Result<()> {
+    /// publish the copy; export trajectory transfers' versions from the
+    /// latent pool of `image`.
+    pub(super) fn copy_products(&mut self, image: Option<&mut ImageRuntime>) -> Result<()> {
         let plan = self.plan;
         let target = self.target();
         let allocations: HashMap<BufferId, BufferAllocation> = plan
@@ -46,12 +54,12 @@ impl TransferBatch<'_> {
         // Each active call moves one product into one output of the same
         // physical kind.
         let mut transfers = Vec::new();
+        let mut trajectories = Vec::new();
         for index in self.active() {
             let call = &plan.calls[index];
             if call.latent_input.is_some() || call.latent_output.is_some() {
-                return Err(Error::Unsupported(
-                    "latent trajectory transfers are served by the latent pool's runtime".into(),
-                ));
+                trajectories.push(index);
+                continue;
             }
             let mut inputs = call.tensor_inputs();
             let mut outputs = call.tensor_outputs();
@@ -70,6 +78,12 @@ impl TransferBatch<'_> {
                 Placement::Relay
             };
             transfers.push((index, input, output, placement));
+        }
+        if !trajectories.is_empty() {
+            let image = image.ok_or_else(|| {
+                Error::Unsupported("trajectory transfers require a latent pool".into())
+            })?;
+            self.export_trajectories(image, &trajectories)?;
         }
         let writes = self.bind(&transfers, &allocations, target)?;
 
@@ -100,6 +114,72 @@ impl TransferBatch<'_> {
             )?;
         }
         Ok(())
+    }
+
+    /// Export the committed trajectory version each of `calls` names (its
+    /// latent input) as its latent output, ordered after the latent pool's
+    /// previous user on the batch's stream.
+    fn export_trajectories(&mut self, image: &mut ImageRuntime, calls: &[usize]) -> Result<()> {
+        let plan = self.plan;
+        let stream = self.stream.as_ref();
+        image.enter_latents(stream)?;
+        let exported = (|| -> Result<()> {
+            for &index in calls {
+                let call = &plan.calls[index];
+                let (Some(input), Some(output)) = (&call.latent_input, &call.latent_output) else {
+                    return Err(Error::Invalid(
+                        "product transfer changes the physical product kind".into(),
+                    ));
+                };
+                if call.tensor_inputs().count() != 1 || call.tensor_outputs().count() != 1 {
+                    return Err(Error::Invalid(
+                        "product transfer requires one physical input and one output".into(),
+                    ));
+                }
+                let params = plan
+                    .latent_params
+                    .iter()
+                    .find(|params| {
+                        params.request_key == call.request_key && params.call_id == call.call_id
+                    })
+                    .ok_or_else(|| {
+                        Error::Invalid("latent transfer has no bound parameters".into())
+                    })?;
+                let slot = self.calls[index].slot;
+                let (pool, storage) = image.latent_pool()?;
+                let pages: Vec<usize> = params
+                    .page_table
+                    .iter()
+                    .map(|&page| page as usize)
+                    .collect();
+                let bank = pool.current_bank(
+                    slot,
+                    i64::from(params.start_step),
+                    i64::from(input.generation),
+                    i64::from(params.latent_units),
+                    i64::from(params.height),
+                    i64::from(params.width),
+                    &pages,
+                )?;
+                let buffer = latents::export(
+                    pool,
+                    storage,
+                    &self.storage.transports,
+                    call,
+                    output,
+                    slot,
+                    params,
+                    bank,
+                    params.start_step,
+                    stream,
+                    &mut self.publications,
+                    &mut self.calls[index].output,
+                )?;
+                self.latent_exports.push(buffer);
+            }
+            Ok(())
+        })();
+        exported.and(image.leave_latents(stream))
     }
 
     /// Bind every transfer's output, in transfer order: features in their

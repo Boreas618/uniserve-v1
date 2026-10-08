@@ -15,15 +15,13 @@
 //! stream: the banks and the shared step workspace are then used by one
 //! batch at a time on the device.
 
-use std::sync::Arc;
-
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 use uniserve_ipc::LatentParams;
 
 use super::super::launch::StreamOrder;
+pub(crate) use super::super::transfer::latents::Pool;
+use crate::storage::LatentStorage;
 use crate::storage::memory::StorageView;
-use crate::storage::{LatentExport, LatentImport, LatentPool, LatentStorage};
-use crate::transfer::Retirement;
 use crate::{Error, Result};
 
 /// A trajectory's place in the step workspace for one call.
@@ -43,9 +41,6 @@ impl Scratch {
         (self.pages.len() * page_units) as u32
     }
 }
-
-pub(crate) type Pool =
-    LatentPool<Arc<LatentImport<Arc<Retirement>>>, Arc<LatentExport<Arc<Retirement>>>>;
 
 /// The image latent pool of a rank.
 pub(crate) struct ImageLatents {

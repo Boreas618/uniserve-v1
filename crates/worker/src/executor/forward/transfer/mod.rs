@@ -23,6 +23,7 @@
 mod batch;
 mod cache;
 pub(crate) mod kv;
+pub(crate) mod latents;
 mod tensor;
 
 use std::collections::HashMap;
@@ -234,7 +235,7 @@ fn run(
         (device.cuda_index(), backend.transfer_stream(kind, device)?)
     };
 
-    let parts = backend.parts();
+    let mut parts = backend.parts();
     let (Some(runtime), Some(storage)) = (parts.transfer, parts.storage) else {
         return Err(Error::Unsupported("transfers require rank storage".into()).into());
     };
@@ -258,7 +259,9 @@ fn run(
             batch.reserve_cache(text.unit_column(&first.component)?, inputs)?;
         }
         match kind {
-            CallKind::Transfer(TransferMode::Tensor) => batch.copy_products()?,
+            CallKind::Transfer(TransferMode::Tensor) => {
+                batch.copy_products(parts.image.as_deref_mut())?
+            }
             CallKind::Transfer(TransferMode::KvExport) => batch.export_cache()?,
             CallKind::Transfer(TransferMode::KvInstall) => batch.install_cache(inputs)?,
             _ => {
@@ -273,42 +276,33 @@ fn run(
     })();
     match result {
         Ok(()) => {
-            let stream = batch.stream.as_ref().map(|stream| {
-                // SAFETY: a view of the lane stream the batch ran on.
-                unsafe { Stream::borrowed(stream.device(), stream.raw()) }
-            });
+            if kv && let Some(text) = parts.text {
+                // Later text batches on other streams order after the
+                // installed tables, pages and verified lengths.
+                text.order_mut()
+                    .record(batch.stream.as_ref())
+                    .map_err(|error| Failure {
+                        error,
+                        committed: true,
+                    })?;
+            }
             let mut stats = ForwardStats::default();
             stats.component_us.insert(
                 "transfer_execute".into(),
                 batch.started.elapsed().as_micros() as u64,
             );
-            let launched = Launched {
+            Ok(Launched {
                 outputs: batch.calls.into_iter().map(|state| state.output).collect(),
                 buffer: batch.buffer,
                 started,
                 stats,
                 timer: "transfer_materialize",
                 host: None,
-            };
-            if kv && let Some(text) = parts.text {
-                // Later text batches on other streams order after the
-                // installed pages and verified lengths.
-                let stream = stream.transpose().map_err(|error| Failure {
-                    error: error.into(),
-                    committed: true,
-                })?;
-                text.order_mut()
-                    .record(stream.as_ref())
-                    .map_err(|error| Failure {
-                        error,
-                        committed: true,
-                    })?;
-            }
-            Ok(launched)
+            })
         }
         Err(failure) if failure.committed => Err(failure),
         Err(failure) => {
-            if let Err(cleanup) = batch.discard() {
+            if let Err(cleanup) = batch.discard(parts.image) {
                 // Storage the cleanup could not retire stays reserved; the
                 // rank cannot reuse it safely.
                 return Err(Failure {

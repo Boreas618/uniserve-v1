@@ -1,11 +1,14 @@
 //! Inputs a batch imports from other calls, prepared before it executes.
 //!
 //! Every capability runtime reads its tensor inputs from the rank's tensor
-//! store. Products another rank or worker published reach this rank as
-//! descriptors (`Batch::input_products`); KV transfers its install calls
-//! name arrive as `Batch::kv_inputs` or are resident exports of this rank.
-//! This module materializes both while other batches execute, so a runtime
-//! consumes imported products exactly like products its own rank produced.
+//! store, and its trajectories from the rank's latent pool. Products
+//! another rank or worker published reach this rank as descriptors
+//! (`Batch::input_products`): tensors are read into the tensor store,
+//! latent trajectory versions into the consuming request's pages; KV
+//! transfers its install calls name arrive as `Batch::kv_inputs` or are
+//! resident exports of this rank. This module materializes them while
+//! other batches execute, so a runtime consumes imported values exactly
+//! like values its own rank produced.
 //!
 //! Preparation runs on the executor thread in phases, each resumed by the
 //! readiness notice of what blocked it ([`prepare`], [`subscribe`]):
@@ -13,8 +16,9 @@
 //! 1. **Storage hazards.** A batch that writes KV storage (newly assigned
 //!    units, forward rows, install destinations) first waits for every
 //!    physical access still overlapping it: executions of earlier batches,
-//!    imports, and exports other ranks are reading. A failed access keeps
-//!    its storage forever, so the batch then fails instead.
+//!    imports, and exports other ranks are reading; one that writes a
+//!    latent bank waits for the exports of versions in it. A failed access
+//!    keeps its storage forever, so the batch then fails instead.
 //! 2. **Admission.** Product imports are admitted in descriptor order. A
 //!    refusal for read credits resumes at the refused product once credits
 //!    return; accepted imports keep their destinations meanwhile. KV imports
@@ -24,8 +28,9 @@
 //!
 //! When the batch executes, [`complete`] publishes each imported product on
 //! its consumers' device stream (a new product is committed, a widened
-//! shard is fenced over its union) before the runtime consumes it; imports
-//! only predicated-off calls read are left unpublished. [`close`] ends the
+//! shard is fenced over its union, a trajectory version is adopted as its
+//! slot's committed one) before the runtime consumes it; imports only
+//! predicated-off calls read are left unpublished. [`close`] ends the
 //! import leases and abandons every import the batch did not consume, on
 //! success and on failure alike.
 
@@ -39,6 +44,7 @@ use uniserve_ipc::{
 
 use super::super::backend::{WorkerBackend, WorkerBatch};
 use super::launch::read_flag;
+use super::transfer::latents::{self, LatentInput};
 use crate::error::WorkerError;
 use crate::executor::{BatchInputs, InputReady, Submission};
 use crate::ffi::Device;
@@ -57,6 +63,9 @@ pub(crate) enum Input {
     },
     /// A KV transfer copied into its install call's pages.
     Cache(PendingImport),
+    /// A latent trajectory version read into the consuming call's slot,
+    /// on `device`.
+    Latent { input: LatentInput, device: Device },
     /// A product a host media call reads in place from a location on this
     /// node; importing it would read unused capacity.
     Borrowed,
@@ -69,6 +78,7 @@ impl InputReady for Input {
         Ok(match self {
             Self::Tensor { read, .. } => read.reads().iter().all(|read| read.ready()),
             Self::Cache(import) => import.done(),
+            Self::Latent { input, .. } => input.reads().iter().all(|read| read.ready()),
             Self::Borrowed => true,
         })
     }
@@ -146,7 +156,11 @@ fn advance(backend: &mut WorkerBackend, batch: &mut WorkerBatch, plan: &BatchPla
         return Err(Error::State("batch inputs were already consumed"));
     }
     if !batch.inputs().resolved {
-        let Resolved { resident, hazards } = resolve(backend, plan)?;
+        let Resolved {
+            resident,
+            mut hazards,
+        } = resolve(backend, plan)?;
+        hazards.extend(latent_hazards(backend, plan)?);
         let inputs = batch.inputs_mut();
         inputs.resident = resident;
         inputs.state.dependencies = hazards.into_iter().map(Hazard).collect();
@@ -220,6 +234,58 @@ fn resolve(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Resolved> {
         .map(Arc::clone)
         .collect();
     Ok(Resolved { resident, hazards })
+}
+
+/// The exports of trajectory versions in the banks the batch's latent
+/// preparation and denoising calls write: other ranks still reading a
+/// version keep its bank from being overwritten.
+fn latent_hazards(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Vec<Arc<Retirement>>> {
+    let writes: Vec<(usize, &uniserve_ipc::LatentParams)> = plan
+        .latent_params
+        .iter()
+        .filter_map(|params| {
+            let call = plan.calls.iter().find(|call| {
+                call.request_key == params.request_key && call.call_id == params.call_id
+            })?;
+            matches!(
+                call.code,
+                CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
+            )
+            .then_some(params)
+        })
+        .map(|params| {
+            let slot = backend
+                .requests()
+                .get(params.request_key.request_id.0)?
+                .slot();
+            Ok((slot, params))
+        })
+        .collect::<Result<_>>()?;
+    if writes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(image) = backend.image_mut() else {
+        return Ok(Vec::new());
+    };
+    let Ok((pool, _)) = image.latent_pool() else {
+        return Ok(Vec::new());
+    };
+    pool.reap();
+    let mut hazards = Vec::new();
+    for (slot, params) in writes {
+        let slot = pool.slot(slot as i64)?;
+        let pages: Vec<usize> = params
+            .page_table
+            .iter()
+            .map(|&page| page as usize)
+            .collect();
+        hazards.extend(
+            pool.write_dependencies(slot, &pages)
+                .iter()
+                .map(|retirement| Arc::clone(&**retirement)),
+        );
+    }
+    Ok(hazards)
 }
 
 /// The install calls of a batch.
@@ -411,9 +477,23 @@ fn import_products(
             continue;
         }
         if matches!(export.value, TransferHandle::Latent { .. }) {
-            return Err(Error::Unsupported(
-                "latent trajectory imports are served by the latent pool's runtime".into(),
-            ));
+            match import_latent(backend, plan, export, indices) {
+                Ok(input) => {
+                    batch
+                        .inputs_mut()
+                        .state
+                        .inputs
+                        .insert(product.buffer_id(), input);
+                    continue;
+                }
+                Err(Error::ReadBackpressure { returns }) => {
+                    let inputs = batch.inputs_mut();
+                    inputs.backpressure = Some(returns);
+                    inputs.state.awaiting_reads = true;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         // A product may feed several calls, but it has one destination.
@@ -484,6 +564,53 @@ fn import_products(
     inputs.state.awaiting_reads = false;
     inputs.backpressure = None;
     Ok(true)
+}
+
+/// Read a latent trajectory version into the slot of its one consumer,
+/// whose scheduler parameters name the pages and the version.
+fn import_latent(
+    backend: &mut WorkerBackend,
+    plan: &BatchPlan,
+    export: &TensorExport,
+    readers: &[usize],
+) -> Result<Input> {
+    let [index] = readers else {
+        return Err(Error::Invalid(
+            "latent transfer must have one consumer".into(),
+        ));
+    };
+    let call = &plan.calls[*index];
+    let params = plan
+        .latent_params
+        .iter()
+        .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
+        .ok_or_else(|| Error::Invalid("latent transfer has no scheduler parameters".into()))?;
+    let device = component_device(backend, &call.component)?;
+    let stream = backend.transfer_stream(call.code, device)?;
+    let slot = backend
+        .requests()
+        .peek(export.product.request_key.request_id.0)
+        .filter(|request| request.key() == export.product.request_key)
+        .map(|request| request.slot())
+        .ok_or_else(|| Error::Invalid("latent transfer has no request slot".into()))?;
+    let parts = backend.parts();
+    let storage = parts
+        .storage
+        .ok_or_else(|| Error::Unsupported("latent imports require rank storage".into()))?;
+    let (pool, latent) = parts
+        .image
+        .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?
+        .latent_pool()?;
+    let input = latents::import(
+        pool,
+        latent,
+        &storage.transports,
+        export,
+        params,
+        slot,
+        stream.as_ref(),
+    )?;
+    Ok(Input::Latent { input, device })
 }
 
 /// Reserve every KV import: each supplied or resident transfer is copied
@@ -612,6 +739,7 @@ pub(crate) fn subscribe(
         match input {
             Input::Tensor { read, .. } => reads.extend(read.reads()),
             Input::Cache(import) => imports.push(import),
+            Input::Latent { input, .. } => reads.extend(input.reads().iter().cloned()),
             Input::Borrowed => {}
         }
     }
@@ -746,20 +874,37 @@ fn predicated(backend: &WorkerBackend, call: &Call) -> Result<bool> {
 
 /// Publish one imported product on its consumers' stream.
 fn publish(
-    backend: &WorkerBackend,
+    backend: &mut WorkerBackend,
     batch: &WorkerBatch,
     plan: &BatchPlan,
     product: &TensorRef,
 ) -> Result<()> {
-    let Some(Input::Tensor { read, device }) =
-        batch.inputs().state.inputs.get(&product.buffer_id())
-    else {
-        // Borrowed inputs stay with their host consumers.
-        return Ok(());
-    };
     let kind = consumer_kind(plan, product)?;
-    let stream = backend.transfer_stream(kind, *device)?;
-    tensors(backend)?.complete_import(read, stream.as_ref())
+    match batch.inputs().state.inputs.get(&product.buffer_id()) {
+        Some(Input::Tensor { read, device }) => {
+            let stream = backend.transfer_stream(kind, *device)?;
+            tensors(backend)?.complete_import(read, stream.as_ref())
+        }
+        // An imported trajectory version becomes its slot's committed one.
+        Some(Input::Latent { input, device }) => {
+            let stream = backend.transfer_stream(kind, *device)?;
+            let (pool, _) = latent_pool(backend)?;
+            latents::adopt(pool, input, stream.as_ref())
+        }
+        // Borrowed inputs stay with their host consumers; KV imports are
+        // adopted by their install calls.
+        _ => Ok(()),
+    }
+}
+
+/// The latent pool trajectory transfers use.
+fn latent_pool(
+    backend: &mut WorkerBackend,
+) -> Result<(&mut latents::Pool, &crate::storage::LatentStorage)> {
+    backend
+        .image_mut()
+        .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?
+        .latent_pool()
 }
 
 /// The call kind of a product's consumers, whose stream publishes it.
@@ -804,6 +949,14 @@ pub(crate) fn close(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Res
     for input in taken {
         match input {
             Input::Tensor { read, device } => reads.entry(device).or_default().push(read),
+            Input::Latent { input, .. } => {
+                let closed = if input.adopted() {
+                    input.reads().iter().try_for_each(|read| read.close())
+                } else {
+                    latent_pool(backend).and_then(|(pool, _)| latents::abandon(pool, &input))
+                };
+                result = result.and(closed);
+            }
             Input::Cache(import) => {
                 if !import.adopted() {
                     let abandoned = backend
