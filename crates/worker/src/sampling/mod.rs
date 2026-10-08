@@ -8,6 +8,8 @@ use uniserve_ipc::{Call, DrawLayout};
 
 use crate::{Error, Result};
 
+pub(crate) mod plan;
+
 /// Token relays carry continuation in bit 31 and the token in the low 31 bits.
 pub const TOKEN_CONTINUATION_BIT: u32 = 1 << 31;
 pub const TOKEN_VALUE_MASK: u32 = TOKEN_CONTINUATION_BIT - 1;
