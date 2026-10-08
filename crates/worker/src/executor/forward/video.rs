@@ -163,17 +163,13 @@ pub(crate) struct Parts<'a> {
 impl<'a> Parts<'a> {
     /// The product owners, borrowed for the parts' lifetime rather than
     /// from the parts themselves.
-    pub(crate) fn owners(&self) -> Result<ProductOwners<'a>> {
+    pub(crate) fn owners(&self) -> ProductOwners<'a> {
         let storage: &'a RankStorage = self.storage;
-        let store = storage
-            .products
-            .as_deref()
-            .ok_or_else(|| Error::Invariant("a media rank has no product store".into()))?;
-        Ok(ProductOwners {
-            store,
+        ProductOwners {
+            store: &storage.tensors,
             transports: &storage.transports,
             events: &storage.events,
-        })
+        }
     }
 }
 
@@ -452,7 +448,7 @@ pub(crate) fn prepare_inputs(
     if !batch.inputs.submitted() {
         let slots = request_slots(plan, parts.requests)?;
         let node = parts.info.endpoint.node.clone();
-        let owners = parts.owners()?;
+        let owners = parts.owners();
         let device = batch.device;
         let stream = batch.stream.as_ref().map(|stream| {
             // SAFETY: a view of the batch's borrowed stream for this call.
@@ -507,7 +503,7 @@ pub(crate) fn execute(
     for index in 0..plan.calls.len() {
         let call = &plan.calls[index];
         let slot = slots[&call.request_key];
-        let owners = parts.owners()?;
+        let owners = parts.owners();
         let completion = bind_completion(owners.store, call, batch.device, &slots)?;
         batch.calls[index].completion = completion;
         if batch.calls[index].skipped {
@@ -544,7 +540,7 @@ pub(crate) fn execute(
             }
         }
     }
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     let trajectories = parts
         .video
         .denoiser
@@ -616,7 +612,7 @@ fn bind_rows(
     shape: Vec<u64>,
     placement: &Placement<'_>,
 ) -> Result<crate::ProductBuffer> {
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     let write = bind_outputs(
         owners.store,
         &[OutputShape {
@@ -642,7 +638,7 @@ fn publish(
     index: usize,
     write: &crate::ProductBuffer,
 ) -> Result<()> {
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     let stream = stream_of(batch)?;
     owners.store.produced(write, &[], Some(&stream), None)?;
     let (exported, locations) = export(
@@ -693,7 +689,7 @@ fn encode_text(
         .first()
         .map(|input| {
             batch.inputs.read(
-                parts.owners()?.store,
+                parts.owners().store,
                 input,
                 call.call_id,
                 batch.device,
@@ -773,7 +769,7 @@ fn encode_vision(
     let tokens: u64 = blocks.iter().map(|block| block.1).sum();
     let stream = stream_of(batch)?;
     let patches = batch.inputs.read(
-        parts.owners()?.store,
+        parts.owners().store,
         &call.inputs[0],
         call.call_id,
         batch.device,
@@ -873,7 +869,7 @@ fn prepare(
             }
         }
     }
-    let store = parts.owners()?.store;
+    let store = parts.owners().store;
     let stream = stream_of(batch)?;
     let device = batch.device;
     let features =
@@ -1043,7 +1039,7 @@ fn denoise(
     let samples = denoiser.runner.final_samples(id)?;
     let rows = denoiser.runner.sample_rows(id)?;
     let modalities = parts.video.model.facts.modalities.clone();
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     let stream = stream_of(batch)?;
     for (output, name) in call.outputs.iter().zip(&names) {
         let modality = modalities
@@ -1132,7 +1128,7 @@ fn decode_video(
     }
     let unit = run.start;
     let segment: Segment = parts.video.model.segment(frames, canvas, unit)?;
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     let stream = stream_of(batch)?;
     let latent = batch.inputs.read(
         owners.store,
@@ -1249,7 +1245,7 @@ fn decode_audio(
     let spans = parts.video.model.audio_units(samples, units)?;
     let first = spans[run.start as usize].start;
     let last = spans[run.end as usize - 1].end;
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     let stream = stream_of(batch)?;
     let latent = batch.inputs.read(
         owners.store,
@@ -1335,7 +1331,7 @@ fn encode_conditions(
         .latent
         .as_ref()
         .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
-    let owners = parts.owners()?;
+    let owners = parts.owners();
     let stream = stream_of(batch)?;
     let width = call.outputs[0]
         .shape_bound
