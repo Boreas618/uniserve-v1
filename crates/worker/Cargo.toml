@@ -10,10 +10,12 @@ license.workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+base64.workspace = true
 crossbeam-channel.workspace = true
 indexmap.workspace = true
 libc.workspace = true
 nvtx.workspace = true
+png.workspace = true
 rustix = { workspace = true, features = ["pipe", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -32,6 +34,12 @@ uuid.workspace = true
 # with the real numerical interface (tests/python/integration/storage).
 [[example]]
 name = "storage_harness"
+crate-type = ["cdylib"]
+
+# A TVM-FFI library that Python tests load to drive the image runners with
+# the real numerical interface (tests/python/integration/runtime).
+[[example]]
+name = "image_harness"
 crate-type = ["cdylib"]
 
 [dev-dependencies]

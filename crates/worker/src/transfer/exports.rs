@@ -14,10 +14,10 @@ use crate::{Error, Result};
 /// One accepted export location and the transport that owns it.
 pub type Location = (Arc<Transport>, Locator);
 
-/// Export `source` through every configured mechanism that reaches its
-/// consumers: local plus CUDA VMM for device memory when VMM is configured
-/// (unless `host` forces host mechanisms), otherwise local, shared memory
-/// and the rank channel.
+/// Export `source` through every export mechanism that reaches its
+/// consumers: local plus CUDA VMM for device memory when the rank exports
+/// over VMM (unless `host` forces host mechanisms), otherwise local, shared
+/// memory and the rank channel.
 ///
 /// The storage owner retains each location's retirement signal through
 /// `retain` before the next export starts. A device payload that does not
@@ -33,14 +33,15 @@ pub fn export(
     stream: Option<&Stream>,
     mut retain: impl FnMut(Arc<Retirement>) -> Result<()>,
 ) -> Result<Vec<Location>> {
-    if transports.is_empty() {
+    if transports.exports_nothing() {
         return Err(Error::Unsupported(
             "tensor export requires a configured transport".into(),
         ));
     }
 
     let device = matches!(source.device(), Device::Cuda(_)) && !host;
-    let kinds: &[TransportKind] = if device && transports.get(TransportKind::CudaVmm).is_some() {
+    let kinds: &[TransportKind] = if device && transports.exporter(TransportKind::CudaVmm).is_some()
+    {
         &[TransportKind::Local, TransportKind::CudaVmm]
     } else {
         &[
@@ -51,7 +52,7 @@ pub fn export(
     };
     let selected: Vec<_> = kinds
         .iter()
-        .filter_map(|&kind| transports.get(kind))
+        .filter_map(|&kind| transports.exporter(kind))
         .filter(|transport| transport.serves(consumers))
         .cloned()
         .collect();
@@ -66,7 +67,7 @@ pub fn export(
                 Exported::PoolExhausted => {
                     // Local was selected before VMM, so never repeat it.
                     for kind in [TransportKind::Shm, TransportKind::Channel] {
-                        let Some(fallback) = transports.get(kind) else {
+                        let Some(fallback) = transports.exporter(kind) else {
                             continue;
                         };
                         if !fallback.serves(consumers) {

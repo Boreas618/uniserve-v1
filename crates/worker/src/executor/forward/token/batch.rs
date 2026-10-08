@@ -9,23 +9,21 @@
 //! failure before the commit point.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::Instant;
 
 use uniserve_cuda::Stream;
-use uniserve_ipc::{
-    Batch as BatchPlan, Call, CallStatus, DType, ForwardMode, RequestKey, TensorRef,
-};
+use uniserve_ipc::{Batch as BatchPlan, CallStatus, DType, ForwardMode, RequestKey, TensorRef};
 
+use super::super::launch::{lock, read_flag, reports_output, seal};
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, TextRuntime};
 use crate::executor::PendingOutput;
+use crate::executor::forward::image::ImageRuntime;
 use crate::ffi::Device;
 use crate::request::RequestPool;
 use crate::sampling::SamplingMetadata;
-use crate::storage::{
-    OutputBuffer, OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar,
-};
+use crate::storage::{OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar};
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
 use crate::{Error, Result};
@@ -49,6 +47,8 @@ pub(super) struct CallState {
 /// A token batch's borrowed owners and the resources it reserved.
 pub(super) struct TokenBatch<'a> {
     pub(super) runtime: &'a mut TextRuntime,
+    /// The image runtime, for prompts placing image features.
+    pub(super) image: Option<&'a mut ImageRuntime>,
     pub(super) storage: &'a mut RankStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
@@ -68,71 +68,12 @@ pub(super) struct TokenBatch<'a> {
     pub(super) started: Instant,
 }
 
-pub(super) fn lock(buffer: &OutputLease) -> MutexGuard<'_, OutputBuffer> {
-    buffer.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// The rank that reports a component's host results: its first member.
-fn reports_output(info: &uniserve_ipc::WorkerInfo, rank: usize, component: &str) -> Result<bool> {
-    match info.components.iter().find(|value| value.name == component) {
-        Some(value) => Ok(value.config.ranks.first() == Some(&rank)),
-        None if info.world_size == 1 => Ok(true),
-        None => Err(Error::Unsupported(format!(
-            "component {component:?} has no output rank"
-        ))),
-    }
-}
-
-/// Read a host-gated (U8) predicate after its producer's fence.
-fn read_flag(
-    storage: &RankStorage,
-    call: &Call,
-    predicate: &TensorRef,
-    device: Option<i32>,
-    stream: Option<&Stream>,
-) -> Result<bool> {
-    let read =
-        storage
-            .tensors
-            .consume(predicate, call.call_id, device.map(Device::Cuda), stream)?;
-    let mut value = [0_u8; 1];
-    let copied = match stream {
-        Some(stream) => {
-            // SAFETY: one byte of a committed product, read after the stream
-            // waited on its producer; the host byte outlives the
-            // synchronized copy.
-            unsafe {
-                uniserve_cuda::memcpy_async(
-                    value.as_mut_ptr() as u64,
-                    read.value().address(),
-                    1,
-                    stream,
-                )
-            }
-            .map_err(Error::from)
-            .and_then(|()| stream.synchronize().map_err(Error::from))
-        }
-        None => {
-            // SAFETY: a committed host product byte.
-            value[0] = unsafe { *(read.value().address() as *const u8) };
-            Ok(())
-        }
-    };
-    storage.tensors.complete_reads(&[read], stream, &[])?;
-    copied?;
-    match value[0] {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(Error::Invalid(
-            "call predicate is not a canonical boolean".into(),
-        )),
-    }
-}
-
 impl<'a> TokenBatch<'a> {
     /// Bind the batch's outputs and lease its output storage.
+    #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(super) fn open(
         runtime: &'a mut TextRuntime,
+        image: Option<&'a mut ImageRuntime>,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
         info: &uniserve_ipc::WorkerInfo,
@@ -195,11 +136,11 @@ impl<'a> TokenBatch<'a> {
 
         // Host-gated predicates resolve before any storage is reserved; a
         // false one skips its call.
-        runtime.order(stream.as_ref())?;
+        runtime.order.wait(stream.as_ref())?;
         for (call, state) in plan.calls.iter().zip(&mut calls) {
             if let Some(predicate) = &call.predicate
                 && predicate.dtype == DType::U8
-                && !read_flag(storage, call, predicate, device, stream.as_ref())?
+                && !read_flag(&storage.tensors, call, predicate, device, stream.as_ref())?
             {
                 state.active = false;
                 state.output.output.status = CallStatus::Predicated;
@@ -225,6 +166,7 @@ impl<'a> TokenBatch<'a> {
         }
         Ok(Self {
             runtime,
+            image,
             storage,
             requests,
             plan,
@@ -277,33 +219,40 @@ impl<'a> TokenBatch<'a> {
             kv.recycle(&units, &self.runtime.columns[self.runner], stream)?;
         }
 
-        // Each active call has one forward row on its own slot. A queued
-        // token relay declares a capacity bound: its device state decides the
-        // visible length when it executes.
+        // Each active call has one forward row on its own slot; a context
+        // prefill has one per prompt run and vision block (checked against
+        // its rows when they are built). A queued token relay declares a
+        // capacity bound: its device state decides the visible length when
+        // it executes.
         let forward = &plan.forward;
-        let mut rows: Vec<Option<usize>> = vec![None; plan.calls.len()];
+        let mut rows: Vec<Vec<usize>> = vec![Vec::new(); plan.calls.len()];
         for (row, &call) in forward.call_indices.iter().enumerate() {
-            let entry = rows
-                .get_mut(call as usize)
-                .ok_or_else(|| Error::Invalid("forward row names no call".into()))?;
-            if entry.replace(row).is_some() {
+            rows.get_mut(call as usize)
+                .ok_or_else(|| Error::Invalid("forward row names no call".into()))?
+                .push(row);
+        }
+        for ((call, state), call_rows) in plan.calls.iter().zip(&self.calls).zip(&rows) {
+            if !state.active {
+                continue;
+            }
+            let (&first, rest) = call_rows
+                .split_first()
+                .ok_or_else(|| Error::Invalid("a token call has no forward row".into()))?;
+            if !rest.is_empty() && !call.writes_context() {
                 return Err(Error::Invalid(
                     "a token call has exactly one forward row".into(),
                 ));
             }
-        }
-        for ((call, state), row) in plan.calls.iter().zip(&self.calls).zip(rows) {
-            if !state.active {
-                continue;
-            }
-            let row = row
-                .ok_or_else(|| Error::Invalid("a token call has exactly one forward row".into()))?;
-            if forward.request_pool_indices[row] as usize != state.slot {
+            if call_rows
+                .iter()
+                .any(|&row| forward.request_pool_indices[row] as usize != state.slot)
+            {
                 return Err(Error::Invalid(
                     "a token call's forward row reads another slot".into(),
                 ));
             }
-            let declared = u64::from(forward.seq_lens[row].saturating_sub(forward.query_lens[row]));
+            let declared =
+                u64::from(forward.seq_lens[first].saturating_sub(forward.query_lens[first]));
             let visible = state.output.progress.kv_visible_len;
             let relayed = call
                 .predicate
@@ -314,24 +263,29 @@ impl<'a> TokenBatch<'a> {
                     "forward row sequence length disagrees with execution state".into(),
                 ));
             }
-            // Readers retain their prefix, writers also their query tokens;
-            // a windowed group starts at its first resident page.
-            let length = u64::from(if forward.write_kv[row] {
-                forward.seq_lens[row]
-            } else {
-                forward.seq_lens[row] - forward.query_lens[row]
-            });
-            let mut spans = Vec::new();
-            let tables = kv.tables();
-            for group in 0..tables.groups().len() as u32 {
-                let table = tables.table(state.slot as u32, group)?;
-                let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
-                if length > start {
-                    spans.extend(table.spans(start, length - start)?);
+            for &row in call_rows {
+                // Readers retain their prefix, writers also their query
+                // tokens; a windowed group starts at its first resident page.
+                let length = u64::from(if forward.write_kv[row] {
+                    forward.seq_lens[row]
+                } else {
+                    forward.seq_lens[row] - forward.query_lens[row]
+                });
+                let mut spans = Vec::new();
+                let tables = kv.tables();
+                for group in 0..tables.groups().len() as u32 {
+                    let table = tables.table(state.slot as u32, group)?;
+                    let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
+                    if length > start {
+                        spans.extend(table.spans(start, length - start)?);
+                    }
                 }
+                kv.manager().retain_execution(
+                    call.request_key,
+                    &spans,
+                    Arc::clone(&self.retirement),
+                );
             }
-            kv.manager()
-                .retain_execution(call.request_key, &spans, Arc::clone(&self.retirement));
         }
 
         self.bind_products()?;
@@ -358,12 +312,6 @@ impl<'a> TokenBatch<'a> {
             {
                 return Err(Error::Unsupported(
                     "token calls publish no tensor products besides their relays".into(),
-                ));
-            }
-            if !call.vision_inputs.is_empty() || call.latent_feature_input.is_some() {
-                return Err(Error::Unsupported(
-                    "context prefill with media features is served by the multimodal runtime"
-                        .into(),
                 ));
             }
             for scalar in [
@@ -455,26 +403,11 @@ impl<'a> TokenBatch<'a> {
     /// Seal the lease on the batch's stream and retire its KV accesses and
     /// output storage once the fences complete; wake the service then.
     pub(super) fn seal(&self) -> Result<()> {
-        let streams: Vec<&Stream> = self.stream.iter().collect();
-        let events = lock(&self.buffer)
-            .seal(&streams, &self.storage.events)?
-            .unwrap_or_default();
-        let fences: Vec<_> = lock(&self.buffer).fences().cloned().collect();
-        for event in fences {
-            self.storage.events.wake_after(&event)?;
-        }
-        let lease = Arc::clone(&self.buffer);
-        let retirement = Arc::clone(&self.retirement);
-        self.storage.events.defer(
-            events,
-            Box::new(move || {
-                lease
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .copies_finished();
-                crate::transfer::notify(retirement.complete(Ok(()))?);
-                Ok(())
-            }),
+        seal(
+            &self.storage.events,
+            &self.buffer,
+            self.stream.as_ref(),
+            &self.retirement,
         )
     }
 

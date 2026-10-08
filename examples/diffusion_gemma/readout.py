@@ -14,6 +14,9 @@ from dataclasses import replace
 import torch
 from transformers import AutoTokenizer
 
+from uniserve_models import catalog
+from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.cache.units import UnitPool, plan_units
 from uniserve_models.model import CanvasInput, TextInput, TextSize
 from uniserve_models.nn.attention import (
     AttentionBatch,
@@ -22,9 +25,6 @@ from uniserve_models.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve_models.runtime import ExecutionContext, PrefixCache
-from uniserve_models.runtime.prefix_cache import plan_units
-from uniserve_models import catalog
 
 
 @torch.inference_mode()
@@ -57,7 +57,8 @@ def read_candidates(model, prompt, canvas, position, candidates):
         blocks[index] = tuple(range(next_unit, next_unit + pages))
         next_unit += pages
 
-    cache = PrefixCache(
+    # Unit zero is the padding sentinel; the prompt's pages follow it.
+    cache = UnitPool.allocate(
         config, num_units=next_unit, block_size=block_size, device=device
     )
     context = ExecutionContext(
@@ -80,7 +81,7 @@ def read_candidates(model, prompt, canvas, position, candidates):
             entries[index] = entry
         return AttentionBatch(entries, entries[0].queries)
 
-    with cache, context:
+    with context:
         context.prepare(TextSize(max(length, count), 1))
         prefill = attention(
             lambda units, page: PagedInput.from_blocks(
@@ -140,7 +141,7 @@ def main():
     parser.add_argument("--question", required=True)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
-    config = loading.read_config(
+    config = catalog.read_config(
         args.checkpoint, modules=frozenset(("text", "denoiser"))
     )
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
@@ -173,7 +174,7 @@ def main():
         [diffusion.pad_token_id] * (diffusion.canvas_length - len(scaffold))
     )
     device = torch.device(args.device)
-    model = loading.load_model(config, device=device).model
+    model = catalog.load_model(config, device=device).model
     probabilities, mass = read_candidates(
         model,
         torch.tensor(prompt, device=device),

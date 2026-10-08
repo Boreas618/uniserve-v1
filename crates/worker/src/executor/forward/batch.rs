@@ -19,15 +19,16 @@ use uniserve_ipc::{
     TensorRef,
 };
 
+use super::products::Publications;
+use crate::executor::forward::placement::{ProductOwners, Reads, export};
 use crate::executor::pending::{BatchResult, PendingOutput};
-use crate::executor::products::{ProductInputs, ProductOwners, export};
 use crate::ffi::Device;
 use crate::host::HostTask;
 use crate::host::task::{MediaTask, TaskOutput};
 use crate::request::RequestPool;
 use crate::storage::OutputLease;
 use crate::storage::Scalar;
-use crate::transfer::exports::{self, Location};
+use crate::transfer::exports::Location;
 use crate::{Error, LatentUpdate, OutputPool, ProductBuffer, Result};
 
 /// How a call publishes what its host tasks wrote.
@@ -63,11 +64,10 @@ pub(crate) struct CallState {
     pub(crate) writes: Vec<ProductBuffer>,
     /// The completion scalar a successor's predicate reads.
     pub(crate) completion: Option<ProductBuffer>,
-    /// Export locations by product: registered with the store on delivery,
-    /// so releasing the product revokes them, and revoked when the batch
-    /// fails before delivery.
-    pub(crate) exports: Vec<(BufferId, Vec<Location>)>,
-    pub(crate) products: Vec<TensorExport>,
+    /// The call's product exports: registered with the store at the commit
+    /// point (host products when their task wrote them), so releasing a
+    /// product revokes them; revoked when the batch fails before.
+    pub(crate) publications: Publications,
     pub(crate) latent: Option<LatentUpdate>,
     pub(crate) tasks: Vec<Arc<HostTask<MediaTask>>>,
     pub(crate) publication: Option<Publication>,
@@ -75,9 +75,23 @@ pub(crate) struct CallState {
     pub(crate) skipped: bool,
 }
 
+impl CallState {
+    /// Record an export of `buffer` and add its descriptor to the call's
+    /// completion products.
+    pub(crate) fn publish(
+        &mut self,
+        buffer: BufferId,
+        locations: Vec<Location>,
+        export: TensorExport,
+    ) -> Result<()> {
+        self.publications
+            .accept(buffer, locations, export, &mut self.pending)
+    }
+}
+
 /// One media batch's running state.
 pub(crate) struct MediaBatch {
-    pub(crate) inputs: ProductInputs,
+    pub(crate) inputs: Reads,
     pub(crate) calls: Vec<CallState>,
     output: OutputLease,
     /// The stream the batch's device work runs on, when it has any.
@@ -92,12 +106,14 @@ fn lock(lease: &OutputLease) -> std::sync::MutexGuard<'_, crate::OutputBuffer> {
 }
 
 impl MediaBatch {
-    /// The batch's input state before any call ran.
+    /// Open a batch of `calls` calls on `device` and `stream` that reads
+    /// `inputs`.
     pub(crate) fn new(
         device: Device,
         stream: Option<Stream>,
         outputs: &mut OutputPool,
         calls: usize,
+        inputs: Reads,
     ) -> Result<Self> {
         let devices: Vec<i32> = match device {
             Device::Cuda(index) => vec![index],
@@ -105,7 +121,7 @@ impl MediaBatch {
         };
         let output = outputs.lease(calls.max(1), calls.max(1), &devices, false)?;
         Ok(Self {
-            inputs: ProductInputs::default(),
+            inputs,
             calls: Vec::new(),
             output,
             stream,
@@ -143,8 +159,7 @@ impl MediaBatch {
                 parent,
                 writes: Vec::new(),
                 completion: None,
-                exports: Vec::new(),
-                products: Vec::new(),
+                publications: Publications::default(),
                 latent: None,
                 tasks: Vec::new(),
                 publication: None,
@@ -190,6 +205,9 @@ impl MediaBatch {
             .cloned()
             .collect();
         owners.store.validate_writes(&writes)?;
+        for call in &self.calls {
+            call.publications.validate(owners.store)?;
+        }
         let updates: Vec<LatentUpdate> = self
             .calls
             .iter()
@@ -214,6 +232,9 @@ impl MediaBatch {
         // Every owner accepted its update; failures from here on are fatal.
         self.committed = true;
         owners.store.commit_writes(&writes)?;
+        for call in &mut self.calls {
+            call.publications.register(owners.store)?;
+        }
         if let Some(pool) = trajectories.as_mut() {
             pool.apply(&updates);
         }
@@ -275,15 +296,11 @@ impl MediaBatch {
             call.pending.accept(requests)?;
             let result = call.pending.result()?;
             if result.status == CallStatus::Ok {
-                products.extend(call.products.iter().cloned());
+                products.extend_from_slice(call.pending.products());
             }
             completions.push(result.clone());
             if let Some(source) = call.pending.take_media() {
                 media.push(source);
-            }
-            // Delivered exports are revoked with their products' release.
-            for (buffer, locations) in call.exports.drain(..) {
-                owners.store.register_exports(buffer, locations)?;
             }
         }
         self.delivered = true;
@@ -353,8 +370,9 @@ impl MediaBatch {
                     owners.store.commit_writes(std::slice::from_ref(&write))?;
                     let (exported, locations) =
                         export(owners, plan_call, &product, &write, true, None, None)?;
-                    call.exports.push((write.id(), locations));
-                    call.products.push(exported);
+                    call.publish(write.id(), locations, exported)?;
+                    // Written after the commit point: registered at once.
+                    call.publications.register(owners.store)?;
                 }
             }
             Some(Publication::Encoded {
@@ -387,8 +405,8 @@ impl MediaBatch {
                     Some(&regions),
                     None,
                 )?;
-                call.exports.push((write.id(), locations));
-                call.products.push(exported);
+                call.publish(write.id(), locations, exported)?;
+                call.publications.register(owners.store)?;
             }
             Some(Publication::Media) if call.pending.reports_output => {
                 for output in &outputs {
@@ -423,12 +441,7 @@ impl MediaBatch {
                     tracing::warn!(target: "uniserve_worker.media", "withdrawing a host media task failed: {error}");
                 }
             }
-            let locations: Vec<Location> = call
-                .exports
-                .drain(..)
-                .flat_map(|(_, locations)| locations)
-                .collect();
-            result = result.and(exports::release(&locations));
+            result = result.and(call.publications.revoke());
         }
         if self.committed {
             for call in &self.calls {

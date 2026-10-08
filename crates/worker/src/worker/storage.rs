@@ -30,19 +30,25 @@ pub(super) fn notify(callbacks: Vec<Notify>) {
 pub struct RankStorage {
     pub events: Arc<EventPool>,
     pub tensors: TensorStore,
-    pub transports: Transports,
+    /// Shared with the KV import copy tasks that read through them.
+    pub transports: Arc<Transports>,
     pub kv: Option<KVCache>,
     /// Stream that orders slot releases after the batches reading them: the
     /// stream serving token calls. A borrowed view of a stream the worker's
     /// lanes own; the lanes close after this owner.
     release_stream: Option<Stream>,
+    /// Finished requests whose guidance prefix slots (image trajectories)
+    /// clear with their own slots, once their readers retired.
+    finished_prefixes: HashSet<RequestKey>,
+    /// Those of them whose retirement is ready.
+    retired_prefixes: HashSet<RequestKey>,
 }
 
 impl RankStorage {
     pub fn new(
         events: Arc<EventPool>,
         tensors: TensorStore,
-        transports: Transports,
+        transports: Arc<Transports>,
         kv: Option<KVCache>,
         release_stream: Option<Stream>,
     ) -> Self {
@@ -52,6 +58,8 @@ impl RankStorage {
             transports,
             kv,
             release_stream,
+            finished_prefixes: HashSet::new(),
+            retired_prefixes: HashSet::new(),
         }
     }
 
@@ -100,6 +108,7 @@ impl RequestStorage for RankStorage {
                 .filter(|buffer| requests.contains(&buffer.owner) && !retained.contains(buffer))
                 .collect();
             kv.manager().release_exports(&exports);
+            self.finished_prefixes.extend(requests.iter().copied());
         }
         Ok(())
     }
@@ -110,17 +119,32 @@ impl RequestStorage for RankStorage {
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
     ) -> Result<bool> {
-        Ok(self.tensors.retirement_ready(buffers, requests, retained)?
+        let ready = self.tensors.retirement_ready(buffers, requests, retained)?
             && self
                 .kv
                 .as_mut()
-                .is_none_or(|kv| kv.manager().retirement_ready(buffers, requests, retained)))
+                .is_none_or(|kv| kv.manager().retirement_ready(buffers, requests, retained));
+        if ready {
+            // Their prefix slots clear with the requests' own slots.
+            for request in requests {
+                if self.finished_prefixes.remove(request) {
+                    self.retired_prefixes.insert(*request);
+                }
+            }
+        }
+        Ok(ready)
     }
 
     fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
         if let Some(kv) = &mut self.kv {
             let slots: Vec<u32> = slots.iter().map(|&slot| slot as u32).collect();
             kv.release_slots(&slots, self.release_stream.as_ref())?;
+            for request in std::mem::take(&mut self.retired_prefixes) {
+                kv.release_request_prefixes(request, self.release_stream.as_ref())?;
+                // A later epoch of the request id starts without the
+                // retired epoch's resident transfers and accepted bases.
+                kv.manager().drop_request(request);
+            }
         }
         Ok(())
     }
@@ -153,11 +177,18 @@ impl RequestStorage for RankStorage {
             std::mem::forget(self.kv.take());
             return Ok(());
         }
-        let mut result = Ok(());
+        // Revoke every published product, stop the imports reading through
+        // the transports, then close the transports, which retires the
+        // exports they still register (the KV cache requires its exports
+        // retired before it closes).
+        let mut result = self.tensors.revoke_exports();
+        if let Some(kv) = &mut self.kv {
+            result = result.and(kv.stop_imports());
+        }
+        result = result.and(self.transports.close());
         if let Some(kv) = &mut self.kv {
             result = result.and(kv.close());
         }
-        result = result.and(self.transports.close());
         self.tensors.close();
         result.and(self.events.close())
     }
