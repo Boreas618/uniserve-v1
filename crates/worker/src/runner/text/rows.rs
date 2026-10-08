@@ -18,6 +18,15 @@ pub(crate) enum RowSource {
     /// One token, its position and the slot's verified KV length gathered on
     /// the device by the decode gather: a decode row of an all-indexed call.
     Indexed,
+    /// Host tokens with explicit rotary positions (temporal, row, column):
+    /// a vision block, or text of a prompt holding one, whose positions do
+    /// not follow from the token count. Without `spatial`, only the
+    /// temporal axis is meaningful and the model reads one axis.
+    Placed {
+        tokens: Vec<u32>,
+        positions: [Vec<i64>; 3],
+        spatial: bool,
+    },
 }
 
 /// One row of a text invocation: one call's query over its slot's KV.
@@ -34,6 +43,9 @@ pub(crate) struct TokenRow {
     pub(crate) gated: bool,
     /// Grammar state forces the call's selection to finish.
     pub(crate) force_finish: bool,
+    /// The query attends causally; a vision block attends to all of
+    /// itself.
+    pub(crate) causal: bool,
 }
 
 impl TokenRow {
@@ -48,6 +60,16 @@ impl TokenRow {
             RowSource::Host { tokens, .. } => tokens.len(),
             RowSource::Relay { drafts, .. } => drafts.len() + 1,
             RowSource::Resident | RowSource::Indexed => 1,
+            RowSource::Placed {
+                tokens, positions, ..
+            } => {
+                if positions.iter().any(|axis| axis.len() != tokens.len()) {
+                    return Err(Error::Invalid(
+                        "placed row positions disagree with its tokens".into(),
+                    ));
+                }
+                tokens.len()
+            }
         };
         if tokens != self.query as usize || self.query == 0 {
             return Err(Error::Invalid(
@@ -90,6 +112,7 @@ mod tests {
             selection,
             gated: false,
             force_finish: false,
+            causal: true,
         }
     }
 

@@ -46,15 +46,26 @@ use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
+use crate::executor::forward::canvas::warmup::CanvasWarmup;
+use crate::executor::forward::canvas::{
+    CanvasRuntime, Startup as CanvasStartup, reserved_bytes as canvas_bytes,
+};
+use crate::executor::forward::image::ImageRuntime;
+use crate::executor::forward::image::start::{
+    Startup as ImageStartup, reserved_bytes as image_reserved_bytes,
+};
+use crate::executor::forward::image::warmup::ImageWarmup;
 use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::token::start::{Startup, TextBounds, reserved_bytes};
 use crate::executor::forward::token::warmup::TextWarmup;
+use crate::executor::forward::transfer::TransferRuntime;
 use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
 use crate::launch::Endpoint;
 use crate::model::bind::StreamWorkspaces;
 use crate::model::components::Capability;
+use crate::model::image::ImageModel;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::model::video::{VideoModel, placed_denoiser};
@@ -311,6 +322,38 @@ impl Worker {
             preparation,
         })
         .map_err(phase("bind"))?;
+        let image = ImageRuntime::start(ImageStartup {
+            interface: &interface,
+            config: &config,
+            request_slots: info.request_slots as usize,
+            queue_depth: launch.ipc.queue_depth,
+            host_capacity: info.host_lane_capacity as usize,
+            model: &model,
+            lanes: &lanes,
+            storage: &storage,
+            latent: plan.latent,
+            components: &mut components,
+            workspaces: &mut workspaces,
+            graphs: &mut graphs,
+            preparation,
+        })
+        .map_err(phase("bind"))?;
+        let canvas = CanvasRuntime::start(CanvasStartup {
+            interface: &interface,
+            config: &config,
+            request_slots: info.request_slots as usize,
+            queue_depth: launch.ipc.queue_depth,
+            max_payload_bytes: launch.ipc.max_payload_bytes,
+            model: &model,
+            experts: expert_exchange(&launch),
+            lanes: &lanes,
+            kv: storage.kv.as_ref(),
+            components: &mut components,
+            workspaces: &mut workspaces,
+            graphs: &mut graphs,
+            preparation,
+        })
+        .map_err(phase("bind"))?;
         let mut lanes = lanes;
         let video_runtime = match (video, video_capacity) {
             (Some(video), Some(capacity)) => Some(
@@ -346,6 +389,28 @@ impl Worker {
         if let Some(text) = text {
             backend.set_text(text);
         }
+        let image_warmup = image.is_some();
+        if let Some(image) = image {
+            backend.set_image(image);
+        }
+        let canvas_warmup = canvas.is_some();
+        if let Some(canvas) = canvas {
+            backend.set_canvas(canvas);
+        }
+        let cuda: Vec<i32> = devices
+            .iter()
+            .filter_map(|device| device.cuda_index())
+            .collect();
+        backend.set_transfer(
+            TransferRuntime::start(
+                &lanes,
+                &cuda,
+                &CallKind::ALL,
+                launch.ipc.queue_depth,
+                info.max_batch_calls as usize,
+            )
+            .map_err(phase("bind"))?,
+        );
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
             .map(|profile| {
@@ -375,6 +440,9 @@ impl Worker {
         if video_warmup {
             hooks.push(Box::new(VideoWarmup));
         }
+        if image_warmup {
+            hooks.push(Box::new(ImageWarmup));
+        }
         if text_warmup {
             hooks.push(Box::new(TextWarmup {
                 row_tokens: config
@@ -382,6 +450,9 @@ impl Worker {
                     .min(config.max_batch_tokens)
                     .max(1),
             }));
+        }
+        if canvas_warmup {
+            hooks.push(Box::new(CanvasWarmup));
         }
 
         tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", facts.model_name);
@@ -570,7 +641,7 @@ impl Worker {
                 record(executor.close());
             }
             // Graphs and steps release before the bindings they run.
-            let closed = executor.backend_mut().close_text(aborted);
+            let closed = executor.backend_mut().close_runtimes(aborted);
             record(closed.map_err(WorkerError::from));
             let closed = executor.backend_mut().components_mut().close(aborted);
             record(closed.map_err(WorkerError::from));
@@ -736,9 +807,20 @@ impl Worker {
                     .map_err(phase("warmup"))?;
             }
         }
+        if let Some(canvas) = executor.backend_mut().canvas_mut() {
+            for (label, kernels) in canvas.kernels().map_err(phase("warmup"))? {
+                records
+                    .add(&label, &self.config.device, &kernels)
+                    .map_err(phase("warmup"))?;
+            }
+            canvas.seal();
+        }
         records.log("startup", self.config.rank, &self.config.device);
         if let Some(text) = executor.backend_mut().text_mut() {
             text.seal();
+        }
+        if let Some(image) = executor.backend_mut().image_mut() {
+            image.seal();
         }
         self.workspaces.seal();
         let choices: i64 = self
@@ -800,7 +882,15 @@ fn allocate_storage(
         cross_host_consumers: launch.ipc.products_cross_hosts,
         vmm_pool_bytes: plan.arena.transfer_bytes,
     };
-    let transports = Transports::new(&kinds, capacity, Arc::clone(&events), &options)?;
+    let exports = launch
+        .data_plane
+        .exports
+        .iter()
+        .map(|name| TransportKind::parse(name))
+        .collect::<Result<Vec<_>>>()?;
+    let transports = Arc::new(
+        Transports::new(&kinds, capacity, Arc::clone(&events), &options)?.with_exports(&exports)?,
+    );
 
     // Products: scheduler-placed buffers in the buffer pool and scalar relay
     // lanes, one per request slot and unresolved call.
@@ -1085,13 +1175,17 @@ fn plan(
             .sum(),
     };
     let mut layout = TokenLayout::new(report, config, launch.ipc.queue_depth, &token_facts)?;
-    let cache = if text
-        && !dedicated
-        && components
-            .placed()
+    // Every rank of a worker holding a causal LM component keeps the same
+    // KV pool, including ranks that hold only its other components: the
+    // worker advertises token work for all of its ranks, and they agree on
+    // one pool capacity.
+    let holds_text = held.iter().any(|name| {
+        declarations
+            .calls(name)
             .iter()
-            .any(|placed| placed.has(Capability::CausalLm))
-    {
+            .any(|call| call.is(Capability::CausalLm))
+    });
+    let cache = if text && !dedicated && holds_text {
         let cache =
             KVPlan::decode(model.cache_plan(interface, block_size, kv_dtype.as_deref())?)?;
         let total = match device {
@@ -1120,6 +1214,32 @@ fn plan(
                 layout.info().request_slots as usize,
                 &cache,
                 facts,
+                unit_columns,
+            )?,
+        );
+        // The image runtime's denoiser columns and decoder staging.
+        if facts.image_flow.is_some() {
+            let image = ImageModel::describe(interface, model.handle())?;
+            layout.reserve(
+                &config.device,
+                image_reserved_bytes(
+                    config,
+                    layout.info().request_slots as usize,
+                    image.denoiser.as_ref(),
+                ),
+            );
+        }
+        // The canvas runners' buffers and the resident canvas banks.
+        layout.reserve(
+            &config.device,
+            canvas_bytes(
+                interface,
+                model,
+                components,
+                expert_exchange(launch),
+                config,
+                layout.info().request_slots as usize,
+                &cache,
                 unit_columns,
             )?,
         );
@@ -1205,4 +1325,19 @@ fn video_layout(
         &facts,
         components.holds_host(),
     )
+}
+
+/// Whether routed experts use an expert exchange, and the attention ranks of
+/// a disaggregated expert union (zero when every rank holds its experts).
+fn expert_exchange(launch: &WorkerLaunch) -> (bool, usize) {
+    launch.expert_parallel.as_ref().map_or((false, 0), |union| {
+        (
+            true,
+            if union.disaggregated() {
+                union.attention_ranks
+            } else {
+                0
+            },
+        )
+    })
 }
