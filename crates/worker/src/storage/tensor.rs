@@ -9,9 +9,9 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use uniserve_core::CallId;
+use uniserve_cuda::Event;
 use uniserve_ipc::{BufferId, RequestKey};
 
-use crate::cuda::Event;
 use crate::{BufferBinding, Completion, Error, Result};
 
 pub type BufferKey = (RequestKey, CallId, u16);
@@ -167,7 +167,7 @@ impl<T, C> Buffer<T, C> {
             let ready = match queried.get(&(Arc::as_ptr(event) as usize)) {
                 Some(&ready) => ready,
                 None => {
-                    let ready = event.ready().map_err(Error::Cuda)?;
+                    let ready = event.query()?;
                     queried.insert(Arc::as_ptr(event) as usize, ready);
                     ready
                 }
