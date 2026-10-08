@@ -50,6 +50,8 @@ use uniserve_ipc::{
 
 const WORLD_SIZE: usize = 2;
 const QUEUE_DEPTH: usize = 2;
+/// The stub model's image start token, the successor of 1001.
+const STUB_IMAGE_START: u32 = 151_670;
 /// Held across `EngineCore::new` in
 /// `unsupported_media_is_rejected_without_stopping_the_engine` and across the
 /// rank-group launch in `a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails`,
@@ -2659,6 +2661,577 @@ fn a_request_continues_on_the_worker_that_installed_its_kv() -> anyhow::Result<(
     );
     executor.close()?;
     Ok(())
+}
+
+/// Device products cross worker processes over CUDA VMM with their values:
+/// the source publishes two requests' transition flags (one false, one
+/// true), and target calls gated by them run exactly when the imported flag
+/// is true, whether they read the import directly or a copy a tensor
+/// transfer made into the target's own relay.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn device_products_cross_workers_over_cuda_vmm() -> anyhow::Result<()> {
+    use uniserve_engine::{WorkerExecutor, WorkerId};
+
+    let edges = "source->target=cuda_vmm";
+    let mut executor = WorkerExecutor::try_new(
+        vec![
+            (
+                WorkerId("source".into()),
+                cuda_worker("source", edges, None)?,
+            ),
+            (
+                WorkerId("target".into()),
+                cuda_worker("target", edges, None)?,
+            ),
+        ],
+        uniserve_engine::TransferConfig::parse(edges)?,
+    )?;
+
+    // The stub's head maps 7 to 1000 and 1001 to its image start token,
+    // which these calls declare a transition: request 95's flag is false,
+    // request 96's true.
+    let mut flags = Vec::new();
+    for (batch_id, request_id, prompt) in [(1, 95, 7), (3, 96, 1001)] {
+        let admission = text_admission(request_id, 1, request_id as u32 - 94)?;
+        let mut prefill = token_batch(
+            batch_id,
+            batch_id,
+            admission.request_key,
+            Some(admission),
+            CallId::new(batch_id, 0),
+            CallKind::Forward(ForwardMode::Prefill),
+            &[prompt],
+            UnitId(request_id as u32 - 94),
+            0,
+        );
+        let flag = scalar_flag(prefill.calls[0].request_key, CallId::new(batch_id, 0), 3);
+        prefill.calls[0].transition_output = Some(flag.clone());
+        prefill.calls[0].sampling_state = Some(uniserve_ipc::SamplingState {
+            transition_token_ids: vec![STUB_IMAGE_START],
+            ..Default::default()
+        });
+        executor.submit(place(prefill, "source", Vec::new()))?;
+        let prefilled = poll_logical(&mut executor)?.context("source prefill did not complete")?;
+        assert_eq!(prefilled.results[0].output.status, CallStatus::Ok);
+
+        // The source republishes the flag as a product other workers read;
+        // the target imports it over the source's one edge.
+        let export = TensorRef {
+            producer_call_id: CallId::new(batch_id + 1, 0),
+            generation: 2,
+            ..flag.clone()
+        };
+        let publish = product_transfer(
+            flag.request_key,
+            CallId::new(batch_id + 1, 0),
+            "model",
+            &flag,
+            &export,
+        );
+        let mut publish = Batch::new(batch_id + 1, Vec::new(), vec![publish]);
+        publish.buffer_allocations.push(BufferAllocation {
+            buffer: export.buffer_id(),
+            offset: 256 * batch_id,
+            bytes: export.max_bytes(),
+        });
+        executor.submit(place(publish, "source", Vec::new()))?;
+        let published = poll_logical(&mut executor)?.context("flag export did not complete")?;
+        assert_eq!(published.results[0].output.status, CallStatus::Ok);
+        flags.push(export);
+    }
+
+    // The same requests on the target, gated directly by their imported
+    // flags.
+    for (batch_id, (request_id, flag, expected)) in [
+        (95, &flags[0], CallStatus::Predicated),
+        (96, &flags[1], CallStatus::Ok),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let admission = text_admission(request_id, 1, request_id as u32 - 94)?;
+        let status = gated_prefill(
+            &mut executor,
+            21 + batch_id as u64,
+            admission.request_key,
+            Some(admission),
+            flag,
+            0,
+        )?;
+        assert_eq!(status, expected, "request {request_id}");
+    }
+
+    // The true flag copied into the target's relay of its request gates the
+    // request's next call the same way.
+    let owner = flags[1].request_key;
+    let copy = TensorRef {
+        producer_call_id: CallId::new(23, 0),
+        generation: 3,
+        ..flags[1].clone()
+    };
+    let transfer = product_transfer(owner, CallId::new(23, 0), "model", &flags[1], &copy);
+    let mut transfer = Batch::new(23, Vec::new(), vec![transfer]);
+    transfer.buffer_allocations.push(BufferAllocation {
+        buffer: copy.buffer_id(),
+        offset: 0,
+        bytes: copy.max_bytes(),
+    });
+    executor.submit(place(transfer, "target", Vec::new()))?;
+    let copied = poll_logical(&mut executor)?.context("target transfer did not complete")?;
+    assert_eq!(copied.results[0].output.status, CallStatus::Ok);
+    assert_eq!(
+        gated_prefill(&mut executor, 24, owner, None, &copy, 1)?,
+        CallStatus::Ok
+    );
+    executor.close()?;
+    Ok(())
+}
+
+/// A request prefilled on a worker with a BF16 cache continues on a worker
+/// with an FP16 cache: its KV crosses the processes over CUDA VMM and is
+/// converted into the target's representation by the cache's conversion.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_converting_cache_installs_kv_another_worker_exported() -> anyhow::Result<()> {
+    use uniserve_engine::{WorkerExecutor, WorkerId};
+
+    let edges = "source->target=cuda_vmm";
+    let mut executor = WorkerExecutor::try_new(
+        vec![
+            (
+                WorkerId("source".into()),
+                cuda_worker("source", edges, None)?,
+            ),
+            (
+                WorkerId("target".into()),
+                cuda_worker("target", edges, Some(uniserve_core::KvCacheDtype::Float16))?,
+            ),
+        ],
+        uniserve_engine::TransferConfig::parse(edges)?,
+    )?;
+    let admission = text_admission(97, 1, 1)?;
+    let key = admission.request_key;
+    let prefill = token_batch(
+        1,
+        1,
+        key,
+        Some(admission.clone()),
+        CallId::new(1, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7, 8, 9],
+        UnitId(1),
+        0,
+    );
+    let tables = prefill.block_tables.clone();
+    executor.submit(place(prefill, "source", Vec::new()))?;
+    let prefilled = poll_logical(&mut executor)?.context("source prefill did not complete")?;
+    let exported = uniserve_ipc::BufferId {
+        owner: key,
+        producer_call_id: CallId::new(2, 0),
+        output_index: 0,
+        generation: 2,
+    };
+    let mut export = Call::new(
+        key,
+        CallId::new(2, 0),
+        CallKind::Transfer(TransferMode::KvExport),
+    );
+    export.coordinates = coordinates_after(&prefilled.results[0].output);
+    export.kv_output = Some(exported);
+    export.bounds.max_transfer_bytes = 1 << 20;
+    let mut publish = Batch::new(2, Vec::new(), vec![export]);
+    publish.block_tables = tables;
+    executor.submit(place(publish, "source", Vec::new()))?;
+    let published = poll_logical(&mut executor)?.context("KV export did not complete")?;
+    assert_eq!(published.results[0].output.status, CallStatus::Ok);
+    let transfer = published.results[0]
+        .output
+        .kv_output
+        .clone()
+        .context("KV export has no transfer")?;
+    assert_eq!(transfer.exported_extent, 3);
+    assert!(
+        transfer
+            .tensors()
+            .all(|tensor| tensor.locations.iter().any(|location| matches!(
+                location.transport,
+                uniserve_ipc::TransferTransport::CudaVmm { .. }
+            )))
+    );
+
+    let mut install = Call::new(
+        key,
+        CallId::new(3, 0),
+        CallKind::Transfer(TransferMode::KvInstall),
+    );
+    install.kv_input = Some(exported);
+    install.kv_output = Some(uniserve_ipc::BufferId {
+        owner: key,
+        producer_call_id: CallId::new(3, 0),
+        output_index: 0,
+        generation: 3,
+    });
+    install.bounds.max_transfer_bytes = 1 << 20;
+    let mut target = Batch::new(3, vec![admission], vec![install]);
+    target.block_tables = vec![BlockTable {
+        request_pool_idx: 1,
+        group_id: 0,
+        start_page: 0,
+        unit_ids: vec![UnitId(6)],
+        allocated_tokens: 3,
+    }];
+    target.new_cache_units = vec![CacheUnitAllocation {
+        request_pool_idx: 1,
+        group_id: 0,
+        unit_ids: vec![UnitId(6)],
+    }];
+    executor.submit(place(target, "target", Vec::new()))?;
+    let installation = poll_logical(&mut executor)?.context("KV install did not complete")?;
+    assert_eq!(installation.results[0].output.status, CallStatus::Ok);
+    assert_eq!(installation.results[0].output.kv_visible_len, 3);
+
+    let mut decode = token_batch(
+        4,
+        4,
+        key,
+        None,
+        CallId::new(4, 0),
+        CallKind::Forward(ForwardMode::Decode),
+        &[1000],
+        UnitId(6),
+        3,
+    );
+    decode.calls[0].coordinates.logical_position = 3;
+    executor.submit(place(decode, "target", Vec::new()))?;
+    let decoded = poll_logical(&mut executor)?.context("target decode did not complete")?;
+    assert_eq!(decoded.results[0].output.status, CallStatus::Ok);
+    assert_eq!(decoded.results[0].output.committed_tokens, vec![1001]);
+    assert_eq!(decoded.results[0].output.kv_visible_len, 4);
+    executor.close()?;
+    Ok(())
+}
+
+/// Launch arguments of a one-rank stub worker on the first visible CUDA
+/// device, with a cache of `kv_cache_dtype` (the model's dtype by default)
+/// and the transfer `edges`.
+fn cuda_worker(
+    worker_id: &str,
+    edges: &str,
+    kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
+) -> anyhow::Result<WorkerGroup> {
+    let mut args = single_rank_args(worker_id, QUEUE_DEPTH);
+    for rank in &mut args.ranks {
+        rank.device = "cuda:0".into();
+    }
+    args.kv_cache_dtype = kv_cache_dtype;
+    args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
+    WorkerGroup::spawn(args)
+}
+
+/// A one-element U8 flag that `producer` publishes as output `index`.
+fn scalar_flag(request_key: RequestKey, producer: CallId, index: u16) -> TensorRef {
+    TensorRef {
+        request_key,
+        producer_call_id: producer,
+        output_index: index,
+        generation: 1,
+        dtype: DType::U8,
+        shape_bound: ShapeBound::default(),
+    }
+}
+
+/// Prefill one prompt token of `key` on the target after its first
+/// `prefix` tokens, gated by `flag`, admitting the request with
+/// `admission` when given; returns the call's status.
+fn gated_prefill(
+    executor: &mut uniserve_engine::WorkerExecutor,
+    batch_id: u64,
+    key: RequestKey,
+    admission: Option<NewRequest>,
+    flag: &TensorRef,
+    prefix: u32,
+) -> anyhow::Result<CallStatus> {
+    let slot = admission
+        .as_ref()
+        .map_or(2, |admission| admission.request_pool_idx);
+    let mut prefill = token_batch(
+        batch_id,
+        batch_id,
+        key,
+        admission,
+        CallId::new(batch_id, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7],
+        UnitId(slot + 10),
+        prefix,
+    );
+    prefill.calls[0].predicate = Some(flag.clone());
+    prefill.block_tables[0].request_pool_idx = slot;
+    prefill.forward.request_pool_indices = vec![slot];
+    for allocation in &mut prefill.new_cache_units {
+        allocation.request_pool_idx = slot;
+    }
+    executor.submit(place(prefill, "target", Vec::new()))?;
+    let result = poll_logical(executor)?.context("gated prefill did not complete")?;
+    let output = &result.results[0].output;
+    if output.status == CallStatus::Ok {
+        assert_eq!(output.committed_tokens, vec![1000]);
+    }
+    Ok(output.status)
+}
+
+/// Environment of a rank process `media_rank` serves: the launch arguments
+/// (JSON), the worker info template (a path), the media case and the path
+/// that receives the published media name.
+const MEDIA_RANK_ARGS: &str = "UNISERVE_TEST_MEDIA_RANK_ARGS";
+const MEDIA_RANK_INFO: &str = "UNISERVE_TEST_MEDIA_RANK_INFO";
+const MEDIA_RANK_CASE: &str = "UNISERVE_TEST_MEDIA_RESPONSE";
+const MEDIA_RANK_NAME: &str = "UNISERVE_TEST_MEDIA_NAME";
+/// The bytes a `media_rank` process publishes.
+const MEDIA_PAYLOAD: &[u8] = b"generated media content";
+
+#[test]
+fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The ranks are `media_rank` processes speaking the rank protocol. Each
+    // answers Info with a real stub group's worker info, completes every
+    // call it receives and attaches a shared-memory media payload to a
+    // completion, selected by case: a valid payload from rank 0
+    // ("retained"), a payload on a call identity the batch never carried
+    // ("unknown-call"), a payload from rank 1 ("rank-output"), and a payload
+    // declaring one byte more than it stores ("short-storage").
+    let template = tempfile::tempdir()?;
+    let info_path = template.path().join("info.json");
+    {
+        let mut worker = spawn_rank_group()?;
+        std::fs::write(&info_path, serde_json::to_vec(worker.info())?)?;
+        worker.close()?;
+    }
+    let executable = serde_json::to_string(&std::env::current_exe()?)?;
+    for case in ["retained", "unknown-call", "rank-output", "short-storage"] {
+        let directory = tempfile::tempdir()?;
+        let wrapper = directory.path().join("worker");
+        let name_path = directory.path().join("media-name");
+        // `WorkerGroup` runs `<python> -m uniserve_models.worker <args>`, so
+        // the wrapper drops its first two arguments and runs this test
+        // binary's `media_rank` with the rest.
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/usr/bin/env python3\nimport json, os, sys\nenv = dict(os.environ, {MEDIA_RANK_ARGS}=json.dumps(sys.argv[3:]), {MEDIA_RANK_INFO}={info}, {MEDIA_RANK_CASE}={case:?}, {MEDIA_RANK_NAME}={name})\nos.execve({executable}, [{executable}, '--exact', 'media_rank', '--ignored', '--nocapture', '--test-threads', '1'], env)\n",
+                info = serde_json::to_string(&info_path)?,
+                name = serde_json::to_string(&name_path)?,
+            ),
+        )?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+        let mut args = rank_group_args(1 << 20, 8 << 20);
+        args.python = wrapper;
+        let mut worker = WorkerGroup::spawn(args)?;
+        let admission = text_admission(81, 1, 1)?;
+        let batch = token_batch(
+            1,
+            1,
+            admission.request_key,
+            Some(admission),
+            CallId::new(1, 0),
+            CallKind::Forward(ForwardMode::Prefill),
+            &[7, 8],
+            UnitId(1),
+            0,
+        );
+        worker.submit_batch(batch, &CallReaders::new())?;
+
+        // A correlation or rank-ownership failure may fail the poll and must
+        // deliver no result. A short extent still delivers the call's
+        // result, with its `media` failed.
+        let rejected = matches!(case, "unknown-call" | "rank-output");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut terminal = false;
+        let mut results = Vec::new();
+        while std::time::Instant::now() < deadline && !terminal {
+            match worker.poll_batch(Duration::from_millis(100)) {
+                Ok(Some(report)) => {
+                    terminal = true;
+                    results.extend(report.results);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    anyhow::ensure!(
+                        rejected,
+                        "unexpected media result failure in {case}: {error:#}"
+                    );
+                    terminal = true;
+                }
+            }
+        }
+        assert!(terminal, "media result did not retire in {case}");
+        let published_name = std::fs::read_to_string(&name_path)?;
+        // The receiver claims the POSIX name even when correlation, rank
+        // ownership, or extent validation rejects the result. Retained
+        // mappings keep the bytes.
+        // SAFETY: the rank handed off an immutable, completed export.
+        assert!(
+            unsafe { uniserve_core::SharedMedia::open(published_name.trim(), 1) }.is_err(),
+            "unclaimed media in {case}"
+        );
+        if rejected {
+            assert!(
+                results.is_empty(),
+                "invalid rank output was delivered in {case}"
+            );
+        } else {
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].output.status, CallStatus::Ok);
+            if case == "short-storage" {
+                assert!(results[0].media.is_err());
+            } else {
+                let media = std::sync::Arc::clone(
+                    results[0]
+                        .media
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!(error.clone()))?
+                        .as_ref()
+                        .context("media result has no storage")?,
+                );
+                // The claimed mapping outlives both the rank group and the
+                // result that delivered it.
+                worker.close()?;
+                drop(results);
+                assert_eq!(media.as_bytes(), MEDIA_PAYLOAD);
+                continue;
+            }
+        }
+        worker.close()?;
+    }
+    Ok(())
+}
+
+/// A rank process of `media_storage_is_owned_through_rank_result_validation`:
+/// it registers its channel endpoint like a worker rank, answers Info with
+/// the template worker info under its own identity, completes every call it
+/// receives as the stub's prefill of a request's first prompt tokens would,
+/// and attaches the case's media payload to a completion.
+#[test]
+#[ignore = "runs as a rank process of the media result test"]
+fn media_rank() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use uniserve_ipc::{
+        ArtifactHandle, BatchOutput, LaunchDescriptor, MediaOutput, RankReport, RankServer,
+        RequestOutput, WorkerRequest, WorkerResponse,
+    };
+
+    let Ok(arguments) = std::env::var(MEDIA_RANK_ARGS) else {
+        return Ok(());
+    };
+    let arguments: Vec<String> = serde_json::from_str(&arguments)?;
+    let descriptor = arguments
+        .iter()
+        .position(|argument| argument == "--launch-descriptor")
+        .and_then(|index| arguments.get(index + 1))
+        .context("a rank launch names its descriptor")?;
+    let descriptor = LaunchDescriptor::from_json(&std::fs::read_to_string(descriptor)?)?;
+    let case = std::env::var(MEDIA_RANK_CASE)?;
+    let mut info: uniserve_ipc::WorkerInfo =
+        serde_json::from_slice(&std::fs::read(std::env::var(MEDIA_RANK_INFO)?)?)?;
+    info.endpoint.rank = descriptor.rank;
+    info.endpoint.address_space = format!("rust:{}", std::process::id());
+    info.endpoint.incarnation = format!("media-rank-{}-{}", descriptor.rank, std::process::id());
+
+    let service =
+        uniserve_ipc::service_name(&format!("media_{}_{}", std::process::id(), descriptor.rank));
+    let mut server = RankServer::bind(
+        &descriptor.channel_transport,
+        &service,
+        descriptor.ipc_payload_cap,
+        descriptor.queue_depth,
+    )?;
+    let report = RankReport {
+        worker_id: descriptor.worker_id.clone(),
+        rank: descriptor.rank,
+        transport: server.transport().to_owned(),
+        endpoint: server.endpoint(&service),
+    };
+    let mut registration = std::net::TcpStream::connect(&descriptor.registration_address)?;
+    let mut line = serde_json::to_vec(&report)?;
+    line.push(b'\n');
+    registration.write_all(&line)?;
+    drop(registration);
+
+    // Media attaches to rank 1's completion only in "rank-output".
+    let media_rank = u32::from(case == "rank-output");
+    loop {
+        let request = server.recv()?.decode_request()?;
+        let response = match request {
+            WorkerRequest::Info { message_id } => WorkerResponse::Info {
+                message_id,
+                info: info.clone(),
+            },
+            WorkerRequest::Close { message_id } => {
+                server.respond(&WorkerResponse::Ok { message_id })?;
+                return Ok(());
+            }
+            WorkerRequest::Submit { message_id, batch } => {
+                let mut completions: Vec<RequestOutput> = batch
+                    .calls
+                    .iter()
+                    .map(|call| {
+                        let length = call.input_token_ids.len() as u32;
+                        RequestOutput {
+                            request_key: call.request_key,
+                            call_id: call.call_id,
+                            status: CallStatus::Ok,
+                            product_generations: call
+                                .tensor_outputs()
+                                .map(|output| output.generation)
+                                .collect(),
+                            error_code: None,
+                            timing_counters: Default::default(),
+                            code: call.code,
+                            position: call.coordinates.logical_position + length,
+                            kv_visible_len: call.coordinates.kv_visible_len + length,
+                            kv_computed_len: call.coordinates.kv_computed_len + length,
+                            num_completed_steps: 0,
+                            committed_tokens: vec![1000],
+                            sampled_logprob: None,
+                            top_logprobs: Vec::new(),
+                            prompt_logprobs: Vec::new(),
+                            candidate_logprobs: Vec::new(),
+                            finish_flags: Default::default(),
+                            media_output: None,
+                            kv_output: None,
+                        }
+                    })
+                    .collect();
+                if descriptor.rank == media_rank
+                    && let Some(completion) = completions.first_mut()
+                {
+                    let locator =
+                        uniserve_core::MediaSource::publish(MEDIA_PAYLOAD)?.into_locator();
+                    std::fs::write(std::env::var(MEDIA_RANK_NAME)?, &locator.name)?;
+                    completion.media_output = Some(MediaOutput {
+                        handle: ArtifactHandle::PosixShm { name: locator.name },
+                        bytes: locator.bytes + u64::from(case == "short-storage"),
+                    });
+                    if case == "unknown-call" {
+                        completion.call_id.request_index = 1000;
+                    }
+                }
+                WorkerResponse::Result {
+                    message_id,
+                    result: BatchOutput {
+                        batch_id: batch.batch_id,
+                        completions,
+                        products: Vec::new(),
+                        worker_exec_us: None,
+                        forward_stats: None,
+                    },
+                }
+            }
+        };
+        server.respond(&response)?;
+    }
 }
 
 /// The components the stub model declares, each on its own rank of a
