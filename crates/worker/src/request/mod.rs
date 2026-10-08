@@ -1,5 +1,6 @@
 //! Request slots, call dependencies, and accepted execution progress.
 
+pub(crate) mod decode_state;
 pub(crate) mod diffusion;
 
 use std::collections::{HashMap, HashSet};

@@ -9,7 +9,7 @@
 //! admission, dependencies, retirement and result delivery are handled
 //! here for every batch, with or without calls.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use uniserve_core::CallId;
@@ -18,7 +18,7 @@ use uniserve_ipc::{
     WorkerInfo, WorkerResponseError,
 };
 
-use super::forward;
+use super::forward::{self, Running};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
@@ -28,6 +28,7 @@ use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
 use crate::service::ServiceBackend;
+use crate::worker::RankStorage;
 use crate::{Error, Result};
 
 /// Serving-time kernel reporting: a cheap counter tells when any provider
@@ -45,10 +46,46 @@ pub struct WorkerBackend {
     info: WorkerInfo,
     rank: usize,
     requests: RequestPool,
+    /// The rank's storage owners (events, products, transports, KV cache).
+    rank_storage: Option<RankStorage>,
+    /// The text runtime, on ranks holding a causal language model.
+    text: Option<forward::token::TextRuntime>,
+    /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
     profiler: Option<Profiler>,
     kernels: Option<KernelWatch>,
+}
+
+/// Disjoint borrows of a backend for one batch's execution.
+pub(crate) struct Parts<'a> {
+    pub info: &'a WorkerInfo,
+    pub rank: usize,
+    pub requests: &'a mut RequestPool,
+    pub storage: Option<&'a mut RankStorage>,
+    pub text: Option<&'a mut forward::token::TextRuntime>,
+}
+
+/// Every request storage owner, in lifecycle order: rank storage, then the
+/// text runtime, then the other runtimes' owners.
+fn owners<'a>(
+    rank: &'a mut Option<RankStorage>,
+    text: &'a mut Option<forward::token::TextRuntime>,
+    others: &'a mut [Box<dyn RequestStorage>],
+) -> Vec<&'a mut dyn RequestStorage> {
+    let mut owners: Vec<&'a mut dyn RequestStorage> = Vec::new();
+    if let Some(rank) = rank {
+        owners.push(rank);
+    }
+    if let Some(text) = text {
+        owners.push(text);
+    }
+    owners.extend(
+        others
+            .iter_mut()
+            .map(|owner| &mut **owner as &mut dyn RequestStorage),
+    );
+    owners
 }
 
 /// A submitted batch with its lifecycle and numerical state.
@@ -57,6 +94,8 @@ pub struct WorkerBatch {
     /// The accepted state call each call follows, by call.
     predecessors: Vec<Option<CallId>>,
     retirement: Retirement,
+    /// A capability runtime's launched work awaiting materialization.
+    running: Option<Running>,
     output: Option<BatchResult>,
 }
 
@@ -67,11 +106,16 @@ impl WorkerBatch {
             plan,
             predecessors: Vec::new(),
             retirement,
+            running: None,
             output: None,
         }
     }
 
     pub fn plan(&self) -> &BatchPlan {
+        &self.plan
+    }
+
+    pub(crate) fn shared_plan(&self) -> &Arc<BatchPlan> {
         &self.plan
     }
 
@@ -101,6 +145,11 @@ impl WorkerBatch {
     pub fn complete(&mut self, result: BatchResult) {
         self.output = Some(result);
     }
+
+    /// Hand launched work to materialization by [`Backend::poll`].
+    pub(crate) fn launch(&mut self, running: Running) {
+        self.running = Some(running);
+    }
 }
 
 impl WorkerBackend {
@@ -109,6 +158,8 @@ impl WorkerBackend {
             requests: RequestPool::new(info.request_slots as usize)?,
             info,
             rank,
+            rank_storage: None,
+            text: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -136,9 +187,43 @@ impl WorkerBackend {
         &mut self.components
     }
 
-    /// Register a storage owner taking part in request lifecycles.
+    /// Install the rank's storage owners.
+    pub fn set_rank_storage(&mut self, storage: RankStorage) {
+        self.rank_storage = Some(storage);
+    }
+
+    pub fn rank_storage(&self) -> Option<&RankStorage> {
+        self.rank_storage.as_ref()
+    }
+
+    pub fn rank_storage_mut(&mut self) -> Option<&mut RankStorage> {
+        self.rank_storage.as_mut()
+    }
+
+    /// Install the text runtime.
+    pub(crate) fn set_text(&mut self, text: forward::token::TextRuntime) {
+        self.text = Some(text);
+    }
+
+    pub(crate) fn text_mut(&mut self) -> Option<&mut forward::token::TextRuntime> {
+        self.text.as_mut()
+    }
+
+    /// Register another runtime's storage owner taking part in request
+    /// lifecycles.
     pub fn add_storage(&mut self, storage: Box<dyn RequestStorage>) {
         self.storage.push(storage);
+    }
+
+    /// Disjoint borrows for executing one batch.
+    pub(crate) fn parts(&mut self) -> Parts<'_> {
+        Parts {
+            info: &self.info,
+            rank: self.rank,
+            requests: &mut self.requests,
+            storage: self.rank_storage.as_mut(),
+            text: self.text.as_mut(),
+        }
     }
 
     pub fn set_profiler(&mut self, profiler: Option<Profiler>) {
@@ -186,7 +271,7 @@ impl WorkerBackend {
         })();
         // Reset every admitted slot even when a later Start failed.
         if !admitted.is_empty() {
-            for owner in &mut self.storage {
+            for owner in owners(&mut self.rank_storage, &mut self.text, &mut self.storage) {
                 owner.admit_slots(&admitted)?;
             }
         }
@@ -300,19 +385,96 @@ impl WorkerBackend {
     /// Install (or clear) the service's completion wake on every storage
     /// owner.
     pub fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
+        if let Some(storage) = &self.rank_storage {
+            storage.set_wake(wake.clone());
+        }
+        if let Some(text) = &self.text {
+            text.set_wake(wake.clone());
+        }
         for owner in &self.storage {
             owner.set_wake(wake.clone());
         }
     }
 
-    /// Close every storage owner, newest first, after the executor drained;
-    /// returns the first failure.
+    /// Close every storage owner, newest first (other runtimes, the text
+    /// runtime, then rank storage), after the executor drained; returns the
+    /// first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
         }
+        if let Some(mut text) = self.text.take() {
+            result = result.and(text.close(aborted));
+        }
+        if let Some(mut storage) = self.rank_storage.take() {
+            result = result.and(storage.close(aborted));
+        }
         result
+    }
+
+    /// Close the text runtime (graphs, then steps) before the bindings it
+    /// runs close.
+    pub fn close_text(&mut self, aborted: bool) -> Result<()> {
+        match self.text.take() {
+            Some(mut text) => text.close(aborted),
+            None => Ok(()),
+        }
+    }
+
+    /// Release the outputs of the predecessors this batch's calls follow.
+    ///
+    /// Before inputs are acquired, a predecessor no call reads can retire
+    /// early; once the batch executed, the predecessors it read retire too.
+    /// The admission root (batch 0) has no outputs.
+    fn release_predecessors(&mut self, batch: &WorkerBatch, inputs_acquired: bool) -> Result<()> {
+        let Some(storage) = self.rank_storage.as_mut() else {
+            return Ok(());
+        };
+        let mut consumed = HashSet::new();
+        for call in &batch.plan.calls {
+            consumed.extend(
+                call.tensor_inputs()
+                    .chain(call.predicate.iter())
+                    .map(|input| (input.request_key, input.producer_call_id)),
+            );
+            if let Some(input) = call.kv_input {
+                consumed.insert((input.owner, input.producer_call_id));
+            }
+        }
+        let releases: Vec<_> = batch
+            .plan
+            .calls
+            .iter()
+            .zip(&batch.predecessors)
+            .filter_map(|(call, previous)| {
+                let previous = previous.as_ref()?;
+                let source = (call.request_key, *previous);
+                (previous.batch_id > 0 && consumed.contains(&source) == inputs_acquired)
+                    .then_some(source)
+            })
+            .collect();
+        storage.release_calls(&releases)?;
+        if inputs_acquired {
+            // Predicates outside the request's predecessor were consumed
+            // here as well; releasing that other call would be too broad.
+            let predicates: HashSet<_> = batch
+                .plan
+                .calls
+                .iter()
+                .zip(&batch.predecessors)
+                .filter_map(|(call, previous)| {
+                    call.predicate
+                        .as_ref()
+                        .filter(|value| Some(value.producer_call_id) != *previous)
+                        .map(|value| value.buffer_id())
+                })
+                .collect();
+            if !predicates.is_empty() {
+                storage.release_buffers(&predicates)?;
+            }
+        }
+        Ok(())
     }
 
     /// Release request references after the executor drained its work.
@@ -357,7 +519,8 @@ impl Backend for WorkerBackend {
     fn admit(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
         // Explicit revocation must not wait behind an allocation-dependent
         // batch; existing readers retain their leases.
-        batch.retirement.admit(&mut self.storage)?;
+        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        batch.retirement.admit(&mut owners)?;
         Ok(())
     }
 
@@ -370,6 +533,7 @@ impl Backend for WorkerBackend {
                 self.requests.finish(*request_key)?;
             }
         }
+        self.release_predecessors(batch, false)?;
         Ok(())
     }
 
@@ -414,25 +578,36 @@ impl Backend for WorkerBackend {
         };
         self.profiler = profiler;
         self.report_new_kernels();
-        executed
+        executed?;
+        self.release_predecessors(batch, true)?;
+        Ok(())
     }
 
     fn begin_retirement(
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<(), WorkerError> {
-        batch.retirement.begin(&self.requests, &mut self.storage)?;
+        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        batch.retirement.begin(&self.requests, &mut owners)?;
         Ok(())
     }
 
     fn poll(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(bool, bool), WorkerError> {
-        if batch.output.is_none() {
-            return Ok((false, false));
+        let mut advanced = false;
+        if batch.output.is_none()
+            && let Some(running) = batch.running.as_mut()
+            && let Some(result) = forward::poll(self, &batch.plan, running)?
+        {
+            batch.output = Some(result);
+            batch.running = None;
+            advanced = true;
         }
-        let retired = batch
-            .retirement
-            .poll(&mut self.requests, &mut self.storage)?;
-        Ok((retired, retired))
+        if batch.output.is_none() {
+            return Ok((advanced, false));
+        }
+        let mut owners = owners(&mut self.rank_storage, &mut self.text, &mut self.storage);
+        let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
+        Ok((advanced || retired, retired))
     }
 
     fn result(&mut self, batch: &mut WorkerBatch) -> std::result::Result<BatchResult, WorkerError> {
@@ -446,15 +621,18 @@ impl Backend for WorkerBackend {
         })
     }
 
-    fn close(&mut self, _batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
-        // Calls become pending only when a capability runtime commits them,
-        // and that runtime cancels what it committed. Lifecycle commands
-        // hold no resource beyond their retirement.
+    fn close(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
+        // Calls become pending only when a capability runtime commits them;
+        // unresolved launched work cancels its pending calls. Lifecycle
+        // commands hold no resource beyond their retirement.
+        if let Some(running) = batch.running.take() {
+            forward::abandon(self, running)?;
+        }
         Ok(())
     }
 
     fn reap(&mut self) -> std::result::Result<(), WorkerError> {
-        for owner in &mut self.storage {
+        for owner in owners(&mut self.rank_storage, &mut self.text, &mut self.storage) {
             owner.reap()?;
         }
         Ok(())
@@ -516,9 +694,13 @@ impl ServiceBackend for WorkerBackend {
 
     fn awaiting_acknowledgment(&self) -> std::result::Result<bool, WorkerError> {
         Ok(self
-            .storage
-            .iter()
-            .any(|owner| owner.awaiting_acknowledgment()))
+            .rank_storage
+            .as_ref()
+            .is_some_and(|storage| storage.awaiting_acknowledgment())
+            || self
+                .storage
+                .iter()
+                .any(|owner| owner.awaiting_acknowledgment()))
     }
 
     fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
