@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_models.diffusion import AdditiveGuidance, Branch, Renorm, make_schedule
+from uniserve_models.diffusion import (
+    AdditiveGuidance,
+    Branch,
+    Renorm,
+    make_schedule,
+)
 from uniserve_models.nn import functional
 from uniserve_models.nn.norm import RMSNorm
 

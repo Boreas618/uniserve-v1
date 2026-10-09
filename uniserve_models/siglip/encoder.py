@@ -1,12 +1,12 @@
 """SigLIP-NaViT image transformer composition and patch coordinates.
 
-``Encoder`` packs the patches of several images of different grid sizes into
-one ``[total_patches, patch_features]`` sequence. Each image attends only to
-its own patches through non-causal varlen attention, and each patch adds the
-learned position of its ``(row, column)`` in a fixed square table; grids
-smaller than the table select a subset of positions without interpolation.
-Patch rows use the order ``uniserve_models.nn.functional.patchify`` produces: pixel
-row, pixel column, then channel within each patch.
+``Encoder`` packs the patches of several images of different grid sizes into one
+``[total_patches, patch_features]`` sequence. Each image attends only to its own
+patches through non-causal varlen attention, and each patch adds the learned
+position of its ``(row, column)`` in a fixed square table; grids smaller than
+the table select a subset of positions without interpolation. Patch rows use the
+order ``uniserve_models.nn.functional.patchify`` produces: pixel row, pixel
+column, then channel within each patch.
 """
 
 from __future__ import annotations

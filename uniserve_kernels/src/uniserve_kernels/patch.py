@@ -1,8 +1,8 @@
 """Token-to-raster rearrangement with explicit spatiotemporal patch shapes.
 
-The kernel backs ``uniserve_models.nn.functional.unpatchify_video_tokens``, which
-validates grid, patch, token and bias shapes, allocates the contiguous output
-and raises on CUDA whenever :func:`unsupported` reports a reason.
+The kernel backs ``uniserve_models.nn.functional.unpatchify_video_tokens``,
+which validates grid, patch, token and bias shapes, allocates the contiguous
+output and raises on CUDA whenever :func:`unsupported` reports a reason.
 """
 
 from __future__ import annotations

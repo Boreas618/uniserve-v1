@@ -262,7 +262,7 @@ impl HostAction for SourceRetirement {
     }
 
     fn report(error: Error) {
-        eprintln!("transport storage retirement failed: {error}");
+        tracing::warn!(target: "uniserve_worker.transfer", "transport storage retirement failed: {error}");
     }
 
     fn error(error: Error) -> Error {
@@ -270,6 +270,6 @@ impl HostAction for SourceRetirement {
     }
 
     fn note_cleanup(_: &mut Error, cleanup: Error) {
-        eprintln!("transport retirement cleanup also failed: {cleanup}");
+        tracing::warn!(target: "uniserve_worker.transfer", "transport retirement cleanup also failed: {cleanup}");
     }
 }
