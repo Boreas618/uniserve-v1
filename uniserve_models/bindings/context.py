@@ -796,6 +796,14 @@ class ExecutionContext:
 
     Args:
         module: The root of the module tree to bind.
+        device: The device of the context's stream and of the tensors its
+            callers exchange; ``None`` takes the root module's. A module tree
+            placed wholly on one other device (a generation tower's codec)
+            computes there: an activation runs it on a delivery stream of
+            that device ordered after the context's stream, and the stream
+            waits for it on exit. Within the tree, submodules placed on
+            other devices than their parent run there through transfers
+            that move their inputs there and their outputs back.
         stream: The execution stream: ``None`` (the caller's current stream),
             a ``torch.cuda.Stream``, or an integer ``CUstream`` handle owned
             by the caller (wrapped in ``torch.cuda.ExternalStream``).
@@ -823,6 +831,7 @@ class ExecutionContext:
         self,
         module: nn.Module,
         *,
+        device: torch.device | str | None = None,
         stream: torch.cuda.Stream | int | None = None,
         cache=None,
         attention="auto",
@@ -847,9 +856,10 @@ class ExecutionContext:
             tuple(groups) if groups is not None else communicators(module)
         )
         handle_stream = isinstance(stream, int)
-        device, dtype = _representation(
+        root, dtype = _representation(
             module, cache, None if handle_stream else stream
         )
+        device = root if device is None else torch.device(device)
         if handle_stream:
             stream = (
                 torch.cuda.ExternalStream(stream, device=device)
@@ -858,10 +868,16 @@ class ExecutionContext:
             )
         if stream is not None and stream.device != device:
             raise ValueError(
-                "the execution stream must belong to the root module device"
+                "the execution stream must belong to the context's device"
             )
+        # The module computes on the one device holding all its parameters
+        # (or, without any, buffers), else on the context's device.
+        placements = _devices(module, "parameters") or _devices(
+            module, "buffers"
+        )
+        placement = next(iter(placements)) if len(placements) == 1 else device
         self.stream = stream
-        self._device, self._dtype = device, dtype
+        self._device, self._dtype = placement, dtype
         self._backends = {
             "attention": attention,
             "vsa": vsa,
@@ -876,7 +892,7 @@ class ExecutionContext:
         self.constants: Mapping[str, torch.Tensor] = _empty()
         self.workspace_views: Mapping[str, torch.Tensor] = _empty()
         self.graph_streams: set[torch.cuda.Stream] = set()
-        self._transfers = _DeviceTransfers(module, device)
+        self._transfers = _DeviceTransfers(module, placement)
         self._entered: contextlib.ExitStack | None = None
         self._closed = False
         self._max_tokens: int | None = None
@@ -924,8 +940,16 @@ class ExecutionContext:
     # Workspace requests made by bindings during preparation.
 
     def scratch(self, role, requirements, device):
-        """Borrow one role's transient work area on this serialized stream."""
+        """Borrow one role's transient work area on this serialized stream.
+
+        Modules placed on another device than the context's (reached
+        through transfers) take that device's area of the role, a field of
+        its own name.
+        """
         self._require_open()
+        if torch.device(device) != self._device:
+            parts = role if isinstance(role, tuple) else (role,)
+            role = (*parts, str(torch.device(device)))
         return self.workspace.scratch(role, requirements, device)
 
     def _allocate(self, requirements, device):
@@ -1373,6 +1397,15 @@ class ExecutionContext:
             if self.stream is not None:
                 stack.enter_context(torch.cuda.device(self.stream.device))
                 stack.enter_context(torch.cuda.stream(self.stream))
+                if self._device != self.stream.device:
+                    # A module placed on another device computes on its
+                    # delivery stream there, between the context's stream's
+                    # prior work and its next.
+                    delivery = self._transfers.stream(self.stream, self._device)
+                    _order(self.stream, delivery)
+                    stack.callback(_order, delivery, self.stream)
+                    stack.enter_context(torch.cuda.device(self._device))
+                    stack.enter_context(torch.cuda.stream(delivery))
             stack.enter_context(stream_collective_scope(self.collectives))
             transfers = self._transfers.scope()
             if transfers is not None:

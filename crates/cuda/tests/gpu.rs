@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -17,13 +17,32 @@ use uniserve_cuda::{
 
 const DEVICE: DeviceId = DeviceId(0);
 
+/// Serializes the tests of this binary.
+///
+/// Some tests hold a stream in a host function to observe the work queued
+/// behind it (see [`block`]). While a stream is held, a driver call that waits
+/// for all of the context's queued work (`cuMemFree`, `cuMemFreeHost`) cannot
+/// return, and it keeps driver locks that every other call needs, including
+/// the calls the holding test makes before it releases the stream. No other
+/// test may use the driver meanwhile, so every test takes this lock first.
+static DRIVER: Mutex<()> = Mutex::new(());
+
+fn exclusive_driver() -> MutexGuard<'static, ()> {
+    DRIVER.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn read(buffer: &PinnedBuffer) -> Vec<u8> {
     // SAFETY: callers synchronize the stream that wrote the buffer first.
     unsafe { buffer.as_slice() }.to_vec()
 }
 
 /// Blocks `stream` in a host function until the returned sender is used.
+///
+/// Until then the caller must not release device or pinned memory: the
+/// release would wait on the held stream (see [`DRIVER`]). Releases queued
+/// earlier are flushed first for the same reason.
 fn block(stream: &Stream) -> mpsc::Sender<()> {
+    reclaim::flush().unwrap();
     let (release, released) = mpsc::channel::<()>();
     stream
         .launch_host_fn(move || {
@@ -36,6 +55,7 @@ fn block(stream: &Stream) -> mpsc::Sender<()> {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn device_queries_report_the_device() {
+    let _driver = exclusive_driver();
     assert!(DeviceId::count().unwrap() > DEVICE.0);
     assert!(uniserve_cuda::driver_version().unwrap() >= 12_080);
     assert!(
@@ -53,6 +73,7 @@ fn device_queries_report_the_device() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn fills_and_copies_round_trip_through_device_memory() {
+    let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE).unwrap();
     let first = DeviceAllocation::linear(DEVICE, 4096).unwrap();
     let second = DeviceAllocation::linear(DEVICE, 4096).unwrap();
@@ -88,6 +109,7 @@ fn fills_and_copies_round_trip_through_device_memory() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn operations_need_no_current_context_on_the_calling_thread() {
+    let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE).unwrap();
     let device = DeviceAllocation::linear(DEVICE, 256).unwrap();
     let host = PinnedBuffer::new(DEVICE, 256).unwrap();
@@ -115,6 +137,7 @@ fn operations_need_no_current_context_on_the_calling_thread() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn during_call_batches_read_host_sources_before_returning() {
+    let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE).unwrap();
     let device = DeviceAllocation::linear(DEVICE, 64).unwrap();
     let readback = PinnedBuffer::new(DEVICE, 64).unwrap();
@@ -142,6 +165,7 @@ fn during_call_batches_read_host_sources_before_returning() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn strided_copies_match_the_reference_in_every_direction() {
+    let _driver = exclusive_driver();
     // [layer, row, column] of u16: dense on the host, padded rows and layers
     // on the device, so the plan is one 3D pitched copy.
     let shape = [3_u64, 4, 6];
@@ -199,6 +223,7 @@ fn strided_copies_match_the_reference_in_every_direction() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn events_order_streams_and_measure_time() {
+    let _driver = exclusive_driver();
     let producer = Stream::new(DEVICE).unwrap();
     let consumer = producer.fork().unwrap();
     let device = DeviceAllocation::linear(DEVICE, 1024).unwrap();
@@ -245,6 +270,7 @@ fn events_order_streams_and_measure_time() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn interprocess_events_export_and_open() {
+    let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE).unwrap();
     let event = Event::new(EventFlags {
         interprocess: true,
@@ -263,6 +289,7 @@ fn interprocess_events_export_and_open() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn exportable_memory_maps_through_imports_and_aliases() {
+    let _driver = exclusive_driver();
     let granularity = DeviceAllocation::granularity(DEVICE).unwrap();
     let stream = Stream::new(DEVICE).unwrap();
     let first = DeviceAllocation::exportable(DEVICE, granularity / 2, &[]).unwrap();
@@ -334,6 +361,7 @@ fn linear_cannot_export() -> bool {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn capturing_streams_report_capture_and_reject_storage_operations() {
+    let _driver = exclusive_driver();
     type BeginCapture = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
     type EndCapture =
         unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32;
@@ -387,6 +415,7 @@ fn capturing_streams_report_capture_and_reject_storage_operations() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn sm_partitions_create_streams_of_the_requested_size() {
+    let _driver = exclusive_driver();
     let total = DEVICE
         .attribute(DeviceAttribute::MultiprocessorCount)
         .unwrap() as u32;
@@ -412,6 +441,7 @@ fn sm_partitions_create_streams_of_the_requested_size() {
 #[test]
 #[ignore = "requires a CUDA device and NVML"]
 fn nvml_attributes_device_memory_to_this_process() {
+    let _driver = exclusive_driver();
     let _allocation = DeviceAllocation::linear(DEVICE, 1 << 20).unwrap();
     let nvml = Nvml::init().unwrap();
 
@@ -429,6 +459,7 @@ fn nvml_attributes_device_memory_to_this_process() {
 #[test]
 #[ignore = "requires a CUDA device and NCCL"]
 fn single_rank_communicators_run_collectives() {
+    let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE).unwrap();
     let data = DeviceAllocation::linear(DEVICE, 16).unwrap();
     let host = PinnedBuffer::new(DEVICE, 16).unwrap();
