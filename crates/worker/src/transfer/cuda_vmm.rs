@@ -155,7 +155,7 @@ impl CudaExports {
                 }
                 None => {
                     let pool = self.pool(device)?;
-                    let chunk = lock(&pool.pool).reserve(nbytes as usize, stream.raw())?;
+                    let chunk = lock(&pool.pool).reserve(nbytes as usize, stream)?;
                     let Some(chunk) = chunk else {
                         return Ok(None);
                     };

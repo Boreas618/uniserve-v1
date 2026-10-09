@@ -34,11 +34,7 @@ pub(super) fn placement(runtime: &ImageRuntime) -> Result<(Option<i32>, Option<S
     let runner = runtime.diffusion().ok_or_else(|| {
         Error::Unsupported("image trajectories are served by an image denoiser".into())
     })?;
-    let stream = runner
-        .stream()
-        // SAFETY: the lanes own the stream for the runtime's lifetime.
-        .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-        .transpose()?;
+    let stream = runner.stream().cloned();
     Ok((runner.device().cuda_index(), stream, 0))
 }
 
@@ -222,7 +218,7 @@ impl ImageBatch<'_> {
             self.place(&values)?
         };
 
-        let stream = self.borrow_stream()?;
+        let stream = self.stream.clone();
         for ((trajectory, image, rng), scratch) in trajectories.iter().zip(&scratch) {
             let call = &self.plan.calls[trajectory.index];
             let diffusion = self.runtime.diffusion().ok_or_else(|| {
@@ -270,7 +266,7 @@ impl ImageBatch<'_> {
     fn reserve_rows(&mut self, active: &[usize]) -> Result<HashMap<usize, Vec<ForwardSlot>>> {
         let plan = self.plan;
         let forward = &plan.forward;
-        let stream = self.borrow_stream()?;
+        let stream = self.stream.clone();
         let mut descriptors: HashMap<usize, Vec<ForwardSlot>> = HashMap::new();
         for (row, &call) in forward.call_indices.iter().enumerate() {
             let index = call as usize;
@@ -367,7 +363,7 @@ impl ImageBatch<'_> {
         if active.is_empty() {
             return Ok(ForwardStats::default());
         }
-        let stream = self.borrow_stream()?;
+        let stream = self.stream.clone();
         if let Some(text) = text.as_deref() {
             // Conditioning K/V and earlier prefixes were written by text
             // batches, possibly on another stream.

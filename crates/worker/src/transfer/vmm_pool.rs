@@ -1,6 +1,6 @@
 //! Bounded export ranges and asynchronous observation of remote readers.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use uniserve_cuda::{
@@ -55,7 +55,9 @@ pub struct VmmPool<B> {
     capacity: usize,
     watermark: usize,
     allocations: BTreeMap<usize, Allocation>,
-    initializers: HashSet<usize>,
+    /// Producer streams with header initialization this pool has not
+    /// drained, one handle per stream.
+    initializers: Vec<Stream>,
     stream: Stream,
     completion: Event,
     observed: Vec<usize>,
@@ -69,8 +71,7 @@ impl<B> VmmPool<B> {
     /// valid as long as `backing` is held. Construction performs no device copy.
     ///
     /// # Safety
-    /// `address` must identify that mapping. All producer streams passed to
-    /// reserve remain valid through close, which drains header initialization.
+    /// `address` must identify that mapping.
     pub unsafe fn new(backing: B, device: i32, address: usize, capacity: usize) -> Result<Self> {
         Ok(Self {
             backing: Some(backing),
@@ -79,7 +80,7 @@ impl<B> VmmPool<B> {
             capacity,
             watermark: 0,
             allocations: BTreeMap::new(),
-            initializers: HashSet::new(),
+            initializers: Vec::new(),
             stream: Stream::new(DeviceId(device))?,
             completion: Event::new(EventFlags::default()),
             observed: Vec::new(),
@@ -101,8 +102,9 @@ impl<B> VmmPool<B> {
 
     /// Reserve a payload and clear its reader words on the producer stream.
     /// None reports capacity exhaustion without reserving any bytes.
-    /// Keep the borrowed stream alive until the pool closes.
-    pub fn reserve(&mut self, bytes: usize, stream: usize) -> Result<Option<Arc<PoolChunk>>> {
+    /// The pool shares `stream` until close, which drains the header
+    /// initialization submitted here.
+    pub fn reserve(&mut self, bytes: usize, stream: &Stream) -> Result<Option<Arc<PoolChunk>>> {
         self.backing()?;
         if self.failed {
             return Err(Error::Resource("VMM pool device completion is unknown"));
@@ -136,14 +138,18 @@ impl<B> VmmPool<B> {
 
         // A default-stream handle resolves against the current context.
         let _device = DeviceGuard::new(self.device)?;
-        self.initializers.insert(stream);
-        let device = self.device;
+        if !self
+            .initializers
+            .iter()
+            .any(|known| known.raw() == stream.raw())
+        {
+            self.initializers.push(stream.clone());
+        }
         let header = (self.address + offset) as u64;
-        // SAFETY: producer streams stay valid through close (see new). This
-        // reservation owns all 64 aligned header words. Later payload copies
-        // and the export's readiness event use this same stream.
-        let filled = unsafe { Stream::borrowed(device, stream) }
-            .and_then(|stream| unsafe { memset_d32(header, 0, ACK_SLOTS, &stream) });
+        // SAFETY: this reservation owns all 64 aligned header words. Later
+        // payload copies and the export's readiness event use this same
+        // stream.
+        let filled = unsafe { memset_d32(header, 0, ACK_SLOTS, stream) };
         if let Err(error) = filled {
             self.failed = true;
             return Err(error.into());
@@ -357,9 +363,8 @@ impl<B> VmmPool<B> {
         }
         // A default-stream initializer resolves against the current context.
         let _device = DeviceGuard::new(self.device)?;
-        for &stream in &self.initializers {
-            // SAFETY: producer streams stay valid through close (see new).
-            unsafe { Stream::borrowed(self.device, stream) }?.synchronize()?;
+        for stream in &self.initializers {
+            stream.synchronize()?;
         }
         self.initializers.clear();
         self.stream.synchronize()?;

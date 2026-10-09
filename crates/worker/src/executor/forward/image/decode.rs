@@ -34,11 +34,7 @@ pub(super) fn placement(
     let runner = runtime
         .decoder()
         .ok_or_else(|| Error::Unsupported("image decoding is served by an image decoder".into()))?;
-    let stream = runner
-        .stream()
-        // SAFETY: the lanes own the stream for the runtime's lifetime.
-        .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-        .transpose()?;
+    let stream = runner.stream().cloned();
     // Each image's pixels, read back as raw bytes.
     let words = plan
         .calls
@@ -81,7 +77,7 @@ impl ImageBatch<'_> {
             return Ok(ForwardStats::default());
         }
         let target = self.target();
-        let stream = self.borrow_stream()?;
+        let stream = self.stream.clone();
         let decoder_range = self
             .runtime
             .decoder()

@@ -339,10 +339,10 @@ impl CanvasModel {
     /// An exchanging tail completes the readout's expert step of
     /// `expert_capacity`.
     pub fn readout_finish(&self, slots: usize, expert_capacity: usize) -> Result<Handle> {
-        Ok(Handle::new(self.readout_finish.call_values(&[
-            integer(slots),
-            integer(expert_capacity),
-        ])?))
+        Handle::new(
+            self.readout_finish
+                .call_values(&[integer(slots), integer(expert_capacity)])?,
+        )
     }
 
     /// Share the final stage's `count` candidate values with every stage.
@@ -423,7 +423,7 @@ impl CanvasModel {
             pool.view(),
             (&integer(expert_capacity)).into(),
         ])?;
-        Ok(Handle::new(graph))
+        Handle::new(graph)
     }
 
     /// Replay a captured function, planning its attention for the live host

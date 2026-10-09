@@ -30,25 +30,68 @@ pub enum CaptureStatus {
     Invalidated,
 }
 
-/// A CUDA stream: owned (destroyed on drop) or borrowed from another owner.
+/// A handle to a CUDA stream this process created, or to one borrowed from
+/// another owner.
 ///
-/// Owned streams are non-blocking with respect to the legacy NULL stream and
-/// retain the context they belong to (a primary context or an SM partition)
-/// until dropped. Dropping an owned stream does not wait: `cuStreamDestroy`
+/// Cloning a handle shares the stream: every clone submits to the same
+/// driver stream, and a stream this process created is destroyed when its
+/// last handle drops. A component that submits to a stream another
+/// component created therefore holds a clone, which keeps the stream and its
+/// context alive for as long as it is used.
+///
+/// Created streams are non-blocking with respect to the legacy NULL stream
+/// and retain the context they belong to (a primary context or an SM
+/// partition). Dropping the last handle does not wait: `cuStreamDestroy`
 /// returns immediately and the driver releases the stream once its queued
 /// work completes.
+#[derive(Clone)]
 pub struct Stream {
     raw: Handle,
     device: DeviceId,
     context: Handle,
     retention: Retention,
-    owned: bool,
+    /// Destroys a created stream with its last handle; `None` for a stream
+    /// borrowed from another owner.
+    _created: Option<Arc<Created>>,
 }
 
 // SAFETY: the driver accepts stream handles from any host thread. Shared
-// references only submit work or query state; destruction requires ownership.
+// references only submit work or query state; destruction happens once, when
+// the last handle drops.
 unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
+
+/// A driver stream this process created, destroyed on drop.
+struct Created {
+    raw: Handle,
+    /// Keeps the stream's context alive until the stream is destroyed.
+    _retention: Retention,
+}
+
+// SAFETY: as for `Stream`; the driver accepts `cuStreamDestroy` from any host
+// thread.
+unsafe impl Send for Created {}
+unsafe impl Sync for Created {}
+
+impl Created {
+    fn new(raw: Handle, retention: &Retention) -> Option<Arc<Self>> {
+        Some(Arc::new(Self {
+            raw,
+            _retention: retention.clone(),
+        }))
+    }
+}
+
+impl Drop for Created {
+    fn drop(&mut self) {
+        if let Ok(driver) = driver() {
+            // SAFETY: the stream was created by this process and is destroyed
+            // once. The driver defers physical release until its queued work
+            // completes.
+            let _ = unsafe { (driver.stream_destroy)(self.raw) };
+        }
+    }
+}
 
 impl Stream {
     /// Creates a non-blocking stream of default priority in `device`'s
@@ -72,21 +115,26 @@ impl Stream {
             )
         })?;
 
+        let context_handle = context.raw();
+        let retention = Retention::Primary { _context: context };
         Ok(Self {
             raw,
             device,
-            context: context.raw(),
-            retention: Retention::Primary { _context: context },
-            owned: true,
+            context: context_handle,
+            _created: Created::new(raw, &retention),
+            retention,
         })
     }
 
-    /// Borrows a stream created elsewhere (for example by PyTorch or NCCL).
+    /// Borrows a stream created outside this crate (for example by PyTorch
+    /// or NCCL) from its integer handle. A stream this crate created is
+    /// shared by cloning its handle instead.
     ///
     /// # Safety
     /// `raw` must be a live stream on `device`, and its creator must keep the
-    /// stream and its context alive for as long as the returned value, any
-    /// stream forked from it, and any event recorded on it are used.
+    /// stream and its context alive for as long as the returned value, its
+    /// clones, any stream forked from it, and any event recorded on it are
+    /// used.
     pub unsafe fn borrowed(device: DeviceId, raw: usize) -> Result<Self> {
         let raw = raw as Handle;
         let driver = driver()?;
@@ -102,7 +150,7 @@ impl Stream {
             device,
             context,
             retention: Retention::Borrowed,
-            owned: false,
+            _created: None,
         })
     }
 
@@ -121,12 +169,13 @@ impl Stream {
             return Err(error);
         }
 
+        let retention = Retention::Green(green);
         Ok(Self {
             raw,
             device,
             context,
-            retention: Retention::Green(green),
-            owned: true,
+            _created: Created::new(raw, &retention),
+            retention,
         })
     }
 
@@ -183,8 +232,8 @@ impl Stream {
             raw,
             device: self.device,
             context: self.context,
+            _created: Created::new(raw, &self.retention),
             retention: self.retention.clone(),
-            owned: true,
         })
     }
 
@@ -337,17 +386,5 @@ impl Stream {
             drop(unsafe { Box::from_raw(data) });
         }
         driver.check(status, "cuLaunchHostFunc")
-    }
-}
-
-impl Drop for Stream {
-    fn drop(&mut self) {
-        if self.owned
-            && let Ok(driver) = driver()
-        {
-            // SAFETY: the stream is owned and dropped once. The driver defers
-            // physical release until its queued work completes.
-            let _ = unsafe { (driver.stream_destroy)(self.raw) };
-        }
     }
 }

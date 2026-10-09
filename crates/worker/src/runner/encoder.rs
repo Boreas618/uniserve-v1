@@ -125,7 +125,7 @@ impl PreparedImage {
                 .ok_or_else(|| Error::Interface(format!("{owner} reports an invalid {key}")))
         };
         Ok(Self {
-            value: Handle::new(record.value("image")?),
+            value: Handle::new(record.value("image")?)?,
             shape: record.shape("shape")?,
             grid,
             height: dimension("height")?,
@@ -508,8 +508,7 @@ pub struct EncoderRunner {
     owner: String,
     info: EncoderInfo,
     device: Device,
-    /// The binding's stream (a borrowed view of the lane's); `None` on the
-    /// host.
+    /// The binding's stream, shared with its lane; `None` on the host.
     stream: Option<Stream>,
     steps: Steps,
     /// The device's product arena, as the binding received it.
@@ -1147,7 +1146,7 @@ impl EncoderRunner {
         if crate::ffi::is_none(&graph) {
             return Ok(());
         }
-        let graph = Handle::new(graph);
+        let graph = Handle::new(graph)?;
         if let Err(error) = check() {
             if let Some(release) = &self.release
                 && let Err(cleanup) = release.invoke(&[graph.view()])
@@ -1293,7 +1292,7 @@ mod tests {
     #[test]
     fn unpacked_images_group_by_pixel_shape_in_appearance_order() {
         let image = |shape: &[i64]| PreparedImage {
-            value: Handle::new(Any::default()),
+            value: Handle::none(),
             shape: shape.to_vec(),
             grid: None,
             height: 1,
