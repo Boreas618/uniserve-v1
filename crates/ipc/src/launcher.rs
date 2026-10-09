@@ -1,0 +1,109 @@
+//! The protocol between the head's engine and a host's launcher.
+//!
+//! The engine starts no process on another host. Each host of a deployment
+//! runs one `uniserve-host` launcher, which connects to the head and keeps one
+//! TCP connection for the deployment's lifetime. The connection carries
+//! newline-delimited JSON in both directions:
+//!
+//! - the launcher sends its [`Presentation`] once, then [`Report`]s: a
+//!   [`Reservation`] answering each [`Instruction::Reserve`], and a
+//!   [`RankExit`] for each rank it still supervises that exits, which excludes
+//!   ranks an [`Instruction::Stop`] ended;
+//! - the head sends [`Instruction`]s.
+//!
+//! Each worker group's launches carry a generation, which every
+//! [`RankSpawn`] names and the launcher echoes in that rank's [`RankExit`].
+//! The head ends a group's generation with a stop before it relaunches the
+//! group under the next one, so an exit the launcher reported just before it
+//! read the stop is recognized as the stopped generation's rather than the
+//! relaunch's.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::launch::LaunchDescriptor;
+
+/// What a launcher says when it connects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Presentation {
+    /// The host identity the launcher owns, as the placement names it.
+    pub host: String,
+}
+
+/// One instruction the head sends a launcher.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Instruction {
+    /// Start one rank from the descriptor the head derived for it, as a
+    /// member of its group's current generation.
+    Spawn(Box<RankSpawn>),
+    /// Bind and hold a collective store socket for one worker group, which
+    /// the launcher hands to that group's first rank when it spawns it. The
+    /// launcher answers with a [`Reservation`].
+    Reserve { worker_id: String },
+    /// Stop every rank of one worker group the launcher owns, before the
+    /// group is relaunched under its next generation. The stopped ranks'
+    /// exits are not reported.
+    Stop { worker_id: String },
+    /// Stop every rank the launcher owns and end supervision.
+    Terminate,
+}
+
+/// Everything a launcher needs to start one rank.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RankSpawn {
+    /// Rank within its worker group's process world, not host-relative.
+    pub rank: u32,
+    /// Worker group the rank belongs to.
+    pub worker_id: String,
+    /// The group generation the head is launching; the rank's exit report
+    /// carries it back.
+    pub generation: u64,
+    /// Ranks in the worker group's process world.
+    pub world_size: u32,
+    /// Interpreter that runs the worker module.
+    pub python: String,
+    /// The launch descriptor the rank reads, as the head derived it for a
+    /// local spawn. The launcher sets the inherited rendezvous socket's
+    /// number in the first rank's copy, which only it knows.
+    pub descriptor: LaunchDescriptor,
+    /// The variables the head's spawn command for this rank sets, applied
+    /// over the environment the launcher inherited. A variable the head's
+    /// command removes arrives with an empty value and is set empty rather
+    /// than removed.
+    pub environment: HashMap<String, String>,
+}
+
+/// One message a launcher sends after its presentation.
+///
+/// The two reports are distinguished by their fields: only a reservation
+/// carries a port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Report {
+    Reservation(Reservation),
+    Exit(RankExit),
+}
+
+/// A launcher's answer to [`Instruction::Reserve`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    /// Worker group the socket is held for.
+    pub worker_id: String,
+    /// Port the launcher bound on its host for the group's collective store.
+    pub port: u16,
+}
+
+/// What a launcher says when one of its ranks exits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankExit {
+    /// Worker group of the process that exited.
+    pub worker_id: String,
+    /// The group generation the rank's spawn named.
+    pub generation: u64,
+    /// Rank of the process that exited within its group.
+    pub rank: u32,
+    /// Exit status text, or the reason the status could not be read.
+    pub status: String,
+}

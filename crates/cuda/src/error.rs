@@ -1,6 +1,5 @@
 //! Typed failures of the runtime-loaded CUDA, NVML and NCCL libraries.
 
-use std::io;
 use std::sync::Arc;
 
 use crate::DeviceId;
@@ -75,27 +74,12 @@ pub enum Error {
     #[error("NVML reports no device memory for process {pid} on {device}")]
     ProcessNotFound { pid: u32, device: DeviceId },
 
-    /// An operating-system call failed.
-    #[error("{call} failed: {source}")]
-    Io {
-        call: &'static str,
-        #[source]
-        source: Arc<io::Error>,
-    },
-
     /// Deferred releases failed since the previous [`crate::reclaim::flush`].
     #[error("{failed} deferred CUDA releases failed; first failure: {first}")]
     Reclaim { failed: usize, first: Box<Error> },
 }
 
 impl Error {
-    pub(crate) fn io(call: &'static str, source: io::Error) -> Self {
-        Self::Io {
-            call,
-            source: Arc::new(source),
-        }
-    }
-
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::InvalidArgument(message.into())
     }

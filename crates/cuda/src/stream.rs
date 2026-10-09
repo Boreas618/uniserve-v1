@@ -1,10 +1,6 @@
-//! Streams, capture status, host functions and selector-compatible completion
-//! signals.
+//! Streams, capture status and host functions.
 
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::driver::{ContextScope, Handle, driver, in_context};
 use crate::event::Event;
@@ -220,10 +216,6 @@ impl Stream {
         self.device
     }
 
-    pub fn is_owned(&self) -> bool {
-        self.owned
-    }
-
     pub fn priority(&self) -> Result<i32> {
         let driver = driver()?;
         let mut priority = 0;
@@ -357,100 +349,5 @@ impl Drop for Stream {
             // physical release until its queued work completes.
             let _ = unsafe { (driver.stream_destroy)(self.raw) };
         }
-    }
-}
-
-struct SignalState {
-    fd: OwnedFd,
-    scheduled: AtomicBool,
-}
-
-/// A one-shot, `poll`/`epoll`-compatible notification that a stream reached
-/// a point.
-///
-/// The signal is an `eventfd` that becomes readable once the scheduled host
-/// function runs. The driver retains the signal's state until then, even if
-/// this owner is dropped first.
-pub struct StreamSignal {
-    state: Arc<SignalState>,
-}
-
-impl StreamSignal {
-    pub fn new() -> Result<Self> {
-        // SAFETY: eventfd has no pointer arguments and returns an owned fd.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(Error::io("eventfd", io::Error::last_os_error()));
-        }
-
-        Ok(Self {
-            state: Arc::new(SignalState {
-                // SAFETY: this is the only owner of the new descriptor.
-                fd: unsafe { OwnedFd::from_raw_fd(fd) },
-                scheduled: AtomicBool::new(false),
-            }),
-        })
-    }
-
-    /// Makes the signal readable after the work currently queued on `stream`.
-    /// Each signal is scheduled at most once; a rejected launch leaves it
-    /// available for another attempt.
-    pub fn schedule(&self, stream: &Stream) -> Result<()> {
-        self.state
-            .scheduled
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::invalid("a stream signal is scheduled at most once"))?;
-
-        let state = Arc::clone(&self.state);
-        let result = stream.launch_host_fn(move || {
-            let value = 1_u64.to_ne_bytes();
-            loop {
-                // SAFETY: state owns the nonblocking eventfd, and value is
-                // eight readable bytes. One write cannot saturate the counter.
-                let written = unsafe {
-                    libc::write(state.fd.as_raw_fd(), value.as_ptr().cast(), value.len())
-                };
-                if written >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    break;
-                }
-            }
-        });
-
-        if result.is_err() {
-            self.state.scheduled.store(false, Ordering::Release);
-        }
-        result
-    }
-
-    /// Consumes the notification. Returns `false` if it has not arrived yet.
-    pub fn consume(&self) -> Result<bool> {
-        let mut value = 0_u64;
-        loop {
-            // SAFETY: the state owns this eventfd, and value is an eight-byte
-            // writable destination as eventfd requires.
-            let read = unsafe {
-                libc::read(
-                    self.as_raw_fd(),
-                    (&raw mut value).cast(),
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if read >= 0 {
-                return Ok(true);
-            }
-
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => return Ok(false),
-                _ => return Err(Error::io("read(eventfd)", error)),
-            }
-        }
-    }
-}
-
-impl AsRawFd for StreamSignal {
-    fn as_raw_fd(&self) -> RawFd {
-        self.state.fd.as_raw_fd()
     }
 }

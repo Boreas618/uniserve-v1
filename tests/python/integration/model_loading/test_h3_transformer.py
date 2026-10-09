@@ -17,6 +17,7 @@ from tests.python.fixtures.vsa import reference_attention
 from uniserve_models import loading
 from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
 from uniserve_models.distributed import DeviceMesh
+from uniserve_models.interface import graphs
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.minimax_h3 import (
     AttentionInput,
@@ -30,7 +31,6 @@ from uniserve_models.minimax_h3.denoiser import (
 )
 from uniserve_models.minimax_h3.weights import transformer_component
 from uniserve_models.nn.attention import vsa
-from uniserve_models.runtime import CUDAGraph
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -284,7 +284,9 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         # The solver step is device data, so one captured evaluation serves
         # every step once the index holds it.
         step = torch.zeros(1, dtype=torch.int64, device="cuda")
-        with ExecutionContext(model, vsa="cute") as context:
+        stream = torch.cuda.Stream(device="cuda")
+        stream.wait_stream(torch.cuda.current_stream())
+        with ExecutionContext(model, vsa="cute", stream=stream) as context:
             context.prepare(None)
             for index in range(4):
                 step.fill_(index)
@@ -302,25 +304,27 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
                     torch.testing.assert_close(
                         result, reference, rtol=2e-2, atol=2e-2
                     )
-            with CUDAGraph(context=context) as graph:
-                step.fill_(3)
-                graph.capture(
-                    lambda: model(
-                        hidden,
-                        inputs,
-                        step=step,
-                        tables=tables,
-                        workspace=workspace,
-                    )
+            step.fill_(3)
+            graph = graphs.capture(
+                lambda: model(
+                    hidden,
+                    inputs,
+                    step=step,
+                    tables=tables,
+                    workspace=workspace,
+                ),
+                stream=stream,
+            )
+            for index in (1, 3):
+                step.fill_(index)
+                hidden.mul_(0.5)
+                actual = graph.replay()
+                expected = _reference(
+                    hidden, source, config, index, tags, cosine, sine, valid
                 )
-                for index in (1, 3):
-                    step.fill_(index)
-                    hidden.mul_(0.5)
-                    actual = graph.replay()
-                    expected = _reference(
-                        hidden, source, config, index, tags, cosine, sine, valid
+                for result, reference in zip(actual, expected, strict=True):
+                    torch.testing.assert_close(
+                        result, reference, rtol=2e-2, atol=2e-2
                     )
-                    for result, reference in zip(actual, expected, strict=True):
-                        torch.testing.assert_close(
-                            result, reference, rtol=2e-2, atol=2e-2
-                        )
+            stream.synchronize()
+            graph.release()

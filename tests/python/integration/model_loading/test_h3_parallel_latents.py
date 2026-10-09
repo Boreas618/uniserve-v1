@@ -11,6 +11,11 @@ import torch
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from tests.python.fixtures.h3 import WIDE
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
 from uniserve_eval.types import (
@@ -24,6 +29,7 @@ from uniserve_models import catalog as models
 from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
 from uniserve_models.diffusion import DenoisingStep, normal_noise
 from uniserve_models.distributed import DeviceMesh, communication_axes
+from uniserve_models.interface import graphs
 from uniserve_models.minimax_h3 import (
     DenoiserInput,
     weight_config,
@@ -40,7 +46,6 @@ from uniserve_models.nn.attention import (
     ContextParallelConfig,
     Ulysses,
 )
-from uniserve_models.runtime import CUDAGraph, initialize_process_groups
 
 pytestmark = [
     pytest.mark.integration,
@@ -119,7 +124,7 @@ _PRECISIONS = {
 @torch.inference_mode()
 def _generate(
     rank,
-    rendezvous,
+    listener,
     checkpoint,
     kind,
     encoder_tp,
@@ -129,13 +134,30 @@ def _generate(
     completed,
 ):
     device = torch.device("cuda", rank)
-    groups = initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=4,
-        device=device,
-        init_method=rendezvous,
-    )
+    with process_world(rank, 4, listener, device) as world:
+        _generate_latents(
+            world,
+            checkpoint,
+            kind,
+            encoder_tp,
+            precision,
+            requests,
+            directory,
+            completed,
+        )
+
+
+def _generate_latents(
+    world,
+    checkpoint,
+    kind,
+    encoder_tp,
+    precision,
+    requests,
+    directory,
+    completed,
+):
+    rank, device = world.rank, world.device
     ranks, shape, axes, parallel = _LAYOUTS[kind]
     encoder_ranks = (0, 2, 1, 3)[:encoder_tp]
     topologies = {
@@ -157,9 +179,9 @@ def _generate(
     with torch.device("meta"):
         description = config.model_class(config.model)
     meshes = {
-        name: groups.bind(
+        name: bind_mesh(
+            world,
             topology,
-            device=device,
             axes=communication_axes(
                 description.get_submodule(name),
                 topology,
@@ -175,7 +197,6 @@ def _generate(
         meshes=meshes,
         attention=attention,
     ).model
-    world = groups.process_group
     for index, (frames, token_ids) in enumerate(requests):
         features = torch.empty(
             len(token_ids),
@@ -190,7 +211,7 @@ def _generate(
                     (torch.tensor(token_ids, device=device),)
                 )[0]
                 features.copy_(encoded)
-        world.broadcast(features, src=0, out=features)
+        world.instance.broadcast(features, src=0, out=features)
         if rank in ranks:
             denoiser = model.denoiser
             mesh = meshes["denoiser"]
@@ -213,8 +234,10 @@ def _generate(
                         denoiser.conditioner.encode((features,))[0]
                     )
             requirements = denoiser.state_buffers(layout)
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
             with (
-                ExecutionContext(denoiser) as context,
+                ExecutionContext(denoiser, stream=stream) as context,
                 TensorBuffers.allocate(requirements, device="cpu") as host,
                 TensorBuffers.allocate(requirements, device=device) as backing,
             ):
@@ -238,7 +261,7 @@ def _generate(
                         for name in denoiser.modalities
                     },
                     constants=context.constants,
-                    workspace=context.workspace,
+                    workspace=context.workspace_views,
                 )
                 denoiser.prepare_state(
                     (size,),
@@ -275,7 +298,7 @@ def _generate(
                         schedules,
                         request,
                         context.constants,
-                        context.workspace,
+                        context.workspace_views,
                     )
                     saved = {
                         name: value.clone() for name, value in state.items()
@@ -290,13 +313,14 @@ def _generate(
                             value.copy_(saved[name])
 
                     restore()
-                    with CUDAGraph(context=context) as graph:
-                        graph.capture(step, restore=restore)
-                        graph.replay()
-                        for name, value in state.items():
-                            torch.testing.assert_close(
-                                value, expected[name], rtol=2e-2, atol=2e-2
-                            )
+                    graph = graphs.capture(step, stream=stream)
+                    graph.replay()
+                    for name, value in state.items():
+                        torch.testing.assert_close(
+                            value, expected[name], rtol=2e-2, atol=2e-2
+                        )
+                    stream.synchronize()
+                    graph.release()
                 if pipeline.rank + 1 == pipeline.size and tensor.rank == 0:
                     layouts = denoiser.output_layout(layout)
                     torch.save(
@@ -313,27 +337,27 @@ def _generate(
         # Independent component owners may finish at different times. A host
         # join retires this trajectory before any rank starts the next one.
         completed.wait()
-    groups.close()
 
 
 def _collect(checkpoint, requests, kind, directory, *, encoder_tp, precision):
     directory.mkdir()
     completed = mp.get_context("spawn").Barrier(4)
-    mp.spawn(
-        _generate,
-        args=(
-            (directory / "world").as_uri(),
-            checkpoint,
-            kind,
-            encoder_tp,
-            precision,
-            requests,
-            directory,
-            completed,
-        ),
-        nprocs=4,
-        join=True,
-    )
+    with rendezvous() as listener:
+        mp.spawn(
+            _generate,
+            args=(
+                listener,
+                checkpoint,
+                kind,
+                encoder_tp,
+                precision,
+                requests,
+                directory,
+                completed,
+            ),
+            nprocs=4,
+            join=True,
+        )
     results = []
     for index, (frames, token_ids) in enumerate(requests):
         shards = [

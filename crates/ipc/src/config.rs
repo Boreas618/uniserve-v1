@@ -7,6 +7,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CallKind, ForwardMode, MediaCall, TransferMode};
 
+/// Why an execution lane's settings are refused.
+#[derive(Debug, thiserror::Error)]
+pub enum LaneConfigError {
+    #[error("lane id must be a non-empty token")]
+    LaneId,
+    #[error("lane SM budget must be positive")]
+    SmBudget,
+    #[error("lane call kinds must be non-empty and unique")]
+    CallKinds,
+    /// The named optional limit is configured as zero.
+    #[error("lane {0} must be positive when configured")]
+    Limit(&'static str),
+    #[error("invalid execution lane JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("unknown execution lane domain {0:?}")]
+    Domain(String),
+}
+
 /// Concrete operations and resource limits assigned to one CUDA lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,17 +40,17 @@ pub struct LaneConfig {
 
 impl LaneConfig {
     /// Reject ambiguous operations and limits that cannot allocate a lane.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), LaneConfigError> {
         if self.lane_id.is_empty() || self.lane_id.chars().any(char::is_whitespace) {
-            return Err("lane id must be a non-empty token".into());
+            return Err(LaneConfigError::LaneId);
         }
         if self.sm_budget == 0 {
-            return Err("lane SM budget must be positive".into());
+            return Err(LaneConfigError::SmBudget);
         }
         if self.call_kinds.is_empty()
             || self.call_kinds.iter().collect::<HashSet<_>>().len() != self.call_kinds.len()
         {
-            return Err("lane call kinds must be non-empty and unique".into());
+            return Err(LaneConfigError::CallKinds);
         }
         for (name, value) in [
             ("max_batch_calls", self.max_batch_calls),
@@ -40,7 +58,7 @@ impl LaneConfig {
             ("max_inflight", self.max_inflight),
         ] {
             if value == Some(0) {
-                return Err(format!("lane {name} must be positive when configured"));
+                return Err(LaneConfigError::Limit(name));
             }
         }
         Ok(())
@@ -48,7 +66,7 @@ impl LaneConfig {
 }
 
 impl FromStr for LaneConfig {
-    type Err = String;
+    type Err = LaneConfigError;
 
     /// Resolve the public `--lane` domain selectors to concrete operations.
     /// Rank launch descriptors carry the resolved structure directly.
@@ -63,8 +81,7 @@ impl FromStr for LaneConfig {
             max_batch_tokens: Option<usize>,
             max_inflight: Option<usize>,
         }
-        let options: Options = serde_json::from_str(value)
-            .map_err(|error| format!("invalid execution lane JSON: {error}"))?;
+        let options: Options = serde_json::from_str(value)?;
         let mut call_kinds = Vec::new();
         for domain in options.domains {
             use CallKind::{Forward, Media, Transfer};
@@ -96,7 +113,7 @@ impl FromStr for LaneConfig {
                     ]
                     .map(Media),
                 ),
-                _ => return Err(format!("unknown execution lane domain {domain:?}")),
+                _ => return Err(LaneConfigError::Domain(domain)),
             }
         }
         let lane = Self {

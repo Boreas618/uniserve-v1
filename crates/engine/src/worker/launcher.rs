@@ -12,19 +12,12 @@
 //! it terminates that host's ranks, which is how an instance stops a host it
 //! can no longer reach without adding a heartbeat.
 //!
-//! The connection carries newline-delimited JSON in both directions. The
-//! launcher sends its `Presentation` once, then reports: a `RankExit` for each
-//! rank it still supervises that exits, which excludes ranks a `Stop` ended,
-//! and a `{worker_id, port}` reply to each `Reserve`. The head sends
-//! `Instruction`s. The launcher side is the `uniserve-host` binary, whose
-//! instruction and report types must stay field-compatible with these.
-//!
-//! Each worker group's launches carry a generation, which every `Spawn` names
-//! and the launcher echoes in that rank's `RankExit`. A `Stop` ends the
-//! group's generation before the group is relaunched under the next one. A
-//! launcher may report an exit of a stopped rank before it reads the `Stop`,
-//! and the head may read that report only after the relaunch, so an exit is
-//! attributed to a group only when it names the group's current generation.
+//! The messages are `uniserve_ipc::launcher`'s, which the `uniserve-host`
+//! binary shares. A `Stop` ends a group's generation before the group is
+//! relaunched under the next one. A launcher may report an exit of a stopped
+//! rank before it reads the `Stop`, and the head may read that report only
+//! after the relaunch, so an exit is attributed to a group only when it names
+//! the group's current generation.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -33,48 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
-
-/// What a launcher says when it connects.
-#[derive(Deserialize)]
-struct Presentation {
-    /// The host identity this launcher owns, as the placement names it.
-    host: String,
-}
-
-/// What a launcher says when one of its ranks exits.
-#[derive(Deserialize)]
-pub(crate) struct RankExit {
-    /// Worker group of the process that exited.
-    pub worker_id: String,
-    /// The group generation the rank's `Spawn` carried.
-    pub generation: u64,
-    /// Rank of the process that exited within its group.
-    pub rank: u32,
-    /// Exit status text the launcher read.
-    pub status: String,
-}
-
-/// One instruction the head sends a launcher.
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Instruction<'a> {
-    /// Start one rank from the descriptor the head derived for it, as a
-    /// member of its group's current generation.
-    Spawn {
-        generation: u64,
-        #[serde(flatten)]
-        launch: RemoteLaunch<'a>,
-    },
-    /// Bind and hold a collective store socket for one worker group, which
-    /// the launcher hands to that group's first rank when it spawns it.
-    Reserve { worker_id: &'a str },
-    /// Stop every rank of one worker group the launcher owns, before the
-    /// group is relaunched under its next generation.
-    Stop { worker_id: &'a str },
-    /// Stop every rank the launcher owns.
-    Terminate,
-}
+use uniserve_ipc::launcher::{Instruction, Presentation, RankExit, RankSpawn, Report};
 
 /// The registry of one deployment, shared by every group that places a rank
 /// on another host.
@@ -87,25 +39,6 @@ pub(crate) fn lock(
     registry
         .lock()
         .map_err(|_| anyhow::anyhow!("the launcher registry is poisoned"))
-}
-
-/// Everything a launcher needs to start one rank.
-///
-/// Serialized as the body of a `spawn` instruction, beside the generation the
-/// registry adds, so the field names are the wire contract with the launcher.
-#[derive(Serialize)]
-pub(crate) struct RemoteLaunch<'a> {
-    pub rank: u32,
-    pub worker_id: &'a str,
-    pub world_size: u32,
-    pub python: &'a str,
-    /// The launch descriptor the rank reads, as the head derived it for a
-    /// local spawn. The launcher sets the inherited rendezvous socket's
-    /// number in the first rank's copy, which only it knows.
-    pub descriptor: &'a uniserve_ipc::LaunchDescriptor,
-    /// The variables the head's spawn command for this rank sets; one the
-    /// command removes is sent with an empty value.
-    pub environment: HashMap<String, String>,
 }
 
 /// One connected launcher.
@@ -362,11 +295,10 @@ impl LauncherRegistry {
             .with_context(|| format!("no launcher presented host {host}"))?;
         let address = launcher.stream.peer_addr()?.ip();
 
-        writeln!(
-            launcher.stream,
-            "{}",
-            serde_json::to_string(&Instruction::Reserve { worker_id })?
-        )?;
+        let reserve = Instruction::Reserve {
+            worker_id: worker_id.to_owned(),
+        };
+        writeln!(launcher.stream, "{}", serde_json::to_string(&reserve)?)?;
         launcher
             .stream
             .set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -377,39 +309,42 @@ impl LauncherRegistry {
             loop {
                 let read = launcher.reader.read_until(b'\n', &mut launcher.pending)?;
                 anyhow::ensure!(read > 0, "launcher disconnected while reserving rendezvous");
-                let report: serde_json::Value = serde_json::from_slice(&launcher.pending)?;
+                let report: Report = serde_json::from_slice(&launcher.pending)?;
                 launcher.pending.clear();
-                if let Some(port) = report.get("port").and_then(serde_json::Value::as_u64) {
-                    anyhow::ensure!(
-                        report["worker_id"] == worker_id && port > 0 && port <= u16::MAX as u64,
-                        "invalid rendezvous reservation"
-                    );
-                    return Ok(super::registration::Rendezvous {
-                        address: SocketAddr::new(address, port as u16).to_string(),
-                        listener: None,
-                    });
+                match report {
+                    Report::Reservation(reservation) => {
+                        anyhow::ensure!(
+                            reservation.worker_id == worker_id && reservation.port > 0,
+                            "invalid rendezvous reservation"
+                        );
+                        return Ok(super::registration::Rendezvous {
+                            address: SocketAddr::new(address, reservation.port).to_string(),
+                            listener: None,
+                        });
+                    }
+                    Report::Exit(exit) => self.exits.file(host, exit),
                 }
-                let exit: RankExit = serde_json::from_value(report)?;
-                self.exits.file(host, exit);
             }
         })();
         launcher.stream.set_read_timeout(None)?;
         reservation
     }
 
-    /// Sends one rank's launch to the launcher that owns its host, under its
-    /// group's current generation.
+    /// Sends one rank's launch to the launcher that owns its host. `launch`
+    /// states the rank's spawn for the generation `worker_id`'s launches
+    /// currently carry, which only the registry knows.
     pub(crate) fn spawn_remote(
         &mut self,
         host: &str,
-        launch: RemoteLaunch<'_>,
+        worker_id: &str,
+        launch: impl FnOnce(u64) -> RankSpawn,
     ) -> anyhow::Result<()> {
-        let generation = self.exits.generation(launch.worker_id);
+        let spawn = launch(self.exits.generation(worker_id));
         let launcher = self
             .hosts
             .get_mut(host)
             .with_context(|| format!("no launcher presented host {host}"))?;
-        let line = serde_json::to_string(&Instruction::Spawn { generation, launch })
+        let line = serde_json::to_string(&Instruction::Spawn(Box::new(spawn)))
             .context("encoding a remote launch")?;
         launcher
             .stream
@@ -442,7 +377,7 @@ impl LauncherRegistry {
                 .read_until(b'\n', &mut launcher.pending)
                 .is_ok_and(|read| read > 0)
             {
-                if let Ok(exit) = serde_json::from_slice::<RankExit>(&launcher.pending) {
+                if let Ok(Report::Exit(exit)) = serde_json::from_slice(&launcher.pending) {
                     self.exits.file(host, exit);
                 }
                 launcher.pending.clear();
@@ -463,8 +398,10 @@ impl LauncherRegistry {
     /// stop is not reported at all.
     pub(crate) fn stop_worker(&mut self, worker_id: &str) -> anyhow::Result<()> {
         self.exits.end_generation(worker_id);
-        let line = serde_json::to_string(&Instruction::Stop { worker_id })
-            .context("encoding a worker stop")?;
+        let stop = Instruction::Stop {
+            worker_id: worker_id.to_owned(),
+        };
+        let line = serde_json::to_string(&stop).context("encoding a worker stop")?;
         for (host, launcher) in self.hosts.iter_mut() {
             launcher
                 .stream
@@ -487,7 +424,7 @@ impl Drop for LauncherRegistry {
     /// close does the work either way.
     fn drop(&mut self) {
         for (host, launcher) in self.hosts.iter_mut() {
-            let Ok(line) = serde_json::to_string(&Instruction::<'_>::Terminate) else {
+            let Ok(line) = serde_json::to_string(&Instruction::Terminate) else {
                 continue;
             };
             if launcher
@@ -542,23 +479,21 @@ impl RemoteHost<'_> {
             .registry
             .lock()
             .map_err(|_| anyhow::anyhow!("the launcher registry is poisoned"))?;
-        registry.spawn_remote(
-            self.host,
-            RemoteLaunch {
-                rank,
-                worker_id,
-                world_size,
-                python,
-                descriptor,
-                environment,
-            },
-        )
+        registry.spawn_remote(self.host, worker_id, |generation| RankSpawn {
+            rank,
+            worker_id: worker_id.to_owned(),
+            generation,
+            world_size,
+            python: python.to_owned(),
+            descriptor: descriptor.clone(),
+            environment,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LauncherRegistry, RemoteLaunch};
+    use super::{LauncherRegistry, RankSpawn};
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
@@ -681,23 +616,24 @@ mod tests {
         let descriptor = crate::WorkerProcessArgs::default()
             .launch_descriptor(0, "127.0.0.1:1", None, None, None)
             .expect("a descriptor");
-        let launch = || RemoteLaunch {
+        let launch = |generation| RankSpawn {
             rank: 5,
-            worker_id: "model",
+            worker_id: "model".to_owned(),
+            generation,
             world_size: 8,
-            python: "python3",
-            descriptor: &descriptor,
+            python: "python3".to_owned(),
+            descriptor: descriptor.clone(),
             environment: HashMap::new(),
         };
         registry
-            .spawn_remote("b", launch())
+            .spawn_remote("b", "model", launch)
             .expect("the rank is launched");
         stale_exit_written
             .recv()
             .expect("the launcher reports the failed rank");
         registry.stop_worker("model").expect("the stop is sent");
         registry
-            .spawn_remote("b", launch())
+            .spawn_remote("b", "model", launch)
             .expect("the rank is relaunched");
 
         assert_eq!(await_exits(&mut registry, "model"), ["exit status: 1"]);

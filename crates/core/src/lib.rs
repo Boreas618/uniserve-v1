@@ -23,8 +23,6 @@ use serde::{Deserialize, Serialize};
 /// Serializable statistics and observer-facing wire values.
 pub mod codec;
 mod events;
-/// Handing a bound socket to a rank process at its launch.
-pub mod launch;
 mod media;
 mod shared_memory;
 mod video;
@@ -330,9 +328,9 @@ pub struct KvCacheDtypeParseError(String);
 /// state.
 ///
 /// The worker receives these fields through the worker IPC codec's flatbuffer
-/// `SamplingParams` table, the PyO3 `_uniserve_ipc` extension's conversion,
-/// and the public Python `uniserve.sampling.SamplingParams` binding. All
-/// consumers share this FP32 representation and its numerical validation.
+/// `SamplingParams` table and stages them for the Python samplers in
+/// `uniserve_models.sampling`. All consumers share this FP32 representation
+/// and its numerical validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
     /// Softmax temperature; zero selects greedy decoding.

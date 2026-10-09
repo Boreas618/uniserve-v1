@@ -7,8 +7,8 @@
 //! client, and the socket arm of `RankServer::respond` in `channel`. Received
 //! payloads on either transport are decoded by `Frame::decode_request` and
 //! `Frame::decode_response`, which call [`decode_request`] and
-//! [`decode_response`]. The `worker-ipc-py` extension reaches the codec
-//! through those transports.
+//! [`decode_response`]. The rank runtime (`uniserve-worker`) reaches the
+//! codec through those transports.
 //!
 //! Table construction lives in the `encode` submodule, which reaches the
 //! `*_to_fb` discriminant mappers defined here beside their `*_from_fb`
@@ -2003,11 +2003,6 @@ fn request_kind_from_fb(kind: fbs::ReqKind) -> CodecResult<RequestKind> {
         }
     }
     codec_bail!("unknown request kind {}", kind.0)
-}
-
-/// Iterates over the stable wire names of all request kinds.
-pub fn request_kind_names() -> impl Iterator<Item = &'static str> {
-    RequestKind::ALL.into_iter().map(RequestKind::as_str)
 }
 
 /// Maps a response kind to its stable FlatBuffers discriminant.

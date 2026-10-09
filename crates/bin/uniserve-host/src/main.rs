@@ -20,15 +20,8 @@
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
 //!
-//! The connection carries newline-delimited JSON. The head's side is the
-//! engine's `LauncherRegistry`, whose instruction and report types these must
-//! stay field-compatible with.
-//!
-//! Every spawn names the generation of its worker group that the head is
-//! launching, and the rank's exit report echoes it. The head relaunches a
-//! group under a new generation after stopping it, so an exit this launcher
-//! reported just before it read the stop is recognized as the stopped
-//! generation's rather than the relaunch's.
+//! The connection carries the messages of `uniserve_ipc::launcher`; the
+//! head's side is the engine's `LauncherRegistry`.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -37,7 +30,7 @@ use std::process::{Child, Command};
 
 use anyhow::Context;
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use uniserve_ipc::launcher::{Instruction, Presentation, RankExit, RankSpawn, Report, Reservation};
 
 /// Spawns and supervises the ranks an instance places on this host.
 #[derive(Parser, Debug)]
@@ -52,62 +45,6 @@ struct Args {
     /// This host's identity, as the placement names it.
     #[arg(long = "host-identity")]
     host_identity: String,
-}
-
-/// What this launcher tells the head when it connects.
-#[derive(Serialize)]
-struct Presentation<'a> {
-    host: &'a str,
-}
-
-/// One instruction the head sends a launcher.
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Instruction {
-    /// Start one rank from the descriptor the head derived for it.
-    Spawn(Spawn),
-    /// Bind and hold a collective store socket for one group, which that
-    /// group's first rank inherits when it is spawned here.
-    Reserve { worker_id: String },
-    /// Stop every rank of one worker group this launcher owns.
-    Stop { worker_id: String },
-    /// Stop every rank this launcher owns and exit.
-    Terminate,
-}
-
-/// Everything needed to start one rank.
-#[derive(Deserialize)]
-struct Spawn {
-    /// Rank within its worker group's process world, not host-relative.
-    /// Exits are reported by worker group, generation and this rank.
-    rank: u32,
-    /// Worker group the rank belongs to.
-    worker_id: String,
-    /// The group generation the head is launching; the rank's exit report
-    /// carries it back.
-    generation: u64,
-    /// Ranks in the worker group's process world.
-    world_size: u32,
-    /// Interpreter that runs the worker module.
-    python: String,
-    /// The head's complete launch descriptor for this rank.
-    descriptor: Box<uniserve_ipc::LaunchDescriptor>,
-    /// Environment variables the head set on its own spawn command for this
-    /// rank. They are applied over the environment this launcher inherited; a
-    /// variable the head's command removes arrives with an empty value and is
-    /// set empty here rather than removed.
-    environment: HashMap<String, String>,
-}
-
-/// What this launcher tells the head when a rank exits.
-#[derive(Serialize)]
-struct Exit<'a> {
-    worker_id: &'a str,
-    /// The group generation the rank's spawn named.
-    generation: u64,
-    rank: u32,
-    /// Exit status text, or the reason the status could not be read.
-    status: &'a str,
 }
 
 /// A rank's identity on this host: its worker group and its rank within it.
@@ -147,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream);
 
     let presentation = serde_json::to_string(&Presentation {
-        host: &args.host_identity,
+        host: args.host_identity.clone(),
     })?;
     writer
         .write_all(format!("{presentation}\n").as_bytes())
@@ -223,9 +160,12 @@ fn supervise(
                 let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
                     .context("reserving a collective store address")?;
                 let port = listener.local_addr()?.port();
-                let response = serde_json::json!({"worker_id": worker_id, "port": port});
+                let reservation = Report::Reservation(Reservation {
+                    worker_id: worker_id.clone(),
+                    port,
+                });
                 rendezvous.insert(worker_id, listener);
-                writeln!(writer, "{response}")?;
+                writeln!(writer, "{}", serde_json::to_string(&reservation)?)?;
             }
             Instruction::Spawn(spawn) => {
                 // The group's first rank serves its store on the reserved
@@ -236,7 +176,7 @@ fn supervise(
                     None
                 };
                 let key = (spawn.worker_id.clone(), spawn.rank);
-                let started = start_rank(args, spawn, store_listener).with_context(|| {
+                let started = start_rank(args, *spawn, store_listener).with_context(|| {
                     format!("starting rank {} of worker {} on this host", key.1, key.0)
                 })?;
                 ranks.insert(key.clone(), started);
@@ -276,7 +216,7 @@ fn supervise(
 /// process knows. This process keeps no copy once the rank is started.
 fn start_rank(
     args: &Args,
-    mut spawn: Spawn,
+    mut spawn: RankSpawn,
     store_listener: Option<TcpListener>,
 ) -> anyhow::Result<Rank> {
     let directory = tempfile::Builder::new()
@@ -285,24 +225,19 @@ fn start_rank(
         .context("creating the launch descriptor directory")?;
     let path = directory.path().join("launch.json");
 
-    let mut command = Command::new(&spawn.python);
-    command
-        .arg("-m")
-        .arg("uniserve_models.worker")
-        .arg("--worker-id")
-        .arg(&spawn.worker_id)
-        .arg("--rank")
-        .arg(spawn.rank.to_string())
-        .arg("--world-size")
-        .arg(spawn.world_size.to_string())
-        .arg("--launch-descriptor")
-        .arg(&path);
+    let mut command = uniserve_ipc::launch::rank_command(
+        &spawn.python,
+        &spawn.worker_id,
+        spawn.rank,
+        spawn.world_size,
+        &path,
+    );
     for (name, value) in &spawn.environment {
         command.env(name, value);
     }
     die_with_launcher(&mut command);
     if let Some(listener) = store_listener {
-        let fd = uniserve_core::launch::inherit_listener(&mut command, listener);
+        let fd = uniserve_ipc::launch::inherit_listener(&mut command, listener);
         spawn.descriptor.rendezvous_listen_fd = Some(fd);
     }
     std::fs::write(&path, spawn.descriptor.to_json()?).context("writing the launch descriptor")?;
@@ -365,12 +300,12 @@ fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<RankKey, Rank>) -> a
     }
     for ((worker_id, rank), generation, status) in exited {
         ranks.remove(&(worker_id.clone(), rank));
-        let report = serde_json::to_string(&Exit {
-            worker_id: &worker_id,
+        let report = serde_json::to_string(&Report::Exit(RankExit {
+            worker_id: worker_id.clone(),
             generation,
             rank,
-            status: &status,
-        })?;
+            status: status.clone(),
+        }))?;
         writer
             .write_all(format!("{report}\n").as_bytes())
             .context("reporting a rank exit to the head")?;
