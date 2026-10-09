@@ -30,9 +30,8 @@ use crate::request::video::VideoLayout;
 use crate::runner::GraphPool;
 use crate::runner::graphs::{GraphMode, GraphTable, Lookup};
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{LatentExport, LatentImport};
+use crate::executor::forward::transfer::latents::Pool;
 use crate::storage::{RequestSlots, SlotField};
-use crate::transfer::Retirement;
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
 
 /// A request's samples occupy at most this many pages, which bounds the
@@ -289,11 +288,6 @@ struct Layout {
     references: usize,
 }
 
-/// The latent pool of a denoising rank: pages imported from and exported
-/// to other ranks retire through the transfer layer's retirements.
-type Trajectories =
-    LatentPool<Arc<LatentImport<Arc<Retirement>>>, Arc<LatentExport<Arc<Retirement>>>>;
-
 /// One rank's video denoiser: its bound steps, buffers, latent pool and
 /// layouts.
 pub(crate) struct VideoDenoiser {
@@ -312,7 +306,9 @@ pub(crate) struct VideoDenoiser {
     conditioner: Option<ConditionerBuffers>,
     pages: SamplePages,
     storage: LatentStorage,
-    pool: Trajectories,
+    /// The requests' trajectories. A video trajectory stays on its rank:
+    /// its final latents leave as tensor products.
+    pool: Pool,
     layouts: Vec<Option<Layout>>,
     ids: HashMap<VideoLayout, usize>,
     /// Transient layout ids, least recently used first.
