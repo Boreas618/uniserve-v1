@@ -70,6 +70,7 @@ fn defaults() -> Value {
         "flow_graph_batch_sizes": null,
         "flow_graph_shapes": null,
         "video_text_capacities": null,
+        "video_canvases": [],
         "canvas_sampling": null,
         "flashinfer_workspace_size": 536870912,
         "flashinfer_use_tensor_core": null,
@@ -290,6 +291,37 @@ fn bucket_lists_are_positive_and_strictly_increasing() {
         vec![(1024, 512), (512, 1024)]
     );
     assert!(resolved(json!({"flow_graph_shapes": "1024x512,1024x512"})).is_err());
+}
+
+#[test]
+fn video_canvases_keep_the_order_the_deployment_names() {
+    let canvas = |width, height| uniserve_core::Canvas { width, height };
+    let launch = resolved(json!({"video_canvases": [
+        {"width": 768, "height": 1344},
+        {"width": 1344, "height": 768},
+    ]}))
+    .unwrap();
+    assert_eq!(
+        launch.execution.video_canvases,
+        vec![canvas(768, 1344), canvas(1344, 768)]
+    );
+
+    // Without a selection the worker prepares the canvases its denoiser
+    // offers.
+    assert!(
+        resolved(json!({}))
+            .unwrap()
+            .execution
+            .video_canvases
+            .is_empty()
+    );
+
+    for canvases in [
+        json!([{"width": 1344, "height": 768}, {"width": 1344, "height": 768}]),
+        json!([{"width": 0, "height": 768}]),
+    ] {
+        assert!(resolved(json!({"video_canvases": canvases})).is_err());
+    }
 }
 
 #[test]

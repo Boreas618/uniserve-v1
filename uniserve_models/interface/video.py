@@ -248,7 +248,6 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
 
     def describe() -> dict[str, Any]:
         tiles = network.condition_tiles
-        canvases = network.fixed_canvases
         shifts = network.schedule_shifts
         return {
             "modalities": list(network.modalities),
@@ -260,7 +259,6 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
                 [int(canvas.width), int(canvas.height)]
                 for canvas in network.canvases
             ],
-            "fixed_canvases": canvases is not None,
             "max_sequence_rows": int(network.max_sequence_rows or 0),
             "condition_tiles": []
             if tiles is None
@@ -304,7 +302,8 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
         sample's rows and width and this rank's rows; ``noise`` each
         modality's native draw shape; ``condition_noise`` the FP32 elements
         of the condition draws; ``text_condition`` the retained
-        conditioning's ``[rows, width]``.
+        conditioning's ``[rows, width]``; ``workspace`` the elements of the
+        layout's workspace buffers.
         """
         resolved = _layout(network, layout)
         outputs = network.output_layout(resolved)
@@ -342,6 +341,10 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
                 int(network.text_condition_rows(resolved)),
                 int(network.text_condition_width),
             ],
+            "workspace": sum(
+                _elements(config.shape)
+                for config in network.workspace_buffers(resolved).values()
+            ),
         }
 
     def latent_shape(modality: str, layout) -> list[int]:
@@ -386,22 +389,27 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
         return int(audio.latent_frames(int(samples)))
 
     def outputs(
-        frames: int, tokens: int, rows: int, dtype: str
+        frames: int, tokens: int, rows: int, dtype: str, canvases
     ) -> dict[str, Any]:
         """Products the model's components publish, bounded for any request.
 
         ``frames`` is the longest admitted video, ``tokens`` the prompt
         capacity, ``rows`` the condition capacity (zero without conditioned
-        tasks) and ``dtype`` the model dtype the text encoder runs at. Each
-        video product bounds the video of ``frames`` frames at every canvas
-        the deployment prepares.
+        tasks), ``dtype`` the model dtype the text encoder runs at and
+        ``canvases`` the ``[width, height]`` canvases the deployment
+        prepares. Each video product bounds the video of ``frames`` frames at
+        every one of them.
         """
         frames = int(frames)
         sizes = [
             network.layout_size(
-                network.make_size(frames, int(tokens), canvas=canvas)
+                network.make_size(
+                    frames,
+                    int(tokens),
+                    canvas=image.Config(int(height), int(width)),
+                )
             )
-            for canvas in network.canvases
+            for width, height in canvases
         ]
         result: dict[str, list[dict[str, Any]]] = {}
 
