@@ -41,6 +41,10 @@ pub enum Error {
     /// The interface table or a binding does not satisfy its contract.
     #[error("{0}")]
     Interface(String),
+    /// The host's node name cannot identify this rank's node to transfer
+    /// peers: it is empty or not UTF-8.
+    #[error("host name {0:?} cannot identify the rank's node in transfers")]
+    HostName(std::ffi::CString),
 }
 
 impl Error {
@@ -314,7 +318,9 @@ fn kind_code(error: &Error) -> ErrorCode {
     match error {
         Error::Invalid(_) => ErrorCode::InvalidDescriptor,
         Error::Resource(_) | Error::ReadBackpressure { .. } => ErrorCode::ResourceError,
-        Error::Unsupported(_) | Error::Interface(_) => ErrorCode::UnsupportedSetup,
+        Error::Unsupported(_) | Error::Interface(_) | Error::HostName(_) => {
+            ErrorCode::UnsupportedSetup
+        }
         Error::Invariant(_) => ErrorCode::InvariantViolation,
         Error::Transport(_) | Error::Cuda(_) | Error::State(_) => ErrorCode::ComputeError,
         Error::Numerical { kind, .. } => numerical_code(kind),

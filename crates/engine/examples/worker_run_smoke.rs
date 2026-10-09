@@ -92,6 +92,9 @@ fn main() -> anyhow::Result<()> {
     let worker_config = WorkerProcessArgs {
         worker_id: "local".into(),
         stub: true,
+        // The stub rank encodes many small images, so it keeps a larger
+        // encoder cache than a served model's default.
+        encoder_cache_entries: 1024,
         ..WorkerProcessArgs::default()
     };
     let engine = WorkerGroup::spawn(uniserve_engine::WorkerProcessArgs {

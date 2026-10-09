@@ -12,21 +12,21 @@ use crate::{Error, Result};
 /// device's fixed storage.
 pub fn auxiliary(
     config: &WorkerConfig,
-    fixed: &BTreeMap<String, u64>,
+    fixed: &BTreeMap<Device, u64>,
     budget: &DeviceBudget,
 ) -> Result<()> {
-    for (name, bytes) in fixed {
-        let Ok(Device::Cuda(index)) = Device::parse(name, "device") else {
+    for (&device, bytes) in fixed {
+        let Device::Cuda(index) = device else {
             continue;
         };
-        if *name == config.device {
+        if device == config.device {
             continue;
         }
         let available = budget.budget(index, config.kv_storage_fraction)?.available;
         let reserved = bytes + graph_storage_budget_bytes(total_bytes(index)? as i64);
         if reserved > available {
             return Err(Error::Unsupported(format!(
-                "runtime storage on {name} requires {reserved} bytes, but its static storage grant is {available} bytes"
+                "runtime storage on {device} requires {reserved} bytes, but its static storage grant is {available} bytes"
             )));
         }
     }
@@ -40,25 +40,25 @@ pub fn auxiliary(
 pub fn startup(
     config: &WorkerConfig,
     device_product_bytes: u64,
-    resident_products: impl Fn(&str) -> u64,
+    resident_products: impl Fn(Device) -> u64,
     budget: &DeviceBudget,
 ) -> Result<()> {
-    for name in config.devices() {
-        let Ok(Device::Cuda(index)) = Device::parse(name, "device") else {
+    for device in config.devices() {
+        let Device::Cuda(index) = device else {
             continue;
         };
         // Product storage lives on the primary device only.
-        let products = if name == config.device {
+        let products = if device == config.device {
             device_product_bytes
         } else {
             0
         };
         let measured = budget.budget(index, config.kv_storage_fraction)?;
         let grant = (measured.total as f64 * config.kv_storage_fraction) as u64;
-        let remaining = products.saturating_sub(resident_products(name));
+        let remaining = products.saturating_sub(resident_products(device));
         if remaining > measured.available || measured.process + remaining > grant {
             return Err(Error::Unsupported(format!(
-                "initialized runtime on {name} exceeds its static storage grant: it requires {} bytes ({} process-resident bytes and {remaining} reserved product bytes) of a {grant}-byte grant, with {} device-free bytes",
+                "initialized runtime on {device} exceeds its static storage grant: it requires {} bytes ({} process-resident bytes and {remaining} reserved product bytes) of a {grant}-byte grant, with {} device-free bytes",
                 measured.process + remaining,
                 measured.process,
                 measured.free,

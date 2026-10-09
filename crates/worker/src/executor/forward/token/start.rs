@@ -198,7 +198,7 @@ pub(crate) fn expert_tokens(config: &WorkerConfig) -> usize {
         max_rows = max_rows.min(lane.max_batch_calls.unwrap_or(max_rows));
         tokens = tokens.min(lane.max_batch_tokens.unwrap_or(tokens));
     }
-    let graphs = config.primary_device().is_cuda() && config.graph_policy != "off";
+    let graphs = config.device.is_cuda() && config.graph_policy != "off";
     if !graphs {
         return tokens;
     }
@@ -585,7 +585,7 @@ pub(crate) fn reserved_bytes(
     let Some(vocab) = facts.vocab_size else {
         return Ok(0);
     };
-    let cuda = config.primary_device().is_cuda();
+    let cuda = config.device.is_cuda();
     let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
     let dtype = model_dtype(&config.model_dtype)?;
     let mut dimensions = bounds.dimensions(vocab, vocab, facts.hidden_size.unwrap_or(0), dtype);

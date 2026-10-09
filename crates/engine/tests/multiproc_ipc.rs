@@ -1390,6 +1390,9 @@ fn rank_group_args(
     let worker = worker_python();
     let config = WorkerProcessArgs {
         stub: true,
+        // The stub rank encodes many small images, so it keeps a larger
+        // encoder cache than a served model's default.
+        encoder_cache_entries: 1024,
         prefill_cuda_graph: false,
         ..WorkerProcessArgs::default()
     };
@@ -1471,6 +1474,9 @@ fn stub_launch_descriptor(registration: &str) -> LaunchDescriptor {
         max_model_len: 8192,
         max_video_seconds: 15.0,
         max_condition_rows: 0,
+        // The stub rank encodes many small images, so it keeps a larger
+        // encoder cache than a served model's default.
+        encoder_cache_entries: 1024,
         ffmpeg: "ffmpeg".into(),
         min_video_seconds: None,
         graph_policy: "off".into(),

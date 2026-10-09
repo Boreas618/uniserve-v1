@@ -101,7 +101,7 @@ impl World {
             .with("rank", execution.rank as i64)
             .with("local_rank", launch.local_rank as i64)
             .with("world_size", execution.world_size as i64)
-            .text("device", &execution.device)
+            .text("device", &execution.device.to_string())
             .optional_text("backend", launch.distributed_backend.as_deref())
             .optional("store", store.map(Fields::map))
             .optional("union", union_store)
