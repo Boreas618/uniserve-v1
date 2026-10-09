@@ -16,8 +16,8 @@ UNISERVE_NVTX=1 nsys profile \
   --export=sqlite --output="$CAPTURE" \
   .venv/bin/python "$WORKLOAD"
 
-.venv/bin/python -m uniserve.sanitizer trace "$CAPTURE.sqlite"
-.venv/bin/python -m uniserve.sanitizer trace "$CAPTURE.sqlite" --json
+.venv/bin/python -m uniserve_eval.sanitizer trace "$CAPTURE.sqlite"
+.venv/bin/python -m uniserve_eval.sanitizer trace "$CAPTURE.sqlite" --json
 ```
 
 The reader uses the Nsight Systems 2025.4 SQLite export schema. It opens the file read-only. `--scope PREFIX` selects synchronous NVTX ranges by name, defaulting to `uniserve.`; repeated `--rule NAME` options select individual rules. Hints do not cause a failing exit status. Invalid inputs or unreadable exports do.
@@ -48,9 +48,11 @@ Standard cProfile captures some Python/native calls and callbacks. Select the na
 
 ```bash
 .venv/bin/python -m cProfile -o "$CALLS" "$WORKLOAD"
-.venv/bin/python -m uniserve.sanitizer calls "$CALLS" \
-  --native _uniserve_ipc
+.venv/bin/python -m uniserve_eval.sanitizer calls "$CALLS" \
+  --native "$NATIVE"
 ```
+
+`NATIVE` is a substring of the builtin's cProfile label, such as `torch._C`; repeat `--native` to select more. cProfile does not record TVM-FFI function calls, so the calls between the rank runtime and its Python numerical functions never appear in this report. Read those crossings from the `uniserve.worker.*` ranges of the CUDA timeline.
 
 The report shows repeated edges in both directions, call counts and inclusive time. Use it to locate repeated metadata conversion or per-row callbacks for further investigation. A repeated batch numerical call is expected. Inclusive time includes the callee's work and must not be summed or interpreted as FFI overhead.
 
