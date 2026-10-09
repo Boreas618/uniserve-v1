@@ -173,8 +173,10 @@ impl Drop for WeightRuntime {
 }
 
 /// The prefetch hooks as TVM-FFI functions closed over `weights`:
-/// `begin()`, `end(stream)`, `before(layer, stream) -> [copy]`,
-/// `after(layer, stream)` and `copy(index)`. They block on no peer.
+/// `begin()`, `end(stream)`, `before(layer, stream, record)`,
+/// `after(layer, stream)` and `copy(index)`. `record` is `None` or, under
+/// graph capture, a function of a copy index that submits it between graph
+/// segments. They block on no peer.
 fn hooks(weights: &Arc<ExpertWeights>) -> Any {
     type Hook = dyn Fn(&ExpertWeights, &[AnyView<'_>]) -> std::result::Result<Any, tvm_ffi::Error>;
     let function = |call: Box<Hook>| {
@@ -202,18 +204,22 @@ fn hooks(weights: &Arc<ExpertWeights>) -> Any {
         )
         .with(
             "before",
-            function(Box::new(|weights, args| {
-                let [layer, stream] = args else {
+            function(Box::new(move |weights, args| {
+                let [layer, stream, record] = args else {
                     return Err(ffi_error(&Error::Invalid(
-                        "before takes a layer and a stream".into(),
+                        "before takes a layer, a stream and a recorder".into(),
                     )));
                 };
-                let recorded = weights
-                    .before(count(layer)?, count(stream)?)
-                    .map_err(|error| ffi_error(&error))?;
-                Ok(Any::from(crate::ffi::integer_list(
-                    recorded.into_iter().map(|index| index as i64),
-                )))
+                let record = Option::<tvm_ffi::Function>::try_from(*record)?;
+                unit(weights.before(count(layer)?, count(stream)?, |index| {
+                    let record = record.as_ref().ok_or(Error::State(
+                        "capture expert weight reads with a segment recorder",
+                    ))?;
+                    record
+                        .call_packed(&[(&Any::from(index as i64)).into()])
+                        .map(drop)
+                        .map_err(|error| Error::numerical("experts.prefetch.record", &error))
+                }))
             })),
         )
         .with(

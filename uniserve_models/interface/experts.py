@@ -429,15 +429,18 @@ class WeightPrefetch:
 
     def before(self, module) -> None:
         """Wait for this layer's weights and prefetch the next layer's."""
-        recorded = self._hooks["before"](
-            self._ordinals[id(module)], self._stream()
+        # Under capture the worker hands each read to the recorder while it
+        # orders the layer's waits, so every wait lands in the segment after
+        # the read it depends on.
+        record = None if self._submit is None else self._record
+        self._hooks["before"](
+            self._ordinals[id(module)], self._stream(), record
         )
-        if not recorded:
-            return
+
+    def _record(self, index: int) -> None:
         if self._submit is None:
             raise RuntimeError("capture expert weight reads with a recorder")
-        for index in recorded:
-            self._submit(partial(self._hooks["copy"], int(index)))
+        self._submit(partial(self._hooks["copy"], int(index)))
 
     def after(self, module) -> None:
         """Release the layer's slots after its last reader."""
@@ -448,6 +451,8 @@ def bind_prefetch(model, hooks: Mapping[str, Any]) -> WeightPrefetch:
     """The prefetch object bindings pass to their expert calls.
 
     ``hooks`` are the worker's ``begin()``, ``end(stream)``, ``before(layer,
-    stream) -> [copy]``, ``after(layer, stream)`` and ``copy(index)``.
+    stream, record)``, ``after(layer, stream)`` and ``copy(index)``;
+    ``record`` is ``None`` eagerly and, under capture, receives each copy
+    index to submit between graph segments.
     """
     return WeightPrefetch(_prefetched_layers(model), hooks)
