@@ -152,13 +152,31 @@ class TransformerLayer(nn.Module):
                     ),
                 )
 
-        attended = self.attention.forward_chunks(
-            normalize(),
-            workspace["cos"],
-            workspace["sin"],
-            inputs,
-            workspace=workspace,
-        )
+        # Each attention kind reads the input of its own packing; the
+        # transformer builds every layer's attention from the attention
+        # configuration the denoiser packs its inputs by.
+        attention, cos, sin = self.attention, workspace["cos"], workspace["sin"]
+        if isinstance(attention, Dense) and isinstance(inputs, SequenceInput):
+            attended = attention.forward_chunks(
+                normalize(), cos, sin, inputs, workspace=workspace
+            )
+        elif isinstance(attention, Sparse) and isinstance(
+            inputs, AttentionInput
+        ):
+            attended = attention.forward_chunks(
+                normalize(), cos, sin, inputs, workspace=workspace
+            )
+        elif isinstance(attention, RegionSparse) and isinstance(
+            inputs, RegionInput
+        ):
+            attended = attention.forward_chunks(
+                normalize(), cos, sin, inputs, workspace=workspace
+            )
+        else:
+            raise TypeError(
+                f"H3 {type(attention).__name__} attention does not read "
+                f"{type(inputs).__name__}"
+            )
 
         def finish(interval, update):
             local = slice(
