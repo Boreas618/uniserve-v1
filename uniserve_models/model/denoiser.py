@@ -266,7 +266,11 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
 
     @property
     def canvases(self) -> tuple[image.Config, ...]:
-        """Canvases whose layouts a deployment prepares before serving."""
+        """Canvases a deployment may prepare layouts for before serving.
+
+        A deployment prepares a selection of them, or all of them without
+        one, and admits only the canvases it prepares.
+        """
         raise NotImplementedError
 
     @property
@@ -277,15 +281,6 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     @property
     def schedule_shifts(self) -> Mapping[str, float]:
         """Each modality's fixed schedule shift."""
-        raise NotImplementedError
-
-    @property
-    def fixed_canvases(self) -> tuple[image.Config, ...] | None:
-        """The only canvases the network generates, or None for any canvas.
-
-        ``None`` admits every canvas of the model's canvas rule; prepared
-        ``canvases`` evaluate in captured layouts and others unprepared.
-        """
         raise NotImplementedError
 
     @property
