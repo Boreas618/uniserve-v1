@@ -18,7 +18,7 @@ use uniserve_core::Canvas;
 use uniserve_cuda::Stream;
 
 use crate::ffi::{Backing, DType, Fields, Function, Functions, Handle};
-use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces};
+use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize};
 use crate::runner::GraphPool;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::graphs::{GraphMode, GraphTable, Lookup};
@@ -449,7 +449,8 @@ pub(crate) struct TextSetup<'a> {
     pub(crate) device: i32,
     pub(crate) stream: Stream,
     pub(crate) attention: String,
-    /// Prompt capacities and the longest admitted prompt.
+    /// Prompt capacities, the longest admitted prompt and, as the row
+    /// budget, the most vision patch rows one request carries.
     pub(crate) config: EncoderConfig,
     /// The device's product arena.
     pub(crate) products: StorageView,
@@ -499,6 +500,16 @@ impl TextEncoding {
         } else {
             None
         };
+        // One vision call encodes every vision block of a request. Their
+        // patch rows together are within the row budget, and a block holds
+        // at least one feature, so the budget also bounds the blocks.
+        let config = match &vision_info {
+            Some(EncoderInfo::Vision(tower)) => EncoderConfig {
+                max_images: (config.row_budget / (tower.downsample as usize).pow(2)).max(1),
+                ..config
+            },
+            _ => config,
+        };
         let prepared = crate::model::bind::prepare(
             interface,
             loaded,
@@ -507,9 +518,20 @@ impl TextEncoding {
                 path: path.to_owned(),
                 device: crate::config::Device::Cuda(device),
                 stream: stream.raw(),
-                // Prompts run one at a time, padded to at most the largest
-                // capacity; the operators' workspaces are declared for it.
-                size: text_info.binding_size(&config),
+                // The binding serves both encoders, so its operators are
+                // declared for the larger of their workloads: a prompt
+                // padded to the largest capacity, and a request's vision
+                // blocks.
+                size: [
+                    text_info.binding_size(&config),
+                    vision_info.and_then(|info| info.binding_size(&config)),
+                ]
+                .into_iter()
+                .flatten()
+                .reduce(|left, right| TextSize {
+                    tokens: left.tokens.max(right.tokens),
+                    rows: left.rows.max(right.rows),
+                }),
                 backends: Backends {
                     attention,
                     ..Backends::default()
