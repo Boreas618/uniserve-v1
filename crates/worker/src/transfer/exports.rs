@@ -19,10 +19,15 @@ pub type Location = (Arc<Transport>, Locator);
 /// over VMM (unless `host` forces host mechanisms), otherwise local, shared
 /// memory and the rank channel.
 ///
+/// `consumers` are the acknowledgment slots of the other ranks that read the
+/// export. This rank reads its own exports through the local mechanism, which
+/// is therefore always selected and reaches none of them.
+///
 /// The storage owner retains each location's retirement signal through
 /// `retain` before the next export starts. A device payload that does not
 /// fit its VMM pool falls back to the host mechanisms that reach its
-/// consumers. Any failure revokes every accepted location; their physical
+/// consumers, and fails when it has consumers and none of those mechanisms
+/// accepts it. Any failure revokes every accepted location; their physical
 /// accesses still retire asynchronously.
 pub fn export(
     transports: &Transports,
@@ -66,6 +71,7 @@ pub fn export(
                 }
                 Exported::PoolExhausted => {
                     // Local was selected before VMM, so never repeat it.
+                    let mut carried = false;
                     for kind in [TransportKind::Shm, TransportKind::Channel] {
                         let Some(fallback) = transports.exporter(kind) else {
                             continue;
@@ -76,6 +82,7 @@ pub fn export(
                         match fallback.export(source, offset, consumers, stream)? {
                             Exported::Located(locator) => {
                                 accept(fallback, *locator, &mut retain, &mut locations)?;
+                                carried = true;
                             }
                             Exported::PoolExhausted => {
                                 return Err(Error::Invariant(
@@ -84,7 +91,10 @@ pub fn export(
                             }
                         }
                     }
-                    if locations.is_empty() {
+                    // The local location accepted earlier reaches no other
+                    // rank: an export with consumers needs a mechanism that
+                    // carries the payload to them.
+                    if !carried && (locations.is_empty() || !consumers.is_empty()) {
                         return Err(Error::Resource(
                             "device product does not fit its VMM pool and the rank binds no \
                              other mechanism that exports it",

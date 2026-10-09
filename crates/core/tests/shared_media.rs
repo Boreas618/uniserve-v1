@@ -1,5 +1,7 @@
 //! Claim semantics of `SharedMedia` exports.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 use uniserve_core::{MediaSource, SharedMedia};
 

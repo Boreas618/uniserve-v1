@@ -207,14 +207,13 @@ def test_shared_parameter_rejects_conflicting_placement_before_materialization(
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("stream_kind", ("default", "external", "partitioned"))
 @torch.inference_mode()
 def test_contexts_deliver_cross_device_components_with_independent_graphs(
-    component_checkpoint, stream_kind
+    component_checkpoint,
 ):
     from uniserve_models.bindings.context import ExecutionContext
+    from uniserve_models.interface import graphs
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import CUDAGraph, CUDAStream, partition_streams
 
     root, io = component_checkpoint
     model = _load(
@@ -222,28 +221,10 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
     ).model
     first = torch.tensor([[1.0, 2.0]], device="cuda:0")
     second = torch.tensor([[3.0, 4.0]], device="cuda:0")
-    if stream_kind == "partitioned":
-        owners = partition_streams(torch.device("cuda:0"), (64, 64))
-    else:
-        owners = tuple(
-            CUDAStream.external(torch.cuda.Stream(device="cuda:0"))
-            if stream_kind == "external"
-            else None
-            for _ in range(2)
-        )
-    streams = tuple(
-        owner.stream
-        if owner is not None
-        else torch.cuda.current_stream("cuda:0")
-        for owner in owners
-    )
-    # MemPool ownership is associated with the current device at construction.
+    streams = tuple(torch.cuda.Stream(device="cuda:0") for _ in range(2))
     # Each graph keeps its secondary-device allocation domain alive for replay.
-    with torch.cuda.device("cuda:1"):
-        pools = tuple(
-            {torch.device("cuda:1"): torch.cuda.MemPool()} for _ in range(2)
-        )
-    with ExecutionContext(model, stream=owners[0]) as a:
+    peers = tuple(((1, graphs.pool(1)[0]),) for _ in range(2))
+    with ExecutionContext(model, stream=streams[0]) as a:
         a.prepare(TextSize(1, 1))
         streams[0].wait_stream(torch.cuda.default_stream("cuda:0"))
         torch.testing.assert_close(
@@ -254,36 +235,37 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
         torch.testing.assert_close(
             model(first), first.new_tensor([[5.0, 66.0]])
         )
-        with CUDAGraph(context=a, pools=pools[0]) as ga:
-            ga.capture(lambda: model(first))
-            with ExecutionContext(model, stream=owners[1]) as b:
-                b.prepare(TextSize(1, 1))
-                streams[1].wait_stream(torch.cuda.default_stream("cuda:0"))
-                torch.testing.assert_close(
-                    model(second), second.new_tensor([[11.0, 150.0]])
-                )
-                with CUDAGraph(context=b, pools=pools[1]) as gb:
-                    gb.capture(lambda: model(second))
-                    with torch.cuda.stream(streams[0]):
-                        first.copy_(first.new_tensor([[2.0, 3.0]]))
-                    actual_a = ga.replay()
-                    actual_b = gb.replay()
-                    for stream in streams:
-                        stream.synchronize()
-                    torch.testing.assert_close(
-                        actual_a, first.new_tensor([[8.0, 108.0]])
-                    )
-                    torch.testing.assert_close(
-                        actual_b, second.new_tensor([[11.0, 150.0]])
-                    )
-            # Returning to the first context restores its stream bindings.
-            out = torch.empty_like(first)
-            assert model(first, out=out) is out
-            torch.testing.assert_close(out, first.new_tensor([[8.0, 108.0]]))
+        ga = graphs.capture(
+            lambda: model(first), stream=streams[0], peers=peers[0]
+        )
+        with ExecutionContext(model, stream=streams[1]) as b:
+            b.prepare(TextSize(1, 1))
+            streams[1].wait_stream(torch.cuda.default_stream("cuda:0"))
+            torch.testing.assert_close(
+                model(second), second.new_tensor([[11.0, 150.0]])
+            )
+            gb = graphs.capture(
+                lambda: model(second), stream=streams[1], peers=peers[1]
+            )
+            with torch.cuda.stream(streams[0]):
+                first.copy_(first.new_tensor([[2.0, 3.0]]))
+                actual_a = ga.replay()
+            actual_b = gb.replay()
+            for stream in streams:
+                stream.synchronize()
+            torch.testing.assert_close(
+                actual_a, first.new_tensor([[8.0, 108.0]])
+            )
+            torch.testing.assert_close(
+                actual_b, second.new_tensor([[11.0, 150.0]])
+            )
+            gb.release()
+        # Returning to the first context restores its stream bindings.
+        out = torch.empty_like(first)
+        assert model(first, out=out) is out
+        torch.testing.assert_close(out, first.new_tensor([[8.0, 108.0]]))
         streams[0].synchronize()
-    for owner in owners:
-        if owner is not None:
-            owner.close()
+        ga.release()
 
 
 @pytest.mark.gpu
@@ -292,7 +274,6 @@ def test_shared_components_deliver_independently_on_concurrent_contexts(
 ):
     from uniserve_models.bindings.context import ExecutionContext
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import CUDAStream
 
     root, io = component_checkpoint
     model = _load(
@@ -304,14 +285,10 @@ def test_shared_components_deliver_independently_on_concurrent_contexts(
     def execute(index):
         with torch.cuda.device(0):
             value = torch.tensor([[1.0, 2.0]], device="cuda:0") + index * 2
-            with (
-                CUDAStream.external(
-                    torch.cuda.Stream(device="cuda:0")
-                ) as stream,
-                ExecutionContext(model, stream=stream) as context,
-            ):
+            stream = torch.cuda.Stream(device="cuda:0")
+            with ExecutionContext(model, stream=stream) as context:
                 context.prepare(TextSize(1, 1))
-                stream.stream.wait_stream(torch.cuda.default_stream("cuda:0"))
+                stream.wait_stream(torch.cuda.default_stream("cuda:0"))
                 # Both contexts use the same numerical modules concurrently.
                 # One failing call must leave the other's delivery intact.
                 barrier.wait()

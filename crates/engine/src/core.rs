@@ -180,6 +180,21 @@ impl WorkerConfig {
         Ok(())
     }
 
+    /// Reads a deployment configuration file: a bare JSON array of worker
+    /// entries, validated as a whole by [`validate_all`](Self::validate_all).
+    ///
+    /// The signature suits a command-line value parser, and each failure
+    /// names the file and its cause in one message.
+    pub fn read_all(path: &str) -> anyhow::Result<Box<[Self]>> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("reading deployment configuration {path}: {error}"))?;
+        let workers: Vec<Self> = serde_json::from_str(&text)
+            .map_err(|error| anyhow::anyhow!("parsing deployment configuration {path}: {error}"))?;
+        Self::validate_all(&workers)?;
+
+        Ok(workers.into_boxed_slice())
+    }
+
     /// Validates unique WorkerGroup identities and every local placement.
     ///
     /// Component names may repeat across WorkerGroups. Repeated names are

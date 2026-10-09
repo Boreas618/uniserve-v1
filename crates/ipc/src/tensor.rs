@@ -11,10 +11,9 @@
 //!
 //! The validators here are the wire contract: the codec runs them, through
 //! `Batch::validate` and `BatchOutput::validate`, whenever it encodes or
-//! decodes a batch or a batch result. The Python worker's
-//! `uniserve_worker.protocol` package reimplements these checks and the
-//! descriptor size estimate bounded by [`MAX_TRANSFER_HANDLE_BYTES`], so the
-//! two sides must change together.
+//! decodes a batch or a batch result. A rank also checks a product's
+//! descriptor size estimate against [`MAX_TRANSFER_HANDLE_BYTES`] before it
+//! publishes the product.
 
 use super::*;
 use std::ops::Range;
@@ -657,8 +656,6 @@ impl KvTransfer {
     }
 
     /// Conservative wire size, including every shard and replica locator.
-    /// The Python worker's `KvTransfer.encoded_size_bound` computes a
-    /// parallel estimate.
     pub fn encoded_size_bound(&self) -> usize {
         // Each group record adds its interval and page size to the envelope.
         transfer_encoded_size(self.tensors())
@@ -975,8 +972,7 @@ impl TensorExport {
 
 /// Maximum estimated encoded size in bytes of one transfer descriptor, as
 /// computed by `TransferHandle::encoded_size_bound` and
-/// `KvTransfer::encoded_size_bound`. The Python worker's
-/// `uniserve_worker.protocol.transfer` module defines the same value.
+/// `KvTransfer::encoded_size_bound`.
 pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
 impl Locator {

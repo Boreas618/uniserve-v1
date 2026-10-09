@@ -78,13 +78,13 @@ struct Args {
     #[arg(long, default_value = "FastH3")]
     served_model_name: String,
 
-    #[arg(long, default_value = "python3")]
+    #[arg(long, default_value_os_t = WorkerProcessArgs::default_python())]
     worker_python: PathBuf,
 
     /// JSON deployment configuration: the Worker instances, their node/device
     /// ranks, and the FastH3 components placed on them, for example
     /// `configs/minimax_h3/fasth3-ulysses4.json`.
-    #[arg(long, value_name = "FILE", value_parser = read_workers)]
+    #[arg(long, value_name = "FILE", value_parser = WorkerConfig::read_all)]
     workers: Box<[WorkerConfig]>,
 
     /// This process's host identity. The engine owns exactly the placed ranks
@@ -108,16 +108,6 @@ struct Args {
 
     #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
     graph_policy: String,
-}
-
-/// Reads and validates a deployment configuration file.
-fn read_workers(path: &str) -> Result<Box<[WorkerConfig]>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read deployment configuration {path}: {error}"))?;
-    let workers: Vec<WorkerConfig> = serde_json::from_str(&text)
-        .map_err(|error| format!("invalid deployment configuration {path}: {error}"))?;
-    WorkerConfig::validate_all(&workers).map_err(|error| error.to_string())?;
-    Ok(workers.into_boxed_slice())
 }
 
 /// Parses a command-line value that must be a JSON object.
