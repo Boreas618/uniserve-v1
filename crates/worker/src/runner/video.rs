@@ -543,7 +543,9 @@ impl TextEncoding {
             },
         )?;
         let mut workspaces = StreamWorkspaces::default();
-        let binding = crate::model::bind::bind(interface, &mut workspaces, vec![prepared])?
+        // The encoders declare no symmetric workspace, so none is
+        // allocated over the worker's ranks.
+        let binding = crate::model::bind::bind(interface, &mut workspaces, vec![prepared], None)?
             .pop()
             .ok_or_else(|| Error::Invariant("the text encoder was not bound".into()))?;
         let borrowed = || -> Result<Stream> {

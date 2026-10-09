@@ -562,6 +562,7 @@ fn run(
         storage,
         text,
         image,
+        experts,
         ..
     } = parts;
     let (Some(runtime), Some(storage)) = (image, storage) else {
@@ -610,7 +611,7 @@ fn run(
                 batch.encode(call, images)?
             }
             CallKind::Media(MediaCall::LatentPreparation) => batch.prepare_latents()?,
-            CallKind::Media(MediaCall::Denoising) => batch.denoise(text)?,
+            CallKind::Media(MediaCall::Denoising) => batch.denoise(text, experts)?,
             CallKind::Media(MediaCall::ImageDecoding) => batch.decode()?,
             CallKind::Transfer(TransferMode::KvExport) => batch.export_conditioning()?,
             _ => ForwardStats::default(),

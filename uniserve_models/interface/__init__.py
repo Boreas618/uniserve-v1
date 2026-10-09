@@ -24,6 +24,7 @@ _AREAS = (
     "binding",
     "canvas",
     "distributed",
+    "experts",
     "graphs",
     "image",
     "encoder",

@@ -125,6 +125,8 @@ pub(crate) struct Startup<'a> {
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
+    /// The process group symmetric workspaces are allocated over.
+    pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
 }
 
 /// One call the runtime binds.
@@ -341,7 +343,7 @@ impl ImageRuntime {
                 },
             )?);
         }
-        let bindings = bind::bind(interface, startup.workspaces, prepared)?;
+        let bindings = bind::bind(interface, startup.workspaces, prepared, startup.peers)?;
 
         // The latent pool lives on the denoiser's device.
         let denoiser_device = targets

@@ -46,12 +46,18 @@ use crate::executor::lifecycle::RequestStorage;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
 use crate::runner::graphs::GraphMode;
-use crate::runner::text::TextRunner;
-use crate::runner::text::{Executed, RowSource, StepContext, StepRequest, TokenRow};
-use crate::storage::{BlockTables, KVCacheManager};
-use crate::storage::{OutputPool, UnitColumn};
+use crate::runner::text::{
+    Executed, RowSource, Staged, StepContext, StepRequest, TextRunner, TokenRow,
+};
+use crate::storage::{BlockTables, KVCacheManager, OutputPool, UnitColumn};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
+
+/// The KV storage a text step borrows.
+pub(crate) struct StepParts<'a> {
+    pub(crate) tables: &'a BlockTables,
+    pub(crate) cache: &'a mut KVCacheManager<Arc<Retirement>>,
+}
 
 use batch::TokenBatch;
 use commit::Failure;
@@ -60,12 +66,20 @@ use step::Stepped;
 /// Fields of a call's completion section: valid, active, token, accepted.
 const COMPLETION_FIELDS: usize = 4;
 
-/// The text runtime of a rank: one runner per lane binding, the slot
-/// continuation state they share, and their output storage.
+/// The text runtime of a rank: one runner per lane binding, or per expert
+/// microbatch of it, the slot continuation state they share, and their
+/// output storage.
 pub(crate) struct TextRuntime {
     runners: Vec<TextRunner>,
+    /// Each lane binding's runners, one per expert microbatch; the first
+    /// runs on the lane's stream, the others on its forks.
+    groups: Vec<Vec<usize>>,
+    /// The NCCL communicators of the runners' bindings, destroyed after
+    /// their graphs.
+    collectives: Vec<crate::parallel::StreamCollectives>,
     /// The unit reset column of each runner's stream.
     columns: Vec<UnitColumn>,
+    /// The group serving each component's call kind.
     routes: HashMap<(String, CallKind), usize>,
     state: DecodeState,
     outputs: OutputPool,
@@ -94,6 +108,149 @@ impl TextRuntime {
         &self.order
     }
 
+    /// The group of `runner` and its microbatch index in it.
+    pub(crate) fn locate(&self, runner: usize) -> Result<(usize, usize)> {
+        self.groups
+            .iter()
+            .enumerate()
+            .find_map(|(group, peers)| {
+                peers
+                    .iter()
+                    .position(|&peer| peer == runner)
+                    .map(|peer| (group, peer))
+            })
+            .ok_or_else(|| Error::Invariant("a text runner belongs to no group".into()))
+    }
+
+    /// The warmup and capture plan every source of an expert union must
+    /// share: each group's microbatches and graph shapes.
+    pub(crate) fn capture_plan(&self) -> serde_json::Value {
+        let groups: Vec<serde_json::Value> = self
+            .groups
+            .iter()
+            .map(|group| {
+                let shapes = self.runners[group[0]].shapes();
+                serde_json::json!({
+                    "microbatches": group.len(),
+                    "decode": shapes.decode(),
+                    "prefill": shapes
+                        .prefill()
+                        .iter()
+                        .map(|shape| (shape.row_bucket, shape.token_bucket, shape.outputs))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(groups)
+    }
+
+    /// Run one invocation per microbatch runner of `group` (`None` for an
+    /// empty microbatch) as one numerical step.
+    ///
+    /// Without experts the group has one runner and its invocation runs on
+    /// the caller's thread. With experts, the step is an expert step: every
+    /// microbatch stream forks from the group's lane stream before inputs
+    /// are staged; the ranks agree on the step's capacity (or, during
+    /// warmup, it is `forced` or derived and announced); then the
+    /// microbatches run in rotation, empty ones joining, and the lane stream
+    /// waits on every microbatch stream. Microbatches replay their graphs
+    /// only once the union joins by replay
+    /// ([`super::experts::ExpertRuntime::replays`]).
+    pub(crate) fn invoke(
+        &mut self,
+        experts: Option<&super::experts::ExpertRuntime>,
+        group: usize,
+        requests: &[Option<StepRequest<'_>>],
+        context: &mut StepParts<'_>,
+        forced: Option<usize>,
+    ) -> Result<Vec<Option<Executed>>> {
+        let peers = self.groups[group].clone();
+        if requests.len() != peers.len() {
+            return Err(Error::Invariant(
+                "a text step has one invocation per microbatch".into(),
+            ));
+        }
+        let state = &self.state;
+        let mut step = |runner: &TextRunner, request: &StepRequest<'_>| {
+            runner.stage(
+                request,
+                &mut StepContext {
+                    tables: context.tables,
+                    cache: context.cache,
+                    state,
+                },
+            )
+        };
+        let Some(experts) = experts else {
+            let [runner] = peers[..] else {
+                return Err(Error::Invariant(
+                    "microbatch runners require expert execution".into(),
+                ));
+            };
+            let request = requests[0]
+                .as_ref()
+                .ok_or(Error::State("a text step has an invocation"))?;
+            let staged = step(&self.runners[runner], request)?;
+            let launch = self.runners[runner].launch(&staged, None, true)?;
+            launch.call.invoke()?;
+            let executed = self.runners[runner].finish(staged, None, launch.mode)?;
+            return Ok(vec![Some(executed)]);
+        };
+
+        let lane = self.runners[peers[0]]
+            .stream()
+            .ok_or(Error::State("expert steps run on a CUDA stream"))?;
+        // SAFETY: the lanes own the stream for the runtime's lifetime.
+        let lane = unsafe { uniserve_cuda::Stream::borrowed(lane.device(), lane.raw()) }?;
+        experts.fork(&lane)?;
+        let mut staged = Vec::with_capacity(peers.len());
+        for (&runner, request) in peers.iter().zip(requests) {
+            staged.push(
+                request
+                    .as_ref()
+                    .map(|request| step(&self.runners[runner], request))
+                    .transpose()?,
+            );
+        }
+        let tokens = staged
+            .iter()
+            .flatten()
+            .map(Staged::expert_tokens)
+            .max()
+            .unwrap_or(0);
+        let capacity = experts.capacity(tokens, group as i64, forced)?;
+        let replay = experts.replays();
+        let mut modes = Vec::with_capacity(peers.len());
+        let mut calls = Vec::with_capacity(peers.len());
+        for (&runner, staged) in peers.iter().zip(&staged) {
+            match staged {
+                Some(staged) => {
+                    let launch = self.runners[runner].launch(staged, Some(capacity), replay)?;
+                    modes.push(Some(launch.mode));
+                    calls.push(Some(launch.call));
+                }
+                None => {
+                    modes.push(None);
+                    calls.push(None);
+                }
+            }
+        }
+        {
+            let _range = crate::profiling::range(c"uniserve.expert.step", None);
+            experts.run(&lane, calls, capacity)?;
+        }
+        let mut executed = Vec::with_capacity(peers.len());
+        for ((&runner, staged), mode) in peers.iter().zip(staged).zip(modes) {
+            executed.push(match (staged, mode) {
+                (Some(staged), Some(mode)) => {
+                    Some(self.runners[runner].finish(staged, Some(capacity), mode)?)
+                }
+                _ => None,
+            });
+        }
+        Ok(executed)
+    }
+
     /// The order of this runtime's batches, for other runtimes that also
     /// write what text batches read (guidance prefixes, latent images'
     /// K/V).
@@ -101,20 +258,27 @@ impl TextRuntime {
         &mut self.order
     }
 
-    /// The device, stream and payload words of work that reads or writes
-    /// `component`'s K/V beside its text batches: its prefill runner's.
-    pub(crate) fn placement(
-        &self,
-        component: &str,
-    ) -> Result<(Option<i32>, Option<Stream>, usize)> {
-        let runner = self
+    /// The runner on the lane stream of the group serving `component`'s
+    /// prefills, and the group.
+    fn prefill_lane(&self, component: &str) -> Result<(usize, usize)> {
+        let group = self
             .route(component, CallKind::Forward(ForwardMode::Prefill))
             .ok_or_else(|| {
                 Error::Unsupported(format!(
                     "component {component:?} has no text prefill binding"
                 ))
             })?;
-        let runner = &self.runners[runner];
+        Ok((self.groups[group][0], group))
+    }
+
+    /// The device, stream and payload words of work that reads or writes
+    /// `component`'s K/V beside its text batches: its prefill lane's.
+    pub(crate) fn placement(
+        &self,
+        component: &str,
+    ) -> Result<(Option<i32>, Option<Stream>, usize)> {
+        let (lane, _) = self.prefill_lane(component)?;
+        let runner = &self.runners[lane];
         let stream = runner
             .stream()
             // SAFETY: the lanes own the stream for the runtime's lifetime.
@@ -123,39 +287,30 @@ impl TextRuntime {
         Ok((runner.device(), stream, 0))
     }
 
-    /// The unit reset column of `component`'s prefill runner stream (see
+    /// The unit reset column of `component`'s prefill lane stream (see
     /// [`Self::placement`]), for work that assigns K/V units beside its
     /// text batches.
     pub(crate) fn unit_column(&self, component: &str) -> Result<&UnitColumn> {
-        let runner = self
-            .route(component, CallKind::Forward(ForwardMode::Prefill))
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "component {component:?} has no text prefill binding"
-                ))
-            })?;
-        Ok(&self.columns[runner])
+        let (lane, _) = self.prefill_lane(component)?;
+        Ok(&self.columns[lane])
     }
 
     /// Write the K/V of token prefixes, each from position zero of its
-    /// slot, with `component`'s prefill runner: guidance prefixes of image
-    /// trajectories. The prefixes are evaluated causally and only their K/V
-    /// is kept; slot continuation state is unchanged. The caller installed
-    /// the slots' block tables and retains their extents.
+    /// slot, with `component`'s prefill lane runner: guidance prefixes of
+    /// image trajectories. The prefixes are evaluated causally and only
+    /// their K/V is kept; slot continuation state is unchanged. The caller
+    /// installed the slots' block tables and retains their extents. On a
+    /// rank of an expert union the evaluation is an expert step whose other
+    /// microbatches join.
     pub(crate) fn prefill_cache(
         &mut self,
+        experts: Option<&super::experts::ExpertRuntime>,
         component: &str,
         prefixes: &[(u32, &[u32])],
         tables: &BlockTables,
         cache: &mut KVCacheManager<Arc<Retirement>>,
     ) -> Result<Executed> {
-        let runner = self
-            .route(component, CallKind::Forward(ForwardMode::Prefill))
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "component {component:?} has no text prefill binding"
-                ))
-            })?;
+        let (lane, group) = self.prefill_lane(component)?;
         let rows: Vec<TokenRow> = prefixes
             .iter()
             .map(|&(slot, tokens)| {
@@ -175,26 +330,34 @@ impl TextRuntime {
                 })
             })
             .collect::<Result<_>>()?;
-        let stream = self.runners[runner]
+        let stream = self.runners[lane]
             .stream()
             // SAFETY: the lanes own the stream for the runtime's lifetime.
             .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
             .transpose()?;
         self.order.wait(stream.as_ref())?;
-        let executed = self.runners[runner].execute(
-            &StepRequest {
-                decode: false,
-                rows: &rows,
-                sampling: None,
-                prompt: &[],
-                embeddings: &[],
-            },
-            &mut StepContext {
-                tables,
-                cache,
-                state: &self.state,
-            },
-        )?;
+
+        // The lane's runner evaluates every prefix.
+        let mut requests: Vec<Option<StepRequest<'_>>> = vec![Some(StepRequest {
+            decode: false,
+            rows: &rows,
+            sampling: None,
+            prompt: &[],
+            embeddings: &[],
+        })];
+        requests.resize_with(self.groups[group].len(), || None);
+        let executed = self
+            .invoke(
+                experts,
+                group,
+                &requests,
+                &mut StepParts { tables, cache },
+                None,
+            )?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| Error::Invariant("the prefix evaluation did not run".into()))?;
         self.order.record(stream.as_ref())?;
         Ok(executed)
     }
@@ -206,6 +369,9 @@ impl TextRuntime {
         let mut result = Ok(());
         for runner in &mut self.runners {
             result = result.and(runner.close(aborted));
+        }
+        for collectives in &mut self.collectives {
+            result = result.and(collectives.close(aborted));
         }
         self.outputs.begin_close();
         if !aborted {
@@ -315,6 +481,7 @@ fn run(parts: Parts<'_>, plan: &BatchPlan) -> std::result::Result<Option<Launche
         parts.image,
         storage,
         parts.requests,
+        parts.experts,
         parts.info,
         parts.rank,
         plan,
@@ -362,13 +529,12 @@ impl TokenBatch<'_> {
     /// were published.
     fn finish_skipped(&mut self) -> std::result::Result<(), Failure> {
         let empty = Stepped {
+            invocations: Vec::new(),
             executed: crate::runner::text::Executed {
                 mode: GraphMode::Eager,
                 live_tokens: 0,
                 padded_tokens: 0,
             },
-            sampling: None,
-            tasks: 0,
             rows: 0,
             drafts: 0,
         };

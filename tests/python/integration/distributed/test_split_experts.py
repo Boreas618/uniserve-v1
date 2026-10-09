@@ -1,23 +1,29 @@
-"""Quantized split experts preserve encodings and weight completed routes."""
+"""Quantized split experts preserve encodings and weight completed routes.
+
+Source ranks route rows to dedicated expert ranks through split MegaMoE on
+peer-mapped symmetric storage; eager steps and graph replays return the
+exact routed equation, also when a source has no rows and only joins.
+"""
 
 import argparse
 import os
 import socket
-from contextlib import ExitStack
-from functools import partial
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
-from uniserve_models.runtime.expert_exchange import ExpertExchange
-from uniserve_models.runtime.process_groups import initialize_process_groups
 
+from uniserve_models.backends.experts import TorchBootstrap
+from uniserve_models.backends.experts import create as create_transport
+from uniserve_models.backends.experts.split import symmetric_bytes
 from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import Communicator, partition_experts
+from uniserve_models.distributed.symmetric import allocate_symmetric_storage
+from uniserve_models.interface import graphs
 from uniserve_models.model import TextSize
 from uniserve_models.nn.moe import FusedMoE
 from uniserve_models.quantization import Quantizer
-from uniserve_models.runtime import CUDAGraph, CUDAStream, Microbatches
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -38,14 +44,17 @@ def _exercise(
     expert_ranks = tuple(range(attention_ranks, world_size))
     experts = 2 * len(expert_ranks)
     source = rank < attention_ranks
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=local_rank,
-        world_size=world_size,
-        device=device,
-        backend="cpu:gloo,cuda:nccl",
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "cpu:gloo,cuda:nccl",
         init_method=init_method,
-    ) as groups:
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        union = Communicator(
+            tuple(range(world_size)), rank, "experts", device, dist.group.WORLD
+        )
         activation = (
             Quantizer(format, calibrated_scale=1.0)
             if format == "nvfp4"
@@ -100,35 +109,47 @@ def _exercise(
                     Quantizer(format).quantize(value), requires_grad=False
                 )
 
-        exchanges = [
-            ExpertExchange(
-                groups.process_group,
-                max_tokens=capacity,
-                top_k=top_k,
-                num_experts=experts,
-                hidden_size=width,
-                device=device,
-                transport="megamoe",
-                attention_ranks=attention_ranks,
-                intermediate_size=intermediate,
-                activation="silu",
-            )
-            for _ in range(2)
-        ]
-        with ExitStack() as scope:
-            contexts = []
-            for exchange in exchanges:
-                stream = scope.enter_context(
-                    CUDAStream.external(torch.cuda.Stream(device=device))
-                )
-                stream.wait(torch.cuda.current_stream(device))
-                context = scope.enter_context(
-                    ExecutionContext(model, stream=stream, experts=exchange)
-                )
-                context.prepare(TextSize(capacity, 1))
-                contexts.append(context)
-            run = Microbatches(contexts)
-            scope.callback(run.close)
+        storage = allocate_symmetric_storage(
+            union,
+            (
+                symmetric_bytes(
+                    size=world_size,
+                    attention_ranks=attention_ranks,
+                    max_tokens=capacity,
+                    num_experts=experts,
+                    top_k=top_k,
+                    hidden=width,
+                    intermediate=intermediate,
+                    format=format,
+                ),
+            ),
+            torch.int8,
+        )
+        exchange = create_transport(
+            "megamoe",
+            union,
+            TorchBootstrap(dist.group.WORLD),
+            max_tokens=capacity,
+            top_k=top_k,
+            num_experts=experts,
+            hidden_size=width,
+            intermediate_size=intermediate,
+            activation="silu",
+            attention_ranks=attention_ranks,
+            device=device,
+            encoding=format,
+            symmetric={
+                "storage": storage.local,
+                "pointers": [peer.data_ptr() for peer in storage.peers],
+            },
+        )
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with ExecutionContext(
+            model, stream=stream, experts=exchange
+        ) as context:
+            context.prepare(TextSize(capacity, 1))
+            exchange.bind_microbatches([exchange])
             for empty in (False, True):
                 count = 0 if not source or empty and rank == 0 else 5 + rank % 3
                 magnitudes = torch.tensor(
@@ -151,26 +172,17 @@ def _exercise(
                     .contiguous()
                 )
 
-                def call(lane):
-                    exchange, context = exchanges[lane], contexts[lane]
-                    exchange.begin(capacity)
-                    try:
-                        output = (
+                def call():
+                    with context.activate(), context.expert_step(capacity):
+                        return (
                             torch.stack(
-                                [
-                                    layer(hidden, ids, weights * 2**lane)
-                                    for layer in model
-                                ]
+                                [layer(hidden, ids, weights) for layer in model]
                             )
                             if source
                             else hidden.expand(len(model), -1, -1)
                         )
-                        context.join_expert_layers()
-                        return output
-                    finally:
-                        exchange.end()
 
-                def compare(outputs):
+                def compare(output):
                     # The exact routed equation; six BF16 roundoffs cover
                     # projections, remote weighted rows and combine, matching
                     # the distributed grouped-expert numerical contract.
@@ -185,26 +197,22 @@ def _exercise(
                             for layer in range(len(model))
                         ]
                     )
-                    for lane, output in enumerate(outputs):
-                        torch.testing.assert_close(
-                            output.double(),
-                            expected * 2**lane,
-                            rtol=6 / 250,
-                            atol=0,
-                        )
+                    torch.testing.assert_close(
+                        output.double(), expected, rtol=6 / 250, atol=0
+                    )
 
-                calls = [partial(call, lane) for lane in range(2)]
-                outputs = run(calls)
+                compare(call())
                 torch.cuda.synchronize(device)
-                compare(outputs)
-                with CUDAGraph(context=contexts[0]) as graph:
-                    graph.capture(lambda: run(calls))
-                    for _ in range(4):
-                        outputs = graph.replay()
-                        contexts[0].stream.synchronize()
-                        compare(outputs)
-        for exchange in exchanges:
-            exchange.close()
+                graph = graphs.capture(call, stream=stream)
+                for _ in range(4):
+                    with torch.cuda.stream(stream):
+                        output = graph.replay()
+                    stream.synchronize()
+                    compare(output)
+                graph.release()
+        exchange.close()
+    finally:
+        dist.destroy_process_group()
 
 
 def _local(rank, port, format, width, intermediate):

@@ -24,6 +24,11 @@
 //! Without pools (CPU lanes, graph policy off) every invocation runs
 //! eagerly. A tail that exchanges tokens with expert peers always runs
 //! eagerly, once over every slot of the invocation.
+//!
+//! With expert-parallel layers, a readout (its pass and an exchanging
+//! tail) and a step are each one expert step: the caller's coordinator
+//! ([`Coordinate`]) turns the invocation's token extent into the step's
+//! agreed capacity, and graphs are captured and replayed per capacity.
 
 pub(crate) mod inputs;
 pub(crate) mod shapes;
@@ -43,6 +48,10 @@ use crate::{Error, Result};
 
 pub(crate) use inputs::{CanvasRow, ReadoutPass, StepRow};
 pub(crate) use shapes::{CanvasGraphKey, CanvasShapes, SLOT_BUCKETS, step_rows};
+
+/// Turns an invocation's expert token extent into its expert step's
+/// capacity; `None` without expert-parallel layers.
+pub(crate) type Coordinate<'a> = &'a mut dyn FnMut(usize) -> Result<Option<usize>>;
 
 /// Candidates selected and read back per readout pass of the bound
 /// candidate buffers.
@@ -160,11 +169,12 @@ impl CanvasRunner {
         writes.submit(self.device(), self.lane.stream.as_ref())
     }
 
-    /// Run `capture` as the graph of `key`, or replay the graph resident for
-    /// it; without pools run `eager`.
+    /// Run `capture` as the graph of `key` at expert `capacity`, or replay
+    /// the graph resident for them; without pools run `eager`.
     fn run(
         &mut self,
         key: CanvasGraphKey,
+        capacity: Option<usize>,
         capture: Capture<'_>,
         attention: Option<&Attention<'_>>,
         eager: impl FnOnce(&CanvasModel) -> Result<()>,
@@ -174,14 +184,17 @@ impl CanvasRunner {
             self.graphs.record(GraphMode::Eager);
             return Ok(GraphMode::Eager);
         };
-        let mode = match self.graphs.lookup(&key, None)? {
+        let mode = match self.graphs.lookup(&key, capacity)? {
             Lookup::Replay(graph) => {
                 self.lane.model.replay(graph, attention)?;
                 GraphMode::Replay
             }
             Lookup::Capture => {
-                let graph = self.lane.model.capture(capture, pool)?;
-                self.graphs.insert(key, None, graph)?;
+                let graph = self
+                    .lane
+                    .model
+                    .capture(capture, pool, capacity.unwrap_or(0))?;
+                self.graphs.insert(key, capacity, graph)?;
                 GraphMode::Capture
             }
         };
@@ -197,7 +210,8 @@ impl CanvasRunner {
             ));
         };
         if let Lookup::Capture = self.graphs.lookup(&key, None)? {
-            let graph = self.lane.model.capture(Capture::Tail { slots }, pool)?;
+            // A local tail exchanges no tokens.
+            let graph = self.lane.model.capture(Capture::Tail { slots }, pool, 0)?;
             self.graphs.insert(key, None, graph)?;
             self.graphs.record(GraphMode::Capture);
         } else {
@@ -224,6 +238,7 @@ impl CanvasRunner {
     pub(crate) fn readout(
         &mut self,
         pass: &ReadoutPass<'_>,
+        coordinate: Coordinate<'_>,
         mut sink: impl FnMut(Range<usize>, &crate::storage::memory::StorageView) -> Result<()>,
     ) -> Result<ReadoutRun> {
         let facts = Arc::clone(&self.lane.facts);
@@ -313,21 +328,35 @@ impl CanvasRunner {
             widths: &metadata.widths,
             starts: &metadata.starts,
         };
+        // The expert step carries the pass's tokens and, through an
+        // exchanging tail, the slot rows.
+        let extent = if facts.local_tail {
+            padded_tokens
+        } else {
+            padded_tokens.max(pass.slots.len())
+        };
+        let capacity = coordinate(extent)?;
+        let expert_capacity = capacity.unwrap_or(0);
         let mode = self.run(
             bucket,
+            capacity,
             Capture::Attend {
                 tokens: padded_tokens,
                 attention,
             },
             Some(&attention),
-            |model| model.readout_attend(padded_tokens, &attention),
+            |model| model.readout_attend(padded_tokens, &attention, expert_capacity),
         )?;
 
         // The tail: replayed slot chunks on a local final stage with graphs,
         // otherwise one eager evaluation over every slot.
         let chunked = graph && facts.local_tail && facts.last_stage();
         let eager = if facts.last_stage() && !chunked {
-            Some(self.lane.model.readout_finish(pass.slots.len())?)
+            Some(
+                self.lane
+                    .model
+                    .readout_finish(pass.slots.len(), expert_capacity)?,
+            )
         } else {
             None
         };
@@ -382,7 +411,12 @@ impl CanvasRunner {
     ///
     /// Returns how the step ran; the rows' int64 `[1 + canvas]` results are
     /// the leading rows of [`Self::step_results`].
-    pub(crate) fn step(&mut self, rows: &[StepRow], pages: &[TablePages]) -> Result<StepRun> {
+    pub(crate) fn step(
+        &mut self,
+        rows: &[StepRow],
+        pages: &[TablePages],
+        coordinate: Coordinate<'_>,
+    ) -> Result<StepRun> {
         let banks = self
             .lane
             .banks
@@ -458,14 +492,16 @@ impl CanvasRunner {
             widths: &metadata.widths,
             starts: &metadata.starts,
         };
+        let capacity = coordinate(padded * length)?;
         let mode = self.run(
             CanvasGraphKey::Step {
                 rows: padded,
                 first,
             },
+            capacity,
             Capture::Step { first, attention },
             Some(&attention),
-            |model| model.step(first, &attention),
+            |model| model.step(first, &attention, capacity.unwrap_or(0)),
         )?;
         Ok(StepRun {
             mode,
@@ -490,7 +526,17 @@ impl CanvasRunner {
     /// generating CUDA lane runs one eager step of every sampler chunk
     /// shape, whose first self-conditioning product chooses its algorithm
     /// and synchronizes the device, so serving never does.
-    pub(crate) fn warm(&mut self, scratch: &dyn Fn(usize) -> Vec<u32>) -> Result<()> {
+    ///
+    /// With expert-parallel layers, `variants(extent)` lists the expert
+    /// capacities an invocation of that token extent is captured at
+    /// (largest first) and `coordinate(extent, capacity)` runs its warmup
+    /// step at one of them; every rank warms the same sequence.
+    pub(crate) fn warm(
+        &mut self,
+        scratch: &dyn Fn(usize) -> Vec<u32>,
+        variants: &dyn Fn(usize) -> Vec<Option<usize>>,
+        coordinate: &mut dyn FnMut(usize, Option<usize>) -> Result<Option<usize>>,
+    ) -> Result<()> {
         if self.lane.pool.is_none() {
             let chunk = match (&self.lane.stream, self.lane.buffers.layout().step) {
                 (Some(_), Some(step)) if self.sampling().is_some() => step.chunk_rows,
@@ -498,7 +544,9 @@ impl CanvasRunner {
             };
             for count in 1..=chunk {
                 let pages = self.scratch_pages(count, self.lane.facts.canvas_length, scratch)?;
-                self.step(&synthetic_steps(count, true), &pages)?;
+                self.step(&synthetic_steps(count, true), &pages, &mut |extent| {
+                    coordinate(extent, None)
+                })?;
             }
             return self.synchronize();
         }
@@ -531,14 +579,30 @@ impl CanvasRunner {
                     }
                     tails = false;
                 }
-                self.readout(&pass, |_, _| Ok(()))?;
+                let (rows, length) = self.lane.shapes.readout(count, length)?;
+                let tokens = CanvasGraphKey::Readout { rows, length }.tokens(facts.canvas_length);
+                let extent = if facts.local_tail {
+                    tokens
+                } else {
+                    tokens.max(count)
+                };
+                for capacity in variants(extent) {
+                    self.readout(&pass, &mut |extent| coordinate(extent, capacity), |_, _| {
+                        Ok(())
+                    })?;
+                }
             }
         }
         if self.sampling().is_some() {
             for &count in &rows {
                 let pages = self.scratch_pages(count, facts.canvas_length, scratch)?;
+                let padded = self.lane.shapes.step(count)?;
                 for first in [true, false] {
-                    self.step(&synthetic_steps(count, first), &pages)?;
+                    for capacity in variants(padded * facts.canvas_length) {
+                        self.step(&synthetic_steps(count, first), &pages, &mut |extent| {
+                            coordinate(extent, capacity)
+                        })?;
+                    }
                 }
             }
         }

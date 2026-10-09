@@ -73,6 +73,9 @@ CONSTANTS = sampler.CanvasSampling(
 SLOTS = 3
 ROWS = 4
 TOKENS = 64
+# The expert step capacity of calls on these models, which have no
+# expert-parallel layer.
+NO_EXPERT_STEP = 0
 
 
 @dataclass(frozen=True)
@@ -420,8 +423,9 @@ def test_a_readout_reads_every_candidate_of_rows_of_different_lengths(
         [PROMPT, PROMPT],
         widths,
         starts,
+        NO_EXPERT_STEP,
     )
-    tail = functions["readout_finish"](len(packed))
+    tail = functions["readout_finish"](len(packed), NO_EXPERT_STEP)
     functions["readout_candidates"](tail, 0, len(index))
 
     torch.testing.assert_close(
@@ -497,6 +501,7 @@ def test_canvas_steps_follow_the_sampler_and_commit_their_slots(tmp_path):
             [PROMPT] * rows,
             widths,
             starts,
+            NO_EXPERT_STEP,
         )
 
     for step in range(2):
@@ -637,8 +642,11 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
         prefixes,
         widths,
         starts,
+        NO_EXPERT_STEP,
     )
-    tail = _synchronized(functions["readout_finish"], len(slots))
+    tail = _synchronized(
+        functions["readout_finish"], len(slots), NO_EXPERT_STEP
+    )
     _synchronized(functions["readout_candidates"], tail, 0, count)
     eager = buffers["candidate_logprobs"][:count].clone()
 
@@ -653,11 +661,14 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
         "readout_attend",
         [4, 64, 32, *padded, widths, starts],
         pool,
+        NO_EXPERT_STEP,
     )
     buffers["candidate_logprobs"].zero_()
     buffers["tail_rows"].zero_()
     buffers["tail_rows"][: len(slots)] = torch.tensor(slots).cuda()
-    tail = _synchronized(functions["capture"], "readout_tail", [64], pool)
+    tail = _synchronized(
+        functions["capture"], "readout_tail", [64], pool, NO_EXPERT_STEP
+    )
     buffers["attend_state.0"].zero_()
     buffers["attend_state.1"].zero_()
     _synchronized(functions["replay"], attend, *padded, starts)
@@ -689,13 +700,19 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
             _gather(session, rows, 2)
 
         restore()
-        _synchronized(functions["step"], 2, step == 0, *metadata)
+        _synchronized(
+            functions["step"], 2, step == 0, *metadata, NO_EXPERT_STEP
+        )
         expected = {name: buffers[f"bank.{name}"].clone() for name in names}
         results = buffers["step.results"][:2].clone()
 
         restore()
         graph = _synchronized(
-            functions["capture"], "step", [2, step == 0, *metadata], pool
+            functions["capture"],
+            "step",
+            [2, step == 0, *metadata],
+            pool,
+            NO_EXPERT_STEP,
         )
         restore()
         buffers["step.results"].zero_()

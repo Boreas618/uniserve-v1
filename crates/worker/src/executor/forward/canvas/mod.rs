@@ -38,6 +38,7 @@ use uniserve_ipc::{
 };
 
 use super::super::backend::{WorkerBackend, WorkerBatch};
+use super::experts::ExpertRuntime;
 use super::launch::{
     Launched, StreamOrder, error_code, failed_output, lock, read_flag, reports_output, seal,
 };
@@ -63,6 +64,9 @@ pub(crate) use start::{CANVAS_KIND, Startup, reserved_bytes};
 /// banks they share and their output storage.
 pub(crate) struct CanvasRuntime {
     runners: Vec<CanvasRunner>,
+    /// The NCCL communicators of the runners' bindings, destroyed after
+    /// their graphs.
+    collectives: Vec<crate::parallel::StreamCollectives>,
     routes: HashMap<String, usize>,
     /// The block-diffusion sampling a generating rank serves.
     sampling: Option<CanvasSampling>,
@@ -83,6 +87,28 @@ pub(crate) struct Context<'a> {
     /// The text runtime's batch order: canvases read the KV its prefills
     /// write, possibly on another stream.
     pub(crate) text: Option<&'a StreamOrder>,
+    /// The rank's expert runtime, when canvas invocations are expert steps.
+    pub(crate) experts: Option<&'a ExpertRuntime>,
+}
+
+/// The expert call kind of canvas runner `index`: distinct from the text
+/// runtime's kinds, so the union's ready kinds take turns.
+pub(crate) fn expert_kind(index: usize) -> i64 {
+    64 + index as i64
+}
+
+/// The coordinator of canvas runner `index`'s expert steps: agreement while
+/// serving, announced or `forced` capacities during warmup.
+pub(crate) fn coordinator<'a>(
+    experts: Option<&'a ExpertRuntime>,
+    index: usize,
+    forced: Option<usize>,
+) -> impl FnMut(usize) -> Result<Option<usize>> + 'a {
+    move |extent| {
+        experts
+            .map(|experts| experts.capacity(extent, expert_kind(index), forced))
+            .transpose()
+    }
 }
 
 /// A failure, the batch phase it happened in and whether the batch had
@@ -127,6 +153,24 @@ struct Reserved {
 }
 
 impl CanvasRuntime {
+    /// The warmup and capture plan every source of an expert union must
+    /// share: each runner's readout and step buckets.
+    pub(crate) fn capture_plan(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.runners
+                .iter()
+                .map(|runner| {
+                    let shapes = runner.shapes();
+                    serde_json::json!({
+                        "rows": shapes.rows(),
+                        "lengths": shapes.lengths(),
+                        "steps": runner.sampling().is_some(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
     /// Seal every runner's graphs.
     pub(crate) fn seal(&mut self) {
         for runner in &mut self.runners {
@@ -139,6 +183,9 @@ impl CanvasRuntime {
         let mut result = Ok(());
         for runner in &mut self.runners {
             result = result.and(runner.close(aborted));
+        }
+        for collectives in &mut self.collectives {
+            result = result.and(collectives.close(aborted));
         }
         self.outputs.begin_close();
         if !aborted {
@@ -171,6 +218,7 @@ impl CanvasRuntime {
             tensors,
             events,
             text,
+            experts,
         } = context;
         let calls = &plan.calls;
         let first = calls
@@ -267,6 +315,7 @@ impl CanvasRuntime {
         let batch = Batch {
             runtime: self,
             index,
+            experts,
             requests,
             kv,
             tensors,
@@ -357,6 +406,7 @@ impl RequestStorage for CanvasRuntime {
 struct Batch<'a> {
     runtime: &'a mut CanvasRuntime,
     index: usize,
+    experts: Option<&'a ExpertRuntime>,
     requests: &'a mut RequestPool,
     kv: &'a mut KVCache,
     tensors: &'a TensorStore,
@@ -563,9 +613,10 @@ impl Batch<'_> {
         let mut spans: Vec<Option<(usize, usize)>> = vec![None; active.len()];
         let (stream, events) = (self.stream, self.events);
         let runner = &mut self.runtime.runners[self.index];
+        let mut coordinate = coordinator(self.experts, self.index, None);
         let run = {
             let mut output = lock(buffer);
-            runner.readout(&pass, |range, values| {
+            runner.readout(&pass, &mut coordinate, |range, values| {
                 for (call, candidates) in ranges.iter().enumerate() {
                     let start = range.start.max(candidates.start);
                     let end = range.end.min(candidates.end);
@@ -658,7 +709,10 @@ impl Batch<'_> {
             .prepare_attention(&attention, |_, _, _| Ok(()))
             .map_err(&execute)?;
         let runner = &mut self.runtime.runners[self.index];
-        let run = runner.step(&steps, &pages).map_err(&execute)?;
+        let mut coordinate = coordinator(self.experts, self.index, None);
+        let run = runner
+            .step(&steps, &pages, &mut coordinate)
+            .map_err(&execute)?;
         let length = runner.facts().canvas_length;
 
         // One copy of every row's `[outcome | canvas]` result.
@@ -806,6 +860,7 @@ pub(crate) fn execute(
         tensors,
         events,
         text: parts.text.map(|text| text.order()),
+        experts: parts.experts,
     };
     let failure = match runtime.launch(context, &plan) {
         Ok(launched) => {

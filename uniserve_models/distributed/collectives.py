@@ -1,10 +1,12 @@
 """Backend collectives behind the logical model communicators.
 
-Numerical code calls :class:`uniserve_models.distributed.Communicator`, which
-orders logical members. This module resolves each call to the stream-bound
-communicator selected by the active execution scope or, without one, to the
-initialized process group, and owns asynchronous completion. Torch custom ops
-keep the process-group name traceable through captured graphs.
+Numerical code calls :class:`uniserve_models.distributed.Communicator`,
+which orders logical members. This module resolves each call to the
+stream-bound collectives selected by the active execution scope (the
+serving worker's NCCL communicators on the binding's stream) or, without
+one, to the initialized process group of direct library use, and owns
+asynchronous completion. Torch custom ops keep the process-group name
+traceable through captured graphs.
 """
 
 from __future__ import annotations

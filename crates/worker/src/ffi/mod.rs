@@ -135,6 +135,30 @@ impl std::fmt::Debug for Handle {
     }
 }
 
+/// A function and its owned arguments, made later, possibly on another
+/// thread (a microbatch's numerical call).
+pub struct DeferredCall {
+    function: Function,
+    args: Vec<Any>,
+}
+
+// SAFETY: the arguments are integers, shapes, strings and handles: immutable
+// reference-counted TVM-FFI objects with atomic counts, which Rust never
+// dereferences; Python accesses handles under the GIL. Tensor views, which
+// must not cross threads, are never deferred.
+unsafe impl Send for DeferredCall {}
+
+impl DeferredCall {
+    pub fn new(function: Function, args: Vec<Any>) -> Self {
+        Self { function, args }
+    }
+
+    /// Make the call and drop the result.
+    pub fn invoke(self) -> Result<()> {
+        self.function.call_values(&self.args).map(drop)
+    }
+}
+
 /// A map of functions returned by a Python loading or binding function.
 pub struct Functions {
     owner: String,

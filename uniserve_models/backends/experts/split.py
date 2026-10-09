@@ -1,42 +1,77 @@
-"""Split MegaMoE execution over a source/expert union communicator.
+"""Split MegaMoE execution over a source/expert union.
 
-The runtime owns symmetric memory and native launch preparation. Models keep
-ordinary routed-expert calls; their input quantizers specify the numerical
-representation, independently of rank placement and transport.
+Attention (source) ranks precede expert ranks in the union. Each source
+writes its encoded tokens, routes and weights into peer-mapped symmetric
+storage and launches the attention-side kernel in two phases around the
+expert ranks' persistent grouped-GEMM launch. The serving runtime allocates
+the symmetric storage and maps every member's allocation
+(:func:`symmetric_bytes` sizes it); models keep ordinary routed-expert
+calls, and their input quantizers fix the numerical representation
+independently of rank placement.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from uniserve_models.quantization import QuantizedTensor, RowOrder, ScaleLayout
 
-from . import Operator
+from ..moe import Operator
 
 
-def _yield_microbatch() -> None:
-    """Hand the device to the next active microbatch, if any."""
-    # The experts runtime supplies microbatch rotation; import it at use so
-    # the provider loads without that runtime.
-    from uniserve_models.runtime.microbatches import yield_microbatch
+def _padded(width: int) -> int:
+    """Physical tile padding of a hidden or intermediate width."""
+    return (width + 511) // 512 * 512
 
-    yield_microbatch()
+
+def symmetric_bytes(
+    *,
+    size: int,
+    attention_ranks: int,
+    max_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden: int,
+    intermediate: int,
+    format: str,
+) -> int:
+    """Bytes of one member's symmetric storage for one microbatch."""
+    from uniserve_kernels.deepgemm import load
+
+    native = load()
+    alignment = native.get_token_alignment_for_mega_moe()
+    capacity = (max_tokens + alignment - 1) // alignment * alignment
+    byte_count, _, _ = native.get_symm_buffer_size_for_mega_moe_m2n(
+        attention_ranks,
+        size - attention_ranks,
+        num_experts,
+        capacity,
+        top_k,
+        _padded(hidden),
+        _padded(intermediate),
+        format == "nvfp4",
+    )
+    return int(byte_count)
 
 
 class Buffer:
     """Collective buffers for one microbatch's ordered expert calls.
 
-    Attention ranks precede expert ranks in ``group``. The first preparation
-    allocates the encoding-specific symmetric layout on every rank. Calls
-    alternate dispatch and combine before reusing that layout. The caller
-    drains streams and closes bound operators before retiring the buffer.
+    Construction is collective over ``group``: every member seeds its
+    symmetric storage, then waits on the host barrier before any peer may
+    address it. Calls alternate dispatch and combine before reusing that
+    layout. The caller drains streams and closes bound operators before
+    retiring the buffer.
     """
 
     def __init__(
         self,
         group,
+        bootstrap,
         *,
         max_tokens,
         num_experts,
@@ -46,6 +81,9 @@ class Buffer:
         activation,
         attention_ranks,
         device,
+        format: str,
+        symmetric: Mapping[str, Any],
+        yield_turn=None,
     ):
         if torch.cuda.get_device_capability(device) not in {(10, 0), (10, 3)}:
             raise ValueError("split MegaMoE requires a Blackwell CUDA device")
@@ -57,7 +95,14 @@ class Buffer:
             raise ValueError("experts must divide the expert ranks")
         if activation != "silu":
             raise ValueError("split MegaMoE requires SiLU experts")
+        if format not in {"mxfp8", "nvfp4"}:
+            raise ValueError(
+                "split MegaMoE requires MXFP8 or NVFP4 activations"
+            )
+        from uniserve_kernels.deepgemm import load
+
         self.group, self.device = group, device
+        self.bootstrap = bootstrap
         self.attention_ranks = attention_ranks
         self.expert_ranks = group.size - attention_ranks
         self.source = group.rank < attention_ranks
@@ -65,20 +110,47 @@ class Buffer:
         self.top_k, self.hidden_size = top_k, hidden
         # Physical tile padding belongs to the provider, not the model's
         # mathematical dimensions. Padded channels have exactly zero weight.
-        self.hidden = (hidden + 511) // 512 * 512
-        self.intermediate = (intermediate + 511) // 512 * 512
-        self.format = None
-        self.storage = self.handle = None
+        self.hidden = _padded(hidden)
+        self.intermediate = _padded(intermediate)
+        self.format = format
         self.operators = {}
         self.step = None
+        self.yield_turn = yield_turn or (lambda: None)
+
+        self.native = load()
+        alignment = self.native.get_token_alignment_for_mega_moe()
+        self.capacity = (
+            (self.max_tokens + alignment - 1) // alignment * alignment
+        )
+        _, _, views = self.native.get_symm_buffer_size_for_mega_moe_m2n(
+            self.attention_ranks,
+            self.expert_ranks,
+            self.num_experts,
+            self.capacity,
+            self.top_k,
+            self.hidden,
+            self.intermediate,
+            format == "nvfp4",
+        )
+        # Rust owns the storage and every peer mapping; members appear in
+        # union order.
+        self.storage = symmetric["storage"]
+        self.pointers = [int(pointer) for pointer in symmetric["pointers"]]
+        if len(self.pointers) != group.size:
+            raise ValueError("symmetric storage maps every union member")
+        self.storage.zero_()
+        # The next launch waits for its predecessor's cleanup phase. Seed
+        # the initial completed phase before publishing this buffer to peers.
+        self.storage[20:24].view(torch.int32).fill_(self.group.size)
+        torch.cuda.current_stream(self.device).synchronize()
+        bootstrap.barrier()
+        self.x, self.scales, self.ids, self.weights, *_ = views(self.storage)
 
     def prepare(self, module, size):
         """Bind a numerical layer and compile its launches without execution."""
         quantizer = module.up_gate.input_quantizer
-        if quantizer is None or quantizer.format not in {"mxfp8", "nvfp4"}:
-            raise ValueError(
-                "split MegaMoE requires MXFP8 or NVFP4 activations"
-            )
+        if quantizer is None or quantizer.format != self.format:
+            raise ValueError("one exchange must share one activation encoding")
         if module.down.input_quantizer is None or (
             module.down.input_quantizer.format != quantizer.format
         ):
@@ -90,10 +162,6 @@ class Buffer:
             or module.down.input_quantizer.calibrated_scale is None
         ):
             raise ValueError("NVFP4 experts require calibrated input scales")
-        if self.format is None:
-            self._allocate(quantizer.format)
-        elif self.format != quantizer.format:
-            raise ValueError("one exchange must share one activation encoding")
         operator = _SplitOperator(
             module=module, size=size, workspace={}, buffer=self
         )
@@ -121,50 +189,6 @@ class Buffer:
             step = _Step(buffers)
             for buffer in buffers:
                 buffer.step = step
-
-    def _allocate(self, format):
-        import torch.distributed._symmetric_memory as symmetric
-        from uniserve_kernels.deepgemm import load
-
-        self.native = load()
-        self.format = format
-        alignment = self.native.get_token_alignment_for_mega_moe()
-        self.capacity = (
-            (self.max_tokens + alignment - 1) // alignment * alignment
-        )
-        byte_count, _, views = (
-            self.native.get_symm_buffer_size_for_mega_moe_m2n(
-                self.attention_ranks,
-                self.expert_ranks,
-                self.num_experts,
-                self.capacity,
-                self.top_k,
-                self.hidden,
-                self.intermediate,
-                format == "nvfp4",
-            )
-        )
-        # The experts runtime supplies collective symmetric storage.
-        from uniserve_models.runtime._peer_storage import (
-            allocate_collective_buffer,
-        )
-
-        self.storage = allocate_collective_buffer(
-            (byte_count,), dtype=torch.int8, device=self.device
-        )
-        self.handle = symmetric.rendezvous(
-            self.storage, group=self.group._require()
-        )
-        self.pointers = list(self.handle.buffer_ptrs)
-        self.storage.zero_()
-        # The next launch waits for its predecessor's cleanup phase. Seed
-        # the initial completed phase before publishing this buffer to peers.
-        self.storage[20:24].view(torch.int32).fill_(self.group.size)
-        torch.cuda.current_stream(self.device).synchronize()
-        dist.all_reduce(
-            torch.zeros((), dtype=torch.int32), group=self.group._require()
-        )
-        self.x, self.scales, self.ids, self.weights, *_ = views(self.storage)
 
     def attention(
         self, output, hidden, ids, weights, *, phase, compile_only=False
@@ -243,11 +267,9 @@ class Buffer:
             return
         # A local stream drain does not retire a peer's remote memory reads.
         # Every owner reaches this host barrier after draining its own work.
-        dist.all_reduce(
-            torch.zeros((), dtype=torch.int32), group=self.group._require()
-        )
+        self.bootstrap.barrier()
         self.x = self.scales = self.ids = self.weights = None
-        self.handle = self.storage = None
+        self.storage = None
         self.step = None
         self.operators.clear()
 
@@ -421,7 +443,7 @@ class _SplitOperator(Operator):
                 buffer.expert(self)
             else:
                 buffer.step.launch(self)
-            _yield_microbatch()
+            buffer.yield_turn()
             return hidden.new_empty((0, buffer.hidden_size))
 
         if count:
@@ -449,7 +471,7 @@ class _SplitOperator(Operator):
         # external_quant consumes the encoded buffer, so hidden's argument
         # only supplies the BF16 shape expected by the native launch contract.
         buffer.attention(output, output, topk_ids, topk_weights, phase=1)
-        _yield_microbatch()
+        buffer.yield_turn()
         buffer.attention(output, output, topk_ids, topk_weights, phase=2)
         # Strip physical channel padding before exposing numerical rows.
         return output[:, : buffer.hidden_size].contiguous()

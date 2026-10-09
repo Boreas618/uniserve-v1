@@ -301,8 +301,14 @@ impl CanvasModel {
         self.release.clone()
     }
 
-    /// Evaluate `tokens` canvas tokens up to the final layer's attention.
-    pub fn readout_attend(&self, tokens: usize, attention: &Attention<'_>) -> Result<()> {
+    /// Evaluate `tokens` canvas tokens up to the final layer's attention,
+    /// as the expert step of `expert_capacity` (zero without experts).
+    pub fn readout_attend(
+        &self,
+        tokens: usize,
+        attention: &Attention<'_>,
+        expert_capacity: usize,
+    ) -> Result<()> {
         let [queries, prefixes, widths, starts] = attention.arguments();
         self.readout_attend.call_values(&[
             integer(attention.rows),
@@ -312,6 +318,7 @@ impl CanvasModel {
             prefixes,
             widths,
             starts,
+            integer(expert_capacity),
         ])?;
         Ok(())
     }
@@ -329,10 +336,13 @@ impl CanvasModel {
     /// Complete every slot of a readout eagerly on the final stage; the
     /// returned tail's candidates are read with [`Self::readout_candidates`]
     /// at flat indices `slot * vocab + token`.
-    pub fn readout_finish(&self, slots: usize) -> Result<Handle> {
-        Ok(Handle::new(
-            self.readout_finish.call(&[(&integer(slots)).into()])?,
-        ))
+    /// An exchanging tail completes the readout's expert step of
+    /// `expert_capacity`.
+    pub fn readout_finish(&self, slots: usize, expert_capacity: usize) -> Result<Handle> {
+        Ok(Handle::new(self.readout_finish.call_values(&[
+            integer(slots),
+            integer(expert_capacity),
+        ])?))
     }
 
     /// Share the final stage's `count` candidate values with every stage.
@@ -340,8 +350,14 @@ impl CanvasModel {
         self.readout_broadcast.invoke(&[(&integer(count)).into()])
     }
 
-    /// Step `attention.rows` gathered canvases eagerly.
-    pub fn step(&self, first: bool, attention: &Attention<'_>) -> Result<()> {
+    /// Step `attention.rows` gathered canvases eagerly, as the expert step
+    /// of `expert_capacity`.
+    pub fn step(
+        &self,
+        first: bool,
+        attention: &Attention<'_>,
+        expert_capacity: usize,
+    ) -> Result<()> {
         let step = self
             .step
             .as_ref()
@@ -354,13 +370,20 @@ impl CanvasModel {
             prefixes,
             widths,
             starts,
+            integer(expert_capacity),
         ])?;
         Ok(())
     }
 
-    /// Capture one canvas function into `pool`; the function also runs once
-    /// eagerly before the capture.
-    pub fn capture(&self, capture: Capture<'_>, pool: &Handle) -> Result<Handle> {
+    /// Capture one canvas function into `pool` as the expert step of
+    /// `expert_capacity`; the function also runs once eagerly before the
+    /// capture.
+    pub fn capture(
+        &self,
+        capture: Capture<'_>,
+        pool: &Handle,
+        expert_capacity: usize,
+    ) -> Result<Handle> {
         let (name, arguments): (&str, Vec<Any>) = match capture {
             Capture::Attend { tokens, attention } => {
                 let [queries, prefixes, widths, starts] = attention.arguments();
@@ -398,6 +421,7 @@ impl CanvasModel {
             (&Any::from(tvm_ffi::String::from(name))).into(),
             (&Any::from(arguments)).into(),
             pool.view(),
+            (&integer(expert_capacity)).into(),
         ])?;
         Ok(Handle::new(graph))
     }

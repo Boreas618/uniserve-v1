@@ -48,3 +48,8 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+# Expert-step agreement latency over the host group (separate processes).
+[[bench]]
+name = "expert_agreement"
+harness = false

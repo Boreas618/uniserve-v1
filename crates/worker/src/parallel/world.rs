@@ -192,6 +192,24 @@ impl World {
         Ok(())
     }
 
+    /// The multi-member groups of `component`'s numerical mesh this rank
+    /// belongs to, in creation order, for stream collectives.
+    /// `first` is the process-world rank of this worker's first rank.
+    pub fn collective_groups(&self, component: &str, first: usize) -> Vec<super::CollectiveGroup> {
+        self.components
+            .iter()
+            .filter(|meshes| meshes.plan.name == component && meshes.plan.member)
+            .flat_map(|meshes| meshes.plan.mesh.iter())
+            .flat_map(|binding| &binding.groups)
+            .filter(|group| group.members.len() > 1)
+            .map(|group| super::CollectiveGroup {
+                name: group.name(),
+                members: group.members.iter().map(|&rank| rank - first).collect(),
+                ranks: group.members.clone(),
+            })
+            .collect()
+    }
+
     /// The meshes of a component this rank is a member of.
     pub fn meshes(&self, component: &str) -> (Option<Handle>, Option<Handle>) {
         self.components

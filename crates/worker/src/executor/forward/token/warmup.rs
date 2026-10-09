@@ -19,12 +19,13 @@ use uniserve_ipc::{
     ShapeBound, TensorRef,
 };
 
-use super::TextRuntime;
+use super::super::experts::ExpertRuntime;
+use super::{StepParts, TextRuntime};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::runner::TokenSelection;
 use crate::runner::graphs::capture_order;
-use crate::runner::text::{RowSource, StepContext, StepRequest, TokenRow};
+use crate::runner::text::{RowSource, StepRequest, TokenRow};
 use crate::storage::KVCache;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
@@ -45,7 +46,7 @@ impl WarmupHooks for TextWarmup {
             .kv
             .as_mut()
             .ok_or(Error::State("text warmup requires a KV cache"))?;
-        capture(runtime, kv, self.row_tokens).map_err(|error| {
+        capture(runtime, kv, self.row_tokens, parts.experts).map_err(|error| {
             WorkerError::classify(error, Some("text graph capture")).with_phase("warmup")
         })
     }
@@ -134,14 +135,43 @@ fn rows(
 }
 
 /// Capture every runner's graphs.
-fn capture(runtime: &mut TextRuntime, kv: &mut KVCache, row_tokens: usize) -> Result<()> {
+///
+/// With experts, each microbatch runner captures every bucket at every step
+/// capacity that holds it, largest first: each capture's eager warmup is a
+/// collective expert step at that capacity (announced to dedicated expert
+/// ranks), in which the other microbatches join.
+fn capture(
+    runtime: &mut TextRuntime,
+    kv: &mut KVCache,
+    row_tokens: usize,
+    experts: Option<&ExpertRuntime>,
+) -> Result<()> {
     let shapes = kv.plan().group_shapes()?;
     let pages: Vec<(usize, usize)> = shapes
         .iter()
         .map(|shape| (shape.page_tokens as usize, shape.units_per_page as usize))
         .collect();
     let units = kv.planes().num_units() as usize - 1;
+    // Step capacities a graph of `tokens` tokens is captured at.
+    let variants = |tokens: usize| -> Vec<Option<usize>> {
+        match experts {
+            None => vec![None],
+            Some(experts) => {
+                let mut capacities: Vec<Option<usize>> = experts
+                    .parallel()
+                    .capacities()
+                    .iter()
+                    .copied()
+                    .filter(|&capacity| capacity >= tokens)
+                    .map(Some)
+                    .collect();
+                capacities.reverse();
+                capacities
+            }
+        }
+    };
     for index in 0..runtime.runners.len() {
+        let (group, peer) = runtime.locate(index)?;
         let prefill = capture_order(
             runtime.runners[index].shapes().prefill().to_vec(),
             |shape| (shape.token_bucket * shape.row_bucket, shape.token_bucket),
@@ -163,6 +193,13 @@ fn capture(runtime: &mut TextRuntime, kv: &mut KVCache, row_tokens: usize) -> Re
         });
         let stream = stream.transpose()?;
         let stream = stream.as_ref();
+        let run = |runtime: &mut TextRuntime,
+                   kv: &mut KVCache,
+                   rows: &[TokenRow],
+                   decode: bool,
+                   capacity: Option<usize>| {
+            step(runtime, experts, (group, peer), kv, rows, decode, capacity)
+        };
         for shape in prefill {
             let lengths = shape.scratch_lengths(row_tokens, &pages, units);
             let selection = if shape.outputs {
@@ -170,9 +207,17 @@ fn capture(runtime: &mut TextRuntime, kv: &mut KVCache, row_tokens: usize) -> Re
             } else {
                 TokenSelection::Cache
             };
-            with_scratch(kv, &lengths, stream, |kv| {
-                step(runtime, index, kv, &rows(1, &lengths, 0, selection), false)
-            })?;
+            for capacity in variants(shape.token_bucket) {
+                with_scratch(kv, &lengths, stream, |kv| {
+                    run(
+                        runtime,
+                        kv,
+                        &rows(1, &lengths, 0, selection),
+                        false,
+                        capacity,
+                    )
+                })?;
+            }
         }
         for size in decode {
             let lengths = vec![1; size];
@@ -183,23 +228,29 @@ fn capture(runtime: &mut TextRuntime, kv: &mut KVCache, row_tokens: usize) -> Re
                 // continuation flag set.
                 for first in (0..size).step_by(prime) {
                     let count = prime.min(size - first);
-                    step(
+                    run(
                         runtime,
-                        index,
                         kv,
                         &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
                         false,
+                        None,
                     )?;
                 }
                 let slots: Vec<usize> = (1..=size).collect();
                 runtime.state.set_predicates(&slots, true, stream)?;
-                let captured = step(
-                    runtime,
-                    index,
-                    kv,
-                    &rows(1, &lengths, 1, TokenSelection::LastLogits),
-                    true,
-                );
+                let mut captured = Ok(());
+                for capacity in variants(size) {
+                    captured = run(
+                        runtime,
+                        kv,
+                        &rows(1, &lengths, 1, TokenSelection::LastLogits),
+                        true,
+                        capacity,
+                    );
+                    if captured.is_err() {
+                        break;
+                    }
+                }
                 runtime.state.set_predicates(&slots, false, stream)?;
                 captured
             })?;
@@ -219,28 +270,35 @@ fn capture(runtime: &mut TextRuntime, kv: &mut KVCache, row_tokens: usize) -> Re
     Ok(())
 }
 
+/// One warmup step of `rows` on microbatch `peer` of `group`; the group's
+/// other microbatches join. `capacity` forces the expert step capacity.
 fn step(
     runtime: &mut TextRuntime,
-    index: usize,
+    experts: Option<&ExpertRuntime>,
+    (group, peer): (usize, usize),
     kv: &mut KVCache,
     rows: &[TokenRow],
     decode: bool,
+    capacity: Option<usize>,
 ) -> Result<()> {
     let (tables, cache) = kv.split();
-    runtime.runners[index]
-        .execute(
-            &StepRequest {
-                decode,
-                rows,
-                sampling: None,
-                prompt: &[],
-                embeddings: &[],
-            },
-            &mut StepContext {
-                tables,
-                cache,
-                state: &runtime.state,
-            },
+    let request = StepRequest {
+        decode,
+        rows,
+        sampling: None,
+        prompt: &[],
+        embeddings: &[],
+    };
+    let mut requests: Vec<Option<StepRequest<'_>>> =
+        (0..runtime.groups[group].len()).map(|_| None).collect();
+    requests[peer] = Some(request);
+    runtime
+        .invoke(
+            experts,
+            group,
+            &requests,
+            &mut StepParts { tables, cache },
+            capacity,
         )
         .map(drop)
 }

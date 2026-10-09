@@ -30,7 +30,7 @@ use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
 use super::graphs::{GraphMode, GraphTable, Lookup};
 use super::{TextShapes, TokenSelection};
-use crate::ffi::{DType, Handle};
+use crate::ffi::{DType, DeferredCall, Handle};
 use crate::model::text::{CaptureArgs, StepArgs, TextModel};
 use crate::request::decode_state::DecodeState;
 use crate::storage::memory::StorageView;
@@ -108,10 +108,38 @@ pub(crate) struct Executed {
     pub(crate) padded_tokens: usize,
 }
 
+/// How an invocation runs, before its expert capacity selects a graph
+/// variant.
 enum Choice {
     Eager,
-    Replay(Handle),
-    Capture(TextGraphKey),
+    Graph(TextGraphKey),
+}
+
+/// A planned invocation whose host columns are staged on the runner's
+/// stream, awaiting its expert step capacity.
+pub(crate) struct Staged {
+    plan: Plan,
+    sampling: Vec<i64>,
+    greedy: bool,
+    prompt: Vec<i64>,
+    /// Vision features replace some of the tokens' embeddings.
+    embedded: bool,
+}
+
+impl Staged {
+    /// Tokens the invocation sends to each expert layer: its graph's padded
+    /// tokens, or its live tokens when it runs eagerly.
+    pub(crate) fn expert_tokens(&self) -> usize {
+        self.plan.tokens
+    }
+}
+
+/// A staged invocation's numerical call at its expert capacity.
+pub(crate) struct Launch {
+    pub(crate) mode: GraphMode,
+    /// The step: an eager forward (a capture's warmup included) or a graph
+    /// replay. Runs on the caller's thread or a microbatch thread.
+    pub(crate) call: DeferredCall,
 }
 
 /// One planned invocation: its shapes and host columns.
@@ -208,6 +236,11 @@ impl TextRunner {
         &self.shapes
     }
 
+    /// The runner's graph pool, absent when graphs are off.
+    pub(crate) fn pool(&self) -> Option<&Handle> {
+        self.pool.as_ref()
+    }
+
     pub(crate) fn dimensions(&self) -> Dimensions {
         self.buffers.dimensions
     }
@@ -231,85 +264,116 @@ impl TextRunner {
         self.graphs.seal();
     }
 
-    /// Run one invocation, capturing its graph first when the rank is not
-    /// sealed and the graph is not resident yet.
-    pub(crate) fn execute(
-        &mut self,
+    /// Plan `request` and stage its host columns on the runner's stream.
+    pub(crate) fn stage(
+        &self,
         request: &StepRequest<'_>,
         context: &mut StepContext<'_>,
-    ) -> Result<Executed> {
+    ) -> Result<Staged> {
         let plan = self.plan(request, context)?;
-        self.stage(&plan, request, context.state)?;
-        let mode = match &plan.choice {
-            Choice::Eager => {
-                self.step(&plan, request, None)?;
-                GraphMode::Eager
-            }
-            Choice::Replay(graph) => {
-                self.step(&plan, request, Some(graph))?;
-                GraphMode::Replay
-            }
-            Choice::Capture(key) => {
+        self.copy_columns(&plan, request, context.state)?;
+        let (sampling, greedy) = match &request.sampling {
+            Some(sampling) => (sampling.words.to_vec(), sampling.greedy),
+            None => (Vec::new(), false),
+        };
+        Ok(Staged {
+            plan,
+            sampling,
+            greedy,
+            prompt: request.prompt.to_vec(),
+            embedded: !request.embeddings.is_empty(),
+        })
+    }
+
+    /// The numerical call of a staged invocation at `capacity`: a replay
+    /// of the resident graph variant, or an eager forward (also the warmup
+    /// of a capture [`Self::finish`] then records). Without `replay`, a
+    /// resident graph's shapes run eagerly instead.
+    pub(crate) fn launch(
+        &self,
+        staged: &Staged,
+        capacity: Option<usize>,
+        replay: bool,
+    ) -> Result<Launch> {
+        let (mode, graph) = match &staged.plan.choice {
+            Choice::Eager => (GraphMode::Eager, None),
+            Choice::Graph(key) => match self.graphs.lookup(key, capacity)? {
+                Lookup::Replay(graph) if replay => (GraphMode::Replay, Some(graph.clone())),
+                Lookup::Replay(_) => (GraphMode::Eager, None),
                 // The eager run is the capture's warmup and produces this
                 // invocation's results; capture records without executing.
-                self.step(&plan, request, None)?;
-                let pool = self
-                    .pool
-                    .as_ref()
-                    .ok_or(Error::State("graph capture requires a graph pool"))?;
-                let graph = self.model.capture(
-                    &CaptureArgs {
-                        decode: plan.decode,
-                        rows: plan.rows,
-                        tokens: plan.tokens,
-                        widths: &plan.widths,
-                        queries: &plan.queries,
-                        prefixes: &plan.prefixes,
-                        starts: &plan.starts,
-                        causal: &plan.causal,
-                        writes: true,
-                        cache_only: plan.cache_only && !key.outputs,
-                    },
-                    pool,
-                )?;
-                self.graphs.insert(key.clone(), None, graph)?;
-                GraphMode::Capture
-            }
+                Lookup::Capture => (GraphMode::Capture, None),
+            },
         };
+        let plan = &staged.plan;
+        let call = self.model.step_call(
+            &StepArgs {
+                graph: graph.as_ref(),
+                decode: plan.decode,
+                rows: plan.rows,
+                live: plan.live,
+                tokens: plan.tokens,
+                indexed: plan.indexed,
+                widths: &plan.widths,
+                queries: &plan.queries,
+                prefixes: &plan.prefixes,
+                starts: &plan.starts,
+                causal: &plan.causal,
+                writes: true,
+                logit_count: plan.logit_count,
+                all_last: plan.all_last,
+                cache_only: plan.cache_only,
+                sampling: &staged.sampling,
+                greedy: staged.greedy,
+                prompt: &staged.prompt,
+                axes: plan.axes,
+                embedded: staged.embedded,
+            },
+            capacity.unwrap_or(0),
+        );
+        Ok(Launch { mode, call })
+    }
+
+    /// Complete an invocation whose call ran: capture its graph after the
+    /// eager warmup when its launch chose capture, and count the mode.
+    /// Capture submits no device work and no communication.
+    pub(crate) fn finish(
+        &mut self,
+        staged: Staged,
+        capacity: Option<usize>,
+        mode: GraphMode,
+    ) -> Result<Executed> {
+        let plan = staged.plan;
+        if mode == GraphMode::Capture
+            && let Choice::Graph(key) = &plan.choice
+        {
+            let pool = self
+                .pool
+                .as_ref()
+                .ok_or(Error::State("graph capture requires a graph pool"))?;
+            let graph = self.model.capture(
+                &CaptureArgs {
+                    decode: plan.decode,
+                    rows: plan.rows,
+                    tokens: plan.tokens,
+                    widths: &plan.widths,
+                    queries: &plan.queries,
+                    prefixes: &plan.prefixes,
+                    starts: &plan.starts,
+                    causal: &plan.causal,
+                    writes: true,
+                    cache_only: plan.cache_only && !key.outputs,
+                },
+                pool,
+                capacity.unwrap_or(0),
+            )?;
+            self.graphs.insert(key.clone(), capacity, graph)?;
+        }
         self.graphs.record(mode);
         Ok(Executed {
             mode,
             live_tokens: plan.live_tokens,
             padded_tokens: plan.tokens - plan.live_tokens,
-        })
-    }
-
-    fn step(&self, plan: &Plan, request: &StepRequest<'_>, graph: Option<&Handle>) -> Result<()> {
-        let (sampling, greedy): (&[i64], bool) = match &request.sampling {
-            Some(sampling) => (sampling.words, sampling.greedy),
-            None => (&[], false),
-        };
-        self.model.step(&StepArgs {
-            graph,
-            decode: plan.decode,
-            rows: plan.rows,
-            live: plan.live,
-            tokens: plan.tokens,
-            indexed: plan.indexed,
-            widths: &plan.widths,
-            queries: &plan.queries,
-            prefixes: &plan.prefixes,
-            starts: &plan.starts,
-            causal: &plan.causal,
-            writes: true,
-            logit_count: plan.logit_count,
-            all_last: plan.all_last,
-            cache_only: plan.cache_only,
-            sampling,
-            greedy,
-            prompt: request.prompt,
-            axes: plan.axes,
-            embedded: !request.embeddings.is_empty(),
         })
     }
 
@@ -398,16 +462,12 @@ impl TextRunner {
                 last_logits,
                 cache_only,
             )? {
-                let key = TextGraphKey {
+                choice = Choice::Graph(TextGraphKey {
                     decode,
                     rows: bucket_rows,
                     tokens: bucket_tokens,
                     outputs,
-                };
-                choice = match self.graphs.lookup(&key, None)? {
-                    Lookup::Replay(graph) => Choice::Replay(graph.clone()),
-                    Lookup::Capture => Choice::Capture(key),
-                };
+                });
                 bucket = (bucket_rows, bucket_tokens);
             }
         }
@@ -603,7 +663,12 @@ impl TextRunner {
 
     /// Copy the plan's host columns and sampling inputs to the device, then
     /// relay slot-state tokens and positions, in stream order.
-    fn stage(&self, plan: &Plan, request: &StepRequest<'_>, state: &DecodeState) -> Result<()> {
+    fn copy_columns(
+        &self,
+        plan: &Plan,
+        request: &StepRequest<'_>,
+        state: &DecodeState,
+    ) -> Result<()> {
         let column = |name: &str| self.buffers.column(name).map(StorageView::address);
         let rows = self.buffers.dimensions.rows as u64;
         let mut entries: Vec<(u64, u64, usize)> = Vec::new();
