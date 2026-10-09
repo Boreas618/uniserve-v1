@@ -696,16 +696,16 @@ def prepare_sparse_input_rows(
 
     One read of the projections yields the packed row-major input layout of
     ``pack_sparse_input_rows`` with Q and K normalized and rotated as
-    ``uniserve_models.nn.functional.qk_norm_rope`` computes them for one normalized
-    domain with a partially rotated prefix, the gate rows copied into
+    ``uniserve_models.nn.functional.qk_norm_rope`` computes them for one
+    normalized domain with a partially rotated prefix, the gate rows copied into
     ``packed_gate`` at their packed rows, and the per-tile means
-    ``vsa_tiles.pool_qkv_means`` computes from stored projections, written
-    at the interval's tiles. ``cosine`` and ``sine`` hold the interval's
-    compact half-width factors, one row per interval row; the interval
-    starts at ``row_start`` and covers whole tiles. The head width must be a
-    power of two. Pooled buffers are fp32 with unit column stride and are
-    indexed by packed tile, so they must reach the interval's last tile; all
-    three are addressed with ``pooled_query``'s tile and head strides.
+    ``vsa_tiles.pool_qkv_means`` computes from stored projections, written at
+    the interval's tiles. ``cosine`` and ``sine`` hold the interval's compact
+    half-width factors, one row per interval row; the interval starts at
+    ``row_start`` and covers whole tiles. The head width must be a power of two.
+    Pooled buffers are fp32 with unit column stride and are indexed by packed
+    tile, so they must reach the interval's last tile; all three are addressed
+    with ``pooled_query``'s tile and head strides.
 
     Raises:
         ValueError: If tensor shapes, dtypes or contiguity, the rotary or

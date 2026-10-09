@@ -19,7 +19,11 @@ from torch import nn
 
 from uniserve_models.nn.activation import get_act_fn
 from uniserve_models.nn.attention import Attention as ScaledAttention
-from uniserve_models.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
+from uniserve_models.nn.attention import (
+    AttentionBatch,
+    SequenceLengths,
+    VarlenInput,
+)
 from uniserve_models.nn.functional import apply_rotary
 from uniserve_models.nn.linear import (
     ColumnParallelLinear,

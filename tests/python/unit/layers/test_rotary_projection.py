@@ -12,7 +12,11 @@ from uniserve_models.nn.attention import (
 )
 from uniserve_models.nn.functional import Rounding, apply_rotary, qk_norm_rope
 from uniserve_models.nn.linear import QKVParallelLinear
-from uniserve_models.nn.rope import DynamicScaling, LinearScaling, LongRoPEScaling
+from uniserve_models.nn.rope import (
+    DynamicScaling,
+    LinearScaling,
+    LongRoPEScaling,
+)
 
 pytestmark = pytest.mark.unit
 
