@@ -153,7 +153,9 @@ impl TextRuntime {
     /// are staged; the ranks agree on the step's capacity (or, during
     /// warmup, it is `forced` or derived and announced); then the
     /// microbatches run in rotation, empty ones joining, and the lane stream
-    /// waits on every microbatch stream.
+    /// waits on every microbatch stream. Microbatches replay their graphs
+    /// only once the union joins by replay
+    /// ([`super::experts::ExpertRuntime::replays`]).
     pub(crate) fn invoke(
         &mut self,
         experts: Option<&super::experts::ExpertRuntime>,
@@ -189,7 +191,7 @@ impl TextRuntime {
                 .as_ref()
                 .ok_or(Error::State("a text step has an invocation"))?;
             let staged = step(&self.runners[runner], request)?;
-            let launch = self.runners[runner].launch(&staged, None)?;
+            let launch = self.runners[runner].launch(&staged, None, true)?;
             launch.call.invoke()?;
             let executed = self.runners[runner].finish(staged, None, launch.mode)?;
             return Ok(vec![Some(executed)]);
@@ -217,12 +219,13 @@ impl TextRuntime {
             .max()
             .unwrap_or(0);
         let capacity = experts.capacity(tokens, group as i64, forced)?;
+        let replay = experts.replays();
         let mut modes = Vec::with_capacity(peers.len());
         let mut calls = Vec::with_capacity(peers.len());
         for (&runner, staged) in peers.iter().zip(&staged) {
             match staged {
                 Some(staged) => {
-                    let launch = self.runners[runner].launch(staged, Some(capacity))?;
+                    let launch = self.runners[runner].launch(staged, Some(capacity), replay)?;
                     modes.push(Some(launch.mode));
                     calls.push(Some(launch.call));
                 }
