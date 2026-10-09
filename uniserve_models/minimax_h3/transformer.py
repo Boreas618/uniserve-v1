@@ -152,13 +152,31 @@ class TransformerLayer(nn.Module):
                     ),
                 )
 
-        attended = self.attention.forward_chunks(
-            normalize(),
-            workspace["cos"],
-            workspace["sin"],
-            inputs,
-            workspace=workspace,
-        )
+        # Each attention kind reads the input of its own packing; the
+        # transformer builds every layer's attention from the attention
+        # configuration the denoiser packs its inputs by.
+        attention, cos, sin = self.attention, workspace["cos"], workspace["sin"]
+        if isinstance(attention, Dense) and isinstance(inputs, SequenceInput):
+            attended = attention.forward_chunks(
+                normalize(), cos, sin, inputs, workspace=workspace
+            )
+        elif isinstance(attention, Sparse) and isinstance(
+            inputs, AttentionInput
+        ):
+            attended = attention.forward_chunks(
+                normalize(), cos, sin, inputs, workspace=workspace
+            )
+        elif isinstance(attention, RegionSparse) and isinstance(
+            inputs, RegionInput
+        ):
+            attended = attention.forward_chunks(
+                normalize(), cos, sin, inputs, workspace=workspace
+            )
+        else:
+            raise TypeError(
+                f"H3 {type(attention).__name__} attention does not read "
+                f"{type(inputs).__name__}"
+            )
 
         def finish(interval, update):
             local = slice(
@@ -255,10 +273,10 @@ class StepProjection(nn.Module):
 
     A parallel-decoding student predicts one head per fine-grid interval; an
     evaluation applies its block's heads fused with their normalized
-    integration weights (``uniserve_models.diffusion.fuse_heads``). Loading fuses
-    every block once (``weights._prepare_heads``) into ``weight`` [steps,
-    out, in] and ``bias`` [steps, out], and a call gathers the step's head
-    on the device, so one captured evaluation serves every step.
+    integration weights (``uniserve_models.diffusion.fuse_heads``). Loading
+    fuses every block once (``weights._prepare_heads``) into ``weight``
+    [steps, out, in] and ``bias`` [steps, out], and a call gathers the step's
+    head on the device, so one captured evaluation serves every step.
     """
 
     weight: torch.Tensor

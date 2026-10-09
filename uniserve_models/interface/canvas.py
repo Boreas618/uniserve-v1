@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
+from torch import nn
 
 from uniserve_models.diffusion import canvas as sampler
 from uniserve_models.model import CanvasInput, TokenDenoiser
@@ -88,6 +89,12 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
+def _table(embedding: nn.Module) -> torch.Tensor:
+    """The token embedding table of ``embedding``."""
+    # ``nn.Module`` types a parameter read as ``Tensor | Module``.
+    return cast(torch.Tensor, embedding.weight)
+
+
 def tail_exchanges(
     denoiser: TokenDenoiser, *, exchange: bool, attention_ranks: int
 ) -> bool:
@@ -110,7 +117,7 @@ def tail_exchanges(
     """
     if not exchange:
         return False
-    final = next(reversed(denoiser.backbone.layers.values()))
+    final = tuple(denoiser.backbone.layers.values())[-1]
     return any(
         isinstance(module, FusedMoE)
         and (attention_ranks > 0 or module.expert_group.size > 1)
@@ -154,7 +161,7 @@ def describe(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
         else backbone.vocab_size,
         "hidden_size": backbone.hidden_size,
         "dtype": _dtype_name(
-            stream_dtype if embedding is None else embedding.weight.dtype
+            stream_dtype if embedding is None else _table(embedding).dtype
         ),
         "eos_token_ids": list(canvas.eos_token_ids),
         "pad_token_id": canvas.pad_token_id,
@@ -404,7 +411,7 @@ def bind(
         exchange=exchange is not None,
         attention_ranks=0 if exchange is None else exchange.attention_ranks,
     )
-    final = next(reversed(backbone.layers.values()))
+    final = tuple(backbone.layers.values())[-1]
     attended = context.expert_layers(denoiser) - context.expert_layers(final)
 
     def _normalized(rows: torch.Tensor) -> torch.Tensor:
@@ -606,7 +613,7 @@ def bind(
                 )
                 sampler.denoise_canvas(
                     cast(Logits, logits).gather().view(count, length, vocab),
-                    embedding.weight,
+                    _table(embedding),
                     backbone.embedding_scale,
                     _rows(rows_state, start, stop),
                     constants,
@@ -704,7 +711,16 @@ def bind(
         if name == "readout_attend":
             tokens, visible = int(arguments[1]), int(arguments[2])
             queries, prefixes, widths, starts = arguments[3:7]
-            readout_attend(rows, tokens, visible, *arguments[3:7], capacity)
+            readout_attend(
+                rows,
+                tokens,
+                visible,
+                queries,
+                prefixes,
+                widths,
+                starts,
+                capacity,
+            )
             body = functools.partial(_attend_step, rows, tokens, capacity)
         elif name == "step" and "step" in functions:
             first, visible = bool(arguments[1]), length
@@ -767,7 +783,9 @@ def bind(
             return records
         from uniserve_kernels.diffusion import canvas as kernels
 
-        table = embedding.weight[:vocab]
+        # Bound sampling required the embedding table above.
+        assert embedding is not None
+        table = _table(embedding)[:vocab]
         for rows in range(1, step_rows + 1):
             chunk = _chunk(workspace, rows * length, device)
             algorithm = kernels.product_algorithm(

@@ -11,7 +11,7 @@ The caller owns every scratch buffer and the stream the work runs on.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import cast
+from typing import Literal, cast
 
 import torch
 
@@ -23,7 +23,7 @@ from .units import UnitPool
 
 __all__ = ["copy_converted"]
 
-_FIELDS = ("key", "value")
+_FIELDS: tuple[Literal["key", "value"], ...] = ("key", "value")
 
 
 def copy_converted(

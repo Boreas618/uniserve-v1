@@ -68,7 +68,7 @@ class ExpertStep:
         # exchanging tail) starts with that invocation's layers reached.
         self.reached = bytearray(len(self.layers))
         self.reached[:reached] = b"\x01" * min(reached, len(self.layers))
-        self._token = None
+        self._token: contextvars.Token[ExpertStep | None] | None = None
 
     def __enter__(self) -> ExpertStep:
         if _STEP.get() is not None:
@@ -79,6 +79,8 @@ class ExpertStep:
 
     def __exit__(self, *exc_info: object) -> None:
         self.exchange.capacity = 0
+        # ``__enter__`` stored the token of the step this exit closes.
+        assert self._token is not None
         _STEP.reset(self._token)
         self._token = None
 
@@ -155,7 +157,7 @@ class MoEBinding:
         self.ordinal = ordinal
         self.size = size
         self.operator = None
-        self.provider = None
+        self.provider: str | None = None
         self.weights = (
             weights
             if weights is not None and weights.contains(module)
@@ -216,7 +218,7 @@ class MoEBinding:
             and self.exchange.attention_ranks
         ):
             operator = self.exchange.fused.prepare(self.module, size)
-            provider = None
+            provider: moe_backend.Backend | None = None
         elif self.exchange is not None and self.exchange.transport == "megamoe":
             # The fused kernel exchanges, computes and combines in one launch
             # over the exchange's symmetric buffers.

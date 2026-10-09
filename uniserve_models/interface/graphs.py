@@ -126,7 +126,7 @@ class _Segments:
         capture_stream: torch.cuda.Stream,
         computation: torch.cuda.Stream,
         pool_handle,
-        generators: Sequence[torch.Generator],
+        generators: Iterable[torch.Generator],
     ) -> None:
         self.capture_stream = capture_stream
         self.computation = computation

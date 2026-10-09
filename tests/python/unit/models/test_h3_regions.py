@@ -20,9 +20,6 @@ import pytest
 import torch
 
 from uniserve_models.media import image, video
-from uniserve_models.model import Condition, ConditionRole
-from uniserve_models.nn.attention import vsa
-from uniserve_models.nn.attention.vsa.regions import select
 from uniserve_models.minimax_h3.packing import (
     AUDIO_CONDITION_GROUP,
     AUDIO_GROUP,
@@ -33,6 +30,9 @@ from uniserve_models.minimax_h3.packing import (
     region_tables,
     region_tiles,
 )
+from uniserve_models.model import Condition, ConditionRole
+from uniserve_models.nn.attention import vsa
+from uniserve_models.nn.attention.vsa.regions import select
 
 pytestmark = pytest.mark.unit
 

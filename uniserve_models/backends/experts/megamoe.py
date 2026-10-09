@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from uniserve_models.distributed import Communicator
+from uniserve_models.nn.moe import Activation
 
 from . import ExpertTransport
 
@@ -40,7 +41,7 @@ class FusedExperts(ExpertTransport):
         num_experts: int,
         hidden_size: int,
         intermediate_size: int,
-        activation: str,
+        activation: Activation,
         device: torch.device,
         attention_ranks: int = 0,
         encoding: str | None = None,

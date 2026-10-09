@@ -31,6 +31,7 @@ import torch
 
 from uniserve_models.nn.attention import (
     AttentionBatch,
+    AttentionInput,
     BlockTable,
     PagedInput,
     SegmentedInput,
@@ -115,7 +116,7 @@ class AttentionColumns:
         )
         mode = tuple(bool(value) for value in causal)
         flags = b["causal_values"][:rows] if len(set(mode)) > 1 else None
-        entries = {}
+        entries: dict[int, AttentionInput] = {}
         for table, width in enumerate(widths):
             first = None
             host_first = None
