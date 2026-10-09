@@ -244,7 +244,7 @@ class Sparse(nn.Module):
             for interval, values in self.projection.forward_chunks(
                 hidden,
                 token_slice=inputs.token_slice,
-                num_tokens=inputs.packing.padded_tokens,
+                num_tokens=inputs.vsa.padded_tokens,
             ):
                 # Each branch is [tokens, heads, head_dim].
                 q, k, v, gate = (
