@@ -173,6 +173,37 @@ def test_unit_bindings_reset_the_units_rust_selects():
     assert torch.all(fields["value.initialized"][:, 0])
 
 
+@pytest.mark.parametrize(
+    "device", ("cpu", pytest.param("cuda", marks=pytest.mark.gpu))
+)
+def test_a_recycled_fp8_unit_encodes_like_a_fresh_unit(device):
+    plan = cache.cache_plan(_model(layers=1), 4, "float8_e4m3fn")
+    fields = {
+        name: tensor.to(device) for name, tensor in _fields(plan, 3).items()
+    }
+    pool = UnitPool.from_plan({**plan, "num_units": 3}, fields)
+    (name,) = plan["groups"][0]["layers"]
+    state = pool.state(name)
+    units = torch.tensor([1, 0, 0], dtype=torch.int64, device=device)
+    bound = cache.bind_units(fields, units, 0)
+
+    large = torch.full((4, 4, 4), 1792.0, device=device)
+    state.write((1,), start=0, key=large, value=-large)
+    bound["recycle"](1)
+
+    # 1.1 encodes exactly at its own scale but not at the stale scale 4
+    # the previous owner left, so only a reset scale reproduces it.
+    small = torch.full((1, 4, 4), 1.1, device=device)
+    for unit in (1, 2):
+        state.write((unit,), start=0, key=small, value=-small)
+    recycled = state.read((1,), start=0, length=1)
+    fresh = state.read((2,), start=0, length=1)
+    for value, reference in zip(recycled, fresh, strict=True):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    scales = fields["key.scale"][0].tolist()
+    assert scales[1] == scales[2]
+
+
 def test_conversion_binding_encodes_scratch_spans_like_writes():
     model = _model(layers=2, heads=((4, 4, 4), (4, 4, 4)), window=None)
     plan = {**cache.cache_plan(model, 4, "float8_e4m3fn"), "num_units": 3}
