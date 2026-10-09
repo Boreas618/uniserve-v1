@@ -166,7 +166,6 @@ macro_rules! driver_table {
 driver_table! {
     eager {
         init = "cuInit": fn(u32);
-        driver_get_version = "cuDriverGetVersion": fn(*mut i32);
         device_get = "cuDeviceGet": fn(*mut i32, i32);
         device_get_count = "cuDeviceGetCount": fn(*mut i32);
         device_get_attribute = "cuDeviceGetAttribute": fn(*mut i32, i32, i32);

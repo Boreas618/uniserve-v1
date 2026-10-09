@@ -10,9 +10,15 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from uniserve_models import loading
 from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh
+from uniserve_models.interface import graphs
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.model import TextSize
 from uniserve_models.nn import (
@@ -21,11 +27,6 @@ from uniserve_models.nn import (
     RowParallelLinear,
 )
 from uniserve_models.quantization import QuantizationConfig, Quantizer
-from uniserve_models.runtime import (
-    CUDAGraph,
-    CUDAStream,
-    initialize_process_groups,
-)
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -58,21 +59,15 @@ def _mapping(model):
 
 
 @torch.inference_mode()
-def _run(rank, rendezvous, directory, source):
+def _run(rank, listener, directory, source):
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=4,
-        device=device,
-        init_method=rendezvous,
-    ) as owner:
+    with process_world(rank, 4, listener, device) as world:
         for ranks in ((3, 1, 2, 0), (3, 1), (0,)):
-            mesh = owner.bind(
+            mesh = bind_mesh(
+                world,
                 DeviceMesh(
                     ranks=ranks, shape=(len(ranks),), axes=("tp",), rank=rank
                 ),
-                device=device,
             )
             if rank not in ranks:
                 continue
@@ -107,9 +102,9 @@ def _run(rank, rendezvous, directory, source):
                 # local BF16 product and TP sum contributes one unit roundoff.
                 calls = group.size + 1
                 gamma = calls * 2**-8 / (1 - calls * 2**-8)
-                stream = CUDAStream.external(torch.cuda.Stream(device=device))
-                stream.wait(torch.cuda.current_stream(device))
-                with stream, ExecutionContext(model, stream=stream) as context:
+                stream = torch.cuda.Stream(device=device)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with ExecutionContext(model, stream=stream) as context:
                     context.prepare(TextSize(128, 1))
                     local = x.chunk(group.size, dim=-1)[group.rank].contiguous()
                     row_result = model.row(local)
@@ -119,49 +114,45 @@ def _run(rank, rendezvous, directory, source):
                     def invoke():
                         return model.row(local), model.branches(x), model.qkv(x)
 
-                    with CUDAGraph(context=context) as graph:
-                        graph.capture(invoke)
-                        for multiplier in (1.0, 2.0):
-                            if multiplier == 2.0:
-                                x.mul_(2)
-                                local.copy_(
-                                    x.chunk(group.size, dim=-1)[group.rank]
+                    graph = graphs.capture(invoke, stream=stream)
+                    for multiplier in (1.0, 2.0):
+                        if multiplier == 2.0:
+                            x.mul_(2)
+                            local.copy_(x.chunk(group.size, dim=-1)[group.rank])
+                        row_result, branch_result, qkv_result = graph.replay()
+                        decoded = quantizer.quantize(x).dequantize(
+                            dtype=torch.float32
+                        )
+                        matrix = quantizer.quantize(
+                            source["row.weight"].to(device)
+                        ).dequantize(dtype=torch.float32)
+                        torch.testing.assert_close(
+                            row_result.float(),
+                            F.linear(decoded, matrix),
+                            rtol=gamma,
+                            atol=0,
+                        )
+                        for prefix, results in (
+                            ("branches", branch_result),
+                            ("qkv", qkv_result),
+                        ):
+                            for name, actual in results.items():
+                                matrix = quantizer.quantize(
+                                    source[
+                                        f"{prefix}.projections.{name}.weight"
+                                    ].to(device)
+                                ).dequantize(dtype=torch.float32)
+                                expected = F.linear(decoded, matrix).chunk(
+                                    group.size, dim=-1
+                                )[group.rank]
+                                torch.testing.assert_close(
+                                    actual.float(),
+                                    expected,
+                                    rtol=gamma,
+                                    atol=0,
                                 )
-                            row_result, branch_result, qkv_result = (
-                                graph.replay()
-                            )
-                            decoded = quantizer.quantize(x).dequantize(
-                                dtype=torch.float32
-                            )
-                            matrix = quantizer.quantize(
-                                source["row.weight"].to(device)
-                            ).dequantize(dtype=torch.float32)
-                            torch.testing.assert_close(
-                                row_result.float(),
-                                F.linear(decoded, matrix),
-                                rtol=gamma,
-                                atol=0,
-                            )
-                            for prefix, results in (
-                                ("branches", branch_result),
-                                ("qkv", qkv_result),
-                            ):
-                                for name, actual in results.items():
-                                    matrix = quantizer.quantize(
-                                        source[
-                                            f"{prefix}.projections.{name}.weight"
-                                        ].to(device)
-                                    ).dequantize(dtype=torch.float32)
-                                    expected = F.linear(decoded, matrix).chunk(
-                                        group.size, dim=-1
-                                    )[group.rank]
-                                    torch.testing.assert_close(
-                                        actual.float(),
-                                        expected,
-                                        rtol=gamma,
-                                        atol=0,
-                                    )
                     torch.cuda.synchronize(device)
+                    graph.release()
 
 
 def test_loaded_quantized_branches_preserve_scale_domains_and_replay(tmp_path):
@@ -182,9 +173,10 @@ def test_loaded_quantized_branches_preserve_scale_domains_and_replay(tmp_path):
             ).unsqueeze(1)
         source[name] = value
     save_file(source, tmp_path / "model.safetensors")
-    mp.spawn(
-        _run,
-        args=((tmp_path / "projections").as_uri(), tmp_path, source),
-        nprocs=4,
-        join=True,
-    )
+    with rendezvous() as listener:
+        mp.spawn(
+            _run,
+            args=(listener, tmp_path, source),
+            nprocs=4,
+            join=True,
+        )

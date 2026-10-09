@@ -8,19 +8,20 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.interface import graphs
 from uniserve_models.nn import MergedColumnParallelLinear
 from uniserve_models.nn.attention import (
     AttentionParallelConfig,
     ContextParallelConfig,
     Ulysses,
     vsa,
-)
-from uniserve_models.runtime import (
-    CUDAGraph,
-    CUDAStream,
-    initialize_process_groups,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -85,16 +86,10 @@ def _paired_order(size):
     return tuple(order)
 
 
-def _run(rank, rendezvous):
+def _run(rank, listener):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=4,
-        device=device,
-        init_method=rendezvous,
-    ) as groups:
+    with process_world(rank, 4, listener, device) as world:
         generator = torch.Generator(device="cpu").manual_seed(47)
         hidden = torch.randn(
             512, 64, dtype=torch.bfloat16, generator=generator
@@ -131,9 +126,9 @@ def _run(rank, rendezvous):
         )
         ranks = _paired_order(4)
         for shape, axes, config in cases:
-            mesh = groups.bind(
+            mesh = bind_mesh(
+                world,
                 DeviceMesh(ranks=ranks, shape=shape, axes=axes, rank=rank),
-                device=device,
             )
             heads = mesh.get_group(
                 () if config.heads is None else config.heads.axis
@@ -188,12 +183,12 @@ def _run(rank, rendezvous):
             local_begin = begin + heads.rank * (query_tokens // heads.size)
             local_end = local_begin + query_tokens // heads.size
             result = tensor((local_end - local_begin, 8, 128), torch.bfloat16)
-            stream = CUDAStream.external(torch.cuda.Stream(device=device))
-            stream.wait(torch.cuda.current_stream())
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream())
             # The contract under test is the value each partition produces,
             # not which kernel produces it, so the provider is the one the
             # device selects rather than one architecture's kernel.
-            with stream, ExecutionContext(layer, stream=stream) as execution:
+            with ExecutionContext(layer, stream=stream) as execution:
                 execution.prepare(None)
 
                 def chunks():
@@ -230,23 +225,22 @@ def _run(rank, rendezvous):
                     rtol=2e-2,
                     atol=2e-2,
                 )
-                with CUDAGraph(context=execution) as graph:
-                    graph.capture(invoke)
-                    hidden.mul_(0.75)
-                    graph.replay()
-                    expected, live = _reference(projections(), valid)
-                    torch.testing.assert_close(
-                        result[live[local_begin:local_end]],
-                        expected[local_begin:local_end][
-                            live[local_begin:local_end]
-                        ],
-                        rtol=2e-2,
-                        atol=2e-2,
-                    )
+                graph = graphs.capture(invoke, stream=stream)
+                hidden.mul_(0.75)
+                graph.replay()
+                expected, live = _reference(projections(), valid)
+                torch.testing.assert_close(
+                    result[live[local_begin:local_end]],
+                    expected[local_begin:local_end][
+                        live[local_begin:local_end]
+                    ],
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
                 torch.cuda.synchronize(device)
+                graph.release()
 
 
-def test_video_sparse_partitions_and_replay(tmp_path):
-    mp.spawn(
-        _run, args=((tmp_path / "rendezvous").as_uri(),), nprocs=4, join=True
-    )
+def test_video_sparse_partitions_and_replay():
+    with rendezvous() as listener:
+        mp.spawn(_run, args=(listener,), nprocs=4, join=True)

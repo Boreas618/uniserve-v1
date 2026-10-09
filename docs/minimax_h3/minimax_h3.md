@@ -27,7 +27,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the CuTe and CUTLASS DSLs) and builds the `uniserve` and `uniserve-host` binaries, the `_uniserve_ipc` extension and UniServe's native kernels. The kernels compile for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names, with `MAX_JOBS` parallel jobs; a later sync recompiles them when their sources change.
+The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the CuTe and CUTLASS DSLs) and builds the `uniserve` and `uniserve-host` binaries, the worker's rank runtime library (`uniserve_models._worker`) and UniServe's native kernels. The kernels compile for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names, with `MAX_JOBS` parallel jobs; a later sync recompiles them when their sources change.
 
 ## Checkpoints
 
@@ -247,7 +247,7 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 
 | Symptom | Remedy |
 | --- | --- |
-| `_uniserve_ipc` import or protocol error | Run the `uv sync` above again and use the resulting `uniserve`. |
+| `uniserve_models._worker` load or protocol error | Run the `uv sync` above again and use the resulting `uniserve`. |
 | CUDA or sparse-attention compile error during `uv sync` | Check CUDA 13 `nvcc`, `CUDA_HOME`, the C++ build tools, and a `TORCH_CUDA_ARCH_LIST` naming the target GPUs when none is visible. |
 | `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the expected model and revision. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config` for a packed NVFP4 checkpoint. |

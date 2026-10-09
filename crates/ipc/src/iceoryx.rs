@@ -131,8 +131,8 @@ macro_rules! ipc_error {
 /// IPC version this build emits on every [`Header`].
 ///
 /// A wire-protocol change bumps this value. Receivers accept only this exact
-/// version, so the engine and the Python worker extension must be built with
-/// the same value.
+/// version, so the engine and the worker library must be built with the
+/// same value.
 pub const IPC_VERSION: u16 = 77;
 
 /// Returns whether this build can decode a peer-advertised IPC `version`.

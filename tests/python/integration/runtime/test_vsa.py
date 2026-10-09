@@ -13,8 +13,8 @@ from uniserve_kernels.attention.vsa_rows import pack_sparse_input_rows
 from tests.python.fixtures.vsa import reference_attention
 from uniserve_models.backends.attention import vsa as providers
 from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
+from uniserve_models.interface import graphs
 from uniserve_models.nn.attention import vsa
-from uniserve_models.runtime import CUDAGraph, CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -33,9 +33,7 @@ def provider(request):
 
 @pytest.fixture
 def stream():
-    owner = CUDAStream.external(torch.cuda.Stream())
-    yield owner
-    owner.close()
+    return torch.cuda.Stream()
 
 
 @pytest.fixture
@@ -122,22 +120,23 @@ def test_large_hopper_key_domain_preserves_head_values_on_graph_replay(stream):
     def invoke():
         return module(q, k, value, batch, out=out)
 
-    stream.wait(torch.cuda.current_stream())
+    stream.wait_stream(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa="flashinfer") as context:
         context.prepare(None)
         invoke()
         torch.testing.assert_close(
             out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
         )
-        with CUDAGraph(context=context) as graph:
-            graph.capture(invoke)
-            valid.fill_(32)
-            codes = 1 - codes
-            value.copy_(codes.expand(rows, -1, -1))
-            graph.replay()
-            torch.testing.assert_close(
-                out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
-            )
+        graph = graphs.capture(invoke, stream=stream)
+        valid.fill_(32)
+        codes = 1 - codes
+        value.copy_(codes.expand(rows, -1, -1))
+        graph.replay()
+        torch.testing.assert_close(
+            out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
+        )
+        stream.synchronize()
+        graph.release()
 
 
 @pytest.mark.parametrize(
@@ -154,7 +153,7 @@ def test_selection_compression_and_projected_chunks(provider, stream):
     inputs, workspace = _input(valid), _workspace(q)
     module = vsa.Attention(vsa.BlockAttention(128**-0.5))
     expected, live = reference_attention(q, k, v, gate, valid)
-    stream.wait(torch.cuda.current_stream())
+    stream.wait_stream(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa=provider) as context:
         context.prepare(None)
         batch = module.select(
@@ -184,16 +183,17 @@ def test_selection_compression_and_projected_chunks(provider, stream):
         torch.testing.assert_close(
             result[live], expected[live], rtol=2e-2, atol=2e-2
         )
-        with CUDAGraph(context=context) as graph:
-            graph.capture(invoke)
-            # Numerical inputs change without changing the prepared tile shape.
-            projections.mul_(0.5)
-            valid[1] = 9
-            graph.replay()
-            expected, live = reference_attention(q, k, v, gate, valid)
-            torch.testing.assert_close(
-                result[live], expected[live], rtol=2e-2, atol=2e-2
-            )
+        graph = graphs.capture(invoke, stream=stream)
+        # Numerical inputs change without changing the prepared tile shape.
+        projections.mul_(0.5)
+        valid[1] = 9
+        graph.replay()
+        expected, live = reference_attention(q, k, v, gate, valid)
+        torch.testing.assert_close(
+            result[live], expected[live], rtol=2e-2, atol=2e-2
+        )
+        stream.synchronize()
+        graph.release()
 
 
 @pytest.mark.parametrize(
@@ -211,7 +211,7 @@ def test_projected_chunks_apply_the_layer_softmax_scale(provider, stream):
     module = vsa.Attention(vsa.BlockAttention(scale))
     expected, live = reference_attention(q, k, v, gate, valid, scale=scale)
 
-    stream.wait(torch.cuda.current_stream())
+    stream.wait_stream(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa=provider) as context:
         context.prepare(None)
         result = torch.empty_like(q)
@@ -281,7 +281,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
             result[interval].copy_(output)
         return result
 
-    stream.wait(torch.cuda.current_stream())
+    stream.wait_stream(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream) as context:
         context.prepare(None)
         expected = attend(normalized_q, normalized_k, None).clone()
@@ -298,25 +298,28 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
         )
         replayed = torch.empty_like(q)
         norm_rope = vsa.NormRope(query_weight, key_weight, 1e-6, cos, sin)
-        with CUDAGraph(context=context) as graph:
-            graph.capture(lambda: attend(q, k, norm_rope, replayed))
-            q.add_(0.3)
-            k.mul_(-0.9)
-            graph.replay()
-            normalized_q, normalized_k = qk_norm_rope(
-                q,
-                k,
-                (query_weight,),
-                (key_weight,),
-                (cos,),
-                (sin,),
-                eps=1e-6,
-                axis_dims=(128,),
-            )
-            expected = attend(normalized_q, normalized_k, None)
-            torch.testing.assert_close(
-                replayed[live], expected[live], rtol=2**-7, atol=2**-7
-            )
+        graph = graphs.capture(
+            lambda: attend(q, k, norm_rope, replayed), stream=stream
+        )
+        q.add_(0.3)
+        k.mul_(-0.9)
+        graph.replay()
+        normalized_q, normalized_k = qk_norm_rope(
+            q,
+            k,
+            (query_weight,),
+            (key_weight,),
+            (cos,),
+            (sin,),
+            eps=1e-6,
+            axis_dims=(128,),
+        )
+        expected = attend(normalized_q, normalized_k, None)
+        torch.testing.assert_close(
+            replayed[live], expected[live], rtol=2**-7, atol=2**-7
+        )
+        stream.synchronize()
+        graph.release()
         torch.cuda.synchronize()
 
 
@@ -346,7 +349,7 @@ def test_row_production_over_many_intervals_matches_one_call(
     module = vsa.Attention(vsa.BlockAttention(128**-0.5))
     live = torch.arange(256, device="cuda") < 64 * 2 + 40
 
-    stream.wait(torch.cuda.current_stream())
+    stream.wait_stream(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa=provider) as context:
         context.prepare(None)
         batch = module.select(
@@ -488,7 +491,7 @@ def test_empty_prefix_tiles_leave_live_rows_unchanged(provider, stream):
         return inputs, workspace
 
     module = vsa.Attention(vsa.BlockAttention(128**-0.5))
-    stream.wait(torch.cuda.current_stream())
+    stream.wait_stream(torch.cuda.current_stream())
     with ExecutionContext(module, stream=stream, vsa=provider) as context:
         context.prepare(None)
         results = []

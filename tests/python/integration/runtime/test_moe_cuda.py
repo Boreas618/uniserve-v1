@@ -9,15 +9,14 @@ every native NVFP4 provider.
 import pytest
 import torch
 from torch.nn import functional as F
-from uniserve_models.runtime.cuda_graph import CUDAGraph
 
 from uniserve_models.backends import moe as moe_backends
 from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
+from uniserve_models.interface import graphs
 from uniserve_models.model import TextSize
 from uniserve_models.nn import functional
 from uniserve_models.nn.moe import FusedMoE
 from uniserve_models.quantization import Quantizer, ScaleLayout
-from uniserve_models.runtime import CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -69,11 +68,10 @@ def _replay_matches(
     module, hidden, ids, weights, expected, *, rtol, provider="auto"
 ):
     """Evaluate eagerly, then replay a capture over rewritten routing."""
-    stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
-    stream.wait(torch.cuda.current_stream(DEVICE))
+    stream = torch.cuda.Stream(device=DEVICE)
+    stream.wait_stream(torch.cuda.current_stream(DEVICE))
     generator = torch.Generator().manual_seed(47)
     with (
-        stream,
         ExecutionContext(module, stream=stream, moe=provider) as context,
     ):
         context.prepare(TextSize(TOKENS, 1))
@@ -83,21 +81,24 @@ def _replay_matches(
             actual.double(), expected(hidden, ids, weights), rtol=rtol, atol=0
         )
 
-        with CUDAGraph(context=context) as graph:
-            graph.capture(lambda: module(hidden, ids, weights))
-            replacement_ids, replacement_weights = _routes(
-                generator, top_k=ids.shape[1]
-            )
-            ids.copy_(replacement_ids)
-            weights.copy_(replacement_weights)
-            hidden.copy_(hidden.flip(0))
-            actual = graph.replay()
-            torch.testing.assert_close(
-                actual.double(),
-                expected(hidden, ids, weights),
-                rtol=rtol,
-                atol=0,
-            )
+        graph = graphs.capture(
+            lambda: module(hidden, ids, weights), stream=stream
+        )
+        replacement_ids, replacement_weights = _routes(
+            generator, top_k=ids.shape[1]
+        )
+        ids.copy_(replacement_ids)
+        weights.copy_(replacement_weights)
+        hidden.copy_(hidden.flip(0))
+        actual = graph.replay()
+        torch.testing.assert_close(
+            actual.double(),
+            expected(hidden, ids, weights),
+            rtol=rtol,
+            atol=0,
+        )
+        stream.synchronize()
+        graph.release()
     torch.cuda.synchronize(DEVICE)
 
 
@@ -174,10 +175,9 @@ def test_bf16_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
     module, hidden = _positive_bf16("gelu_tanh", generator, top_k=top_k)
     ids, weights = _routes(generator, top_k=top_k)
 
-    stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
-    stream.wait(torch.cuda.current_stream(DEVICE))
+    stream = torch.cuda.Stream(device=DEVICE)
+    stream.wait_stream(torch.cuda.current_stream(DEVICE))
     with (
-        stream,
         ExecutionContext(module, stream=stream, moe=provider) as context,
     ):
         context.prepare(TextSize(TOKENS, 1))
@@ -185,10 +185,13 @@ def test_bf16_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
             first = module(hidden, ids, weights).clone()
             for _ in range(16):
                 assert torch.equal(module(hidden, ids, weights), first)
-        with CUDAGraph(context=context) as graph:
-            graph.capture(lambda: module(hidden, ids, weights))
-            for _ in range(16):
-                assert torch.equal(graph.replay(), first)
+        graph = graphs.capture(
+            lambda: module(hidden, ids, weights), stream=stream
+        )
+        for _ in range(16):
+            assert torch.equal(graph.replay(), first)
+        stream.synchronize()
+        graph.release()
     torch.cuda.synchronize(DEVICE)
 
 
@@ -543,10 +546,9 @@ def test_nvfp4_experts_read_hidden_states_stored_in_their_input_encoding(
     ids, weights = _routes(generator)
     encoded = module.up_gate.input_quantizer.quantize(hidden)
 
-    stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
-    stream.wait(torch.cuda.current_stream(DEVICE))
+    stream = torch.cuda.Stream(device=DEVICE)
+    stream.wait_stream(torch.cuda.current_stream(DEVICE))
     with (
-        stream,
         ExecutionContext(module, stream=stream, moe=provider) as context,
     ):
         context.prepare(TextSize(TOKENS, 1))
@@ -559,9 +561,12 @@ def test_nvfp4_experts_read_hidden_states_stored_in_their_input_encoding(
                     ids,
                     weights,
                 )
-        with CUDAGraph(context=context) as graph:
-            graph.capture(lambda: module(encoded, ids, weights))
-            assert torch.equal(graph.replay(), expected)
+        graph = graphs.capture(
+            lambda: module(encoded, ids, weights), stream=stream
+        )
+        assert torch.equal(graph.replay(), expected)
+        stream.synchronize()
+        graph.release()
     torch.cuda.synchronize(DEVICE)
 
 
@@ -589,10 +594,9 @@ def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
         "gelu_tanh",
     )
 
-    stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
-    stream.wait(torch.cuda.current_stream(DEVICE))
+    stream = torch.cuda.Stream(device=DEVICE)
+    stream.wait_stream(torch.cuda.current_stream(DEVICE))
     with (
-        stream,
         ExecutionContext(module, stream=stream, moe=provider) as context,
     ):
         context.prepare(TextSize(TOKENS, 1))
@@ -603,10 +607,13 @@ def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
             )
             for _ in range(16):
                 assert torch.equal(module(hidden, ids, weights), first)
-        with CUDAGraph(context=context) as graph:
-            graph.capture(lambda: module(hidden, ids, weights))
-            for _ in range(16):
-                assert torch.equal(graph.replay(), first)
+        graph = graphs.capture(
+            lambda: module(hidden, ids, weights), stream=stream
+        )
+        for _ in range(16):
+            assert torch.equal(graph.replay(), first)
+        stream.synchronize()
+        graph.release()
     torch.cuda.synchronize(DEVICE)
 
 

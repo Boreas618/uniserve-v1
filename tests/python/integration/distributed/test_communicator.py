@@ -5,29 +5,27 @@ import torch
 import torch.multiprocessing as mp
 from torch.distributed.tensor import Replicate, Shard
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from uniserve_models.distributed import DeviceMesh, Distribution
 from uniserve_models.quantization import Quantizer
-from uniserve_models.runtime.process_groups import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 
 
-def _communicate(rank, rendezvous):
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=2,
-        device="cpu",
-        init_method=rendezvous,
-    ) as owner:
-        mesh = owner.bind(
+def _communicate(rank, listener):
+    with process_world(rank, 2, listener) as world:
+        mesh = bind_mesh(
+            world,
             DeviceMesh(
                 ranks=(1, 0),
                 shape=(2, 1),
                 axes=("tensor", "replica"),
                 rank=rank,
             ),
-            device="cpu",
         )
         group = mesh.submesh(("replica", "tensor")).get_group(
             ("replica", "tensor")
@@ -128,7 +126,6 @@ def _communicate(rank, rendezvous):
         )
 
 
-def test_collectives_preserve_values_and_outputs(tmp_path):
-    mp.spawn(
-        _communicate, args=((tmp_path / "world").as_uri(),), nprocs=2, join=True
-    )
+def test_collectives_preserve_values_and_outputs():
+    with rendezvous() as listener:
+        mp.spawn(_communicate, args=(listener,), nprocs=2, join=True)

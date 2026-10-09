@@ -1,7 +1,7 @@
 //! One rank's process and channel, from spawn to shutdown.
 //!
 //! `PendingRank::spawn_rank` writes the rank's launch descriptor and starts
-//! the Python worker here, or hands the launch to the host's launcher
+//! the rank process here, or hands the launch to the host's launcher
 //! (`launcher::RemoteHost`) when the placement puts the rank on another host.
 //! Once the rank reports its endpoint through `registration::RankRegistry`,
 //! `PendingRank::adopt` binds a `RankChannel` to it and yields a
@@ -19,7 +19,7 @@
 
 use crate::executor::WorkerResult;
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use super::BatchSubmitError;
@@ -122,12 +122,41 @@ impl std::str::FromStr for FlashInferBackend {
 /// Error returned for an unsupported FlashInfer backend name.
 pub struct FlashInferBackendParseError(String);
 
+impl WorkerProcessArgs {
+    /// The interpreter that runs rank processes when none is configured: the
+    /// one installed next to the running binary (an environment's `bin/`),
+    /// then the active virtual environment's, then `python3` on `PATH`.
+    pub fn default_python() -> std::path::PathBuf {
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(directory) = executable.parent()
+        {
+            for name in ["python3", "python"] {
+                let candidate = directory.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+
+        if let Some(environment) = std::env::var_os("VIRTUAL_ENV") {
+            let candidate = std::path::Path::new(&environment)
+                .join("bin")
+                .join("python");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+
+        "python3".into()
+    }
+}
+
 impl Default for WorkerProcessArgs {
     /// Returns worker launch settings suitable for a single local rank.
     fn default() -> Self {
         Self {
             worker_id: "worker".into(),
-            python: "python3".into(),
+            python: Self::default_python(),
             launcher_timeout: std::time::Duration::from_secs(120),
             model: String::new(),
             base_model: None,
@@ -629,17 +658,13 @@ impl PendingRank {
             .context("creating the worker launch descriptor directory")?;
         let descriptor_path = descriptor_directory.path().join("launch.json");
 
-        let mut cmd = Command::new(&args.python);
-        cmd.arg("-m")
-            .arg("uniserve_models.worker")
-            .arg("--worker-id")
-            .arg(&args.worker_id)
-            .arg("--rank")
-            .arg(rank.to_string())
-            .arg("--world-size")
-            .arg(world_size.to_string())
-            .arg("--launch-descriptor")
-            .arg(&descriptor_path);
+        let mut cmd = uniserve_ipc::launch::rank_command(
+            &args.python,
+            &args.worker_id,
+            rank,
+            world_size,
+            &descriptor_path,
+        );
 
         // Torch and the numerical libraries read the host-relative pair; the
         // global pair names the rank's place in the whole process world.
@@ -663,10 +688,10 @@ impl PendingRank {
         // process's copy when it is dropped, after the spawn below.
         let rendezvous_listen_fd = sockets
             .group
-            .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
+            .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener));
         let expert_listen_fd = sockets
             .experts
-            .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
+            .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener));
 
         // One typed descriptor carries every launch value. argv keeps the
         // process identity and the descriptor's location so a running worker
@@ -704,7 +729,7 @@ impl PendingRank {
                 components: args.components.clone(),
             });
         }
-        let child = cmd.spawn().context("spawning python worker")?;
+        let child = cmd.spawn().context("spawning the rank process")?;
 
         Ok(Self {
             child: PendingChild(Some(child)),

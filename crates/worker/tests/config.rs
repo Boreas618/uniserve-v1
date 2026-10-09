@@ -273,6 +273,12 @@ fn bucket_lists_are_positive_and_strictly_increasing() {
         vec![1024, 4096, 8192]
     );
     assert_eq!(launch.execution.min_video_seconds, Some(4.0));
+
+    // Without settings the worker derives its video capacities itself.
+    let unset = resolved(json!({})).unwrap();
+    assert!(unset.execution.video_text_capacities.is_empty());
+    assert_eq!(unset.execution.min_video_seconds, None);
+
     for capacities in ["0,1024", "4096,1024", "1024,1024"] {
         assert!(resolved(json!({"video_text_capacities": capacities})).is_err());
     }
@@ -318,7 +324,14 @@ fn attention_options_and_cuda_representations_are_checked() {
             launch_error(cuda).contains(&format!("{option} has no native CUDA attention kernel"))
         );
         // A CPU rank keeps the portable representations.
-        assert!(resolved(overrides).is_ok());
+        let requested = overrides
+            .get("model_dtype")
+            .and_then(Value::as_str)
+            .unwrap_or("bfloat16")
+            .to_owned();
+        let cpu = resolved(overrides).unwrap();
+        assert_eq!(cpu.execution.device, "cpu");
+        assert_eq!(cpu.execution.model_dtype, requested);
     }
 }
 
@@ -419,7 +432,8 @@ fn disaggregated_ranks_keep_their_local_rank_and_role() {
             (launch.execution.rank, launch.execution.world_size),
             (rank, world_size)
         );
-        assert_eq!(launch.expert_parallel.as_ref().unwrap().rank, union_rank);
+        let union = launch.expert_parallel.as_ref().unwrap();
+        assert_eq!((union.rank, union.attention_ranks), (union_rank, 4));
         assert_eq!(launch.execution.expert_microbatches, 2);
         assert_eq!(launch.supported_calls.is_empty(), role == "experts");
     }
