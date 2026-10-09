@@ -136,10 +136,8 @@ markers = [
 # Enforces the Google Python Style Guide
 # (https://google.github.io/styleguide/pyguide.html) on all project Python
 # modules: 80-column line limit (guide section 3.4), Google docstring
-# convention, and PEP 8 naming. Where the guide and the previous project
-# configuration disagreed, the guide wins; resolutions are recorded in
-# specs/python-style.md. The `refs/` reference checkouts keep their own
-# per-repository style enforcement (see refs/TensorRT-LLM/pyproject.toml).
+# convention, and PEP 8 naming. Local reference checkouts under the ignored
+# `refs/` directory keep their own per-repository style enforcement.
 line-length = 80
 target-version = "py311"
 extend-exclude = [
