@@ -81,7 +81,8 @@ def _options(backend: str, device: torch.device) -> dict[str, Any]:
         pg.use_pg_for_symm_mem_rendezvous = True
         # NCCL chooses an eligible algorithm for each operation and topology;
         # zero-CTA is a preference, not a claim about a mesh axis.
-        pg.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
+        # torch's stub declares neither the policy field nor its constant.
+        pg.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO  # type: ignore[attr-defined]
         options["pg_options"] = pg
     if device.type == "cuda" and (
         backend == "nccl" or "cuda:nccl" in backend.split(",")
@@ -264,7 +265,9 @@ class _Transfer:
     """A started native collective; its consumer joins it on its stream."""
 
     def __init__(self, wait: Callable[..., Any], token: int) -> None:
-        self._wait, self._token = wait, token
+        self._wait = wait
+        # Cleared once the consumer has joined the collective.
+        self._token: int | None = token
 
     def block_current_stream(self) -> None:
         token, self._token = self._token, None

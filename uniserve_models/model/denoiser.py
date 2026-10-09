@@ -451,7 +451,7 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
         latents: Mapping[str, tuple[LatentInput, ...]],
         sizes: tuple[image.Config, ...],
         step: torch.Tensor,
-        positions: torch.Tensor,
+        positions: tuple[torch.Tensor, ...],
         sequence_lengths: tuple[int, ...],
         attention: Any,
     ) -> InputT:
