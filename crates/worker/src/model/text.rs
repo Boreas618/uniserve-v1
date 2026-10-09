@@ -8,7 +8,7 @@
 
 use tvm_ffi::{Any, AnyView};
 
-use crate::ffi::{Fields, Function, Functions, Handle, Record, Shape};
+use crate::ffi::{DeferredCall, Fields, Function, Functions, Handle, Record, Shape};
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
 
@@ -173,10 +173,16 @@ impl TextModel {
         })
     }
 
-    /// Run one invocation.
-    pub fn step(&self, args: &StepArgs<'_>) -> Result<()> {
+    /// Run one invocation as an expert step of `expert_capacity` tokens per
+    /// rank (zero without expert-parallel layers).
+    pub fn step(&self, args: &StepArgs<'_>, expert_capacity: usize) -> Result<()> {
+        self.step_call(args, expert_capacity).invoke()
+    }
+
+    /// One invocation as a deferred call, for a microbatch thread.
+    pub fn step_call(&self, args: &StepArgs<'_>, expert_capacity: usize) -> DeferredCall {
         let graph = args.graph.map_or_else(Any::default, Handle::to_any);
-        let values = [
+        let values = vec![
             graph,
             flag(args.decode),
             integer(args.rows),
@@ -197,13 +203,19 @@ impl TextModel {
             shape(args.prompt),
             integer(args.axes),
             flag(args.embedded),
+            integer(expert_capacity),
         ];
-        let views: Vec<AnyView<'_>> = values.iter().map(AnyView::from).collect();
-        self.step.invoke(&views)
+        DeferredCall::new(self.step.clone(), values)
     }
 
-    /// Capture the shapes an eager step just prepared, in `pool`.
-    pub fn capture(&self, args: &CaptureArgs<'_>, pool: &Handle) -> Result<Handle> {
+    /// Capture the shapes an eager step just prepared, in `pool`, as the
+    /// expert step of `expert_capacity` tokens per rank.
+    pub fn capture(
+        &self,
+        args: &CaptureArgs<'_>,
+        pool: &Handle,
+        expert_capacity: usize,
+    ) -> Result<Handle> {
         let values = [
             flag(args.decode),
             integer(args.rows),
@@ -216,6 +228,7 @@ impl TextModel {
             flag(args.writes),
             flag(args.cache_only),
             pool.to_any(),
+            integer(expert_capacity),
         ];
         let views: Vec<AnyView<'_>> = values.iter().map(AnyView::from).collect();
         Ok(Handle::new(self.capture.call(&views)?))

@@ -395,6 +395,17 @@ def bind(
     input_ids, positions = tensors["input_ids"], tensors["positions"]
     candidate_index = tensors["candidate_index"]
     candidate_logprobs = tensors["candidate_logprobs"]
+    # With an exchanging tail, a readout's expert step spans the attend
+    # pass and the tail: the pass leaves the final layer's experts to the
+    # tail, which starts with every earlier expert layer reached.
+    exchange = context.experts
+    exchanging = tail_exchanges(
+        denoiser,
+        exchange=exchange is not None,
+        attention_ranks=0 if exchange is None else exchange.attention_ranks,
+    )
+    final = next(reversed(backbone.layers.values()))
+    attended = context.expert_layers(denoiser) - context.expert_layers(final)
 
     def _normalized(rows: torch.Tensor) -> torch.Tensor:
         """Full-vocabulary FP32 log-probabilities of attend-state ``rows``."""
@@ -417,6 +428,10 @@ def bind(
             for value, target in zip(values, state, strict=True):
                 target[: value.shape[0]].copy_(value)
 
+    def _attend_step(rows: int, tokens: int, capacity: int, batch) -> None:
+        with context.expert_step(capacity, join=not exchanging):
+            _attend(rows, tokens, batch)
+
     def readout_attend(
         rows: int,
         tokens: int,
@@ -425,19 +440,23 @@ def bind(
         prefixes: Sequence[int],
         widths: Sequence[int],
         starts: Sequence[int],
+        expert_capacity: int,
     ) -> None:
         """Evaluate ``tokens`` canvas tokens of ``rows`` sequences eagerly.
 
         Writes the final stage's per-token ``attend`` state into the leading
         rows of ``attend_state``; earlier stages forward their activations.
-        ``visible`` is the widest sequence.
+        ``visible`` is the widest sequence. ``expert_capacity`` is the
+        agreed capacity of the readout's expert step (zero without
+        expert-parallel layers); with an exchanging tail the step continues
+        in ``readout_finish``.
         """
         batch = attention.batch(
             int(rows), int(visible), queries, prefixes, widths, starts
         )
         context.bind_attention(batch)
         with context.activate(), torch.inference_mode():
-            _attend(int(rows), int(tokens), batch)
+            _attend_step(int(rows), int(tokens), int(expert_capacity), batch)
 
     def readout_tail(slots: int) -> torch.Tensor:
         """Log-probabilities ``[slots, vocab]`` of ``tail_rows[:slots]``.
@@ -467,17 +486,23 @@ def bind(
                 out=candidate_logprobs[start : start + count],
             )
 
-    def readout_finish(slots: int) -> _Tail:
+    def readout_finish(slots: int, expert_capacity: int) -> _Tail:
         """Complete every slot of a readout eagerly, on the final stage.
 
         Completes the final layer for ``slot_tokens[:slots]`` (exchanging
-        tokens with expert peers where the layer does) and returns the
+        tokens with expert peers where the layer does, as the rest of the
+        readout's expert step of ``expert_capacity``) and returns the
         ``[slots, vocab]`` log-probabilities for ``readout_candidates``,
         whose ``candidate_index`` then holds ``slot * vocab + token``.
         """
         if not last:
             raise ValueError("readout tails belong to the final stage")
-        with context.activate(), torch.inference_mode():
+        capacity = int(expert_capacity) if exchanging else 0
+        with (
+            context.activate(),
+            torch.inference_mode(),
+            context.expert_step(capacity, reached=attended),
+        ):
             return _Tail(_normalized(tensors["slot_tokens"][: int(slots)]))
 
     def readout_broadcast(count: int) -> None:
@@ -614,6 +639,10 @@ def bind(
             flags.copy_(output[:, 0] == STEP_CONTINUED)
             sampler.commit_rows(banks["live"], targets, flags)
 
+        def _expert_step(rows: int, first: bool, capacity: int, batch):
+            with context.expert_step(capacity):
+                _step(rows, first, batch)
+
         def step(
             rows: int,
             first: bool,
@@ -621,11 +650,14 @@ def bind(
             prefixes: Sequence[int],
             widths: Sequence[int],
             starts: Sequence[int],
+            expert_capacity: int,
         ) -> None:
             """Step ``rows`` gathered canvases once, eagerly.
 
             ``first`` declares every row at step zero. Writes
             ``step.results[:rows]`` and commits active rows to the banks.
+            The whole step is one expert step of ``expert_capacity`` (zero
+            without expert-parallel layers).
             """
             rows = int(rows)
             batch = attention.batch(
@@ -633,11 +665,13 @@ def bind(
             )
             context.bind_attention(batch)
             with context.activate(), torch.inference_mode():
-                _step(rows, bool(first), batch)
+                _expert_step(rows, bool(first), int(expert_capacity), batch)
 
         functions["step"] = step
 
-    def capture(function: str, arguments: Sequence, pool) -> _Graph:
+    def capture(
+        function: str, arguments: Sequence, pool, expert_capacity: int
+    ) -> _Graph:
         """Capture one canvas function for a fixed shape in ``pool``.
 
         ``function`` is ``readout_attend`` (``[rows, tokens, visible,
@@ -646,10 +680,14 @@ def bind(
         widths, starts]``), with the bucket's padded host metadata already
         written by the worker. The function runs once eagerly first, so
         lazy initialization and algorithm selection (which may synchronize
-        the device) happen outside the capture.
+        the device) happen outside the capture; that eager run is an expert
+        step of ``expert_capacity`` like the captured one.
         """
         arguments = list(arguments)
         name = str(function)
+        capacity = int(expert_capacity)
+        # Distributed expert weights submit peer reads between segments.
+        segments = None if context.weights is None else context.weights.capture
         if name == "readout_tail":
             slots = int(arguments[0])
             readout_tail(slots)
@@ -658,6 +696,7 @@ def bind(
                     lambda: _normalized(tensors["tail_rows"][:slots]),
                     stream=context.stream,
                     pool=pool,
+                    segments=segments,
                 )
             return _Graph(graph, None)
 
@@ -665,13 +704,13 @@ def bind(
         if name == "readout_attend":
             tokens, visible = int(arguments[1]), int(arguments[2])
             queries, prefixes, widths, starts = arguments[3:7]
-            readout_attend(rows, tokens, visible, *arguments[3:7])
-            body = functools.partial(_attend, rows, tokens)
+            readout_attend(rows, tokens, visible, *arguments[3:7], capacity)
+            body = functools.partial(_attend_step, rows, tokens, capacity)
         elif name == "step" and "step" in functions:
             first, visible = bool(arguments[1]), length
             queries, prefixes, widths, starts = arguments[2:6]
-            functions["step"](rows, first, *arguments[2:6])
-            body = functools.partial(_step, rows, first)
+            functions["step"](rows, first, *arguments[2:6], capacity)
+            body = functools.partial(_expert_step, rows, first, capacity)
         else:
             raise ValueError(f"canvas function {name!r} is not capturable")
 
@@ -691,6 +730,7 @@ def bind(
                 functools.partial(body, batch),
                 stream=context.stream,
                 pool=pool,
+                segments=segments,
             )
 
         def rebind(queries, prefixes, starts) -> None:

@@ -20,6 +20,7 @@ use uniserve_ipc::{DrawLayout, ForwardStats, LatentParams};
 use super::ImageRuntime;
 use super::batch::ImageBatch;
 use super::latents::Scratch;
+use crate::executor::forward::experts::ExpertRuntime;
 use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::transfer::latents;
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
@@ -353,8 +354,14 @@ impl ImageBatch<'_> {
         Ok(descriptors)
     }
 
-    /// Advance every active trajectory by its assigned interval.
-    pub(super) fn denoise(&mut self, mut text: Option<&mut TextRuntime>) -> Result<ForwardStats> {
+    /// Advance every active trajectory by its assigned interval. Missing
+    /// guidance prefixes are evaluated by `text` first, as expert steps on a
+    /// rank with `experts`.
+    pub(super) fn denoise(
+        &mut self,
+        mut text: Option<&mut TextRuntime>,
+        experts: Option<&ExpertRuntime>,
+    ) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();
         if active.is_empty() {
@@ -540,7 +547,7 @@ impl ImageBatch<'_> {
                     .iter()
                     .map(|(_, slot, tokens)| (*slot, &tokens[..]))
                     .collect();
-                text.prefill_cache(&component, &prefixes, tables, manager)?;
+                text.prefill_cache(experts, &component, &prefixes, tables, manager)?;
                 text.order().wait(stream.as_ref())?;
                 for (position, slot, tokens) in &fills {
                     let (trajectory, _) = &trajectories[*position];

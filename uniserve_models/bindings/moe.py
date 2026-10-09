@@ -1,6 +1,15 @@
-"""Routed-expert operators and workspace for one ``FusedMoE`` call site."""
+"""Routed-expert operators and workspace for one ``FusedMoE`` call site.
+
+An expert-parallel call site exchanges tokens with the other ranks of its
+expert group inside an :class:`ExpertStep`: every rank calls the same expert
+layers in the same order in every step, ranks without tokens included, at
+one per-rank token capacity the ranks agreed on before the step.
+"""
 
 from __future__ import annotations
+
+import contextvars
+from collections.abc import Sequence
 
 import torch
 
@@ -12,14 +21,104 @@ from ..backends import moe as moe_backend
 from ..backends import record_kernel_choice
 from . import capturing
 
+# The expert step of the running numerical invocation, if any.
+_STEP: contextvars.ContextVar[ExpertStep | None] = contextvars.ContextVar(
+    "uniserve_expert_step", default=None
+)
 
-def _yield_microbatch() -> None:
-    """Hand the device to the next active microbatch, if any."""
-    # The experts runtime supplies microbatch rotation; import it at use so
-    # bindings load without that runtime.
-    from ..runtime.microbatches import yield_microbatch
 
-    yield_microbatch()
+class ExpertStep:
+    """One expert step of a numerical invocation.
+
+    ``capacity`` is the step's per-rank token capacity, identical on every
+    rank of the group; ``layers`` are the invocation's expert-parallel call
+    sites in collective (traversal) order. While the step is open, each call
+    site records that the forward reached it; :meth:`join_tail` then joins
+    the layers the forward did not reach, with no tokens, so every rank
+    exchanges at every layer of the step. A forward may stop early (a
+    pipeline stage, a readout), but it may not skip a layer before one it
+    reaches. One step may span two invocations of the same rank: the first
+    leaves its tail unjoined, the second starts with the first's layers
+    ``reached`` and joins what neither reached.
+
+    The first call of a transport that needs it waits on the group's host
+    barrier, so a peer's preceding compilation cannot consume a device
+    collective timeout; that call must not be under CUDA graph capture.
+    """
+
+    def __init__(
+        self,
+        exchange,
+        layers: Sequence[MoEBinding],
+        capacity: int,
+        dtype: torch.dtype,
+        *,
+        reached: int = 0,
+    ) -> None:
+        if not 0 < capacity <= exchange.max_tokens:
+            raise ValueError(
+                f"expert step capacity {capacity} is outside the exchange's "
+                f"{exchange.max_tokens} tokens per rank"
+            )
+        self.exchange = exchange
+        self.layers = tuple(layers)
+        self.capacity = capacity
+        self.dtype = dtype
+        # A step one invocation continues from a preceding one (a readout's
+        # exchanging tail) starts with that invocation's layers reached.
+        self.reached = bytearray(len(self.layers))
+        self.reached[:reached] = b"\x01" * min(reached, len(self.layers))
+        self._token = None
+
+    def __enter__(self) -> ExpertStep:
+        if _STEP.get() is not None:
+            raise RuntimeError("an expert step is already open")
+        self.exchange.capacity = self.capacity
+        self._token = _STEP.set(self)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.exchange.capacity = 0
+        _STEP.reset(self._token)
+        self._token = None
+
+    def enter(self, binding: MoEBinding) -> None:
+        """Record that the forward reached ``binding``'s layer."""
+        exchange = self.exchange
+        if not exchange.ready:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("warm the expert exchange before capture")
+            exchange.barrier()
+            exchange.ready = True
+        self.reached[binding.ordinal] = 1
+
+    def join_tail(self) -> None:
+        """Join every layer after the last one the forward reached.
+
+        Raises:
+            RuntimeError: The forward skipped a layer before one it reached.
+        """
+        tail = self.reached.find(0)
+        if tail < 0:
+            return
+        if any(self.reached[tail:]):
+            raise RuntimeError(
+                "a forward skipped an expert layer before one it reached"
+            )
+        for binding in self.layers[tail:]:
+            binding.join(binding.module.hidden_size, self.dtype)
+
+
+def current_step() -> ExpertStep:
+    """The open expert step of an expert-parallel call site.
+
+    Raises:
+        RuntimeError: No expert step is open.
+    """
+    step = _STEP.get()
+    if step is None:
+        raise RuntimeError("expert-parallel layers run inside an expert step")
+    return step
 
 
 class MoEBinding:
@@ -29,13 +128,15 @@ class MoEBinding:
     CUDA capture; a smaller call reuses it.
 
     An expert-parallel call site (``module.expert_group`` spans several
-    ranks) borrows the worker's ``ExpertExchange``: each call sends its
-    tokens to the ranks holding their experts, runs this rank's experts over
-    the tokens it receives, ``P * C`` rows for a group of ``P`` ranks and the
-    open step's capacity ``C``, and combines the partial sums back. Its
-    local operator is prepared once for ``P`` times the exchange's largest
-    capacity. Hidden states of NVFP4 experts travel in the experts' input
-    encoding, dense hidden states otherwise.
+    ranks, or experts run on dedicated ranks) borrows an expert transport
+    (``backends.experts``): each call sends its tokens to the ranks holding
+    their experts, runs this rank's experts over the tokens it receives,
+    ``P * C`` rows for a group of ``P`` ranks and the open step's capacity
+    ``C``, and combines the partial sums back. Its local operator is
+    prepared once for ``P`` times the transport's largest capacity. Hidden
+    states of NVFP4 experts travel in the experts' input encoding, dense
+    hidden states otherwise. ``ordinal`` is the call site's position among
+    the invocation's expert-parallel layers, in collective order.
     """
 
     def __init__(
@@ -47,9 +148,11 @@ class MoEBinding:
         allocate,
         exchange=None,
         weights=None,
+        ordinal: int = 0,
     ):
         self.module, self.backend, self.device = module, backend, device
         self.allocate = allocate
+        self.ordinal = ordinal
         self.size = size
         self.operator = None
         self.provider = None
@@ -213,10 +316,10 @@ class MoEBinding:
             return output
 
         operator = self.prepare(TextSize(hidden.shape[0], 1))
+        current_step().enter(self)
         if exchange.transport == "megamoe":
             # The fused kernel exchanges, runs the experts and combines in
             # one launch over the exchange's symmetric buffers.
-            exchange.enter(id(self.module))
             output = operator(hidden, topk_ids, topk_weights)
         else:
             quantizer = self.module.up_gate.input_quantizer
@@ -242,13 +345,14 @@ class MoEBinding:
                 # join it.
                 hidden = operator.encode(hidden)
             received = exchange.dispatch(
-                id(self.module),
                 hidden,
                 topk_ids,
                 topk_weights,
                 invalid_expert=self._invalid_expert,
             )
-            _yield_microbatch()
+            # Other microbatches submit their dispatch while this one's
+            # tokens travel.
+            exchange.yield_turn()
             # The local experts combine their routes into this rank's
             # partial sums, and the exchange sums the ranks' partials (FP32,
             # one BF16 rounding).

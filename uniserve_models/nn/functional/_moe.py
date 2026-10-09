@@ -210,5 +210,9 @@ def fused_moe(
         routes[selected] = F.linear(
             _encoded(activated, input_quantizers[1]), down_values[expert]
         ).to(dtype)
-    result = Routes(routes.reshape(tokens, -1, width), topk_weights)
+    # Explicit route count: zero tokens (a rank joining an expert step
+    # without rows of its own) still form [0, K, H] routes.
+    result = Routes(
+        routes.reshape(tokens, topk_ids.shape[1], width), topk_weights
+    )
     return result.combine() if combine else result

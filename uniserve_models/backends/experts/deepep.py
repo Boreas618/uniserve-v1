@@ -9,21 +9,25 @@ caller still sees global model expert ids and unpadded hidden states.
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 
 from uniserve_models.distributed import Communicator
 from uniserve_models.quantization import QuantizedTensor, ScaleLayout
 
+from . import ExpertTransport
 
-class DeepEP:
+
+class DeepEP(ExpertTransport):
     """Own one elastic communication buffer and its native communicator.
 
-    Construction and ``close`` are collective over ``group``. Calls must
+    Construction and ``close`` are collective over ``group``; ``bootstrap``
+    distributes the NCCL unique id and runs the host barriers. Calls must
     alternate ``dispatch`` and ``combine`` in the same order on all ranks,
     including ranks with no tokens. Different microbatches use different
     instances, each with its own communication stream and buffer. A caller
     drains device work before closing; on distributed failure it exits the
-    process without collective cleanup.
+    process without collective cleanup. The first call waits on a host
+    barrier, so a peer's preceding compilation cannot consume a device
+    collective timeout.
 
     ``attention_ranks=0`` serves ordinary expert parallelism. Otherwise the
     first ``attention_ranks`` members source tokens and the remaining ranks
@@ -32,15 +36,19 @@ class DeepEP:
     computation exactly once, before ``combine``.
     """
 
+    transport = "deepep"
+
     def __init__(
         self,
         group: Communicator,
+        bootstrap,
         *,
         num_experts: int,
         top_k: int,
         hidden_size: int,
         max_tokens: int,
         attention_ranks: int = 0,
+        yield_turn=None,
     ):
         expert_ranks = group.size - attention_ranks
         if (
@@ -57,27 +65,31 @@ class DeepEP:
 
         from uniserve_kernels.deepep import load
 
-        self.group = group
+        super().__init__(
+            group,
+            bootstrap,
+            max_tokens=max_tokens,
+            attention_ranks=attention_ranks,
+            barrier_first=True,
+            yield_turn=yield_turn,
+        )
         self.hidden_size = hidden_size
         # DeepEP's combine distributes int4 vectors over 32-lane warps.
         self.wire_hidden = (hidden_size + 255) // 256 * 256
-        self.max_tokens = max_tokens
         self.top_k = top_k
-        self.attention_ranks = attention_ranks
-        self.source_only = group.rank < attention_ranks
         local_experts = num_experts // expert_ranks
         self.expert_offset = attention_ranks * local_experts
         self.local_start = (group.rank - attention_ranks) * local_experts
         self.wire_experts = group.size * local_experts
         self._native = load()
-        identities = [
-            self._native.get_local_nccl_unique_id() if group.rank == 0 else None
-        ]
-        dist.broadcast_object_list(
-            identities, src=group.ranks[0], group=group._require()
+        identity = bootstrap.bcast(
+            self._native.get_local_nccl_unique_id()
+            if group.rank == 0
+            else None,
+            root=0,
         )
         self._comm = self._native.create_nccl_comm(
-            identities[0], group.size, group.rank
+            identity, group.size, group.rank
         )
         # The elastic metadata can use one guard slot beyond a token bucket.
         # The caller-visible capacity remains max_tokens.
@@ -106,7 +118,7 @@ class DeepEP:
             True,
         )
         torch.cuda.synchronize(group.device)
-        dist.barrier(group=group._require())
+        bootstrap.barrier()
         self._buffer.barrier(True, False)
         torch.cuda.synchronize(group.device)
         self._sms = min(
@@ -118,17 +130,24 @@ class DeepEP:
         self._qps = min(self._sms * 16 + 1, 129)
         self._handle = None
 
-    def dispatch(self, hidden, ids, weights, *, capacity=None):
+    def dispatch(self, hidden, topk_ids, topk_weights, *, invalid_expert):
         """Route BF16 or encoded NVFP4 rows without changing their values.
 
         Returned tensors have a static worst-case row extent, suitable for
-        CUDA capture. Unused rows carry zero states/weights and ids of -1;
-        no host read of the received token count is required. The returned
-        views stay live through the matching ``combine``.
+        CUDA capture. Unused rows carry zero states and weights and the
+        ``invalid_expert`` id; no host read of the received token count is
+        required. The returned views stay live through the matching
+        ``combine``.
         """
+        states, ids, weights = self._dispatch(
+            hidden, topk_ids, topk_weights, capacity=self.capacity
+        )
+        # Each numerical provider declares the sentinel its kernel skips.
+        return states, torch.where(ids < 0, invalid_expert, ids), weights
+
+    def _dispatch(self, hidden, ids, weights, *, capacity):
         if self._buffer is None or self._handle is not None:
             raise RuntimeError("dispatch requires an open, idle exchange")
-        capacity = self.max_tokens if capacity is None else capacity
         tokens = hidden.shape[0]
         if (
             hidden.ndim != 2
@@ -262,13 +281,19 @@ class DeepEP:
             )
         return states, global_ids, route_weights
 
-    def combine(self, partial):
+    def combine(self, partial, tokens):
         """Return each source's weighted expert sums in its original row order.
 
         ``partial`` has the same logical shape as dispatch's returned hidden
         states. Expert computation has already applied route weights;
         passing them to DeepEP again would multiply them twice.
         """
+        output = self._combine(partial)
+        if output.shape[0] != tokens:
+            raise RuntimeError("the combine returned another token count")
+        return output
+
+    def _combine(self, partial):
         if self._buffer is None or self._handle is None:
             raise RuntimeError("combine requires a preceding dispatch")
         metadata, ids, counts, token_metadata, links, capacity, shape = (
@@ -305,11 +330,16 @@ class DeepEP:
         return output[:, : self.hidden_size].contiguous()
 
     def close(self):
-        """Release the collective resources after all invocations finish."""
+        """Release the collective resources after all invocations finish.
+
+        Every member reaches the host barrier after draining its own work,
+        because a local drain does not retire a peer's remote accesses.
+        """
         if self._handle is not None:
             raise RuntimeError("complete the expert exchange before closing")
         if self._buffer is None:
             return
+        self.barrier()
         self._buffer.destroy()
         self._native.destroy_nccl_comm(self._comm)
         self._buffer = None

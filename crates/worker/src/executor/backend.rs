@@ -55,6 +55,10 @@ pub struct WorkerBackend {
     image: Option<forward::image::ImageRuntime>,
     /// The canvas runtime, on ranks holding a token denoiser.
     canvas: Option<forward::canvas::CanvasRuntime>,
+    /// The expert-parallel runtime, on ranks of an expert union.
+    experts: Option<forward::experts::ExpertRuntime>,
+    /// Distributed expert weights, on ranks that prefetch them.
+    weights: Option<forward::experts::WeightRuntime>,
     /// The transfer runtime: tensor transfers, KV exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<forward::transfer::TransferRuntime>,
@@ -76,6 +80,7 @@ pub(crate) struct Parts<'a> {
     pub text: Option<&'a mut forward::token::TextRuntime>,
     pub image: Option<&'a mut forward::image::ImageRuntime>,
     pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
+    pub experts: Option<&'a forward::experts::ExpertRuntime>,
     pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
 }
 
@@ -234,6 +239,8 @@ impl WorkerBackend {
             text: None,
             image: None,
             canvas: None,
+            experts: None,
+            weights: None,
             transfer: None,
             video: None,
             storage: Vec::new(),
@@ -303,6 +310,38 @@ impl WorkerBackend {
         self.canvas.as_mut()
     }
 
+    /// Install the expert-parallel runtime.
+    pub(crate) fn set_experts(&mut self, experts: forward::experts::ExpertRuntime) {
+        self.experts = Some(experts);
+    }
+
+    /// Install the distributed expert weights.
+    pub(crate) fn set_weights(&mut self, weights: forward::experts::WeightRuntime) {
+        self.weights = Some(weights);
+    }
+
+    pub(crate) fn experts(&self) -> Option<&forward::experts::ExpertRuntime> {
+        self.experts.as_ref()
+    }
+
+    pub(crate) fn experts_mut(&mut self) -> Option<&mut forward::experts::ExpertRuntime> {
+        self.experts.as_mut()
+    }
+
+    /// Release the expert runtime after the bindings and graphs using its
+    /// transports retired; collective unless `aborted`.
+    pub(crate) fn close_experts(&mut self, aborted: bool) -> Result<()> {
+        let experts = match &mut self.experts {
+            Some(experts) => experts.close(aborted),
+            None => Ok(()),
+        };
+        let weights = match &mut self.weights {
+            Some(weights) => weights.close(aborted),
+            None => Ok(()),
+        };
+        experts.and(weights)
+    }
+
     /// Install the transfer runtime.
     pub(crate) fn set_transfer(&mut self, transfer: forward::transfer::TransferRuntime) {
         self.transfer = Some(transfer);
@@ -342,6 +381,7 @@ impl WorkerBackend {
             text: self.text.as_mut(),
             image: self.image.as_mut(),
             canvas: self.canvas.as_mut(),
+            experts: self.experts.as_ref(),
             transfer: self.transfer.as_mut(),
         }
     }
