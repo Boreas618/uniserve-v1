@@ -180,6 +180,23 @@ impl ExpertRuntime {
         self.warming.store(false, Ordering::Release);
     }
 
+    /// Whether this rank's forwards may replay their captured graphs.
+    ///
+    /// A replayed forward submits its whole step in one launch, without
+    /// passing the host turn, and its thread then waits in the driver for
+    /// that stream to finish before it can launch more: the driver holds
+    /// about a thousand unfinished launches per stream and blocks the next
+    /// one. A rank that joins eagerly submits its microbatches in rotation
+    /// behind kernels that wait for this rank's other microbatches, reaches
+    /// the same limit and keeps its own turn. Neither rank then submits what
+    /// the other waits for. A replayed join submits each microbatch whole
+    /// and waits on no host turn, so forwards replay only once the union's
+    /// joins are captured; until then they run eagerly, in the same rotation
+    /// as every rank's joins. Without microbatch threads no turn is held.
+    pub(crate) fn replays(&self) -> bool {
+        self.lanes.is_none() || self.joins.is_some()
+    }
+
     /// Order every microbatch stream after `parent`'s submitted work, before
     /// the caller stages microbatch inputs.
     pub(crate) fn fork(&self, parent: &Stream) -> Result<()> {
