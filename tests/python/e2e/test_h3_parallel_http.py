@@ -575,9 +575,13 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         video = caps["video"]
         assert video["tasks"] == ["t2va"]
         assert video["task_conditions"] == {"t2va": {"conditions": []}}
-        # A FastH3 DMD export generates the 16:9 canvas alone.
-        assert video["canvas"]["aspect_ratios"] == ["16:9"]
-        assert video["canvas"]["canvases"] == [{"width": 1344, "height": 768}]
+        # The default deployment prepares the 768p 16:9 and 9:16 buckets.
+        assert video["canvas"]["short_edges"] == [768]
+        assert video["canvas"]["aspect_ratios"] == ["16:9", "9:16"]
+        assert video["canvas"]["canvases"] == [
+            {"width": 1344, "height": 768},
+            {"width": 768, "height": 1344},
+        ]
         # The schedule counts sigma points: one per trained rung and the
         # clean endpoint.
         schedule = video["schedule"]
@@ -606,7 +610,9 @@ def test_video_jobs_retain_content_and_cancel_active_work(
             # Denoiser forwards are one fewer than the schedule's points.
             {**river, "num_inference_steps": expected_steps},
             {**river, "target": {**river["target"], "duration_seconds": 16}},
-            {**river, "target": {**river["target"], "aspect_ratio": "9:16"}},
+            # Buckets the deployment did not prepare.
+            {**river, "target": {**river["target"], "aspect_ratio": "1:1"}},
+            {**river, "target": {**river["target"], "short_edge": 480}},
             {**river, "seconds": 10},
         ):
             response = client.post("/v1/videos", json=payload)

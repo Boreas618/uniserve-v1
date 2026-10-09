@@ -717,21 +717,21 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
     );
 }
 
-/// A FastH3 DMD export generates its single 16:9 canvas on its own schedule:
-/// other canvases are refused, and the capabilities report the canvas, the
-/// schedule and the deployment's duration capacity.
+/// A FastH3 DMD deployment serves the training buckets its workers prepared,
+/// on the export's own schedule: other canvases are refused, and the
+/// capabilities report the canvases, the short edges and named ratios they
+/// serve, the schedule and the deployment's duration capacity.
 #[tokio::test]
 async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
+    let canvas = |width, height| uniserve_core::Canvas { width, height };
+    // 768p 16:9, then 480p 21:9 and 16:9.
     let denoiser = VideoDenoiserInfo {
         tasks: vec!["t2va".to_owned()],
         schedule_points: 9,
         video_shift: 10.0,
         audio_shift: 3.0,
-        canvases: vec![uniserve_core::Canvas {
-            width: 1344,
-            height: 768,
-        }],
+        canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
         max_sequence_rows: None,
         condition_tiles: None,
     };
@@ -769,11 +769,29 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     assert_eq!(capabilities["fps"], 24);
     assert_eq!(
         capabilities["canvas"]["canvases"],
-        serde_json::json!([{"width": 1344, "height": 768}])
+        serde_json::json!([
+            {"width": 1344, "height": 768},
+            {"width": 992, "height": 416},
+            {"width": 832, "height": 480},
+        ])
+    );
+    assert_eq!(
+        capabilities["canvas"]["short_edges"],
+        serde_json::json!([768, 480])
     );
     assert_eq!(
         capabilities["canvas"]["aspect_ratios"],
-        serde_json::json!(["16:9"])
+        serde_json::json!(["21:9", "16:9"])
+    );
+    assert_eq!(
+        capabilities["canvas"]["sizes"],
+        serde_json::json!({
+            "768": {"16:9": {"width": 1344, "height": 768}},
+            "480": {
+                "21:9": {"width": 992, "height": 416},
+                "16:9": {"width": 832, "height": 480},
+            },
+        })
     );
     assert_eq!(
         capabilities["schedule"],
@@ -793,9 +811,35 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         .unwrap();
     assert_eq!(prepared.request.sampling.num_frames, 243);
     assert_eq!(prepared.request.sampling.num_inference_steps, 8);
+    assert_eq!(prepared.canvas, canvas(1344, 768));
+
+    // A 480 short edge names the 480p training bucket of the ratio.
+    let narrow = model
+        .preprocess_video_request(
+            &id,
+            &video_request(serde_json::json!({
+                "target": {"short_edge": 480, "aspect_ratio": "21:9", "duration_seconds": 5.0}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(narrow.canvas, canvas(992, 416));
+    assert_eq!(
+        (
+            narrow.request.sampling.width,
+            narrow.request.sampling.height
+        ),
+        (992, 416)
+    );
+
+    // A duration beyond the capacity, an unprepared bucket at either short
+    // edge, and an unserved short edge are refused.
     for target in [
         serde_json::json!({"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 10.5}),
         serde_json::json!({"short_edge": 768, "aspect_ratio": "9:16", "duration_seconds": 5.0}),
+        serde_json::json!({"short_edge": 768, "aspect_ratio": "21:9", "duration_seconds": 5.0}),
+        serde_json::json!({"short_edge": 480, "aspect_ratio": "1:1", "duration_seconds": 5.0}),
+        serde_json::json!({"short_edge": 720, "aspect_ratio": "16:9", "duration_seconds": 5.0}),
     ] {
         assert!(
             model

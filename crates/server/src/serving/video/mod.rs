@@ -219,6 +219,11 @@ impl VideoIngest {
         }
     }
 
+    /// What the deployment serves, which every request is planned against.
+    pub fn limits(&self) -> &PlanLimits {
+        &self.limits
+    }
+
     /// Validates, fetches, probes, plans and presents one request.
     ///
     /// The request-only rules run before any fetch. Fetches and probes of

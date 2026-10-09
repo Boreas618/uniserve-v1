@@ -34,6 +34,7 @@ pub mod omni;
 pub mod reasoning;
 pub mod tokenizer;
 pub mod tools;
+pub mod video;
 
 /// The complete configured model-description set selected at server startup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
