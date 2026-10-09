@@ -651,7 +651,7 @@ impl Transport {
         stream: Option<&Stream>,
     ) -> Result<Arc<Read>> {
         if let Some(error) = self.reads.error() {
-            return Err(Error::Transport(error.to_string()));
+            return Err(Error::Shared(error));
         }
         let (buffer, grant) = Endpoint::acquire_read(locator)?;
         let borrowed = destination.is_none();
@@ -821,7 +821,7 @@ impl Transport {
             .take()
             .unwrap_or_default();
         let mut result = match self.reads.close() {
-            Some(error) => Err(Error::Transport(error.to_string())),
+            Some(error) => Err(Error::Shared(error)),
             None => Ok(()),
         };
         for read in borrowed

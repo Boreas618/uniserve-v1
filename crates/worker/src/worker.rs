@@ -95,6 +95,8 @@ fn phase(phase: &'static str) -> impl Fn(Error) -> WorkerError {
     move |error| {
         // Description and process-group setup refuse a launch the rank
         // cannot serve; report input errors there as unsupported setups.
+        // `ValueError` is the kind of a returned value TVM-FFI could not
+        // convert.
         let error = match error {
             Error::Numerical {
                 kind,
@@ -102,10 +104,7 @@ fn phase(phase: &'static str) -> impl Fn(Error) -> WorkerError {
                 traceback,
                 function,
             } if matches!(phase, "describe" | "process groups")
-                && matches!(
-                    kind.as_str(),
-                    "InputError" | "FileNotFound" | "ValueError" | "FileNotFoundError"
-                ) =>
+                && matches!(kind.as_str(), "InputError" | "FileNotFound" | "ValueError") =>
             {
                 Error::Numerical {
                     kind: "UnsupportedSetup".into(),

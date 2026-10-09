@@ -138,7 +138,7 @@ impl Read {
     /// Fail unless the read is still wanted (checked between copy steps).
     pub(crate) fn require_active(&self) -> Result<()> {
         match self.lock().ticket.cancellation_error() {
-            Some(error) => Err(Error::Transport(error.to_string())),
+            Some(error) => Err(Error::Shared(error)),
             None => Ok(()),
         }
     }
@@ -150,7 +150,7 @@ impl Read {
         let mut state = self.lock();
         let value = match state.ticket.result()? {
             Outcome::Success(value) => Spans::clone(&value),
-            Outcome::Failed(error) => return Err(Error::Transport(error.to_string())),
+            Outcome::Failed(error) => return Err(Error::Shared(error)),
             Outcome::Cancelled => return Err(Error::Resource("transfer read was cancelled")),
         };
         if state.ticket.producer().is_some() {
@@ -255,8 +255,8 @@ impl Read {
         Ok(())
     }
 
-    fn fail(&self, error: Error) {
-        let (_, callbacks) = self.lock().ticket.fail(error);
+    fn fail(&self, error: Arc<Error>) {
+        let (_, callbacks) = self.lock().ticket.fail_shared(error);
         self.ready.notify_all();
         notify(callbacks);
     }
@@ -594,9 +594,12 @@ impl NativeRead {
             self.context.events.record(&completed, &stream)?;
             self.read.complete(destination.clone(), Some(completed))
         })();
-        if let Err(error) = &copied {
-            self.read.fail(Error::Transport(error.to_string()));
-        }
+        // The read's waiters and this call's caller observe one failure.
+        let copied = copied.map_err(|error| {
+            let shared = Arc::new(error);
+            self.read.fail(Arc::clone(&shared));
+            Error::Shared(shared)
+        });
 
         let drained = DeviceGuard::new(DeviceId(device))
             .map_err(Error::from)
@@ -755,7 +758,7 @@ pub(crate) fn submit(
     reservation: Option<&super::ReadReservation<Notify>>,
 ) -> Result<Arc<Read>> {
     if let Some(error) = pool.error() {
-        return Err(Error::Transport(error.to_string()));
+        return Err(Error::Shared(error));
     }
     let read = Arc::clone(&backend.read);
     let destination_device = match &backend.call {
@@ -814,4 +817,28 @@ pub(crate) fn borrow(
         read.add_retirement_callback(wake);
     }
     read.complete(spans, producer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{ErrorCode, WorkerError};
+
+    #[test]
+    fn a_cancelled_read_reports_a_resource_failure() -> Result<()> {
+        let read = Read::new(EventPool::new(), None);
+        read.cancel()?;
+
+        // Both the copy's activity check and the consumer's result report
+        // the cancellation with its own class.
+        for observed in [read.require_active(), read.result(None).map(drop)] {
+            let Err(error) = observed else {
+                return Err(Error::State("a cancelled read stayed usable"));
+            };
+            let classified = WorkerError::classify(error, None);
+            assert_eq!(classified.code, ErrorCode::ResourceError);
+            assert_eq!(classified.message(), "transfer read was cancelled");
+        }
+        Ok(())
+    }
 }

@@ -35,7 +35,7 @@ import torch
 from uniserve_models.media import codec, reader
 from uniserve_models.model import AudioEncoder, PatchEncoder
 
-from .errors import SetupError, translate
+from .errors import SetupError, binding
 
 
 def functions() -> dict[str, Callable[..., Any]]:
@@ -133,10 +133,12 @@ def bind_reader(loaded) -> dict[str, Any]:
             raise ValueError("a condition's patch rows disagree with its plan")
         target.copy_(rows)
 
-    return {
-        "pack_vision": translate(pack_vision),
-        "sample_rate": int(audio.sample_rate),
-    }
+    return binding(
+        {
+            "pack_vision": pack_vision,
+            "sample_rate": int(audio.sample_rate),
+        }
+    )
 
 
 def encode_video_unit(rgb, frame_rate: int) -> bytes:

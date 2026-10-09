@@ -40,7 +40,7 @@ from uniserve_models.media.pixels import quantize_image_hwc
 from uniserve_models.model import ImageDecoder
 
 from . import calls, regions
-from .errors import translate
+from .errors import binding
 
 
 def functions() -> dict[str, Callable[..., Any]]:
@@ -113,7 +113,4 @@ def bind(
                 int(offset),
             )
 
-    return {
-        name: translate(step)
-        for name, step in {"decode": decode, "quantize": quantize}.items()
-    }
+    return binding({"decode": decode, "quantize": quantize})
