@@ -1690,7 +1690,7 @@ impl VideoRuntime {
             })
             .collect();
         let slots = info.request_slots;
-        let capture = config.graph_policy != "off" && config.primary_device().is_cuda();
+        let capture = config.graph_policy != "off" && config.device.is_cuda();
         let create_pool = interface.function("graphs.pool")?;
         let pool = |graphs: &mut crate::runner::GraphStorage<String, Handle>,
                     key: usize,
@@ -1959,7 +1959,7 @@ impl VideoRuntime {
             )?),
             None => None,
         };
-        let device = match config.primary_device() {
+        let device = match config.device {
             crate::config::Device::Cuda(index) => Some(index),
             crate::config::Device::Cpu => None,
         };

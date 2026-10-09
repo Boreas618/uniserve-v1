@@ -515,7 +515,7 @@ pub(crate) fn reserved_bytes(
     };
     let facts = CanvasFacts::describe(interface, model.handle(), &path, experts.0, experts.1)?;
     let facts = &facts;
-    let cuda = config.primary_device().cuda_index();
+    let cuda = config.device.cuda_index();
     let bounds = CanvasBounds::new(config, request_slots, cache, None, facts, cuda.is_some())?;
     let banks = config
         .canvas_sampling

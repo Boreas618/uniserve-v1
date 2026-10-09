@@ -129,7 +129,7 @@ pub struct WorkerLaunch {
 impl WorkerLaunch {
     /// The rank's primary device.
     pub fn device(&self) -> Device {
-        self.execution.primary_device()
+        self.execution.device
     }
 }
 
@@ -617,8 +617,8 @@ fn execution(
         .transpose()?;
 
     let mut config = WorkerConfig {
-        device: device.to_string(),
-        generation_device: generation.map(|device| device.to_string()),
+        device,
+        generation_device: generation,
         rank: descriptor.rank as usize,
         world_size: descriptor.world_size as usize,
         role: if role.is_empty() {
@@ -633,6 +633,7 @@ fn execution(
         max_sequence_tokens: descriptor.max_model_len as usize,
         max_video_seconds: descriptor.max_video_seconds,
         max_condition_rows: descriptor.max_condition_rows as usize,
+        encoder_cache_entries: descriptor.encoder_cache_entries as usize,
         ffmpeg: descriptor.ffmpeg.clone(),
         min_video_seconds: descriptor.min_video_seconds,
         video_canvases: descriptor.video_canvases.clone(),
