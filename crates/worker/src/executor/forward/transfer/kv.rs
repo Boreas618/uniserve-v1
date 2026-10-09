@@ -16,10 +16,6 @@
 //! the batch's stream, and the import's pages become the slot's prefix.
 //! The installed buffer becomes resident beside its source at the commit
 //! point, which also accepts the extent as the destination's base.
-//!
-//! These functions serve every runtime that executes KV transfers: the
-//! image runtime publishes conditioning in its own batches, the transfer
-//! runtime serves the rest.
 
 use uniserve_cuda::Stream;
 use uniserve_ipc::{BufferId, Call, KvTransfer};
