@@ -428,6 +428,42 @@ fn sm_partitions_create_streams_of_the_requested_size() {
 }
 
 #[test]
+#[ignore = "requires a CUDA device"]
+fn forks_and_fences_outlive_their_partition_stream() {
+    let _driver = exclusive_driver();
+    let parent = Stream::partition(DEVICE, &[16]).unwrap().remove(0);
+    let fork = parent.fork().unwrap();
+    let device = DeviceAllocation::linear(DEVICE, 1024).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 1024).unwrap();
+    let written = Event::new(EventFlags::default());
+
+    // SAFETY: the ranges outlive the synchronizations below.
+    unsafe { memset_d8(device.address(), 7, 1024, &parent).unwrap() };
+    written.record(&parent).unwrap();
+    drop(parent);
+
+    // The fence recorded in the partition still orders a consumer of the
+    // primary context after the recording stream is gone.
+    let consumer = Stream::new(DEVICE).unwrap();
+    consumer.wait_event(&written).unwrap();
+    // SAFETY: as above.
+    unsafe { memcpy_async(host.address(), device.address(), 1024, &consumer).unwrap() };
+    consumer.synchronize().unwrap();
+    assert!(read(&host).iter().all(|byte| *byte == 7));
+
+    // The fork keeps the partition and still executes work in it.
+    assert!(fork.is_partitioned().unwrap());
+    assert_eq!(fork.sm_count().unwrap(), 16);
+    // SAFETY: as above.
+    unsafe {
+        memset_d8(device.address(), 9, 1024, &fork).unwrap();
+        memcpy_async(host.address(), device.address(), 1024, &fork).unwrap();
+    }
+    fork.synchronize().unwrap();
+    assert!(read(&host).iter().all(|byte| *byte == 9));
+}
+
+#[test]
 #[ignore = "requires a CUDA device and NVML"]
 fn nvml_attributes_device_memory_to_this_process() {
     let _driver = exclusive_driver();

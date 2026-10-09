@@ -6,34 +6,29 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh, parallelize_
+from uniserve_models.interface import graphs
 from uniserve_models.model import TextSize
 from uniserve_models.nn import ColumnParallelLinear
 from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
 from uniserve_models.quantization import Quantizer
-from uniserve_models.runtime import (
-    CUDAGraph,
-    CUDAStream,
-    initialize_process_groups,
-)
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 @torch.inference_mode()
-def _run(rank, rendezvous):
+def _run(rank, listener):
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=2,
-        device=device,
-        init_method=rendezvous,
-    ) as groups:
-        mesh = groups.bind(
+    with process_world(rank, 2, listener, device) as world:
+        mesh = bind_mesh(
+            world,
             DeviceMesh(ranks=(1, 0), shape=(2,), axes=("tokens",), rank=rank),
-            device=device,
         )
         group = mesh.get_group("tokens")
         source = (
@@ -70,9 +65,9 @@ def _run(rank, rendezvous):
             result = torch.empty(257, 64, device=device, dtype=torch.bfloat16)
             nested_result = torch.empty_like(result)
             local = source[interval].clone()
-            stream = CUDAStream.external(torch.cuda.Stream(device=device))
-            stream.wait(torch.cuda.current_stream(device))
-            with stream, ExecutionContext(layer, stream=stream) as context:
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with ExecutionContext(layer, stream=stream) as context:
                 context.prepare(TextSize(0, 0))
                 empty = torch.cat(
                     [
@@ -145,42 +140,40 @@ def _run(rank, rendezvous):
                     return result
 
                 invoke()
-                with CUDAGraph(context=context) as graph:
-                    graph.capture(invoke)
-                    for multiplier in (1.0, 3.0):
-                        local.copy_(source[interval] * multiplier)
-                        actual = graph.replay()
-                        inputs = source * multiplier
-                        if quantizer is not None:
-                            # Native scaled GEMM accumulates encoded values
-                            # before its output conversion. BF16
-                            # dequantization would add an operand rounding
-                            # absent from that math.
-                            inputs = quantizer.quantize(inputs).dequantize(
-                                dtype=torch.float32
-                            )
-                            matrix = layer.weight.dequantize(
-                                dtype=torch.float32
-                            )
-                        else:
-                            matrix = weight
-                        expected = F.linear(
-                            inputs.float(), matrix.float()
-                        ).bfloat16()
-                        torch.testing.assert_close(
-                            actual,
-                            expected,
-                            rtol=2e-2,
-                            atol=2e-2,
-                            msg=lambda message: (
-                                f"{quantizer=}, {multiplier=}: {message}"
-                            ),
+                graph = graphs.capture(invoke, stream=stream)
+                for multiplier in (1.0, 3.0):
+                    local.copy_(source[interval] * multiplier)
+                    actual = graph.replay()
+                    inputs = source * multiplier
+                    if quantizer is not None:
+                        # Native scaled GEMM accumulates encoded values
+                        # before its output conversion. BF16
+                        # dequantization would add an operand rounding
+                        # absent from that math.
+                        inputs = quantizer.quantize(inputs).dequantize(
+                            dtype=torch.float32
                         )
-                        if quantizer is None:
-                            torch.testing.assert_close(
-                                nested_result, -expected, rtol=2e-2, atol=2e-2
-                            )
+                        matrix = layer.weight.dequantize(dtype=torch.float32)
+                    else:
+                        matrix = weight
+                    expected = F.linear(
+                        inputs.float(), matrix.float()
+                    ).bfloat16()
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        rtol=2e-2,
+                        atol=2e-2,
+                        msg=lambda message: (
+                            f"{quantizer=}, {multiplier=}: {message}"
+                        ),
+                    )
+                    if quantizer is None:
+                        torch.testing.assert_close(
+                            nested_result, -expected, rtol=2e-2, atol=2e-2
+                        )
                 torch.cuda.synchronize(device)
+                graph.release()
                 # Re-preparation retires the captured exchange resources. New
                 # storage and communicator registrations must accept live
                 # values.
@@ -191,7 +184,6 @@ def _run(rank, rendezvous):
                 torch.cuda.synchronize(device)
 
 
-def test_streamed_projection_replay_preserves_complete_scale_domains(tmp_path):
-    mp.spawn(
-        _run, args=((tmp_path / "projection").as_uri(),), nprocs=2, join=True
-    )
+def test_streamed_projection_replay_preserves_complete_scale_domains():
+    with rendezvous() as listener:
+        mp.spawn(_run, args=(listener,), nprocs=2, join=True)

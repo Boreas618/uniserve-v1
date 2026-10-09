@@ -1,16 +1,14 @@
 """The public rotary projection preserves head values and caller ownership."""
 
-from contextlib import ExitStack
-
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.interface import graphs
 from uniserve_models.nn import QKVParallelLinear, RMSNorm
 from uniserve_models.nn.attention import RotaryQKVProjection
-from uniserve_models.runtime import CUDAGraph, CUDAStream
 
 
 class Projection(nn.Module):
@@ -95,27 +93,26 @@ def test_rotary_projection_preserves_qkv_values_and_replay(rows, flow_device):
         for actual, reference in zip(result, wanted, strict=True):
             torch.testing.assert_close(actual, reference.to(device))
 
-    with ExitStack() as scope, torch.inference_mode():
-        stream = (
-            None
-            if device == "cpu"
-            else CUDAStream.external(torch.cuda.Stream(device=device))
-        )
-        if stream is not None:
-            scope.callback(stream.close)
-            stream.wait(torch.cuda.current_stream(device))
-        context = scope.enter_context(ExecutionContext(module, stream=stream))
+    stream = None if device == "cpu" else torch.cuda.Stream(device=device)
+    if stream is not None:
+        stream.wait_stream(torch.cuda.current_stream(device))
+    with (
+        torch.inference_mode(),
+        ExecutionContext(module, stream=stream) as context,
+    ):
         context.prepare(None)
         verify(module(inputs, cos, sin), expected(hidden))
         if stream is not None:
-            with torch.cuda.device(flow_device):
-                pool = torch.cuda.MemPool()
-            graph = scope.enter_context(
-                CUDAGraph(
-                    context=context, pools={torch.device(flow_device): pool}
-                )
+            # The projection runs on the other device: its allocations go
+            # to that device's pool for the capture.
+            flow = torch.device(flow_device)
+            pool, *_ = graphs.pool(flow.index)
+            graph = graphs.capture(
+                lambda: module(inputs, cos, sin),
+                stream=stream,
+                peers=((flow.index, pool),),
             )
-            graph.capture(lambda: module(inputs, cos, sin))
             inputs.mul_(1.25)
             verify(graph.replay(), expected(hidden * 1.25))
             stream.synchronize()
+            graph.release()

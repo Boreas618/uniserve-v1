@@ -33,6 +33,7 @@ from uniserve_models.backends.attention import resolve
 from uniserve_models.backends.attention.torch import Backend as TorchBackend
 from uniserve_models.bindings.context import TensorBuffers
 from uniserve_models.cache import Config, mha
+from uniserve_models.cache.units import UnitPool
 from uniserve_models.model import TextSize
 from uniserve_models.nn.attention import (
     BlockTable,
@@ -40,7 +41,6 @@ from uniserve_models.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve_models.runtime import PrefixCache
 
 pytestmark = [
     pytest.mark.integration,
@@ -72,7 +72,6 @@ class Row:
     sequence: int | None = None
 
 
-@contextmanager
 def _pool(block_size, window):
     layers = Config(
         {
@@ -82,10 +81,9 @@ def _pool(block_size, window):
             "full": mha.Config(2, 512, (0, 1), torch.bfloat16),
         }
     )
-    with PrefixCache(
+    return UnitPool.allocate(
         layers, num_units=_UNITS, block_size=block_size, device="cuda"
-    ) as cache:
-        yield cache
+    )
 
 
 @contextmanager
@@ -309,30 +307,30 @@ def test_calls_match_the_portable_reference(kind, layer, window, block_size):
     generator = torch.Generator(device="cuda").manual_seed(block_size)
     rows = _ROWS[kind]
     padding = 0 if kind == "mixed" else 13
-    with _pool(block_size, window if layer == "sliding" else 1023) as cache:
-        state = cache.state(layer)
-        state.key.normal_(generator=generator)
-        state.value.normal_(generator=generator)
-        batch, live = _call(
-            state,
-            rows,
-            kind=kind,
-            window=window,
-            units=list(range(1, _UNITS)),
-            generator=generator,
-            padding=padding,
-        )
-        tokens = live + padding
-        q, k, v = _projections(tokens, layer, generator)
-        size = TextSize(tokens, batch.queries.batch_size)
-        with _operators(state, layer=layer, window=window, size=size) as (
-            native,
-            reference,
-        ):
-            actual, expected = torch.empty_like(q), torch.empty_like(q)
-            native.bind(batch)
-            native(q, k, v, batch, scale=1.0, out=actual)
-            _reference(reference, q, k, v, batch, expected)
+    cache = _pool(block_size, window if layer == "sliding" else 1023)
+    state = cache.state(layer)
+    state.key.normal_(generator=generator)
+    state.value.normal_(generator=generator)
+    batch, live = _call(
+        state,
+        rows,
+        kind=kind,
+        window=window,
+        units=list(range(1, _UNITS)),
+        generator=generator,
+        padding=padding,
+    )
+    tokens = live + padding
+    q, k, v = _projections(tokens, layer, generator)
+    size = TextSize(tokens, batch.queries.batch_size)
+    with _operators(state, layer=layer, window=window, size=size) as (
+        native,
+        reference,
+    ):
+        actual, expected = torch.empty_like(q), torch.empty_like(q)
+        native.bind(batch)
+        native(q, k, v, batch, scale=1.0, out=actual)
+        _reference(reference, q, k, v, batch, expected)
 
     torch.testing.assert_close(actual[:live], expected[:live], **_TOLERANCE)
 
@@ -364,62 +362,62 @@ def test_graph_replay_reads_changed_lengths_and_tables(kind, layer, window):
     generator = torch.Generator(device="cuda").manual_seed(11)
     captured_rows, replayed_rows = _REPLAYS[kind]
     padding = 7
-    with _pool(16, 1023) as cache:
-        state = cache.state(layer)
-        state.key.normal_(generator=generator)
-        state.value.normal_(generator=generator)
-        # Disjoint units keep the captured call's writes out of the
-        # replayed call's history.
-        units = list(range(1, _UNITS))
-        calls = [
-            _call(
-                state,
-                rows,
-                kind=kind,
-                window=window,
-                units=units,
-                generator=generator,
-                padding=padding,
-            )
-            for rows in (captured_rows, replayed_rows)
-        ]
-        (captured, live), (replayed, replayed_live) = calls
-        assert live == replayed_live
-        # The captured table spans the widest table a replay may read.
-        width = max(
-            call.block_table.indices.shape[1] for call in (captured, replayed)
+    cache = _pool(16, 1023)
+    state = cache.state(layer)
+    state.key.normal_(generator=generator)
+    state.value.normal_(generator=generator)
+    # Disjoint units keep the captured call's writes out of the
+    # replayed call's history.
+    units = list(range(1, _UNITS))
+    calls = [
+        _call(
+            state,
+            rows,
+            kind=kind,
+            window=window,
+            units=units,
+            generator=generator,
+            padding=padding,
         )
-        captured = _widen(captured, width)
+        for rows in (captured_rows, replayed_rows)
+    ]
+    (captured, live), (replayed, replayed_live) = calls
+    assert live == replayed_live
+    # The captured table spans the widest table a replay may read.
+    width = max(
+        call.block_table.indices.shape[1] for call in (captured, replayed)
+    )
+    captured = _widen(captured, width)
 
-        tokens = live + padding
-        q, k, v = _projections(tokens, layer, generator)
-        size = TextSize(tokens, captured.queries.batch_size)
-        with _operators(state, layer=layer, window=window, size=size) as (
-            native,
-            reference,
-        ):
-            actual = torch.empty_like(q)
-            native.bind(captured)
-            # The eager call compiles every kernel specialization first.
+    tokens = live + padding
+    q, k, v = _projections(tokens, layer, generator)
+    size = TextSize(tokens, captured.queries.batch_size)
+    with _operators(state, layer=layer, window=window, size=size) as (
+        native,
+        reference,
+    ):
+        actual = torch.empty_like(q)
+        native.bind(captured)
+        # The eager call compiles every kernel specialization first.
+        native(q, k, v, captured, scale=1.0, out=actual)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
             native(q, k, v, captured, scale=1.0, out=actual)
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                native(q, k, v, captured, scale=1.0, out=actual)
 
-            # Replay reads the captured buffers with the other call's values.
-            _assign(captured, replayed)
-            for tensor, value in zip(
-                (q, k, v), _projections(tokens, layer, generator), strict=True
-            ):
-                tensor.copy_(value)
-            actual.zero_()
-            graph.replay()
+        # Replay reads the captured buffers with the other call's values.
+        _assign(captured, replayed)
+        for tensor, value in zip(
+            (q, k, v), _projections(tokens, layer, generator), strict=True
+        ):
+            tensor.copy_(value)
+        actual.zero_()
+        graph.replay()
 
-            expected = torch.empty_like(q)
-            _reference(reference, q, k, v, replayed, expected)
-            torch.cuda.synchronize()
-            graph.reset()
+        expected = torch.empty_like(q)
+        _reference(reference, q, k, v, replayed, expected)
+        torch.cuda.synchronize()
+        graph.reset()
 
     torch.testing.assert_close(actual[:live], expected[:live], **_TOLERANCE)
 
@@ -447,31 +445,31 @@ def _assign(target, source):
 def test_windowed_calls_without_a_native_kernel_raise_when_bound():
     # Head dimension 512 has no windowed TensorRT-LLM context kernel, and
     # the prefix-block kernel reads only non-causal rows.
-    with _pool(16, 7) as cache:
-        state = cache.state("full")
-        batch = PagedInput.from_blocks(
-            blocks=((1, 2), (3,)),
-            query_lengths=(20, 4),
-            prefix_lengths=(30, 0),
-            block_size=state.block_size,
-            causal=True,
-            device="cuda",
-        )
-        with (
-            _operators(state, layer="full", window=7, size=TextSize(24, 2)) as (
-                native,
-                _,
+    cache = _pool(16, 7)
+    state = cache.state("full")
+    batch = PagedInput.from_blocks(
+        blocks=((1, 2), (3,)),
+        query_lengths=(20, 4),
+        prefix_lengths=(30, 0),
+        block_size=state.block_size,
+        causal=True,
+        device="cuda",
+    )
+    with (
+        _operators(state, layer="full", window=7, size=TextSize(24, 2)) as (
+            native,
+            _,
+        ),
+        pytest.raises(
+            ValueError,
+            match=(
+                r"paged attention of 2 rows.*causal rows.*16 query and 2 "
+                r"KV heads of dimension 512.*bfloat16.*32-token pages.*"
+                r"7-token history window"
             ),
-            pytest.raises(
-                ValueError,
-                match=(
-                    r"paged attention of 2 rows.*causal rows.*16 query and 2 "
-                    r"KV heads of dimension 512.*bfloat16.*32-token pages.*"
-                    r"7-token history window"
-                ),
-            ),
-        ):
-            native.bind(batch)
+        ),
+    ):
+        native.bind(batch)
 
 
 def test_windowed_layers_without_native_storage_raise_when_prepared():
