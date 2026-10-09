@@ -5,12 +5,10 @@ diffusion/image.rs``) serves the ``ImageDenoiser`` at ``path`` within a
 bound component. ``denoiser.bind(prepared, loaded, path, buffers, layout)``
 binds the worker's buffers once:
 
-- ``samples``: the latent pool's step workspace ``[units, width]``, where
-  the worker gathers each trajectory's committed pages before a step and
-  from which it scatters the updated pages after it;
-- ``inputs``: the samples the network reads, on the denoiser's device: the
-  same workspace, or the worker's mirror of it when the latent pool lives
-  on another (generation) device;
+- ``samples``: the latent pool's step workspace ``[units, width]`` on the
+  denoiser's device, where the worker gathers each trajectory's committed
+  pages before a step and from which it scatters the updated pages after
+  it;
 - ``positions`` ``[3, T]`` int64, ``timesteps`` ``[R, 1]`` float32 and
   ``predictions`` ``[P, width]``: the worker's per-row positions and
   timesteps, and the predictions of every row packed in row order;
@@ -25,13 +23,12 @@ binds the worker's buffers once:
 
 A row is one guidance branch of one image: ``[sample, units, height,
 width, token, tokens, prediction]``: its latent rows
-``inputs[sample:sample + units]``, its size, its positions
+``samples[sample:sample + units]``, its size, its positions
 ``positions[:, token:token + tokens]`` and its prediction rows
 ``predictions[prediction:prediction + units]``. Row ``i`` reads
 ``timesteps[i]``.
 
-Step functions (``stream`` is the binding's stream; ``sample_stream`` the
-latent pool's):
+Step functions, each on the binding's stream:
 
 - ``plan(steps, shift, text_scale, image_scale, interval_low,
   interval_high, renorm, renorm_min) -> [plan, timesteps, branches]``:
@@ -40,21 +37,23 @@ latent pool's):
   timestep and the mask of guidance branches it evaluates (bit 0
   conditioned, 1 text-unconditional, 2 image-unconditional). A
   non-positive ``shift`` keeps the denoiser's default shift.
-- ``initial_latent(sample, units, padded, height, width, seed, index)``
-  (sample stream): zero ``samples[sample:sample + padded]`` and draw image
+- ``initial_latent(sample, units, padded, height, width, seed, index)``:
+  zero ``samples[sample:sample + padded]`` and draw image
   ``index``'s seeded initial latent into its first ``units`` rows.
-- ``predict(graph, rows, attention)`` (stream): gather the rows'
+- ``predict(graph, rows, attention)``: gather the rows'
   attention metadata (``attention`` = ``[rows, tokens, queries, prefixes,
   starts, widths]``), then evaluate the network (replaying ``graph`` when
   given) and write each row's prediction.
-- ``capture(rows, attention, pool) -> graph``: capture the evaluation of
-  the geometry the last eager ``predict`` gathered.
-- ``condition(rows, attention, features)`` (stream): write the K/V of
+- ``capture(rows, attention, pool, peers) -> graph``: capture the
+  evaluation of the geometry the last eager ``predict`` gathered;
+  ``peers`` are the ``[device, pool]`` pairs of the other devices the
+  network's modules run on (see ``uniserve_models.interface.graphs``).
+- ``condition(rows, attention, features)``: write the K/V of
   latent images inserted as conditioning (latent ingest and feedback): row
   ``i`` reads the latent feature product region ``features[i]`` instead of
   samples, at timestep zero, and writes its K/V; its prediction is
   computed and unused.
-- ``integrate(calls, plans)`` (sample stream): ``calls`` holds one
+- ``integrate(calls, plans)``: ``calls`` holds one
   ``[sample, units, slot, step, prediction, branches]`` row per image:
   combine its branch predictions (consecutive from ``prediction``, in
   evaluation order) with its plan's guidance and update its samples in
@@ -106,25 +105,14 @@ class Trajectory:
     guidance: Guidance
 
 
-def _stream(handle: int, device: torch.device):
-    if device.type != "cuda":
-        return None
-    return torch.cuda.ExternalStream(int(handle), device=device)
-
-
 def bind(
     prepared,
     loaded,
     path: str,
     buffers: Mapping[str, Any],
     layout: Mapping[str, Any],
-    sample_stream: int,
 ) -> dict[str, Callable[..., Any]]:
     """Bind the image denoiser at ``path`` to the worker's buffers.
-
-    ``sample_stream`` is the stream of the latent pool's device, on which
-    initial latents are drawn and samples updated (the binding's own stream
-    when the pool shares its device).
 
     Raises:
         UnsupportedCall: The module is not an ``ImageDenoiser``.
@@ -138,12 +126,11 @@ def bind(
     if context is None:
         raise RuntimeError("denoiser binding requires a bound component")
     b = calls.tensors(buffers)
-    samples, inputs = b["samples"], b["inputs"]
+    samples = b["samples"]
     positions, timesteps = b["positions"], b["timesteps"]
     predictions, step = b["predictions"], b["step"]
     slot_timesteps, products = b["slot_timesteps"], b["products"]
     attention = AttentionColumns(b, layout)
-    updates = _stream(sample_stream, samples.device)
     pipeline = denoiser.mesh.get_group(
         "pp" if "pp" in denoiser.mesh.axes else ()
     )
@@ -199,7 +186,7 @@ def bind(
             raise ValueError(
                 "image trajectory storage must have its canonical patch shape"
             )
-        with torch.inference_mode(), torch.cuda.stream(updates):
+        with torch.inference_mode(), torch.cuda.stream(context.stream):
             # Physical page padding past the trajectory's rows stays zero.
             samples[sample : sample + padded].zero_()
             noise = torch.empty(
@@ -218,17 +205,17 @@ def bind(
                 workspace={},
             )
 
-    def evaluate(rows, batch, features=None) -> None:
-        """Run the network over the rows and write their predictions."""
+    def bind_rows(rows, batch, features=None):
+        """The network's typed input over the rows' column views."""
         latents = []
         for index, (offset, units, *_) in enumerate(rows):
             values = (
-                inputs[offset : offset + units]
+                samples[offset : offset + units]
                 if features is None
                 else regions.view(products, features[index])
             )
             latents.append(LatentInput(values, timesteps[index : index + 1]))
-        typed = denoiser.bind_inputs(
+        return denoiser.bind_inputs(
             latents={"image": tuple(latents)},
             sizes=tuple(image.Config(row[2], row[3]) for row in rows),
             step=step,
@@ -238,6 +225,9 @@ def bind(
             sequence_lengths=tuple(row[5] for row in rows),
             attention=batch,
         )
+
+    def run(rows, typed) -> None:
+        """Evaluate the network and write each row's prediction."""
         result = denoiser(
             typed,
             state={},
@@ -251,6 +241,10 @@ def bind(
             if prediction is not None:
                 target.copy_(prediction.tensor.reshape(target.shape))
             pipeline.broadcast(target, src=pipeline.size - 1)
+
+    def evaluate(rows, batch, features=None) -> None:
+        """Run the network over the rows and write their predictions."""
+        run(rows, bind_rows(rows, batch, features))
 
     def batch(layout_args, writes: bool):
         """The attention batch the rows read (never causal)."""
@@ -292,7 +286,7 @@ def bind(
             timesteps[: len(rows)].zero_()
             evaluate(rows, inputs_batch, features)
 
-    def capture(rows, layout_args, pool) -> graphs.Graph:
+    def capture(rows, layout_args, pool, peers) -> graphs.Graph:
         if context.stream is None:
             raise ValueError("graph capture requires a CUDA binding")
         rows = _rows(rows)
@@ -301,16 +295,21 @@ def bind(
             context.bind_attention(inputs_batch, replay=False)
 
         def body():
+            # The denoiser binds its inputs inside the step: whatever it
+            # derives from the samples (SenseNova's conditioning pixels)
+            # must follow each replay's samples.
             with context.activate():
                 evaluate(rows, inputs_batch)
 
-        return graphs.capture(body, stream=context.stream, pool=pool)
+        return graphs.capture(
+            body, stream=context.stream, pool=pool, peers=peers
+        )
 
     def integrate(rows: Sequence[Sequence[int]], plans: Sequence) -> None:
         rows = [tuple(int(value) for value in row) for row in rows]
         if len(rows) != len(plans):
             raise ValueError("integration rows and plans must align")
-        with torch.inference_mode(), torch.cuda.stream(updates):
+        with torch.inference_mode(), torch.cuda.stream(context.stream):
             for (sample, units, slot, index, first, mask), trajectory in zip(
                 rows, plans, strict=True
             ):
@@ -322,13 +321,11 @@ def bind(
                         "guidance branches disagree with the evaluated rows"
                     )
                 values = samples[sample : sample + units]
-                # Predictions may come from another device of the binding;
-                # the copy stays ordered on the sample stream.
                 outputs = {
                     branch: predictions[
                         first + position * units : first
                         + (position + 1) * units
-                    ].to(values.device, non_blocking=True)
+                    ]
                     for position, branch in enumerate(branches)
                 }
                 guided = guidance.combine(outputs, schedule, index)

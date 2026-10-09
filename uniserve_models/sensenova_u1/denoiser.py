@@ -68,7 +68,8 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         with the resolution-dependent noise scale that ``prepare_latents``
         applied to its initial draw. The image tokens only read the
         trajectory's prefix in the K/V cache; the worker's denoising rows
-        (``flow_rows``) do not write them into it.
+        (``flow_rows``) do not write them into it. The conditioning derives
+        from the samples on the device, so a captured step binds it too.
         """
         images = []
         for latent, size in zip(latents["image"], sizes, strict=True):
@@ -80,12 +81,15 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
                 channels=self.latent_channels,
             )
             patch = self.config.vision.patch_size
-            grid = torch.tensor(
-                [[size.height // patch, size.width // patch]],
-                device=sample.device,
-                dtype=torch.int64,
+            # Device fills rather than host copies, so a CUDA graph can
+            # capture the binding with the step that reads it.
+            grid = sample.new_full(
+                (1, 2), size.height // patch, dtype=torch.int64
             )
-            scale = sample.new_tensor([self.noise_scale.scale(sample.shape[0])])
+            grid[:, 1].fill_(size.width // patch)
+            scale = sample.new_full(
+                (1,), self.noise_scale.scale(sample.shape[0])
+            )
             images.append(ImageConditioning(pixels, grid, scale))
 
         return DenoiserInput(

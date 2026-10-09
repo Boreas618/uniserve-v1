@@ -187,10 +187,6 @@ impl Worker {
             &launch.components,
             config.rank,
             device,
-            config
-                .generation_device
-                .as_deref()
-                .and_then(|name| Device::parse(name, "device").ok()),
             |name| world.meshes(name),
         );
         let host_only = !dedicated && components.host_only();
@@ -687,10 +683,15 @@ impl Worker {
             return Ok(());
         };
         let devices: Vec<String> = self.config.devices().map(str::to_owned).collect();
-        let products = self.plan.arena.device_product_bytes / devices.len().max(1) as u64;
         for name in devices {
             let Ok(Device::Cuda(index)) = Device::parse(&name, "device") else {
                 continue;
+            };
+            // Product storage lives on the primary device only.
+            let products = if name == self.config.device {
+                self.plan.arena.device_product_bytes
+            } else {
+                0
             };
             let measured = budget.budget(index, self.config.kv_storage_fraction)?;
             let segments = self.segments(index)?;
@@ -898,18 +899,12 @@ fn allocate_storage(
     );
 
     // Products: scheduler-placed buffers in the buffer pool and scalar relay
-    // lanes, one per request slot and unresolved call.
-    let devices: Vec<StorageDevice> = config
-        .devices()
-        .map(|name| {
-            let device =
-                Device::parse(name, "device").map_err(|error| Error::Invalid(error.to_string()))?;
-            Ok(match device {
-                Device::Cuda(index) => StorageDevice::Cuda(index),
-                Device::Cpu => StorageDevice::Cpu,
-            })
-        })
-        .collect::<Result<_>>()?;
+    // lanes, one per request slot and unresolved call, on the primary
+    // device where every binding computes.
+    let devices = vec![match config.primary_device() {
+        Device::Cuda(index) => StorageDevice::Cuda(index),
+        Device::Cpu => StorageDevice::Cpu,
+    }];
     let physical = plan.physical_buffer_pool_bytes.max(1);
     let buffer_pool =
         BufferPool::allocate(physical, physical < plan.info.buffer_pool_bytes, &devices)?;
