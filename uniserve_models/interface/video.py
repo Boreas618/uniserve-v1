@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, TypeVar, cast
 
 import torch
 from torch import nn
@@ -55,12 +55,14 @@ from uniserve_models.model import (
     ConditionRole,
     LatentInput,
     PatchEncoder,
+    TextConditioner,
     TextEncoder,
     VideoDecoder,
     VideoDenoiser,
     VideoEncoder,
     VideoPostprocessor,
 )
+from uniserve_models.tensors import BufferConfig
 
 from . import graphs
 from .errors import SetupError, binding
@@ -71,6 +73,25 @@ _ROLES = (
     ConditionRole.LAST_FRAME,
     ConditionRole.REFERENCE,
 )
+
+# A capability class a model's module is looked up by.
+_Kind = TypeVar("_Kind")
+
+
+class _Buffered(Protocol):
+    """The constants and workspace a served module declares for a size.
+
+    The capability classes do not declare these methods, so the bindings
+    name the signatures they call.
+    """
+
+    def constant_buffers(self, size: Any) -> Mapping[str, BufferConfig]: ...
+
+    def prepare_constants(
+        self, size: Any, *, out: Mapping[str, torch.Tensor]
+    ) -> None: ...
+
+    def workspace_buffers(self, size: Any) -> Mapping[str, BufferConfig]: ...
 
 
 def functions() -> dict[str, Callable[..., Any]]:
@@ -83,7 +104,7 @@ def functions() -> dict[str, Callable[..., Any]]:
     }
 
 
-def _unique(root: nn.Module, kind: type) -> nn.Module | None:
+def _unique(root: nn.Module, kind: type[_Kind]) -> _Kind | None:
     """The model's unique module of ``kind``, or None."""
     found = list(
         {
@@ -97,7 +118,7 @@ def _unique(root: nn.Module, kind: type) -> nn.Module | None:
     return found[0] if found else None
 
 
-def _require(root: nn.Module, kind: type) -> nn.Module:
+def _require(root: nn.Module, kind: type[_Kind]) -> _Kind:
     module = _unique(root, kind)
     if module is None:
         raise SetupError(f"the model has no {kind.__name__}")
@@ -237,6 +258,7 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
     network = _component(loaded, denoiser)
     if not isinstance(network, VideoDenoiser):
         raise SetupError(f"component {denoiser!r} is not a video denoiser")
+    buffered = cast(_Buffered, network)
     decoder = _require(root, VideoDecoder)
     audio = _require(root, AudioDecoder)
     clock = _require(root, VideoPostprocessor)
@@ -343,7 +365,7 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
             ],
             "workspace": sum(
                 _elements(config.shape)
-                for config in network.workspace_buffers(resolved).values()
+                for config in buffered.workspace_buffers(resolved).values()
             ),
         }
 
@@ -563,7 +585,7 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
     )
 
 
-def _replayer(stream: torch.cuda.Stream) -> Callable[[Any], None]:
+def _replayer(stream: torch.cuda.Stream | None) -> Callable[[Any], None]:
     """Replay a captured graph on the binding's stream.
 
     A CUDA graph launches on the current stream; the worker orders its
@@ -575,6 +597,13 @@ def _replayer(stream: torch.cuda.Stream) -> Callable[[Any], None]:
             graph.replay()
 
     return replay
+
+
+def _stream(context: ExecutionContext) -> torch.cuda.Stream:
+    """The worker's stream of a binding that captures graphs."""
+    # The worker captures only on a device binding, which it creates with
+    # its own stream handle; a binding without one never reaches capture.
+    return cast(torch.cuda.Stream, context.stream)
 
 
 def _owner(loaded, kind: type) -> str:
@@ -665,6 +694,7 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
     network = _component(loaded, str(request["component"]))
     if not isinstance(network, VideoDenoiser):
         raise SetupError("the denoising component is not a video denoiser")
+    buffered = cast(_Buffered, network)
     device = next(network.parameters()).device
     context = _context(network, request, "denoiser")
     maximum = _layout(network, request["maximum"])
@@ -692,14 +722,14 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
         if resolved == maximum:
             constants, workspace = context.constants, context.workspace_views
         else:
-            requirements = network.constant_buffers(resolved)
+            requirements = buffered.constant_buffers(resolved)
             owned = TensorBuffers.allocate(requirements, device=device)
             constants = owned.view(requirements)
             with context.activate():
-                network.prepare_constants(resolved, out=constants)
+                buffered.prepare_constants(resolved, out=constants)
             workspace = TensorBuffers.from_tensors(
                 dict(context.workspace_views)
-            ).view(network.workspace_buffers(resolved))
+            ).view(buffered.workspace_buffers(resolved))
         fields = network.state_buffers(resolved)
         views = {}
         for name, offset in zip(modalities, offsets, strict=True):
@@ -784,7 +814,7 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
             with context.activate():
                 _compute(plan)
 
-        return graphs.capture(body, stream=context.stream, pool=pool)
+        return graphs.capture(body, stream=_stream(context), pool=pool)
 
     def _host_views(slot: int, plan: _Plan) -> dict[str, torch.Tensor]:
         resolved = plan.layout
@@ -904,7 +934,8 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
     conditioner_buffers = request.get("conditioner")
     contexts: dict[int, ExecutionContext] = {}
     if conditioner_buffers is not None:
-        conditioner = network.conditioner
+        # A denoiser bound with conditioner buffers holds its conditioner.
+        conditioner = cast(TextConditioner, network.conditioner)
         buffers = _tensors(conditioner_buffers)
         source, lengths, target = (
             buffers["input"],
@@ -945,7 +976,7 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
                 with prepared.activate():
                     _condition(capacity)
 
-            return graphs.capture(body, stream=prepared.stream, pool=pool)
+            return graphs.capture(body, stream=_stream(prepared), pool=pool)
 
         result.update(
             prepare_conditioner=prepare_conditioner,
@@ -986,6 +1017,7 @@ def bind_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
     root = loaded.module
     decoder = _require(root, VideoDecoder)
     postprocessor = _require(root, VideoPostprocessor)
+    buffered = cast(_Buffered, postprocessor)
     device = next(decoder.parameters()).device
     window = torch.from_dlpack(request["window"])
     overlap = torch.from_dlpack(request["overlap"])
@@ -995,7 +1027,8 @@ def bind_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
     graph_outputs: dict[tuple[int, int, int], graphs.Graph] = {}
 
     def _segment_key(segment) -> tuple[int, int, int]:
-        return tuple(_segment(segment))
+        frames, width, height = _segment(segment)
+        return frames, width, height
 
     def prepare_segment(frames: int, width: int, height: int) -> None:
         """Prepare decoding of one segment, before any capture."""
@@ -1014,11 +1047,11 @@ def bind_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
             return
         size = _video(_first_frames(decoder), width, height)
         backing = TensorBuffers.allocate(
-            postprocessor.constant_buffers(size), device=device
+            buffered.constant_buffers(size), device=device
         )
-        constants = backing.view(postprocessor.constant_buffers(size))
+        constants = backing.view(buffered.constant_buffers(size))
         with torch.inference_mode():
-            postprocessor.prepare_constants(size, out=constants)
+            buffered.prepare_constants(size, out=constants)
         canvases[key] = constants
 
     def _window(config) -> torch.Tensor:
@@ -1036,7 +1069,7 @@ def bind_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
             with prepared.activate():
                 return decoder.decode((target,), segments=(config,))[0]
 
-        graph = graphs.capture(body, stream=prepared.stream, pool=pool)
+        graph = graphs.capture(body, stream=_stream(prepared), pool=pool)
         graph_outputs[key] = graph
         return graph
 

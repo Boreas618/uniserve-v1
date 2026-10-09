@@ -19,8 +19,13 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from fractions import Fraction
+from typing import TYPE_CHECKING, Final
 
 import numpy as np
+
+if TYPE_CHECKING:
+    # PyAV is imported where a codec runs; its names here only annotate.
+    from av.container import OutputContainer
 
 __all__ = [
     "AUDIO_CODEC",
@@ -32,8 +37,8 @@ __all__ = [
 ]
 
 # The encoders every served container uses.
-VIDEO_CODEC = "libx264"
-AUDIO_CODEC = "aac"
+VIDEO_CODEC: Final = "libx264"
+AUDIO_CODEC: Final = "aac"
 
 # Each media unit is its own encoder session, and several ranks encode at once
 # on one host, so a session must not size its thread pool to the machine.
@@ -199,7 +204,7 @@ class Container:
     """
 
     buffer: io.BytesIO
-    output: object
+    output: OutputContainer
     video: object
     audio: object
 
