@@ -6,9 +6,8 @@
 //! it onto the calls each rank owns (`rank_projection`, which narrows forward
 //! rows with `ForwardBatch::select` and sets each call's `consumer_slots`),
 //! and [`crate::codec`] encodes it as FlatBuffers. A rank answers with one
-//! [`BatchOutput`] of per-call [`RequestOutput`] completions. The Python
-//! worker exposes native request, call and buffer identifiers alongside the
-//! numerical records in `uniserve_worker.protocol`.
+//! [`BatchOutput`] of per-call [`RequestOutput`] completions. The rank
+//! runtime (`uniserve-worker`) consumes these types directly.
 //!
 //! Types with invariants carry a `validate` method. [`Batch::validate`]
 //! reaches each nested one and adds the checks that span calls. The
@@ -58,18 +57,6 @@ pub enum ForwardMode {
 }
 
 impl ForwardMode {
-    /// Every mode in declaration order.
-    ///
-    /// `worker-ipc-py` builds its Python enum table from this array and
-    /// indexes it with `mode as usize`, so the order must match the
-    /// declaration order.
-    pub const ALL: [Self; 4] = [
-        Self::Prefill,
-        Self::Decode,
-        Self::Verify,
-        Self::TokenDenoising,
-    ];
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Prefill => "prefill",
@@ -104,9 +91,6 @@ pub enum MediaCall {
 
 impl MediaCall {
     /// Every media call in declaration order.
-    ///
-    /// `worker-ipc-py` indexes a Python enum table built from this array with
-    /// `call as usize`, so the order must match the declaration order.
     pub const ALL: [Self; 12] = [
         Self::MediaReading,
         Self::VisionEncoding,
@@ -152,9 +136,6 @@ pub enum TransferMode {
 
 impl TransferMode {
     /// Every transfer mode in declaration order.
-    ///
-    /// `worker-ipc-py` indexes a Python enum table built from this array with
-    /// `mode as usize`, so the order must match the declaration order.
     pub const ALL: [Self; 3] = [Self::Tensor, Self::KvExport, Self::KvInstall];
 
     pub const fn as_str(self) -> &'static str {
@@ -292,11 +273,8 @@ impl<'de> Deserialize<'de> for AttentionBackend {
 pub struct AttentionBackendParseError(String);
 
 impl CallKind {
-    /// Computations accepted as individual scheduled request items.
-    ///
-    /// Mirrored, in the same order, by `CALL_KINDS` in
-    /// `uniserve_worker.protocol.call`; the worker's reports list supported
-    /// calls in this order.
+    /// Computations accepted as individual scheduled request items. A rank's
+    /// reports list its supported calls in this order.
     pub const ALL: [Self; 19] = [
         Self::Forward(ForwardMode::Prefill),
         Self::Forward(ForwardMode::Decode),
@@ -321,9 +299,8 @@ impl CallKind {
 
     /// Returns whether a call of this kind advances its request's state.
     ///
-    /// The worker mirrors this set in `uniserve_worker.protocol.call`; its
-    /// `RequestPool` uses it to choose the call a request's next call follows
-    /// and the `Ok` results that move the request's `state_call_id`.
+    /// A request's next call follows its latest state-advancing call, and
+    /// only an `Ok` result of such a call moves the request's state.
     pub const fn advances_state(self) -> bool {
         matches!(
             self,
@@ -578,8 +555,8 @@ pub struct Call {
     pub consumer_slots: Vec<u32>,
     /// Source token scalar transported between components.
     pub token_input: Option<TensorRef>,
-    /// Sampled token and continuation bit in one I64 scalar. The worker packs
-    /// it with `tagged_token_values` in `uniserve_worker.sampling.sampler`.
+    /// Sampled token and continuation bit in one I64 scalar: the token in
+    /// the low 31 bits and continuation in bit 31.
     pub token_output: Option<TensorRef>,
     /// Image blocks a prefill injects, in context order: each block's
     /// vision-encoder feature and the input token it precedes.

@@ -210,7 +210,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
     pub device: String,
-    /// Attention backend preference forwarded to the Python worker.
+    /// Attention backend preference forwarded to the worker.
     #[arg(long, default_value = "auto")]
     pub attention_backend: AttentionBackend,
     /// Python interpreter used to launch the forward-only worker.
@@ -262,7 +262,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// zero. Omitted, every rank is placed on this host.
     #[arg(long = "worker-hosts", value_delimiter = ',')]
     pub worker_hosts: Vec<String>,
-    /// Explicit Python worker launch/runtime arguments.
+    /// Explicit worker launch/runtime arguments.
     #[command(flatten)]
     pub worker_process: WorkerProcessOptions,
     /// How many call batches the scheduler keeps in flight against the worker.
@@ -545,7 +545,7 @@ impl SharedRuntimeArgs {
     }
 }
 
-/// Worker-runtime arguments forwarded to the Python worker process.
+/// Worker-runtime arguments forwarded to the worker's rank processes.
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
 pub(crate) struct WorkerProcessOptions {
@@ -585,7 +585,7 @@ pub(crate) struct WorkerProcessOptions {
         value_parser = parse_storage_fraction
     )]
     pub kv_storage_fraction: f64,
-    /// Parallelism mesh forwarded to the Python worker, e.g.
+    /// Parallelism mesh forwarded to the worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1`.
     #[arg(long, hide = true)]
     pub worker_mesh: Option<String>,

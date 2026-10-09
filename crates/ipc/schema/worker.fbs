@@ -5,12 +5,12 @@
 // `codec` module of `uniserve-ipc` decodes these tables in its
 // `*_from_table` and `*_from_fb` functions and `codec::encode` builds them;
 // the owned Rust types they map to (`Batch`, `Call`, `WorkerInfo`, ...) carry
-// the full field semantics. The Python worker never reads these tables: the
-// `worker-ipc-py` extension converts the decoded Rust values.
+// the full field semantics. Both ends of the protocol are Rust: the engine
+// and the rank runtime (`uniserve-worker`) exchange the decoded values.
 //
 // Receivers decode a frame only after its header matches this build's
 // `IPC_VERSION` (`Header::validate`), so a wire-format change here bumps that
-// constant and the engine and the Python extension are rebuilt together.
+// constant and the engine and the worker library are rebuilt together.
 //
 // Wire conventions the codec relies on:
 // - A scalar declared `= null` is optional and decodes as `Option`; every

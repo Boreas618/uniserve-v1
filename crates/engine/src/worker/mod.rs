@@ -1,6 +1,6 @@
 //! WorkerGroup process configuration, IPC execution, rank aggregation, and recovery.
 //!
-//! The engine drives GPU and host work through Python worker processes. A
+//! The engine drives GPU and host work through worker rank processes. A
 //! `WorkerGroup` (in `instance`) is one worker's cooperating ranks: it projects
 //! each submitted `Batch` onto the ranks whose components own its calls, joins
 //! their agreeing results into `WorkerResult`s, and replaces the whole group

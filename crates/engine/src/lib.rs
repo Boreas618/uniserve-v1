@@ -1,7 +1,7 @@
 //! In-process scheduling, storage management, worker execution, and request control.
 //!
 //! The crate sits between the HTTP frontend (`uniserve-server`) and the
-//! Python worker processes. `EngineCore` (`core`) launches the worker
+//! worker rank processes. `EngineCore` (`core`) launches the worker
 //! processes, or takes a supplied executor, and runs the `Scheduler` on its
 //! owner thread. Frontends submit and control requests through a cloneable
 //! `EngineHandle` (`handle`) and receive each request's events on its

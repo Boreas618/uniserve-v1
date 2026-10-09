@@ -1,7 +1,7 @@
 //! One rank's process and channel, from spawn to shutdown.
 //!
 //! `PendingRank::spawn_rank` writes the rank's launch descriptor and starts
-//! the Python worker here, or hands the launch to the host's launcher
+//! the rank process here, or hands the launch to the host's launcher
 //! (`launcher::RemoteHost`) when the placement puts the rank on another host.
 //! Once the rank reports its endpoint through `registration::RankRegistry`,
 //! `PendingRank::adopt` binds a `RankChannel` to it and yields a
@@ -704,7 +704,7 @@ impl PendingRank {
                 components: args.components.clone(),
             });
         }
-        let child = cmd.spawn().context("spawning python worker")?;
+        let child = cmd.spawn().context("spawning the rank process")?;
 
         Ok(Self {
             child: PendingChild(Some(child)),
