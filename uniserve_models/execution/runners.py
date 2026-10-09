@@ -43,9 +43,7 @@ class ModelRunner(Generic[ModelT, SizeT]):
     policy to the model.
     """
 
-    def __init__(
-        self, model: ModelT, *, context: ExecutionContext[SizeT]
-    ) -> None:
+    def __init__(self, model: ModelT, *, context: ExecutionContext) -> None:
         if context.module is not model:
             raise ValueError(
                 "execution context must be bound to the runner's model"
@@ -75,7 +73,7 @@ class ModelRunner(Generic[ModelT, SizeT]):
         with self.context.activate():
             result = call(*args, **kwargs)
 
-        if caller is not None and caller != owner:
+        if owner is not None and caller is not None and caller != owner:
             caller.wait_stream(owner)
         return result
 
@@ -83,9 +81,7 @@ class ModelRunner(Generic[ModelT, SizeT]):
 class TextRunner(ModelRunner[CausalLM, TextSize]):
     """Run a causal model while binding its numerical attention input."""
 
-    def __init__(
-        self, model: CausalLM, *, context: ExecutionContext[TextSize]
-    ) -> None:
+    def __init__(self, model: CausalLM, *, context: ExecutionContext) -> None:
         super().__init__(model, context=context)
         self.inputs = None
 
@@ -153,7 +149,7 @@ class DenoisingRunner(
         self,
         model: Denoiser[DenoiserInputT, SizeT],
         *,
-        context: ExecutionContext[SizeT],
+        context: ExecutionContext,
     ) -> None:
         super().__init__(model, context=context)
         self.inputs: DenoiserInputT | None = None

@@ -1,11 +1,11 @@
 """Named H3 weight and activation representations at their numerical owners.
 
 ``weight_config`` expands a named preset, optionally with per-component
-overrides, into a ``uniserve_models.loading.weights.Config`` whose ``dtypes`` and
-``quantization`` mappings are keyed by module path and resolved by longest
-prefix; the paths cover the denoisers the checkpoint holds. ``precisions``
-lists every complete preset selectable by name at load time, and
-``checkpoint_precision`` is the dense base for a calibrated ModelOpt
+overrides, into a ``uniserve_models.loading.weights.Config`` whose ``dtypes``
+and ``quantization`` mappings are keyed by module path and resolved by
+longest prefix; the paths cover the denoisers the checkpoint holds.
+``precisions`` lists every complete preset selectable by name at load time,
+and ``checkpoint_precision`` is the dense base for a calibrated ModelOpt
 checkpoint, onto which ``uniserve_models.catalog`` overlays the checkpoint's
 own quantized modules.
 """

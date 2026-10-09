@@ -183,10 +183,10 @@ def modulation_timesteps(
             )
         steps.append(torch.stack(row))
     keys: dict[int, int] = {}
-    entries = []
+    entries: list[torch.Tensor] = []
     table = torch.empty((len(steps), groups), dtype=torch.int64, device="cpu")
-    for step, row in enumerate(steps):
-        for group, value in enumerate(row):
+    for step, step_times in enumerate(steps):
+        for group, value in enumerate(step_times):
             key = int(value.view(torch.int32))
             if key not in keys:
                 keys[key] = len(entries)
@@ -824,6 +824,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             for name, layout in self.output_layout(size).items()
         }
         width = self._rotary_width()
+        packing: DensePacking | RegionPacking | TileExtent
         if self.dense:
             packing = self._dense_packing(size)
             rows = packing.padded_tokens // self.sequence_group().size
@@ -1026,6 +1027,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         # complete native draw it takes: the video raster row, or the
         # channel-major audio row.
         size = self.layout_size(size)
+        packing: RegionPacking | DensePacking
         if self.regional:
             packing = self._region_packing(size)
             interval = self._token_slice(packing.padded_tokens)
@@ -1271,6 +1273,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 "request state"
             )
         attention: AttentionInput | SequenceInput | RegionInput
+        packing: DensePacking | RegionPacking
         if self.dense:
             packing = self._dense_packing(size)
             tokens = packing.padded_tokens

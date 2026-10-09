@@ -66,7 +66,7 @@ def bind(
     tensors = calls.tensors(buffers)
     latents, staging = tensors["latents"], tensors["staging"]
     products = tensors["products"]
-    value_range = tuple(float(value) for value in decoder.decoder.value_range)
+    low, high = (float(value) for value in decoder.decoder.value_range)
 
     def stage(value: torch.Tensor, low: float, high: float, offset: int):
         """Quantize one image into the staging bytes at ``offset``."""
@@ -101,7 +101,7 @@ def bind(
             for value, row, region in zip(values, rows, images, strict=True):
                 if region is not None:
                     calls.write(regions.view(products, region), value)
-                counts.append(stage(value, *value_range, row[4]))
+                counts.append(stage(value, low, high, row[4]))
             return counts
 
     def quantize(region, low: float, high: float, offset: int) -> int:
@@ -113,7 +113,8 @@ def bind(
                 int(offset),
             )
 
-    return {
-        name: translate(step)
-        for name, step in {"decode": decode, "quantize": quantize}.items()
+    steps: dict[str, Callable[..., Any]] = {
+        "decode": decode,
+        "quantize": quantize,
     }
+    return {name: translate(step) for name, step in steps.items()}
