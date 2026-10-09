@@ -23,6 +23,8 @@ from uniserve_models.bindings.context import (
 )
 from uniserve_models.model import TextSize
 
+from .errors import binding
+
 
 def functions() -> dict[str, Callable[..., Any]]:
     return {
@@ -151,4 +153,4 @@ def bind(prepared: Prepared, resources: Mapping[str, Any]) -> dict:
             prepared.context = None
             prepared.workspaces = {}
 
-    return {"kernels": kernels, "close": close}
+    return binding({"kernels": kernels, "close": close})
