@@ -32,7 +32,7 @@ use crate::executor::forward::placement::{
     OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export, skipped,
 };
 use crate::ffi::Region;
-use crate::ffi::{DType, Device, Function, Handle};
+use crate::ffi::{DType, Device, Function, Handle, list};
 use crate::host::mux::{MuxConfig, MuxFunctions, MuxSession};
 use crate::host::reader::ConditionReader;
 use crate::host::task::MediaTask;
@@ -927,81 +927,101 @@ fn prepare(
     Ok(())
 }
 
-/// Split latent preparation's condition reads into per-condition latents
-/// in request order, each condition's visual rows before its audio rows.
-/// The reads are the visual rounds' rows in round order, then, when any
-/// condition carries audio, every track's rows.
+/// Rows of one condition read: `(read, first row, rows)`.
+type RowSpan = (usize, u64, u64);
+
+/// Locate every condition latent in latent preparation's condition reads.
+///
+/// `conditions` are each condition's `(visual rows, audio rows)` in request
+/// order. The reads are the visual rounds' rows in round order (`rounds`
+/// holds each round's row count), then, when any condition carries audio,
+/// one read of every track's rows (`tracks`). The visual rounds hold the
+/// conditions' visual rows back to back, and a round ends wherever its
+/// units do, so a condition's rows may continue into the next round.
+///
+/// Returns the latents in request order, a condition's visual rows before
+/// its audio rows, each as the spans that hold its rows in row order.
+fn condition_spans(
+    conditions: &[(u64, u64)],
+    rounds: &[u64],
+    tracks: Option<u64>,
+) -> Result<Vec<Vec<RowSpan>>> {
+    let mismatch =
+        || Error::Invalid("condition latents disagree with the request's planned rows".into());
+    let visual: u64 = conditions.iter().map(|rows| rows.0).sum();
+    let audio: u64 = conditions.iter().map(|rows| rows.1).sum();
+    if rounds.iter().sum::<u64>() != visual || tracks.unwrap_or(0) != audio {
+        return Err(mismatch());
+    }
+    // The audio read follows the visual rounds.
+    let track_read = rounds.len();
+    let mut result = Vec::new();
+    let (mut round, mut row, mut audio_row) = (0usize, 0u64, 0u64);
+    for &(visual_rows, audio_rows) in conditions {
+        if visual_rows > 0 {
+            let mut spans = Vec::new();
+            let mut needed = visual_rows;
+            while needed > 0 {
+                let available = *rounds.get(round).ok_or_else(mismatch)? - row;
+                let taken = available.min(needed);
+                if taken > 0 {
+                    spans.push((round, row, taken));
+                }
+                needed -= taken;
+                row += taken;
+                if taken == available {
+                    round += 1;
+                    row = 0;
+                }
+            }
+            result.push(spans);
+        }
+        if audio_rows > 0 {
+            result.push(vec![(track_read, audio_row, audio_rows)]);
+            audio_row += audio_rows;
+        }
+    }
+    Ok(result)
+}
+
+/// The condition latents of latent preparation's condition `reads`, each a
+/// list of row tensors that together hold its rows (see
+/// [`condition_spans`]).
 fn condition_latents(
     conditions: &[VideoCondition],
     reads: &[Arc<crate::ProductRead>],
 ) -> Result<Vec<Any>> {
     let audio = conditions.iter().any(|condition| condition.audio_rows > 0);
-    let (rounds, tracks) = if audio {
-        let (tracks, rounds) = reads
-            .split_last()
-            .ok_or_else(|| Error::Invalid("condition latents lack their audio rows".into()))?;
-        (rounds, Some(tracks))
-    } else {
-        (reads, None)
-    };
-    // Visual rounds follow each other in unit order; their rows are the
-    // conditions' visual rows back to back.
-    let mut visual = Vec::new();
-    for round in rounds {
-        let value = round.value();
-        visual.push(value.clone());
-    }
-    let mut result = Vec::new();
-    let mut round = 0usize;
-    let mut row = 0i64;
-    let mut audio_row = 0i64;
-    for condition in conditions {
-        let rows = condition.video_rows() as i64;
-        if rows > 0 {
-            let mut parts = Vec::new();
-            let mut needed = rows;
-            while needed > 0 {
-                let value = visual.get(round).ok_or_else(|| {
-                    Error::Invalid(
-                        "condition latents disagree with the request's planned rows".into(),
-                    )
-                })?;
-                let available = value.shape()[0] - row;
-                let taken = available.min(needed);
-                parts.push(value.narrow(0, row, taken)?);
-                needed -= taken;
-                row += taken;
-                if row == value.shape()[0] {
-                    round += 1;
-                    row = 0;
-                }
-            }
-            let [part] = &parts[..] else {
-                return Err(Error::Unsupported(
-                    "a condition's visual rows span several encoding rounds".into(),
-                ));
-            };
-            result.push(Any::from(part.to_tensor()?));
-        }
-        if condition.audio_rows > 0 {
-            let tracks = tracks
-                .ok_or_else(|| Error::Invalid("condition latents lack their audio rows".into()))?;
-            let rows = i64::from(condition.audio_rows);
-            result.push(Any::from(
-                tracks.value().narrow(0, audio_row, rows)?.to_tensor()?,
+    let (rounds, tracks) = match (audio, reads.split_last()) {
+        (true, Some((tracks, rounds))) => (rounds, Some(tracks)),
+        (true, None) => {
+            return Err(Error::Invalid(
+                "condition latents lack their audio rows".into(),
             ));
-            audio_row += rows;
         }
-    }
-    let leftover = visual
-        .get(round)
-        .is_some_and(|value| row < value.shape()[0] || round + 1 < visual.len());
-    if leftover || tracks.is_some_and(|tracks| audio_row != tracks.value().shape()[0]) {
-        return Err(Error::Invalid(
-            "condition latents disagree with the request's planned rows".into(),
-        ));
-    }
-    Ok(result)
+        (false, _) => (reads, None),
+    };
+    let rows = |read: &Arc<crate::ProductRead>| {
+        read.value().shape().first().copied().unwrap_or(0).max(0) as u64
+    };
+    let planned: Vec<(u64, u64)> = conditions
+        .iter()
+        .map(|condition| (condition.video_rows(), u64::from(condition.audio_rows)))
+        .collect();
+    let round_rows: Vec<u64> = rounds.iter().map(rows).collect();
+    condition_spans(&planned, &round_rows, tracks.map(rows))?
+        .into_iter()
+        .map(|spans| {
+            let parts = spans
+                .into_iter()
+                .map(|(read, first, count)| {
+                    let rows = reads[read].value().narrow(0, first as i64, count as i64)?;
+                    Ok(Any::from(rows.to_tensor()?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Any::from(list(parts)))
+        })
+        .collect()
 }
 
 /// Advance a request's trajectory by one step; the final step publishes the
@@ -2188,6 +2208,36 @@ mod tests {
             distribution: distribution.then_some(ComponentDistribution::TemporalUnits),
             units_per_rank,
         }
+    }
+
+    #[test]
+    fn condition_latents_follow_their_rows_across_encoding_rounds() {
+        // A keyframe of 4 rows, a reference video of 10 rows with 3 audio
+        // rows and a voice of 2 audio rows; the encoder published the
+        // visual rows in rounds of 6, 5 and 3 rows.
+        let conditions = [(4, 0), (10, 3), (0, 2)];
+        let latents = condition_spans(&conditions, &[6, 5, 3], Some(5)).unwrap();
+        assert_eq!(
+            latents,
+            vec![
+                vec![(0, 0, 4)],
+                // The video continues through the second round into the third.
+                vec![(0, 4, 2), (1, 0, 5), (2, 0, 3)],
+                // The audio read follows the three visual rounds.
+                vec![(3, 0, 3)],
+                vec![(3, 3, 2)],
+            ]
+        );
+
+        // Reads that hold other rows than the request planned are refused.
+        assert!(condition_spans(&conditions, &[6, 5], Some(5)).is_err());
+        assert!(condition_spans(&conditions, &[6, 5, 3], Some(4)).is_err());
+        assert!(condition_spans(&conditions, &[6, 5, 3], None).is_err());
+        // Without audio, every read is a visual round.
+        assert_eq!(
+            condition_spans(&[(4, 0)], &[4], None).unwrap(),
+            vec![vec![(0, 0, 4)]]
+        );
     }
 
     #[test]
