@@ -534,23 +534,28 @@ impl ExpertWeights {
 
     /// Make layer `layer` readable on `compute` and prefetch the next one.
     ///
-    /// Eagerly, the copies are submitted now and the result is empty. On a
-    /// capturing stream, copies cannot be recorded: the result lists the
-    /// copies the caller submits between graph segments, in order.
-    pub fn before(&self, layer: usize, compute: usize) -> Result<Vec<usize>> {
+    /// Eagerly, the copies are submitted now. On a capturing stream, copies
+    /// cannot be recorded: `record(index)` receives each copy in submission
+    /// order and must end the current graph segment, schedule
+    /// [`copy`](Self::copy) of `index` and begin the next segment. The order
+    /// matters: the wait for this layer's slots is captured after the
+    /// segment boundary that submits their copy.
+    pub fn before(
+        &self,
+        layer: usize,
+        compute: usize,
+        mut record: impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
         // SAFETY: the caller's live compute stream on this device.
         let stream = unsafe { Stream::borrowed(self.prefetch.device, compute) }?;
         let capturing = stream.capture_status()? != uniserve_cuda::CaptureStatus::None;
-        let mut recorded = Vec::new();
         self.prefetch.before(layer, compute, |index| {
             if capturing {
-                recorded.push(index);
-                Ok(())
+                record(index)
             } else {
                 self.prefetch.copy(index)
             }
-        })??;
-        Ok(recorded)
+        })?
     }
 
     /// Release layer `layer`'s slots after its last reader on `compute`.
