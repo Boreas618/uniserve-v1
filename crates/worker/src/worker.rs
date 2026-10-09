@@ -51,14 +51,21 @@ use crate::executor::forward::canvas::{
 };
 use crate::executor::forward::experts::warmup::ExpertWarmup;
 use crate::executor::forward::experts::{ExpertRuntime, ExpertStart, WeightRuntime};
+use crate::executor::forward::image::ImageRuntime;
+use crate::executor::forward::image::start::{
+    Startup as ImageStartup, reserved_bytes as image_reserved_bytes,
+};
+use crate::executor::forward::image::warmup::ImageWarmup;
 use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::token::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
 use crate::executor::forward::token::warmup::TextWarmup;
+use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
 use crate::launch::Endpoint;
 use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
+use crate::model::image::ImageModel;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::model::{
@@ -179,10 +186,6 @@ impl Worker {
             &launch.components,
             config.rank,
             device,
-            config
-                .generation_device
-                .as_deref()
-                .and_then(|name| Device::parse(name, "device").ok()),
             |name| world.meshes(name),
         );
         let host_only = !dedicated && components.host_only();
@@ -339,6 +342,23 @@ impl Worker {
             weights: weights.as_ref().map(WeightRuntime::prefetch),
         })
         .map_err(phase("bind"))?;
+        let image = ImageRuntime::start(ImageStartup {
+            interface: &interface,
+            config: &config,
+            request_slots: info.request_slots as usize,
+            queue_depth: launch.ipc.queue_depth,
+            host_capacity: info.host_lane_capacity as usize,
+            model: &model,
+            lanes: &lanes,
+            storage: &storage,
+            latent: plan.latent,
+            components: &mut components,
+            workspaces: &mut workspaces,
+            graphs: &mut graphs,
+            preparation,
+            peers: Some(&peers),
+        })
+        .map_err(phase("bind"))?;
         let canvas = CanvasRuntime::start(CanvasStartup {
             interface: &interface,
             config: &config,
@@ -373,6 +393,10 @@ impl Worker {
         if let Some(text) = text {
             backend.set_text(text);
         }
+        let image_warmup = image.is_some();
+        if let Some(image) = image {
+            backend.set_image(image);
+        }
         let canvas_warmup = canvas.is_some();
         if let Some(canvas) = canvas {
             backend.set_canvas(canvas);
@@ -384,6 +408,20 @@ impl Worker {
         if let Some(experts) = experts {
             backend.set_experts(experts);
         }
+        let cuda: Vec<i32> = devices
+            .iter()
+            .filter_map(|device| device.cuda_index())
+            .collect();
+        backend.set_transfer(
+            TransferRuntime::start(
+                &lanes,
+                &cuda,
+                &CallKind::ALL,
+                launch.ipc.queue_depth,
+                info.max_batch_calls as usize,
+            )
+            .map_err(phase("bind"))?,
+        );
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
             .map(|profile| {
@@ -410,6 +448,9 @@ impl Worker {
         )
         .map_err(|error| error.with_phase("executor"))?;
         let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
+        if image_warmup {
+            hooks.push(Box::new(ImageWarmup));
+        }
         if text_warmup {
             hooks.push(Box::new(TextWarmup {
                 row_tokens: config
@@ -658,10 +699,15 @@ impl Worker {
             return Ok(());
         };
         let devices: Vec<String> = self.config.devices().map(str::to_owned).collect();
-        let products = self.plan.arena.device_product_bytes / devices.len().max(1) as u64;
         for name in devices {
             let Ok(Device::Cuda(index)) = Device::parse(&name, "device") else {
                 continue;
+            };
+            // Product storage lives on the primary device only.
+            let products = if name == self.config.device {
+                self.plan.arena.device_product_bytes
+            } else {
+                0
             };
             let measured = budget.budget(index, self.config.kv_storage_fraction)?;
             let segments = self.segments(index)?;
@@ -788,6 +834,9 @@ impl Worker {
         if let Some(text) = executor.backend_mut().text_mut() {
             text.seal();
         }
+        if let Some(image) = executor.backend_mut().image_mut() {
+            image.seal();
+        }
         self.workspaces.seal();
         let choices: i64 = self
             .interface
@@ -848,21 +897,23 @@ fn allocate_storage(
         cross_host_consumers: launch.ipc.products_cross_hosts,
         vmm_pool_bytes: plan.arena.transfer_bytes,
     };
-    let transports = Transports::new(&kinds, capacity, Arc::clone(&events), &options)?;
+    let exports = launch
+        .data_plane
+        .exports
+        .iter()
+        .map(|name| TransportKind::parse(name))
+        .collect::<Result<Vec<_>>>()?;
+    let transports = Arc::new(
+        Transports::new(&kinds, capacity, Arc::clone(&events), &options)?.with_exports(&exports)?,
+    );
 
     // Products: scheduler-placed buffers in the buffer pool and scalar relay
-    // lanes, one per request slot and unresolved call.
-    let devices: Vec<StorageDevice> = config
-        .devices()
-        .map(|name| {
-            let device =
-                Device::parse(name, "device").map_err(|error| Error::Invalid(error.to_string()))?;
-            Ok(match device {
-                Device::Cuda(index) => StorageDevice::Cuda(index),
-                Device::Cpu => StorageDevice::Cpu,
-            })
-        })
-        .collect::<Result<_>>()?;
+    // lanes, one per request slot and unresolved call, on the primary
+    // device where every binding computes.
+    let devices = vec![match config.primary_device() {
+        Device::Cuda(index) => StorageDevice::Cuda(index),
+        Device::Cpu => StorageDevice::Cpu,
+    }];
     let physical = plan.physical_buffer_pool_bytes.max(1);
     let buffer_pool =
         BufferPool::allocate(physical, physical < plan.info.buffer_pool_bytes, &devices)?;
@@ -1139,13 +1190,17 @@ fn plan(
             .sum(),
     };
     let mut layout = TokenLayout::new(report, config, launch.ipc.queue_depth, &token_facts)?;
-    let cache = if text
-        && !dedicated
-        && components
-            .placed()
+    // Every rank of a worker holding a causal LM component keeps the same
+    // KV pool, including ranks that hold only its other components: the
+    // worker advertises token work for all of its ranks, and they agree on
+    // one pool capacity.
+    let holds_text = held.iter().any(|name| {
+        declarations
+            .calls(name)
             .iter()
-            .any(|placed| placed.has(Capability::CausalLm))
-    {
+            .any(|call| call.is(Capability::CausalLm))
+    });
+    let cache = if text && !dedicated && holds_text {
         let cache =
             KVPlan::decode(model.cache_plan(interface, block_size, kv_dtype.as_deref())?)?;
         let total = match device {
@@ -1177,6 +1232,18 @@ fn plan(
                 unit_columns,
             )?,
         );
+        // The image runtime's denoiser columns and decoder staging.
+        if facts.image_flow.is_some() {
+            let image = ImageModel::describe(interface, model.handle())?;
+            layout.reserve(
+                &config.device,
+                image_reserved_bytes(
+                    config,
+                    layout.info().request_slots as usize,
+                    image.denoiser.as_ref(),
+                ),
+            );
+        }
         // The canvas runners' buffers and the resident canvas banks.
         layout.reserve(
             &config.device,

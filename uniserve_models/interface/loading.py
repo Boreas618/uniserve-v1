@@ -505,7 +505,7 @@ _PRODUCT_DTYPES = {
 }
 
 
-def _capability(model: nn.Module, kind: type) -> nn.Module | None:
+def capability(model: nn.Module, kind: type) -> nn.Module | None:
     """The model's unique module of ``kind``, if any."""
     found = []
     for module in model.modules():
@@ -584,7 +584,7 @@ def _vision_feature_bytes(model: nn.Module, processor) -> int:
     Rows come from the processor's ViT transform pixel bound and the
     encoder stride; zero without a ``PatchEncoder``, processor or ViT.
     """
-    encoder = _capability(model, PatchEncoder)
+    encoder = capability(model, PatchEncoder)
     if encoder is None or processor is None or processor.vit is None:
         return 0
     from uniserve_models.media import image
@@ -606,7 +606,7 @@ def _vision_feature_bytes(model: nn.Module, processor) -> int:
 
 def _image_flow(model: nn.Module) -> dict[str, int] | None:
     """The image denoiser's latent geometry for the latent pool plan."""
-    denoiser = _capability(model, ImageDenoiser)
+    denoiser = capability(model, ImageDenoiser)
     if denoiser is None:
         return None
     return {
@@ -631,7 +631,7 @@ def facts(loaded: Loaded, bounds: Mapping[str, Any]) -> dict[str, Any]:
     text = (
         None
         if str(bounds["role"]) == "experts"
-        else _capability(model, CausalLM)
+        else capability(model, CausalLM)
     )
     weight_formats = sorted(
         {

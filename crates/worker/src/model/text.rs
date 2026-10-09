@@ -61,6 +61,10 @@ pub struct StepArgs<'a> {
     pub greedy: bool,
     /// The prompt scoring descriptor.
     pub prompt: &'a [i64],
+    /// Rotary position axes the rows carry (1 or 3).
+    pub axes: usize,
+    /// Precomputed embeddings replace masked token embeddings.
+    pub embedded: bool,
 }
 
 /// The shapes a graph captures.
@@ -197,6 +201,8 @@ impl TextModel {
             shape(args.sampling),
             flag(args.greedy),
             shape(args.prompt),
+            integer(args.axes),
+            flag(args.embedded),
             integer(expert_capacity),
         ];
         DeferredCall::new(self.step.clone(), values)
