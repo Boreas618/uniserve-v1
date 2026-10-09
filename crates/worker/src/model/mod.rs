@@ -23,6 +23,7 @@ pub mod image;
 pub mod interface;
 pub mod registry;
 pub mod text;
+pub(crate) mod video;
 
 use std::collections::BTreeMap;
 
@@ -383,7 +384,7 @@ impl ModelFacts {
 }
 
 /// Translate a numerical output layout into a bounded protocol product.
-fn output_info(component: &str, output: &Record) -> Result<OutputInfo> {
+pub(crate) fn output_info(component: &str, output: &Record) -> Result<OutputInfo> {
     let name = output.string("name")?;
     let dtype = match output.string("dtype")?.as_str() {
         "uint8" => DType::U8,

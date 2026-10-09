@@ -183,7 +183,7 @@ def generate(
                 (conditioning,),
             )
             runner.step(inputs, schedules, state=request)
-        group = denoiser._sequence_group()
+        group = denoiser.sequence_group()
         latents = {
             name: _gather(
                 samples[name],
@@ -227,7 +227,7 @@ def generate(
                     sizes=(output,),
                     state=overlap,
                     constants=processing.constants,
-                    workspace=processing.workspace,
+                    workspace=processing.workspace_views,
                 )
             frames.extend(value.tensor.clone() for value in rgb)
 
@@ -243,7 +243,7 @@ def generate(
                 (latents["audio"],),
                 frames=(slice(0, frames_count),),
                 num_samples=(samples_count,),
-                workspace=context.workspace,
+                workspace=context.workspace_views,
             )[0]
     return Generation(
         video_latent=latents["video"],

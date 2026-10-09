@@ -58,6 +58,8 @@ pub struct WorkerBackend {
     /// The transfer runtime: tensor transfers, KV exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<forward::transfer::TransferRuntime>,
+    /// The video runtime, on ranks of a video model.
+    video: Option<forward::video::VideoRuntime>,
     /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
@@ -78,14 +80,15 @@ pub(crate) struct Parts<'a> {
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, then the
-/// text, image, canvas and transfer runtimes, then the other runtimes'
-/// owners.
+/// text, image, canvas, transfer and video runtimes, then the other
+/// runtimes' owners.
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<forward::token::TextRuntime>,
     image: &'a mut Option<forward::image::ImageRuntime>,
     canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
     transfer: &'a mut Option<forward::transfer::TransferRuntime>,
+    video: &'a mut Option<forward::video::VideoRuntime>,
     others: &'a mut [Box<dyn RequestStorage>],
 ) -> Vec<&'a mut dyn RequestStorage> {
     let mut owners: Vec<&'a mut dyn RequestStorage> = Vec::new();
@@ -103,6 +106,9 @@ fn owners<'a>(
     }
     if let Some(transfer) = transfer {
         owners.push(transfer);
+    }
+    if let Some(video) = video {
+        owners.push(video);
     }
     owners.extend(
         others
@@ -124,6 +130,8 @@ pub struct WorkerBatch {
     image_inputs: Option<forward::image::Inputs>,
     /// Products and KV transfers imported from other calls.
     inputs: forward::inputs::Inputs,
+    /// A video runtime batch's calls and completion.
+    media: Option<forward::batch::MediaBatch>,
     output: Option<BatchResult>,
 }
 
@@ -137,6 +145,7 @@ impl WorkerBatch {
             running: None,
             image_inputs: None,
             inputs: forward::inputs::Inputs::default(),
+            media: None,
             output: None,
         }
     }
@@ -193,6 +202,18 @@ impl WorkerBatch {
         self.image_inputs.take()
     }
 
+    /// The batch's plan, the inputs it reads in place and its video batch
+    /// state, borrowed apart.
+    pub(crate) fn media_parts(
+        &mut self,
+    ) -> (
+        &BatchPlan,
+        HashSet<uniserve_ipc::BufferId>,
+        &mut Option<forward::batch::MediaBatch>,
+    ) {
+        (&self.plan, self.inputs.borrowed(), &mut self.media)
+    }
+
     /// The batch's imported inputs.
     pub(crate) fn inputs(&self) -> &forward::inputs::Inputs {
         &self.inputs
@@ -214,6 +235,7 @@ impl WorkerBackend {
             image: None,
             canvas: None,
             transfer: None,
+            video: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -337,32 +359,47 @@ impl WorkerBackend {
         self.kernels = Some(watch);
     }
 
-    /// Whether the component of a batch belongs to a video model.
-    pub fn video_model(&self, batch: &WorkerBatch) -> bool {
-        batch
-            .plan
-            .calls
-            .first()
-            .and_then(|call| self.components.get(&call.component))
-            .is_some_and(|placed| {
-                forward::decodes_video(
-                    placed
-                        .calls
-                        .iter()
-                        .flat_map(|call| call.capabilities.iter().copied()),
-                )
-            })
+    /// Whether the rank serves a video model: its encoders and denoisers
+    /// run in the video runtime.
+    pub fn serves_video(&self) -> bool {
+        self.video.is_some()
+    }
+
+    /// Install the video runtime of a video model's rank.
+    pub(crate) fn set_video(&mut self, video: forward::video::VideoRuntime) {
+        self.video = Some(video);
+    }
+
+    pub(crate) fn video_mut(&mut self) -> Option<&mut forward::video::VideoRuntime> {
+        self.video.as_mut()
+    }
+
+    /// The parts a video batch executes with.
+    pub(crate) fn media_parts(&mut self) -> Result<forward::video::Parts<'_>> {
+        Ok(forward::video::Parts {
+            requests: &mut self.requests,
+            storage: self
+                .rank_storage
+                .as_ref()
+                .ok_or_else(|| Error::Invariant("the rank has no storage owners".into()))?,
+            video: self.video.as_mut().ok_or_else(|| {
+                Error::Unsupported("video calls are served by the video runtime".into())
+            })?,
+            info: &self.info,
+        })
     }
 
     /// Install every Start, then follow each call's predecessor.
     fn admit_requests(&mut self, batch: &mut WorkerBatch) -> Result<()> {
         let mut admitted = Vec::new();
+        let mut installed = Vec::new();
         let started = (|| -> Result<()> {
             for command in &batch.plan.commands {
                 if let BatchCommand::Start { request } = command
                     && let Some(slot) = self.requests.start(request.as_ref().clone())?
                 {
                     admitted.push(slot);
+                    installed.push(request);
                 }
             }
             Ok(())
@@ -375,12 +412,18 @@ impl WorkerBackend {
                 &mut self.image,
                 &mut self.canvas,
                 &mut self.transfer,
+                &mut self.video,
                 &mut self.storage,
             ) {
                 owner.admit_slots(&admitted)?;
             }
         }
         started?;
+        if let Some(video) = &mut self.video {
+            for request in installed {
+                video.admit(request)?;
+            }
+        }
 
         batch.predecessors = batch
             .plan
@@ -502,18 +545,26 @@ impl WorkerBackend {
         if let Some(transfer) = &self.transfer {
             transfer.set_wake(wake.clone());
         }
+        if let Some(video) = &self.video {
+            video.set_wake(wake.clone());
+        }
         for owner in &self.storage {
             owner.set_wake(wake.clone());
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, the
+    /// Close every storage owner, newest first (other runtimes, the video,
     /// transfer, canvas, image and text runtimes, then rank storage), after
     /// the executor drained; returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
+        }
+        // The video runtime closes before the rank storage its products
+        // live in.
+        if let Some(mut video) = self.video.take() {
+            result = result.and(video.close(aborted));
         }
         if let Some(mut transfer) = self.transfer.take() {
             result = result.and(transfer.close(aborted));
@@ -655,6 +706,7 @@ impl Backend for WorkerBackend {
             &mut self.image,
             &mut self.canvas,
             &mut self.transfer,
+            &mut self.video,
             &mut self.storage,
         );
         batch.retirement.admit(&mut owners)?;
@@ -689,7 +741,7 @@ impl Backend for WorkerBackend {
         // runtime's host lane while other batches execute; the batch
         // launches once they are ready (the lane notifies `submission`).
         // Other batches' inputs are prepared when their runtime executes.
-        if self.image.is_some() && !self.video_model(batch) {
+        if self.image.is_some() && !self.serves_video() {
             return forward::image::prepare_inputs(self, batch, submission);
         }
         Ok(true)
@@ -749,6 +801,7 @@ impl Backend for WorkerBackend {
             &mut self.image,
             &mut self.canvas,
             &mut self.transfer,
+            &mut self.video,
             &mut self.storage,
         );
         batch.retirement.begin(&self.requests, &mut owners)?;
@@ -765,6 +818,16 @@ impl Backend for WorkerBackend {
             batch.running = None;
             advanced = true;
         }
+        if batch.output.is_none()
+            && let Some(media) = &mut batch.media
+        {
+            let parts = self.media_parts()?;
+            let owners = parts.owners();
+            if let Some(result) = media.poll(&batch.plan, owners, parts.requests)? {
+                batch.output = Some(result);
+                advanced = true;
+            }
+        }
         if batch.output.is_none() {
             return Ok((advanced, false));
         }
@@ -774,6 +837,7 @@ impl Backend for WorkerBackend {
             &mut self.image,
             &mut self.canvas,
             &mut self.transfer,
+            &mut self.video,
             &mut self.storage,
         );
         let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
@@ -795,10 +859,17 @@ impl Backend for WorkerBackend {
         // Calls become pending only when a capability runtime commits them;
         // unresolved launched work cancels its pending calls. Lifecycle
         // commands hold no resource beyond their retirement.
-        let abandoned = batch
+        let mut abandoned = batch
             .running
             .take()
             .map_or(Ok(()), |running| forward::abandon(self, running));
+        if let Some(media) = &mut batch.media {
+            let closed = self.media_parts().and_then(|parts| {
+                let owners = parts.owners();
+                media.close(owners, parts.requests)
+            });
+            abandoned = abandoned.and(closed.map_err(WorkerError::from));
+        }
         // Imports the batch did not consume are abandoned; their storage
         // retires with their physical accesses.
         let closed = forward::inputs::close(self, batch).map_err(WorkerError::from);
@@ -812,6 +883,7 @@ impl Backend for WorkerBackend {
             &mut self.image,
             &mut self.canvas,
             &mut self.transfer,
+            &mut self.video,
             &mut self.storage,
         ) {
             owner.reap()?;
