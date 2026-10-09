@@ -711,7 +711,8 @@ fn execution(
         }
     }
     for lane in &config.lanes {
-        lane.validate().map_err(DescriptorError::new)?;
+        lane.validate()
+            .map_err(|error| DescriptorError::new(error.to_string()))?;
     }
     if let Some(sampling) = descriptor.canvas_sampling {
         if let Some(parameter) = sampling.invalid_parameter() {

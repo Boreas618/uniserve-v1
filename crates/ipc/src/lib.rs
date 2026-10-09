@@ -117,7 +117,7 @@ mod request;
 mod tensor;
 
 pub use call::*;
-pub use config::LaneConfig;
+pub use config::{LaneConfig, LaneConfigError};
 pub use info::*;
 pub use request::*;
 pub use tensor::*;
