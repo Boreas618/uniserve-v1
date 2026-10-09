@@ -18,7 +18,7 @@ from uniserve_models.model import (
     SelfConditioning,
     TokenDenoiser,
 )
-from uniserve_models.nn.linear import VocabParallelHead
+from uniserve_models.nn.linear import VocabParallelEmbedding, VocabParallelHead
 from uniserve_models.nn.mlp import GatedMLP
 from uniserve_models.nn.norm import RMSNorm
 
@@ -53,7 +53,7 @@ class Model(nn.Module):
         # Parameter. Construction precedes pipeline binding, so both modules
         # are still present.
         embedding = backbone.embedding
-        assert embedding is not None
+        assert isinstance(embedding, VocabParallelEmbedding)
         head.weight = embedding.weight
         self.text = CausalLM(backbone, head)
 

@@ -19,13 +19,12 @@ from transformers import (
     Qwen3MoeForCausalLM,
 )
 
-from uniserve_models import loading
-from uniserve_models.diffusion import NoiseScale
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models import bagel, siglip
+from uniserve_models import bagel, loading, siglip
 from uniserve_models import catalog as models
 from uniserve_models import sensenova_u1 as u1
 from uniserve_models.bagel import vae
+from uniserve_models.diffusion import NoiseScale
+from uniserve_models.loading import checkpoint, weights
 from uniserve_models.sensenova_u1 import flow, vision
 
 

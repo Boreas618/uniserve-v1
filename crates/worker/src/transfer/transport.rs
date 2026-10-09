@@ -715,7 +715,7 @@ impl Transport {
         if submitted.is_err()
             && let Err(cleanup) = read.release_source()
         {
-            eprintln!("failed to release a local transfer source: {cleanup}");
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to release a local transfer source: {cleanup}");
         }
         submitted
     }

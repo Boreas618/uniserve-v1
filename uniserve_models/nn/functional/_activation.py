@@ -63,8 +63,8 @@ def _act_and_mul(
     row-scaled FP8 ``QuantizedTensor`` output receives the E4M3 encoding of
     the unrounded FP32 products with one scale per row.
     """
-    from uniserve_models.quantization import Quantizer
     from uniserve_kernels import activation as kernels
+    from uniserve_models.quantization import Quantizer
 
     if x.ndim < 1 or x.shape[-1] % 2 or x.shape[-1] == 0:
         raise ValueError("gating requires equal channel halves")

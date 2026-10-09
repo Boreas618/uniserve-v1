@@ -1,14 +1,14 @@
 """Head-shard relayout kernels for the Ulysses head exchange.
 
-``uniserve_models.distributed.tokens.HeadExchange`` trades a member's token shard
-of every head for every token of its own heads. ``pack_head_shards`` writes
-the outgoing payload destination-major: up to three ``[tokens, heads, dim]``
-sources (query, key and value) become one ``[members, tokens, slots, dim]``
-buffer whose member ``m`` row holds, for each source in order, the heads
-member ``m`` owns. ``merge_head_shards`` restores the received
-``[members, tokens, heads, dim]`` attention output to ``[tokens,
-members * heads, dim]``. Both are pure copies, so their results equal the
-tensor-operation relayouts bit for bit.
+``uniserve_models.distributed.tokens.HeadExchange`` trades a member's token
+shard of every head for every token of its own heads. ``pack_head_shards``
+writes the outgoing payload destination-major: up to three ``[tokens, heads,
+dim]`` sources (query, key and value) become one ``[members, tokens, slots,
+dim]`` buffer whose member ``m`` row holds, for each source in order, the heads
+member ``m`` owns. ``merge_head_shards`` restores the received ``[members,
+tokens, heads, dim]`` attention output to ``[tokens, members * heads, dim]``.
+Both are pure copies, so their results equal the tensor-operation relayouts bit
+for bit.
 
 A source with fewer heads than members is replicated: member ``m`` takes
 head ``m // replicas`` as its single slot. Sources and the merge destination
