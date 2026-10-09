@@ -10,12 +10,16 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from uniserve_models import loading
 from uniserve_models.distributed import DeviceMesh
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.model import Logits
 from uniserve_models.nn.linear import VocabParallelEmbedding, VocabParallelHead
-from uniserve_models.runtime import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 
@@ -43,17 +47,11 @@ def _mapping(model):
     )
 
 
-def _run(rank, rendezvous, root):
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=4,
-        device="cpu",
-        init_method=rendezvous,
-    ) as owner:
-        mesh = owner.bind(
+def _run(rank, listener, root):
+    with process_world(rank, 4, listener) as world:
+        mesh = bind_mesh(
+            world,
             DeviceMesh(ranks=(3, 1, 0, 2), shape=(4,), axes=("tp",), rank=rank),
-            device="cpu",
         )
         result = loading.load_model(
             Vocabulary,
@@ -89,9 +87,10 @@ def test_loaded_vocabulary_shards_preserve_tied_values(tmp_path):
         {"weight": torch.arange(37 * 4).reshape(37, 4).float() / 16},
         tmp_path / "model.safetensors",
     )
-    mp.spawn(
-        _run,
-        args=((tmp_path / "vocab").as_uri(), tmp_path),
-        nprocs=4,
-        join=True,
-    )
+    with rendezvous() as listener:
+        mp.spawn(
+            _run,
+            args=(listener, tmp_path),
+            nprocs=4,
+            join=True,
+        )
