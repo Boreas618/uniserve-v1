@@ -16,7 +16,9 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use uniserve_cuda::{DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, Strided};
+use uniserve_cuda::{
+    CopyBatch, DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, SourceOrder, Stream, Strided,
+};
 
 use crate::ffi::{Backing, DType, Device, Tensor, contiguous_strides, export};
 use crate::{Error, Result};
@@ -542,6 +544,70 @@ impl StorageView {
     }
 
     /// Export to Python as a DLPack tensor retaining the allocation.
+    /// Write `bytes` into the leading bytes of this contiguous view, after
+    /// preceding work on `stream` for device memory (`stream` is `None`
+    /// exactly for host memory). The source is read before the call
+    /// returns, so the caller may reuse it at once.
+    pub fn upload(&self, bytes: &[u8], stream: Option<&Stream>) -> Result<()> {
+        if !self.is_contiguous() || bytes.len() as u64 > self.nbytes() {
+            return Err(Error::Invariant(
+                "an upload writes a prefix of a contiguous view".to_owned(),
+            ));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        match (self.device(), stream) {
+            (Device::Cuda(_), Some(stream)) => {
+                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+                batch.push(self.address(), bytes.as_ptr() as u64, bytes.len());
+                // SAFETY: the destination lies in this view; the pageable
+                // source is consumed during the call.
+                unsafe { batch.submit(stream) }.map_err(Error::from)
+            }
+            (Device::Cpu | Device::CudaHost, None) => {
+                // SAFETY: the destination lies in this view's host memory;
+                // the caller orders its readers.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        self.address() as *mut u8,
+                        bytes.len(),
+                    );
+                }
+                Ok(())
+            }
+            _ => Err(Error::Invariant(
+                "uploads use a stream exactly for device memory".to_owned(),
+            )),
+        }
+    }
+
+    /// Zero this contiguous view, in `stream` order for device memory.
+    pub fn zero(&self, stream: Option<&Stream>) -> Result<()> {
+        if !self.is_contiguous() {
+            return Err(Error::Invariant(
+                "only a contiguous view is zeroed".to_owned(),
+            ));
+        }
+        let bytes = self.nbytes() as usize;
+        match (self.device(), stream) {
+            // SAFETY: the bytes lie in this view.
+            (Device::Cuda(_), Some(stream)) => {
+                unsafe { uniserve_cuda::memset_d8(self.address(), 0, bytes, stream) }
+                    .map_err(Error::from)
+            }
+            (Device::Cpu | Device::CudaHost, None) => {
+                // SAFETY: the bytes lie in this view's host memory.
+                unsafe { std::ptr::write_bytes(self.address() as *mut u8, 0, bytes) };
+                Ok(())
+            }
+            _ => Err(Error::Invariant(
+                "fills use a stream exactly for device memory".to_owned(),
+            )),
+        }
+    }
+
     pub fn to_tensor(&self) -> Result<Tensor> {
         export(
             Arc::clone(&self.memory),

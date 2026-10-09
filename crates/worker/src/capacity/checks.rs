@@ -43,11 +43,15 @@ pub fn startup(
     resident_products: impl Fn(&str) -> u64,
     budget: &DeviceBudget,
 ) -> Result<()> {
-    let devices: Vec<&str> = config.devices().collect();
-    let products = device_product_bytes / devices.len().max(1) as u64;
-    for name in devices {
+    for name in config.devices() {
         let Ok(Device::Cuda(index)) = Device::parse(name, "device") else {
             continue;
+        };
+        // Product storage lives on the primary device only.
+        let products = if name == config.device {
+            device_product_bytes
+        } else {
+            0
         };
         let measured = budget.budget(index, config.kv_storage_fraction)?;
         let grant = (measured.total as f64 * config.kv_storage_fraction) as u64;

@@ -12,6 +12,7 @@
 
 mod dlpack;
 mod record;
+mod region;
 
 use tvm_ffi::{Any, AnyView};
 
@@ -19,6 +20,7 @@ use crate::{Error, Result};
 
 pub use dlpack::{Backing, DType, Device, contiguous_strides, export};
 pub use record::{Fields, Record, integer_list, integers, is_none, json, list, strings, to_json};
+pub use region::Region;
 pub use tvm_ffi::{Array, Map, Shape, Tensor};
 
 /// A function from the interface table or a binding map.
