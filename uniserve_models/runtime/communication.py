@@ -1,7 +1,7 @@
 """Backend collectives behind the logical model communicators.
 
-Numerical code calls :class:`uniserve_models.distributed.Communicator`, which orders
-logical members. This module resolves each call to the stream-bound
+Numerical code calls :class:`uniserve_models.distributed.Communicator`, which
+orders logical members. This module resolves each call to the stream-bound
 communicator selected by the active execution scope or, without one, to the
 initialized process group, and owns asynchronous completion. Torch custom ops
 keep the process-group name traceable through captured graphs.

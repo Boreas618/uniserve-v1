@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from torch import nn
 
+from uniserve_models import siglip
 from uniserve_models.nn.vision import MLPConnector, PositionEmbedding
 from uniserve_models.nn.vision.position import build_abs_positions_from_grid_hw
-from uniserve_models import siglip
 
 from .config import Config
 
