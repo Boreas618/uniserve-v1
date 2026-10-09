@@ -109,7 +109,7 @@ pub fn export(
     if let Err(error) = result {
         for (transport, locator) in &locations {
             if let Err(cleanup) = transport.release(locator) {
-                eprintln!("failed to revoke an export after a failed export: {cleanup}");
+                tracing::warn!(target: "uniserve_worker.transfer", "failed to revoke an export after a failed export: {cleanup}");
             }
         }
         return Err(error);

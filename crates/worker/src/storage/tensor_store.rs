@@ -2016,7 +2016,7 @@ impl TensorStore {
         })();
         if let Err(error) = result {
             if let Err(cleanup) = exports::release(&locations) {
-                eprintln!("failed to revoke a failed product export: {cleanup}");
+                tracing::warn!(target: "uniserve_worker.storage", "failed to revoke a failed product export: {cleanup}");
             }
             return Err(error);
         }

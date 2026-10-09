@@ -169,7 +169,7 @@ pub fn export(
     })();
     if let Err(error) = result {
         if let Err(cleanup) = exports::release(&locations) {
-            eprintln!("failed to revoke a failed KV export: {cleanup}");
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to revoke a failed KV export: {cleanup}");
         }
         manager.release_exports(&[buffer]);
         return Err(error);
