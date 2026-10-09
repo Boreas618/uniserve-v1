@@ -217,8 +217,8 @@ async def run_load(
             try:
                 completed = await asyncio.gather(*session_tasks)
             except BaseException:
-                for task in session_tasks:
-                    task.cancel()
+                for session_task in session_tasks:
+                    session_task.cancel()
                 await asyncio.gather(*session_tasks, return_exceptions=True)
                 raise
             ordered = sorted(
@@ -241,8 +241,14 @@ async def run_load(
         raise
     # Every attempted request, including errors and deadlines, contributes to
     # the window. Coroutine cleanup and subsequent inspection do not.
+    # Request dispatch closes every record on each path, failures included.
+    ends = []
+    for output in outputs:
+        if output.final_event_time is None:
+            raise RuntimeError("request dispatch returned an unclosed record")
+        ends.append(output.final_event_time)
     first = min(output.start_time for output in outputs)
-    last = max(output.final_event_time for output in outputs)
+    last = max(ends)
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),
