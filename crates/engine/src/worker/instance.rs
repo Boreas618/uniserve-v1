@@ -1400,6 +1400,17 @@ fn rank_projection(
         // side tables to what those calls use: their request pool slots,
         // identities, inputs, KV sources, and buffers.
         projection.forward = batch.forward.select(&indices);
+        // A KV transfer reads or writes its request's pages without a
+        // forward row; a batch carries one call kind, so every page table
+        // of a KV transfer batch belongs to its calls.
+        let transfers_kv = projection.calls.iter().any(|call| {
+            matches!(
+                call.code,
+                uniserve_ipc::CallKind::Transfer(
+                    uniserve_ipc::TransferMode::KvExport | uniserve_ipc::TransferMode::KvInstall
+                )
+            )
+        });
         let slots = projection
             .forward
             .request_pool_indices
@@ -1408,10 +1419,10 @@ fn rank_projection(
             .collect::<HashSet<_>>();
         projection
             .block_tables
-            .retain(|table| slots.contains(&table.request_pool_idx));
+            .retain(|table| transfers_kv || slots.contains(&table.request_pool_idx));
         projection
             .new_cache_units
-            .retain(|units| slots.contains(&units.request_pool_idx));
+            .retain(|units| transfers_kv || slots.contains(&units.request_pool_idx));
         let identities = projection
             .calls
             .iter()

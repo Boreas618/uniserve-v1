@@ -324,7 +324,9 @@ impl PeerGroup<'_> {
     /// Bind `binding`'s collectives to NCCL communicators on its stream
     /// (`owner`), collectively over each group's members, and route the
     /// binding's numerical collectives to them (`distributed.bind_collectives`).
-    /// `None` when the binding's component communicates over no group.
+    /// `None` when the binding's component communicates over no group, and
+    /// for a host binding: it has no stream, and its collectives run on the
+    /// component's host process groups.
     pub fn bind_collectives(
         &self,
         interface: &Interface,
@@ -338,6 +340,9 @@ impl PeerGroup<'_> {
         else {
             return Ok(None);
         };
+        if binding.device == Device::Cpu {
+            return Ok(None);
+        }
         let owner = owner
             .ok_or_else(|| Error::Unsupported("stream collectives require a CUDA stream".into()))?;
         // SAFETY: the lanes own the stream and close after every binding

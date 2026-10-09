@@ -168,6 +168,7 @@ impl TextBounds {
             vocab,
             hidden,
             hidden_output: self.prefill.iter().any(|shape| shape.outputs),
+            embeddings: false,
             dtype,
         }
     }
@@ -467,7 +468,10 @@ impl TextRuntime {
                     shard.size
                 )));
             }
-            let dimensions = bounds.dimensions(vocab, shard.width(), hidden, dtype);
+            let mut dimensions = bounds.dimensions(vocab, shard.width(), hidden, dtype);
+            // Prompts of a model with an image processor place vision
+            // features in place of token embeddings.
+            dimensions.embeddings = startup.facts.image_processor;
             let buffers = TextBuffers::allocate(dimensions, ordinal, startup.preparation)?;
             let mut views = buffers.views();
             views.extend(
@@ -584,7 +588,8 @@ pub(crate) fn reserved_bytes(
     let cuda = config.primary_device().is_cuda();
     let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
     let dtype = model_dtype(&config.model_dtype)?;
-    let dimensions = bounds.dimensions(vocab, vocab, facts.hidden_size.unwrap_or(0), dtype);
+    let mut dimensions = bounds.dimensions(vocab, vocab, facts.hidden_size.unwrap_or(0), dtype);
+    dimensions.embeddings = facts.image_processor;
     Ok(
         dimensions.bytes() * streams.max(1) as u64
             + DecodeState::bytes(request_slots, vocab, dtype),

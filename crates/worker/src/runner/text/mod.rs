@@ -73,6 +73,15 @@ pub(crate) struct SamplingColumns<'a> {
     pub(crate) greedy: bool,
 }
 
+/// Precomputed embeddings replacing the token embeddings of consecutive
+/// tokens of an invocation: one vision block's features.
+pub(crate) struct Embeddings {
+    /// The first token, counted from the invocation's first token.
+    pub(crate) token: usize,
+    /// `[tokens, hidden]` features in the model dtype.
+    pub(crate) values: StorageView,
+}
+
 /// One invocation request.
 pub(crate) struct StepRequest<'a> {
     pub(crate) decode: bool,
@@ -80,6 +89,8 @@ pub(crate) struct StepRequest<'a> {
     pub(crate) sampling: Option<SamplingColumns<'a>>,
     /// The prompt scoring descriptor; empty when no row scores its prompt.
     pub(crate) prompt: &'a [i64],
+    /// Vision features placed over some of the rows' tokens.
+    pub(crate) embeddings: &'a [Embeddings],
 }
 
 /// The storage a step borrows.
@@ -111,6 +122,8 @@ pub(crate) struct Staged {
     sampling: Vec<i64>,
     greedy: bool,
     prompt: Vec<i64>,
+    /// Vision features replace some of the tokens' embeddings.
+    embedded: bool,
 }
 
 impl Staged {
@@ -142,6 +155,9 @@ struct Plan {
     prefixes: Vec<i64>,
     starts: Vec<i64>,
     causal: Vec<i64>,
+    /// Rotary position axes the rows carry: 1, or 3 when a row places
+    /// positions explicitly.
+    axes: usize,
     logit_count: usize,
     all_last: bool,
     cache_only: bool,
@@ -265,6 +281,7 @@ impl TextRunner {
             sampling,
             greedy,
             prompt: request.prompt.to_vec(),
+            embedded: !request.embeddings.is_empty(),
         })
     }
 
@@ -302,6 +319,8 @@ impl TextRunner {
                 sampling: &staged.sampling,
                 greedy: staged.greedy,
                 prompt: &staged.prompt,
+                axes: plan.axes,
+                embedded: staged.embedded,
             },
             capacity.unwrap_or(0),
         );
@@ -409,11 +428,23 @@ impl TextRunner {
             .iter()
             .all(|row| row.selection == TokenSelection::LastLogits);
 
+        // Multimodal prompts (explicit positions, vision features or
+        // non-causal blocks) run eagerly.
+        let placed = rows
+            .iter()
+            .any(|row| matches!(row.source, RowSource::Placed { .. }));
+        let multimodal =
+            placed || !request.embeddings.is_empty() || rows.iter().any(|row| !row.causal);
+        let spatial = rows
+            .iter()
+            .any(|row| matches!(row.source, RowSource::Placed { spatial: true, .. }));
+        let axes = if spatial { 3 } else { 1 };
+
         // Graph selection depends only on call metadata, so every rank of a
         // group selects the same graph.
         let mut choice = Choice::Eager;
         let mut bucket = (live, live_tokens);
-        if self.pool.is_some() {
+        if self.pool.is_some() && !multimodal {
             let queries: Vec<usize> = rows.iter().map(|row| row.query as usize).collect();
             if let Some((bucket_rows, bucket_tokens, decode, outputs)) = self.shapes.select(
                 &queries,
@@ -500,7 +531,8 @@ impl TextRunner {
                 starts[table * padded_rows + row] = i64::from(start);
             }
         }
-        let causal = vec![1_i64; padded_rows];
+        let mut causal: Vec<i64> = rows.iter().map(|row| i64::from(row.causal)).collect();
+        causal.resize(padded_rows, 1);
         let gated_all = rows.iter().all(|row| row.gated);
         let mut force: Vec<u8> = rows
             .iter()
@@ -541,7 +573,8 @@ impl TextRunner {
             row_columns[5 * stride + padded_rows] = prefix_offset;
 
             token_ids = vec![0_i64; padded_tokens];
-            positions = vec![0_i64; padded_tokens];
+            // Axis-major: axis `a` of token `t` at `a * padded_tokens + t`.
+            positions = vec![0_i64; axes * padded_tokens];
             let mut offset = 0;
             for row in rows {
                 match &row.source {
@@ -562,6 +595,18 @@ impl TextRunner {
                     }
                     RowSource::Resident | RowSource::Indexed => {
                         relays.push((offset, row.slot, true));
+                    }
+                    RowSource::Placed {
+                        tokens,
+                        positions: placed,
+                        ..
+                    } => {
+                        for (index, &token) in tokens.iter().enumerate() {
+                            token_ids[offset + index] = i64::from(token);
+                            for (axis, values) in placed.iter().take(axes).enumerate() {
+                                positions[axis * padded_tokens + offset + index] = values[index];
+                            }
+                        }
                     }
                 }
                 offset += row.query as usize;
@@ -594,6 +639,7 @@ impl TextRunner {
             prefixes,
             starts,
             causal,
+            axes,
             logit_count: if request.decode { live } else { logit_count },
             all_last,
             cache_only,
@@ -624,10 +670,23 @@ impl TextRunner {
         };
         push(column("request_pool_indices")?, bytes(&plan.slots));
         push(column("decode_force_finish")?, &plan.force);
+        let mut causal_values = Vec::new();
         if !plan.indexed {
             push(column("row_columns")?, bytes(&plan.row_columns));
             push(column("input_ids")?, bytes(&plan.token_ids));
-            push(column("positions")?, bytes(&plan.positions));
+            // Each axis is one row of the `[3, T]` column.
+            let axis_words = plan.positions.len() / plan.axes.max(1);
+            let stride = 8 * self.buffers.dimensions.tokens as u64;
+            for (axis, values) in plan.positions.chunks(axis_words.max(1)).enumerate() {
+                push(column("positions")? + axis as u64 * stride, bytes(values));
+            }
+            if plan.causal.iter().any(|&value| value != plan.causal[0]) {
+                // Mixed causality is read from the device column.
+                causal_values = plan.causal.iter().map(|&value| value as i32).collect();
+            }
+        }
+        if !causal_values.is_empty() {
+            push(column("causal_values")?, bytes_i32(&causal_values));
         }
         if !plan.logit_rows.is_empty() {
             push(column("logit_rows")?, bytes(&plan.logit_rows));
@@ -637,6 +696,34 @@ impl TextRunner {
             push(column("params")?, bytes_f32(sampling.params));
             push(column("tasks")?, bytes(sampling.slots));
             push(column("tasks")? + 8 * rows, bytes(sampling.gates));
+        }
+
+        // Vision features replace their tokens' embeddings: the mask is
+        // cleared over the invocation, then set over each block.
+        let mut features = Vec::new();
+        let mut masks = Vec::new();
+        if !request.embeddings.is_empty() {
+            let values = self.buffers.column("input_embeddings")?;
+            let row_bytes = values.nbytes() / self.buffers.dimensions.tokens.max(1) as u64;
+            let mask = self.buffers.column("embedding_mask")?.address();
+            masks.push((mask, 0_u8, plan.tokens));
+            for block in request.embeddings {
+                let count = block.values.shape().first().copied().unwrap_or(0) as usize;
+                if block.values.dtype() != values.dtype()
+                    || block.values.nbytes() != count as u64 * row_bytes
+                    || block.token + count > plan.live_tokens
+                {
+                    return Err(Error::Invalid(
+                        "vision features disagree with the embedding column".into(),
+                    ));
+                }
+                features.push((
+                    values.address() + block.token as u64 * row_bytes,
+                    block.values.address(),
+                    block.values.nbytes() as usize,
+                ));
+                masks.push((mask + block.token as u64, 1, count));
+            }
         }
 
         let mut relays = Vec::new();
@@ -674,9 +761,26 @@ impl TextRunner {
                 // invocation, written after the host columns above; sources
                 // are slot state committed earlier on this stream.
                 unsafe { device.submit(stream) }?;
+                for &(address, value, count) in &masks {
+                    // SAFETY: bytes of the binding's mask column, ordered on
+                    // its stream.
+                    unsafe { uniserve_cuda::memset_d8(address, value, count, stream) }?;
+                }
+                for &(destination, source, size) in &features {
+                    // One copy per block: a batched device-to-device copy
+                    // faults on streams of SM partitions (green contexts).
+                    // SAFETY: rows of the binding's embedding column; the
+                    // features are leased products whose producers this
+                    // stream waited on.
+                    unsafe { uniserve_cuda::memcpy_async(destination, source, size, stream) }?;
+                }
             }
             None => {
-                for &(destination, source, size) in entries.iter().chain(&relays) {
+                for &(address, value, count) in &masks {
+                    // SAFETY: bytes of a host column of this binding.
+                    unsafe { std::ptr::write_bytes(address as *mut u8, value, count) };
+                }
+                for &(destination, source, size) in entries.iter().chain(&relays).chain(&features) {
                     // SAFETY: host columns and state owned by this rank; the
                     // executor thread serializes their writers and readers.
                     unsafe {
@@ -746,6 +850,11 @@ impl TextRunner {
 }
 
 fn bytes(values: &[i64]) -> &[u8] {
+    // SAFETY: plain integers reinterpreted as their bytes.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+fn bytes_i32(values: &[i32]) -> &[u8] {
     // SAFETY: plain integers reinterpreted as their bytes.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }

@@ -58,6 +58,11 @@ impl PendingImport {
         &self.export
     }
 
+    /// Whether an install call adopted the import as its slot's prefix.
+    pub fn adopted(&self) -> bool {
+        self.entry.write().released()
+    }
+
     /// Whether the copy task finished (successfully or not).
     pub fn done(&self) -> bool {
         self.task.as_ref().is_none_or(|task| task.completion.done())
@@ -285,6 +290,33 @@ impl KVCache {
         Ok(())
     }
 
+    /// Clear guidance prefix slots `slots` of `request` on `stream`
+    /// (ordered after every batch that read them) and forget them.
+    pub fn release_prefixes(
+        &mut self,
+        request: RequestKey,
+        slots: &[u32],
+        stream: Option<&Stream>,
+    ) -> Result<()> {
+        let slots = self.tables.release_slots(slots)?;
+        self.storage.clear(&slots, stream)?;
+        self.tables.release_prefixes(request, &slots);
+        Ok(())
+    }
+
+    /// Clear every guidance prefix slot `request` still holds.
+    pub fn release_request_prefixes(
+        &mut self,
+        request: RequestKey,
+        stream: Option<&Stream>,
+    ) -> Result<()> {
+        let slots = self.tables.prefix_slots(request);
+        if slots.is_empty() {
+            return Ok(());
+        }
+        self.release_prefixes(request, &slots, stream)
+    }
+
     /// Export a slot's visible KV extent (see [`kv_export::export`]).
     #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
     pub fn export(
@@ -497,20 +529,26 @@ impl KVCache {
         Ok(ScratchUnits { count })
     }
 
-    /// Stop imports, release exports and require every access retired.
-    /// Failed retirements keep their storage: the caller must not reuse it.
-    pub fn close(&mut self) -> Result<()> {
+    /// Cancel every import and join the import copy threads, so no import
+    /// reads through the transports any more. Idempotent.
+    pub fn stop_imports(&mut self) -> Result<()> {
         let cancelled = self.imports.cancel(self.imports.importer.stop());
         let mut stopped = Ok(());
         for error in self.imports.lane.close() {
             stopped = stopped.and(Err(error));
         }
-        let reaped = self.imports.retired.reap();
+        cancelled.and(stopped).and(self.imports.retired.reap())
+    }
+
+    /// Stop imports, release exports and require every access retired.
+    /// Exports retire once their transports revoked them, so the caller
+    /// closes the transports first. Failed retirements keep their storage:
+    /// the caller must not reuse it.
+    pub fn close(&mut self) -> Result<()> {
+        let stopped = self.stop_imports();
         let exports = self.manager.exported_buffers();
         self.manager.release_exports(&exports);
-        cancelled
-            .and(stopped)
-            .and(reaped)
+        stopped
             .and(self.imports.importer.require_retired())
             .and(self.manager.require_retired())?;
         self.manager.clear_resident();

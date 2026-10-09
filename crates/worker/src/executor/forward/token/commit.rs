@@ -96,7 +96,7 @@ impl TokenBatch<'_> {
                 state.metadata.as_ref(),
                 penalties,
             )?);
-            if state.prompt.is_some() {
+            if !state.prompt.is_empty() {
                 state.output.progress.prompt_logits_ready = true;
             }
         }
@@ -163,26 +163,25 @@ impl TokenBatch<'_> {
             }
         }
         for state in self.calls.iter_mut().filter(|state| mine(state)) {
-            let Some(layout) = state
-                .prompt
-                .as_mut()
-                .and_then(|prompt| prompt.layout.take())
-            else {
-                continue;
-            };
-            let prompt = state
-                .prompt
-                .as_ref()
-                .ok_or_else(|| Error::Invariant("prompt score lost its span".into()))?;
-            let words =
-                runner
-                    .column("logprobs")?
-                    .narrow(0, prompt.words as i64, prompt.size as i64)?;
-            let (offset, count) = output.capture(&words, stream, events)?;
-            let scored = layout.rows.len();
-            output.register_logprobs(offset, count, layout)?;
-            state.output.prompt_logprob_ranges =
-                (0..scored).map(|row| (offset, count, row)).collect();
+            // Chunks of one prompt report their scores in prompt order.
+            let mut ranges = Vec::new();
+            for prompt in &mut state.prompt {
+                let Some(layout) = prompt.layout.take() else {
+                    continue;
+                };
+                let words = runner.column("logprobs")?.narrow(
+                    0,
+                    prompt.words as i64,
+                    prompt.size as i64,
+                )?;
+                let (offset, count) = output.capture(&words, stream, events)?;
+                let scored = layout.rows.len();
+                output.register_logprobs(offset, count, layout)?;
+                ranges.extend((0..scored).map(|row| (offset, count, row)));
+            }
+            if !state.prompt.is_empty() {
+                state.output.prompt_logprob_ranges = ranges;
+            }
         }
         Ok(())
     }
@@ -308,7 +307,7 @@ impl TokenBatch<'_> {
         let tails: Vec<(usize, usize, usize)> = self
             .calls
             .iter()
-            .filter_map(|state| Some((state.microbatch, state.prompt.as_ref()?.tail, state.slot)))
+            .filter_map(|state| Some((state.microbatch, state.prompt.last()?.tail, state.slot)))
             .collect();
         if tails.is_empty() {
             return Ok(());

@@ -61,7 +61,7 @@ impl WarmupHooks for TextWarmup {
 
 /// Install scratch tables of `lengths` tokens for slots `1..`, run
 /// `operation`, then clear the tables and reset the scratch units.
-fn with_scratch<T>(
+pub(crate) fn with_scratch<T>(
     kv: &mut KVCache,
     lengths: &[usize],
     stream: Option<&uniserve_cuda::Stream>,
@@ -129,6 +129,7 @@ fn rows(
             selection,
             gated: false,
             force_finish: false,
+            causal: true,
         })
         .collect()
 }
@@ -286,6 +287,7 @@ fn step(
         rows,
         sampling: None,
         prompt: &[],
+        embeddings: &[],
     };
     let mut requests: Vec<Option<StepRequest<'_>>> =
         (0..runtime.groups[group].len()).map(|_| None).collect();

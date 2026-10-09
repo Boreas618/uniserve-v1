@@ -180,24 +180,31 @@ class _Segments:
 
 @contextmanager
 def _prepared(
-    device: torch.device, computation: torch.cuda.Stream
+    device: torch.device,
+    computation: torch.cuda.Stream,
+    peers: Sequence[tuple[torch.device, torch.cuda.MemPool]],
 ) -> Iterator[None]:
     """Retire warmup allocations and order the capture after its caller.
 
     Capturing waits for all prior work so the allocator can return warmup
     blocks, and creates this thread's cuBLAS handle outside the capture
     (handles are thread-local and may not exist on a thread that only
-    warmed up elsewhere). The caller's stream waits on the computation
-    afterwards, whether or not the capture succeeded.
+    warmed up elsewhere). Allocations on each peer device go to its pool
+    for the capture's duration. The caller's stream waits on the
+    computation afterwards, whether or not the capture succeeded.
     """
-    torch.cuda.synchronize(device)
+    for target in (device, *(peer for peer, _ in peers)):
+        torch.cuda.synchronize(target)
     torch.cuda.empty_cache()
     torch._C._host_emptyCache()
     with torch.cuda.stream(computation):
         torch.cuda.current_blas_handle()
     current = torch.cuda.current_stream(device)
     try:
-        yield
+        with ExitStack() as pools:
+            for peer, pool in peers:
+                pools.enter_context(torch.cuda.use_mem_pool(pool, peer))
+            yield
     finally:
         current.wait_stream(computation)
 
@@ -209,6 +216,8 @@ class Capture:
     streams that wait on it and are joined back before :meth:`end`);
     :meth:`end` instantiates the :class:`Graph`. Both run on the same host
     thread; work between them may be submitted from other threads.
+    ``peers`` pairs each other device the work allocates on with the pool
+    receiving those allocations.
     """
 
     def __init__(
@@ -216,9 +225,11 @@ class Capture:
         stream: torch.cuda.Stream,
         pool: torch.cuda.MemPool | None = None,
         generators: Iterable[torch.Generator] = (),
+        peers: Sequence[tuple[torch.device, torch.cuda.MemPool]] = (),
     ) -> None:
         self.device = stream.device
         self.stream = stream
+        self.peers = tuple(peers)
         self.capture_stream = torch.cuda.Stream(device=self.device)
         self.capture_stream.wait_stream(torch.cuda.current_stream(self.device))
         self.segments = _Segments(
@@ -234,7 +245,7 @@ class Capture:
             for scope in (
                 torch.inference_mode(),
                 torch.cuda.device(self.device),
-                _prepared(self.device, self.stream),
+                _prepared(self.device, self.stream, self.peers),
             ):
                 self._scopes.enter_context(scope)
             self.segments.begin()
@@ -281,6 +292,7 @@ def capture(
     ]
     | None = None,
     generators: Iterable[torch.Generator] = (),
+    peers: Sequence[Sequence[Any]] = (),
 ) -> Graph:
     """Capture ``body`` as it runs on ``stream``.
 
@@ -303,6 +315,10 @@ def capture(
         generators: Generators the body draws from besides the device's
             default generator, which every capture registers. Replay
             advances each registered generator's offset.
+        peers: ``[device, pool]`` pairs: the allocator pool (from
+            :func:`pool`) receiving the step's allocations on each other
+            device its modules run on (a generation tower reached through
+            transfers). Each pool must outlive the graph.
 
     Returns:
         The instantiated :class:`Graph`.
@@ -311,7 +327,11 @@ def capture(
         RuntimeError: Capture failed; every partial graph was reset and the
             original error is the cause.
     """
-    recording = Capture(stream, pool, generators)
+    placed = tuple(
+        (torch.device("cuda", int(ordinal)), handle)
+        for ordinal, handle in peers
+    )
+    recording = Capture(stream, pool, generators, placed)
     scope = (
         nullcontext()
         if segments is None

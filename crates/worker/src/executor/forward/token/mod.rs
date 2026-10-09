@@ -24,6 +24,7 @@
 mod batch;
 mod calls;
 mod commit;
+mod context;
 pub(crate) mod start;
 mod step;
 pub(crate) mod warmup;
@@ -32,21 +33,25 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use uniserve_cuda::Stream;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferId, CallKind, ForwardMode, ForwardStats, RequestKey, Wake,
 };
 
 use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
 use super::launch::{Launched, StreamOrder, error_code, failed_output};
-use crate::Result;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
 use crate::executor::lifecycle::RequestStorage;
 use crate::request::decode_state::DecodeState;
+use crate::runner::TokenSelection;
 use crate::runner::graphs::GraphMode;
-use crate::runner::text::{Executed, Staged, StepContext, StepRequest, TextRunner};
+use crate::runner::text::{
+    Executed, RowSource, Staged, StepContext, StepRequest, TextRunner, TokenRow,
+};
 use crate::storage::{BlockTables, KVCacheManager, OutputPool, UnitColumn};
 use crate::transfer::Retirement;
+use crate::{Error, Result};
 
 /// The KV storage a text step borrows.
 pub(crate) struct StepParts<'a> {
@@ -114,7 +119,7 @@ impl TextRuntime {
                     .position(|&peer| peer == runner)
                     .map(|peer| (group, peer))
             })
-            .ok_or_else(|| crate::Error::Invariant("a text runner belongs to no group".into()))
+            .ok_or_else(|| Error::Invariant("a text runner belongs to no group".into()))
     }
 
     /// The warmup and capture plan every source of an expert union must
@@ -159,7 +164,7 @@ impl TextRuntime {
     ) -> Result<Vec<Option<Executed>>> {
         let peers = self.groups[group].clone();
         if requests.len() != peers.len() {
-            return Err(crate::Error::Invariant(
+            return Err(Error::Invariant(
                 "a text step has one invocation per microbatch".into(),
             ));
         }
@@ -176,13 +181,13 @@ impl TextRuntime {
         };
         let Some(experts) = experts else {
             let [runner] = peers[..] else {
-                return Err(crate::Error::Invariant(
+                return Err(Error::Invariant(
                     "microbatch runners require expert execution".into(),
                 ));
             };
             let request = requests[0]
                 .as_ref()
-                .ok_or(crate::Error::State("a text step has an invocation"))?;
+                .ok_or(Error::State("a text step has an invocation"))?;
             let staged = step(&self.runners[runner], request)?;
             let launch = self.runners[runner].launch(&staged, None)?;
             launch.call.invoke()?;
@@ -192,7 +197,7 @@ impl TextRuntime {
 
         let lane = self.runners[peers[0]]
             .stream()
-            .ok_or(crate::Error::State("expert steps run on a CUDA stream"))?;
+            .ok_or(Error::State("expert steps run on a CUDA stream"))?;
         // SAFETY: the lanes own the stream for the runtime's lifetime.
         let lane = unsafe { uniserve_cuda::Stream::borrowed(lane.device(), lane.raw()) }?;
         experts.fork(&lane)?;
@@ -240,6 +245,117 @@ impl TextRuntime {
                 _ => None,
             });
         }
+        Ok(executed)
+    }
+
+    /// The order of this runtime's batches, for other runtimes that also
+    /// write what text batches read (guidance prefixes, latent images'
+    /// K/V).
+    pub(crate) fn order_mut(&mut self) -> &mut StreamOrder {
+        &mut self.order
+    }
+
+    /// The runner on the lane stream of the group serving `component`'s
+    /// prefills, and the group.
+    fn prefill_lane(&self, component: &str) -> Result<(usize, usize)> {
+        let group = self
+            .route(component, CallKind::Forward(ForwardMode::Prefill))
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "component {component:?} has no text prefill binding"
+                ))
+            })?;
+        Ok((self.groups[group][0], group))
+    }
+
+    /// The device, stream and payload words of work that reads or writes
+    /// `component`'s K/V beside its text batches: its prefill lane's.
+    pub(crate) fn placement(
+        &self,
+        component: &str,
+    ) -> Result<(Option<i32>, Option<Stream>, usize)> {
+        let (lane, _) = self.prefill_lane(component)?;
+        let runner = &self.runners[lane];
+        let stream = runner
+            .stream()
+            // SAFETY: the lanes own the stream for the runtime's lifetime.
+            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
+            .transpose()?;
+        Ok((runner.device(), stream, 0))
+    }
+
+    /// The unit reset column of `component`'s prefill lane stream (see
+    /// [`Self::placement`]), for work that assigns K/V units beside its
+    /// text batches.
+    pub(crate) fn unit_column(&self, component: &str) -> Result<&UnitColumn> {
+        let (lane, _) = self.prefill_lane(component)?;
+        Ok(&self.columns[lane])
+    }
+
+    /// Write the K/V of token prefixes, each from position zero of its
+    /// slot, with `component`'s prefill lane runner: guidance prefixes of
+    /// image trajectories. The prefixes are evaluated causally and only
+    /// their K/V is kept; slot continuation state is unchanged. The caller
+    /// installed the slots' block tables and retains their extents. On a
+    /// rank of an expert union the evaluation is an expert step whose other
+    /// microbatches join.
+    pub(crate) fn prefill_cache(
+        &mut self,
+        experts: Option<&super::experts::ExpertRuntime>,
+        component: &str,
+        prefixes: &[(u32, &[u32])],
+        tables: &BlockTables,
+        cache: &mut KVCacheManager<Arc<Retirement>>,
+    ) -> Result<Executed> {
+        let (lane, group) = self.prefill_lane(component)?;
+        let rows: Vec<TokenRow> = prefixes
+            .iter()
+            .map(|&(slot, tokens)| {
+                Ok(TokenRow {
+                    slot,
+                    source: RowSource::Host {
+                        tokens: tokens.to_vec(),
+                        position: 0,
+                    },
+                    prefix: 0,
+                    query: u32::try_from(tokens.len())
+                        .map_err(|_| Error::Invalid("prefix exceeds the token range".into()))?,
+                    selection: TokenSelection::Cache,
+                    gated: false,
+                    force_finish: false,
+                    causal: true,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let stream = self.runners[lane]
+            .stream()
+            // SAFETY: the lanes own the stream for the runtime's lifetime.
+            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
+            .transpose()?;
+        self.order.wait(stream.as_ref())?;
+
+        // The lane's runner evaluates every prefix.
+        let mut requests: Vec<Option<StepRequest<'_>>> = vec![Some(StepRequest {
+            decode: false,
+            rows: &rows,
+            sampling: None,
+            prompt: &[],
+            embeddings: &[],
+        })];
+        requests.resize_with(self.groups[group].len(), || None);
+        let executed = self
+            .invoke(
+                experts,
+                group,
+                &requests,
+                &mut StepParts { tables, cache },
+                None,
+            )?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| Error::Invariant("the prefix evaluation did not run".into()))?;
+        self.order.record(stream.as_ref())?;
         Ok(executed)
     }
 
@@ -359,6 +475,7 @@ fn run(parts: Parts<'_>, plan: &BatchPlan) -> std::result::Result<Option<Launche
     };
     let mut batch = TokenBatch::open(
         runtime,
+        parts.image,
         storage,
         parts.requests,
         parts.experts,
@@ -386,6 +503,7 @@ fn run(parts: Parts<'_>, plan: &BatchPlan) -> std::result::Result<Option<Launche
                 started,
                 stats,
                 timer: "text_materialize",
+                host: None,
             }))
         }
         Err(failure) if failure.committed => Err(failure),

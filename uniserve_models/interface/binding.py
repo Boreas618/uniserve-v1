@@ -65,8 +65,20 @@ def prepare(loaded, request: Mapping[str, Any]) -> list[Any]:
     path = str(request["path"])
     module = loaded.module.get_submodule(path) if path else loaded.module
     stream = int(request["stream"])
+    ordinal = int(request.get("device", -1))
+    # The binding's stream and buffers are on its device: a module without
+    # parameters (such as a pixel-space image decoder) runs there, and
+    # modules placed on a generation tower compute on the tower between the
+    # stream's steps (see ``ExecutionContext``).
+    device = torch.device("cuda", ordinal) if ordinal >= 0 else None
+    execution = (
+        torch.cuda.ExternalStream(stream, device=device)
+        if stream and device is not None
+        else (stream or None)
+    )
     options = {
-        "stream": stream if stream else None,
+        "device": device,
+        "stream": execution,
         "cache": request.get("cache"),
         "attention": str(request["attention"])
         if str(request["attention"]) != "auto"
@@ -84,8 +96,9 @@ def prepare(loaded, request: Mapping[str, Any]) -> list[Any]:
     declared = DeclaredWorkspace()
     context = ExecutionContext(module, workspace=declared, **options)
     try:
-        if prepared.size is not None:
-            context.prepare(prepared.size)
+        # Without a text size the call sites bind without a row bound, as
+        # encoders, decoders and media denoisers serve their sizes.
+        context.prepare(prepared.size)
         requirements = [
             {
                 "name": item.name,
@@ -126,8 +139,7 @@ def bind(prepared: Prepared, resources: Mapping[str, Any]) -> dict:
     context = ExecutionContext(
         prepared.module, workspace=BoundWorkspace(tensors), **prepared.options
     )
-    if prepared.size is not None:
-        context.prepare(prepared.size)
+    context.prepare(prepared.size)
     prepared.context = context
 
     def kernels() -> list[dict]:

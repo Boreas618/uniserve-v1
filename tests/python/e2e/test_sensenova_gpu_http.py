@@ -28,6 +28,11 @@ pytestmark = [
 ]
 
 MODEL_ENV = "UNISERVE_SENSENOVA_MODEL"
+# Comma-separated CUDA devices the server ranks use, one rank per device.
+DEVICES_ENV = "UNISERVE_SENSENOVA_DEVICES"
+# Two comma-separated CUDA devices: the rank's device and the generation
+# tower's.
+TOWER_DEVICES_ENV = "UNISERVE_SENSENOVA_TOWER_DEVICES"
 SERVED_MODEL = "SenseNova-U1"
 IMAGE_SIZE = (2048, 1152)
 
@@ -56,14 +61,23 @@ def image_start_token_id(model: Path) -> int:
 
 @contextmanager
 def production_server(
-    tmp_path: Path, model: Path, binding: str, graph_policy: str
+    tmp_path: Path,
+    model: Path,
+    binding: str,
+    graph_policy: str,
+    *,
+    devices: str | None = None,
+    ranks: int | None = None,
+    extra: tuple[str, ...] = (),
 ) -> Iterator[str]:
+    """Serve ``model`` on ``devices`` (one rank per device by default)."""
     try:
         binary = require_uniserve_binary()
     except FileNotFoundError as error:
         pytest.fail(str(error))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
+    devices = devices or os.environ.get(DEVICES_ENV, "0,1")
     args = [
         str(binary),
         "serve",
@@ -87,9 +101,10 @@ def production_server(
         "--graph-policy",
         graph_policy,
         "--worker-ranks",
-        "2",
+        str(ranks or len(devices.split(","))),
         "--log-stats",
         "false",
+        *extra,
     ]
     if binding == "shared":
         args.extend(
@@ -107,11 +122,11 @@ def production_server(
                 '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}',
             ]
         )
-    environment = {"CUDA_VISIBLE_DEVICES": "0,1"}
+    environment = {"CUDA_VISIBLE_DEVICES": devices}
     with server_process(
         args,
         base_url,
-        tmp_path / "sensenova-production.log",
+        tmp_path / f"sensenova-production-{port}.log",
         timeout_s=300,
         env=environment,
     ):
@@ -301,3 +316,74 @@ def test_sensenova_public_production_lineage(
             )
             snapshots.append(copy.deepcopy(delivered[-1]))
             assert delivered == snapshots
+
+
+@pytest.mark.timeout(900)
+def test_sensenova_generation_tower_serves_one_device_outputs(tmp_path: Path):
+    """A generation tower on a second device leaves served outputs unchanged.
+
+    The tower holds the flow route, the denoiser's own modules and the image
+    decoder; the rank's device keeps the text model and the KV cache. Image
+    understanding, seeded generation (replaying captured denoising steps)
+    and prompt scoring must equal those of the same rank on one device.
+    """
+    model = active_model()
+    devices = os.environ.get(TOWER_DEVICES_ENV)
+    if not devices or len(devices.split(",")) != 2:
+        pytest.fail(f"{TOWER_DEVICES_ENV} must name two CUDA devices")
+    input_image_url = f"data:image/png;base64,{tiny_input_png_b64()}"
+
+    def serve(placement: str, **options) -> tuple:
+        with production_server(
+            tmp_path / placement, model, "default", "full", **options
+        ) as base_url:
+            understanding = post_chat(
+                base_url,
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Describe it."},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": input_image_url},
+                                },
+                            ],
+                        }
+                    ],
+                    "modalities": ["text"],
+                    "max_completion_tokens": 4,
+                    "prompt_logprobs": 1,
+                },
+            )
+            generation = httpx.post(
+                f"{base_url}/v1/images/generations",
+                json={
+                    "model": SERVED_MODEL,
+                    "prompt": "A blue square.",
+                    "n": 1,
+                    "steps": 2,
+                    "seed": 7,
+                },
+                timeout=600,
+            )
+            generation.raise_for_status()
+            (image,) = generation.json()["data"]
+            assert_generated_image(image)
+            return (
+                understanding["choices"][0]["message"],
+                understanding["prompt_logprobs"],
+                image["b64_json"],
+            )
+
+    for path in (tmp_path / "one", tmp_path / "tower"):
+        path.mkdir()
+    one = serve("one", devices=devices.split(",")[0])
+    tower = serve(
+        "tower",
+        devices=devices,
+        ranks=1,
+        extra=("--worker-mesh", "tower=text:cuda:0;gen:cuda:1"),
+    )
+    assert tower == one
