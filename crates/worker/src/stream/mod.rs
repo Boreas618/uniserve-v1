@@ -126,8 +126,10 @@ impl CUDAStream {
         Ok(())
     }
 
-    /// Drain submitted work before releasing the stream and its SM partition.
-    /// Failed collective execution retains resources until process exit.
+    /// Drain submitted work, then release this owner's handle to the stream.
+    /// The driver stream and its SM partition are released once every
+    /// component sharing the handle has dropped its clone. Failed collective
+    /// execution retains resources until process exit.
     #[allow(clippy::mem_forget)]
     pub fn close(&mut self, aborted: bool) -> Result<()> {
         // A closed stream keeps an unrecorded fence, which holds no driver
