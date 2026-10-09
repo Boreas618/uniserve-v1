@@ -78,7 +78,7 @@ def prepare(loaded, request: Mapping[str, Any]) -> list[Any]:
         if stream and device is not None
         else (stream or None)
     )
-    options = {
+    options: dict[str, Any] = {
         "device": device,
         "stream": execution,
         "cache": request.get("cache"),

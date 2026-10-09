@@ -65,7 +65,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 
 import torch
 
@@ -91,6 +91,24 @@ _BITS = {
     Branch.TEXT_UNCONDITIONAL: 2,
     Branch.IMAGE_UNCONDITIONAL: 4,
 }
+
+
+class _Guided(Protocol):
+    """The guidance an image denoiser makes for one trajectory.
+
+    ``ImageDenoiser`` does not declare the method, so the binding names the
+    signature it calls.
+    """
+
+    def make_guidance(
+        self,
+        *,
+        text_scale: float,
+        image_scale: float,
+        interval: tuple[float, float],
+        renorm: Renorm,
+        renorm_min: float,
+    ) -> Guidance: ...
 
 
 def functions() -> dict[str, Callable[..., Any]]:
@@ -151,7 +169,7 @@ def bind(
                 int(steps), shift=shift if shift > 0 else None, device="cpu"
             )
         )
-        guidance = denoiser.make_guidance(
+        guidance = cast(_Guided, denoiser).make_guidance(
             text_scale=float(text_scale),
             image_scale=float(image_scale),
             interval=(float(interval_low), float(interval_high)),
@@ -337,7 +355,7 @@ def bind(
                     schedule.step(index),
                 )
 
-    steps = {
+    steps: dict[str, Callable[..., Any]] = {
         "plan": plan,
         "initial_latent": initial_latent,
         "predict": predict,

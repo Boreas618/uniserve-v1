@@ -41,6 +41,7 @@ from uniserve_models.model import (
 )
 from uniserve_models.nn.attention import (
     AttentionBatch,
+    AttentionInput,
     BlockTable,
     PagedInput,
     SegmentedInput,
@@ -357,7 +358,7 @@ def bind(
         )
         mode = tuple(bool(value) for value in causal)
         flags = b["causal_values"][:rows] if len(set(mode)) > 1 else None
-        entries = {}
+        entries: dict[int, AttentionInput] = {}
         for table, table_width in enumerate(widths):
             first = None
             host_first = None

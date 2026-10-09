@@ -21,9 +21,13 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from uniserve_models.media.pixels import PreparedImage, prepare_host_image
+from uniserve_models.media.pixels import (
+    PreparedImage,
+    Tower,
+    prepare_host_image,
+)
 from uniserve_models.model import ImageDecoder, ImageDenoiser
 from uniserve_models.processing import (
     FeatureInjection,
@@ -81,7 +85,9 @@ def describe_model(loaded) -> dict[str, Any]:
     """
     model = loaded.module
     processor = loaded.image_processor
-    denoiser = capability(model, ImageDenoiser)
+    # mypy rejects an abstract class as a ``type`` argument; the lookup
+    # only tests membership.
+    denoiser = capability(model, ImageDenoiser)  # type: ignore[type-abstract]
     decoder = capability(model, ImageDecoder)
     return {
         "processor": None
@@ -252,7 +258,8 @@ def prepare_input(
         raise ValueError("request admission declares no input images")
     image = prepare_host_image(
         processor,
-        str(tower),
+        # The worker sends a plain string; the selection rejects unknown towers.
+        cast(Tower, str(tower)),
         str(payload),
         input_images=int(input_images),
         pin=bool(pin),
