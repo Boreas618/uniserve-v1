@@ -182,6 +182,8 @@ fn request(
 #[derive(Default)]
 struct Outcome {
     tokens: Vec<u32>,
+    /// Scored prompt positions.
+    prompt_scores: usize,
     images: Vec<String>,
     reason: Option<FinishReason>,
 }
@@ -202,6 +204,9 @@ fn run(engine: &EngineCore, request: GenerationRequest) -> anyhow::Result<Outcom
         match event {
             EngineCoreOutput::TextToken { id, .. } => outcome.tokens.push(id),
             EngineCoreOutput::TextTokens { ids } => outcome.tokens.extend(ids),
+            EngineCoreOutput::PromptLogprobs { positions } => {
+                outcome.prompt_scores += positions.len();
+            }
             EngineCoreOutput::ImageDone { pixels_png_b64, .. } => {
                 outcome.images.push(pixels_png_b64);
             }
@@ -359,6 +364,25 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
         }
         // The cached feature conditions the prompt as the encoded one did.
         assert_eq!(red.tokens, cached.tokens);
+
+        // A scored image prompt scores its text: every token but the first,
+        // the one after the image predicted from the image's last logits.
+        let mut scored = request(
+            13,
+            vec![5, 6, 7, 8],
+            prompt(200),
+            GenerationConstraint::UndOnly,
+            image(1, 1, 1.0),
+            false,
+        );
+        scored.sampling.return_prompt_logprobs = true;
+        let scored = run(&engine, scored)?;
+        assert!(
+            !matches!(scored.reason, Some(FinishReason::Error)),
+            "scored understanding failed"
+        );
+        assert_eq!(scored.prompt_scores, 3);
+        assert_eq!(scored.tokens, red.tokens);
         Ok(())
     })();
     engine.shutdown();

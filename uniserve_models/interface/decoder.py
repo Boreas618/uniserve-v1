@@ -6,8 +6,9 @@ serves the ``ImageDecoder`` at ``path`` within a bound component.
 buffers once:
 
 - ``latents``: the latent pool's step workspace ``[units, width]`` on the
-  decoder's device, into which the worker gathers each completed
-  trajectory's pages before decoding;
+  binding's device, into which the worker gathers each completed
+  trajectory's pages before decoding (a decoder placed on a generation
+  tower computes there and returns its results to these buffers);
 - ``staging``: ``uint8`` bytes receiving each image's quantized HWC pixels,
   which the worker copies to the host and encodes;
 - ``products``: the device's product arena (image products are regions of
@@ -73,7 +74,9 @@ def bind(
         count = pixels.numel()
         if offset < 0 or offset + count > staging.numel():
             raise ValueError("image pixels exceed the decoder staging")
-        staging[offset : offset + count].copy_(pixels.reshape(-1))
+        staging[offset : offset + count].copy_(
+            calls.local(pixels.reshape(-1), staging.device)
+        )
         return count
 
     def decode(rows: Sequence[Sequence[int]], images: Sequence) -> list[int]:
@@ -81,9 +84,12 @@ def bind(
         if len(rows) != len(images) or any(len(row) != 5 for row in rows):
             raise ValueError("decoder rows and image products must align")
         with calls.scope(context):
+            # A decoder placed on a generation tower reads its latents there.
             values = decoder.decode(
                 tuple(
-                    latents[offset : offset + units]
+                    latents[offset : offset + units].to(
+                        context.device, non_blocking=True
+                    )
                     for offset, units, *_ in rows
                 ),
                 sizes=tuple(
