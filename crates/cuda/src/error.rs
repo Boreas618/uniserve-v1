@@ -79,9 +79,56 @@ pub enum Error {
     Reclaim { failed: usize, first: Box<Error> },
 }
 
+/// `CUDA_ERROR_OUT_OF_MEMORY`: the call could not allocate enough memory or
+/// other resources.
+const CUDA_ERROR_OUT_OF_MEMORY: i32 = 2;
+
+/// Driver results after which the process cannot continue using CUDA.
+///
+/// The driver documents each as leaving the process in an inconsistent
+/// state in which further CUDA work returns the same error, or its context
+/// as unusable (`CUDA_ERROR_ASSERT`). An uncorrectable ECC error is included
+/// because the memory the process computes with can no longer be trusted.
+const UNRECOVERABLE_DRIVER_RESULTS: &[i32] = &[
+    214, // CUDA_ERROR_ECC_UNCORRECTABLE
+    226, // CUDA_ERROR_CONTAINED
+    700, // CUDA_ERROR_ILLEGAL_ADDRESS
+    702, // CUDA_ERROR_LAUNCH_TIMEOUT
+    710, // CUDA_ERROR_ASSERT
+    714, // CUDA_ERROR_HARDWARE_STACK_ERROR
+    715, // CUDA_ERROR_ILLEGAL_INSTRUCTION
+    716, // CUDA_ERROR_MISALIGNED_ADDRESS
+    717, // CUDA_ERROR_INVALID_ADDRESS_SPACE
+    718, // CUDA_ERROR_INVALID_PC
+    719, // CUDA_ERROR_LAUNCH_FAILED
+    721, // CUDA_ERROR_TENSOR_MEMORY_LEAK
+    810, // CUDA_ERROR_MPS_CLIENT_TERMINATED
+    911, // CUDA_ERROR_EXTERNAL_DEVICE
+];
+
 impl Error {
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::InvalidArgument(message.into())
+    }
+
+    /// The driver could not allocate memory or another resource for the
+    /// call; the process and its contexts remain usable.
+    pub fn is_out_of_memory(&self) -> bool {
+        match self {
+            Self::Driver { code, .. } => *code == CUDA_ERROR_OUT_OF_MEMORY,
+            Self::Reclaim { first, .. } => first.is_out_of_memory(),
+            _ => false,
+        }
+    }
+
+    /// The driver reported a failure after which this process cannot
+    /// continue using CUDA and must be restarted.
+    pub fn is_unrecoverable(&self) -> bool {
+        match self {
+            Self::Driver { code, .. } => UNRECOVERABLE_DRIVER_RESULTS.contains(code),
+            Self::Reclaim { first, .. } => first.is_unrecoverable(),
+            _ => false,
+        }
     }
 }
 
@@ -102,6 +149,29 @@ mod tests {
             error.to_string(),
             "cuMemAlloc_v2 failed with CUDA_ERROR_OUT_OF_MEMORY (2): out of memory"
         );
+    }
+
+    #[test]
+    fn driver_results_decide_the_failure_class() {
+        let driver = |code| Error::Driver {
+            call: "cuMemcpyBatchAsync_v2",
+            code,
+            name: "CUDA_ERROR",
+            message: "failed",
+        };
+
+        assert!(driver(2).is_out_of_memory());
+        assert!(!driver(2).is_unrecoverable());
+        assert!(driver(700).is_unrecoverable());
+        assert!(driver(719).is_unrecoverable());
+        // CUDA_ERROR_INVALID_VALUE reports a rejected call.
+        assert!(!driver(1).is_out_of_memory() && !driver(1).is_unrecoverable());
+
+        let reclaim = Error::Reclaim {
+            failed: 1,
+            first: Box::new(driver(700)),
+        };
+        assert!(reclaim.is_unrecoverable());
     }
 
     #[test]

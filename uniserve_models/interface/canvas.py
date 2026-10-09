@@ -52,6 +52,7 @@ from uniserve_models.nn.attention import (
 from uniserve_models.nn.moe import FusedMoE
 
 from . import graphs
+from .errors import binding
 
 __all__ = [
     "STEP_CONTINUED",
@@ -790,4 +791,4 @@ def bind(
     functions.update(
         capture=capture, replay=replay, release=release, kernels=kernels
     )
-    return functions
+    return binding(functions)
