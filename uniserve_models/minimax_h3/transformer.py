@@ -273,10 +273,10 @@ class StepProjection(nn.Module):
 
     A parallel-decoding student predicts one head per fine-grid interval; an
     evaluation applies its block's heads fused with their normalized
-    integration weights (``uniserve_models.diffusion.fuse_heads``). Loading fuses
-    every block once (``weights._prepare_heads``) into ``weight`` [steps,
-    out, in] and ``bias`` [steps, out], and a call gathers the step's head
-    on the device, so one captured evaluation serves every step.
+    integration weights (``uniserve_models.diffusion.fuse_heads``). Loading
+    fuses every block once (``weights._prepare_heads``) into ``weight``
+    [steps, out, in] and ``bias`` [steps, out], and a call gathers the step's
+    head on the device, so one captured evaluation serves every step.
     """
 
     weight: torch.Tensor
