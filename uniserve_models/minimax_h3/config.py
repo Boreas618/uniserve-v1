@@ -88,8 +88,20 @@ def canvas(aspect_width: float, aspect_height: float) -> image.Config:
     )
 
 
-# FastH3 DMD exports are trained on, and serve only, the 16:9 canvas.
-DMD_CANVASES = (canvas(16, 9),)
+# FastH3 DMD exports are trained on, and generate only, 12 buckets: the named
+# aspect ratios at the 768p and 480p resolutions. The 768p buckets are the
+# canvas rule's canvases; the 480p buckets, (height, width) below in the same
+# ratio order, are the training table's own rather than a rescaled rule (21:9
+# is 992x416, not 960x416). A deployment prepares a subset of them.
+DMD_CANVASES = (
+    *(canvas(*ratio) for ratio in NAMED_ASPECT_RATIOS),
+    image.Config(416, 992),
+    image.Config(480, 832),
+    image.Config(480, 640),
+    image.Config(480, 480),
+    image.Config(640, 480),
+    image.Config(832, 480),
+)
 
 # A FastVideo PDD student's packed sequence capacity in rows; the checkpoint
 # owns this bound and serving options may only tighten it.
