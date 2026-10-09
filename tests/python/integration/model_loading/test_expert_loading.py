@@ -8,7 +8,11 @@ from torch.nn import functional as F
 from uniserve_models import loading
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.nn.moe import FusedMoE
-from uniserve_models.quantization import QuantizationConfig, Quantizer, ScaleLayout
+from uniserve_models.quantization import (
+    QuantizationConfig,
+    Quantizer,
+    ScaleLayout,
+)
 
 pytestmark = pytest.mark.integration
 

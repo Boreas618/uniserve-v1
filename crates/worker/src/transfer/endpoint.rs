@@ -326,7 +326,7 @@ impl Endpoint {
         let task = lane.reserve()?;
         if let Err(error) = task.configure(action).and_then(|()| task.submit()) {
             if let Err(cleanup) = task.cancel(true) {
-                eprintln!("failed to withdraw a transport retirement: {cleanup}");
+                tracing::warn!(target: "uniserve_worker.transfer", "failed to withdraw a transport retirement: {cleanup}");
             }
             return Err(error);
         }
