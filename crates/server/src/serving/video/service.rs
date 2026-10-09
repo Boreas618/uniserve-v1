@@ -21,7 +21,7 @@ use uniserve_core::{
 use uniserve_engine::VideoDenoiserInfo;
 
 use super::plan::{
-    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, ConditionSpec, MAX_ASPECT_RATIO,
+    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
     MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
     MIN_ASPECT_RATIO, NAMED_ASPECT_RATIOS, PlanLimits, RequestPlan, Target, VisionConfig,
 };
@@ -142,23 +142,28 @@ impl VideoService {
 
     /// Describes the served video contract for `GET /v1/capabilities`.
     ///
-    /// Reports the tasks and their condition rules, the canvas rule and the
-    /// canvases it yields here, the duration range, the fixed schedule (its
-    /// sigma points, the form `num_inference_steps` restates), the prompt and
-    /// sequence capacities, and the media sources and size caps.
+    /// Reports the tasks and their condition rules, the canvas rule, the
+    /// short edges and named aspect ratios the deployment serves and the
+    /// canvas each pair resolves to, the duration range, the fixed schedule
+    /// (its sigma points, the form `num_inference_steps` restates), the
+    /// prompt and sequence capacities, and the media sources and size caps.
     pub fn capabilities(&self, max_prompt_tokens: u32) -> Value {
-        let served = |size: Canvas| {
-            self.denoiser.canvases.is_empty() || self.denoiser.canvases.contains(&size)
-        };
-        // The named ratios whose canvas this denoiser generates; `auto` is
-        // 16:9 for t2va and ref2va.
+        // The named ratios served at any short edge, in their canonical
+        // order, and each served pair's canvas; `auto` is 16:9 for t2va and
+        // ref2va.
+        let served = plan::named_canvases(self.ingest.limits());
         let named: Vec<String> = NAMED_ASPECT_RATIOS
             .iter()
-            .filter(|(width, height)| {
-                plan::canvas(f64::from(*width), f64::from(*height)).is_ok_and(served)
-            })
             .map(|(width, height)| format!("{width}:{height}"))
+            .filter(|ratio| served.iter().any(|(_, served, _)| served == ratio))
             .collect();
+        let mut sizes = serde_json::Map::new();
+        for (short_edge, aspect_ratio, size) in served {
+            let entry = sizes
+                .entry(short_edge.to_string())
+                .or_insert_with(|| json!({}));
+            entry[aspect_ratio] = json!({"width": size.width, "height": size.height});
+        }
         let limits = MediaLimits::new(self.media.max_request_bytes);
         let conditions: serde_json::Map<String, Value> = self
             .tasks
@@ -185,11 +190,12 @@ impl VideoService {
             "tasks": self.denoiser.tasks,
             "task_conditions": conditions,
             "canvas": {
-                "short_edge": CANVAS_SHORT_EDGE,
+                "short_edges": self.ingest.limits().short_edges(),
                 "multiple": CANVAS_MULTIPLE,
                 "max_pixels": CANVAS_MAX_PIXELS,
                 "aspect_ratios": named,
                 "free_aspect_range": [MIN_ASPECT_RATIO, MAX_ASPECT_RATIO],
+                "sizes": sizes,
                 "canvases": (!self.denoiser.canvases.is_empty()).then_some(&self.denoiser.canvases),
             },
             "fps": VIDEO_FPS,

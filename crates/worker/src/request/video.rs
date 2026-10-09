@@ -179,7 +179,11 @@ pub(crate) fn vision_spans(tags: &[u8]) -> Vec<(u32, u32)> {
 pub(crate) struct MediaPlan {
     /// Admitted frame counts, ascending.
     pub(crate) frame_counts: Vec<u32>,
-    /// Admitted canvases, largest generated sample first.
+    /// Admitted canvases in the order the deployment names them, which the
+    /// handshake reports.
+    pub(crate) admitted: Vec<Canvas>,
+    /// The admitted canvases in preparation order (see
+    /// [`preparation_order`]).
     pub(crate) canvases: Vec<Canvas>,
     /// Prompt capacities of the prepared layouts, ascending.
     pub(crate) text_capacities: Vec<u32>,
@@ -187,10 +191,12 @@ pub(crate) struct MediaPlan {
     pub(crate) max_text_tokens: u32,
     /// Condition rows a request may occupy; zero without conditioned tasks.
     pub(crate) condition_rows: u32,
-    /// The largest layout, widened to the condition capacity.
+    /// The leading canvas's longest layout at the prompt capacity, widened
+    /// to the condition capacity. The denoiser prepares it first, so it
+    /// sizes the storage every layout shares.
     pub(crate) maximum: VideoLayout,
-    /// Startup layouts: canvases (largest first) by frame counts (longest
-    /// first) by prompt capacities (largest first).
+    /// Startup layouts: canvases (in preparation order) by frame counts
+    /// (longest first) by prompt capacities (largest first).
     pub(crate) layouts: Vec<VideoLayout>,
     /// Each canvas's longest layout at the prompt capacity, widened to the
     /// condition capacity; their envelope bounds every request's state.
@@ -209,6 +215,75 @@ pub(crate) struct Admission {
     pub(crate) text_capacity: u32,
 }
 
+/// One admitted canvas as preparation orders it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanvasExtent {
+    canvas: Canvas,
+    /// State and workspace elements of the canvas's largest layout.
+    storage: u64,
+    /// Generated video elements of the canvas's longest video.
+    generated: u64,
+}
+
+/// The canvases a deployment prepares and admits: `configured`, or every
+/// canvas the denoiser offers without a selection.
+///
+/// Fails, as an unsupported setup, when the denoiser offers no canvas or
+/// does not offer a configured one.
+fn admitted_canvases(offered: &[Canvas], configured: &[Canvas]) -> Result<Vec<Canvas>> {
+    if offered.is_empty() {
+        return Err(Error::Unsupported(
+            "the video denoiser prepares no canvas".into(),
+        ));
+    }
+    if configured.is_empty() {
+        return Ok(offered.to_vec());
+    }
+    if configured.iter().any(|canvas| !offered.contains(canvas)) {
+        let names = |canvases: &[Canvas]| {
+            canvases
+                .iter()
+                .map(|canvas| format!("{}x{}", canvas.width, canvas.height))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return Err(Error::Unsupported(format!(
+            "the denoiser offers only the canvases {}, not every canvas of {}",
+            names(offered),
+            names(configured)
+        )));
+    }
+    Ok(configured.to_vec())
+}
+
+/// The order a deployment prepares its canvases in.
+///
+/// The leading canvas is the one whose largest layout takes the most state
+/// and workspace, the first such canvas on ties: its layout is prepared
+/// first and sizes the storage every later layout shares. Generated rows
+/// alone do not select it: 768p 21:9 generates as many rows as 16:9 but
+/// pads to more sparse-attention tiles. The other canvases follow in
+/// decreasing generated elements, in their given order on ties.
+fn preparation_order(extents: &[CanvasExtent]) -> Vec<Canvas> {
+    let mut leading = None;
+    for extent in extents {
+        if leading.is_none_or(|first: &CanvasExtent| extent.storage > first.storage) {
+            leading = Some(extent);
+        }
+    }
+    let mut rest: Vec<&CanvasExtent> = extents
+        .iter()
+        .filter(|extent| leading.is_some_and(|first| first.canvas != extent.canvas))
+        .collect();
+    // A stable sort keeps the given order among equal extents.
+    rest.sort_by_key(|extent| std::cmp::Reverse(extent.generated));
+    leading
+        .into_iter()
+        .chain(rest)
+        .map(|extent| extent.canvas)
+        .collect()
+}
+
 /// The seconds-to-frames rule the HTTP planner shares: round half to even.
 fn frames_of(seconds: f64, rate: u32) -> u32 {
     (seconds * f64::from(rate)).round_ties_even() as u32
@@ -220,6 +295,9 @@ impl MediaPlan {
     /// `requested` are the configured prompt capacities (default
     /// `[1024, 2048, 4096, ...]` up to the prompt capacity), each mapped to
     /// the text rows of its layout, capped at the largest layout's.
+    /// `canvases` are the canvases the deployment names, each one the
+    /// denoiser offers; without any the deployment prepares every offered
+    /// canvas.
     pub(crate) fn new(
         model: &VideoModel,
         max_seconds: f64,
@@ -227,6 +305,7 @@ impl MediaPlan {
         max_text_tokens: u32,
         requested: &[u32],
         condition_rows: u32,
+        canvases: &[Canvas],
     ) -> Result<Self> {
         let facts = &model.facts;
         let longest = model.legal_frame_count(frames_of(max_seconds, facts.frame_rate))?;
@@ -245,25 +324,35 @@ impl MediaPlan {
                 "the video denoiser admits no frame count of the duration capacity".into(),
             ));
         }
-        if facts.canvases.is_empty() {
-            return Err(Error::Unsupported(
-                "the video denoiser prepares no canvas".into(),
-            ));
-        }
+        let admitted = admitted_canvases(&facts.canvases, canvases)?;
+        let widen = |layout: VideoLayout| {
+            if condition_rows == 0 {
+                Ok(layout)
+            } else {
+                model.condition_layout(&layout, condition_rows)
+            }
+        };
 
-        // Global sample extents bound every shard, even when a shorter prompt
-        // moves more media rows onto one sequence-parallel rank.
-        let mut ordered = Vec::new();
-        for &canvas in &facts.canvases {
-            let size = VideoSize::plain(longest, canvas, max_text_tokens);
-            let layout = model.layout_size(&size)?;
-            let elements = model.latent_elements("video", &layout)?;
-            ordered.push((elements, canvas, layout));
+        // Each canvas's longest layout at the prompt capacity, widened to
+        // the condition capacity, bounds every layout of the canvas.
+        let mut largest = Vec::with_capacity(admitted.len());
+        let mut extents = Vec::with_capacity(admitted.len());
+        for &canvas in &admitted {
+            let plain = model.layout_size(&VideoSize::plain(longest, canvas, max_text_tokens))?;
+            let layout = widen(plain)?;
+            extents.push(CanvasExtent {
+                canvas,
+                storage: model.layout_fields(&layout)?.storage(),
+                // Global sample extents order the canvases: a rank's share
+                // moves with the prompt under sequence parallelism.
+                generated: model.latent_elements("video", &plain)?,
+            });
+            largest.push(layout);
         }
-        // A stable sort keeps the model's order among equal extents.
-        ordered.sort_by_key(|(elements, _, _)| std::cmp::Reverse(*elements));
-        let reference = ordered[0].1;
-        let largest_text = ordered[0].2.text_rows;
+        let ordered = preparation_order(&extents);
+        let reference = ordered[0];
+        let leading = model.layout_size(&VideoSize::plain(longest, reference, max_text_tokens))?;
+        let largest_text = leading.text_rows;
 
         let requested: Vec<u32> = if requested.is_empty() {
             std::iter::once(1024)
@@ -290,31 +379,18 @@ impl MediaPlan {
         text_capacities.dedup();
 
         let mut layouts = Vec::new();
-        for (_, canvas, _) in &ordered {
+        for &canvas in &ordered {
             for &frames in frame_counts.iter().rev() {
                 for &tokens in text_capacities.iter().rev() {
-                    layouts.push(model.layout_size(&VideoSize::plain(frames, *canvas, tokens))?);
+                    layouts.push(model.layout_size(&VideoSize::plain(frames, canvas, tokens))?);
                 }
             }
         }
-        let widen = |layout: VideoLayout| {
-            if condition_rows == 0 {
-                Ok(layout)
-            } else {
-                model.condition_layout(&layout, condition_rows)
-            }
-        };
-        let largest = facts
-            .canvases
-            .iter()
-            .map(|&canvas| {
-                widen(model.layout_size(&VideoSize::plain(longest, canvas, max_text_tokens))?)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let maximum = widen(ordered[0].2)?;
+        let maximum = widen(leading)?;
         Ok(Self {
             frame_counts,
-            canvases: ordered.iter().map(|(_, canvas, _)| *canvas).collect(),
+            admitted,
+            canvases: ordered,
             text_capacities,
             max_text_tokens,
             condition_rows,
@@ -407,6 +483,56 @@ mod tests {
         );
         assert!(VideoLayout::from_values(&[1, 2, 3]).is_err());
         assert!(VideoLayout::from_values(&[-1, 2, 3, 4, 5]).is_err());
+    }
+
+    fn canvas(width: u32, height: u32) -> Canvas {
+        Canvas { width, height }
+    }
+
+    #[test]
+    fn a_deployment_admits_the_offered_canvases_it_names() {
+        let offered = [canvas(1536, 672), canvas(1344, 768), canvas(768, 1344)];
+        // Without a selection every offered canvas is prepared.
+        assert_eq!(admitted_canvases(&offered, &[]).unwrap(), offered);
+        // A selection keeps the order the deployment names.
+        let named = [canvas(768, 1344), canvas(1344, 768)];
+        assert_eq!(admitted_canvases(&offered, &named).unwrap(), named);
+        // A canvas the denoiser does not offer refuses the deployment,
+        // naming what it offers.
+        let error = admitted_canvases(&offered, &[canvas(832, 480)]).unwrap_err();
+        assert!(matches!(&error, Error::Unsupported(message)
+            if message.contains("1536x672, 1344x768, 768x1344") && message.contains("832x480")));
+        assert!(admitted_canvases(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn the_canvas_taking_the_most_storage_is_prepared_first() {
+        let extent = |canvas, storage, generated| CanvasExtent {
+            canvas,
+            storage,
+            generated,
+        };
+        // 21:9 generates as many elements as 16:9 and takes more storage;
+        // the 480p canvas and the portrait canvas follow by generated
+        // elements, the equal ones in the order they were named.
+        let wide = canvas(1536, 672);
+        let landscape = canvas(1344, 768);
+        let portrait = canvas(768, 1344);
+        let small = canvas(832, 480);
+        assert_eq!(
+            preparation_order(&[
+                extent(small, 40, 30),
+                extent(landscape, 90, 100),
+                extent(wide, 96, 100),
+                extent(portrait, 90, 100),
+            ]),
+            vec![wide, landscape, portrait, small]
+        );
+        // The first canvas leads among equal storage.
+        assert_eq!(
+            preparation_order(&[extent(portrait, 90, 100), extent(landscape, 90, 100)]),
+            vec![portrait, landscape]
+        );
     }
 
     #[test]

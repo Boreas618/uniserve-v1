@@ -635,6 +635,7 @@ fn execution(
         max_condition_rows: descriptor.max_condition_rows as usize,
         ffmpeg: descriptor.ffmpeg.clone(),
         min_video_seconds: descriptor.min_video_seconds,
+        video_canvases: descriptor.video_canvases.clone(),
         deployment_components: descriptor.deployment_components.clone(),
         model_dtype: descriptor.model_dtype.clone(),
         kv_storage_fraction: descriptor.kv_memory_fraction,
