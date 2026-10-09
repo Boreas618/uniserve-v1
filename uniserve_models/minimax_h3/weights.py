@@ -18,10 +18,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from uniserve_models import qwen3_vl
 from uniserve_models.diffusion import block_grid, fuse_heads
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.nn import Modulation
-from uniserve_models import qwen3_vl
 
 from . import audio_vae, video_vae
 from .checkpoint import DENOISER_DIRECTORIES

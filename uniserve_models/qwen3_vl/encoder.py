@@ -13,22 +13,22 @@ prompt's M-RoPE coordinates.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from torchvision.transforms.v2 import functional as tvF
 
-from uniserve_models.model import (
-    EmbeddingReplacement,
-    PatchEncoder,
-    TransformerDecoder,
-)
+from uniserve_models.model import EmbeddingReplacement, PatchEncoder
 from uniserve_models.model import TextEncoder as BaseTextEncoder
 from uniserve_models.tensors import OutputLayout
 
 from .config import PixelConfig, VisionConfig
 from .positions import rope_index
 from .vision import VisionTower
+
+if TYPE_CHECKING:
+    from uniserve_models.qwen3.transformer import Transformer
 
 
 class VisionEncoder(PatchEncoder):
@@ -40,6 +40,8 @@ class VisionEncoder(PatchEncoder):
     decoded frames exactly as the checkpoint's Qwen3-VL image and video
     processors do on the host.
     """
+
+    network: VisionTower
 
     def __init__(
         self, config: VisionConfig, pixels: PixelConfig, *, dtype: torch.dtype
@@ -142,9 +144,11 @@ class TextEncoder(BaseTextEncoder):
     ``image_token_id`` or ``video_token_id``.
     """
 
+    network: Transformer
+
     def __init__(
         self,
-        network: TransformerDecoder,
+        network: Transformer,
         retained_layers: tuple[int, ...],
         vision: VisionConfig,
         *,
@@ -190,7 +194,9 @@ class TextEncoder(BaseTextEncoder):
             spatial_merge_size=self.vision.downsample,
         )
 
-    def encode(
+    # This encoder builds the base's embedding and DeepStack inputs from
+    # ``visual``, which it takes in their place.
+    def encode(  # type: ignore[override]
         self,
         tokens: tuple[torch.Tensor, ...],
         *,
@@ -234,7 +240,8 @@ class TextEncoder(BaseTextEncoder):
             else []
         )
         hidden = self.network.hidden_size
-        embeddings, deepstack = [], []
+        embeddings: list[EmbeddingReplacement | None] = []
+        deepstack: list[tuple[torch.Tensor, ...] | None] = []
         for mask, count, rows in zip(masks, counts, visual, strict=True):
             if rows is None:
                 if count:
