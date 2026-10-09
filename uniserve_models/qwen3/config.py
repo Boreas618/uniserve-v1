@@ -16,6 +16,7 @@ from pathlib import Path
 
 from uniserve_models import loading
 from uniserve_models.loading import checkpoint
+from uniserve_models.nn.moe import Activation
 from uniserve_models.nn.rope import RoPEScaling, YaRNScaling
 
 from ..rotary import read_rotary
@@ -186,7 +187,7 @@ class Config:
 
 
 # ``hidden_act`` aliases and the expert gating each one names.
-_EXPERT_ACTIVATIONS = {
+_EXPERT_ACTIVATIONS: Mapping[str, Activation] = {
     "silu": "silu",
     "swish": "silu",
     "silu_and_mul": "silu",
@@ -196,7 +197,7 @@ _EXPERT_ACTIVATIONS = {
 }
 
 
-def expert_activation(hidden_act: str) -> str:
+def expert_activation(hidden_act: str) -> Activation:
     """Name the ``FusedMoE`` gating that ``hidden_act`` specifies."""
     return _EXPERT_ACTIVATIONS[hidden_act]
 

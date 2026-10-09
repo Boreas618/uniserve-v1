@@ -291,7 +291,7 @@ class TransformerDecoder(nn.Module):
         complete-stream layers). Each state tensor is ``[tokens, width]``
         in the stream dtype.
         """
-        layer = next(reversed(self.layers.values()))
+        layer = tuple(self.layers.values())[-1]
         if isinstance(layer, PhasedLayer):
             return layer.state_widths
         if self.separate_residual:
@@ -311,7 +311,7 @@ class TransformerDecoder(nn.Module):
         if self._pipeline.rank != self._pipeline.size - 1:
             raise ValueError("the output norm belongs to the final stage")
         selected = tuple(value.index_select(0, rows) for value in state)
-        layer = next(reversed(self.layers.values()))
+        layer = tuple(self.layers.values())[-1]
         if isinstance(layer, PhasedLayer):
             hidden, residual = layer.feed_forward(*selected)
         else:
@@ -444,11 +444,11 @@ class TransformerDecoder(nn.Module):
         norm = self.norm
         assert norm is not None
         if residual is None:
-            result = (
-                hidden.apply(norm).packed(local_routes)
-                if isinstance(hidden, RoutedTensor)
-                else norm(hidden)
-            )
+            if isinstance(hidden, RoutedTensor):
+                assert isinstance(norm, nn.ModuleDict)
+                result = hidden.apply(norm).packed(local_routes)
+            else:
+                result = norm(hidden)
         elif isinstance(hidden, RoutedTensor):
             assert isinstance(residual, RoutedTensor)
             assert isinstance(norm, nn.ModuleDict)

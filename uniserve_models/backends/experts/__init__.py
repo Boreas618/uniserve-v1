@@ -32,6 +32,7 @@ from typing import Any
 import torch
 
 from uniserve_models.distributed import Communicator
+from uniserve_models.nn.moe import Activation
 
 __all__ = [
     "ExpertTransport",
@@ -218,7 +219,7 @@ def create(
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
-    activation: str,
+    activation: Activation,
     attention_ranks: int,
     device: torch.device,
     yield_turn: Callable[[], None] | None = None,
@@ -237,7 +238,7 @@ def create(
     Raises:
         ValueError: The transport cannot serve this placement.
     """
-    options = {
+    options: dict[str, Any] = {
         "max_tokens": max_tokens,
         "attention_ranks": attention_ranks,
         "yield_turn": yield_turn,

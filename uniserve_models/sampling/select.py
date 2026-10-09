@@ -313,7 +313,7 @@ def _logprobs(
         work,
         rows.index_select(0, selected),
         tokens.index_select(0, selected),
-        [tasks[index].logprobs for index in requesting],
+        [task.logprobs for task in tasks if task.logprobs is not None],
     )
 
 
@@ -525,7 +525,7 @@ def shape_logits(
     if penalized:
         selected = torch.tensor(penalized, dtype=torch.long, device=device)
         counts = torch.stack(
-            [penalty_counts[index] for index in penalized]  # type: ignore[index]
+            [value for value in penalty_counts or () if value is not None]
         ).to(dtype=work.dtype)
         values = params.index_select(0, selected)
         repetition = values[:, REPETITION].unsqueeze(1)
