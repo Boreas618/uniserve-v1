@@ -30,13 +30,32 @@ import functools
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from types import GenericAlias, MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 from torch import nn
 
 from uniserve_models.bindings import capturing
 from uniserve_models.tensors import BufferConfig
+
+if TYPE_CHECKING:
+    # The binding and layer modules import this one; their names are needed
+    # only to annotate the tables an ExecutionContext keeps.
+    from uniserve_models.bindings.attention import (
+        AttentionBinding,
+        ExchangeBuffers,
+    )
+    from uniserve_models.bindings.matmul import MatmulBinding
+    from uniserve_models.bindings.moe import MoEBinding
+    from uniserve_models.bindings.vsa import VsaBinding
+    from uniserve_models.nn._binding import ChunkStorage, MergedKey
+    from uniserve_models.nn.attention._parallel import (
+        AttentionBuffers,
+        OutputBuffers,
+        ParallelAttention,
+    )
+
+_T = TypeVar("_T")
 
 # Owners whose asynchronous accesses could not be proven finished. An aborted
 # context retains them until the process exits instead of releasing storage
@@ -695,7 +714,7 @@ class _TransferScope:
 
     def __init__(self, owner: _DeviceTransfers) -> None:
         self.owner = owner
-        self.token = None
+        self.token: contextvars.Token[_TransferScope | None] | None = None
         self.hooks: list = []
         self.calls: list[_Call] = []
 
@@ -786,6 +805,15 @@ def _empty() -> Mapping:
     return MappingProxyType({})
 
 
+def _install(
+    stack: contextlib.ExitStack,
+    variable: contextvars.ContextVar[_T],
+    values: _T,
+) -> None:
+    """Set ``variable`` to ``values`` until ``stack`` unwinds."""
+    stack.callback(variable.reset, variable.set(values))
+
+
 class ExecutionContext:
     """Bind ordinary numerical modules to prepared operators and backing.
 
@@ -825,7 +853,9 @@ class ExecutionContext:
             ``None`` uses the process groups directly.
     """
 
-    __class_getitem__ = classmethod(GenericAlias)
+    __class_getitem__: classmethod[Any, [Any], GenericAlias] = classmethod(
+        GenericAlias
+    )
 
     def __init__(
         self,
@@ -855,18 +885,13 @@ class ExecutionContext:
         self.groups = (
             tuple(groups) if groups is not None else communicators(module)
         )
-        handle_stream = isinstance(stream, int)
-        root, dtype = _representation(
-            module, cache, None if handle_stream else stream
-        )
+        # An integer handle becomes a stream once the device is known.
+        bound = None if isinstance(stream, int) else stream
+        root, dtype = _representation(module, cache, bound)
         device = root if device is None else torch.device(device)
-        if handle_stream:
-            stream = (
-                torch.cuda.ExternalStream(stream, device=device)
-                if stream
-                else None
-            )
-        if stream is not None and stream.device != device:
+        if isinstance(stream, int) and stream:
+            bound = torch.cuda.ExternalStream(stream, device=device)
+        if bound is not None and bound.device != device:
             raise ValueError(
                 "the execution stream must belong to the context's device"
             )
@@ -876,7 +901,7 @@ class ExecutionContext:
             module, "buffers"
         )
         placement = next(iter(placements)) if len(placements) == 1 else device
-        self.stream = stream
+        self.stream: torch.cuda.Stream | None = bound
         self._device, self._dtype = placement, dtype
         self._backends = {
             "attention": attention,
@@ -916,6 +941,28 @@ class ExecutionContext:
         "_chunks",
         "_gather_pools",
     )
+
+    # weight or module id -> prepared matmul operator
+    _operators: dict[int, MatmulBinding]
+    # module id, or branch key -> prepared merged operator
+    _merged: dict[int | MergedKey, MatmulBinding]
+    _attention: dict[int, AttentionBinding]
+    _vsa: dict[int, VsaBinding]
+    # (device, dtype, heads, head_dim, pattern) -> (provider name, operator)
+    _vsa_operators: dict[tuple, tuple[str, Any]]
+    _moe: dict[int, MoEBinding]
+    _vsa_output: dict[ParallelAttention, OutputBuffers]
+    _vsa_context: dict[ParallelAttention, AttentionBuffers]
+    # (key group, rows, heads, head_dim, dtype) -> context K/V buffers
+    _context_backing: dict[tuple, AttentionBuffers]
+    # (three groups, rows, heads, head_dim, dtype) -> output, context buffers
+    _vsa_transport: dict[tuple, tuple[OutputBuffers, AttentionBuffers | None]]
+    # module id -> attention exchange storage
+    _exchange: dict[int, ExchangeBuffers]
+    # module id -> gather storage for chunked token exchange
+    _chunks: dict[int, ChunkStorage]
+    # communication group -> its standalone gather pool
+    _gather_pools: dict[Any, GatherPool]
 
     def _clear_bindings(self) -> None:
         for name in self._BINDINGS:
@@ -1177,7 +1224,8 @@ class ExecutionContext:
                 else:
                     self.workspace_views = views
             if hasattr(module, "prepare_constants"):
-                module.prepare_constants(size, out=self.constants)
+                # An optional hook: ``nn.Module`` declares no such method.
+                getattr(module, "prepare_constants")(size, out=self.constants)
 
             representations = {"": (self._device, self._dtype)}
             vsa_slot = 0
@@ -1245,7 +1293,7 @@ class ExecutionContext:
             for name, branch in layer.projections.items():
                 weights.append((name, id(branch.weight)))
                 quantizers.append(branch.input_quantizer)
-            bindings[(tuple(weights), layer.branch_width)] = binding
+            self._merged[(tuple(weights), layer.branch_width)] = binding
         else:
             bindings[id(layer.weight)] = binding
             quantizers = [layer.input_quantizer]
@@ -1334,7 +1382,7 @@ class ExecutionContext:
             ):
                 # Device-driven launches share one numerical input per table;
                 # host-planned launches bind every reading layer.
-                first = {}
+                first: dict[Any, AttentionBinding] = {}
                 for reader in readers:
                     first.setdefault(reader.table, reader)
                 readers = list(first.values())
@@ -1400,7 +1448,7 @@ class ExecutionContext:
         """Selected kernels by module path; empty once closed."""
         from uniserve_models.nn.linear import MergedColumnParallelLinear
 
-        records = []
+        records: list[dict] = []
         if self._closed:
             return records
         for path, child in self.module.named_modules():
@@ -1448,16 +1496,13 @@ class ExecutionContext:
                 stack.enter_context(transfers)
             stack.enter_context(output_scope(self._vsa_output))
             stack.enter_context(context_scope(self._vsa_context))
-            for variable, values in (
-                (_binding.matmul, self._operators),
-                (_binding.merged_matmul, self._merged),
-                (_binding.attention, self._attention),
-                (_binding.vsa, self._vsa),
-                (_binding.moe, self._moe),
-                (_binding.attention_storage, self._exchange),
-                (_binding.linear_chunks, self._chunks),
-            ):
-                stack.callback(variable.reset, variable.set(values))
+            _install(stack, _binding.matmul, self._operators)
+            _install(stack, _binding.merged_matmul, self._merged)
+            _install(stack, _binding.attention, self._attention)
+            _install(stack, _binding.vsa, self._vsa)
+            _install(stack, _binding.moe, self._moe)
+            _install(stack, _binding.attention_storage, self._exchange)
+            _install(stack, _binding.linear_chunks, self._chunks)
             if self.weights is not None:
                 stack.enter_context(self.weights.activate())
             yield self
