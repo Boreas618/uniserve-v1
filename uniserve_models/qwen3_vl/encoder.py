@@ -133,13 +133,13 @@ class TextEncoder(BaseTextEncoder):
     """Encode prompts whose placeholders carry Qwen3-VL vision features.
 
     ``network`` is the language decoder, with the M-RoPE sections of the
-    checkpoint, and ``retained_layers`` the decoder layers this encoder
-    runs (``uniserve_models.model.TextEncoder``). ``vision`` is a ``PatchEncoder``
-    over ``VisionTower``: it encodes ``VisionInput`` samples of packed
-    tubelet rows with their ``(time, height, width)`` grids into
-    ``[time * height * width / merge**2, vision.feature_size]`` rows of
-    ``dtype``, each a token's embedding followed by its DeepStack features.
-    Prompts mark those tokens with ``image_token_id`` or ``video_token_id``.
+    checkpoint, and ``retained_layers`` the decoder layers this encoder runs
+    (``uniserve_models.model.TextEncoder``). ``vision`` is a ``PatchEncoder``
+    over ``VisionTower``: it encodes ``VisionInput`` samples of packed tubelet
+    rows with their ``(time, height, width)`` grids into ``[time * height *
+    width / merge**2, vision.feature_size]`` rows of ``dtype``, each a token's
+    embedding followed by its DeepStack features. Prompts mark those tokens with
+    ``image_token_id`` or ``video_token_id``.
     """
 
     def __init__(

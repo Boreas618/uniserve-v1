@@ -4,10 +4,10 @@ Caches store ``[blocks, tokens, heads, dim]`` rows. Writes address physical
 token slots ``block * block_size + token``; ``-1`` skips a token.
 
 These kernels back ``uniserve_models.cache.paged.paged_kv_write`` and
-``uniserve_models.cache._fp8.rescale_``; ``uniserve_kernels.attention.paged`` also
-calls the scatter body from its own kernel. The scatter has an eligibility
-check (``unsupported_paged_kv_write``); ``paged_kv_write`` raises on CUDA
-when it reports a reason. Every launch selects the device of its tensors,
+``uniserve_models.cache._fp8.rescale_``; ``uniserve_kernels.attention.paged``
+also calls the scatter body from its own kernel. The scatter has an eligibility
+check (``unsupported_paged_kv_write``); ``paged_kv_write`` raises on CUDA when
+it reports a reason. Every launch selects the device of its tensors,
 independently of the calling thread's current CUDA device.
 """
 

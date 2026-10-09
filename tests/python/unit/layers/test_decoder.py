@@ -6,7 +6,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_models.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
+from uniserve_models.nn.attention import (
+    AttentionBatch,
+    SequenceLengths,
+    VarlenInput,
+)
 from uniserve_models.qwen3 import Config, Transformer
 
 pytestmark = pytest.mark.unit

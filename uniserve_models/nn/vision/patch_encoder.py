@@ -8,7 +8,9 @@ import torch
 from torch import nn
 
 from uniserve_models.nn.functional import patchify
-from uniserve_models.nn.vision.position import get_flattened_position_ids_extrapolate
+from uniserve_models.nn.vision.position import (
+    get_flattened_position_ids_extrapolate,
+)
 
 
 class PatchEncoder(nn.Module):

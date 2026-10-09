@@ -257,11 +257,11 @@ class VideoDecoder(nn.Module):
     """Decode a video's packed latent one reconstruction window at a time.
 
     A video's size is its frame count and raster
-    (``uniserve_models.media.video.Config``). Its native output is cut at the legal
-    output frame slices of ``frame_slices``, and each slice is reconstructed
-    from one window of the packed latent into one native segment. Subclasses
-    define the slices, the native output layout, each slice's ``segment``,
-    the decoder input of a segment's window (``window_input``) and
+    (``uniserve_models.media.video.Config``). Its native output is cut at the
+    legal output frame slices of ``frame_slices``, and each slice is
+    reconstructed from one window of the packed latent into one native segment.
+    Subclasses define the slices, the native output layout, each slice's
+    ``segment``, the decoder input of a segment's window (``window_input``) and
     ``unpack_latents``: the mathematical conversion from a complete packed
     latent to one window's decoder input.
 

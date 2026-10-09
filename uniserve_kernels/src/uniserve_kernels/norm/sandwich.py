@@ -1,13 +1,13 @@
 """Sandwich RMS normalization of a residual stream in one launch.
 
-The Triton kernel here backs ``uniserve_models.nn.functional.sandwich_rms_norm``,
-which defines the numbers with its portable composition, allocates the
-outputs and raises on CUDA with the reason :func:`unsupported` reports. One
-program owns one contiguous row: it normalizes and sums the updates,
-normalizes the sum, adds it to the residual, applies the optional device
-scale, stores the stream and then every requested normalization of that
-stream. Each stored intermediate of the composition rounds to the row dtype
-at the same point.
+The Triton kernel here backs
+``uniserve_models.nn.functional.sandwich_rms_norm``, which defines the numbers
+with its portable composition, allocates the outputs and raises on CUDA with the
+reason :func:`unsupported` reports. One program owns one contiguous row: it
+normalizes and sums the updates, normalizes the sum, adds it to the residual,
+applies the optional device scale, stores the stream and then every requested
+normalization of that stream. Each stored intermediate of the composition rounds
+to the row dtype at the same point.
 
 Every normalization of a row evaluates exactly as
 ``uniserve_kernels.norm.rms.rms_norm`` does on that row: the same

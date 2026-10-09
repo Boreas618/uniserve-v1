@@ -171,7 +171,7 @@ class DenoisingRunner(
             noise=noise,
             state=state,
             constants=self.context.constants,
-            workspace=self.context.workspace,
+            workspace=self.context.workspace_views,
         )
 
     def prepare_state(
@@ -202,7 +202,7 @@ class DenoisingRunner(
             schedules,
             state,
             self.context.constants,
-            self.context.workspace,
+            self.context.workspace_views,
         )
         return self._run(call)
 
@@ -232,7 +232,7 @@ class AudioRunner(ModelRunner[AudioDecoder, int]):
             self.model.decode,
             latents,
             num_samples=num_samples,
-            workspace=self.context.workspace,
+            workspace=self.context.workspace_views,
         )
 
 
@@ -271,5 +271,5 @@ class VideoProcessor(ModelRunner[VideoPostprocessor, video.Config]):
             sizes=sizes,
             state=state,
             constants=self.context.constants,
-            workspace=self.context.workspace,
+            workspace=self.context.workspace_views,
         )

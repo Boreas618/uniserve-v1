@@ -22,8 +22,8 @@ them:
 - :func:`condition` turns the self-conditioning product into the next
   step's embedding.
 
-``uniserve_models.diffusion.canvas`` calls these kernels and defines the portable
-formulas they follow; its module documentation states the numerical
+``uniserve_models.diffusion.canvas`` calls these kernels and defines the
+portable formulas they follow; its module documentation states the numerical
 contract, including where the kernels round differently.
 """
 

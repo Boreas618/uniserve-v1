@@ -1,8 +1,8 @@
 """Dense and quantized projections over bound or standalone matmul operators.
 
 ``apply_linear`` and ``apply_merged_linear`` also accept an already-bound
-operator; the layers in :mod:`uniserve_models.nn.linear` supply theirs through the
-active execution context.
+operator; the layers in :mod:`uniserve_models.nn.linear` supply theirs through
+the active execution context.
 """
 
 from __future__ import annotations

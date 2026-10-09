@@ -19,9 +19,9 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from uniserve_models import siglip
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.model import TransformerDecoder
-from uniserve_models import siglip
 
 from . import vae
 

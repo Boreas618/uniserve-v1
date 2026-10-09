@@ -110,6 +110,16 @@ pub(crate) struct Inputs {
 }
 
 impl Inputs {
+    /// The inputs host media calls read in place from their exports.
+    pub(crate) fn borrowed(&self) -> HashSet<BufferId> {
+        self.state
+            .inputs
+            .iter()
+            .filter(|(_, input)| matches!(input, Input::Borrowed))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// The KV import of an install call's source export.
     pub(crate) fn cache_import(&self, source: BufferId) -> Option<&PendingImport> {
         match self.state.inputs.get(&source) {

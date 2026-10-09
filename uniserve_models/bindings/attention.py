@@ -363,7 +363,10 @@ class AttentionBinding:
             raise RuntimeError("this attention layer has no bound prefix state")
 
         if self.module.context_parallel is not None:
-            from uniserve_models.nn.attention import SequenceLengths, VarlenInput
+            from uniserve_models.nn.attention import (
+                SequenceLengths,
+                VarlenInput,
+            )
 
             count = indices.numel()
             if count not in self.cache_batches:

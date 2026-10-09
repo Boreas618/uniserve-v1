@@ -7,9 +7,9 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from tests.python.fixtures.checkpoints import qwen_checkpoint
+from uniserve_models import catalog as models
 from uniserve_models.nn.linear import Linear
 from uniserve_models.quantization import QuantizedTensor
-from uniserve_models import catalog as models
 
 pytestmark = pytest.mark.integration
 

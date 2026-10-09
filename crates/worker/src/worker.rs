@@ -41,6 +41,7 @@ use crate::capacity::device::{DeviceBudget, total_bytes};
 use crate::capacity::plan::{
     LatentPlan, Plan, Report, TokenFacts, TokenLayout, page_size, product_bytes,
 };
+use crate::capacity::video::VideoCapacity;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::Executor;
@@ -60,6 +61,7 @@ use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::token::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
 use crate::executor::forward::token::warmup::TextWarmup;
 use crate::executor::forward::transfer::TransferRuntime;
+use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
 use crate::launch::Endpoint;
@@ -68,6 +70,7 @@ use crate::model::components::Capability;
 use crate::model::image::ImageModel;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
+use crate::model::video::{VideoModel, placed_denoiser};
 use crate::model::{
     ComponentMesh, Description, ExpertPartition, LoadedModel, ModelFacts, sequence_kind,
 };
@@ -227,6 +230,13 @@ impl Worker {
         )
         .map_err(phase("load"))?;
         let facts = model.facts(&interface, &launch).map_err(phase("load"))?;
+        let video = if model.video_decoder {
+            let denoiser = placed_denoiser(&model.declarations, &config.deployment_components)
+                .map_err(phase("load"))?;
+            Some(VideoModel::new(&interface, model.handle(), denoiser).map_err(phase("load"))?)
+        } else {
+            None
+        };
         drop(loading);
         if launch.stub {
             // The stub encodes many small images in tests.
@@ -262,7 +272,7 @@ impl Worker {
         };
 
         let planning = range(c"uniserve.worker.plan", None);
-        let plan = plan(
+        let (plan, video_capacity) = plan(
             &launch,
             &interface,
             &mut config,
@@ -272,6 +282,7 @@ impl Worker {
             budget.as_ref(),
             &components,
             lanes.lanes().len().max(1),
+            video.as_ref(),
         )
         .map_err(phase("capacity"))?;
         if let Some(budget) = &budget {
@@ -342,23 +353,28 @@ impl Worker {
             weights: weights.as_ref().map(WeightRuntime::prefetch),
         })
         .map_err(phase("bind"))?;
-        let image = ImageRuntime::start(ImageStartup {
-            interface: &interface,
-            config: &config,
-            request_slots: info.request_slots as usize,
-            queue_depth: launch.ipc.queue_depth,
-            host_capacity: info.host_lane_capacity as usize,
-            model: &model,
-            lanes: &lanes,
-            storage: &storage,
-            latent: plan.latent,
-            components: &mut components,
-            workspaces: &mut workspaces,
-            graphs: &mut graphs,
-            preparation,
-            peers: Some(&peers),
-        })
-        .map_err(phase("bind"))?;
+        // A video model's encoders and denoiser run in the video runtime.
+        let image = if video.is_some() {
+            None
+        } else {
+            ImageRuntime::start(ImageStartup {
+                interface: &interface,
+                config: &config,
+                request_slots: info.request_slots as usize,
+                queue_depth: launch.ipc.queue_depth,
+                host_capacity: info.host_lane_capacity as usize,
+                model: &model,
+                lanes: &lanes,
+                storage: &storage,
+                latent: plan.latent,
+                components: &mut components,
+                workspaces: &mut workspaces,
+                graphs: &mut graphs,
+                preparation,
+                peers: Some(&peers),
+            })
+            .map_err(phase("bind"))?
+        };
         let canvas = CanvasRuntime::start(CanvasStartup {
             interface: &interface,
             config: &config,
@@ -386,10 +402,38 @@ impl Worker {
             }
             reserve_join_pools(&interface, &config, experts, &mut graphs).map_err(phase("bind"))?;
         }
+        let mut lanes = lanes;
+        let video_runtime = match (video, video_capacity) {
+            (Some(video), Some(capacity)) => Some(
+                VideoRuntime::create(RuntimeSetup {
+                    interface: &interface,
+                    loaded: model.handle(),
+                    model: video,
+                    capacity,
+                    info: &info,
+                    config: &config,
+                    components: &components,
+                    lanes: &mut lanes,
+                    graphs: &mut graphs,
+                    attention: facts.attention_backend.clone(),
+                    products: device
+                        .cuda_index()
+                        .map(|index| storage.tensors.arena(StorageDevice::Cuda(index)))
+                        .transpose()
+                        .map_err(phase("storage"))?,
+                })
+                .map_err(phase("storage"))?,
+            ),
+            _ => None,
+        };
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
         backend.set_rank_storage(storage);
         let text_warmup = text.is_some();
+        let video_warmup = video_runtime.is_some();
+        if let Some(runtime) = video_runtime {
+            backend.set_video(runtime);
+        }
         if let Some(text) = text {
             backend.set_text(text);
         }
@@ -448,6 +492,9 @@ impl Worker {
         )
         .map_err(|error| error.with_phase("executor"))?;
         let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
+        if video_warmup {
+            hooks.push(Box::new(VideoWarmup));
+        }
         if image_warmup {
             hooks.push(Box::new(ImageWarmup));
         }
@@ -822,6 +869,13 @@ impl Worker {
                 .add(&label, &binding.device.to_string(), &kernels)
                 .map_err(phase("warmup"))?;
         }
+        if let Some(video) = executor.backend_mut().video_mut() {
+            for (label, kernels) in video.kernels().map_err(phase("warmup"))? {
+                records
+                    .add(&label, &self.config.device, &kernels)
+                    .map_err(phase("warmup"))?;
+            }
+        }
         if let Some(canvas) = executor.backend_mut().canvas_mut() {
             for (label, kernels) in canvas.kernels().map_err(phase("warmup"))? {
                 records
@@ -1076,7 +1130,8 @@ fn plan(
     budget: Option<&DeviceBudget>,
     components: &Components,
     unit_columns: usize,
-) -> Result<Plan> {
+    video: Option<&VideoModel>,
+) -> Result<(Plan, Option<VideoCapacity>)> {
     let device = config.primary_device();
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
         config.pool_storage_bytes =
@@ -1099,11 +1154,6 @@ fn plan(
         &world.host,
     )?;
     config.block_size = Some(block_size);
-    if model.video_decoder || declarations.has(Capability::VideoPostprocessor) {
-        return Err(Error::Unsupported(
-            "video models are planned and served by the video runtime".into(),
-        ));
-    }
 
     let dedicated = config.role == "experts";
     let held: Vec<&str> = launch.components.keys().map(String::as_str).collect();
@@ -1130,6 +1180,26 @@ fn plan(
             .filter(|(kind, _)| supported.contains(&CallKind::Media(*kind)))
             .collect()
     };
+    let capacity = match video {
+        Some(video) => {
+            let denoising = components.get(&video.denoiser).is_some();
+            let decoding = components
+                .placed()
+                .iter()
+                .any(|placed| placed.has(Capability::VideoDecoder));
+            Some(crate::capacity::video::plan(
+                video,
+                config,
+                &facts.outputs,
+                denoising,
+                decoding,
+            )?)
+        }
+        None => None,
+    };
+    let outputs = capacity
+        .as_ref()
+        .map_or(&facts.outputs, |capacity| &capacity.outputs);
     let infos: Vec<ComponentInfo> = launch
         .components
         .iter()
@@ -1137,7 +1207,7 @@ fn plan(
             |(name, config): (&String, &ComponentConfig)| ComponentInfo {
                 name: name.clone(),
                 config: config.clone(),
-                outputs: facts.outputs.get(name).cloned().unwrap_or_default(),
+                outputs: outputs.get(name).cloned().unwrap_or_default(),
             },
         )
         .collect();
@@ -1158,6 +1228,20 @@ fn plan(
         weight_formats: facts.weight_formats.clone(),
         activation_formats: facts.activation_formats.clone(),
     };
+    if let (Some(video), Some(capacity)) = (video, capacity) {
+        let plan = video_layout(
+            report,
+            config,
+            launch,
+            declarations,
+            components,
+            video,
+            &capacity,
+            budget,
+            &world.host,
+        )?;
+        return Ok((plan, Some(capacity)));
+    }
 
     let element_bytes = DType::from_name(&config.model_dtype)
         .map(DType::bytes)
@@ -1277,7 +1361,69 @@ fn plan(
         let (prefill, decode) = bounds.graph_calls();
         plan.bound_graph_calls(prefill, decode);
     }
-    Ok(plan)
+    Ok((plan, None))
+}
+
+/// The layout of a video rank: request slots sized by every rank's storage
+/// for that many resident requests, agreed over the group.
+#[allow(clippy::too_many_arguments)]
+fn video_layout(
+    report: Report,
+    config: &mut WorkerConfig,
+    launch: &WorkerLaunch,
+    declarations: &crate::model::components::Declarations,
+    components: &Components,
+    video: &VideoModel,
+    capacity: &VideoCapacity,
+    budget: Option<&DeviceBudget>,
+    group: &crate::parallel::host::HostGroup,
+) -> Result<Plan> {
+    let queue_depth = launch.ipc.queue_depth;
+    let deployment: Vec<&str> = if config.deployment_components.is_empty() {
+        launch.components.keys().map(String::as_str).collect()
+    } else {
+        config
+            .deployment_components
+            .iter()
+            .map(String::as_str)
+            .collect()
+    };
+    let routes = declarations.routes(&deployment)?;
+    let held: std::collections::BTreeSet<String> = components
+        .placed()
+        .iter()
+        .map(|placed| placed.name.clone())
+        .collect();
+    let local = crate::capacity::video::local_product_bytes(&capacity.outputs, &routes, &held);
+    let codec_ranks = launch
+        .components
+        .get("video_codec")
+        .map(|component| component.ranks.len());
+    if let (Device::Cuda(index), Some(budget)) = (config.primary_device(), budget) {
+        let available = budget.budget(index, config.kv_storage_fraction)?.available;
+        let maximum = config.max_request_pool_size;
+        let minimum = config.min_request_pool_size.min(maximum).max(1);
+        let facts = capacity.facts(video, maximum, local, codec_ranks)?;
+        let requirements = crate::capacity::plan::slot_requirements(
+            config,
+            queue_depth,
+            &facts,
+            minimum,
+            maximum,
+        )?;
+        let slots = crate::capacity::plan::request_slots(&requirements, minimum, available, group)?;
+        config.max_request_pool_size = slots;
+        config.max_batch_calls = config.max_batch_calls.min(slots);
+        config.max_batch_tokens = config.max_batch_tokens.min(slots);
+    }
+    let facts = capacity.facts(video, config.max_request_pool_size, local, codec_ranks)?;
+    crate::capacity::plan::request_layout(
+        report,
+        config,
+        queue_depth,
+        &facts,
+        components.holds_host(),
+    )
 }
 
 /// Whether routed experts use an expert exchange, and the attention ranks of

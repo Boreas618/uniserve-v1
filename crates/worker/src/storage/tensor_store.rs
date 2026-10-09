@@ -1043,9 +1043,10 @@ impl TensorStore {
             None => reference.shape_bound.contains_shape(&shape),
         };
         if !matches {
-            return Err(Error::Invalid(
-                "tensor export changes its declared shape".into(),
-            ));
+            return Err(Error::Invalid(format!(
+                "tensor export of shape {shape:?} changes the declared shape of output {} of {:?}",
+                reference.output_index, reference.producer_call_id
+            )));
         }
         let extent = value.numel();
         if extent > target.numel() {
@@ -2015,7 +2016,7 @@ impl TensorStore {
         })();
         if let Err(error) = result {
             if let Err(cleanup) = exports::release(&locations) {
-                eprintln!("failed to revoke a failed product export: {cleanup}");
+                tracing::warn!(target: "uniserve_worker.storage", "failed to revoke a failed product export: {cleanup}");
             }
             return Err(error);
         }
