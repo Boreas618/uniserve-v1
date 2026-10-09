@@ -33,10 +33,8 @@ pub struct Lanes {
 }
 
 impl Lanes {
-    /// Create the streams of `devices`. `event_slots` bounds each stream's
-    /// outstanding submission fences; a lane bounded by `max_inflight` keeps
-    /// one more than its bound.
-    pub fn create(config: &WorkerConfig, devices: &[Device], event_slots: usize) -> Result<Self> {
+    /// Create the streams of `devices`.
+    pub fn create(config: &WorkerConfig, devices: &[Device]) -> Result<Self> {
         let cuda: Vec<DeviceId> = devices
             .iter()
             .filter_map(|device| device.cuda_index().map(DeviceId))
@@ -61,12 +59,7 @@ impl Lanes {
                 .iter()
                 .map(|lane| u32::try_from(lane.sm_budget).unwrap_or(u32::MAX))
                 .collect();
-            let slots: Vec<usize> = config
-                .lanes
-                .iter()
-                .map(|lane| lane.max_inflight.unwrap_or(event_slots.saturating_sub(1)) + 1)
-                .collect();
-            let streams = CUDAStream::partition(device, &counts, &slots)?;
+            let streams = CUDAStream::partition(device, &counts)?;
             lanes.lanes = config
                 .lanes
                 .iter()
@@ -76,13 +69,11 @@ impl Lanes {
                 .collect();
         } else {
             for &device in &cuda {
-                lanes
-                    .devices
-                    .push(CUDAStream::create(device, event_slots.max(1))?);
+                lanes.devices.push(CUDAStream::create(device)?);
             }
         }
         for &device in &cuda {
-            lanes.preparation.push(CUDAStream::create(device, 1)?);
+            lanes.preparation.push(CUDAStream::create(device)?);
         }
         Ok(lanes)
     }

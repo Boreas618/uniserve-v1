@@ -240,8 +240,7 @@ impl Worker {
         drop(loading);
 
         let devices: Vec<Device> = config.devices().collect();
-        let mut lanes = Lanes::create(&config, &devices, launch.ipc.queue_depth + 1)
-            .map_err(phase("streams"))?;
+        let mut lanes = Lanes::create(&config, &devices).map_err(phase("streams"))?;
         let node = host_name().map_err(phase("host"))?;
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.

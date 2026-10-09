@@ -120,7 +120,7 @@ impl<T> StreamCommunicator<T> {
     }
 
     fn start(&mut self, call: impl FnOnce(&mut Self) -> Result<()>) -> Result<Arc<Event>> {
-        let resources = self.resources()?;
+        let resources = self.resources_mut()?;
         resources.transfer.wait(&resources.computation)?;
         let completed = Arc::new(Event::new(EventFlags::default()));
         let result = call(self);

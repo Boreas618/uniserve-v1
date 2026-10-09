@@ -72,7 +72,7 @@ fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
                     let device = rank as i32;
                     let host =
                         HostGroup::connect(rendezvous, rank, 2, Duration::from_secs(60)).unwrap();
-                    let stream = CUDAStream::create(DeviceId(device), 2).unwrap();
+                    let stream = CUDAStream::create(DeviceId(device)).unwrap();
                     // Logical order differs from world order: world rank 1
                     // is the first member.
                     let groups = [CollectiveGroup {
