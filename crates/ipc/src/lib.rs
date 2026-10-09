@@ -86,6 +86,8 @@ pub mod codec;
 pub mod iceoryx;
 /// The launch descriptor shared by the engine, `uniserve-host` and the rank.
 pub mod launch;
+/// Messages between the head's engine and a host's `uniserve-host` launcher.
+pub mod launcher;
 /// Stream-socket rank transport for ranks on other hosts.
 pub mod socket;
 #[allow(missing_docs, warnings)]
@@ -115,7 +117,7 @@ mod request;
 mod tensor;
 
 pub use call::*;
-pub use config::LaneConfig;
+pub use config::{LaneConfig, LaneConfigError};
 pub use info::*;
 pub use request::*;
 pub use tensor::*;

@@ -47,23 +47,6 @@ from .state import Config, State
 _FIELDS = ("key", "value")
 
 
-def async_tensor_h2d(
-    values: Sequence[int], *, dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    """Copy host integers into a new tensor on ``device`` without a host wait.
-
-    On CUDA the values are written to pinned memory from PyTorch's caching
-    host allocator and copied non-blocking on the current stream. The
-    allocator reuses that pinned block only after the copy completes, so the
-    calling thread never waits for device work queued ahead of the copy, and
-    the result is ordered before every later operation on the stream. Other
-    devices receive an ordinary copy.
-    """
-    pinned = device.type == "cuda"
-    host = torch.tensor(values, dtype=dtype, pin_memory=pinned)
-    return host.to(device, non_blocking=pinned)
-
-
 @dataclass(frozen=True, slots=True)
 class CacheGroup:
     """Cache layers that share a history window and a K/V page shape.
@@ -325,10 +308,6 @@ class UnitPool:
         self.num_units = num_units
         self._fields = {name: fields[name] for name in expected}
         self.device = self._fields["key.values"].device
-        # Groups storing different element types reinterpret each other's
-        # stale bytes, which need not decode as finite (`recycle_units`).
-        self._mixed_types = len({group.dtype for group in planes.groups}) > 1
-
         quantizer = Quantizer("fp8", axis=0) if planes.quantized else None
         self._configs = dict(configs)
         self._states: dict[str, State] = {}
@@ -562,43 +541,6 @@ class UnitPool:
         for name, tensor in self._fields.items():
             # Every field is laid out [columns, num_units, ...].
             tensor.index_fill_(1, index, int(name.endswith(".scale")))
-
-    def recycle_units(self, units: torch.Tensor | Sequence[int]) -> None:
-        """Prepare units that held earlier tokens for a new owner.
-
-        Readers never weigh tokens a unit's owner has not written: every
-        attention kernel replaces the scores of unwritten positions, so
-        their values contribute exactly zero while they are finite. The pool
-        starts zeroed and writers store finite values, so when every group
-        stores one element type, stale bytes decode as finite values in
-        every group's view and stay in place. What a writer reads is reset:
-        the FP8 scales and initialization flags that decide whether a write
-        grows a block's scale. Unquantized writes only set flags, so an
-        unquantized pool of one element type needs no device work. A pool
-        whose groups store different element types is reset completely
-        (``zero_units``), since stale bytes of one type need not decode as
-        finite values of another.
-        """
-        if self._mixed_types:
-            self.zero_units(units)
-            return
-        if not self.planes.quantized:
-            return
-        self.reset_flags(units)
-
-    def reset_flags(self, units: torch.Tensor | Sequence[int]) -> None:
-        """Clear the selected units' initialization flags and FP8 scales.
-
-        This is the device work of ``recycle_units`` for a quantized pool of
-        one element type.
-        """
-        index = self._index(units)
-        if not index.numel():
-            return
-        for field in _FIELDS:
-            self._fields[f"{field}.initialized"].index_fill_(1, index, False)
-            if self.planes.quantized:
-                self._fields[f"{field}.scale"].index_fill_(1, index, 1)
 
     def mark_initialized(self, units: torch.Tensor | Sequence[int]) -> None:
         """Commit externally transferred values and scales of whole units.

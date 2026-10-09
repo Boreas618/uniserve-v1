@@ -3,9 +3,9 @@
 //! The generated code lands in `${OUT_DIR}/flatbuffers/mod.rs`, which the
 //! crate's `schema` module includes and the `codec` module maps to the owned
 //! protocol types. `flatbuffers-build` emits `cargo:rerun-if-changed` for the
-//! schema file, so editing it regenerates the bindings. The `_uniserve_ipc`
-//! Python extension (`worker-ipc-py`) links this crate, so an installed
-//! extension keeps the schema it was built with until it is rebuilt.
+//! schema file, so editing it regenerates the bindings. The engine and the
+//! worker library both link this crate, so an installed worker library keeps
+//! the schema it was built with until it is rebuilt.
 
 /// Compiles the worker schema for borrowed tables and direct builders.
 ///

@@ -396,6 +396,74 @@ fn cancelled_reads_keep_credits_until_their_copy_drains() {
     transports.close().unwrap();
 }
 
+/// A device export that does not fit the VMM pool is carried to its consumer
+/// by a host mechanism, and fails when the rank binds none: the local
+/// location alone reaches no other rank.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
+    let _driver = exclusive_driver();
+    let stream = stream();
+    // 5 MiB of f32, more than the 4 MiB pool `transports` configures.
+    let elements: i64 = 5 << 18;
+    let memory = Memory::device(DEVICE, elements as usize * 4).unwrap();
+    let spans = Spans::single(counting(&[elements], memory, &stream)).unwrap();
+    let settle = |transports: &Transports, capacity: &Capacity| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while capacity.used() != 0 && std::time::Instant::now() < deadline {
+            transports.reap().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(capacity.used(), 0);
+    };
+
+    let (device_only, capacity) = transports(
+        &[TransportKind::Local, TransportKind::CudaVmm],
+        "producer",
+        0,
+    );
+    let exported = exports::export(
+        &device_only,
+        &spans,
+        None,
+        &[1],
+        false,
+        Some(&stream),
+        |_| Ok(()),
+    );
+    assert!(matches!(exported, Err(Error::Resource(_))));
+    settle(&device_only, &capacity);
+    device_only.close().unwrap();
+
+    let (with_shared, capacity) = transports(
+        &[
+            TransportKind::Local,
+            TransportKind::CudaVmm,
+            TransportKind::Shm,
+        ],
+        "producer",
+        0,
+    );
+    let locations = exports::export(
+        &with_shared,
+        &spans,
+        None,
+        &[1],
+        false,
+        Some(&stream),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let kinds: Vec<_> = locations
+        .iter()
+        .map(|(_, locator)| TransportKind::of(locator))
+        .collect();
+    assert_eq!(kinds, [TransportKind::Local, TransportKind::Shm]);
+    exports::release(&locations).unwrap();
+    settle(&with_shared, &capacity);
+    with_shared.close().unwrap();
+}
+
 /// Producer half: export a device tensor through a CUDA VMM pool chunk to
 /// consumer slot 1, run this test binary as the consumer, and require the
 /// export to retire only after the consumer acknowledged its read.
