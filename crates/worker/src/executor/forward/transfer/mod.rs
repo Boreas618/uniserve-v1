@@ -9,9 +9,8 @@
 //!   a latent input and output publishes its request's committed trajectory
 //!   version from the latent pool instead ([`latents`]).
 //! - **KV export** (`TransferMode::KvExport`): each call publishes its
-//!   request's visible KV extent ([`kv`]). On a rank with an image runtime
-//!   the image runtime serves it as an image's conditioning in its own
-//!   batches; the transfer runtime serves it elsewhere.
+//!   request's visible KV extent ([`kv`]), which an image's latent
+//!   preparation and denoising calls name as their conditioning.
 //! - **KV install** (`TransferMode::KvInstall`): each call adopts the KV
 //!   import its batch prepared into its slot's pages ([`kv`]).
 //!
@@ -162,9 +161,6 @@ pub(crate) fn execute(
     batch: &mut WorkerBatch,
     kind: CallKind,
 ) -> std::result::Result<(), WorkerError> {
-    if kind == CallKind::Transfer(TransferMode::KvExport) && backend.image_mut().is_some() {
-        return super::image::execute(backend, batch, kind);
-    }
     let plan = Arc::clone(batch.shared_plan());
     match run(backend, &plan, batch.inputs(), kind) {
         Ok(launched) => {
