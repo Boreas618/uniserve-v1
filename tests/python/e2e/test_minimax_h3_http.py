@@ -1,10 +1,10 @@
 """The MiniMax-H3 base checkpoint serves text-to-video on every named canvas.
 
 Serves the diffusers root's ``transformer`` on the published Ulysses-4
-deployment and requests one five-second ``t2va`` video at each named aspect
-ratio of the canvas rule. Every response is a complete MP4 at the ratio's
-canvas; the capabilities report the handshake's schedule and canvases, and
-the request body without a task is refused.
+deployment, preparing every named aspect ratio of the canvas rule, and
+requests one five-second ``t2va`` video at each. Every response is a complete
+MP4 at the ratio's canvas; the capabilities report the handshake's schedule
+and the prepared canvases, and the request body without a task is refused.
 """
 
 from __future__ import annotations
@@ -66,6 +66,8 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         str(port),
         # Five seconds bound the layouts startup prepares: two frame counts
         # at each of the six canvases and one text capacity.
+        "--video-aspect-ratios",
+        ",".join(CANVASES),
         "--max-video-seconds",
         "5",
         "--max-model-len",
@@ -87,8 +89,12 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
             "flow_shift": 12.0,
             "audio_flow_shift": 3.0,
         }
-        assert video["canvas"]["canvases"] is None
-        assert set(video["canvas"]["aspect_ratios"]) == set(CANVASES)
+        assert video["canvas"]["canvases"] == [
+            {"width": width, "height": height}
+            for width, height in CANVASES.values()
+        ]
+        assert video["canvas"]["short_edges"] == [768]
+        assert video["canvas"]["aspect_ratios"] == list(CANVASES)
 
         legacy = client.post(
             "/v1/videos/sync",
