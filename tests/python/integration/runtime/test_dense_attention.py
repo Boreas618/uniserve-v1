@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 
 from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.interface import graphs
 from uniserve_models.nn.attention import Attention, AttentionBatch, DenseInput
-from uniserve_models.runtime import CUDAGraph, CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -91,10 +91,9 @@ def test_dense_attention_preserves_heads_and_graph_inputs(
     # The existing paged/segmented attention conformance uses 2e-2 for half
     # precision against an independently normalized reference.
     tolerance = 2e-2
-    stream = CUDAStream.external(torch.cuda.Stream(device=device))
-    stream.wait(torch.cuda.current_stream(device))
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
     with (
-        stream,
         ExecutionContext(
             attention, attention=provider, stream=stream
         ) as context,
@@ -104,14 +103,15 @@ def test_dense_attention_preserves_heads_and_graph_inputs(
         torch.testing.assert_close(
             actual, reference(), rtol=tolerance, atol=tolerance
         )
-        with CUDAGraph(context=context) as graph:
-            graph.capture(execute)
-            q.mul_(0.5)
-            v.add_(0.25)
-            actual = graph.replay()
-            torch.testing.assert_close(
-                actual, reference(), rtol=tolerance, atol=tolerance
-            )
+        graph = graphs.capture(execute, stream=stream)
+        q.mul_(0.5)
+        v.add_(0.25)
+        actual = graph.replay()
+        torch.testing.assert_close(
+            actual, reference(), rtol=tolerance, atol=tolerance
+        )
+        stream.synchronize()
+        graph.release()
 
 
 @pytest.mark.parametrize(
@@ -131,10 +131,9 @@ def test_fp32_dense_attention_preserves_precision_and_visibility(
     attention = Attention(heads, kv_heads, width)
     inputs = AttentionBatch.single(DenseInput(causal=causal, mask=None))
 
-    stream = CUDAStream.external(torch.cuda.Stream(device=device))
-    stream.wait(torch.cuda.current_stream(device))
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
     with (
-        stream,
         ExecutionContext(attention, attention="auto", stream=stream) as context,
     ):
         context.prepare(None)
@@ -187,10 +186,9 @@ def test_dense_calls_without_a_native_kernel_raise(dtype, mask, message):
     attention = Attention(8, 2, 128)
     inputs = AttentionBatch.single(DenseInput(causal=True, mask=visible))
 
-    stream = CUDAStream.external(torch.cuda.Stream(device=device))
-    stream.wait(torch.cuda.current_stream(device))
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
     with (
-        stream,
         ExecutionContext(attention, attention="auto", stream=stream) as context,
     ):
         context.prepare(None)

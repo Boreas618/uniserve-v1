@@ -110,8 +110,8 @@ def test_variable_image_grids_match_independent_encoder(tmp_path):
 @torch.inference_mode()
 def test_image_encoding_replay_reads_updated_pixels():
     from uniserve_models.bindings.context import ExecutionContext
+    from uniserve_models.interface import graphs
     from uniserve_models.model import TextSize
-    from uniserve_models.runtime import CUDAGraph
 
     torch.manual_seed(987)
     config = siglip.Config(
@@ -134,15 +134,17 @@ def test_image_encoding_replay_reads_updated_pixels():
         torch.randn(3, 4, 4, device="cuda:0", dtype=torch.bfloat16),
     )
     inputs = VisionInput(pixels, (None, None), (None, None))
-    with ExecutionContext(encoder) as context:
+    stream = torch.cuda.Stream(device="cuda:0")
+    stream.wait_stream(torch.cuda.current_stream("cuda:0"))
+    with ExecutionContext(encoder, stream=stream) as context:
         context.prepare(TextSize(8, 2))
         encoder.encode(inputs)
-        with CUDAGraph(context=context) as graph:
-            graph.capture(lambda: encoder.encode(inputs))
-            pixels[0].mul_(0.5)
-            pixels[1].add_(0.25)
-            result = graph.replay()
-            expected = encoder.encode(inputs)
-            for actual, target in zip(result, expected, strict=True):
-                torch.testing.assert_close(actual, target, rtol=0, atol=0)
-            torch.cuda.synchronize()
+        graph = graphs.capture(lambda: encoder.encode(inputs), stream=stream)
+        pixels[0].mul_(0.5)
+        pixels[1].add_(0.25)
+        result = graph.replay()
+        expected = encoder.encode(inputs)
+        for actual, target in zip(result, expected, strict=True):
+            torch.testing.assert_close(actual, target, rtol=0, atol=0)
+        torch.cuda.synchronize()
+        graph.release()
