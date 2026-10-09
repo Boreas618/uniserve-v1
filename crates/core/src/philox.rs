@@ -5,10 +5,10 @@
 //! depth, completion order, and replay.
 //!
 //! The engine simulator draws through this module; the model worker draws
-//! through `uniserve.nn.rng`, which implements the same mapping in Python. The
-//! two must stay bit-identical in the key fold, counter layout, round
-//! function, and uniform conversion, or simulated and real sampling diverge
-//! for the same seed.
+//! through `uniserve_models.nn.rng`, which implements the same mapping in
+//! Python. The two must stay bit-identical in the key fold, counter layout,
+//! round function, and uniform conversion, or simulated and real sampling
+//! diverge for the same seed.
 //!
 //! Layout:
 //!

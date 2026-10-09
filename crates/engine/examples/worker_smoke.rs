@@ -1,7 +1,7 @@
 //! Demonstrates worker startup, capability negotiation, and execution over the
 //! worker IPC transport.
 //!
-//! One CPU rank is launched with `stub: true`, so the Python worker runs its
+//! One CPU rank is launched with `stub: true`, so the rank runs its
 //! deterministic test model without weights. The example prints the reported
 //! worker info, drives `Scheduler::step` on the main thread instead of a
 //! scheduler thread, and prints PASS when every request finished. Unlike
