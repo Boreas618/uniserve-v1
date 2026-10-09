@@ -5,9 +5,9 @@ one E4M3 dequantization scale per row; magnitude variants store one absolute
 maximum per program for :func:`uniserve_kernels.reduction.absmax`.
 
 Launchers write caller-supplied outputs and validate nothing. The callers in
-``uniserve_models.nn.functional`` run :func:`unsupported` first, size the outputs,
-and raise on CUDA when it reports a reason; tensor operations evaluate the
-same formulas only off CUDA.
+``uniserve_models.nn.functional`` run :func:`unsupported` first, size the
+outputs, and raise on CUDA when it reports a reason; tensor operations evaluate
+the same formulas only off CUDA.
 
 Every input is addressed as rows with unit channel stride: packed inputs
 ``[..., 2 * width]`` whose leading axes flatten to rows of one stride (see

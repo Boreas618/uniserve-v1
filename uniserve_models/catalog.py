@@ -540,8 +540,8 @@ def _exclusions(model, declarations, sources, ignored, io):
     Each entry of ``ignored`` names either a model module path or a checkpoint
     tensor prefix. The result maps every module path that directly owns an
     excluded parameter to ``None``, which leaves that module unquantized in
-    ``uniserve_models.loading.weights.Config.quantization``. Opens each source in
-    ``sources`` to read its assignments.
+    ``uniserve_models.loading.weights.Config.quantization``. Opens each source
+    in ``sources`` to read its assignments.
 
     Raises:
         ValueError: ``ignored`` is not a tuple or list of strings, or an entry
@@ -1203,11 +1203,12 @@ def load_model(
 ) -> loading.Result[ModelT]:
     """Materialize the selected capability modules through the common loader.
 
-    ``precision`` names one of ``config.precisions`` and ``weights`` supplies
-    a weight configuration directly; with neither, ``config.weights``
-    applies. ``modules`` may narrow ``config.modules`` but not widen it.
+    ``precision`` names one of ``config.precisions`` and ``weights`` supplies a
+    weight configuration directly; with neither, ``config.weights`` applies.
+    ``modules`` may narrow ``config.modules`` but not widen it.
     ``exclude_modules`` adds to the exclusions already resolved in ``config``.
-    The remaining arguments pass through to ``uniserve_models.loading.load_model``.
+    The remaining arguments pass through to
+    ``uniserve_models.loading.load_model``.
 
     Raises:
         ValueError: Both ``precision`` and ``weights`` are given, the

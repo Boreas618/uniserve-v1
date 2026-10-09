@@ -1,14 +1,14 @@
 """Softmax top-k expert routing in one launch (CUDA).
 
 The kernel in ``csrc/topk_softmax.cu`` backs
-``uniserve_models.nn.functional.topk_softmax``, which defines the numbers with its
-tensor composition, allocates the outputs and raises on CUDA with the reason
+``uniserve_models.nn.functional.topk_softmax``, which defines the numbers with
+its tensor composition, allocates the outputs and raises on CUDA with the reason
 :func:`unsupported` reports. One warp routes one token and reproduces the
-composition's FP32 arithmetic and order: PyTorch's warp softmax over the
-scores, the k largest probabilities in descending order with equal ones in
-ascending expert order, their renormalization by PyTorch's butterfly row
-sum clamped below by the FP32 epsilon, and an optional per-expert scale.
-Outputs are int32 expert ids and FP32 weights, both ``[tokens, k]``.
+composition's FP32 arithmetic and order: PyTorch's warp softmax over the scores,
+the k largest probabilities in descending order with equal ones in ascending
+expert order, their renormalization by PyTorch's butterfly row sum clamped below
+by the FP32 epsilon, and an optional per-expert scale. Outputs are int32 expert
+ids and FP32 weights, both ``[tokens, k]``.
 
 The extension builds with :func:`uniserve_kernels.jit.load` on first use;
 :func:`unsupported` never compiles. Launches synchronize nothing, so CUDA

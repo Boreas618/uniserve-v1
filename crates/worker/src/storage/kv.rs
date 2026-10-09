@@ -387,7 +387,7 @@ impl KVCache {
             if let Some(task) = task
                 && let Err(cleanup) = task.cancel(true)
             {
-                eprintln!("failed to withdraw a KV import task: {cleanup}");
+                tracing::warn!(target: "uniserve_worker.storage", "failed to withdraw a KV import task: {cleanup}");
             }
         };
         if let Some(task) = &task {

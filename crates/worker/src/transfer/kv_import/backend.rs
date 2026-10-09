@@ -292,7 +292,7 @@ impl ImportBackend for KVImportBackend {
     }
 
     fn report(error: Error) {
-        eprintln!("KV import cleanup failed: {error}");
+        tracing::warn!(target: "uniserve_worker.transfer", "KV import cleanup failed: {error}");
     }
 
     fn note_cleanup(error: &mut Error, cleanup: Error) {
@@ -359,7 +359,7 @@ impl GroupCopy<'_> {
                 if let Some(retired) = retired.upgrade()
                     && let Err(error) = retired.reap()
                 {
-                    eprintln!("failed to retire KV imports: {error}");
+                    tracing::warn!(target: "uniserve_worker.transfer", "failed to retire KV imports: {error}");
                 }
             }));
             if cancelled {

@@ -174,14 +174,14 @@ def _scopes(db: sqlite3.Connection, prefix: str) -> dict[int, list[Scope]]:
         WHERE n.end IS NOT NULL AND n.end >= n.start
           AND (n.endGlobalTid IS NULL OR n.endGlobalTid = n.globalTid)
           AND (instr(coalesce(n.text, s.value), ?) = 1
-               OR instr(coalesce(n.text, s.value), 'uniserve_models.worker.') = 1)
+               OR instr(coalesce(n.text, s.value), 'uniserve.worker.') = 1)
         ORDER BY n.start, n.end DESC
         """,
         (prefix,),
     )
     for row in rows:
         batch_id = None
-        if row["name"].startswith("uniserve_models.worker."):
+        if row["name"].startswith("uniserve.worker."):
             batch_id = row["uint64Value"]
 
         scopes[row["globalTid"]].append(

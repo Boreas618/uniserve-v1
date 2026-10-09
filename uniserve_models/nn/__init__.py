@@ -1,7 +1,8 @@
 """Neural layers, parallel primitives and model operators.
 
-Numerical formulas live in :mod:`uniserve_models.nn.functional`; the modules exported
-here compose them with parameters, partitioning and bound execution resources.
+Numerical formulas live in :mod:`uniserve_models.nn.functional`; the modules
+exported here compose them with parameters, partitioning and bound execution
+resources.
 """
 
 from uniserve_models.nn.activation import GELUAndMul, SiLUAndMul, get_act_fn

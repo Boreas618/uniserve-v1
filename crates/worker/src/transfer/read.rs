@@ -340,7 +340,7 @@ impl Drop for Read {
             }),
         );
         if let Err(error) = deferred.and_then(|()| self.events.reap()) {
-            eprintln!("failed to retire transfer read fences: {error}");
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to retire transfer read fences: {error}");
         }
     }
 }
@@ -528,7 +528,7 @@ impl ReadBackend for NativeRead {
     }
 
     fn report(error: Error) {
-        eprintln!("transfer read cleanup failed: {error}");
+        tracing::warn!(target: "uniserve_worker.transfer", "transfer read cleanup failed: {error}");
     }
 }
 
@@ -788,7 +788,7 @@ pub(crate) fn submit(
     })();
     if let Err(error) = submitted {
         if let Err(cleanup) = task.cancel(true) {
-            eprintln!("failed to withdraw a transfer read: {cleanup}");
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to withdraw a transfer read: {cleanup}");
         }
         return Err(error);
     }
