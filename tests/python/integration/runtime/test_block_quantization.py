@@ -66,10 +66,10 @@ def test_block_encoding_and_scale_repacking_preserve_native_values(format):
 @torch.inference_mode()
 def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
     from uniserve_models.bindings.context import ExecutionContext
+    from uniserve_models.interface import graphs
     from uniserve_models.model import TextSize
     from uniserve_models.nn import Linear
     from uniserve_models.nn.functional import linear
-    from uniserve_models.runtime import CUDAGraph
 
     x = torch.full((128, 256), 2.0, dtype=torch.bfloat16, device="cuda:0")
     weight = torch.ones((128, 256), dtype=torch.bfloat16, device="cuda:0")
@@ -85,21 +85,23 @@ def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
     layer = Linear(256, 128, bias=False, dtype=x.dtype, device=x.device)
     layer.weight = torch.nn.Parameter(right, requires_grad=False)
     layer.input_quantizer = converter
-    with ExecutionContext(layer) as context:
+    stream = torch.cuda.Stream(device=x.device)
+    stream.wait_stream(torch.cuda.current_stream(x.device))
+    with ExecutionContext(layer, stream=stream) as context:
         context.prepare(TextSize(160, 1))
         assert layer(x, out=out) is out
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
-        with CUDAGraph(context=context) as graph:
-            graph.capture(lambda: layer(x, out=out))
-            x.mul_(2)
-            graph.replay()
-            encoded = converter.quantize(x)
-            expected = (
-                encoded.dequantize(dtype=torch.float32)
-                @ right.dequantize(dtype=torch.float32).T
-            ).bfloat16()
-            torch.testing.assert_close(out, expected, rtol=0, atol=0)
-            torch.cuda.synchronize(x.device)
+        graph = graphs.capture(lambda: layer(x, out=out), stream=stream)
+        x.mul_(2)
+        graph.replay()
+        encoded = converter.quantize(x)
+        expected = (
+            encoded.dequantize(dtype=torch.float32)
+            @ right.dequantize(dtype=torch.float32).T
+        ).bfloat16()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.cuda.synchronize(x.device)
+        graph.release()
 
 
 @pytest.mark.parametrize("format", [None, "fp8", "mxfp8", "nvfp4"])
@@ -109,9 +111,9 @@ def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
     format, branch_width
 ):
     from uniserve_models.bindings.context import ExecutionContext
+    from uniserve_models.interface import graphs
     from uniserve_models.model import TextSize
     from uniserve_models.nn import MergedColumnParallelLinear
-    from uniserve_models.runtime import CUDAGraph
 
     device = torch.device("cuda:0")
     generator = torch.Generator(device=device).manual_seed(718)
@@ -177,7 +179,9 @@ def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
     # FP32 accumulation over K=128 followed by a BF16 result and bias roundoff.
     unit = 2**-8
     bound = 2 * unit / (1 - 2 * unit) + 128 * 2**-24 / (1 - 128 * 2**-24)
-    with ExecutionContext(layer) as context:
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with ExecutionContext(layer, stream=stream) as context:
         context.prepare(TextSize(160, 1))
         initial = source[:3]
         if format in {"nvfp4", "mxfp8"}:
@@ -197,26 +201,24 @@ def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
             for name, branch in layer.projections.items()
         }
         layer(source, out=out)
-        with CUDAGraph(context=context) as graph:
-            graph.capture(lambda: layer(source, out=out))
-            source.mul_(2)
-            for branch in layer.projections.values():
-                if quantizer is None:
-                    branch.weight.mul_(2)
-                else:
-                    replacement = branch.weight.quantizer.quantize(
-                        branch.weight.dequantize() * 2
-                    )
-                    replacement = replacement.repack(
-                        scale_layout=branch.weight.scale_layout
-                    )
-                    for name, buffer in branch.weight.buffers().items():
-                        buffer.copy_(replacement.buffers()[name])
-            graph.replay()
-            for name, value in expected(source).items():
-                torch.testing.assert_close(out[name], value, rtol=bound, atol=0)
-            for name, value in retained.items():
-                torch.testing.assert_close(
-                    value, original[name], rtol=0, atol=0
+        graph = graphs.capture(lambda: layer(source, out=out), stream=stream)
+        source.mul_(2)
+        for branch in layer.projections.values():
+            if quantizer is None:
+                branch.weight.mul_(2)
+            else:
+                replacement = branch.weight.quantizer.quantize(
+                    branch.weight.dequantize() * 2
                 )
-            torch.cuda.synchronize(device)
+                replacement = replacement.repack(
+                    scale_layout=branch.weight.scale_layout
+                )
+                for name, buffer in branch.weight.buffers().items():
+                    buffer.copy_(replacement.buffers()[name])
+        graph.replay()
+        for name, value in expected(source).items():
+            torch.testing.assert_close(out[name], value, rtol=bound, atol=0)
+        for name, value in retained.items():
+            torch.testing.assert_close(value, original[name], rtol=0, atol=0)
+        torch.cuda.synchronize(device)
+        graph.release()

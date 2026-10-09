@@ -12,6 +12,7 @@ from uniserve_models.backends.attention import resolve
 from uniserve_models.backends.attention.torch import Backend as TorchBackend
 from uniserve_models.bindings.context import TensorBuffers
 from uniserve_models.cache import Config, mha
+from uniserve_models.cache.units import UnitPool
 from uniserve_models.model import TextSize
 from uniserve_models.nn.attention import (
     DenseInput,
@@ -21,7 +22,6 @@ from uniserve_models.nn.attention import (
     VarlenInput,
     VisibleInput,
 )
-from uniserve_models.runtime import PrefixCache
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -74,65 +74,65 @@ def test_native_attention_matches_declared_visibility(
         for _ in range(2)
     )
     cache_layout = Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)})
-    with PrefixCache(
+    cache = UnitPool.allocate(
         cache_layout, num_units=4, block_size=16, device=device
-    ) as cache:
-        state = cache.state("attention")
-        state.write((0,), start=0, key=k[:2], value=v[:2])
-        state.write((1,), start=0, key=k[:1], value=v[:1])
-        paged = PagedInput.from_blocks(
-            blocks=((0,), (1,)),
-            query_lengths=(2, 3),
-            prefix_lengths=(2, 1),
-            block_size=16,
-            causal=(True, False),
-            device=device,
+    )
+    state = cache.state("attention")
+    state.write((0,), start=0, key=k[:2], value=v[:2])
+    state.write((1,), start=0, key=k[:1], value=v[:1])
+    paged = PagedInput.from_blocks(
+        blocks=((0,), (1,)),
+        query_lengths=(2, 3),
+        prefix_lengths=(2, 1),
+        block_size=16,
+        causal=(True, False),
+        device=device,
+    )
+    ends = torch.tensor(
+        [[1, 2, 0], [0, 2, 3]], dtype=torch.int32, device=device
+    )
+    batch = {
+        "dense": DenseInput(True, None),
+        "varlen": VarlenInput(
+            paged.queries,
+            SequenceLengths.from_lengths((3, 2), device=device),
+            (True, False),
+        ),
+        "paged": paged,
+        "visible": VisibleInput(
+            paged.queries, paged.queries, ends, None, True, False
+        ),
+        "segmented": SegmentedInput(
+            paged.queries,
+            paged.prefixes,
+            paged.block_table,
+            None,
+            ends,
+            False,
+        ),
+    }[representation]
+    with (
+        _prepare(resolve(provider, device=device), state) as native,
+        _prepare(TorchBackend(), state) as reference,
+    ):
+        native.bind(batch)
+        actual, expected = torch.empty_like(q), torch.empty_like(q)
+        native(q, k, v, batch, scale=0.125, out=actual)
+        if graphs:
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                native(q, k, v, batch, scale=0.125, out=actual)
+            graph.replay()
+        # Compare the already committed cache so the reference invocation
+        # does not perform a second write for the same numerical call.
+        reference_batch = (
+            replace(batch, write_indices=None)
+            if representation == "paged"
+            else batch
         )
-        ends = torch.tensor(
-            [[1, 2, 0], [0, 2, 3]], dtype=torch.int32, device=device
-        )
-        batch = {
-            "dense": DenseInput(True, None),
-            "varlen": VarlenInput(
-                paged.queries,
-                SequenceLengths.from_lengths((3, 2), device=device),
-                (True, False),
-            ),
-            "paged": paged,
-            "visible": VisibleInput(
-                paged.queries, paged.queries, ends, None, True, False
-            ),
-            "segmented": SegmentedInput(
-                paged.queries,
-                paged.prefixes,
-                paged.block_table,
-                None,
-                ends,
-                False,
-            ),
-        }[representation]
-        with (
-            _prepare(resolve(provider, device=device), state) as native,
-            _prepare(TorchBackend(), state) as reference,
-        ):
-            native.bind(batch)
-            actual, expected = torch.empty_like(q), torch.empty_like(q)
-            native(q, k, v, batch, scale=0.125, out=actual)
-            if graphs:
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    native(q, k, v, batch, scale=0.125, out=actual)
-                graph.replay()
-            # Compare the already committed cache so the reference invocation
-            # does not perform a second write for the same numerical call.
-            reference_batch = (
-                replace(batch, write_indices=None)
-                if representation == "paged"
-                else batch
-            )
-            reference(q, k, v, reference_batch, scale=0.125, out=expected)
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        reference(q, k, v, reference_batch, scale=0.125, out=expected)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @torch.inference_mode()
@@ -149,55 +149,53 @@ def test_paged_replay_reads_changed_causal_flags(provider):
         torch.randn(5, 2, 64, dtype=q.dtype, device=device, generator=generator)
         for _ in range(2)
     )
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=4,
         block_size=16,
         device=device,
-    ) as cache:
-        state = cache.state("attention")
-        state.write((0,), start=0, key=k[:2], value=v[:2])
-        state.write((1,), start=0, key=k[:1], value=v[:1])
-        batch = PagedInput.from_blocks(
-            blocks=((0,), (1,)),
-            query_lengths=(2, 3),
-            prefix_lengths=(2, 1),
-            block_size=16,
-            causal=(True, False),
-            device=device,
-        )
-        flags = torch.tensor((1, 0), dtype=torch.int32, device=device)
-        batch = replace(batch, causal_values=flags)
-        with (
-            _prepare(resolve(provider, device=device), state) as native,
-            _prepare(TorchBackend(), state) as reference,
-        ):
-            native.bind(batch)
-            actual, expected = torch.empty_like(q), torch.empty_like(q)
+    )
+    state = cache.state("attention")
+    state.write((0,), start=0, key=k[:2], value=v[:2])
+    state.write((1,), start=0, key=k[:1], value=v[:1])
+    batch = PagedInput.from_blocks(
+        blocks=((0,), (1,)),
+        query_lengths=(2, 3),
+        prefix_lengths=(2, 1),
+        block_size=16,
+        causal=(True, False),
+        device=device,
+    )
+    flags = torch.tensor((1, 0), dtype=torch.int32, device=device)
+    batch = replace(batch, causal_values=flags)
+    with (
+        _prepare(resolve(provider, device=device), state) as native,
+        _prepare(TorchBackend(), state) as reference,
+    ):
+        native.bind(batch)
+        actual, expected = torch.empty_like(q), torch.empty_like(q)
+        native(q, k, v, batch, scale=0.125, out=actual)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
             native(q, k, v, batch, scale=0.125, out=actual)
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                native(q, k, v, batch, scale=0.125, out=actual)
-            for causal in ((True, False), (False, True), (True, True)):
-                flags.copy_(torch.tensor(causal, dtype=torch.int32))
-                graph.replay()
-                reference(
-                    q,
-                    k,
-                    v,
-                    replace(
-                        batch,
-                        write_indices=None,
-                        causal=causal,
-                        causal_values=None,
-                    ),
-                    scale=0.125,
-                    out=expected,
-                )
-                torch.testing.assert_close(
-                    actual, expected, rtol=2e-2, atol=2e-2
-                )
+        for causal in ((True, False), (False, True), (True, True)):
+            flags.copy_(torch.tensor(causal, dtype=torch.int32))
+            graph.replay()
+            reference(
+                q,
+                k,
+                v,
+                replace(
+                    batch,
+                    write_indices=None,
+                    causal=causal,
+                    causal_values=None,
+                ),
+                scale=0.125,
+                out=expected,
+            )
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @torch.inference_mode()
@@ -229,15 +227,13 @@ def test_segmented_graph_keeps_nonfinite_values_within_their_sequence():
     segmented = SegmentedInput(
         batch.queries, batch.prefixes, batch.block_table, None, ends, True
     )
-    with (
-        PrefixCache(
-            Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
-            num_units=2,
-            block_size=16,
-            device=device,
-        ) as cache,
-        _prepare(TorchBackend(), cache.state("attention")) as operator,
-    ):
+    cache = UnitPool.allocate(
+        Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
+        num_units=2,
+        block_size=16,
+        device=device,
+    )
+    with _prepare(TorchBackend(), cache.state("attention")) as operator:
         operator.bind(segmented)
         actual = torch.empty_like(q)
         operator(q, k, v, segmented, scale=0.125, out=actual)
@@ -282,53 +278,53 @@ def test_native_paged_replay_reads_changed_block_table_and_writes_slot_zero(
         torch.randn(1, 2, 64, dtype=q.dtype, device=device, generator=generator)
         for _ in range(2)
     )
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=3,
         block_size=16,
         device=device,
-    ) as cache:
-        state = cache.state("attention")
-        batch = PagedInput.from_blocks(
-            blocks=((0,),),
-            query_lengths=(1,),
-            prefix_lengths=(0,),
-            block_size=16,
-            causal=True,
-            device=device,
+    )
+    state = cache.state("attention")
+    batch = PagedInput.from_blocks(
+        blocks=((0,),),
+        query_lengths=(1,),
+        prefix_lengths=(0,),
+        block_size=16,
+        causal=True,
+        device=device,
+    )
+    with (
+        _prepare(resolve(provider, device=device), state) as native,
+        _prepare(TorchBackend(), state) as reference,
+    ):
+        out = torch.empty_like(q)
+        native.bind(batch)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            native(q, k, v, batch, scale=0.125, out=out)
+        torch.cuda.current_stream(device).wait_stream(stream)
+        torch.testing.assert_close(state.key[0, 0], k[0], rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            native(q, k, v, batch, scale=0.125, out=out)
+        batch.block_table.indices[0, 0] = 2
+        batch.write_indices[0] = 32
+        v.mul_(3)
+        native.bind(batch)
+        graph.replay()
+        expected = torch.empty_like(q)
+        reference(
+            q,
+            k,
+            v,
+            replace(batch, write_indices=None),
+            scale=0.125,
+            out=expected,
         )
-        with (
-            _prepare(resolve(provider, device=device), state) as native,
-            _prepare(TorchBackend(), state) as reference,
-        ):
-            out = torch.empty_like(q)
-            native.bind(batch)
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            with torch.cuda.stream(stream):
-                native(q, k, v, batch, scale=0.125, out=out)
-            torch.cuda.current_stream(device).wait_stream(stream)
-            torch.testing.assert_close(state.key[0, 0], k[0], rtol=0, atol=0)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                native(q, k, v, batch, scale=0.125, out=out)
-            batch.block_table.indices[0, 0] = 2
-            batch.write_indices[0] = 32
-            v.mul_(3)
-            native.bind(batch)
-            graph.replay()
-            expected = torch.empty_like(q)
-            reference(
-                q,
-                k,
-                v,
-                replace(batch, write_indices=None),
-                scale=0.125,
-                out=expected,
-            )
-            torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
-            torch.testing.assert_close(state.value[2, 0], v[0], rtol=0, atol=0)
-            graph.reset()
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(state.value[2, 0], v[0], rtol=0, atol=0)
+        graph.reset()
 
 
 @torch.inference_mode()
@@ -373,57 +369,57 @@ def test_native_paged_output_views_preserve_values_on_replay(
         ].view_as(q)
     else:
         out = torch.empty_like(q)
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=2,
         block_size=16,
         device=device,
-    ) as cache:
-        state = cache.state("attention")
-        batch = PagedInput.from_blocks(
-            blocks=((0,), (1,)),
-            query_lengths=counts,
-            prefix_lengths=(1, 2),
-            block_size=16,
-            causal=True,
-            device=device,
+    )
+    state = cache.state("attention")
+    batch = PagedInput.from_blocks(
+        blocks=((0,), (1,)),
+        query_lengths=counts,
+        prefix_lengths=(1, 2),
+        block_size=16,
+        causal=True,
+        device=device,
+    )
+    with (
+        _prepare(resolve("trtllm", device=device), state) as native,
+        _prepare(TorchBackend(), state) as reference,
+    ):
+        native.bind(batch)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            assert native(q, k, v, batch, scale=0.125, out=out) is out
+        torch.cuda.current_stream(device).wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            native(q, k, v, batch, scale=0.125, out=out)
+        # Restore all live inputs after capture, including a query that
+        # also supplies output storage. Expected values use its snapshot.
+        q.copy_(
+            torch.randn(
+                q.shape, dtype=q.dtype, device=device, generator=generator
+            )
         )
-        with (
-            _prepare(resolve("trtllm", device=device), state) as native,
-            _prepare(TorchBackend(), state) as reference,
-        ):
-            native.bind(batch)
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            with torch.cuda.stream(stream):
-                assert native(q, k, v, batch, scale=0.125, out=out) is out
-            torch.cuda.current_stream(device).wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                native(q, k, v, batch, scale=0.125, out=out)
-            # Restore all live inputs after capture, including a query that
-            # also supplies output storage. Expected values use its snapshot.
-            q.copy_(
-                torch.randn(
-                    q.shape, dtype=q.dtype, device=device, generator=generator
-                )
-            )
-            query = q.clone()
-            v.mul_(2)
-            graph.replay()
-            expected = torch.empty_like(q)
-            reference(
-                query,
-                k,
-                v,
-                replace(batch, write_indices=None),
-                scale=0.125,
-                out=expected,
-            )
-            torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
-            if destination != "query":
-                torch.testing.assert_close(q, query, rtol=0, atol=0)
-            graph.reset()
+        query = q.clone()
+        v.mul_(2)
+        graph.replay()
+        expected = torch.empty_like(q)
+        reference(
+            query,
+            k,
+            v,
+            replace(batch, write_indices=None),
+            scale=0.125,
+            out=expected,
+        )
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+        if destination != "query":
+            torch.testing.assert_close(q, query, rtol=0, atol=0)
+        graph.reset()
 
 
 @torch.inference_mode()
@@ -447,93 +443,90 @@ def test_paged_replay_preserves_masked_writes_and_live_sequence_boundaries(
         )[..., ::column_stride]
         for _ in range(2)
     )
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=4,
         block_size=16,
         device=device,
-    ) as cache:
-        state = cache.state("attention")
-        batch = PagedInput.from_blocks(
-            blocks=((0, 1), (2, 3)),
-            query_lengths=(2, 3),
-            prefix_lengths=(1, 2),
+    )
+    state = cache.state("attention")
+    batch = PagedInput.from_blocks(
+        blocks=((0, 1), (2, 3)),
+        query_lengths=(2, 3),
+        prefix_lengths=(1, 2),
+        block_size=16,
+        causal=True,
+        device=device,
+    )
+    # The device columns remain borrowed inputs; no host mirror supplies
+    # lengths or offsets to the captured numerical call.
+    batch = replace(
+        batch,
+        queries=replace(batch.queries, host=None),
+        prefixes=replace(batch.prefixes, host=None),
+    )
+    batch.write_indices[0] = -1
+    with (
+        _prepare(resolve("trtllm", device=device), state) as native,
+        _prepare(TorchBackend(), state) as reference,
+    ):
+        out = torch.empty_like(q)
+        native.bind(batch)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            native(q, k, v, batch, scale=0.125, out=out)
+        torch.cuda.current_stream(device).wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            native(q, k, v, batch, scale=0.125, out=out)
+
+        changed = PagedInput.from_blocks(
+            blocks=((1, 0), (3, 2)),
+            query_lengths=(3, 2),
+            prefix_lengths=(2, 1),
             block_size=16,
             causal=True,
             device=device,
         )
-        # The device columns remain borrowed inputs; no host mirror supplies
-        # lengths or offsets to the captured numerical call.
-        batch = replace(
-            batch,
-            queries=replace(batch.queries, host=None),
-            prefixes=replace(batch.prefixes, host=None),
+        changed.write_indices[1] = -1
+        for name in ("queries", "prefixes"):
+            getattr(batch, name).values.copy_(getattr(changed, name).values)
+            getattr(batch, name).offsets.copy_(getattr(changed, name).offsets)
+        batch.block_table.indices.copy_(changed.block_table.indices)
+        batch.write_indices.copy_(changed.write_indices)
+        k.mul_(2)
+        v.mul_(3)
+        before = tuple(tensor.clone() for tensor in (q, k, v))
+        expected_state = tuple(
+            tensor.clone() for tensor in (state.key, state.value)
         )
-        batch.write_indices[0] = -1
-        with (
-            _prepare(resolve("trtllm", device=device), state) as native,
-            _prepare(TorchBackend(), state) as reference,
+        slots = changed.write_indices.cpu().tolist()
+        for target, source in zip(expected_state, (k, v), strict=True):
+            for row, slot in enumerate(slots):
+                if slot != -1:
+                    target.flatten(0, 1)[slot].copy_(source[row])
+        graph.replay()
+        expected = torch.empty_like(q)
+        reference(
+            q,
+            k,
+            v,
+            replace(changed, write_indices=None),
+            scale=0.125,
+            out=expected,
+        )
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+        for actual, expected in zip(
+            (state.key, state.value), expected_state, strict=True
         ):
-            out = torch.empty_like(q)
-            native.bind(batch)
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            with torch.cuda.stream(stream):
-                native(q, k, v, batch, scale=0.125, out=out)
-            torch.cuda.current_stream(device).wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                native(q, k, v, batch, scale=0.125, out=out)
-
-            changed = PagedInput.from_blocks(
-                blocks=((1, 0), (3, 2)),
-                query_lengths=(3, 2),
-                prefix_lengths=(2, 1),
-                block_size=16,
-                causal=True,
-                device=device,
-            )
-            changed.write_indices[1] = -1
-            for name in ("queries", "prefixes"):
-                getattr(batch, name).values.copy_(getattr(changed, name).values)
-                getattr(batch, name).offsets.copy_(
-                    getattr(changed, name).offsets
-                )
-            batch.block_table.indices.copy_(changed.block_table.indices)
-            batch.write_indices.copy_(changed.write_indices)
-            k.mul_(2)
-            v.mul_(3)
-            before = tuple(tensor.clone() for tensor in (q, k, v))
-            expected_state = tuple(
-                tensor.clone() for tensor in (state.key, state.value)
-            )
-            slots = changed.write_indices.cpu().tolist()
-            for target, source in zip(expected_state, (k, v), strict=True):
-                for row, slot in enumerate(slots):
-                    if slot != -1:
-                        target.flatten(0, 1)[slot].copy_(source[row])
-            graph.replay()
-            expected = torch.empty_like(q)
-            reference(
-                q,
-                k,
-                v,
-                replace(changed, write_indices=None),
-                scale=0.125,
-                out=expected,
-            )
-            torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
-            for actual, expected in zip(
-                (state.key, state.value), expected_state, strict=True
-            ):
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            for actual, expected in zip((q, k, v), before, strict=True):
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            assert all(
-                flags.tolist() == [True] * 4
-                for flags in state.initialized.values()
-            )
-            graph.reset()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual, expected in zip((q, k, v), before, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert all(
+            flags.tolist() == [True] * 4 for flags in state.initialized.values()
+        )
+        graph.reset()
 
 
 @torch.inference_mode()
@@ -552,54 +545,54 @@ def test_visible_paged_replay_uses_changed_endpoints(provider, paged_keys):
         )
         for _ in range(2)
     )
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": mha.Config(2, 64, (0, 1), q.dtype)}),
         num_units=17,
         block_size=16,
         device=device,
-    ) as cache:
-        state = cache.state("attention")
-        state.write(tuple(range(17)), start=0, key=k, value=v)
-        paged = PagedInput.from_blocks(
-            blocks=(tuple(range(17)),),
-            query_lengths=(count,),
-            prefix_lengths=(0,),
-            block_size=16,
-            causal=True,
-            device=device,
-        )
-        ends = (torch.arange(count, dtype=torch.int32, device=device) + 1)[None]
-        batch = VisibleInput(
-            paged.queries,
-            paged.queries,
-            ends,
-            paged.block_table if paged_keys else None,
-            True,
-            False,
-        )
-        with (
-            _prepare(
-                resolve(provider, device=device), state, TextSize(count, 1)
-            ) as native,
-            _prepare(TorchBackend(), state, TextSize(count, 1)) as reference,
-        ):
-            native.bind(batch)
-            actual = torch.empty_like(q)
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            with torch.cuda.stream(stream):
-                native(q, k, v, batch, scale=0.125, out=actual)
-            torch.cuda.current_stream(device).wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                native(q, k, v, batch, scale=0.125, out=actual)
-            ends.fill_(count)
-            native.bind(batch)
-            graph.replay()
-            expected = torch.empty_like(q)
-            reference(q, k, v, batch, scale=0.125, out=expected)
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-            graph.reset()
+    )
+    state = cache.state("attention")
+    state.write(tuple(range(17)), start=0, key=k, value=v)
+    paged = PagedInput.from_blocks(
+        blocks=(tuple(range(17)),),
+        query_lengths=(count,),
+        prefix_lengths=(0,),
+        block_size=16,
+        causal=True,
+        device=device,
+    )
+    ends = (torch.arange(count, dtype=torch.int32, device=device) + 1)[None]
+    batch = VisibleInput(
+        paged.queries,
+        paged.queries,
+        ends,
+        paged.block_table if paged_keys else None,
+        True,
+        False,
+    )
+    with (
+        _prepare(
+            resolve(provider, device=device), state, TextSize(count, 1)
+        ) as native,
+        _prepare(TorchBackend(), state, TextSize(count, 1)) as reference,
+    ):
+        native.bind(batch)
+        actual = torch.empty_like(q)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            native(q, k, v, batch, scale=0.125, out=actual)
+        torch.cuda.current_stream(device).wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            native(q, k, v, batch, scale=0.125, out=actual)
+        ends.fill_(count)
+        native.bind(batch)
+        graph.replay()
+        expected = torch.empty_like(q)
+        reference(q, k, v, batch, scale=0.125, out=expected)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        graph.reset()
 
 
 @torch.inference_mode()
@@ -842,48 +835,46 @@ def test_native_history_window_matches_portable_reference(
         "size": TextSize(tokens, 2),
         "window": window,
     }
-    with PrefixCache(
+    cache = UnitPool.allocate(
         layout, num_units=16, block_size=block_size, device=device
-    ) as cache:
-        state = cache.state("attention")
-        for row, prefix in zip(blocks, prefixes, strict=True):
-            history = torch.randn(
-                prefix,
-                num_kv_heads,
-                head_dim,
-                dtype=q.dtype,
-                device=device,
-                generator=generator,
-            )
-            state.write(row, start=0, key=history, value=history.flip(0))
+    )
+    state = cache.state("attention")
+    for row, prefix in zip(blocks, prefixes, strict=True):
+        history = torch.randn(
+            prefix,
+            num_kv_heads,
+            head_dim,
+            dtype=q.dtype,
+            device=device,
+            generator=generator,
+        )
+        state.write(row, start=0, key=history, value=history.flip(0))
 
-        backends = (resolve(provider, device=device), TorchBackend())
-        with ExitStack() as scope:
-            native, reference = (
-                scope.enter_context(
-                    _prepare_with(backend, state, arguments, device)
-                )
-                for backend in backends
+    backends = (resolve(provider, device=device), TorchBackend())
+    with ExitStack() as scope:
+        native, reference = (
+            scope.enter_context(
+                _prepare_with(backend, state, arguments, device)
             )
-            actual, expected = torch.empty_like(q), torch.empty_like(q)
-            native.bind(batch)
-            native(q, k, v, batch, scale=head_dim**-0.5, out=actual)
-            if graphs:
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    native(q, k, v, batch, scale=head_dim**-0.5, out=actual)
-                actual.zero_()
-                graph.replay()
-            reference_batch = (
-                replace(batch, write_indices=None)
-                if isinstance(batch, PagedInput)
-                else batch
-            )
-            reference(
-                q, k, v, reference_batch, scale=head_dim**-0.5, out=expected
-            )
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+            for backend in backends
+        )
+        actual, expected = torch.empty_like(q), torch.empty_like(q)
+        native.bind(batch)
+        native(q, k, v, batch, scale=head_dim**-0.5, out=actual)
+        if graphs:
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                native(q, k, v, batch, scale=head_dim**-0.5, out=actual)
+            actual.zero_()
+            graph.replay()
+        reference_batch = (
+            replace(batch, write_indices=None)
+            if isinstance(batch, PagedInput)
+            else batch
+        )
+        reference(q, k, v, reference_batch, scale=head_dim**-0.5, out=expected)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @contextmanager

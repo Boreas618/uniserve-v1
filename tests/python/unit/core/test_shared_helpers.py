@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from uniserve_models.env import flag_from_value
-from uniserve_models.math import ceil_div
 
 pytestmark = pytest.mark.unit
 
@@ -23,13 +22,3 @@ def test_flag_from_value_allowlist_semantics():
     assert flag_from_value("garbage", default=True) is True
     # Explicit false tokens always win over a True default.
     assert flag_from_value("0", default=True) is False
-
-
-def test_ceil_div_rounds_up_and_rejects_nonpositive_divisors():
-    assert ceil_div(0, 256) == 0
-    assert ceil_div(1, 256) == 1
-    assert ceil_div(256, 256) == 1
-    assert ceil_div(257, 256) == 2
-    for divisor in (0, -4):
-        with pytest.raises(ValueError, match="positive divisor"):
-            ceil_div(5, divisor)

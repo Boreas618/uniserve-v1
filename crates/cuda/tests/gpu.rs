@@ -11,8 +11,8 @@ use std::time::Duration;
 use uniserve_cuda::nccl::{Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceId, Error, Event,
-    EventFlags, HandleType, Nvml, PeerMapping, PinnedBuffer, SourceOrder, Stream, StreamSignal,
-    Strided, StridedCopy, memcpy_async, memset_d8, memset_d32, reclaim,
+    EventFlags, HandleType, Nvml, PeerMapping, PinnedBuffer, SourceOrder, Stream, Strided,
+    StridedCopy, memcpy_async, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -57,7 +57,6 @@ fn block(stream: &Stream) -> mpsc::Sender<()> {
 fn device_queries_report_the_device() {
     let _driver = exclusive_driver();
     assert!(DeviceId::count().unwrap() > DEVICE.0);
-    assert!(uniserve_cuda::driver_version().unwrap() >= 12_080);
     assert!(
         DEVICE
             .attribute(DeviceAttribute::MultiprocessorCount)
@@ -246,25 +245,15 @@ fn events_order_streams_and_measure_time() {
     consumer.wait_event(&ready).unwrap();
     // SAFETY: as above.
     unsafe { memcpy_async(host.address(), device.address(), 1024, &consumer).unwrap() };
-    let signal = StreamSignal::new().unwrap();
-    signal.schedule(&consumer).unwrap();
 
     thread::sleep(Duration::from_millis(20));
     assert!(!ready.query().unwrap());
-    assert!(!signal.consume().unwrap());
 
     release.send(()).unwrap();
     consumer.synchronize().unwrap();
     assert!(ready.query().unwrap());
     assert!(read(&host).iter().all(|byte| *byte == 9));
     assert!(start.elapsed_ms(&ready).unwrap() >= 0.0);
-    // The host function runs on a driver thread shortly after the stream
-    // reaches it; synchronize only guarantees the device work.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !signal.consume().unwrap() {
-        assert!(std::time::Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(1));
-    }
 }
 
 #[test]
@@ -436,6 +425,42 @@ fn sm_partitions_create_streams_of_the_requested_size() {
         Stream::partition(DEVICE, &[total + 1]),
         Err(Error::InvalidArgument(_))
     ));
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn forks_and_fences_outlive_their_partition_stream() {
+    let _driver = exclusive_driver();
+    let parent = Stream::partition(DEVICE, &[16]).unwrap().remove(0);
+    let fork = parent.fork().unwrap();
+    let device = DeviceAllocation::linear(DEVICE, 1024).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 1024).unwrap();
+    let written = Event::new(EventFlags::default());
+
+    // SAFETY: the ranges outlive the synchronizations below.
+    unsafe { memset_d8(device.address(), 7, 1024, &parent).unwrap() };
+    written.record(&parent).unwrap();
+    drop(parent);
+
+    // The fence recorded in the partition still orders a consumer of the
+    // primary context after the recording stream is gone.
+    let consumer = Stream::new(DEVICE).unwrap();
+    consumer.wait_event(&written).unwrap();
+    // SAFETY: as above.
+    unsafe { memcpy_async(host.address(), device.address(), 1024, &consumer).unwrap() };
+    consumer.synchronize().unwrap();
+    assert!(read(&host).iter().all(|byte| *byte == 7));
+
+    // The fork keeps the partition and still executes work in it.
+    assert!(fork.is_partitioned().unwrap());
+    assert_eq!(fork.sm_count().unwrap(), 16);
+    // SAFETY: as above.
+    unsafe {
+        memset_d8(device.address(), 9, 1024, &fork).unwrap();
+        memcpy_async(host.address(), device.address(), 1024, &fork).unwrap();
+    }
+    fork.synchronize().unwrap();
+    assert!(read(&host).iter().all(|byte| *byte == 9));
 }
 
 #[test]

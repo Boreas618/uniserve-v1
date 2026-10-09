@@ -10,17 +10,85 @@
 //!
 //! Every tuning value is stated explicitly: the launching side is the single
 //! source of defaults and the worker never re-derives one.
+//!
+//! Both launching sides start a rank with [`rank_command`] and hand it the
+//! sockets it serves with [`inherit_listener`].
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::net::TcpListener;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{CanvasSampling, ComponentConfig};
 
 use crate::LaneConfig;
 
-/// Descriptor key naming the inherited descriptor number of the listening
-/// socket the group's first rank accepts its host-collective peers on.
-pub use uniserve_core::launch::RENDEZVOUS_LISTEN_FD;
+/// The command that starts one rank with the interpreter `python`.
+///
+/// argv carries the rank's identity and its descriptor's location, so a
+/// running rank remains identifiable from the process table; every other
+/// launch value is in the descriptor file at `descriptor`. The caller adds
+/// the environment and any inherited sockets, and writes the descriptor
+/// before it spawns the command.
+pub fn rank_command(
+    python: impl AsRef<OsStr>,
+    worker_id: &str,
+    rank: u32,
+    world_size: u32,
+    descriptor: &Path,
+) -> Command {
+    let mut command = Command::new(python);
+    command
+        .arg("-m")
+        .arg("uniserve_models.worker")
+        .arg("--worker-id")
+        .arg(worker_id)
+        .arg("--rank")
+        .arg(rank.to_string())
+        .arg("--world-size")
+        .arg(world_size.to_string())
+        .arg("--launch-descriptor")
+        .arg(descriptor);
+    command
+}
+
+/// Makes the process `command` starts inherit `listener` at the descriptor
+/// number returned, which the caller names in that process's launch
+/// descriptor.
+///
+/// A worker group's first rank serves the group's collective store. The
+/// process that spawns that rank binds the store's listening socket before
+/// the rank exists and passes it across the rank's exec, so the port is never
+/// released between the reservation and the store serving on it.
+///
+/// The command owns `listener` from here on and closes it when the command is
+/// dropped, so the socket stays open until the spawn has duplicated it and the
+/// spawning process holds no listening copy afterwards. Close-on-exec is
+/// cleared only in the forked child: the descriptor keeps the flag in the
+/// spawning process, so no other process it starts meanwhile inherits the
+/// socket. A failure to clear the flag fails the spawn.
+pub fn inherit_listener(command: &mut Command, listener: TcpListener) -> RawFd {
+    let fd = listener.as_raw_fd();
+
+    // SAFETY: the closure runs in the forked child between fork and exec, and
+    // only calls `fcntl`, which is async-signal-safe. `listener` is moved into
+    // the closure, so the descriptor is open in the parent at fork time.
+    unsafe {
+        command.pre_exec(move || {
+            // FD_CLOEXEC is the only descriptor flag, so clearing every flag
+            // leaves the socket open across exec at the same number.
+            if libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    fd
+}
 
 /// Every value one rank process is launched with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

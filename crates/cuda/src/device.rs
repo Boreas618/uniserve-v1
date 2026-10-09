@@ -56,18 +56,6 @@ impl fmt::Display for DeviceUuid {
     }
 }
 
-/// The installed driver's CUDA version, encoded as `1000 * major + 10 * minor`.
-pub fn driver_version() -> Result<i32> {
-    let driver = driver()?;
-    let mut version = 0;
-    // SAFETY: the driver writes one int.
-    driver.check(
-        unsafe { (driver.driver_get_version)(&mut version) },
-        "cuDriverGetVersion",
-    )?;
-    Ok(version)
-}
-
 /// Start the CUDA profiler's capture range for `device`'s primary context
 /// (`cuProfilerStart`), for external profilers launched with capture ranges.
 pub fn profiler_start(device: DeviceId) -> Result<()> {
