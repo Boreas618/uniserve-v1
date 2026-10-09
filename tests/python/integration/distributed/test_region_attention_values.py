@@ -10,6 +10,11 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from tests.python.fixtures.vsa import (
     REGION_TILE,
     REGION_VALID,
@@ -20,7 +25,6 @@ from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh, parallelize_
 from uniserve_models.nn import MergedColumnParallelLinear
 from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses, vsa
-from uniserve_models.runtime import initialize_process_groups
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -28,16 +32,10 @@ MEMBERS, HEADS, WIDTH, HIDDEN = 2, 4, 128, 64
 ROWS = len(REGION_VALID) * REGION_TILE
 
 
-def _run(rank, rendezvous):
+def _run(rank, listener):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=MEMBERS,
-        device=device,
-        init_method=rendezvous,
-    ) as groups:
+    with process_world(rank, MEMBERS, listener, device) as world:
         generator = torch.Generator(device="cpu").manual_seed(91)
         hidden = torch.randn(
             ROWS, HIDDEN, dtype=torch.bfloat16, generator=generator
@@ -48,14 +46,14 @@ def _run(rank, rendezvous):
             ).to(device, torch.bfloat16)
             for name in ("q", "k", "v", "gate")
         }
-        mesh = groups.bind(
+        mesh = bind_mesh(
+            world,
             DeviceMesh(
                 ranks=tuple(range(MEMBERS)),
                 shape=(MEMBERS,),
                 axes=("heads",),
                 rank=rank,
             ),
-            device=device,
         )
         layer = torch.nn.Module()
         layer.projection = MergedColumnParallelLinear(
@@ -115,12 +113,13 @@ def _run(rank, rendezvous):
             torch.cuda.synchronize(device)
 
 
-def test_region_attention_keeps_values_through_ulysses(tmp_path):
+def test_region_attention_keeps_values_through_ulysses():
     if torch.cuda.device_count() < MEMBERS:
         pytest.skip(f"Ulysses region attention needs {MEMBERS} devices")
-    mp.spawn(
-        _run,
-        args=((tmp_path / "rendezvous").as_uri(),),
-        nprocs=MEMBERS,
-        join=True,
-    )
+    with rendezvous() as listener:
+        mp.spawn(
+            _run,
+            args=(listener,),
+            nprocs=MEMBERS,
+            join=True,
+        )

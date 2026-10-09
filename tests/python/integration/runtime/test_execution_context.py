@@ -3,7 +3,6 @@
 They do so without shared mutable prefix state.
 """
 
-from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 
 import pytest
@@ -13,6 +12,8 @@ from torch.nn import functional as F
 
 from uniserve_models.bindings.context import ExecutionContext, Scratch
 from uniserve_models.cache import Config, mha
+from uniserve_models.cache.units import UnitPool
+from uniserve_models.interface import graphs
 from uniserve_models.model import TextSize
 from uniserve_models.nn import Linear, MergedColumnParallelLinear
 from uniserve_models.nn.attention import (
@@ -22,14 +23,13 @@ from uniserve_models.nn.attention import (
     PagedInput,
 )
 from uniserve_models.quantization import Quantizer
-from uniserve_models.runtime import CUDAGraph, CUDAStream, PrefixCache
 from uniserve_models.tensors import BufferConfig
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize(
-    "provider,device,graphs,causal",
+    "provider,device,replay,causal",
     [
         ("torch", "cpu", False, (True, False)),
         pytest.param(
@@ -51,7 +51,7 @@ pytestmark = pytest.mark.integration
 )
 @torch.inference_mode()
 def test_device_lengths_drive_current_attention_values(
-    provider, device, graphs, causal
+    provider, device, replay, causal
 ):
     dtype = torch.float32 if device == "cpu" else torch.bfloat16
     generator = torch.Generator(device=device).manual_seed(810)
@@ -63,23 +63,16 @@ def test_device_lengths_drive_current_attention_values(
         for _ in range(2)
     )
     layer = Attention(4, 2, 64, cache_name="attention")
-    stream = (
-        CUDAStream.external(torch.cuda.Stream(device=device))
-        if graphs
-        else None
+    stream = torch.cuda.Stream(device=device) if replay else None
+    cache = UnitPool.allocate(
+        Config({"attention": mha.Config(2, 64, (0, 1), dtype)}),
+        num_units=2,
+        block_size=16,
+        device=device,
     )
-    with (
-        stream if stream is not None else nullcontext(),
-        PrefixCache(
-            Config({"attention": mha.Config(2, 64, (0, 1), dtype)}),
-            num_units=2,
-            block_size=16,
-            device=device,
-        ) as cache,
-        ExecutionContext(
-            layer, cache=cache, attention=provider, stream=stream
-        ) as context,
-    ):
+    with ExecutionContext(
+        layer, cache=cache, attention=provider, stream=stream
+    ) as context:
         context.prepare(TextSize(5, 2))
 
         def indices(counts):
@@ -103,16 +96,16 @@ def test_device_lengths_drive_current_attention_values(
         try:
             context.bind_attention(AttentionBatch.single(batch))
             layer(query, key, value, AttentionBatch.single(batch), out=output)
-            if graphs:
-                graph = CUDAGraph(context=context)
-                graph.capture(
+            if replay:
+                graph = graphs.capture(
                     lambda: layer(
                         query,
                         key,
                         value,
                         AttentionBatch.single(batch),
                         out=output,
-                    )
+                    ),
+                    stream=stream,
                 )
             for counts in ((2, 3), (4, 1), (1, 4)):
                 changed = indices(counts)
@@ -160,7 +153,7 @@ def test_device_lengths_drive_current_attention_values(
         finally:
             if graph is not None:
                 stream.synchronize()
-                graph.close()
+                graph.release()
 
 
 @pytest.mark.gpu
@@ -188,10 +181,8 @@ def test_replay_binding_still_rejects_inputs_outside_the_captured_contract():
             for name in names
         }
     )
-    with (
-        PrefixCache(config, num_units=8, block_size=16, device=device) as cache,
-        ExecutionContext(module, cache=cache, attention="trtllm") as context,
-    ):
+    cache = UnitPool.allocate(config, num_units=8, block_size=16, device=device)
+    with ExecutionContext(module, cache=cache, attention="trtllm") as context:
         context.prepare(TextSize(5, 2))
         tables = sorted({cache.table(name) for name in names})
         assert len(tables) == 2
@@ -242,11 +233,11 @@ def test_nested_execution_contexts_keep_prefixes_independent():
     module = _SelfAttention()
     module.projection.weight.copy_(torch.eye(64))
     config = Config({"attention": mha.Config(1, 64, (0,), torch.float32)})
-    with (
-        PrefixCache(config, num_units=1, block_size=16, device="cpu") as first,
-        PrefixCache(config, num_units=1, block_size=16, device="cpu") as second,
-        ExecutionContext(module, cache=first, attention="torch") as a,
-    ):
+    first, second = (
+        UnitPool.allocate(config, num_units=1, block_size=16, device="cpu")
+        for _ in range(2)
+    )
+    with ExecutionContext(module, cache=first, attention="torch") as a:
         a.prepare(TextSize(1, 1))
         batch = PagedInput.from_blocks(
             blocks=((0,),),
@@ -313,22 +304,31 @@ def test_shared_projection_has_independent_encoded_graph_inputs(axis):
         torch.empty(5, 32, dtype=x.dtype, device=device),
         torch.empty(5, 32, dtype=x.dtype, device=device),
     )
-    with ExecutionContext(layer) as a:
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+
+    def project(context, value, out):
+        with context.activate():
+            return layer(value, out=out)
+
+    with ExecutionContext(layer, stream=stream) as a:
         a.prepare(TextSize(8, 1))
         layer(x, out=first)
-        with CUDAGraph(context=a) as ga, ExecutionContext(layer) as b:
+        with ExecutionContext(layer, stream=stream) as b:
             b.prepare(TextSize(8, 1))
             layer(y, out=second)
-            with CUDAGraph(context=b) as gb:
-                ga.capture(lambda: layer(x, out=first))
-                gb.capture(lambda: layer(y, out=second))
-                x.mul_(4)
-                ga.replay()
-                expected_x = layer(x)
-                gb.replay()
-                expected_y = layer(y)
-                torch.testing.assert_close(first, expected_x, rtol=0, atol=0)
-                torch.testing.assert_close(second, expected_y, rtol=0, atol=0)
+            ga = graphs.capture(lambda: project(a, x, first), stream=stream)
+            gb = graphs.capture(lambda: project(b, y, second), stream=stream)
+            x.mul_(4)
+            ga.replay()
+            expected_x = layer(x)
+            gb.replay()
+            expected_y = layer(y)
+            torch.testing.assert_close(first, expected_x, rtol=0, atol=0)
+            torch.testing.assert_close(second, expected_y, rtol=0, atol=0)
+            stream.synchronize()
+            gb.release()
+            ga.release()
 
 
 @pytest.mark.gpu
@@ -344,10 +344,10 @@ def test_eager_attention_replans_changed_sequence_boundaries():
         torch.randn(5, 1, 64, dtype=dtype, device=device, generator=generator)
         for _ in range(2)
     )
-    with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
-        ExecutionContext(layer, cache=cache, attention="flashinfer") as context,
-    ):
+    cache = UnitPool.allocate(config, num_units=2, block_size=16, device=device)
+    with ExecutionContext(
+        layer, cache=cache, attention="flashinfer"
+    ) as context:
         context.prepare(TextSize(5, 2))
         for counts in ((4, 1), (2, 3), (1, 4)):
             batch = PagedInput.from_blocks(
@@ -432,10 +432,8 @@ def test_bound_metadata_serves_one_call_and_later_changes_are_planned(provider):
         queries=replace(initial.queries, host=None),
         prefixes=replace(initial.prefixes, host=None),
     )
-    with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
-        ExecutionContext(layer, cache=cache, attention=provider) as context,
-    ):
+    cache = UnitPool.allocate(config, num_units=2, block_size=16, device=device)
+    with ExecutionContext(layer, cache=cache, attention=provider) as context:
         context.prepare(TextSize(5, 2))
         context.bind_attention(AttentionBatch.single(batch))
         torch.testing.assert_close(
@@ -507,12 +505,10 @@ def test_context_without_derived_lengths_plans_only_with_host_mirrors():
             )
         ]
     )
-    with (
-        PrefixCache(config, num_units=2, block_size=16, device=device) as cache,
-        ExecutionContext(
-            layer, cache=cache, attention="torch", derive_host_lengths=False
-        ) as context,
-    ):
+    cache = UnitPool.allocate(config, num_units=2, block_size=16, device=device)
+    with ExecutionContext(
+        layer, cache=cache, attention="torch", derive_host_lengths=False
+    ) as context:
         context.prepare(TextSize(5, 2))
         context.bind_attention(AttentionBatch.single(batch))
         torch.testing.assert_close(
@@ -550,18 +546,18 @@ def test_caller_exception_releases_backing_only_after_its_work_finished(
     torch.cuda.synchronize(device)
     baseline = torch.cuda.memory_allocated(device)
 
-    with CUDAStream.external(torch.cuda.Stream(device=device)) as stream:
-        with pytest.raises(ValueError, match="caller"):
-            with ExecutionContext(module, stream=stream) as context:
-                context.prepare(None)
-                context.workspace["scratch"].fill_(1)
-                if pending:
-                    # Keep the stream busy past the exit decision.
-                    torch.cuda._sleep(1 << 30)
-                else:
-                    stream.synchronize()
-                raise ValueError("caller rejected its own input")
-        stream.synchronize()
+    stream = torch.cuda.Stream(device=device)
+    with pytest.raises(ValueError, match="caller"):
+        with ExecutionContext(module, stream=stream) as context:
+            context.prepare(None)
+            context.workspace_views["scratch"].fill_(1)
+            if pending:
+                # Keep the stream busy past the exit decision.
+                torch.cuda._sleep(1 << 30)
+            else:
+                stream.synchronize()
+            raise ValueError("caller rejected its own input")
+    stream.synchronize()
 
     retained = torch.cuda.memory_allocated(device) - baseline
     # Released backing returns to the allocator; storage an unfinished access
@@ -621,45 +617,47 @@ def test_contexts_sharing_scratch_replay_their_own_values():
     }
     scratch = Scratch()
     torch.cuda.synchronize(device)
-    with (
-        CUDAStream.external(torch.cuda.Stream(device=device)) as stream,
-        ExitStack() as scope,
-    ):
-        graphs = {}
-        for rows in sizes:
-            context = scope.enter_context(
-                ExecutionContext(layer, stream=stream, scratch=scratch)
-            )
-            context.prepare(TextSize(rows, 1))
-            graph = scope.enter_context(CUDAGraph(context=context))
-            with context.activate():
-                layer(inputs[rows], out=outputs[rows])
-            graph.capture(
-                lambda rows=rows: layer(inputs[rows], out=outputs[rows])
-            )
-            graphs[rows] = graph
+    stream = torch.cuda.Stream(device=device)
+    contexts, captured = [], {}
+    for rows in sizes:
+        context = ExecutionContext(layer, stream=stream, scratch=scratch)
+        context.prepare(TextSize(rows, 1))
+        contexts.append(context)
 
-        # FP32 accumulation over K=128, rounded once to BF16.
-        for _ in range(2):
-            for rows in (*sizes, sizes[0]):
-                inputs[rows].copy_(
-                    torch.randn(
-                        rows,
-                        128,
-                        device=device,
-                        dtype=torch.bfloat16,
-                        generator=generator,
-                    )
+        def project(context=context, rows=rows):
+            with context.activate():
+                return layer(inputs[rows], out=outputs[rows])
+
+        project()
+        captured[rows] = graphs.capture(project, stream=stream)
+
+    # FP32 accumulation over K=128, rounded once to BF16.
+    for _ in range(2):
+        for rows in (*sizes, sizes[0]):
+            inputs[rows].copy_(
+                torch.randn(
+                    rows,
+                    128,
+                    device=device,
+                    dtype=torch.bfloat16,
+                    generator=generator,
                 )
-                # Inputs are written on the default stream; the graph
-                # replays on the context's.
-                torch.cuda.synchronize(device)
-                graphs[rows].replay()
-                torch.cuda.synchronize(device)
-                for name, value in reference(inputs[rows]).items():
-                    torch.testing.assert_close(
-                        outputs[rows][name], value, rtol=2**-7, atol=2**-10
-                    )
+            )
+            # Inputs are written on the default stream; the graph
+            # replays on the contexts'.
+            torch.cuda.synchronize(device)
+            with torch.cuda.stream(stream):
+                captured[rows].replay()
+            torch.cuda.synchronize(device)
+            for name, value in reference(inputs[rows]).items():
+                torch.testing.assert_close(
+                    outputs[rows][name], value, rtol=2**-7, atol=2**-10
+                )
+
+    for graph in captured.values():
+        graph.release()
+    for context in reversed(contexts):
+        context.close()
     scratch.close()
 
 
@@ -694,10 +692,8 @@ def test_table_batches_plan_cached_layers_beside_cacheless_layers():
             "full": mha.Config(1, 8, (0,), torch.float32),
         }
     )
-    with (
-        PrefixCache(config, num_units=4, block_size=2, device="cpu") as cache,
-        ExecutionContext(module, cache=cache, attention="torch") as context,
-    ):
+    cache = UnitPool.allocate(config, num_units=4, block_size=2, device="cpu")
+    with ExecutionContext(module, cache=cache, attention="torch") as context:
         context.prepare(TextSize(3, 1))
         # The full rows are the widest: two-token full pages, four-token
         # windowed pages, and disjoint units for the two groups' tables.

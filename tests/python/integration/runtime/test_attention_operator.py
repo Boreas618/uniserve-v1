@@ -4,7 +4,9 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+from uniserve_models.backends.attention.torch import Backend
 from uniserve_models.cache import Config, mha
+from uniserve_models.cache.units import UnitPool
 from uniserve_models.model import TextSize
 from uniserve_models.nn.attention import (
     BlockTable,
@@ -16,8 +18,6 @@ from uniserve_models.nn.attention import (
     VisibleInput,
 )
 from uniserve_models.quantization import Quantizer
-from uniserve_models.runtime import PrefixCache
-from uniserve_models.backends.attention.torch import Backend
 
 pytestmark = pytest.mark.integration
 
@@ -122,7 +122,7 @@ def test_shared_visible_endpoint_bounds_every_query_of_its_sequence():
 @pytest.mark.parametrize("quantized", [False, True])
 def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
     config = mha.Config(1, 4, (0,), torch.float32)
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": config}),
         num_units=3,
         block_size=2,
@@ -130,75 +130,75 @@ def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
         quantization={"attention": Quantizer("fp8", axis=0)}
         if quantized
         else None,
-    ) as cache:
-        state = cache.state("attention")
-        operator = _operator(state)
-        key = torch.arange(12).reshape(3, 1, 4).float() / 4
-        value = key + 1
-        state.write((1,), start=0, key=key[:2], value=value[:2])
-        q = torch.ones(1, 2, 4)
-        batch = PagedInput.from_blocks(
-            blocks=((1, 0),),
-            query_lengths=(1,),
-            prefix_lengths=(2,),
-            block_size=2,
-            causal=True,
-            device="cpu",
-        )
-        out = torch.empty_like(q)
-        operator.bind(batch)
-        operator(q, key[2:], value[2:], batch, scale=0.5, out=out)
-        keys, values = state.read((1, 0), start=0, length=3)
-        torch.testing.assert_close(out, _expected(q, keys, values))
-        state.write((2,), start=0, key=key[:2], value=value[:2] * 4)
-        batch.block_table.indices[0, 0] = 2
-        operator.bind(batch)
-        operator(q, key[2:], value[2:], batch, scale=0.5, out=out)
-        keys, values = state.read((2, 0), start=0, length=3)
-        torch.testing.assert_close(out, _expected(q, keys, values))
+    )
+    state = cache.state("attention")
+    operator = _operator(state)
+    key = torch.arange(12).reshape(3, 1, 4).float() / 4
+    value = key + 1
+    state.write((1,), start=0, key=key[:2], value=value[:2])
+    q = torch.ones(1, 2, 4)
+    batch = PagedInput.from_blocks(
+        blocks=((1, 0),),
+        query_lengths=(1,),
+        prefix_lengths=(2,),
+        block_size=2,
+        causal=True,
+        device="cpu",
+    )
+    out = torch.empty_like(q)
+    operator.bind(batch)
+    operator(q, key[2:], value[2:], batch, scale=0.5, out=out)
+    keys, values = state.read((1, 0), start=0, length=3)
+    torch.testing.assert_close(out, _expected(q, keys, values))
+    state.write((2,), start=0, key=key[:2], value=value[:2] * 4)
+    batch.block_table.indices[0, 0] = 2
+    operator.bind(batch)
+    operator(q, key[2:], value[2:], batch, scale=0.5, out=out)
+    keys, values = state.read((2, 0), start=0, length=3)
+    torch.testing.assert_close(out, _expected(q, keys, values))
 
 
 @pytest.mark.parametrize("prefix_length", [0, 1, 2, 3])
 def test_segmented_attention_merges_visible_current_tokens_with_prefix(
     prefix_length,
 ):
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
         num_units=2,
         block_size=2,
         device="cpu",
-    ) as cache:
-        state = cache.state("attention")
-        key = torch.arange((prefix_length + 2) * 4).view(-1, 1, 4).float() / 8
-        value = key + 1
-        state.write(
-            (0, 1),
-            start=0,
-            key=key[:prefix_length],
-            value=value[:prefix_length],
-        )
-        batch = SegmentedInput(
-            SequenceLengths.from_lengths((2,), device="cpu"),
-            SequenceLengths.from_lengths((prefix_length,), device="cpu"),
-            BlockTable(torch.tensor([[0, 1]], dtype=torch.int32), 2),
-            None,
-            torch.tensor([[0, 2]], dtype=torch.int32),
-            False,
-        )
-        query = torch.ones(2, 2, 4)
-        out = torch.empty_like(query)
-        _operator(state)(
-            query,
-            key[prefix_length:],
-            value[prefix_length:],
-            batch,
-            scale=0.5,
-            out=out,
-        )
-        allowed = torch.arange(prefix_length + 2)[None] < torch.tensor(
-            [[prefix_length], [prefix_length + 2]]
-        )
-        torch.testing.assert_close(out, _expected(query, key, value, allowed))
+    )
+    state = cache.state("attention")
+    key = torch.arange((prefix_length + 2) * 4).view(-1, 1, 4).float() / 8
+    value = key + 1
+    state.write(
+        (0, 1),
+        start=0,
+        key=key[:prefix_length],
+        value=value[:prefix_length],
+    )
+    batch = SegmentedInput(
+        SequenceLengths.from_lengths((2,), device="cpu"),
+        SequenceLengths.from_lengths((prefix_length,), device="cpu"),
+        BlockTable(torch.tensor([[0, 1]], dtype=torch.int32), 2),
+        None,
+        torch.tensor([[0, 2]], dtype=torch.int32),
+        False,
+    )
+    query = torch.ones(2, 2, 4)
+    out = torch.empty_like(query)
+    _operator(state)(
+        query,
+        key[prefix_length:],
+        value[prefix_length:],
+        batch,
+        scale=0.5,
+        out=out,
+    )
+    allowed = torch.arange(prefix_length + 2)[None] < torch.tensor(
+        [[prefix_length], [prefix_length + 2]]
+    )
+    torch.testing.assert_close(out, _expected(query, key, value, allowed))
 
 
 def _windowed(window, cache=None):
@@ -237,27 +237,27 @@ def test_paged_window_follows_each_query_position(window, causal):
     key = torch.randn(8, 1, 4, generator=generator)
     value = torch.randn(8, 1, 4, generator=generator)
     query = torch.randn(3, 2, 4, generator=generator)
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
         num_units=5,
         block_size=2,
         device="cpu",
-    ) as cache:
-        state = cache.state("attention")
-        # A five-token prefix is resident; the three query tokens append.
-        state.write((3, 1, 4), start=0, key=key[:5], value=value[:5])
-        batch = PagedInput.from_blocks(
-            blocks=((3, 1, 4, 2),),
-            query_lengths=(3,),
-            prefix_lengths=(5,),
-            block_size=2,
-            causal=causal,
-            device="cpu",
-        )
-        out = torch.empty_like(query)
-        _windowed(window, state)(
-            query, key[5:], value[5:], batch, scale=0.5, out=out
-        )
+    )
+    state = cache.state("attention")
+    # A five-token prefix is resident; the three query tokens append.
+    state.write((3, 1, 4), start=0, key=key[:5], value=value[:5])
+    batch = PagedInput.from_blocks(
+        blocks=((3, 1, 4, 2),),
+        query_lengths=(3,),
+        prefix_lengths=(5,),
+        block_size=2,
+        causal=causal,
+        device="cpu",
+    )
+    out = torch.empty_like(query)
+    _windowed(window, state)(
+        query, key[5:], value[5:], batch, scale=0.5, out=out
+    )
 
     allowed = _history(3, 8, window=window, causal=causal)
     torch.testing.assert_close(out, _expected(query, key, value, allowed))
@@ -302,36 +302,36 @@ def test_segmented_window_reads_one_prefix_interval(prefix_length, window):
     key = torch.randn(prefix_length + 3, 1, 4, generator=generator)
     value = torch.randn(prefix_length + 3, 1, 4, generator=generator)
     query = torch.randn(3, 2, 4, generator=generator)
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": mha.Config(1, 4, (0,), torch.float32)}),
         num_units=3,
         block_size=2,
         device="cpu",
-    ) as cache:
-        state = cache.state("attention")
-        state.write(
-            (0, 1, 2),
-            start=0,
-            key=key[:prefix_length],
-            value=value[:prefix_length],
-        )
-        batch = SegmentedInput(
-            SequenceLengths.from_lengths((3,), device="cpu"),
-            SequenceLengths.from_lengths((prefix_length,), device="cpu"),
-            BlockTable(torch.tensor([[0, 1, 2]], dtype=torch.int32), 2),
-            None,
-            torch.tensor([[3, 3, 3]], dtype=torch.int32),
-            True,
-        )
-        out = torch.empty_like(query)
-        _windowed(window, state)(
-            query,
-            key[prefix_length:],
-            value[prefix_length:],
-            batch,
-            scale=0.5,
-            out=out,
-        )
+    )
+    state = cache.state("attention")
+    state.write(
+        (0, 1, 2),
+        start=0,
+        key=key[:prefix_length],
+        value=value[:prefix_length],
+    )
+    batch = SegmentedInput(
+        SequenceLengths.from_lengths((3,), device="cpu"),
+        SequenceLengths.from_lengths((prefix_length,), device="cpu"),
+        BlockTable(torch.tensor([[0, 1, 2]], dtype=torch.int32), 2),
+        None,
+        torch.tensor([[3, 3, 3]], dtype=torch.int32),
+        True,
+    )
+    out = torch.empty_like(query)
+    _windowed(window, state)(
+        query,
+        key[prefix_length:],
+        value[prefix_length:],
+        batch,
+        scale=0.5,
+        out=out,
+    )
 
     # Every query reads the same final `window` prefix tokens plus all of the
     # current tokens, independent of its own position.
@@ -359,35 +359,35 @@ def test_paged_window_reads_each_row_from_its_start_page(causal):
     ]
     query = torch.randn(5, 2, 4, generator=generator)
     layout = mha.Config(1, 4, (0,), torch.float32)
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": layout}), num_units=10, block_size=2, device="cpu"
-    ) as cache:
-        state = cache.state("attention")
-        # Row 0: an eight-token prefix in pages 0..3 appends three tokens;
-        # its first query (position 8) reads from position 5, so pages 0
-        # and 1 are retired. Row 1: a three-token prefix appends two tokens
-        # and still reads from page 0.
-        state.write((5, 1, 6, 3), start=0, key=keys[0][:8], value=values[0][:8])
-        state.write((7, 8), start=0, key=keys[1][:3], value=values[1][:3])
-        _retire(state, (5, 1))
-        batch = PagedInput.from_blocks(
-            blocks=((6, 3, 2, 4), (7, 8, 9)),
-            query_lengths=(3, 2),
-            prefix_lengths=(8, 3),
-            block_size=2,
-            causal=causal,
-            device="cpu",
-            start_pages=(2, 0),
-        )
-        out = torch.empty_like(query)
-        _windowed(3, state)(
-            query,
-            torch.cat((keys[0][8:], keys[1][3:])),
-            torch.cat((values[0][8:], values[1][3:])),
-            batch,
-            scale=0.5,
-            out=out,
-        )
+    )
+    state = cache.state("attention")
+    # Row 0: an eight-token prefix in pages 0..3 appends three tokens;
+    # its first query (position 8) reads from position 5, so pages 0
+    # and 1 are retired. Row 1: a three-token prefix appends two tokens
+    # and still reads from page 0.
+    state.write((5, 1, 6, 3), start=0, key=keys[0][:8], value=values[0][:8])
+    state.write((7, 8), start=0, key=keys[1][:3], value=values[1][:3])
+    _retire(state, (5, 1))
+    batch = PagedInput.from_blocks(
+        blocks=((6, 3, 2, 4), (7, 8, 9)),
+        query_lengths=(3, 2),
+        prefix_lengths=(8, 3),
+        block_size=2,
+        causal=causal,
+        device="cpu",
+        start_pages=(2, 0),
+    )
+    out = torch.empty_like(query)
+    _windowed(3, state)(
+        query,
+        torch.cat((keys[0][8:], keys[1][3:])),
+        torch.cat((values[0][8:], values[1][3:])),
+        batch,
+        scale=0.5,
+        out=out,
+    )
 
     expected = torch.cat(
         (
@@ -414,31 +414,29 @@ def test_segmented_window_reads_its_prefix_from_the_start_page():
     value = torch.randn(10, 1, 4, generator=generator)
     query = torch.randn(3, 2, 4, generator=generator)
     layout = mha.Config(1, 4, (0,), torch.float32)
-    with PrefixCache(
+    cache = UnitPool.allocate(
         Config({"attention": layout}), num_units=5, block_size=2, device="cpu"
-    ) as cache:
-        state = cache.state("attention")
-        # A seven-token prefix whose window [4, 7) starts on page 2, after
-        # the retired pages 0 and 1.
-        state.write((1, 2, 3, 4), start=0, key=key[:7], value=value[:7])
-        _retire(state, (1, 2))
-        batch = SegmentedInput(
-            SequenceLengths.from_lengths((3,), device="cpu"),
-            SequenceLengths.from_lengths((7,), device="cpu"),
-            BlockTable(
-                torch.tensor([[3, 4]], dtype=torch.int32),
-                2,
-                torch.tensor([2], dtype=torch.int32),
-                (2,),
-            ),
-            None,
-            torch.tensor([[3, 3, 3]], dtype=torch.int32),
-            True,
-        )
-        out = torch.empty_like(query)
-        _windowed(3, state)(
-            query, key[7:], value[7:], batch, scale=0.5, out=out
-        )
+    )
+    state = cache.state("attention")
+    # A seven-token prefix whose window [4, 7) starts on page 2, after
+    # the retired pages 0 and 1.
+    state.write((1, 2, 3, 4), start=0, key=key[:7], value=value[:7])
+    _retire(state, (1, 2))
+    batch = SegmentedInput(
+        SequenceLengths.from_lengths((3,), device="cpu"),
+        SequenceLengths.from_lengths((7,), device="cpu"),
+        BlockTable(
+            torch.tensor([[3, 4]], dtype=torch.int32),
+            2,
+            torch.tensor([2], dtype=torch.int32),
+            (2,),
+        ),
+        None,
+        torch.tensor([[3, 3, 3]], dtype=torch.int32),
+        True,
+    )
+    out = torch.empty_like(query)
+    _windowed(3, state)(query, key[7:], value[7:], batch, scale=0.5, out=out)
 
     columns = torch.arange(10)
     allowed = (columns >= 4).expand(3, -1)
