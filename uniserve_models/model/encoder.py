@@ -9,7 +9,11 @@ import torch
 from torch import nn
 
 from uniserve_models.media import image
-from uniserve_models.nn.attention import AttentionBatch, SequenceLengths, VarlenInput
+from uniserve_models.nn.attention import (
+    AttentionBatch,
+    SequenceLengths,
+    VarlenInput,
+)
 from uniserve_models.tensors import OutputLayout
 
 from .inputs import EmbeddingReplacement, VisionInput

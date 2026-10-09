@@ -21,7 +21,11 @@ from uniserve_models.nn.attention import (
     VarlenInput,
 )
 from uniserve_models.nn.functional import patchify, qk_norm_rope
-from uniserve_models.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
+from uniserve_models.nn.linear import (
+    Linear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from uniserve_models.nn.mlp import GatedMLP
 from uniserve_models.nn.norm import RMSNorm
 from uniserve_models.nn.rope import RotaryEmbedding
@@ -317,6 +321,7 @@ class Encoder(nn.Module):
             or grids.shape[1] != 2
         ) or (
             grid_shapes is not None
+            and counts is not None
             and (
                 pixels.shape[0] != sum(counts)
                 or grids.shape[0] != len(counts)

@@ -2,7 +2,11 @@
 
 import torch
 
-from uniserve_models.nn.attention.inputs import DenseInput, PagedInput, VarlenInput
+from uniserve_models.nn.attention.inputs import (
+    DenseInput,
+    PagedInput,
+    VarlenInput,
+)
 from uniserve_models.quantization import QuantizedTensor
 from uniserve_models.tensors import BufferConfig
 

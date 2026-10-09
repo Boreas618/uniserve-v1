@@ -5,7 +5,11 @@ from itertools import groupby
 
 import torch
 
-from uniserve_models.nn.attention.inputs import BlockTable, PagedInput, SequenceLengths
+from uniserve_models.nn.attention.inputs import (
+    BlockTable,
+    PagedInput,
+    SequenceLengths,
+)
 
 
 def host_lengths(batch, *, prepared=None, derive=True):

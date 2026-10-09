@@ -308,7 +308,7 @@ impl<C> ReadReservation<C> {
 impl<C> Drop for ReadReservation<C> {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
-            eprintln!("Failed to return unused read credits: {error}");
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to return unused read credits: {error}");
         }
     }
 }

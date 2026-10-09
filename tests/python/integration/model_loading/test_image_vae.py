@@ -8,10 +8,10 @@ from diffusers import AutoencoderKL
 from safetensors.torch import save_file
 
 from uniserve_models import loading
+from uniserve_models.bagel import vae
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.media import image
 from uniserve_models.nn.vae.patch import PatchAutoencoder
-from uniserve_models.bagel import vae
 
 pytestmark = pytest.mark.integration
 
