@@ -252,8 +252,12 @@ def warm_thread(device: int) -> None:
     cuBLAS handles are thread-local; a microbatch thread must own one before
     any of its calls is captured.
     """
-    with torch.cuda.device(int(device)):
-        torch.cuda.current_blas_handle()
+    target = torch.device("cuda", int(device))
+    torch.cuda.set_device(target)
+    # A first allocation makes the device's primary context current on this
+    # thread, which the handle creation requires.
+    torch.empty(0, device=target)
+    torch.cuda.current_blas_handle()
 
 
 def close_exchange(exchange) -> None:
