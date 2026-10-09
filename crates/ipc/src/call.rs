@@ -1744,12 +1744,6 @@ impl Batch {
         })
     }
 
-    /// Attaches resolved input products to the run.
-    pub fn with_input_products(mut self, input_products: Vec<TensorExport>) -> Self {
-        self.input_products = input_products;
-        self
-    }
-
     /// Validates identities, call kinds, allocations, products, and commands.
     ///
     /// Runs every nested `validate`, including [`Call::validate`] for each
