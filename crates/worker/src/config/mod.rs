@@ -64,6 +64,10 @@ pub struct WorkerConfig {
     pub min_video_seconds: Option<f64>,
     /// Prompt-token capacities admitted by standalone denoiser layouts.
     pub video_text_capacities: Vec<usize>,
+    /// Canvases a video deployment prepares and admits, in the order the
+    /// deployment names them; empty prepares every canvas the denoiser
+    /// offers.
+    pub video_canvases: Vec<uniserve_core::Canvas>,
     pub deployment_components: Vec<String>,
 
     /// Sampling shared by all generating canvases of this deployment.
@@ -111,6 +115,7 @@ impl Default for WorkerConfig {
             ffmpeg: "ffmpeg".into(),
             min_video_seconds: None,
             video_text_capacities: vec![],
+            video_canvases: vec![],
             deployment_components: vec![],
             canvas_sampling: None,
             max_request_pool_size: 128,
@@ -273,6 +278,15 @@ impl WorkerConfig {
 
         if self.video_text_capacities.contains(&0) {
             return Err(invalid("video text capacities must be positive"));
+        }
+
+        for (index, canvas) in self.video_canvases.iter().enumerate() {
+            if canvas.width == 0 || canvas.height == 0 {
+                return Err(invalid("video canvases must have positive sides"));
+            }
+            if self.video_canvases[..index].contains(canvas) {
+                return Err(invalid("video canvases must be distinct"));
+            }
         }
 
         let mut lane_ids = std::collections::HashSet::new();
