@@ -23,6 +23,8 @@ use uniserve_engine::{
     FlashInferBackend, LaneConfig, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
+use uniserve_server::profile::omni::resolution::ResolutionName;
+use uniserve_server::profile::video::VideoResolution;
 use uniserve_server::serving::systemone::{
     CandidateTokens, CanvasMode, ReadoutLayout, ReadoutOptions,
 };
@@ -172,6 +174,26 @@ pub(crate) struct SharedRuntimeArgs {
     /// advertised as `max_seconds`.
     #[arg(long = "max-video-seconds", default_value_t = 15.0)]
     pub max_video_seconds: f64,
+    /// Comma-separated video resolution classes (`768p`, `480p`) a video
+    /// deployment prepares, each at every `--video-aspect-ratios` entry. A
+    /// request's `target.short_edge` selects one: 768 or 480. Only a FastH3
+    /// export generates the 480p buckets.
+    #[arg(
+        long = "video-resolutions",
+        value_delimiter = ',',
+        default_value = "768p"
+    )]
+    pub video_resolutions: Vec<VideoResolution>,
+    /// Comma-separated video aspect ratios, from the trained buckets `21:9`,
+    /// `16:9`, `4:3`, `1:1`, `3:4`, `9:16`, a video deployment prepares. A
+    /// request's `target.aspect_ratio` selects one; requests are refused at
+    /// any canvas the deployment did not prepare.
+    #[arg(
+        long = "video-aspect-ratios",
+        value_delimiter = ',',
+        default_value = "16:9,9:16"
+    )]
+    pub video_aspect_ratios: Vec<ResolutionName>,
     /// Most denoiser rows the conditions of one video request may take: a
     /// capacity video workers provision their condition products, request
     /// slots and largest denoiser layout for, advertised as
@@ -475,6 +497,8 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
+            video_resolutions: self.video_resolutions.clone(),
+            video_aspect_ratios: self.video_aspect_ratios.clone(),
             max_condition_rows: self.max_condition_rows,
             // Without a written configuration each replica serves one
             // component over its `--worker-ranks` ranks. A model whose

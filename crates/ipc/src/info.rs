@@ -325,8 +325,9 @@ pub struct VideoDenoiserInfo {
     pub video_shift: f64,
     /// Shift of the audio schedule.
     pub audio_shift: f64,
-    /// The only canvases the denoiser generates; empty when it generates
-    /// every canvas of the model's canvas rule.
+    /// The only canvases the deployment serves: those it prepares, in the
+    /// order it names them. Empty declares every canvas of the model's
+    /// canvas rule.
     #[serde(default)]
     pub canvases: Vec<uniserve_core::Canvas>,
     /// The checkpoint's packed sequence capacity in rows, when it has one.

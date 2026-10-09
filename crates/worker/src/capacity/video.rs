@@ -63,9 +63,13 @@ pub(crate) fn outputs(
 ) -> Result<BTreeMap<String, Vec<OutputInfo>>> {
     let frames = media.max_frames();
     let mut result = facts.clone();
-    for (component, outputs) in
-        model.outputs(frames, media.max_text_tokens, media.condition_rows, dtype)?
-    {
+    for (component, outputs) in model.outputs(
+        frames,
+        media.max_text_tokens,
+        media.condition_rows,
+        dtype,
+        &media.canvases,
+    )? {
         let declared = result.entry(component).or_default();
         for output in outputs {
             // A loaded component's facts already declare its products.
@@ -182,6 +186,7 @@ pub(crate) fn plan(
         tokens,
         &requested,
         rows,
+        &config.video_canvases,
     )?;
     let pages = SamplePages::plan(model, &media.largest)?;
     let envelope = if denoising {
@@ -240,7 +245,7 @@ impl VideoCapacity {
         };
         Ok(MediaFacts {
             num_steps: model.facts.num_steps,
-            video_denoiser: Some(model.denoiser_info()?),
+            video_denoiser: Some(model.denoiser_info(&self.media.admitted)?),
             state_bytes: self.envelope.as_ref().map_or(0, StateEnvelope::slot_bytes)
                 + self.overlap_bytes,
             local_product_bytes,

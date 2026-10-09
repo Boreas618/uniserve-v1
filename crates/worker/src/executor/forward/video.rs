@@ -2149,7 +2149,7 @@ fn device_index(device: Device) -> Result<i32> {
     }
 }
 
-/// Every segment admitted videos decode to: canvases (largest first) by
+/// Every segment admitted videos decode to: canvases (in preparation order) by
 /// frame counts (longest first) by units, without repeats.
 pub(crate) fn segments(model: &VideoModel, plan: &MediaPlan) -> Result<Vec<Segment>> {
     let mut result = Vec::new();

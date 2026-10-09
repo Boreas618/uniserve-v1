@@ -1482,6 +1482,7 @@ fn stub_launch_descriptor(registration: &str) -> LaunchDescriptor {
         flow_graph_batch_sizes: None,
         flow_graph_shapes: None,
         video_text_capacities: None,
+        video_canvases: Vec::new(),
         canvas_sampling: None,
         flashinfer_workspace_size: 512 << 20,
         flashinfer_use_tensor_core: None,

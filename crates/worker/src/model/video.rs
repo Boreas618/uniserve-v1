@@ -13,7 +13,7 @@ use tvm_ffi::{Any, AnyView};
 use uniserve_core::Canvas;
 use uniserve_ipc::{ConditionTiles, OutputInfo, VideoDenoiserInfo};
 
-use crate::ffi::{DType, Function, Handle, Record, integers};
+use crate::ffi::{DType, Function, Handle, Record, integer_list, integers, list};
 use crate::model::components::{Capability, Declarations};
 use crate::model::interface::Interface;
 use crate::request::video::{VideoLayout, VideoSize};
@@ -29,10 +29,9 @@ pub(crate) struct VideoFacts {
     pub(crate) tasks: Vec<String>,
     pub(crate) video_shift: f64,
     pub(crate) audio_shift: f64,
-    /// Canvases the denoiser's layouts are prepared for.
+    /// Canvases the denoiser offers: a deployment prepares a selection of
+    /// them, or all of them without one, and admits only those.
     pub(crate) canvases: Vec<Canvas>,
-    /// The denoiser generates only `canvases`.
-    pub(crate) fixed_canvases: bool,
     pub(crate) max_sequence_rows: Option<u32>,
     pub(crate) condition_tiles: Option<ConditionTiles>,
     pub(crate) sample_dtype: DType,
@@ -88,6 +87,17 @@ pub(crate) struct LayoutFields {
     pub(crate) condition_noise: u64,
     /// `[rows, width]` of the retained conditioning.
     pub(crate) text_condition: (u64, u64),
+    /// Elements of the layout's workspace buffers.
+    pub(crate) workspace: u64,
+}
+
+impl LayoutFields {
+    /// Elements of the state and workspace the denoiser holds for the
+    /// layout on this rank: what the layout takes of the storage every
+    /// layout shares.
+    pub(crate) fn storage(&self) -> u64 {
+        self.state.iter().map(StateField::elements).sum::<u64>() + self.workspace
+    }
 }
 
 struct Functions {
@@ -217,7 +227,6 @@ impl VideoModel {
             video_shift: record.get::<f64>("video_shift")?,
             audio_shift: record.get::<f64>("audio_shift")?,
             canvases,
-            fixed_canvases: record.flag("fixed_canvases")?,
             max_sequence_rows: (rows > 0).then_some(rows as u32),
             condition_tiles,
             sample_dtype: parse_dtype(&record.string("sample_dtype")?)?,
@@ -252,8 +261,9 @@ impl VideoModel {
         self.executed_tasks().iter().any(|task| task != "t2va")
     }
 
-    /// The handshake's description of the denoiser.
-    pub(crate) fn denoiser_info(&self) -> Result<VideoDenoiserInfo> {
+    /// The handshake's description of the denoiser on a deployment that
+    /// prepares and admits `canvases`.
+    pub(crate) fn denoiser_info(&self, canvases: &[Canvas]) -> Result<VideoDenoiserInfo> {
         let tasks = self.executed_tasks();
         if tasks.is_empty() {
             return Err(Error::Unsupported(format!(
@@ -266,11 +276,7 @@ impl VideoModel {
             schedule_points: self.facts.num_steps + 1,
             video_shift: self.facts.video_shift,
             audio_shift: self.facts.audio_shift,
-            canvases: if self.facts.fixed_canvases {
-                self.facts.canvases.clone()
-            } else {
-                Vec::new()
-            },
+            canvases: canvases.to_vec(),
             max_sequence_rows: self.facts.max_sequence_rows,
             condition_tiles: self.facts.condition_tiles,
         })
@@ -409,6 +415,7 @@ impl VideoModel {
             noise,
             condition_noise: record.count("condition_noise")? as u64,
             text_condition: (rows.max(0) as u64, width.max(0) as u64),
+            workspace: record.count("workspace")? as u64,
         })
     }
 
@@ -502,13 +509,14 @@ impl VideoModel {
 
     /// The products each model component publishes, bounded for any request
     /// of at most `frames` frames, `tokens` prompt tokens and `rows`
-    /// condition rows.
+    /// condition rows at any of `canvases`.
     pub(crate) fn outputs(
         &self,
         frames: u32,
         tokens: u32,
         rows: u32,
         dtype: &str,
+        canvases: &[Canvas],
     ) -> Result<BTreeMap<String, Vec<OutputInfo>>> {
         let record = Record::new(
             "video.model.outputs",
@@ -517,6 +525,12 @@ impl VideoModel {
                 Any::from(i64::from(tokens)),
                 Any::from(i64::from(rows)),
                 Any::from(tvm_ffi::String::from(dtype)),
+                Any::from(list(canvases.iter().map(|canvas| {
+                    Any::from(integer_list([
+                        i64::from(canvas.width),
+                        i64::from(canvas.height),
+                    ]))
+                }))),
             ])?,
         )?;
         let mut result = BTreeMap::new();

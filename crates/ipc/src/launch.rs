@@ -23,7 +23,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
-use uniserve_core::{CanvasSampling, ComponentConfig};
+use uniserve_core::{Canvas, CanvasSampling, ComponentConfig};
 
 use crate::LaneConfig;
 
@@ -197,6 +197,10 @@ pub struct LaunchDescriptor {
     /// Comma-separated `HEIGHTxWIDTH` image capture sizes.
     pub flow_graph_shapes: Option<String>,
     pub video_text_capacities: Option<String>,
+    /// Canvases a video deployment prepares and admits, in the order the
+    /// deployment names them; empty prepares every canvas the denoiser
+    /// offers.
+    pub video_canvases: Vec<Canvas>,
     pub canvas_sampling: Option<CanvasSampling>,
 
     /// FlashInfer attention options, in bytes and backend names.
