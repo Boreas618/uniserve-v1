@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from math import prod
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -24,6 +25,9 @@ from uniserve_models.cache.units import Planes, UnitPool, plan_units
 from uniserve_models.quantization import Quantizer
 
 from .errors import binding
+
+if TYPE_CHECKING:
+    from uniserve_models.model import CausalLM
 
 __all__ = [
     "bind_conversion",
@@ -39,7 +43,7 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def _causal_lm(loaded) -> nn.Module:
+def _causal_lm(loaded) -> CausalLM:
     """Return the loaded model's unique ``CausalLM`` module.
 
     ``loaded`` is the handle the loading interface returned: either the
@@ -70,7 +74,7 @@ def _storage(kv_dtype: str) -> tuple[torch.dtype | None, bool]:
     return dtype, False
 
 
-def _plan(model: nn.Module, block_size: int, kv_dtype: str) -> Planes:
+def _plan(model: CausalLM, block_size: int, kv_dtype: str) -> Planes:
     """Plan the pool with ``block_size``-token pages of the widest rows."""
     layers = model.cache_config.layers
     if not layers:
@@ -88,7 +92,7 @@ def _plan(model: nn.Module, block_size: int, kv_dtype: str) -> Planes:
     )
 
 
-def _group_layers(model: nn.Module, planes: Planes) -> list[list[int]]:
+def _group_layers(model: CausalLM, planes: Planes) -> list[list[int]]:
     """Return every group's global cache-layer ids across pipeline stages.
 
     A logical cache layer joins the group whose history window, logical
@@ -401,8 +405,9 @@ def bind_conversion(
         layers, heads = len(cache_group.layers), cache_group.num_kv_heads
         shape = (int(count), layers, heads, cache_group.head_dim)
         nbytes = prod(shape) * dtype.itemsize
-        source = tuple(
-            raw[field, :nbytes].view(dtype).view(shape) for field in (0, 1)
+        source = (
+            raw[0, :nbytes].view(dtype).view(shape),
+            raw[1, :nbytes].view(dtype).view(shape),
         )
         source_scales = None
         if int(scale_heads) > 0:

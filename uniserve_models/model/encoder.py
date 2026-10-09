@@ -81,7 +81,7 @@ class TextConditioner(Encoder[tuple[torch.Tensor, ...]]):
         inputs: tuple[torch.Tensor, ...],
         *,
         lengths: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, ...] | None:
+    ) -> tuple[torch.Tensor, ...]:
         if any(value.ndim != 2 for value in inputs):
             raise ValueError("text conditioning samples are [rows, width]")
         if lengths is None:

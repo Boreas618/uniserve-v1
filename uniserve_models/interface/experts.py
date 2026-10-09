@@ -211,7 +211,7 @@ def create_exchange(
             num_experts=int(first.num_experts),
             hidden_size=int(first.hidden_size),
             intermediate_size=int(first.intermediate_size),
-            activation=str(first.activation),
+            activation=first.activation,
             attention_ranks=attention_ranks,
             device=target,
             yield_turn=yield_turn,

@@ -23,7 +23,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeVar, cast
 
 import torch
 from torch import nn
@@ -59,6 +59,9 @@ from .components import (
 from .errors import SetupError
 
 logger = logging.getLogger(__name__)
+
+# A capability class a model's module is looked up by.
+_Kind = TypeVar("_Kind")
 
 
 def functions() -> dict[str, Callable[..., Any]]:
@@ -122,9 +125,10 @@ def _io(value: Mapping[str, Any]) -> library.Config:
     directory = _text(value.get("download_dir"))
     manifest = _text(value.get("checksum_manifest"))
     threads = value.get("num_threads")
+    # The worker sends plain strings; ``Config`` rejects unknown values.
     return library.Config(
-        format=str(value["format"]),
-        mode=str(value["mode"]),
+        format=cast(Literal["auto", "safetensors", "pt"], str(value["format"])),
+        mode=cast(Literal["eager", "layered", "dummy"], str(value["mode"])),
         download_dir=None if directory is None else Path(directory),
         num_threads=None if threads is None else int(threads),
         checksum_manifest=None if manifest is None else Path(manifest),
@@ -256,6 +260,8 @@ def resolve(
     """
     if description.stub:
         return description
+    # ``describe`` requires a checkpoint path of every model but the stub.
+    assert description.path is not None
     source = catalog.read_config(
         description.path,
         io=description.io,
@@ -303,6 +309,7 @@ def load(
             meshes[str(path)] = item["mesh"]
             attention[str(path)] = attention_parallel(str(item["sequence"]))
 
+    module: nn.Module
     if description.stub:
         from uniserve_models.stub import Model, image_processor
 
@@ -317,6 +324,8 @@ def load(
             model_name=f"{type(module).__module__}.{type(module).__qualname__}",
         )
     elif request.get("host_only"):
+        # ``resolve`` returns a bare description for the stub model alone.
+        assert source is not None
         # A host rank holds only host components: the weight-less
         # description carries the media geometry, rates and unit division.
         logger.info(
@@ -332,6 +341,8 @@ def load(
             model_name=_name(description.model),
         )
     else:
+        # ``resolve`` returns a bare description for the stub model alone.
+        assert source is not None
         partition = _expert_partition(request.get("experts"))
         result = catalog.load_model(
             source,
@@ -505,9 +516,9 @@ _PRODUCT_DTYPES = {
 }
 
 
-def capability(model: nn.Module, kind: type) -> nn.Module | None:
+def capability(model: nn.Module, kind: type[_Kind]) -> _Kind | None:
     """The model's unique module of ``kind``, if any."""
-    found = []
+    found: list[_Kind] = []
     for module in model.modules():
         if isinstance(module, kind) and all(module is not m for m in found):
             found.append(module)
@@ -606,7 +617,9 @@ def _vision_feature_bytes(model: nn.Module, processor) -> int:
 
 def _image_flow(model: nn.Module) -> dict[str, int] | None:
     """The image denoiser's latent geometry for the latent pool plan."""
-    denoiser = capability(model, ImageDenoiser)
+    # mypy rejects an abstract class as a ``type`` argument; the lookup
+    # only tests membership.
+    denoiser = capability(model, ImageDenoiser)  # type: ignore[type-abstract]
     if denoiser is None:
         return None
     return {

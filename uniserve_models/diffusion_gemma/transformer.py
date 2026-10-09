@@ -256,7 +256,9 @@ class Layer(PhasedLayer):
         attended = self.attention(self.input_norm(hidden), positions, attention)
         return hidden, attended
 
-    def feed_forward(
+    # ``PhasedLayer`` accepts any state; this layer names the two tensors
+    # its ``attend`` returns.
+    def feed_forward(  # type: ignore[override]
         self, hidden: torch.Tensor, attended: torch.Tensor
     ) -> tuple[torch.Tensor, None]:
         stream, (dense_input, expert_input, routed) = sandwich_rms_norm(

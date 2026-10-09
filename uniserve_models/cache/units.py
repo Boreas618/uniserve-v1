@@ -206,6 +206,8 @@ def plan_units(
     # layout validates each layer's dtype and quantizer through its buffers.
     members: dict[tuple, list[str]] = {}
     for name, layout in layers.items():
+        # Every layer was validated as an MHA layout above.
+        assert isinstance(layout, mha.Config)
         fields = layout.buffers(
             num_blocks=1, block_size=1, dtype=dtype, quantizer=quantizer
         )
