@@ -1248,6 +1248,7 @@ mod tests {
             ],
             condition_noise: 0,
             text_condition: (rows, 4),
+            workspace: 0,
         }
     }
 

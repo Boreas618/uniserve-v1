@@ -233,11 +233,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
     @property
     def canvases(self) -> tuple[image.Config, ...]:
-        """Canvases a deployment prepares layouts for.
+        """Canvases a deployment may prepare layouts for.
 
-        A checkpoint that generates only some canvases prepares those; one
-        that follows the canvas rule prepares every named aspect ratio's
-        canvas, and other canvases evaluate unprepared.
+        A checkpoint that generates only some canvases offers those; one
+        that follows the canvas rule offers every named aspect ratio's
+        canvas.
         """
         if self.config.canvases is not None:
             return self.config.canvases
@@ -253,10 +253,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def schedule_shifts(self) -> Mapping[str, float]:
         schedule = self.config.schedule
         return {"video": schedule.video_shift, "audio": schedule.audio_shift}
-
-    @property
-    def fixed_canvases(self) -> tuple[image.Config, ...] | None:
-        return self.config.canvases
 
     @property
     def max_sequence_rows(self) -> int | None:

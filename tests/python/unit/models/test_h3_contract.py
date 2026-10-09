@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from uniserve_models.loading import Config as IOConfig
-from uniserve_models.nn.functional import Rounding
 from uniserve_models.minimax_h3 import (
     DenseAttention,
     Model,
@@ -22,6 +21,7 @@ from uniserve_models.minimax_h3 import (
 )
 from uniserve_models.minimax_h3.checkpoint import Kind, detect
 from uniserve_models.minimax_h3.config import Config, normalize, read_config
+from uniserve_models.nn.functional import Rounding
 
 pytestmark = pytest.mark.unit
 
@@ -61,8 +61,21 @@ def test_full_vsa_checkpoint_resolves_its_trained_rungs(checkpoint):
     assert denoiser.schedule.audio_shift == 3
     assert denoiser.attention == SparseAttention(tile=64, sparsity=0.9)
     assert denoiser.tasks == ("t2va",)
+    # The export generates its 12 (width, height) training buckets: 21:9,
+    # 16:9, 4:3, 1:1, 3:4 and 9:16 at 768p, then at 480p.
     assert [(canvas.width, canvas.height) for canvas in denoiser.canvases] == [
-        (1344, 768)
+        (1536, 672),
+        (1344, 768),
+        (1024, 768),
+        (768, 768),
+        (768, 1024),
+        (768, 1344),
+        (992, 416),
+        (832, 480),
+        (640, 480),
+        (480, 480),
+        (480, 640),
+        (480, 832),
     ]
     # FastH3 exports keep the single-rounding block epilogues.
     assert denoiser.transformer.rounding is Rounding.ONCE
