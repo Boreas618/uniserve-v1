@@ -28,7 +28,7 @@ use super::{
     ArenaCapacity, DEFAULT_NUM_UNITS, KVCapacity, call_window, latent_pool_bytes,
     request_tensor_window,
 };
-use crate::config::{WorkerConfig, graph_padding_block_count};
+use crate::config::{Device, WorkerConfig, graph_padding_block_count};
 use crate::parallel::host::HostGroup;
 use crate::runner::graph_storage_budget_bytes;
 use crate::storage::KVPlan;
@@ -220,8 +220,8 @@ pub struct TokenFacts {
 pub struct Plan {
     pub info: WorkerInfo,
     pub arena: ArenaCapacity,
-    /// Fixed device bytes by device name, beside the KV pool.
-    pub fixed_device_bytes: BTreeMap<String, u64>,
+    /// Fixed bytes by device, beside the KV pool.
+    pub fixed_device_bytes: BTreeMap<Device, u64>,
     /// Bytes of this rank's physical buffer pool.
     pub physical_buffer_pool_bytes: u64,
     pub latent: Option<LatentPlan>,
@@ -300,7 +300,7 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
 pub struct TokenLayout {
     info: WorkerInfo,
     arena: ArenaCapacity,
-    fixed: BTreeMap<String, u64>,
+    fixed: BTreeMap<Device, u64>,
     feature_bytes: u64,
     latent: Option<LatentPlan>,
 }
@@ -354,7 +354,7 @@ impl TokenLayout {
         )?;
         let mut fixed = BTreeMap::new();
         fixed.insert(
-            config.device.clone(),
+            config.device,
             info.buffer_pool_bytes + arena.device_product_bytes + latent_bytes,
         );
         info.host_lane_capacity = narrow(arena.host_lane_inflight, "host lane capacity")?;
@@ -372,8 +372,8 @@ impl TokenLayout {
     }
 
     /// Record fixed storage a capability runtime allocates on `device`.
-    pub fn reserve(&mut self, device: &str, bytes: u64) {
-        *self.fixed.entry(device.to_owned()).or_default() += bytes;
+    pub fn reserve(&mut self, device: Device, bytes: u64) {
+        *self.fixed.entry(device).or_default() += bytes;
     }
 
     /// Fit the KV pool beside the fixed storage and agree its unit count.
@@ -410,7 +410,7 @@ impl TokenLayout {
             .unwrap_or(0)
             .div_ceil(unit_bytes);
 
-        let cuda = config.primary_device().is_cuda();
+        let cuda = config.device.is_cuda();
         let tokens = config.kv_token_capacity.map(|tokens| tokens as u64);
         let available = config.pool_storage_bytes.map(|bytes| bytes as u64);
         if cuda && tokens.is_none() && available.is_none() {
@@ -670,7 +670,7 @@ mod tests {
     fn the_kv_pool_takes_the_grant_left_after_reservations() {
         let gib = 1u64 << 30;
         let config = WorkerConfig {
-            device: "cuda:0".into(),
+            device: Device::Cuda(0),
             max_batch_calls: 8,
             max_batch_tokens: 2048,
             max_request_pool_size: 8,
@@ -685,8 +685,8 @@ mod tests {
             product_bytes: 0,
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
-        let fixed_before = layout.fixed["cuda:0"];
-        layout.reserve("cuda:0", gib);
+        let fixed_before = layout.fixed[&Device::Cuda(0)];
+        layout.reserve(Device::Cuda(0), gib);
         let cache = cache();
         let capacity = layout
             .fit_cache(&cache, 0, &config, 100 * gib, &group())
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn cpu_workers_take_the_default_pool_and_lane_limits_clamp_the_batch() {
         let config = WorkerConfig {
-            device: "cpu".into(),
+            device: Device::Cpu,
             max_batch_calls: 8,
             max_batch_tokens: 64,
             max_request_pool_size: 8,

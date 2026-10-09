@@ -260,7 +260,7 @@ impl ImageRuntime {
                     startup.request_slots,
                     kv.plan(),
                     Some(kv.planes().num_units()),
-                    config.primary_device().is_cuda(),
+                    config.device.is_cuda(),
                 )?;
                 let tokens = flow_tokens(&layout, config);
                 let width = bounds.widths.iter().copied().max().unwrap_or(1).max(1) as usize;
@@ -513,7 +513,6 @@ impl ImageRuntime {
                 devices.extend(
                     config
                         .devices()
-                        .filter_map(|name| Device::parse(name, "device").ok())
                         .filter_map(Device::cuda_index)
                         .filter(|&device| device != ordinal),
                 );
@@ -553,7 +552,7 @@ impl ImageRuntime {
 
         // Completion words per call plus every image's pixels.
         let max_pixel_words = (max_image_pixels(layout.as_ref()) * 3).div_ceil(8) * max_calls;
-        let device = config.primary_device().cuda_index();
+        let device = config.device.cuda_index();
         let outputs = OutputPool::new(
             device,
             startup.queue_depth.max(1) * 2,
