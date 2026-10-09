@@ -6,11 +6,11 @@
 
 use std::collections::HashSet;
 use std::process::Command;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
 use uniserve_core::UnitId;
-use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32, reclaim};
 use uniserve_ipc::{BlockTable, Locator, TransferTransport, WorkerEndpoint};
 use uniserve_worker::ffi::{Backing, DType, Device};
 use uniserve_worker::storage::memory::{Memory, StorageView};
@@ -27,8 +27,38 @@ const DEVICE: i32 = 0;
 /// The child half of the two-process VMM test reads this variable.
 const CHILD_LOCATOR: &str = "UNISERVE_TEST_VMM_LOCATOR";
 
+/// Serializes the tests of this binary.
+///
+/// Some tests hold a stream in a host function to observe the work queued
+/// behind it (see [`block`]). While a stream is held, a driver call that waits
+/// for all of the context's queued work (`cuMemFree`, `cuMemFreeHost`) cannot
+/// return, and it keeps driver locks that every other call needs, including
+/// the calls the holding test makes before it releases the stream. No other
+/// test may use the driver meanwhile, so every test takes this lock first.
+static DRIVER: Mutex<()> = Mutex::new(());
+
+fn exclusive_driver() -> MutexGuard<'static, ()> {
+    DRIVER.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn stream() -> Stream {
     Stream::new(DeviceId(DEVICE)).unwrap()
+}
+
+/// Blocks `stream` in a host function until the returned sender is used.
+///
+/// Until then the caller must not release device or pinned memory: the
+/// release would wait on the held stream (see [`DRIVER`]). Releases queued
+/// earlier are flushed first for the same reason.
+fn block(stream: &Stream) -> mpsc::Sender<()> {
+    reclaim::flush().unwrap();
+    let (release, released) = mpsc::channel::<()>();
+    stream
+        .launch_host_fn(move || {
+            let _ = released.recv();
+        })
+        .unwrap();
+    release
 }
 
 /// Copy a device view's bytes to the host (drains `stream`).
@@ -102,6 +132,7 @@ fn transports(
 #[test]
 #[ignore = "requires a CUDA device"]
 fn block_table_installs_and_clears_write_device_tables() {
+    let _driver = exclusive_driver();
     let stream = stream();
     let groups = vec![
         GroupShape::new(16, 1, None).unwrap(),
@@ -198,6 +229,7 @@ fn block_table_installs_and_clears_write_device_tables() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn output_readback_waits_for_device_copies_and_widens_tokens() {
+    let _driver = exclusive_driver();
     let stream = stream();
     let events = EventPool::default();
     let tokens = Memory::device(DEVICE, 12).unwrap();
@@ -223,6 +255,7 @@ fn output_readback_waits_for_device_copies_and_widens_tokens() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn device_exports_reach_local_shared_and_channel_readers() {
+    let _driver = exclusive_driver();
     let stream = stream();
     let (transports, capacity) = transports(
         &[
@@ -299,6 +332,7 @@ fn device_exports_reach_local_shared_and_channel_readers() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn cancelled_reads_keep_credits_until_their_copy_drains() {
+    let _driver = exclusive_driver();
     let (transports, capacity) = transports(&[TransportKind::Local], "space", 0);
     let stream = stream();
     let source = counting(&[256], Memory::device(DEVICE, 1024).unwrap(), &stream);
@@ -318,12 +352,7 @@ fn cancelled_reads_keep_credits_until_their_copy_drains() {
     // The destination's submitting stream is blocked: the transport copy
     // waits on its handoff fence, so the read cannot drain yet.
     let submitter = Stream::new(DeviceId(DEVICE)).unwrap();
-    let (release, released) = mpsc::channel::<()>();
-    submitter
-        .launch_host_fn(move || {
-            let _ = released.recv();
-        })
-        .unwrap();
+    let release = block(&submitter);
     let destination = Spans::single(
         StorageView::contiguous(
             Memory::device(DEVICE, 1024).unwrap() as Arc<dyn Backing>,
@@ -373,6 +402,7 @@ fn cancelled_reads_keep_credits_until_their_copy_drains() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn vmm_exports_are_imported_by_another_process() {
+    let _driver = exclusive_driver();
     let stream = stream();
     let (transports, capacity) = transports(
         &[TransportKind::Local, TransportKind::CudaVmm],
@@ -426,6 +456,7 @@ fn vmm_exports_are_imported_by_another_process() {
 #[test]
 #[ignore = "runs as the consumer process of the VMM export test"]
 fn vmm_export_consumer() {
+    let _driver = exclusive_driver();
     let Ok(locator) = std::env::var(CHILD_LOCATOR) else {
         return;
     };
@@ -508,6 +539,7 @@ fn fp8_plan() -> uniserve_worker::KVPlan {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn kv_planes_reset_scratch_and_restore_snapshots() {
+    let _driver = exclusive_driver();
     use uniserve_worker::storage::UnitSnapshot;
 
     let stream = stream();
