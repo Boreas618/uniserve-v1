@@ -192,6 +192,13 @@ def create_exchange(
             "storage": torch.from_dlpack(symmetric["storage"]),
             "pointers": [int(value) for value in symmetric["pointers"]],
         }
+    yield_turn = hooks.get("yield")
+    if yield_turn is not None:
+        # The worker's function waits for this microbatch's next turn. Other
+        # microbatch threads run numerical code meanwhile, so the wait must
+        # never hold the interpreter lock, whatever the process default for
+        # native calls is.
+        yield_turn.release_gil = True
     with torch.cuda.device(target), torch.cuda.stream(computation):
         return transports.create(
             str(transport),
@@ -205,7 +212,7 @@ def create_exchange(
             activation=str(first.activation),
             attention_ranks=attention_ranks,
             device=target,
-            yield_turn=hooks.get("yield"),
+            yield_turn=yield_turn,
             encoding=_encoding(first),
             symmetric=storage,
         )
