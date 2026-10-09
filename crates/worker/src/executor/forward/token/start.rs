@@ -33,6 +33,8 @@ use crate::storage::{KVCache, KVPlan, OutputPool};
 use crate::worker::Lanes;
 use crate::{Error, Result};
 
+use super::super::experts::ExpertRuntime;
+
 /// The text call kinds a runner may serve.
 pub(crate) const TEXT_KINDS: [CallKind; 3] = [
     CallKind::Forward(ForwardMode::Prefill),
@@ -186,6 +188,28 @@ impl TextBounds {
     }
 }
 
+/// Tokens one text forward sends to each expert layer at most: the batch
+/// token bound or the largest decode graph bucket, whichever is larger.
+/// The runners' bounds never exceed it, before or after the KV pool fits.
+pub(crate) fn expert_tokens(config: &WorkerConfig) -> usize {
+    let mut max_rows = config.max_batch_calls;
+    let mut tokens = config.max_batch_tokens;
+    for lane in &config.lanes {
+        max_rows = max_rows.min(lane.max_batch_calls.unwrap_or(max_rows));
+        tokens = tokens.min(lane.max_batch_tokens.unwrap_or(tokens));
+    }
+    let graphs = config.primary_device().is_cuda() && config.graph_policy != "off";
+    if !graphs {
+        return tokens;
+    }
+    config
+        .decode_graph_batch_sizes
+        .iter()
+        .copied()
+        .filter(|&rows| rows > 0 && rows <= max_rows)
+        .fold(tokens, usize::max)
+}
+
 /// The streams serving text calls on `device`, with the text kinds each
 /// serves: every configured lane with a text kind, or the device stream.
 fn streams(
@@ -236,6 +260,13 @@ pub(crate) struct Startup<'a> {
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
+    /// The expert runtime, when forwards are expert steps: each lane binding
+    /// gets one runner per microbatch, bound to its transport and stream.
+    pub(crate) experts: Option<&'a mut ExpertRuntime>,
+    /// The worker's ranks, across which symmetric workspaces are mapped.
+    pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
+    /// The distributed expert weights' prefetch object, with DWDP.
+    pub(crate) weights: Option<&'a Handle>,
 }
 
 impl TextRuntime {
@@ -278,6 +309,15 @@ impl TextRuntime {
             Some(kv.planes().num_units()),
             cuda.is_some(),
         )?;
+        if let Some(experts) = startup.experts.as_ref()
+            && bounds.tokens > experts.parallel().max_tokens()
+        {
+            return Err(Error::Invariant(format!(
+                "text invocations of {} tokens exceed the expert exchange's {} tokens per rank",
+                bounds.tokens,
+                experts.parallel().max_tokens()
+            )));
+        }
         let vocab = startup.facts.vocab_size.ok_or_else(|| {
             Error::Interface("a causal language model reports no vocabulary".into())
         })?;
@@ -309,36 +349,98 @@ impl TextRuntime {
         )?;
 
         // Prepare every binding before binding any, so shared workspaces
-        // hold the largest of them.
+        // hold the largest of them. With experts, each lane binding has one
+        // binding per microbatch: the first on the lane's stream, the others
+        // on the microbatch streams, each with its own transport.
+        let mut experts = startup.experts;
         let mut prepared = Vec::new();
         let mut targets = Vec::new();
+        let mut groups = Vec::new();
         for (component, path, device, kinds) in &texts {
             for (stream, served) in streams(startup.lanes, *device, kinds)? {
-                let handle = stream.as_ref().map_or(0, Stream::raw);
-                prepared.push(bind::prepare(
-                    startup.interface,
-                    startup.model.handle(),
-                    BindingRequest {
-                        component: component.clone(),
-                        path: path.clone(),
-                        device: *device,
-                        stream: handle,
-                        size: Some(TextSize {
-                            tokens: bounds.tokens,
-                            rows: bounds.rows,
-                        }),
-                        // The loaded model resolved its attention backend.
-                        backends: Backends::default(),
-                        derive_host_lengths: false,
-                        experts: None,
-                        weights: None,
-                        cache: Some(pool.clone()),
-                    },
-                )?);
-                targets.push((component.clone(), *device, stream, served));
+                let mut peers = Vec::new();
+                let microbatches = experts.as_ref().map_or(1, |experts| experts.microbatches());
+                for microbatch in 0..microbatches {
+                    let (stream, transport) = match experts.as_ref() {
+                        Some(experts) => {
+                            if let Some(lane) = &stream
+                                && microbatch == 0
+                                && lane.raw() != experts.stream(0).raw()
+                            {
+                                return Err(Error::Unsupported(
+                                    "expert parallelism runs every forward on one execution lane"
+                                        .into(),
+                                ));
+                            }
+                            let peer = experts.stream(microbatch);
+                            // SAFETY: the lanes own the stream and close
+                            // after the text runtime.
+                            let view = unsafe { Stream::borrowed(peer.device(), peer.raw()) }?;
+                            (Some(view), Some(experts.transport(microbatch).clone()))
+                        }
+                        None => (
+                            stream
+                                .as_ref()
+                                // SAFETY: as above.
+                                .map(|stream| unsafe {
+                                    Stream::borrowed(stream.device(), stream.raw())
+                                })
+                                .transpose()?,
+                            None,
+                        ),
+                    };
+                    let handle = stream.as_ref().map_or(0, Stream::raw);
+                    prepared.push(bind::prepare(
+                        startup.interface,
+                        startup.model.handle(),
+                        BindingRequest {
+                            component: component.clone(),
+                            path: path.clone(),
+                            device: *device,
+                            stream: handle,
+                            size: Some(TextSize {
+                                tokens: bounds.tokens,
+                                rows: bounds.rows,
+                            }),
+                            // The loaded model resolved its attention backend.
+                            backends: Backends::default(),
+                            derive_host_lengths: false,
+                            experts: transport,
+                            weights: startup.weights.cloned(),
+                            cache: Some(pool.clone()),
+                        },
+                    )?);
+                    peers.push(targets.len());
+                    targets.push((component.clone(), *device, stream, served.clone()));
+                }
+                groups.push(peers);
             }
         }
-        let bindings = bind::bind(startup.interface, startup.workspaces, prepared)?;
+        if experts.is_some() && groups.len() != 1 {
+            return Err(Error::Unsupported(format!(
+                "expert parallelism serves one text binding; {} lane bindings are placed",
+                groups.len()
+            )));
+        }
+        let bindings = bind::bind(
+            startup.interface,
+            startup.workspaces,
+            prepared,
+            startup.peers,
+        )?;
+        let mut collectives = Vec::new();
+        if let Some(peers) = startup.peers {
+            for ((_, _, stream, _), binding) in targets.iter().zip(&bindings) {
+                let owner = stream
+                    .as_ref()
+                    .and_then(|stream| startup.lanes.owner(stream.raw()));
+                collectives.extend(peers.bind_collectives(startup.interface, binding, owner)?);
+            }
+        }
+        if let Some(experts) = experts.as_deref_mut() {
+            let handles: Vec<&Handle> = bindings.iter().map(|binding| binding.prepared()).collect();
+            experts.bind_joins(&handles)?;
+        }
 
         let table_layout: Vec<i64> = bounds
             .tables
@@ -413,15 +515,18 @@ impl TextRuntime {
                 _ => None,
             };
             columns.push(kv.bind_units(&bind_units, stream.as_ref())?);
-            for &kind in &served {
-                if routes
-                    .insert((component.clone(), kind), runners.len())
-                    .is_some()
-                {
-                    return Err(Error::Invalid(format!(
-                        "computation {component}.{} has multiple lane bindings",
-                        kind.as_str()
-                    )));
+            let group = groups
+                .iter()
+                .position(|peers| peers.contains(&runners.len()))
+                .ok_or_else(|| Error::Invariant("a text runner belongs to no group".into()))?;
+            if groups[group][0] == runners.len() {
+                for &kind in &served {
+                    if routes.insert((component.clone(), kind), group).is_some() {
+                        return Err(Error::Invalid(format!(
+                            "computation {component}.{} has multiple lane bindings",
+                            kind.as_str()
+                        )));
+                    }
                 }
             }
             runners.push(TextRunner::new(RunnerParts {
@@ -446,8 +551,19 @@ impl TextRuntime {
         if let Some(stream) = startup.preparation {
             stream.synchronize()?;
         }
+        if let Some(experts) = experts {
+            let pools: Vec<Handle> = groups[0]
+                .iter()
+                .filter_map(|&runner| runners[runner].pool().cloned())
+                .collect();
+            if !pools.is_empty() {
+                experts.set_pools(pools);
+            }
+        }
         Ok(Some(Self {
             runners,
+            groups,
+            collectives,
             columns,
             routes,
             state,

@@ -38,9 +38,29 @@ STARTUP_ENTRIES = {
 }
 
 
+# Entries an expert-parallel rank resolves; a missing one fails the rank.
+EXPERT_ENTRIES = {
+    "experts.layers",
+    "experts.symmetric_bytes",
+    "experts.create_exchange",
+    "experts.bind_microbatches",
+    "experts.bind",
+    "experts.warm_thread",
+    "experts.close_exchange",
+    "experts.weight_fields",
+    "experts.bind_weights",
+    "experts.bind_prefetch",
+    "graphs.begin_capture",
+    "graphs.end_capture",
+    "graphs.replay",
+    "graphs.release",
+    "distributed.bind_collectives",
+}
+
+
 def test_table_provides_every_startup_entry_as_a_function():
     table = interface.table()
-    assert STARTUP_ENTRIES <= table.keys()
+    assert STARTUP_ENTRIES | EXPERT_ENTRIES <= table.keys()
     assert all(callable(function) for function in table.values())
     assert all(name.count(".") == 1 for name in table)
 

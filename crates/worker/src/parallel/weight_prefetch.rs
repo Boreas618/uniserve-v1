@@ -272,3 +272,306 @@ fn plan(copies: Vec<(usize, usize, usize, usize)>) -> CopyBatch {
     }
     batch
 }
+
+/// One sharded expert-weight field of one layer: this rank's contiguous
+/// shard of `rows` experts (the field's leading axis), on the device.
+pub struct ShardField {
+    /// The field's name, unique within its layer (`up_gate.values`).
+    pub name: String,
+    /// Device address and bytes of this rank's shard.
+    pub address: u64,
+    pub bytes: usize,
+}
+
+/// Storage that must outlive every copy and every reader of the composite
+/// weight views: published shards, reusable remote slots and the composite
+/// mappings.
+pub struct WeightStorage {
+    published: Vec<crate::transfer::PeerStorage>,
+    slots: Vec<uniserve_cuda::DeviceAllocation>,
+    composites: Vec<std::sync::Arc<crate::storage::memory::Memory>>,
+}
+
+/// Distributed expert weights: every rank keeps its expert shard resident
+/// and reads the other ranks' shards from peer memory into two reusable
+/// slots per field, prefetching the next layer while one computes.
+///
+/// The mechanism follows TensorRT-LLM's composite-VA weight buffer. For each
+/// field, every rank publishes a page-granular allocation holding its shard
+/// (all ranks the same size, so every peer maps them back to back); a
+/// composite virtual range maps `[pre slot | resident pages | post slot]`
+/// contiguously, so the numerical layer reads the full field as one
+/// contiguous tensor. The slots of layer `i` are shared with layer `i + 2`.
+/// Bytes of peers' shards inside this rank's resident pages (page edges)
+/// are copied once at setup; every other remote byte is copied before its
+/// layer computes. Only setup is collective: inference waits on local copy
+/// and compute events alone.
+pub struct ExpertWeights {
+    prefetch: WeightPrefetch<WeightStorage>,
+    /// Bytes of resident pages, reusable slots and per-invocation copies.
+    pub resident_bytes: usize,
+    pub buffer_bytes: usize,
+    pub transfer_bytes: usize,
+}
+
+impl ExpertWeights {
+    /// Publish and map every layer's fields, collectively over `group`.
+    ///
+    /// `layers[i]` holds layer `i`'s sharded fields in the same order on
+    /// every rank. Returns the owner and, per layer and field, the full
+    /// field as a contiguous byte view (`bytes * group size` long). Setup
+    /// copies run on `stream`, which is drained before returning. On
+    /// failure every mapping is retained until the process exits, because
+    /// peers may already read published pages.
+    pub fn build(
+        group: &super::host::HostGroup,
+        device: i32,
+        node: &str,
+        layers: &[Vec<ShardField>],
+        stream: &Stream,
+    ) -> Result<(Self, Vec<Vec<crate::storage::memory::StorageView>>)> {
+        let mut storage = WeightStorage {
+            published: Vec::new(),
+            slots: Vec::new(),
+            composites: Vec::new(),
+        };
+        let built = Self::map(group, device, node, layers, stream, &mut storage);
+        match built {
+            Ok((copies, views, (resident_bytes, buffer_bytes, transfer_bytes))) => {
+                let prefetch =
+                    WeightPrefetch::new(device, (0..layers.len()).collect(), copies, storage)?;
+                Ok((
+                    Self {
+                        prefetch,
+                        resident_bytes,
+                        buffer_bytes,
+                        transfer_bytes,
+                    },
+                    views,
+                ))
+            }
+            Err(error) => {
+                #[expect(
+                    clippy::mem_forget,
+                    reason = "peers may read published pages of a failed setup"
+                )]
+                std::mem::forget(storage);
+                Err(error)
+            }
+        }
+    }
+
+    #[expect(clippy::type_complexity, reason = "one setup's complete result")]
+    fn map(
+        group: &super::host::HostGroup,
+        device: i32,
+        node: &str,
+        layers: &[Vec<ShardField>],
+        stream: &Stream,
+        storage: &mut WeightStorage,
+    ) -> Result<(
+        Vec<Vec<(usize, usize, usize, usize)>>,
+        Vec<Vec<crate::storage::memory::StorageView>>,
+        (usize, usize, usize),
+    )> {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use uniserve_cuda::{DeviceAllocation, PeerMapping, memcpy_async};
+
+        use crate::ffi::{Backing, DType};
+        use crate::storage::memory::{Memory, StorageView};
+
+        let (rank, size) = (group.rank(), group.size());
+        let page = DeviceAllocation::granularity(DeviceId(device))?;
+        let mut slots: HashMap<(usize, String, &'static str, usize), usize> = HashMap::new();
+        let mut copies = Vec::with_capacity(layers.len());
+        let mut views = Vec::with_capacity(layers.len());
+        let (mut resident_bytes, mut buffer_bytes, mut transfer_bytes) = (0, 0, 0);
+        for (index, fields) in layers.iter().enumerate() {
+            let mut layer_copies = Vec::new();
+            let mut layer_views = Vec::new();
+            for field in fields {
+                let shard = field.bytes;
+                let total = shard * size;
+                let (begin, end) = (rank * shard, (rank + 1) * shard);
+                let first = begin / page * page;
+                // Every rank publishes the same extent, even when its shard
+                // starts at another offset within a page; fabric handles map
+                // only whole allocations.
+                let capacity = (0..size)
+                    .map(|peer| (peer * shard % page + shard).div_ceil(page) * page)
+                    .max()
+                    .unwrap_or(page);
+                let last = first + capacity;
+                let published =
+                    crate::transfer::PeerStorage::allocate(device, capacity, node, group)?;
+                if published.bytes_each() != capacity {
+                    return Err(Error::Invariant(
+                        "published expert pages disagree with their capacity".into(),
+                    ));
+                }
+                let local = published
+                    .local()
+                    .allocation()
+                    .ok_or_else(|| Error::Invariant("published pages are device memory".into()))?
+                    .address();
+                // SAFETY: the shard is a live device tensor of `shard` bytes
+                // the caller keeps through this setup; the destination lies
+                // inside this rank's published allocation.
+                unsafe {
+                    memcpy_async(local + (begin - first) as u64, field.address, shard, stream)
+                }?;
+                stream.synchronize()?;
+                // Publish: no rank writes its resident pages again.
+                group.barrier()?;
+                resident_bytes += capacity;
+
+                let mut parts: Vec<usize> = Vec::new();
+                let post = total.div_ceil(page) * page;
+                for (side, length) in [("pre", first), ("post", post.saturating_sub(last))] {
+                    if length == 0 {
+                        continue;
+                    }
+                    let key = (index % 2, field.name.clone(), side, length);
+                    let slot = match slots.get(&key) {
+                        Some(&slot) => slot,
+                        None => {
+                            storage.slots.push(DeviceAllocation::exportable(
+                                DeviceId(device),
+                                length,
+                                &[],
+                            )?);
+                            buffer_bytes += length;
+                            slots.insert(key, storage.slots.len() - 1);
+                            storage.slots.len() - 1
+                        }
+                    };
+                    parts.push(slot);
+                }
+                let resident = published
+                    .local()
+                    .allocation()
+                    .ok_or_else(|| Error::Invariant("published pages are device memory".into()))?;
+                let mut pieces: Vec<&DeviceAllocation> = Vec::new();
+                let mut part = parts.iter();
+                if first > 0 {
+                    pieces.push(
+                        &storage.slots[*part.next().ok_or_else(|| {
+                            Error::Invariant("expert weight pre slot is missing".into())
+                        })?],
+                    );
+                }
+                pieces.push(resident);
+                if let Some(&slot) = part.next() {
+                    pieces.push(&storage.slots[slot]);
+                }
+                let composite = Memory::mapped(PeerMapping::alias(&pieces)?);
+                let whole = composite.address();
+                let peers = published.peers().address();
+
+                // Edge bytes share immutable resident pages: copy them once
+                // now. Sources always lie inside the peer's own shard.
+                for peer in (0..size).filter(|&peer| peer != rank) {
+                    let (peer_begin, peer_end) = (peer * shard, (peer + 1) * shard);
+                    let source_begin = peers + (peer * capacity + peer_begin % page) as u64;
+                    for (low, high, persistent) in [
+                        (0, first, false),
+                        (first, begin, true),
+                        (end, last.min(total), true),
+                        (last, total, false),
+                    ] {
+                        let (start, stop) = (low.max(peer_begin), high.min(peer_end));
+                        if start >= stop {
+                            continue;
+                        }
+                        let source = source_begin + (start - peer_begin) as u64;
+                        let destination = whole + start as u64;
+                        if persistent {
+                            // SAFETY: both ranges lie inside live mappings
+                            // retained by `storage`.
+                            unsafe { memcpy_async(destination, source, stop - start, stream) }?;
+                        } else {
+                            layer_copies.push((
+                                peer,
+                                destination as usize,
+                                source as usize,
+                                stop - start,
+                            ));
+                            transfer_bytes += stop - start;
+                        }
+                    }
+                }
+                stream.synchronize()?;
+                layer_views.push(StorageView::contiguous(
+                    Arc::clone(&composite) as Arc<dyn Backing>,
+                    0,
+                    DType::U8,
+                    &[total as i64],
+                )?);
+                storage.composites.push(composite);
+                storage.published.push(published);
+            }
+            copies.push(layer_copies);
+            views.push(layer_views);
+        }
+        Ok((
+            copies,
+            views,
+            (resident_bytes, buffer_bytes, transfer_bytes),
+        ))
+    }
+
+    /// Open one invocation.
+    pub fn begin(&self) -> Result<()> {
+        self.prefetch.begin()
+    }
+
+    /// Close one invocation on `compute`, joining a speculative tail copy.
+    pub fn end(&self, compute: usize) -> Result<()> {
+        self.prefetch.end(compute)
+    }
+
+    /// Make layer `layer` readable on `compute` and prefetch the next one.
+    ///
+    /// Eagerly, the copies are submitted now. On a capturing stream, copies
+    /// cannot be recorded: `record(index)` receives each copy in submission
+    /// order and must end the current graph segment, schedule
+    /// [`copy`](Self::copy) of `index` and begin the next segment. The order
+    /// matters: the wait for this layer's slots is captured after the
+    /// segment boundary that submits their copy.
+    pub fn before(
+        &self,
+        layer: usize,
+        compute: usize,
+        mut record: impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        // SAFETY: the caller's live compute stream on this device.
+        let stream = unsafe { Stream::borrowed(self.prefetch.device, compute) }?;
+        let capturing = stream.capture_status()? != uniserve_cuda::CaptureStatus::None;
+        self.prefetch.before(layer, compute, |index| {
+            if capturing {
+                record(index)
+            } else {
+                self.prefetch.copy(index)
+            }
+        })?
+    }
+
+    /// Release layer `layer`'s slots after its last reader on `compute`.
+    pub fn after(&self, layer: usize, compute: usize) -> Result<()> {
+        self.prefetch.after(layer, compute)
+    }
+
+    /// Submit one recorded copy (graph replay between segments).
+    pub fn copy(&self, index: usize) -> Result<()> {
+        self.prefetch.copy(index)
+    }
+
+    /// Drain the copy stream and release the storage after every reader and
+    /// graph retired.
+    pub fn close(&self) -> Result<()> {
+        drop(self.prefetch.close()?);
+        Ok(())
+    }
+}

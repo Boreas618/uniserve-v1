@@ -11,9 +11,9 @@
 use uniserve_cuda::{CopyBatch, SourceOrder};
 
 use super::super::launch::lock;
-use super::batch::TokenBatch;
+use super::batch::{CallState, TokenBatch};
 use super::calls;
-use super::step::Stepped;
+use super::step::{Invoked, Stepped};
 use crate::storage::{LogprobLayout, ProductBuffer, Scalar};
 use crate::{Error, Result};
 
@@ -48,8 +48,9 @@ impl TokenBatch<'_> {
         self.commit(&commits)
     }
 
-    /// Each active call's progress and slot-state commit row.
-    fn advance(&mut self, stepped: &Stepped) -> Result<Vec<[i64; 8]>> {
+    /// Each active call's progress and slot-state commit row, by the
+    /// runner of its microbatch.
+    fn advance(&mut self, stepped: &Stepped) -> Result<Vec<(usize, Vec<[i64; 8]>)>> {
         let plan = self.plan;
         let tables = self
             .storage
@@ -57,7 +58,10 @@ impl TokenBatch<'_> {
             .as_ref()
             .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?
             .tables();
-        let mut commits = Vec::new();
+        let mut commits: Vec<(usize, Vec<[i64; 8]>)> = self.runtime.groups[self.group]
+            .iter()
+            .map(|&runner| (runner, Vec::new()))
+            .collect();
         for (call, state) in plan.calls.iter().zip(&mut self.calls) {
             if !state.active {
                 continue;
@@ -73,12 +77,22 @@ impl TokenBatch<'_> {
                 .ar
                 .as_ref()
                 .is_some_and(|ar| ar.sampling.uses_penalties());
-            commits.push(calls::finish(
+            let position = match state.task {
+                Some(task) => Some(stepped.invocation(state.microbatch)?.position(task)),
+                None => None,
+            };
+            let rows = commits
+                .iter_mut()
+                .find(|(runner, _)| *runner == state.microbatch)
+                .ok_or_else(|| {
+                    Error::Invariant("a call's microbatch is outside its group".into())
+                })?;
+            rows.1.push(calls::finish(
                 call,
                 &mut state.output,
                 prepared,
                 tables,
-                state.task.map(|task| stepped.position(task)),
+                position,
                 state.metadata.as_ref(),
                 penalties,
             )?);
@@ -92,24 +106,34 @@ impl TokenBatch<'_> {
     /// Copy completion fields, logprob words and prompt scores into the
     /// output lease and record each call's spans.
     fn capture(&mut self, stepped: &Stepped) -> Result<()> {
+        for invoked in &stepped.invocations {
+            self.capture_invocation(invoked)?;
+        }
+        Ok(())
+    }
+
+    /// Capture one microbatch invocation's outputs from its runner's
+    /// columns. The lane stream already waits on the microbatch's stream.
+    fn capture_invocation(&mut self, invoked: &Invoked) -> Result<()> {
         let stream = self.stream.as_ref();
-        let runner = &self.runtime.runners[self.runner];
+        let runner = &self.runtime.runners[invoked.runner];
         let events = &self.storage.events;
         let mut output = lock(&self.buffer);
-        if stepped.tasks > 0 {
+        let mine = |state: &CallState| state.microbatch == invoked.runner;
+        if invoked.tasks > 0 {
             // Fields of the sampled tasks: `[valid | active | token |
             // accepted]`, one section per field.
             let completion = runner
                 .column("completion")?
-                .narrow(1, 0, stepped.tasks as i64)?;
+                .narrow(1, 0, invoked.tasks as i64)?;
             let (offset, extent) = output.capture(&completion, stream, events)?;
-            for state in &mut self.calls {
+            for state in self.calls.iter_mut().filter(|state| mine(state)) {
                 if let Some(task) = state.task {
-                    state.output.sampling_range = Some((offset, extent, stepped.position(task)));
+                    state.output.sampling_range = Some((offset, extent, invoked.position(task)));
                 }
             }
         }
-        if let Some(sampling) = &stepped.sampling {
+        if let Some(sampling) = &invoked.sampling {
             for group in sampling.logprobs.iter().flatten() {
                 let words = runner.column("logprobs")?.narrow(
                     0,
@@ -128,7 +152,7 @@ impl TokenBatch<'_> {
                         max_requested: group.layout.max_requested,
                     },
                 )?;
-                for state in &mut self.calls {
+                for state in self.calls.iter_mut().filter(|state| mine(state)) {
                     if let Some(task) = state.task
                         && let Some((first, _, row)) = sampling.logprob_span(task)
                         && first == group.offset
@@ -138,7 +162,7 @@ impl TokenBatch<'_> {
                 }
             }
         }
-        for state in &mut self.calls {
+        for state in self.calls.iter_mut().filter(|state| mine(state)) {
             // Chunks of one prompt report their scores in prompt order.
             let mut ranges = Vec::new();
             for prompt in &mut state.prompt {
@@ -163,20 +187,29 @@ impl TokenBatch<'_> {
     }
 
     /// Publish sampled tokens and transition decisions into the products
-    /// that relay them, in runs of consecutive task columns.
+    /// that relay them, in runs of consecutive task columns of each
+    /// microbatch.
     fn relay(&mut self, stepped: &Stepped) -> Result<()> {
-        let runner = &self.runtime.runners[self.runner];
+        for invoked in &stepped.invocations {
+            self.relay_invocation(invoked)?;
+        }
+        Ok(())
+    }
+
+    fn relay_invocation(&mut self, invoked: &Invoked) -> Result<()> {
+        let runner = &self.runtime.runners[invoked.runner];
         for (column, transition) in [("tagged", false), ("transition", true)] {
             let mut writes: Vec<(usize, ProductBuffer)> = self
                 .calls
                 .iter()
+                .filter(|state| state.microbatch == invoked.runner)
                 .filter_map(|state| {
                     let write = if transition {
                         &state.transition_write
                     } else {
                         &state.token_write
                     };
-                    Some((stepped.position(state.task?), write.clone()?))
+                    Some((invoked.position(state.task?), write.clone()?))
                 })
                 .collect();
             writes.sort_by_key(|(position, _)| *position);
@@ -205,7 +238,7 @@ impl TokenBatch<'_> {
     }
 
     /// Validate every owner's update, then commit them together.
-    fn commit(&mut self, commits: &[[i64; 8]]) -> std::result::Result<(), Failure> {
+    fn commit(&mut self, commits: &[(usize, Vec<[i64; 8]>)]) -> std::result::Result<(), Failure> {
         let stream = self.stream.as_ref();
         let plan = self.plan;
 
@@ -255,9 +288,15 @@ impl TokenBatch<'_> {
         // Every owner accepted its update. Any failure from here is fatal.
         let writes = std::mem::take(&mut self.writes);
         self.storage.tensors.commit_writes(&writes).map_err(fatal)?;
-        let runner = &self.runtime.runners[self.runner];
-        runner.commit(commits).map_err(fatal)?;
+        // Each microbatch runner commits its calls' slot state on its own
+        // stream; the lane stream then orders after all of them.
+        for (runner, rows) in commits {
+            self.runtime.runners[*runner].commit(rows).map_err(fatal)?;
+        }
         self.install_prompt_tails().map_err(fatal)?;
+        if let (Some(experts), Some(stream)) = (self.experts, stream) {
+            experts.join_streams(stream).map_err(fatal)?;
+        }
         self.runtime.order.record(stream).map_err(fatal)?;
         self.requests.add_pending(&pending).map_err(fatal)
     }
@@ -265,18 +304,18 @@ impl TokenBatch<'_> {
     /// Copy scored chunks' last logits rows into their slots' retained
     /// prompt logits.
     fn install_prompt_tails(&self) -> Result<()> {
-        let tails: Vec<(usize, usize)> = self
+        let tails: Vec<(usize, usize, usize)> = self
             .calls
             .iter()
-            .filter_map(|state| Some((state.prompt.last()?.tail, state.slot)))
+            .filter_map(|state| Some((state.microbatch, state.prompt.last()?.tail, state.slot)))
             .collect();
         if tails.is_empty() {
             return Ok(());
         }
-        let tail = self.runtime.runners[self.runner].column("prompt_tail")?;
-        let row_bytes = tail.nbytes() / tail.shape()[0] as u64;
         let mut copies = CopyBatch::new(SourceOrder::Stream);
-        for &(row, slot) in &tails {
+        for &(runner, row, slot) in &tails {
+            let tail = self.runtime.runners[runner].column("prompt_tail")?;
+            let row_bytes = tail.nbytes() / tail.shape()[0] as u64;
             copies.push(
                 self.runtime.state.prompt_row(slot)?,
                 tail.address() + row as u64 * row_bytes,

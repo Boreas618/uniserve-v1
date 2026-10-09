@@ -38,7 +38,9 @@ pub(super) struct CallState {
     pub(super) token_write: Option<ProductBuffer>,
     pub(super) transition_write: Option<ProductBuffer>,
     pub(super) completion_write: Option<ProductBuffer>,
-    /// The call's input index among the invocation's sampled tasks.
+    /// The runner of the microbatch the call's row runs in.
+    pub(super) microbatch: usize,
+    /// The call's input index among its invocation's sampled tasks.
     pub(super) task: Option<usize>,
     pub(super) metadata: Option<SamplingMetadata>,
     /// The call's prompt chunks, in order.
@@ -53,8 +55,11 @@ pub(super) struct TokenBatch<'a> {
     pub(super) storage: &'a mut RankStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
-    pub(super) runner: usize,
-    /// A borrowed view of the runner's lane stream.
+    /// The runner group serving the batch.
+    pub(super) group: usize,
+    /// The rank's expert runtime, when its forwards are expert steps.
+    pub(super) experts: Option<&'a super::super::experts::ExpertRuntime>,
+    /// A borrowed view of the group's lane stream.
     pub(super) stream: Option<Stream>,
     pub(super) device: Option<i32>,
     pub(super) mode: ForwardMode,
@@ -77,6 +82,7 @@ impl<'a> TokenBatch<'a> {
         image: Option<&'a mut ImageRuntime>,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
+        experts: Option<&'a super::super::experts::ExpertRuntime>,
         info: &uniserve_ipc::WorkerInfo,
         rank: usize,
         plan: &'a BatchPlan,
@@ -94,15 +100,16 @@ impl<'a> TokenBatch<'a> {
         {
             return Err(Error::Invalid("a token batch serves one component".into()));
         }
-        let runner = runtime.route(&first.component, first.code).ok_or_else(|| {
+        let group = runtime.route(&first.component, first.code).ok_or_else(|| {
             Error::Unsupported(format!(
                 "component {:?} has no text binding for {}",
                 first.component,
                 first.code.as_str()
             ))
         })?;
-        let device = runtime.runners[runner].device();
-        let stream = runtime.runners[runner]
+        let lane = runtime.groups[group][0];
+        let device = runtime.runners[lane].device();
+        let stream = runtime.runners[lane]
             .stream()
             // SAFETY: the lanes own the stream for the runtime's lifetime.
             .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
@@ -129,6 +136,7 @@ impl<'a> TokenBatch<'a> {
                 token_write: None,
                 transition_write: None,
                 completion_write: None,
+                microbatch: lane,
                 task: None,
                 metadata: None,
                 prompt: Vec::new(),
@@ -171,7 +179,8 @@ impl<'a> TokenBatch<'a> {
             storage,
             requests,
             plan,
-            runner,
+            group,
+            experts,
             stream,
             device,
             mode,
@@ -217,7 +226,8 @@ impl<'a> TokenBatch<'a> {
             .flat_map(|allocation| allocation.unit_ids.iter().map(|unit| unit.0))
             .collect();
         if !units.is_empty() {
-            kv.recycle(&units, &self.runtime.columns[self.runner], stream)?;
+            let lane = self.runtime.groups[self.group][0];
+            kv.recycle(&units, &self.runtime.columns[lane], stream)?;
         }
 
         // Each active call has one forward row on its own slot; a context

@@ -1,34 +1,34 @@
 """Expert-parallel experts evaluate the routed equation across ranks.
 
 Two ranks each keep half of the experts of one ``FusedMoE`` and exchange
-tokens through the NVLink all-to-all at every call. Each rank's tokens return
-with the complete routed sum over all experts, whichever rank holds them, and
-a rank without tokens of its own still serves the other rank's tokens routed
-to its experts by joining the step, in one launch of the join captured at
-the step's capacity. Replaying a captured step reproduces it.
-The fused MegaMoE exchange serves NVFP4 experts with the same step protocol
-and gates with each layer's declared nonlinearity.
+tokens through an expert transport at every call of an expert step. Each
+rank's tokens return with the complete routed sum over all experts,
+whichever rank holds them, and a rank without tokens of its own still serves
+the other rank's tokens routed to its experts by joining the step, also by
+replaying its join captured at the step's capacity. Replaying a captured
+step reproduces it. The transports bootstrap over a ``torch.distributed``
+group, as direct library callers do. The fused MegaMoE transport serves
+NVFP4 experts with the same step protocol and gates with each layer's
+declared nonlinearity.
 """
 
 import socket
+from contextlib import contextmanager
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn import functional as F
-from uniserve_models.runtime.expert_exchange import ExpertExchange, JoinGraphs
-from uniserve_models.runtime.process_groups import (
-    Rendezvous,
-    initialize_process_groups,
-)
 
+from uniserve_models.backends import experts as transports
 from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import partition_experts
+from uniserve_models.distributed import Communicator, partition_experts
+from uniserve_models.interface import graphs
 from uniserve_models.model import TextSize
 from uniserve_models.nn import functional
 from uniserve_models.nn.moe import FusedMoE
 from uniserve_models.quantization import Quantizer, ScaleLayout
-from uniserve_models.runtime import CUDAGraph, CUDAStream
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -36,6 +36,58 @@ EXPERTS, HIDDEN, INTERMEDIATE, TOP_K = 8, 256, 128, 2
 # Tokens each rank routes: the second rank has none and joins the step.
 TOKENS = (40, 0)
 CAPACITY = 64
+
+
+@contextmanager
+def _union(rank, port):
+    """The expert group of every rank, over a Gloo and NCCL process group."""
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "cpu:gloo,cuda:nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=len(TOKENS),
+    )
+    try:
+        yield Communicator(
+            tuple(range(len(TOKENS))),
+            rank,
+            "experts",
+            device,
+            dist.group.WORLD,
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _transport(group, transport="alltoall", **options):
+    """One transport of ``CAPACITY`` tokens per rank over ``group``."""
+    settings = {
+        "max_tokens": CAPACITY,
+        "top_k": TOP_K,
+        "num_experts": EXPERTS,
+        "hidden_size": HIDDEN,
+        "intermediate_size": INTERMEDIATE,
+        "activation": "gelu_tanh",
+        "attention_ranks": 0,
+        "device": group.device,
+    }
+    settings.update(options)
+    return transports.create(
+        transport,
+        group,
+        transports.TorchBootstrap(dist.group.WORLD),
+        **settings,
+    )
+
+
+def _replay(graph, stream):
+    """Replay ``graph`` on ``stream`` and wait for it."""
+    with torch.cuda.stream(stream):
+        output = graph.replay()
+    stream.synchronize()
+    return output
 
 
 def _gamma(roundings):
@@ -94,18 +146,10 @@ def _inputs(rank, device):
 
 
 @torch.inference_mode()
-def _run(rank, port, grouped=False):
+def _run(rank, port):
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=0,
-        local_rank=rank,
-        world_size=1,
-        device=device,
-        experts=(rank, len(TOKENS), Rendezvous("127.0.0.1", port)),
-    ) as groups:
-        up_gate, down, hidden, ids, weights = _inputs(
-            0 if grouped else rank, device
-        )
+    with _union(rank, port) as group:
+        up_gate, down, hidden, ids, weights = _inputs(rank, device)
         module = FusedMoE(
             EXPERTS,
             HIDDEN,
@@ -117,59 +161,31 @@ def _run(rank, port, grouped=False):
         )
         module.up_gate.weight.copy_(up_gate)
         module.down.weight.copy_(down)
-        partition_experts(module, groups.experts)
+        partition_experts(module, group)
 
-        exchange = ExpertExchange(
-            groups.experts,
-            max_tokens=CAPACITY,
-            top_k=TOP_K,
-            num_experts=EXPERTS,
-            hidden_size=HIDDEN,
-            device=device,
-            source_group=(0, 1) if grouped else None,
-        )
-        stream = CUDAStream.external(torch.cuda.Stream(device=device))
-        stream.wait(torch.cuda.current_stream(device))
+        exchange = _transport(group)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
         expected = _reference(hidden, up_gate, down, ids, weights)
-        with (
-            stream,
-            ExecutionContext(
-                module, stream=stream, experts=exchange
-            ) as context,
-        ):
+        with ExecutionContext(
+            module, stream=stream, experts=exchange
+        ) as context:
             context.prepare(TextSize(CAPACITY, 1))
 
             def step():
                 """One expert step: this rank's tokens, or a join."""
-                exchange.begin(CAPACITY)
-                try:
-                    output = (
+                with context.activate(), context.expert_step(CAPACITY):
+                    return (
                         module(hidden, ids, weights)
                         if hidden.shape[0]
                         else hidden.new_empty((0, HIDDEN))
                     )
-                    context.join_expert_layers()
-                finally:
-                    exchange.end()
-                return output
 
-            if grouped:
-                # The first member received the shared request, while the
-                # second is still polling IPC. Starting a forward here would
-                # leave its tensor collectives without a peer.
-                assert exchange.agree(hidden.shape[0] if rank == 0 else 0) == 0
-                assert not exchange.active
-            capacity = exchange.agree(hidden.shape[0])
-            assert capacity == CAPACITY
-            assert exchange.active == bool(hidden.shape[0])
-            with context.activate():
-                eager = step()
-
+            eager = step()
             # Every rank captures the same step, then replays it.
-            with CUDAGraph(context=context) as graph:
-                graph.capture(step)
-                captured = graph.replay()
-                stream.synchronize()
+            graph = graphs.capture(step, stream=stream)
+            captured = _replay(graph, stream)
+            graph.release()
 
         if hidden.shape[0]:
             # The local kernel's roundings, the BF16 partial sum each rank
@@ -180,24 +196,6 @@ def _run(rank, port, grouped=False):
                 )
         else:
             assert eager.shape == captured.shape == (0, HIDDEN)
-
-        if grouped:
-            # One source group cannot mix forwards from different runners.
-            assert exchange.agree(40, kind=rank) == 0
-            assert not exchange.active
-            assert exchange.agree(40, kind=0) == CAPACITY
-            assert exchange.active
-        else:
-            # Independent sources retain their work until their kind is next.
-            for kind in (1, 0, 1):
-                assert exchange.agree(40, kind=rank) == CAPACITY
-                assert exchange.kind == kind
-                assert exchange.active == (rank == kind)
-
-        assert exchange.agree(0, leaving=rank == 0) == 0
-        assert not exchange.released
-        assert exchange.agree(0, leaving=True) == 0
-        assert exchange.released
         exchange.close()
 
 
@@ -213,22 +211,10 @@ def test_expert_parallel_ranks_return_the_complete_routed_sum():
     mp.spawn(_run, (_free_port(),), nprocs=len(TOKENS), join=True)
 
 
-def test_tensor_sources_wait_for_their_shared_request():
-    if torch.cuda.device_count() < 2:
-        pytest.fail("tensor source agreement needs two GPUs")
-    mp.spawn(_run, (_free_port(), True), nprocs=2, join=True)
-
-
 @torch.inference_mode()
 def _run_joined(rank, port):
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=0,
-        local_rank=rank,
-        world_size=1,
-        device=device,
-        experts=(rank, len(TOKENS), Rendezvous("127.0.0.1", port)),
-    ) as groups:
+    with _union(rank, port) as group:
         up_gate, down, hidden, ids, weights = _inputs(rank, device)
         # Two expert layers of the same experts: a join covers every layer.
         layers = torch.nn.ModuleList(
@@ -246,45 +232,37 @@ def _run_joined(rank, port):
         for layer in layers:
             layer.up_gate.weight.copy_(up_gate)
             layer.down.weight.copy_(down)
-        partition_experts(layers, groups.experts)
+        partition_experts(layers, group)
 
-        exchange = ExpertExchange(
-            groups.experts,
-            max_tokens=CAPACITY,
-            top_k=TOP_K,
-            num_experts=EXPERTS,
-            hidden_size=HIDDEN,
-            device=device,
-        )
-        stream = CUDAStream.external(torch.cuda.Stream(device=device))
-        stream.wait(torch.cuda.current_stream(device))
+        exchange = _transport(group)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
         expected = _reference(hidden, up_gate, down, ids, weights)
-        with (
-            stream,
-            ExecutionContext(
-                layers, stream=stream, experts=exchange
-            ) as context,
-        ):
+        with ExecutionContext(
+            layers, stream=stream, experts=exchange
+        ) as context:
             context.prepare(TextSize(CAPACITY, 1))
-            # Collective: every rank captures its joins at the same point.
-            joins = JoinGraphs(context, exchange, {CAPACITY})
-            try:
-                if hidden.shape[0]:
-                    # This rank's eager step meets the other rank's replay.
-                    with context.activate():
-                        exchange.begin(CAPACITY)
-                        try:
-                            outputs = [
-                                layer(hidden, ids, weights) for layer in layers
-                            ]
-                        finally:
-                            exchange.end()
-                    stream.synchronize()
-                else:
-                    joins.replay(CAPACITY)
-                    stream.synchronize()
-            finally:
-                joins.close()
+
+            def forward():
+                with context.activate(), context.expert_step(CAPACITY):
+                    return [layer(hidden, ids, weights) for layer in layers]
+
+            def join():
+                with context.activate(), context.expert_step(CAPACITY):
+                    pass
+
+            if hidden.shape[0]:
+                # A warmup step, then the step the other rank's replay meets.
+                forward()
+                outputs = forward()
+                stream.synchronize()
+            else:
+                # The join warms with the peer's first step, is captured
+                # without communication, and its replay meets the second.
+                join()
+                graph = graphs.capture(join, stream=stream)
+                _replay(graph, stream)
+                graph.release()
 
         if hidden.shape[0]:
             # The joining rank's experts served both layers' routes.
@@ -414,10 +392,10 @@ def _check_received(group, exchange, tokens, device):
     encoding = Quantizer("nvfp4", calibrated_scale=INPUT_SCALES[0])
     local = range(rank * EXPERTS // size, (rank + 1) * EXPERTS // size)
     hidden, ids, weights = tokens[rank]
-    exchange.begin(CAPACITY)
+    exchange.capacity = CAPACITY
     try:
         received, received_ids, received_weights = exchange.dispatch(
-            0, encoding.quantize(hidden), ids, weights, invalid_expert=-1
+            encoding.quantize(hidden), ids, weights, invalid_expert=-1
         )
         assert received.quantizer == encoding
         assert received.shape == (size * CAPACITY, HIDDEN)
@@ -457,74 +435,54 @@ def _check_received(group, exchange, tokens, device):
             hidden.shape[0],
         )
     finally:
-        exchange.end()
+        exchange.capacity = 0
 
 
 @torch.inference_mode()
 def _run_encoded(rank, port, provider, transport):
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=0,
-        local_rank=rank,
-        world_size=1,
-        device=device,
-        experts=(rank, len(TOKENS), Rendezvous("127.0.0.1", port)),
-    ) as groups:
-        exchange = ExpertExchange(
-            groups.experts,
-            max_tokens=CAPACITY,
-            top_k=TOP_K,
-            num_experts=EXPERTS,
-            hidden_size=HIDDEN,
-            device=device,
-            transport=transport,
-        )
+    with _union(rank, port) as group:
+        exchange = _transport(group, transport)
+        if transport == "deepep":
+            # The first call's host barrier is the expert step's.
+            exchange.barrier()
+            exchange.ready = True
         # Both ranks send tokens, so each receives rows from both.
         _, tokens = _encoded_inputs((24, 16), device)
-        _check_received(groups.experts, exchange, tokens, device)
+        _check_received(group, exchange, tokens, device)
 
         # The first rank's tokens through the experts; the second rank has
         # none and joins every step with its empty rows.
         codes, tokens = _encoded_inputs(TOKENS, device)
         hidden, ids, weights = tokens[rank]
-        module = _nvfp4_moe(codes, device, groups.experts)
+        module = _nvfp4_moe(codes, device, group)
         # A rank without tokens only joins, with no rows to encode.
         encoded = (
             module.up_gate.input_quantizer.quantize(hidden)
             if hidden.shape[0]
             else hidden
         )
-        stream = CUDAStream.external(torch.cuda.Stream(device=device))
-        stream.wait(torch.cuda.current_stream(device))
-        with (
-            stream,
-            ExecutionContext(
-                module, stream=stream, moe=provider, experts=exchange
-            ) as context,
-        ):
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with ExecutionContext(
+            module, stream=stream, moe=provider, experts=exchange
+        ) as context:
             context.prepare(TextSize(CAPACITY, 1))
 
             def step(states):
                 """One expert step: this rank's tokens, or a join."""
-                exchange.begin(CAPACITY)
-                try:
-                    output = (
+                with context.activate(), context.expert_step(CAPACITY):
+                    return (
                         module(states, ids, weights)
                         if hidden.shape[0]
                         else hidden.new_empty((0, HIDDEN))
                     )
-                    context.join_expert_layers()
-                finally:
-                    exchange.end()
-                return output
 
-            with context.activate():
-                dense = step(hidden).clone()
-                eager = step(encoded).clone()
-            with CUDAGraph(context=context) as graph:
-                graph.capture(lambda: step(encoded))
-                captured = graph.replay()
-                stream.synchronize()
+            dense = step(hidden).clone()
+            eager = step(encoded).clone()
+            graph = graphs.capture(lambda: step(encoded), stream=stream)
+            captured = _replay(graph, stream).clone()
+            graph.release()
 
         exchange.close()
         if not hidden.shape[0]:
@@ -612,13 +570,7 @@ def _probe_experts():
 @torch.inference_mode()
 def _run_megamoe(rank, port, activation):
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=0,
-        local_rank=rank,
-        world_size=1,
-        device=device,
-        experts=(rank, len(TOKENS), Rendezvous("127.0.0.1", port)),
-    ) as groups:
+    with _union(rank, port) as group:
         up_gate, down = _probe_experts()
         quantizers = (
             Quantizer("nvfp4", calibrated_scale=1.0),
@@ -635,7 +587,7 @@ def _run_megamoe(rank, port, activation):
             device=device,
             dtype=torch.bfloat16,
         )
-        partition_experts(module, groups.experts)
+        partition_experts(module, group)
         local = module.expert_slice
         module.up_gate.weight = torch.nn.Parameter(
             _nvfp4(up_gate[0][local], device, up_gate[1][local]),
@@ -647,25 +599,12 @@ def _run_megamoe(rank, port, activation):
         )
         module.up_gate.input_quantizer, module.down.input_quantizer = quantizers
 
-        exchange = ExpertExchange(
-            groups.experts,
-            max_tokens=CAPACITY,
-            top_k=1,
-            num_experts=EXPERTS,
-            hidden_size=HIDDEN,
-            device=device,
-            transport="megamoe",
-            intermediate_size=INTERMEDIATE,
-            activation=activation,
-        )
-        stream = CUDAStream.external(torch.cuda.Stream(device=device))
-        stream.wait(torch.cuda.current_stream(device))
-        with (
-            stream,
-            ExecutionContext(
-                module, stream=stream, experts=exchange
-            ) as context,
-        ):
+        exchange = _transport(group, "megamoe", top_k=1, activation=activation)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with ExecutionContext(
+            module, stream=stream, experts=exchange
+        ) as context:
             context.prepare(TextSize(CAPACITY, 1))
 
             # Unequal and empty senders share one resident expert binding.
@@ -693,17 +632,12 @@ def _run_megamoe(rank, port, activation):
 
                 def step(states):
                     """One expert step: this rank's tokens, or a join."""
-                    exchange.begin(CAPACITY)
-                    try:
-                        output = (
+                    with context.activate(), context.expert_step(CAPACITY):
+                        return (
                             module(states, ids, weights)
                             if tokens
                             else hidden.new_empty((0, HIDDEN))
                         )
-                        context.join_expert_layers()
-                    finally:
-                        exchange.end()
-                    return output
 
                 # These probe rows encode exactly. Stored input must retain
                 # those bytes, including across different sender lengths.
@@ -712,13 +646,11 @@ def _run_megamoe(rank, port, activation):
                     if tokens
                     else hidden
                 )
-                with context.activate():
-                    eager = step(hidden).clone()
-                    stored = step(encoded).clone()
-                with CUDAGraph(context=context) as graph:
-                    graph.capture(lambda: step(hidden))
-                    captured = graph.replay().clone()
-                    stream.synchronize()
+                eager = step(hidden).clone()
+                stored = step(encoded).clone()
+                graph = graphs.capture(lambda: step(hidden), stream=stream)
+                captured = _replay(graph, stream).clone()
+                graph.release()
 
                 for actual in (eager, stored, captured):
                     assert actual.shape == (tokens, HIDDEN)

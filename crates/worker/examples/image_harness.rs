@@ -60,7 +60,13 @@ fn binding(
             cache: None,
         },
     )?;
-    let mut bound = bind::bind(interface, &mut StreamWorkspaces::default(), vec![prepared])?;
+    // One process: no symmetric workspace has peers to allocate over.
+    let mut bound = bind::bind(
+        interface,
+        &mut StreamWorkspaces::default(),
+        vec![prepared],
+        None,
+    )?;
     Ok(bound.remove(0))
 }
 

@@ -315,9 +315,9 @@ class StandaloneWorkspace:
         tensors = dict(self.allocate(local, requirement.group.device))
         peers = {}
         if symmetric:
-            # Peer-mapped storage comes from the parallel runtime, which maps
-            # every member's allocation; import it only where it is needed.
-            from uniserve_models.runtime._peer_storage import (
+            # Library use maps peers over the torch process group; the
+            # worker binds its own peer-mapped storage instead.
+            from uniserve_models.distributed.symmetric import (
                 allocate_symmetric_storage,
             )
 
@@ -1204,6 +1204,10 @@ class ExecutionContext:
                         self._moe_workspace,
                         self.experts,
                         self.weights,
+                        ordinal=sum(
+                            other.exchange is not None
+                            for other in self._moe.values()
+                        ),
                     )
                     self._moe[id(child)] = binding
                     if text:
@@ -1346,19 +1350,51 @@ class ExecutionContext:
             for reader in readers:
                 reader.bind(mirrored, source=batch)
 
-    def join_expert_layers(self) -> None:
-        """Complete the open expert step at layers this forward skipped."""
-        exchange = self.experts
-        if exchange is None or not exchange.capacity:
+    @contextlib.contextmanager
+    def expert_step(
+        self, capacity: int, *, join: bool = True, reached: int = 0
+    ) -> Iterator[None]:
+        """Run the enclosed forward as one expert step of ``capacity``.
+
+        ``capacity`` is the step's per-rank token capacity the expert group
+        agreed on; zero runs the forward without an expert step (a context
+        without expert-parallel layers, or a call outside one). When the
+        forward returns, the expert layers it did not reach are joined with
+        no tokens, so every rank exchanges at every layer of the step.
+
+        A step may span two calls of this context: the first passes
+        ``join=False``, leaving its tail to the second, which declares the
+        first ``reached`` expert layers (in collective order) done.
+        """
+        from uniserve_models.bindings.moe import ExpertStep
+
+        if not capacity:
+            yield
             return
-        modules = [
-            module
-            for module, binding in self._moe.items()
-            if binding.exchange is exchange
-        ]
-        for module in exchange.pending_layers(modules):
-            binding = self._moe[module]
-            binding.join(binding.module.hidden_size, self._dtype)
+        if self.experts is None:
+            raise ValueError("an expert step requires an expert exchange")
+        layers = sorted(
+            (
+                binding
+                for binding in self._moe.values()
+                if binding.exchange is not None
+            ),
+            key=lambda binding: binding.ordinal,
+        )
+        with ExpertStep(
+            self.experts, layers, int(capacity), self._dtype, reached=reached
+        ) as step:
+            yield
+            if join:
+                step.join_tail()
+
+    def expert_layers(self, module: nn.Module) -> int:
+        """Expert-parallel call sites of this context inside ``module``."""
+        inside = {id(child) for child in module.modules()}
+        return sum(
+            binding.exchange is not None and key in inside
+            for key, binding in self._moe.items()
+        )
 
     def kernels(self) -> list[dict]:
         """Selected kernels by module path; empty once closed."""
@@ -1383,13 +1419,13 @@ class ExecutionContext:
     @contextlib.contextmanager
     def activate(self) -> Iterator[ExecutionContext]:
         """Enter the bindings, transfers and stream for one call."""
+        from uniserve_models.distributed.collectives import (
+            stream_collective_scope,
+        )
         from uniserve_models.nn import _binding
         from uniserve_models.nn.attention._parallel import (
             context_scope,
             output_scope,
-        )
-        from uniserve_models.runtime.communication import (
-            stream_collective_scope,
         )
 
         self._require_open()

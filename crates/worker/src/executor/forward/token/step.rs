@@ -1,28 +1,34 @@
 //! A token batch's invocation: input rows, sampling tasks and prompt scoring.
 //!
-//! Every active call becomes one row. Sampled calls become tasks: prefill and
-//! decode sample their last projected row, a verification every candidate
-//! row. A prefill chunk that scores its prompt projects all of its rows; they
-//! score its tokens, its last row also samples. A decode invocation whose
-//! calls all qualify uses the decode body's greedy selections and only
-//! applies terminal policy; otherwise the tasks form a [`SamplingPlan`].
+//! Every active call contributes its input rows: one row, or for a prefill
+//! placing image features one row per prompt run and vision block. The
+//! calls split into one invocation per expert microbatch of the batch's
+//! runner group (one invocation without microbatches). Sampled calls become
+//! tasks: prefill and decode sample their last projected row, a
+//! verification every candidate row. A prefill chunk that scores its prompt
+//! projects all of its rows; they score its tokens, its last row also
+//! samples. A decode invocation whose calls all qualify uses the decode
+//! body's greedy selections and only applies terminal policy; otherwise the
+//! tasks form a [`SamplingPlan`].
 
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
+use super::StepParts;
 use super::batch::TokenBatch;
 use super::calls::{self, Prepared};
 use super::context::{self, Sources};
 use crate::runner::diffusion::image::ConditionRow;
 use crate::runner::graphs::GraphMode;
 use crate::runner::text::{
-    Embeddings, Executed, RowSource, SamplingColumns, StepContext, StepRequest, TokenRow,
-    logit_layout,
+    Embeddings, Executed, RowSource, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };
+use crate::sampling::SamplingMetadata;
 use crate::sampling::plan::{
     SampleTask, SamplingPlan, greedy_finish_words, logprob_request, logprob_words,
 };
 use crate::storage::LogprobLayout;
+use crate::storage::memory::StorageView;
 use crate::{Error, Result};
 
 /// A prefill chunk's prompt scoring.
@@ -46,22 +52,95 @@ pub(super) struct PromptScore {
     pub(super) layout: Option<LogprobLayout>,
 }
 
-/// What a step produced, for capture and commit.
-pub(super) struct Stepped {
-    pub(super) executed: Executed,
+/// One microbatch's invocation, as it ran.
+pub(super) struct Invoked {
+    /// The runner that ran it.
+    pub(super) runner: usize,
     /// The tasks' plan; absent for greedy decode and unsampled calls.
     pub(super) sampling: Option<SamplingPlan>,
     pub(super) tasks: usize,
+}
+
+impl Invoked {
+    /// A task's column in this invocation's selection outputs.
+    pub(super) fn position(&self, task: usize) -> usize {
+        self.sampling
+            .as_ref()
+            .map_or(task, |plan| plan.position(task))
+    }
+}
+
+/// What a step produced, for capture and commit.
+pub(super) struct Stepped {
+    /// Every populated microbatch's invocation, in microbatch order.
+    pub(super) invocations: Vec<Invoked>,
+    /// How the step ran: the populated invocations' tokens summed, and
+    /// their mode (any capture, else any replay, else eager).
+    pub(super) executed: Executed,
     pub(super) rows: usize,
     pub(super) drafts: u64,
 }
 
 impl Stepped {
-    /// A task's column in the selection outputs.
-    pub(super) fn position(&self, task: usize) -> usize {
-        self.sampling
-            .as_ref()
-            .map_or(task, |plan| plan.position(task))
+    /// The invocation of microbatch runner `runner`.
+    pub(super) fn invocation(&self, runner: usize) -> Result<&Invoked> {
+        self.invocations
+            .iter()
+            .find(|invoked| invoked.runner == runner)
+            .ok_or_else(|| Error::Invariant("a sampled call's microbatch did not run".into()))
+    }
+}
+
+/// One active call's input rows, before the calls split into microbatches.
+struct CallRows {
+    /// The call's index in the batch.
+    call: usize,
+    /// Its rows in sequence order; the call samples from the last.
+    rows: Vec<TokenRow>,
+    /// Vision features by their first token, counted from the call's first
+    /// row.
+    embeddings: Vec<(usize, StorageView)>,
+}
+
+/// One microbatch's invocation before it runs.
+struct Planned {
+    runner: usize,
+    rows: Vec<TokenRow>,
+    embeddings: Vec<Embeddings>,
+    sampling: Option<SamplingPlan>,
+    greedy: Vec<i64>,
+    prompt: Vec<i64>,
+    tasks: usize,
+}
+
+impl Planned {
+    fn request(&self, decode: bool) -> StepRequest<'_> {
+        let columns = if !self.greedy.is_empty() {
+            Some(SamplingColumns {
+                words: &self.greedy,
+                draws: &[],
+                params: &[],
+                slots: &[],
+                gates: &[],
+                greedy: true,
+            })
+        } else {
+            self.sampling.as_ref().map(|plan| SamplingColumns {
+                words: &plan.words,
+                draws: &plan.draws,
+                params: &plan.params,
+                slots: &plan.slots,
+                gates: &plan.gates,
+                greedy: false,
+            })
+        };
+        StepRequest {
+            decode,
+            rows: &self.rows,
+            sampling: columns,
+            prompt: &self.prompt,
+            embeddings: &self.embeddings,
+        }
     }
 }
 
@@ -85,10 +164,18 @@ impl PromptScore {
 }
 
 impl TokenBatch<'_> {
-    /// Build the invocation of the active calls and run it.
+    /// Build the active calls' invocations, one per microbatch, and run
+    /// them as one step.
+    ///
+    /// The calls that have input rows split into contiguous microbatches
+    /// of `[i * R / P, (i + 1) * R / P)` calls for `R` such calls and `P`
+    /// microbatches; each microbatch runner samples and scores its own
+    /// calls. A latent conditioning has no text row: the image denoiser
+    /// writes its K/V before the invocations run.
     pub(super) fn step(&mut self) -> Result<Stepped> {
         let plan = self.plan;
-        let indexed = self.runtime.runners[self.runner].indexed();
+        let peers = self.runtime.groups[self.group].clone();
+        let indexed = self.runtime.runners[peers[0]].indexed();
         let kv = self
             .storage
             .kv
@@ -106,12 +193,7 @@ impl TokenBatch<'_> {
             }
         }
         let mut params: Vec<Option<(SamplingParams, Vec<u32>)>> = vec![None; plan.calls.len()];
-        let mut rows: Vec<TokenRow> = Vec::with_capacity(active.len());
-        // Each call's last row, from which it samples.
-        let mut last_rows: Vec<Option<usize>> = vec![None; plan.calls.len()];
-        // Each image prompt's rows: first and count.
-        let mut call_rows: Vec<(usize, usize)> = vec![(0, 0); plan.calls.len()];
-        let mut embeddings: Vec<Embeddings> = Vec::new();
+        let mut inputs: Vec<CallRows> = Vec::with_capacity(active.len());
         let mut conditions: Vec<ConditionRow> = Vec::new();
         let mut reads = Vec::new();
         for &index in &active {
@@ -175,29 +257,143 @@ impl TokenBatch<'_> {
                     if let Some(condition) = &media.latent {
                         // The image denoiser writes this call's K/V.
                         conditions.push(condition.clone());
-                    } else {
-                        let base: usize = rows.iter().map(|row| row.query as usize).sum();
-                        for (token, values) in &media.embeddings {
-                            embeddings.push(Embeddings {
-                                token: base + token,
-                                values: values.clone(),
-                            });
+                        let start = state.output.progress.logical_position;
+                        if calls::sample_positions(call, &prepared, start)?.is_some() {
+                            return Err(Error::Invalid(
+                                "a call sampling a token has no text row".into(),
+                            ));
                         }
-                        call_rows[index] = (rows.len(), media.rows.len() + 1);
-                        rows.extend(media.rows.iter().cloned());
-                        last_rows[index] = Some(rows.len());
+                    } else {
+                        let mut rows = media.rows.clone();
                         rows.push(prepared.row.clone());
+                        inputs.push(CallRows {
+                            call: index,
+                            rows,
+                            embeddings: media.embeddings.clone(),
+                        });
                     }
                 }
-                None => {
-                    last_rows[index] = Some(rows.len());
-                    rows.push(prepared.row.clone());
-                }
+                None => inputs.push(CallRows {
+                    call: index,
+                    rows: vec![prepared.row.clone()],
+                    embeddings: Vec::new(),
+                }),
             }
             state.prepared = Some(prepared);
             params[index] = Some((admitted, finish));
         }
         self.reads.extend(reads);
+        if !conditions.is_empty() {
+            self.condition_latents(&conditions)?;
+        }
+
+        let count = peers.len();
+        let total = inputs.len();
+        let mut planned = Vec::with_capacity(count);
+        let mut metadata = Vec::new();
+        for (index, &runner) in peers.iter().enumerate() {
+            let range = index * total / count..(index + 1) * total / count;
+            if range.is_empty() {
+                planned.push(None);
+                continue;
+            }
+            planned.push(Some(self.plan_invocation(
+                runner,
+                &inputs[range],
+                &params,
+                &mut metadata,
+            )?));
+        }
+
+        let executed = if total == 0 {
+            // Only latent conditionings, which the image denoiser wrote.
+            vec![None; count]
+        } else {
+            let decode = self.mode == ForwardMode::Decode;
+            let requests: Vec<Option<StepRequest<'_>>> = planned
+                .iter()
+                .map(|planned| planned.as_ref().map(|planned| planned.request(decode)))
+                .collect();
+            let kv = self
+                .storage
+                .kv
+                .as_mut()
+                .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
+            let (tables, cache) = kv.split();
+            self.runtime.invoke(
+                self.experts,
+                self.group,
+                &requests,
+                &mut StepParts { tables, cache },
+                None,
+            )?
+        };
+        for (index, controls) in metadata {
+            self.calls[index].metadata = Some(controls);
+        }
+
+        let mut invocations = Vec::new();
+        let mut summary = Executed {
+            mode: GraphMode::Eager,
+            live_tokens: 0,
+            padded_tokens: 0,
+        };
+        for (planned, executed) in planned.into_iter().zip(executed) {
+            let (Some(planned), Some(executed)) = (planned, executed) else {
+                continue;
+            };
+            summary.live_tokens += executed.live_tokens;
+            summary.padded_tokens += executed.padded_tokens;
+            summary.mode = match (summary.mode, executed.mode) {
+                (GraphMode::Capture, _) | (_, GraphMode::Capture) => GraphMode::Capture,
+                (GraphMode::Replay, _) | (_, GraphMode::Replay) => GraphMode::Replay,
+                _ => GraphMode::Eager,
+            };
+            invocations.push(Invoked {
+                runner: planned.runner,
+                sampling: planned.sampling,
+                tasks: planned.tasks,
+            });
+        }
+        let rows = || inputs.iter().flat_map(|input| &input.rows);
+        Ok(Stepped {
+            invocations,
+            executed: summary,
+            rows: rows().count(),
+            drafts: rows()
+                .map(|row| u64::from(row.query.saturating_sub(1)))
+                .sum(),
+        })
+    }
+
+    /// Plan one microbatch's invocation of the calls of `inputs`: its
+    /// rows, sampling tasks and prompt scoring. Each call's microbatch,
+    /// task and prompt state is recorded; its sampling metadata is
+    /// appended to `metadata` for after the step.
+    fn plan_invocation(
+        &mut self,
+        runner: usize,
+        inputs: &[CallRows],
+        params: &[Option<(SamplingParams, Vec<u32>)>],
+        metadata: &mut Vec<(usize, SamplingMetadata)>,
+    ) -> Result<Planned> {
+        let plan = self.plan;
+        // Each call's rows in the invocation (first and count) and its
+        // features, placed from the invocation's first token.
+        let mut rows: Vec<TokenRow> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(inputs.len());
+        let mut embeddings: Vec<Embeddings> = Vec::new();
+        for input in inputs {
+            let base: usize = rows.iter().map(|row| row.query as usize).sum();
+            for (token, values) in &input.embeddings {
+                embeddings.push(Embeddings {
+                    token: base + token,
+                    values: values.clone(),
+                });
+            }
+            spans.push((rows.len(), input.rows.len()));
+            rows.extend(input.rows.iter().cloned());
+        }
         // An all-indexed decode gathers on the device; mixed calls read the
         // indexed rows' tokens and positions from the slot state.
         if !rows.iter().all(|row| row.source == RowSource::Indexed) {
@@ -207,21 +403,20 @@ impl TokenBatch<'_> {
                 }
             }
         }
-        if !conditions.is_empty() {
-            self.condition_latents(&conditions)?;
-        }
 
         let layout = logit_layout(&rows);
         let vocab = self.runtime.vocab;
-        let dimensions = self.runtime.runners[self.runner].dimensions();
-        let mut metadata = Vec::new();
+        let dimensions = self.runtime.runners[runner].dimensions();
+        let mut sampled = Vec::new();
         let mut greedy = self.mode == ForwardMode::Decode;
         // Prompt chunks: call, candidate rows, first token and what
         // predicts the first token (see `PromptScore::continued`).
         let mut prompts: Vec<(usize, (usize, usize), usize, i64)> = Vec::new();
-        for &index in &active {
+        for (input, &(first_row, row_count)) in inputs.iter().zip(&spans) {
+            let index = input.call;
             let call = &plan.calls[index];
             let state = &mut self.calls[index];
+            state.microbatch = runner;
             let (admitted, finish) = params[index]
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("active call lost its parameters".into()))?;
@@ -249,8 +444,8 @@ impl TokenBatch<'_> {
                 state.token_write.is_some(),
                 state.transition_write.is_some(),
             );
-            let position = last_rows[index]
-                .ok_or_else(|| Error::Invalid("a call sampling a token has no text row".into()))?;
+            // The call samples from its last row.
+            let position = first_row + row_count - 1;
             let (first, count) = layout[position];
             // A verification samples every candidate row; the others their
             // last projected row.
@@ -272,13 +467,14 @@ impl TokenBatch<'_> {
                 let token = rows[..position].iter().map(|row| row.query as usize).sum();
                 prompts.push((index, (first, count), token, i64::from(continued)));
             }
-            state.task = Some(metadata.len());
-            metadata.push((index, controls, draws, row, prepared.tagged));
+            state.task = Some(sampled.len());
+            sampled.push((index, controls, draws, row, prepared.tagged));
         }
         // An image prompt scores each prompt run; a run after a vision block
         // continues from the block's last logits, and a prompt ending with a
         // block retains its logits for the next chunk.
-        for &index in &active {
+        for (input, &(first_row, row_count)) in inputs.iter().zip(&spans) {
+            let index = input.call;
             let state = &self.calls[index];
             let Some(prepared) = &state.prepared else {
                 continue;
@@ -293,19 +489,18 @@ impl TokenBatch<'_> {
                 ));
             }
             let mut previous = i64::from(start > 0);
-            let (first_row, count) = call_rows[index];
-            for row in first_row..first_row + count {
+            for row in first_row..first_row + row_count {
                 let (first, candidates) = layout[row];
                 if rows[row].causal {
                     let token = rows[..row].iter().map(|row| row.query as usize).sum();
                     prompts.push((index, (first, candidates), token, previous));
-                } else if row + 1 == first_row + count {
+                } else if row + 1 == first_row + row_count {
                     prompts.push((index, (first + candidates - 1, 0), 0, 0));
                 }
                 previous = 2 + (first + candidates - 1) as i64;
             }
         }
-        let tasks: Vec<SampleTask<'_>> = metadata
+        let tasks: Vec<SampleTask<'_>> = sampled
             .iter()
             .map(|(index, controls, draws, row, gated)| {
                 Ok(SampleTask {
@@ -323,7 +518,7 @@ impl TokenBatch<'_> {
             .collect::<Result<_>>()?;
         // The decode body's greedy selections are final only when every call
         // qualifies; otherwise its logits are sampled like any other.
-        greedy &= tasks.len() == active.len();
+        greedy &= tasks.len() == inputs.len();
         let sampling = if tasks.is_empty() || greedy {
             None
         } else {
@@ -385,68 +580,21 @@ impl TokenBatch<'_> {
         } else {
             Vec::new()
         };
-        let columns = if greedy {
-            Some(SamplingColumns {
-                words: &greedy_words,
-                draws: &[],
-                params: &[],
-                slots: &[],
-                gates: &[],
-                greedy: true,
-            })
-        } else {
-            sampling.as_ref().map(|plan| SamplingColumns {
-                words: &plan.words,
-                draws: &plan.draws,
-                params: &plan.params,
-                slots: &plan.slots,
-                gates: &plan.gates,
-                greedy: false,
-            })
-        };
-        let kv = self
-            .storage
-            .kv
-            .as_mut()
-            .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
-        let (tables, cache) = kv.split();
-        let executed = if rows.is_empty() {
-            // Only latent conditionings, which the image denoiser wrote.
-            Executed {
-                mode: GraphMode::Eager,
-                live_tokens: 0,
-                padded_tokens: 0,
-            }
-        } else {
-            self.runtime.runners[self.runner].execute(
-                &StepRequest {
-                    decode: self.mode == ForwardMode::Decode,
-                    rows: &rows,
-                    sampling: columns,
-                    prompt: &prompt_words,
-                    embeddings: &embeddings,
-                },
-                &mut StepContext {
-                    tables,
-                    cache,
-                    state: &self.runtime.state,
-                },
-            )?
-        };
         let task_count = tasks.len();
         drop(tasks);
-        for (index, controls, ..) in metadata {
-            self.calls[index].metadata = Some(controls);
-        }
-        Ok(Stepped {
-            executed,
+        metadata.extend(
+            sampled
+                .into_iter()
+                .map(|(index, controls, ..)| (index, controls)),
+        );
+        Ok(Planned {
+            runner,
+            rows,
+            embeddings,
             sampling,
+            greedy: greedy_words,
+            prompt: prompt_words,
             tasks: task_count,
-            rows: rows.len(),
-            drafts: rows
-                .iter()
-                .map(|row| u64::from(row.query.saturating_sub(1)))
-                .sum(),
         })
     }
 }
