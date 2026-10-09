@@ -125,7 +125,13 @@ impl ExpertRuntime {
             .as_ref()
             .ok_or(Error::State("an expert union requires its host group"))?;
         let members: Vec<usize> = (0..union_group.size()).collect();
-        let host = Arc::new(Mutex::new(union_group.subgroup(&members)?));
+        let group = union_group.subgroup(&members)?;
+        // Expert steps wait on peers without a deadline: a peer may still
+        // compile kernels before its first announcement or plan comparison,
+        // and an idle union agrees indefinitely. A failed peer closes its
+        // connections, which fails the waiting collective.
+        group.set_timeout(None)?;
+        let host = Arc::new(Mutex::new(group));
         let sources: Vec<usize> = if dedicated {
             Vec::new()
         } else {
