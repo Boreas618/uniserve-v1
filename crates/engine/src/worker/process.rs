@@ -122,12 +122,41 @@ impl std::str::FromStr for FlashInferBackend {
 /// Error returned for an unsupported FlashInfer backend name.
 pub struct FlashInferBackendParseError(String);
 
+impl WorkerProcessArgs {
+    /// The interpreter that runs rank processes when none is configured: the
+    /// one installed next to the running binary (an environment's `bin/`),
+    /// then the active virtual environment's, then `python3` on `PATH`.
+    pub fn default_python() -> std::path::PathBuf {
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(directory) = executable.parent()
+        {
+            for name in ["python3", "python"] {
+                let candidate = directory.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+
+        if let Some(environment) = std::env::var_os("VIRTUAL_ENV") {
+            let candidate = std::path::Path::new(&environment)
+                .join("bin")
+                .join("python");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+
+        "python3".into()
+    }
+}
+
 impl Default for WorkerProcessArgs {
     /// Returns worker launch settings suitable for a single local rank.
     fn default() -> Self {
         Self {
             worker_id: "worker".into(),
-            python: "python3".into(),
+            python: Self::default_python(),
             launcher_timeout: std::time::Duration::from_secs(120),
             model: String::new(),
             base_model: None,
