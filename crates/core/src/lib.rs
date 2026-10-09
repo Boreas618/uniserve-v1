@@ -23,8 +23,6 @@ use serde::{Deserialize, Serialize};
 /// Serializable statistics and observer-facing wire values.
 pub mod codec;
 mod events;
-/// Handing a bound socket to a rank process at its launch.
-pub mod launch;
 mod media;
 mod shared_memory;
 mod video;
