@@ -20,14 +20,13 @@ from pathlib import Path
 
 import pytest
 import torch
-from uniserve_models.runtime.cuda_graph import CUDAGraph
 
 from uniserve_models import catalog as models
 from uniserve_models.backends import moe as backends
 from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.interface import graphs
 from uniserve_models.model import TextSize
 from uniserve_models.nn.functional import sandwich_rms_norm
-from uniserve_models.runtime import CUDAStream
 
 pytestmark = [
     pytest.mark.integration,
@@ -109,23 +108,20 @@ def _check_provider(block, provider):
         )
         return result
 
-    cuda_stream = CUDAStream.external(torch.cuda.Stream(device=DEVICE))
-    cuda_stream.wait(torch.cuda.current_stream(DEVICE))
-    with (
-        cuda_stream,
-        ExecutionContext(block, stream=cuda_stream, moe=provider) as context,
-    ):
+    cuda_stream = torch.cuda.Stream(device=DEVICE)
+    cuda_stream.wait_stream(torch.cuda.current_stream(DEVICE))
+    with ExecutionContext(block, stream=cuda_stream, moe=provider) as context:
         context.prepare(TextSize(TOKENS, 1))
         with context.activate():
             ids, weights = block.router(routed)
             expected = feed_forward(experts(hidden, ids, weights))
             routes = experts(hidden, ids, weights, combine=False)
             assert torch.equal(feed_forward(routes), expected), provider
-        with CUDAGraph(context=context) as graph:
-            graph.capture(
-                lambda: feed_forward(
-                    experts(hidden, ids, weights, combine=False)
-                )
-            )
-            assert torch.equal(graph.replay(), expected), provider
+        graph = graphs.capture(
+            lambda: feed_forward(experts(hidden, ids, weights, combine=False)),
+            stream=cuda_stream,
+        )
+        assert torch.equal(graph.replay(), expected), provider
+        cuda_stream.synchronize()
+        graph.release()
     torch.cuda.synchronize(DEVICE)
