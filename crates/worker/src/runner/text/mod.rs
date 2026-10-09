@@ -287,12 +287,19 @@ impl TextRunner {
 
     /// The numerical call of a staged invocation at `capacity`: a replay
     /// of the resident graph variant, or an eager forward (also the warmup
-    /// of a capture [`Self::finish`] then records).
-    pub(crate) fn launch(&self, staged: &Staged, capacity: Option<usize>) -> Result<Launch> {
+    /// of a capture [`Self::finish`] then records). Without `replay`, a
+    /// resident graph's shapes run eagerly instead.
+    pub(crate) fn launch(
+        &self,
+        staged: &Staged,
+        capacity: Option<usize>,
+        replay: bool,
+    ) -> Result<Launch> {
         let (mode, graph) = match &staged.plan.choice {
             Choice::Eager => (GraphMode::Eager, None),
             Choice::Graph(key) => match self.graphs.lookup(key, capacity)? {
-                Lookup::Replay(graph) => (GraphMode::Replay, Some(graph.clone())),
+                Lookup::Replay(graph) if replay => (GraphMode::Replay, Some(graph.clone())),
+                Lookup::Replay(_) => (GraphMode::Eager, None),
                 // The eager run is the capture's warmup and produces this
                 // invocation's results; capture records without executing.
                 Lookup::Capture => (GraphMode::Capture, None),
