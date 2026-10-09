@@ -20,7 +20,6 @@ from uniserve_models.distributed import DeviceMesh
 from uniserve_models.loading import checkpoint, weights
 from uniserve_models.minimax_h3 import (
     AttentionInput,
-    TilePacking,
     Transformer,
     TransformerConfig,
 )
@@ -244,24 +243,6 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
     )
     angles = (positions[..., None] * frequencies).flatten(1)
     cosine, sine = angles.cos(), angles.sin()
-    packing = TilePacking(
-        num_tokens=int(live.sum()),
-        padded_tokens=256,
-        position_ids=positions.cpu(),
-        token_tags=tags.cpu(),
-        text_indices=selections["text"].cpu(),
-        audio_indices=selections["audio"].cpu(),
-        video_indices=selections["video"].cpu(),
-        video_raster_indices=torch.arange(selections["video"].numel()),
-        video_untile_indices=selections["video"].cpu(),
-        tile_valid_sizes=valid.cpu(),
-        prefix_tiles=1,
-        video_tiles=2,
-        video_frames=1,
-        latent_height=1,
-        latent_width=1,
-        audio_frames=16,
-    )
     group = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0).get_group(
         ()
     )
@@ -276,7 +257,6 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         torch.tensor(1, device="cuda", dtype=torch.int32),
     )
     inputs = AttentionInput(
-        packing,
         slice(0, 256),
         group,
         sparse,

@@ -30,7 +30,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import cast
+from typing import Any, cast
 
 import torch
 
@@ -75,6 +75,7 @@ from .packing import (
     VIDEO_TILE_SHAPES,
     DensePacking,
     RegionPacking,
+    TileExtent,
     TilePacking,
     audio_latent_frames,
     condition_segments,
@@ -85,6 +86,7 @@ from .packing import (
     region_packing,
     region_tables,
     region_tiles,
+    tile_extent,
     tile_packing,
     video_latent_frames,
 )
@@ -635,20 +637,32 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         distribution = query.input_distribution
         return distribution.mesh.get_group(distribution.shard_axes(0))
 
+    def _tile_rows(
+        self, size: DenoiserSize, layout: DenoiserSize | None
+    ) -> dict[str, Any]:
+        # ``size``'s prompt in ``layout``'s text region (its own tiles by
+        # default). The alignment is a multiple of both the default 256-row
+        # alignment and one 64-row tile per sequence rank, so every rank's
+        # shard holds whole tiles.
+        return {
+            "num_text_tokens": size.num_text_tokens,
+            "num_frames": size.num_frames,
+            "canvas": size.canvas,
+            "token_multiple": 64 * math.lcm(4, self.sequence_group().size),
+            "text_rows": None if layout is None else layout.num_text_tokens,
+        }
+
+    def _tile_extent(
+        self, size: DenoiserSize, layout: DenoiserSize | None = None
+    ) -> TileExtent:
+        # The row and tile counts alone: evaluating a layout reads no table
+        # of its packing, which is request state (``prepare_state``).
+        return tile_extent(**self._tile_rows(size, layout))
+
     def _tile_packing(
         self, size: DenoiserSize, layout: DenoiserSize | None = None
     ) -> TilePacking:
-        # Packs ``size``'s prompt in ``layout``'s text region (its own tiles
-        # by default). The alignment is a multiple of both the default
-        # 256-row alignment and one 64-row tile per sequence rank, so every
-        # rank's shard holds whole tiles.
-        return tile_packing(
-            num_text_tokens=size.num_text_tokens,
-            num_frames=size.num_frames,
-            canvas=size.canvas,
-            token_multiple=64 * math.lcm(4, self.sequence_group().size),
-            text_rows=None if layout is None else layout.num_text_tokens,
-        )
+        return tile_packing(**self._tile_rows(size, layout))
 
     def _dense_packing(self, layout: DenoiserSize) -> DensePacking:
         # Every rank's shard holds a whole number of 128-row blocks.
@@ -676,7 +690,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             return self._dense_packing(layout).padded_tokens
         if self.regional:
             return self._region_packing(layout).padded_tokens
-        return self._tile_packing(layout).padded_tokens
+        return self._tile_extent(layout).padded_tokens
 
     def _token_slice(self, padded_tokens: int) -> slice:
         group = self.sequence_group()
@@ -847,7 +861,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                     )
                 },
             }
-        packing = self._tile_packing(size)
+        packing = self._tile_extent(size)
         rows = packing.padded_tokens
         return {
             **samples,
@@ -1303,10 +1317,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
             prefix_rows = self.text_condition_rows(size)
         else:
-            tiles = self._tile_packing(size)
+            tiles = self._tile_extent(size)
             tokens = tiles.padded_tokens
             attention = AttentionInput(
-                tiles,
                 self._token_slice(tokens),
                 self.sequence_group(),
                 vsa.Input(

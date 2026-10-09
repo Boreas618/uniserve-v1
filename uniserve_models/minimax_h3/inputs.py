@@ -12,7 +12,7 @@ from uniserve_models.model import Condition
 from uniserve_models.model import DenoiserInput as BaseDenoiserInput
 from uniserve_models.nn.attention import VisibleInput, vsa
 
-from .packing import TilePacking, latent_raster, video_latent_frames
+from .packing import latent_raster, video_latent_frames
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,15 +92,15 @@ class AttentionInput:
     """Address one token shard within the complete tile packing.
 
     ``__post_init__`` checks that ``token_slice`` is ``group``'s equal share of
-    the padded rows, that ``vsa`` describes the same row count, and that the
-    local index tables are 1-D int64.
+    the padded rows ``vsa`` describes, and that the local index tables are
+    1-D int64.
 
     Attributes:
-        packing: Complete packing of the layout being evaluated.
         token_slice: Global packed rows this sequence rank holds.
         group: Sequence-parallel group whose rank selects ``token_slice``.
-        vsa: Tile domains and borrowed index views shared by every layer's
-            sparse attention.
+        vsa: Tile domains of the layout being evaluated, whose padded rows
+            are the packing's, and borrowed index views shared by every
+            layer's sparse attention.
         local_text_indices: Int64 shard rows, relative to
             ``token_slice.start``, that hold text tokens.
         local_video_indices: Int64 shard rows that hold video tokens, in
@@ -108,7 +108,6 @@ class AttentionInput:
         local_audio_indices: Int64 shard rows that hold audio tokens.
     """
 
-    packing: TilePacking
     token_slice: slice
     group: Communicator
     vsa: vsa.Input
@@ -117,7 +116,7 @@ class AttentionInput:
     local_audio_indices: torch.Tensor
 
     def __post_init__(self):
-        tokens = self.packing.padded_tokens
+        tokens = self.vsa.padded_tokens
         if tokens % self.group.size:
             raise ValueError(
                 "H3 tokens must divide their numerical sequence group"
@@ -128,10 +127,6 @@ class AttentionInput:
         ):
             raise ValueError(
                 "H3 token slice must match the logical sequence rank"
-            )
-        if self.vsa.padded_tokens != tokens:
-            raise ValueError(
-                "H3 attention and packing must describe the same token domain"
             )
         _check_indices(
             self.local_text_indices,
