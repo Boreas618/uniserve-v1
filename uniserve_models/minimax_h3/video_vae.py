@@ -45,7 +45,11 @@ from uniserve_models.nn.functional import (
     weighted_rms_norm,
     weighted_rms_norm_absmax,
 )
-from uniserve_models.nn.linear import Linear, QKVParallelLinear, RowParallelLinear
+from uniserve_models.nn.linear import (
+    Linear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from uniserve_models.nn.mlp import GatedMLP
 from uniserve_models.nn.rope import RotaryEmbedding
 from uniserve_models.nn.vae import (
