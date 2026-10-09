@@ -1,4 +1,4 @@
-//! Exercises the event-driven engine loop against a Python worker process.
+//! Exercises the event-driven engine loop against a worker rank process.
 //!
 //! The engine parks on result, command, and worker-death events while the worker
 //! parks on request notifications. The flow includes idle wakeup and graceful

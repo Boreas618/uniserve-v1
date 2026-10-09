@@ -2,7 +2,7 @@
 
 UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
-UniServe is a Python computation library and a Rust server. `uniserve` supplies numerical layers, loading and resource binding; `uniserve_models` composes the models; `uniserve_worker` executes serving requests with those same numerical implementations. Rust owns HTTP admission, scheduling, request state and response assembly.
+UniServe is a Rust serving system with a Python numerical library. Rust owns HTTP admission, scheduling, worker processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. `uniserve_models` supplies the numerical layers, loading, resource binding and the models; each worker rank runs the Rust rank runtime and calls those same numerical implementations through TVM-FFI.
 
 The configured model descriptions are `qwen3`, `sensenova`, `bagel`, `minimax-h3`, and `diffusion-gemma`. A server process loads exactly one description and exposes one served-model identity.
 
@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` server and `uniserve-host` launcher binaries, the native worker IPC extension, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` server and `uniserve-host` launcher binaries, the worker's rank runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 ## Quickstart
 
@@ -201,25 +201,29 @@ For decision-session replay, use the `systemone` dataset with a non-empty `sessi
 crates/core/                  Shared values and the engine-process codec
 crates/observability/         Runtime metrics and process registry
 crates/observability-derive/  Metrics proc-macro
-crates/ipc/                       Worker messages, serialization, and iceoryx endpoints
-crates/ipc-py/                    Python worker IPC extension
-crates/engine/                           Scheduler, executors, and engine process
-crates/server/                           Model profiles, serving funnel, HTTP API, and engine clients
-crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
-crates/bin/uniserve-host/                Per-host launcher for multi-host deployments
-crates/bin/dynamo-worker/                NVIDIA Dynamo worker backend
-uniserve/                                 Numerical layers, loading, and resource binding
-uniserve_models/                          Concrete models, typed configs, and checkpoint catalog
-uniserve_worker/                          Worker lifecycle and rank-local execution
-  protocol/                              Validated batches, calls, WorkerInfo, and IPC envelopes
-  execution/                             Submission, request progress, publication, and retirement
-  model_executor/                        Capability runners, numerical inputs, and CUDA graphs
-  sampling/                              Sampling metadata, execution, and numerical results
-  storage/                               KV, latent, tensor, request-slot, and output backing
-  transport/                             Local, SHM, CUDA VMM, and channel transfers
-uniserve_eval/                            Serving evaluator, profiles, and request workloads
-configs/minimax_h3/                       H3 deployment files
-docs/minimax_h3/                          H3 serving, library, evaluation and Dynamo guides, container files
+crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
+crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime
+crates/engine/                Scheduler, KV allocation, executors, worker fleet and rank launch
+crates/server/                Model profiles, serving funnel, HTTP API, and engine clients
+crates/worker/                Rank runtime: the library a rank process loads through TVM-FFI
+  launch/, config/            Launch descriptor, rank configuration and startup
+  model/                      Typed bindings over the numerical interface
+  executor/, runner/          Batch execution per computation and its CUDA graphs
+  request/, sampling/         Request progress and sampling state
+  storage/                    KV, latent, tensor, request-slot and output backing
+  transfer/                   Local, shared-memory, CUDA VMM and channel transfers
+  parallel/                   Host groups, topology and collectives across ranks
+  stream/, host/, capacity/   CUDA streams and events, host lanes, capacity planning
+crates/bin/uniserve/          `serve` and `engine` CLI entrypoints
+crates/bin/uniserve-host/     Per-host launcher for multi-host deployments
+crates/bin/dynamo-worker/     NVIDIA Dynamo worker backend
+uniserve_models/              Numerical layers, loading, resource binding, concrete models and checkpoint catalog
+  interface/                  Numerical interface table the rank runtime calls
+  worker.py                   Rank process entry: loads the rank runtime and hands it the interface
+uniserve_kernels/             Native CUDA, Triton and CuTe kernels
+uniserve_eval/                Serving evaluator, profiles, and request workloads
+configs/minimax_h3/           H3 deployment files
+docs/minimax_h3/              H3 serving, library, evaluation and Dynamo guides, container files
 ```
 
 ## License

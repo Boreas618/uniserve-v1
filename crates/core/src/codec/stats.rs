@@ -70,9 +70,8 @@ pub struct PrefillStats {
 /// per-update deltas when carried in [`SchedulerStats`].
 ///
 /// The same counters are mirrored elsewhere, including the `ForwardStats`
-/// table of the worker flatbuffers schema, the worker-ipc codec, the Python
-/// extension's native `ForwardStats` view,
-/// the engine's `WorkerStats` and `SchedulerStatsReporter`, and the server's
+/// table of the worker flatbuffers schema, the `uniserve-ipc` codec, the
+/// worker's forward statistics, the engine's `WorkerStats` and `SchedulerStatsReporter`, and the server's
 /// `record_scheduler_stats`. A field added here also needs an entry in
 /// [`ForwardStats::merge`] and [`ForwardStats::is_empty`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
