@@ -6,7 +6,11 @@ import torch
 from torch import nn
 
 from uniserve_models.model import TransformerDecoder
-from uniserve_models.nn.attention import Attention, AttentionBatch, RotaryQKVProjection
+from uniserve_models.nn.attention import (
+    Attention,
+    AttentionBatch,
+    RotaryQKVProjection,
+)
 from uniserve_models.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
