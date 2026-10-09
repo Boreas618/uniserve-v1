@@ -84,7 +84,11 @@ from typing import Any, cast
 
 import torch
 
-from uniserve_models.media.pixels import PreparedImage, prepare_tensor_image
+from uniserve_models.media.pixels import (
+    PreparedImage,
+    Tower,
+    prepare_tensor_image,
+)
 from uniserve_models.model import PatchEncoder, TextEncoder, VisionInput
 from uniserve_models.nn.vae import PatchAutoencoder
 from uniserve_models.processing import PatchTransform
@@ -183,12 +187,12 @@ def describe(loaded, path: str, dtype: str) -> dict[str, Any]:
                 "torch."
             ),
         }
-    encoder = cast(TextEncoder, module)
+    text_encoder = cast(TextEncoder, module)
     return {
         "kind": kind,
-        "hidden_size": int(encoder.network.hidden_size),
+        "hidden_size": int(text_encoder.network.hidden_size),
         "output_dtype": str(dtype).removeprefix("torch."),
-        "positions": _defines(encoder, "positions", TextEncoder),
+        "positions": _defines(text_encoder, "positions", TextEncoder),
     }
 
 
@@ -239,7 +243,13 @@ def _device_grid(
     return grid.to(device, non_blocking=True)
 
 
-def _warm(loaded, context, tower: str, run):
+def _grid(values: Sequence[int]) -> tuple[int, int, int]:
+    """A vision block's patch grid as integers."""
+    # The worker sends three extents per block; the encoder reads them.
+    return cast("tuple[int, int, int]", tuple(int(value) for value in values))
+
+
+def _warm(loaded, context, tower: Tower, run):
     """The ``warm`` step: ``run`` one black image prepared for ``tower``."""
 
     def warm(side: int) -> None:
@@ -270,7 +280,9 @@ def _resident(loaded, context, products):
         with calls.scope(context):
             prepared = prepare_tensor_image(
                 processor,
-                str(tower),
+                # The worker sends a plain string; the selection rejects
+                # unknown towers.
+                cast(Tower, str(tower)),
                 regions.view(products, image),
                 device=context.device,
                 signed_unit=bool(signed_unit),
@@ -378,6 +390,8 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
             for index, (image, region) in enumerate(
                 zip(images, out, strict=True)
             ):
+                # The copy loop above rejected images without a patch grid.
+                assert image.grid_shape is not None
                 height, width = image.grid_shape
                 count = height * width // encoder.downsample**2
                 start = index * tokens
@@ -470,8 +484,8 @@ def _text(encoder: TextEncoder, context, tensors):
         capacity = int(capacity)
         values = encoder.positions(
             [int(token) for token in token_ids],
-            image_grids=[tuple(int(x) for x in grid) for grid in image_grids],
-            video_grids=[tuple(int(x) for x in grid) for grid in video_grids],
+            image_grids=[_grid(grid) for grid in image_grids],
+            video_grids=[_grid(grid) for grid in video_grids],
         )
         if values.shape != (3, capacity):
             raise ValueError("rotary coordinates must cover the capacity")
