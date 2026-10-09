@@ -19,7 +19,7 @@
 
 use crate::executor::WorkerResult;
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use super::BatchSubmitError;
@@ -658,17 +658,13 @@ impl PendingRank {
             .context("creating the worker launch descriptor directory")?;
         let descriptor_path = descriptor_directory.path().join("launch.json");
 
-        let mut cmd = Command::new(&args.python);
-        cmd.arg("-m")
-            .arg("uniserve_models.worker")
-            .arg("--worker-id")
-            .arg(&args.worker_id)
-            .arg("--rank")
-            .arg(rank.to_string())
-            .arg("--world-size")
-            .arg(world_size.to_string())
-            .arg("--launch-descriptor")
-            .arg(&descriptor_path);
+        let mut cmd = uniserve_ipc::launch::rank_command(
+            &args.python,
+            &args.worker_id,
+            rank,
+            world_size,
+            &descriptor_path,
+        );
 
         // Torch and the numerical libraries read the host-relative pair; the
         // global pair names the rank's place in the whole process world.
@@ -692,10 +688,10 @@ impl PendingRank {
         // process's copy when it is dropped, after the spawn below.
         let rendezvous_listen_fd = sockets
             .group
-            .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
+            .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener));
         let expert_listen_fd = sockets
             .experts
-            .map(|listener| uniserve_core::launch::inherit_listener(&mut cmd, listener));
+            .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener));
 
         // One typed descriptor carries every launch value. argv keeps the
         // process identity and the descriptor's location so a running worker
