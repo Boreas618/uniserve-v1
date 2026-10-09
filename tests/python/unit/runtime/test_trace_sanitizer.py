@@ -47,7 +47,7 @@ def trace(tmp_path):
             );
             INSERT INTO NVTX_EVENTS
                 (start, end, eventType, text, globalTid, uint64Value) VALUES
-                (90, 210, 59, 'uniserve_models.worker.execute', 16777217, 7),
+                (90, 210, 59, 'uniserve.worker.execute', 16777217, 7),
                 (100, 200, 59, 'model.forward', 16777217, NULL),
                 (100, 200, 59, 'model.forward', 16777218, NULL);
         """)
