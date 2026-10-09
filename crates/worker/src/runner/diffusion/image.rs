@@ -390,7 +390,7 @@ impl ImageDiffusion {
             )));
         }
         Ok(GuidancePlan {
-            handle: Handle::new(item(0)?),
+            handle: Handle::new(item(0)?)?,
             timesteps,
             branches,
         })
@@ -679,7 +679,7 @@ impl ImageDiffusion {
             geometry.to_any(),
             pool.value.to_any(),
             Any::from(peers),
-        ])?);
+        ])?)?;
         if let Err(error) = check() {
             if let Err(cleanup) = self.release.invoke(&[graph.view()]) {
                 tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);

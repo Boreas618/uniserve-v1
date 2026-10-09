@@ -59,7 +59,7 @@ pub(super) struct TokenBatch<'a> {
     pub(super) group: usize,
     /// The rank's expert runtime, when its forwards are expert steps.
     pub(super) experts: Option<&'a super::super::experts::ExpertRuntime>,
-    /// A borrowed view of the group's lane stream.
+    /// The group's lane stream.
     pub(super) stream: Option<Stream>,
     pub(super) device: Option<i32>,
     pub(super) mode: ForwardMode,
@@ -109,11 +109,7 @@ impl<'a> TokenBatch<'a> {
         })?;
         let lane = runtime.groups[group][0];
         let device = runtime.runners[lane].device();
-        let stream = runtime.runners[lane]
-            .stream()
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-            .transpose()?;
+        let stream = runtime.runners[lane].stream().cloned();
         let reports = reports_output(info, rank, &first.component)?;
 
         // Output rows, bound to their requests' live epochs and slots.

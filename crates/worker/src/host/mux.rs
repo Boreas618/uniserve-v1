@@ -257,7 +257,7 @@ impl MuxSession {
                         payload.clone(),
                         Any::from(i64::from(self.config.frame_rate)),
                         Any::from(i64::from(self.config.audio_rate)),
-                    ])?),
+                    ])?)?,
                 };
                 let opened = container.insert(opened);
                 offset = self.functions.append.call_as::<i64>(&[
@@ -291,7 +291,7 @@ impl MuxSession {
                 "artifact assembly received its audio twice".into(),
             ));
         }
-        state.audio = Some(Handle::new(Any::from(audio)));
+        state.audio = Some(Handle::new(Any::from(audio))?);
         Ok(())
     }
 

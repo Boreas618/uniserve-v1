@@ -610,11 +610,7 @@ impl TokenBatch<'_> {
         let diffusion = image.diffusion_mut().ok_or_else(|| {
             Error::Unsupported("latent conditioning requires an image denoiser".into())
         })?;
-        let stream = diffusion
-            .stream()
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            .map(|stream| unsafe { uniserve_cuda::Stream::borrowed(stream.device(), stream.raw()) })
-            .transpose()?;
+        let stream = diffusion.stream().cloned();
         let kv = self
             .storage
             .kv

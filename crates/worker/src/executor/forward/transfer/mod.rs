@@ -51,8 +51,7 @@ use batch::{Failure, TransferBatch};
 /// The transfer runtime of a rank: the lane streams its transfers and
 /// imports run on, and its output storage.
 pub(crate) struct TransferRuntime {
-    /// Borrowed views of the lane stream serving each call kind on each
-    /// CUDA device; the lanes outlive the runtime.
+    /// The lane stream serving each call kind on each CUDA device.
     streams: HashMap<(CallKind, i32), Stream>,
     outputs: OutputPool,
 }
@@ -72,10 +71,7 @@ impl TransferRuntime {
         for &device in devices {
             for &kind in kinds {
                 if let Some(stream) = lanes.stream_for(kind, DeviceId(device)) {
-                    // SAFETY: the lanes own the stream and close after the
-                    // runtimes (see `Worker::close`).
-                    let borrowed = unsafe { Stream::borrowed(DeviceId(device), stream.handle()?) }?;
-                    streams.insert((kind, device), borrowed);
+                    streams.insert((kind, device), stream.stream()?.clone());
                 }
             }
         }
@@ -101,10 +97,7 @@ impl TransferRuntime {
                 kind.as_str()
             ))
         })?;
-        // SAFETY: a view of a lane stream that outlives the runtime.
-        Ok(Some(unsafe {
-            Stream::borrowed(stream.device(), stream.raw())
-        }?))
+        Ok(Some(stream.clone()))
     }
 
     pub(crate) fn set_wake(&self, _wake: Option<uniserve_ipc::Wake>) {}

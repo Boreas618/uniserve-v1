@@ -241,11 +241,7 @@ impl ImageRuntime {
         };
         let units = diffusion.layout().latent_rows(shape.height, shape.width)?;
         let padded = units.div_ceil(page_units) * page_units;
-        let stream = diffusion
-            .stream()
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            .map(|stream| unsafe { uniserve_cuda::Stream::borrowed(stream.device(), stream.raw()) })
-            .transpose()?;
+        let stream = diffusion.stream().cloned();
         // Captured samples start from zeros, as fresh scratch pages do.
         workspace
             .narrow(0, 0, i64::from(padded) * shape.images as i64)?

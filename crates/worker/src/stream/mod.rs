@@ -8,6 +8,26 @@ use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
 
 use crate::{Error, Result};
 
+/// The stream a numerical binding names by its integer handle.
+///
+/// The worker gives every binding the handle of a stream the rank owns, and
+/// the binding hands that integer back when it asks for stream work. This is
+/// the one place the worker turns such an integer into a [`Stream`]; code
+/// that holds a `Stream` shares it by cloning the handle instead.
+///
+/// The legacy default stream (handle 0) names no context of its own: the
+/// driver resolves it against the calling thread's current context, here
+/// and in every later use of the returned handle.
+///
+/// # Safety
+/// `handle` is a live stream on `device`. Its owner keeps the stream and its
+/// context alive while the returned handle, its clones and the events
+/// recorded on it are used.
+pub(crate) unsafe fn external(device: DeviceId, handle: usize) -> Result<Stream> {
+    // SAFETY: forwarded from the caller.
+    Ok(unsafe { Stream::borrowed(device, handle) }?)
+}
+
 /// An execution stream and its SM allocation.
 ///
 /// Callers serialize context use across streams sharing an SM partition.
@@ -41,32 +61,6 @@ impl CUDAStream {
     /// primary context.
     pub fn create(device: DeviceId) -> Result<Self> {
         Self::new(device, Stream::new(device)?)
-    }
-
-    /// Borrow an existing numerical stream; its creator retains the handle.
-    ///
-    /// # Safety
-    /// `handle` is a live stream on `device`. Its creator keeps the stream and
-    /// its context alive while this value, its forks and its fences are used.
-    pub unsafe fn borrowed(device: DeviceId, handle: usize) -> Result<Self> {
-        // The legacy default stream (handle 0) names no context of its own;
-        // the driver resolves it against the calling thread's current context.
-        let _device = DeviceGuard::new(device)?;
-        // SAFETY: forwarded from the caller.
-        let stream = unsafe { Stream::borrowed(device, handle) }?;
-        Self::new(device, stream)
-    }
-
-    /// Own an independent stream in the origin's borrowed CUDA context.
-    ///
-    /// # Safety
-    /// `origin` is a live stream on `device` whose creator keeps its context
-    /// (or SM partition) alive while the returned stream is used.
-    pub unsafe fn sibling(device: DeviceId, origin: usize) -> Result<Self> {
-        let _device = DeviceGuard::new(device)?;
-        // SAFETY: forwarded from the caller.
-        let origin = unsafe { Stream::borrowed(device, origin) }?;
-        Self::new(device, origin.fork()?)
     }
 
     /// Allocate the configured SM partitions from one disjoint split tree.

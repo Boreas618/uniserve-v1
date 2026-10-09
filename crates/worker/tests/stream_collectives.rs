@@ -80,8 +80,7 @@ fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
                         members: vec![1, 0],
                         ranks: vec![1, 0],
                     }];
-                    let mut collectives =
-                        unsafe { StreamCollectives::bind(&stream, &host, &groups) }.unwrap();
+                    let mut collectives = StreamCollectives::bind(&stream, &host, &groups).unwrap();
                     let tables: Map<tvm_ffi::String, Any> =
                         Map::try_from(collectives.tables()).unwrap();
                     let table: Map<tvm_ffi::String, Any> =

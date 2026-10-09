@@ -79,7 +79,7 @@ pub struct KVPlan {
 impl KVPlan {
     /// Decode and validate the `model.cache_plan` result.
     pub fn decode(value: Any) -> Result<Self> {
-        let record = Handle::new(value.clone());
+        let record = Handle::new(value.clone())?;
         let plan = Record::new("model.cache_plan", value)?;
         let groups = plan
             .get::<tvm_ffi::Array<Any>>("groups")?

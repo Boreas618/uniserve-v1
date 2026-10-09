@@ -81,11 +81,9 @@ impl<T> WeightPrefetch<T> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Borrows the caller's compute stream for one operation.
-    fn compute(&self, handle: usize) -> Result<Stream> {
-        // SAFETY: expert calls submit on a live compute stream of this device,
-        // which the caller keeps alive through the call.
-        Ok(unsafe { Stream::borrowed(self.device, handle) }?)
+    /// The device the weights and their copy stream live on.
+    pub fn device(&self) -> DeviceId {
+        self.device
     }
 
     pub fn contains(&self, module: usize) -> bool {
@@ -109,7 +107,7 @@ impl<T> WeightPrefetch<T> {
     }
 
     /// Join a speculative tail copy even if the call omitted its last layer.
-    pub fn end(&self, compute: usize) -> Result<()> {
+    pub fn end(&self, compute: &Stream) -> Result<()> {
         let last = self
             .state()
             .calls
@@ -117,7 +115,7 @@ impl<T> WeightPrefetch<T> {
             .ok_or(Error::State("DWDP expert call requires an active context"))?
             .last;
         if let Some(last) = last {
-            self.compute(compute)?.wait_event(&self.ready[last % 2])?;
+            compute.wait_event(&self.ready[last % 2])?;
         }
         Ok(())
     }
@@ -128,7 +126,7 @@ impl<T> WeightPrefetch<T> {
     pub fn before<E>(
         &self,
         module: usize,
-        compute: usize,
+        compute: &Stream,
         mut submit: impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> Result<std::result::Result<(), E>> {
         let index = self.index(module)?;
@@ -144,10 +142,9 @@ impl<T> WeightPrefetch<T> {
 
         // A default-stream handle resolves against the current context.
         let _device = DeviceGuard::new(self.device)?;
-        let compute = self.compute(compute)?;
         if !started {
             for event in &self.consumed {
-                event.record(&compute)?;
+                event.record(compute)?;
             }
         }
 
@@ -186,9 +183,9 @@ impl<T> WeightPrefetch<T> {
         Ok(submit(index))
     }
 
-    pub fn after(&self, module: usize, compute: usize) -> Result<()> {
+    pub fn after(&self, module: usize, compute: &Stream) -> Result<()> {
         let index = self.index(module)?;
-        self.consumed[index % 2].record(&self.compute(compute)?)?;
+        self.consumed[index % 2].record(compute)?;
         Ok(())
     }
 
@@ -522,13 +519,18 @@ impl ExpertWeights {
         ))
     }
 
+    /// The device the weights live on.
+    pub fn device(&self) -> DeviceId {
+        self.prefetch.device()
+    }
+
     /// Open one invocation.
     pub fn begin(&self) -> Result<()> {
         self.prefetch.begin()
     }
 
     /// Close one invocation on `compute`, joining a speculative tail copy.
-    pub fn end(&self, compute: usize) -> Result<()> {
+    pub fn end(&self, compute: &Stream) -> Result<()> {
         self.prefetch.end(compute)
     }
 
@@ -543,12 +545,10 @@ impl ExpertWeights {
     pub fn before(
         &self,
         layer: usize,
-        compute: usize,
+        compute: &Stream,
         mut record: impl FnMut(usize) -> Result<()>,
     ) -> Result<()> {
-        // SAFETY: the caller's live compute stream on this device.
-        let stream = unsafe { Stream::borrowed(self.prefetch.device, compute) }?;
-        let capturing = stream.capture_status()? != uniserve_cuda::CaptureStatus::None;
+        let capturing = compute.capture_status()? != uniserve_cuda::CaptureStatus::None;
         self.prefetch.before(layer, compute, |index| {
             if capturing {
                 record(index)
@@ -559,7 +559,7 @@ impl ExpertWeights {
     }
 
     /// Release layer `layer`'s slots after its last reader on `compute`.
-    pub fn after(&self, layer: usize, compute: usize) -> Result<()> {
+    pub fn after(&self, layer: usize, compute: &Stream) -> Result<()> {
         self.prefetch.after(layer, compute)
     }
 
