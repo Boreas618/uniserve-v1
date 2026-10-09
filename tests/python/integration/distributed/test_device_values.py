@@ -7,9 +7,9 @@ import pytest
 import torch
 
 from uniserve_models.cache import Config, mha
+from uniserve_models.cache.units import UnitPool
 from uniserve_models.nn import RotaryEmbedding
 from uniserve_models.quantization import Quantizer
-from uniserve_models.runtime import PrefixCache
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -31,9 +31,8 @@ def test_rotary_factors_follow_positions_on_another_device():
 
 @pytest.mark.parametrize("quantized", (False, True))
 def test_cache_reset_follows_backing_on_another_device(quantized):
-    with (
-        torch.cuda.device(0),
-        PrefixCache(
+    with torch.cuda.device(0):
+        cache = UnitPool.allocate(
             Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
             num_units=3,
             block_size=4,
@@ -41,8 +40,7 @@ def test_cache_reset_follows_backing_on_another_device(quantized):
             quantization={
                 "attention": Quantizer("fp8", axis=0) if quantized else None
             },
-        ) as cache,
-    ):
+        )
         state = cache.state("attention")
         source = torch.full((12, 1, 16), 896.0, device="cuda:1")
         state.write((0, 1, 2), start=0, key=source, value=-source)
@@ -63,9 +61,8 @@ def test_cache_reset_follows_backing_on_another_device(quantized):
 def test_cache_updates_follow_backing_and_preserve_existing_values_on_another_device(  # noqa: E501
     quantized,
 ):
-    with (
-        torch.cuda.device(0),
-        PrefixCache(
+    with torch.cuda.device(0):
+        cache = UnitPool.allocate(
             Config({"attention": mha.Config(1, 16, (0,), torch.float32)}),
             num_units=3,
             block_size=4,
@@ -73,8 +70,7 @@ def test_cache_updates_follow_backing_and_preserve_existing_values_on_another_de
             quantization={
                 "attention": Quantizer("fp8", axis=0) if quantized else None
             },
-        ) as cache,
-    ):
+        )
         state = cache.state("attention")
         first = torch.full((1, 1, 16), 448.0, device="cuda:1")
         state.write((0,), start=0, key=first, value=-first)
