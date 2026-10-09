@@ -8,6 +8,11 @@ import torch
 import torch.multiprocessing as mp
 from torch import nn
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from uniserve_models.distributed import DeviceMesh, parallelize_
 from uniserve_models.model import TransformerDecoder
 from uniserve_models.nn.attention import (
@@ -17,7 +22,6 @@ from uniserve_models.nn.attention import (
     Ulysses,
     VarlenInput,
 )
-from uniserve_models.runtime import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 
@@ -35,22 +39,16 @@ class NonlinearLayer(nn.Module):
 
 
 @torch.inference_mode()
-def _run(rank, rendezvous, stages):
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=4,
-        device="cpu",
-        init_method=rendezvous,
-    ) as owner:
-        mesh = owner.bind(
+def _run(rank, listener, stages):
+    with process_world(rank, 4, listener) as world:
+        mesh = bind_mesh(
+            world,
             DeviceMesh(
                 ranks=(3, 2, 1, 0),
                 shape=(stages, 4 // stages),
                 axes=("pp", "tokens"),
                 rank=rank,
             ),
-            device="cpu",
         )
         generator = torch.Generator().manual_seed(191)
         weights = (
@@ -105,12 +103,11 @@ def _run(rank, rendezvous, stages):
 
 
 @pytest.mark.parametrize("stages", (2, 4))
-def test_pipeline_recurrence_preserves_independent_trajectories(
-    tmp_path, stages
-):
-    mp.spawn(
-        _run,
-        args=((tmp_path / "pipeline").as_uri(), stages),
-        nprocs=4,
-        join=True,
-    )
+def test_pipeline_recurrence_preserves_independent_trajectories(stages):
+    with rendezvous() as listener:
+        mp.spawn(
+            _run,
+            args=(listener, stages),
+            nprocs=4,
+            join=True,
+        )

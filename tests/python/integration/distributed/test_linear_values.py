@@ -9,6 +9,11 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh, parallelize_
 from uniserve_models.model import TextSize
@@ -20,22 +25,15 @@ from uniserve_models.nn.linear import (
     RowParallelLinear,
 )
 from uniserve_models.quantization import Quantizer
-from uniserve_models.runtime import initialize_process_groups
 
 pytestmark = pytest.mark.integration
 
 
-def _run(rank, rendezvous):
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=4,
-        device="cpu",
-        init_method=rendezvous,
-    ) as owner:
-        tensor_mesh = owner.bind(
+def _run(rank, listener):
+    with process_world(rank, 4, listener) as world:
+        tensor_mesh = bind_mesh(
+            world,
             DeviceMesh(ranks=(3, 1, 0, 2), shape=(4,), axes=("tp",), rank=rank),
-            device="cpu",
         )
         group = tensor_mesh.get_group("tp")
         weight = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 16
@@ -98,11 +96,11 @@ def _run(rank, rendezvous):
                 actual[name], full[name].chunk(2, dim=-1)[group.rank // 2]
             )
 
-        token_mesh = owner.bind(
+        token_mesh = bind_mesh(
+            world,
             DeviceMesh(
                 ranks=(3, 1, 0, 2), shape=(4,), axes=("tokens",), rank=rank
             ),
-            device="cpu",
         )
         tokens = token_mesh.get_group("tokens")
         for count in (0, 2, 7, 521):
@@ -222,5 +220,6 @@ def _run(rank, rendezvous):
                         )
 
 
-def test_parallel_projection_values(tmp_path):
-    mp.spawn(_run, args=((tmp_path / "linear").as_uri(),), nprocs=4, join=True)
+def test_parallel_projection_values():
+    with rendezvous() as listener:
+        mp.spawn(_run, args=(listener,), nprocs=4, join=True)
