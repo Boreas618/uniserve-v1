@@ -228,12 +228,41 @@ def audio_latent_frames(num_frames: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class TilePacking:
-    """CPU indices for the mathematical text, stereo audio and tiled video
-    order of sparse attention.
+class TileExtent:
+    """Row and tile counts of sparse attention's `[text | audio | tiled video
+    | padding]` rows.
 
-    num_tokens counts valid tokens. padded_tokens also includes tile-boundary
-    and partition alignment, whose validity is represented separately.
+    The counts follow from the prompt length, the frame count, the canvas
+    and the alignment alone (``tile_extent``), so sizing a layout builds no
+    tables. num_tokens counts valid tokens. padded_tokens also includes
+    tile-boundary and partition alignment, whose validity the tables of
+    ``TilePacking`` represent.
+
+    Attributes:
+        num_tokens: Valid prompt, audio and video tokens.
+        padded_tokens: All rows, whole 64-row tiles in an even number.
+        prefix_tiles: Tiles of the dense text/audio prefix.
+        video_tiles: Tiles of the video region, including partial tiles.
+        video_frames: Temporal latent frames.
+        latent_height: Latent raster height before patching.
+        latent_width: Latent raster width before patching.
+        audio_frames: Audio latent frames per stereo channel.
+    """  # noqa: D205
+
+    num_tokens: int
+    padded_tokens: int
+    prefix_tiles: int
+    video_tiles: int
+    video_frames: int
+    latent_height: int
+    latent_width: int
+    audio_frames: int
+
+
+@dataclass(frozen=True, slots=True)
+class TilePacking(TileExtent):
+    """CPU indices for the mathematical text, stereo audio and tiled video
+    order of sparse attention, with the extent they fill.
 
     Attributes:
         position_ids: [padded_tokens, 3] FP64 (time, height, width) rotary
@@ -248,16 +277,8 @@ class TilePacking:
         video_untile_indices: Packed row of each video raster row, the
             inverse of ``video_raster_indices``.
         tile_valid_sizes: [padded_tokens // 64] int32 valid rows per tile.
-        prefix_tiles: Tiles of the dense text/audio prefix.
-        video_tiles: Tiles of the video region, including partial tiles.
-        video_frames: Temporal latent frames.
-        latent_height: Latent raster height before patching.
-        latent_width: Latent raster width before patching.
-        audio_frames: Audio latent frames per stereo channel.
     """  # noqa: D205
 
-    num_tokens: int
-    padded_tokens: int
     position_ids: torch.Tensor
     token_tags: torch.Tensor
     text_indices: torch.Tensor
@@ -266,12 +287,6 @@ class TilePacking:
     video_raster_indices: torch.Tensor
     video_untile_indices: torch.Tensor
     tile_valid_sizes: torch.Tensor
-    prefix_tiles: int
-    video_tiles: int
-    video_frames: int
-    latent_height: int
-    latent_width: int
-    audio_frames: int
 
 
 def _spatial_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
@@ -311,7 +326,20 @@ def _temporal_grid(count: int, origin: float) -> torch.Tensor:
     )
 
 
-def tile_packing(
+def _text_region(num_text_tokens: int, text_rows: int | None) -> int:
+    """Rows of the text region: whole 64-row tiles holding the prompt."""
+    if num_text_tokens < 1:
+        raise ValueError("H3 packing requires nonempty text")
+    if text_rows is None:
+        return math.ceil(num_text_tokens / 64) * 64
+    if text_rows % 64 or text_rows < num_text_tokens:
+        raise ValueError(
+            "the H3 text region must be whole 64-row tiles holding the prompt"
+        )
+    return text_rows
+
+
+def tile_extent(
     *,
     num_text_tokens: int,
     num_frames: int,
@@ -320,11 +348,8 @@ def tile_packing(
     token_multiple: int = 256,
     audio_frames: int | None = None,
     text_rows: int | None = None,
-) -> TilePacking:
-    """Build CPU coordinates for `[text | audio | tiled video | padding]` rows.
-
-    These host metadata values remain concrete during deferred parameter
-    construction. Execution supplies device views for numerical kernels.
+) -> TileExtent:
+    """Size the `[text | audio | tiled video | padding]` rows of one layout.
 
     Args:
         num_text_tokens: Prompt tokens, the valid leading rows of the text
@@ -338,11 +363,7 @@ def tile_packing(
         audio_frames: Audio latent frames per channel; defaults to the
             40 Hz timeline of ``num_frames``.
         text_rows: Rows of the text region, whole 64-row tiles holding at
-            least the prompt; defaults to the prompt's own tiles. Rows past
-            the prompt are invalid in every tile they occupy, and the media
-            rotary timeline still starts at the prompt's exact length, so a
-            larger region changes the packed shapes but not the positions,
-            tags or validity of any prompt, audio or video token.
+            least the prompt; defaults to the prompt's own tiles.
 
     Raises:
         ValueError: A canvas off the 32-pixel grid, empty text, a frame
@@ -351,18 +372,11 @@ def tile_packing(
             text region that is not whole tiles holding the prompt, or a
             patch that does not divide the latents.
     """
-    if num_text_tokens < 1:
-        raise ValueError("H3 packing requires nonempty text")
     if token_multiple < 1 or token_multiple % 64:
         raise ValueError(
             "packing alignment must contain complete 64-token tiles"
         )
-    if text_rows is None:
-        text_rows = math.ceil(num_text_tokens / 64) * 64
-    elif text_rows % 64 or text_rows < num_text_tokens:
-        raise ValueError(
-            "the H3 text region must be whole 64-row tiles holding the prompt"
-        )
+    text_rows = _text_region(num_text_tokens, text_rows)
     patch_t, patch_h, patch_w = patch_size
     # Latents are 16x spatially compressed relative to the output raster.
     latent_height, latent_width = latent_raster(canvas)
@@ -383,7 +397,72 @@ def tile_packing(
             "fixed latent dimensions are not divisible by the transformer patch"
         )
 
-    # Text and audio occupy dense 64-row tiles before the sparse video region.
+    # Text and audio occupy dense 64-row tiles before the sparse video
+    # region, whose 4x4x4 spatiotemporal tiles each reserve 64 rows.
+    grid = (
+        video_frames // patch_t,
+        latent_height // patch_h,
+        latent_width // patch_w,
+    )
+    audio_rows = AUDIO_CHANNELS * audio_frames
+    video_start = text_rows + math.ceil(audio_rows / 64) * 64
+    video_tiles = math.prod(math.ceil(extent / 4) for extent in grid)
+    transport_rows = video_start + video_tiles * 64
+    # The block-sparse kernel consumes tile pairs, so an odd logical tile count
+    # receives one all-zero transport partner that is not a semantic model row.
+    padded_tokens = math.ceil(transport_rows / max(token_multiple, 128)) * max(
+        token_multiple, 128
+    )
+    if padded_tokens // 64 % 2:
+        padded_tokens += 64
+    return TileExtent(
+        num_tokens=num_text_tokens + audio_rows + math.prod(grid),
+        padded_tokens=padded_tokens,
+        prefix_tiles=video_start // 64,
+        video_tiles=video_tiles,
+        video_frames=video_frames,
+        latent_height=latent_height,
+        latent_width=latent_width,
+        audio_frames=audio_frames,
+    )
+
+
+def tile_packing(
+    *,
+    num_text_tokens: int,
+    num_frames: int,
+    canvas: image.Config,
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+    token_multiple: int = 256,
+    audio_frames: int | None = None,
+    text_rows: int | None = None,
+) -> TilePacking:
+    """Build CPU coordinates for `[text | audio | tiled video | padding]` rows.
+
+    These host metadata values remain concrete during deferred parameter
+    construction. Execution supplies device views for numerical kernels.
+
+    The arguments are ``tile_extent``'s, which sizes the rows and raises for
+    the same arguments. Rows of the text region past the prompt are invalid
+    in every tile they occupy, and the media rotary timeline still starts at
+    the prompt's exact length, so a larger region changes the packed shapes
+    but not the positions, tags or validity of any prompt, audio or video
+    token.
+    """
+    extent = tile_extent(
+        num_text_tokens=num_text_tokens,
+        num_frames=num_frames,
+        canvas=canvas,
+        patch_size=patch_size,
+        token_multiple=token_multiple,
+        audio_frames=audio_frames,
+        text_rows=text_rows,
+    )
+    text_rows = _text_region(num_text_tokens, text_rows)
+    patch_t, patch_h, patch_w = patch_size
+    latent_height, latent_width = extent.latent_height, extent.latent_width
+    video_frames, audio_frames = extent.video_frames, extent.audio_frames
+    padded_tokens, video_tiles = extent.padded_tokens, extent.video_tiles
     rows_per_frame = latent_height // patch_h * (latent_width // patch_w)
     audio_rows = AUDIO_CHANNELS * audio_frames
     video_rows = video_frames // patch_t * rows_per_frame
@@ -397,11 +476,7 @@ def tile_packing(
     grid_t = video_frames // patch_t
     grid_h = latent_height // patch_h
     grid_w = latent_width // patch_w
-    tiles_t, tiles_h, tiles_w = (
-        math.ceil(extent / tile)
-        for extent, tile in zip((grid_t, grid_h, grid_w), (4, 4, 4))
-    )
-    video_tiles = tiles_t * tiles_h * tiles_w
+    tiles_h, tiles_w = math.ceil(grid_h / tile_h), math.ceil(grid_w / tile_w)
     # Tiles are ordered time-major over the tile grid. Within a tile, row
     # offset o addresses the (time, height, width) cell
     # (o // 16, o // 4 % 4, o % 4) before boundary compaction.
@@ -428,16 +503,6 @@ def tile_packing(
     video_indices = torch.from_numpy(
         (video_start + tile_ids * 64 + offsets)[offsets < valid_sizes[:, None]]
     )
-    video_transport_rows = video_tiles * 64
-    transport_rows = video_start + video_transport_rows
-    # The block-sparse kernel consumes tile pairs, so an odd logical tile count
-    # receives one all-zero transport partner that is not a semantic model row.
-    padded_tokens = math.ceil(transport_rows / max(token_multiple, 128)) * max(
-        token_multiple, 128
-    )
-    if padded_tokens // 64 % 2:
-        padded_tokens += 64
-    num_tokens = num_text_tokens + audio_rows + video_rows
 
     # Map semantic video raster rows to their tile-major transport positions.
     text_indices = torch.arange(num_text_tokens, dtype=torch.long, device="cpu")
@@ -529,8 +594,14 @@ def tile_packing(
         video_valid_sizes
     )
     return TilePacking(
-        num_tokens=num_tokens,
+        num_tokens=extent.num_tokens,
         padded_tokens=padded_tokens,
+        prefix_tiles=extent.prefix_tiles,
+        video_tiles=video_tiles,
+        video_frames=video_frames,
+        latent_height=latent_height,
+        latent_width=latent_width,
+        audio_frames=audio_frames,
         position_ids=positions,
         token_tags=tags,
         text_indices=text_indices,
@@ -539,12 +610,6 @@ def tile_packing(
         video_raster_indices=video_raster_indices,
         video_untile_indices=raster_to_transport,
         tile_valid_sizes=tile_valid_sizes,
-        prefix_tiles=video_start // 64,
-        video_tiles=video_tiles,
-        video_frames=video_frames,
-        latent_height=latent_height,
-        latent_width=latent_width,
-        audio_frames=audio_frames,
     )
 
 
