@@ -530,14 +530,23 @@ fn stream_of(batch: &MediaBatch) -> Result<Stream> {
     Ok(unsafe { Stream::borrowed(stream.device(), stream.raw()) }?)
 }
 
+/// The most elements a product holds along one dimension.
+fn extent(dim: &uniserve_ipc::DimBound) -> u64 {
+    match dim {
+        uniserve_ipc::DimBound::Static(extent) | uniserve_ipc::DimBound::Device { max: extent } => {
+            u64::from(*extent)
+        }
+    }
+}
+
 /// Rows' width of a two-dimensional product.
 fn row_width(output: &TensorRef) -> Result<u64> {
-    match output.shape_bound.dims.get(1) {
-        Some(
-            uniserve_ipc::DimBound::Static(extent) | uniserve_ipc::DimBound::Device { max: extent },
-        ) => Ok(u64::from(*extent)),
-        None => Err(Error::Invalid("the product is not rows".into())),
-    }
+    output
+        .shape_bound
+        .dims
+        .get(1)
+        .map(extent)
+        .ok_or_else(|| Error::Invalid("the product is not rows".into()))
 }
 
 /// The patch grids of a request's vision blocks, images and videos apart,
@@ -605,6 +614,39 @@ fn publish(
         &call.outputs[0],
         write,
         false,
+        None,
+        Some(&stream),
+    )?;
+    batch.calls[index].publish(write.id(), locations, exported)?;
+    Ok(())
+}
+
+/// Publish a call's first output, whose bound view the producer filled, and
+/// export it to its readers (`host` readers read it from host memory).
+///
+/// The bound view is this rank's share of the product: its region when
+/// other ranks hold the rest, the whole product when the round assigns
+/// this rank all of it. Publishing the view itself is right in both cases;
+/// the store tracks a share that covers the product as a whole product.
+fn publish_bound(
+    parts: &Parts<'_>,
+    batch: &mut MediaBatch,
+    call: &Call,
+    index: usize,
+    write: &crate::ProductBuffer,
+    host: bool,
+) -> Result<()> {
+    let owners = parts.owners();
+    let stream = stream_of(batch)?;
+    owners
+        .store
+        .write(write, &write.view(), Some(&stream), None)?;
+    let (exported, locations) = export(
+        owners,
+        call,
+        &call.outputs[0],
+        write,
+        host,
         None,
         Some(&stream),
     )?;
@@ -1157,18 +1199,7 @@ fn decode_video(
             )?;
         }
     }
-    owners.store.produced(&write, &[], Some(&stream), None)?;
-    let (exported, locations) = export(
-        owners,
-        call,
-        &call.outputs[0],
-        &write,
-        true,
-        None,
-        Some(&stream),
-    )?;
-    batch.calls[index].publish(write.id(), locations, exported)?;
-    Ok(())
+    publish_bound(parts, batch, call, index, &write, true)
 }
 
 /// Decode this rank's audio units into its span of the track.
@@ -1249,18 +1280,7 @@ fn decode_audio(
             "audio units disagree with their sample span".into(),
         ));
     }
-    owners.store.produced(&write, &[], Some(&stream), None)?;
-    let (exported, locations) = export(
-        owners,
-        call,
-        &call.outputs[0],
-        &write,
-        true,
-        None,
-        Some(&stream),
-    )?;
-    batch.calls[index].publish(write.id(), locations, exported)?;
-    Ok(())
+    publish_bound(parts, batch, call, index, &write, true)
 }
 
 /// Encode a request's conditions into denoiser rows: a round of visual
@@ -1294,15 +1314,7 @@ fn encode_conditions(
         .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
     let owners = parts.owners();
     let stream = stream_of(batch)?;
-    let width = call.outputs[0]
-        .shape_bound
-        .dims
-        .get(1)
-        .map(|dim| match dim {
-            uniserve_ipc::DimBound::Static(extent)
-            | uniserve_ipc::DimBound::Device { max: extent } => u64::from(*extent),
-        })
-        .ok_or_else(|| Error::Invalid("condition latents are rows".into()))?;
+    let width = row_width(&call.outputs[0])?;
     match name.as_str() {
         "condition_video_latents" => {
             let range = decode_range(plan, call)?;
@@ -1392,17 +1404,7 @@ fn encode_conditions(
                     "encoded condition units disagree with their planned rows".into(),
                 ));
             }
-            owners.store.produced(&write, &[], Some(&stream), None)?;
-            let (exported, locations) = export(
-                owners,
-                call,
-                &call.outputs[0],
-                &write,
-                false,
-                None,
-                Some(&stream),
-            )?;
-            batch.calls[index].publish(write.id(), locations, exported)?;
+            publish_bound(parts, batch, call, index, &write, false)?;
         }
         "condition_audio_latents" => {
             // The audio call is one unit, the component's first rank's.
@@ -1452,19 +1454,7 @@ fn encode_conditions(
                     "encoded audio tracks disagree with their planned rows".into(),
                 ));
             }
-            owners
-                .store
-                .produced(&write, &[rows, width], Some(&stream), None)?;
-            let (exported, locations) = export(
-                owners,
-                call,
-                &call.outputs[0],
-                &write,
-                false,
-                None,
-                Some(&stream),
-            )?;
-            batch.calls[index].publish(write.id(), locations, exported)?;
+            publish_bound(parts, batch, call, index, &write, false)?;
         }
         other => {
             return Err(Error::Invalid(format!(
@@ -1655,7 +1645,7 @@ impl VideoRuntime {
             media: plan,
             pages,
             envelope,
-            outputs: _,
+            outputs: capacity_outputs,
             overlap_bytes: _,
         } = capacity;
         let products: HashMap<String, Vec<String>> = info
@@ -1722,13 +1712,12 @@ impl VideoRuntime {
             .flat_map(|component| &component.outputs)
             .find(|output| output.name == "conditioning")
             .map(|output| -> Result<(u64, DType)> {
-                let width = match output.shape_bound.dims.get(1) {
-                    Some(
-                        uniserve_ipc::DimBound::Static(extent)
-                        | uniserve_ipc::DimBound::Device { max: extent },
-                    ) => u64::from(*extent),
-                    None => return Err(Error::Interface("text features are rows".into())),
-                };
+                let width = output
+                    .shape_bound
+                    .dims
+                    .get(1)
+                    .map(extent)
+                    .ok_or_else(|| Error::Interface("text features are rows".into()))?;
                 Ok((
                     width,
                     crate::storage::memory::parse_dtype(output.dtype.storage_name())?,
@@ -1743,6 +1732,16 @@ impl VideoRuntime {
                 continue;
             }
             if has(crate::model::components::Capability::TextEncoder) {
+                // The media reader packs a request's vision blocks into the
+                // rows of `vision_pixels`; a deployment without conditioned
+                // tasks declares none.
+                let vision_rows = capacity_outputs
+                    .get("media_reader")
+                    .and_then(|outputs| {
+                        outputs.iter().find(|output| output.name == "vision_pixels")
+                    })
+                    .and_then(|output| output.shape_bound.dims.first())
+                    .map_or(0, |dim| extent(dim) as usize);
                 let path = placed
                     .calls
                     .iter()
@@ -1764,9 +1763,10 @@ impl VideoRuntime {
                     attention: attention.clone(),
                     dtype: crate::runner::text::model_dtype(&config.model_dtype)?,
                     config: EncoderConfig {
-                        max_images: info.max_batch_calls.max(1) as usize,
-                        // Vision blocks encode one sample per call.
-                        row_budget: config.max_batch_tokens.max(1),
+                        // The text encoder derives its vision blocks'
+                        // bound from the row budget.
+                        max_images: 1,
+                        row_budget: vision_rows.max(1),
                         text_capacities: plan
                             .text_capacities
                             .iter()
