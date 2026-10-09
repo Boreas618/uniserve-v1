@@ -24,13 +24,13 @@ use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memcpy_async, memset_d8, memset_d32};
 use uniserve_ipc::{Call, LatentParams};
 
+use crate::executor::forward::transfer::latents::Pool;
 use crate::ffi::{Backing, DType, Fields, Function, Functions, Handle, integer_list, list};
 use crate::model::video::{LayoutFields, VideoModel};
 use crate::request::video::VideoLayout;
 use crate::runner::GraphPool;
 use crate::runner::graphs::{GraphMode, GraphTable, Lookup};
 use crate::storage::memory::{Memory, StorageView};
-use crate::executor::forward::transfer::latents::Pool;
 use crate::storage::{RequestSlots, SlotField};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
 
@@ -175,7 +175,23 @@ impl StateEnvelope {
         let mut host = Vec::new();
         for fields in layouts {
             for field in &fields.state {
-                if !field.sample {
+                let elements = if field.sample {
+                    // A rank's rows of a sample move with the rows before
+                    // them in the sequence: the prompt's and conditions' of
+                    // the request's own layout, which no startup layout
+                    // need match. The complete sample bounds every share.
+                    fields
+                        .samples
+                        .iter()
+                        .find(|(name, _)| *name == field.name)
+                        .map(|(_, sample)| sample.rows * sample.width)
+                        .ok_or_else(|| {
+                            Error::Interface(format!(
+                                "sample field {} has no sample rows",
+                                field.name
+                            ))
+                        })?
+                } else {
                     grow(
                         &mut device,
                         field.name.clone(),
@@ -183,12 +199,13 @@ impl StateEnvelope {
                         field.elements(),
                         false,
                     )?;
-                }
+                    field.elements()
+                };
                 grow(
                     &mut host,
                     format!("{}_source", field.name),
                     field.dtype,
-                    field.elements(),
+                    elements,
                     true,
                 )?;
             }
@@ -1206,23 +1223,24 @@ mod tests {
         }
     }
 
-    /// One layout's fields: a video and an audio sample, a timestep table
-    /// and `rows` prompt rows of width 4.
-    fn layout(video: i64, audio: i64, table: i64, rows: u64) -> LayoutFields {
-        let sample = |rows: i64| SampleRows {
+    /// One layout's fields on a rank that holds every sample row but the
+    /// video's last `shared` rows: a video and an audio sample, a timestep
+    /// table and `rows` prompt rows of width 4.
+    fn shared_layout(video: i64, audio: i64, table: i64, rows: u64, shared: i64) -> LayoutFields {
+        let sample = |rows: i64, local: i64| SampleRows {
             rows: rows as u64,
             width: 8,
-            local: (0, rows as u64),
+            local: (0, local as u64),
         };
         LayoutFields {
             state: vec![
-                field("video", DType::F32, &[video, 8], true),
+                field("video", DType::F32, &[video - shared, 8], true),
                 field("audio", DType::F32, &[audio, 8], true),
                 field("tables", DType::I64, &[table], false),
             ],
             samples: vec![
-                ("video".into(), sample(video)),
-                ("audio".into(), sample(audio)),
+                ("video".into(), sample(video, video - shared)),
+                ("audio".into(), sample(audio, audio)),
             ],
             noise: vec![
                 ("video".into(), vec![1, video, 8]),
@@ -1231,6 +1249,11 @@ mod tests {
             condition_noise: 0,
             text_condition: (rows, 4),
         }
+    }
+
+    /// One layout's fields on a rank that holds every sample row.
+    fn layout(video: i64, audio: i64, table: i64, rows: u64) -> LayoutFields {
+        shared_layout(video, audio, table, rows, 0)
     }
 
     #[test]
@@ -1287,6 +1310,12 @@ mod tests {
         assert_eq!(envelope.samples, 4 * 256);
         // A layout whose samples exceed a slot's pages is refused.
         assert!(StateEnvelope::new(&[layout(40, 3, 5, 16)], pages(2)).is_err());
+
+        // A rank's share of a sample grows and shrinks with the request's
+        // prompt and conditions, so its source holds the complete sample
+        // wherever the prepared layouts leave the rank fewer rows.
+        let envelope = StateEnvelope::new(&[shared_layout(40, 3, 5, 16, 30)], pages(4)).unwrap();
+        assert_eq!(size(&envelope.host, "video_source"), Some(320));
 
         let mut changed = layout(8, 30, 9, 4);
         changed.state[2].dtype = DType::I32;

@@ -610,6 +610,12 @@ def _tensors(values) -> dict[str, torch.Tensor]:
     }
 
 
+def _joined(parts: Sequence[Any]) -> torch.Tensor:
+    """The rows of consecutive row tensors as one tensor."""
+    rows = [torch.from_dlpack(part) for part in parts]
+    return rows[0] if len(rows) == 1 else torch.cat(rows)
+
+
 def _view(tensor: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
     """The leading elements of a flat backing as ``shape``."""
     return tensor.reshape(-1)[: _elements(shape)].view(tuple(shape))
@@ -862,8 +868,10 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
         """Write a request's encoded conditions into its retained rows.
 
         ``latents`` are the condition latents in request order, a
-        condition's visual rows before its audio rows. The rows follow the
-        prompt's in the slot's ``text_condition``.
+        condition's visual rows before its audio rows. Each is a list of
+        row tensors that together hold its rows in order: a condition
+        encoded over several rounds has one tensor per round. The rows
+        follow the prompt's in the slot's ``text_condition``.
         """
         slot = int(slot)
         plan = plans[int(identifier)]
@@ -877,7 +885,7 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
             network.encode_conditions(
                 resolved,
                 plan.layout,
-                latents=tuple(torch.from_dlpack(value) for value in latents),
+                latents=tuple(_joined(parts) for parts in latents),
                 noise=_condition_noise(slot, resolved),
                 out=out,
             )
