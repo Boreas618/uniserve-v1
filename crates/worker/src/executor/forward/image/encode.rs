@@ -41,11 +41,7 @@ pub(super) fn placement(
         .first()
         .ok_or_else(|| Error::Invariant("an image batch has calls".into()))?;
     let runner = &runtime.encoders[runtime.encoder_route(&first.component, first.code)?];
-    let stream = runner
-        .stream()
-        // SAFETY: the lanes own the stream for the runtime's lifetime.
-        .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-        .transpose()?;
+    let stream = runner.stream().cloned();
     Ok((runner.device().cuda_index(), stream, 0))
 }
 

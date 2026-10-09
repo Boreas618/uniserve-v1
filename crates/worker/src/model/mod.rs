@@ -105,7 +105,7 @@ impl Description {
             result
                 .get(0)
                 .map_err(|error| Error::numerical("model.describe", &error))?,
-        );
+        )?;
         let info = Record::new(
             "model.describe",
             result
@@ -157,11 +157,11 @@ impl Description {
             )
             .text("model_dtype", &launch.execution.model_dtype)
             .into_any();
-        Ok(Handle::new(
+        Handle::new(
             interface
                 .resolve
                 .call(&[self.handle.view(), (&request).into()])?,
-        ))
+        )
     }
 }
 
@@ -261,7 +261,7 @@ impl LoadedModel {
                     .map(),
             )
             .into_any();
-        let handle = Handle::new(interface.load.call(&[resolved.view(), (&request).into()])?);
+        let handle = Handle::new(interface.load.call(&[resolved.view(), (&request).into()])?)?;
         Ok(Self {
             handle,
             model_name: description.model_name,

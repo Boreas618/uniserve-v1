@@ -409,10 +409,8 @@ impl Transport {
                 return Err(error);
             }
         };
-        let device = producer
-            .as_ref()
-            .map(|(device, stream)| (*device, stream.raw()));
-        let mut storage = match SharedBuffer::new(view.nbytes as usize, consumers.to_vec(), device)
+        let shared = producer.as_ref().map(|(_, stream)| (*stream).clone());
+        let mut storage = match SharedBuffer::new(view.nbytes as usize, consumers.to_vec(), shared)
         {
             Ok(storage) => storage,
             Err(error) => {

@@ -204,17 +204,6 @@ impl<'a> ImageBatch<'a> {
         })
     }
 
-    /// Another view of the batch's stream, for work the batch issues while
-    /// it is borrowed mutably.
-    pub(super) fn borrow_stream(&self) -> Result<Option<Stream>> {
-        self.stream
-            .as_ref()
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-            .transpose()
-            .map_err(Error::from)
-    }
-
     /// The batch's product device.
     pub(super) fn target(&self) -> Device {
         self.device.map_or(Device::Cpu, Device::Cuda)

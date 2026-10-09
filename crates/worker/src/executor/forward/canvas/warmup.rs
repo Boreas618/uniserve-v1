@@ -37,13 +37,11 @@ impl CanvasRuntime {
         if rows == 0 {
             return Ok(());
         }
-        let stream = self.runners.first().and_then(|runner| runner.stream());
-        let stream = stream
-            .map(|stream| {
-                // SAFETY: the lanes own the stream for the runtime's lifetime.
-                unsafe { uniserve_cuda::Stream::borrowed(stream.device(), stream.raw()) }
-            })
-            .transpose()?;
+        let stream = self
+            .runners
+            .first()
+            .and_then(|runner| runner.stream())
+            .cloned();
         let scratch = kv.scratch_units((rows * row_units) as u32, stream.as_ref())?;
         // Runners on other streams read the zeroed units.
         if let Some(stream) = &stream {

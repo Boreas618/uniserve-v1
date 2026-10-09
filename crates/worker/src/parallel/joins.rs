@@ -52,9 +52,9 @@ impl GraphFunctions {
             pool.to_any(),
             Any::from(stream as i64),
             Any::from(i64::from(device)),
-        ])?);
+        ])?)?;
         let ran = body();
-        let ended = self.end.call(&[capture.view()]).map(Handle::new);
+        let ended = self.end.call(&[capture.view()]).and_then(Handle::new);
         match ran {
             Ok(()) => ended,
             Err(error) => {

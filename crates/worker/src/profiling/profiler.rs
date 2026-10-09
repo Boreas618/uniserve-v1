@@ -138,7 +138,7 @@ impl Profiler {
                 .with("with_stack", self.config.with_stack)
                 .with("record_shapes", self.config.record_shapes)
                 .into_any();
-            let profile = Handle::new(self.start.call(&[(&options).into()])?);
+            let profile = Handle::new(self.start.call(&[(&options).into()])?)?;
             if !profile.is_none() {
                 self.torch = Some(profile);
             }

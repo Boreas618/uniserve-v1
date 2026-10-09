@@ -33,7 +33,7 @@ use std::sync::Arc;
 use tvm_ffi::Any;
 use uniserve_core::ComponentConfig;
 
-use uniserve_cuda::{DeviceId, HandleType, PrimaryContext, Stream};
+use uniserve_cuda::{DeviceId, HandleType, PrimaryContext};
 use uniserve_ipc::{CallKind, ComponentInfo, ForwardMode, WorkerEndpoint, WorkerInfo};
 
 use crate::capacity::checks;
@@ -993,11 +993,7 @@ fn allocate_storage(
     let release_stream = match device {
         Some(index) => lanes
             .stream_for(CallKind::Forward(ForwardMode::Decode), DeviceId(index))
-            .map(|stream| -> Result<Stream> {
-                // SAFETY: the lanes own the stream and close after the
-                // storage owners (see `Worker::close`).
-                Ok(unsafe { Stream::borrowed(DeviceId(index), stream.handle()?) }?)
-            })
+            .map(|stream| stream.stream().cloned())
             .transpose()?,
         None => None,
     };

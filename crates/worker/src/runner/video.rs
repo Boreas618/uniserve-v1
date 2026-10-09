@@ -199,7 +199,7 @@ impl VideoDecoding {
             }
             let mut arguments = segment_arguments(segment).to_vec();
             arguments.push(pool.value.to_any());
-            let graph = Handle::new(self.capture_segment.call_values(&arguments)?);
+            let graph = Handle::new(self.capture_segment.call_values(&arguments)?)?;
             self.graphs.insert(segment, None, graph)?;
             self.graphs.record(GraphMode::Capture);
         }
@@ -548,11 +548,6 @@ impl TextEncoding {
         let binding = crate::model::bind::bind(interface, &mut workspaces, vec![prepared], None)?
             .pop()
             .ok_or_else(|| Error::Invariant("the text encoder was not bound".into()))?;
-        let borrowed = || -> Result<Stream> {
-            // SAFETY: the worker's lanes own the stream and close it after
-            // the runtime.
-            Ok(unsafe { Stream::borrowed(stream.device(), stream.raw()) }?)
-        };
         let text = EncoderRunner::bind(
             interface,
             &binding,
@@ -561,7 +556,7 @@ impl TextEncoding {
             text_info,
             &config,
             products.clone(),
-            Some(borrowed()?),
+            Some(stream.clone()),
         )?;
         let vision = vision_info
             .map(|info| {
@@ -573,7 +568,7 @@ impl TextEncoding {
                     info,
                     &config,
                     products,
-                    Some(borrowed()?),
+                    Some(stream.clone()),
                 )
             })
             .transpose()?;
