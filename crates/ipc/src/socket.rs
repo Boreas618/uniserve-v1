@@ -382,11 +382,6 @@ impl SocketClient {
         self.send_raw(header, &payload)
     }
 
-    /// Returns the descriptor that becomes readable when a result arrives.
-    pub fn wake_file_descriptor(&self) -> RawFd {
-        self.stream.as_raw_fd()
-    }
-
     /// Sends one frame and returns the identity its response will carry.
     ///
     /// The frame is queued and written as far as the socket accepts; the rest

@@ -2005,11 +2005,6 @@ fn request_kind_from_fb(kind: fbs::ReqKind) -> CodecResult<RequestKind> {
     codec_bail!("unknown request kind {}", kind.0)
 }
 
-/// Iterates over the stable wire names of all request kinds.
-pub fn request_kind_names() -> impl Iterator<Item = &'static str> {
-    RequestKind::ALL.into_iter().map(RequestKind::as_str)
-}
-
 /// Maps a response kind to its stable FlatBuffers discriminant.
 fn response_kind_to_fb(kind: ResponseKind) -> fbs::RespKind {
     match kind {
