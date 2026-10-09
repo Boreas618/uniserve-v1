@@ -214,7 +214,7 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long, default_value = "auto")]
     pub attention_backend: AttentionBackend,
     /// Python interpreter used to launch the forward-only worker.
-    #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
+    #[arg(long, default_value_os_t = WorkerProcessArgs::default_python(), hide = true)]
     pub worker_python: std::path::PathBuf,
     /// Number of physical worker processes of each replica when configuration
     /// is omitted; they form one tensor-parallel group.
@@ -239,7 +239,7 @@ pub(crate) struct SharedRuntimeArgs {
     pub expert_exchange: ExpertExchangeArg,
     /// Path to a JSON deployment configuration: the Worker instances to serve,
     /// each one's node/device ranks, and the components placed on them.
-    #[arg(long, value_name = "FILE", value_parser = read_workers)]
+    #[arg(long, value_name = "FILE", value_parser = WorkerConfig::read_all)]
     pub workers: Option<Box<[WorkerConfig]>>,
     /// Directed product bindings: source[:rank]->destination[:rank]=mechanisms,
     /// where mechanisms names the edge's device mechanism, its host mechanism,
@@ -715,47 +715,6 @@ fn parse_storage_fraction(value: &str) -> Result<f64, String> {
 fn non_empty_secret(value: Option<&str>) -> Option<String> {
     let trimmed = value?.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-/// Returns the default worker interpreter next to the running binary
-/// (the env `bin/` for a `pip install`), then `$VIRTUAL_ENV`, then `python3`.
-fn default_worker_python() -> std::path::PathBuf {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        for name in ["python3", "python"] {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
-        let candidate = std::path::Path::new(&venv).join("bin").join("python");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    "python3".into()
-}
-
-/// Reads the deployment configuration a serve invocation was given.
-///
-/// The file holds a bare JSON array of `WorkerConfig` entries with no
-/// enclosing object. The configuration is a file rather than an inline
-/// argument because it states a whole deployment -- every rank's node and
-/// device, and every component placed on them -- and is written once and
-/// reused, not composed on a command line.
-///
-/// Runs as a clap value parser, so an unreadable file, malformed JSON, or a
-/// configuration `WorkerConfig::validate_all` rejects fails argument parsing.
-fn read_workers(path: &str) -> Result<Box<[WorkerConfig]>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("reading deployment configuration {path}: {error}"))?;
-    let workers: Vec<WorkerConfig> = serde_json::from_str(&text)
-        .map_err(|error| format!("parsing deployment configuration {path}: {error}"))?;
-    WorkerConfig::validate_all(&workers).map_err(|error| error.to_string())?;
-    Ok(workers.into_boxed_slice())
 }
 
 #[cfg(test)]
