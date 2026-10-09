@@ -12,11 +12,15 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
+from tests.python.fixtures.distributed import (
+    bind_mesh,
+    process_world,
+    rendezvous,
+)
 from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.distributed import DeviceMesh, parallelize_
 from uniserve_models.nn import ColumnParallelLinear
 from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
-from uniserve_models.runtime import CUDAStream, initialize_process_groups
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -31,23 +35,17 @@ def _rows(rows: slice, device) -> torch.Tensor:
 
 
 @torch.inference_mode()
-def _run(rank, rendezvous):
+def _run(rank, listener):
     device = torch.device("cuda", rank)
-    with initialize_process_groups(
-        rank=rank,
-        local_rank=rank,
-        world_size=MEMBERS,
-        device=device,
-        init_method=rendezvous,
-    ) as groups:
-        mesh = groups.bind(
+    with process_world(rank, MEMBERS, listener, device) as world:
+        mesh = bind_mesh(
+            world,
             DeviceMesh(
                 ranks=tuple(range(MEMBERS)),
                 shape=(MEMBERS,),
                 axes=("tokens",),
                 rank=rank,
             ),
-            device=device,
         )
         layer = ColumnParallelLinear(
             WIDTH, OUTPUT, bias=False, device=device, dtype=torch.bfloat16
@@ -69,12 +67,12 @@ def _run(rank, rendezvous):
         shard = ROWS // MEMBERS
         interval = slice(rank * shard, (rank + 1) * shard)
         local = _rows(interval, device)
-        stream = CUDAStream.external(torch.cuda.Stream(device=device))
-        stream.wait(torch.cuda.current_stream(device))
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
         covered = 0
         # A context prepared without a token bound sizes the gather transport
         # by each call's own payload, as a denoiser's context does.
-        with stream, ExecutionContext(layer, stream=stream) as context:
+        with ExecutionContext(layer, stream=stream) as context:
             context.prepare(None)
             for selected, value in layer.forward_chunks(
                 local, token_slice=interval, num_tokens=ROWS
@@ -92,12 +90,13 @@ def _run(rank, rendezvous):
         assert covered == ROWS
 
 
-def test_projection_gathers_a_reference_layout_sequence(tmp_path):
+def test_projection_gathers_a_reference_layout_sequence():
     if torch.cuda.device_count() < MEMBERS:
         pytest.skip(f"the reference layout gather needs {MEMBERS} devices")
-    mp.spawn(
-        _run,
-        args=((tmp_path / "rendezvous").as_uri(),),
-        nprocs=MEMBERS,
-        join=True,
-    )
+    with rendezvous() as listener:
+        mp.spawn(
+            _run,
+            args=(listener,),
+            nprocs=MEMBERS,
+            join=True,
+        )
