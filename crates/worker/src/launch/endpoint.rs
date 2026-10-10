@@ -31,7 +31,7 @@ impl Connection {
         let mut channel =
             Channel::connect(&arguments.head, REGISTRATION_TIMEOUT).map_err(failed)?;
         channel
-            .send(&Registration {
+            .send(&Registration::Rank {
                 worker_id: arguments.worker_id.clone(),
                 rank: arguments.rank,
                 generation: arguments.generation,

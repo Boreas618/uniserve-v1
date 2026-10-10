@@ -2,7 +2,7 @@
 //!
 //! Each host of a deployment runs one of these, started by the cluster; exactly
 //! one host runs the head. The engine does not start processes on other hosts,
-//! so a launcher connects out to the head, presents its host identity, receives
+//! so a launcher connects out to the head, registers its host identity, receives
 //! the launches of the ranks placed on its host, of every worker group the
 //! deployment places there, spawns them, reports their exits by
 //! worker, generation and rank, stops one group's ranks on instruction ahead
@@ -20,18 +20,31 @@
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
 //!
-//! The connection carries the messages of `uniserve_ipc::launcher`; the
-//! head's side is the engine's `LauncherRegistry`.
+//! The connection carries the messages of `uniserve_ipc::launcher` as frames,
+//! after the launcher's `Registration`; the head's side is the engine's
+//! `LauncherRegistry`. The launcher accepts no inbound connection.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
-use uniserve_ipc::launcher::{Instruction, Presentation, RankExit, RankSpawn, Report, Reservation};
+use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report, Reservation};
+use uniserve_ipc::{Channel, IpcError, Registration, VERSION};
+
+/// Bounds connecting to the head and sending it one report.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounds how long a rank's exit waits to be reported: exit reporting must
+/// not depend on another instruction arriving.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Frames queued for a head that reads slowly; a launcher reports the exits
+/// of many ranks at once when a group fails.
+const REPORT_DEPTH: usize = 256;
 
 /// Spawns and supervises the ranks an instance places on this host.
 #[derive(Parser, Debug)]
@@ -40,7 +53,7 @@ use uniserve_ipc::launcher::{Instruction, Presentation, RankExit, RankSpawn, Rep
     about = "Launch and supervise one host's ranks"
 )]
 struct Args {
-    /// Address of the head's launcher registration endpoint.
+    /// Address of the head: the TCP address its log names for launchers.
     #[arg(long)]
     head: String,
     /// This host's identity, as the placement names it.
@@ -71,29 +84,18 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    let stream = TcpStream::connect(&args.head)
+    let mut head = Channel::connect(&args.head, HEAD_TIMEOUT)
         .with_context(|| format!("connecting to the head at {}", args.head))?;
-    stream
-        .set_nodelay(true)
-        .context("disabling Nagle on the head connection")?;
-    let mut writer = stream
-        .try_clone()
-        .context("splitting the head connection for writing")?;
-    let mut reader = BufReader::new(stream);
-
-    let presentation = serde_json::to_string(&Presentation {
+    head.set_capacity(uniserve_ipc::channel::INITIAL_BOUND, REPORT_DEPTH);
+    head.send(&Registration::Launcher {
         host: args.host_identity.clone(),
-    })?;
-    writer
-        .write_all(format!("{presentation}\n").as_bytes())
-        .context("presenting this host to the head")?;
-    writer
-        .flush()
-        .context("flushing this host's presentation")?;
+        version: VERSION.to_owned(),
+    })
+    .context("registering this host with the head")?;
     tracing::info!(host = %args.host_identity, head = %args.head, "presented this host");
 
     let mut ranks: HashMap<RankKey, Rank> = HashMap::new();
-    let outcome = supervise(&mut reader, &mut writer, &args, &mut ranks);
+    let outcome = supervise(&mut head, &args, &mut ranks);
 
     // However supervision ends (the head closing the connection because the
     // instance stopped or the head was lost, a `Terminate`, or an error), this
@@ -105,50 +107,35 @@ fn main() -> anyhow::Result<()> {
 /// Follows the head's instructions until it closes the connection or sends
 /// `Terminate`, reporting rank exits as they happen.
 ///
-/// Fails when the read timeout cannot be set, on a read error other than a
-/// timeout or interruption, an undecodable instruction, a failed reservation
-/// or rank start, or a failed write to the head. The caller terminates the
-/// remaining ranks in every case.
+/// Fails on an undecodable instruction, a failed reservation or rank start,
+/// or a failed report to the head. The caller terminates the remaining ranks
+/// in every case.
 fn supervise(
-    reader: &mut BufReader<TcpStream>,
-    writer: &mut TcpStream,
+    head: &mut Channel,
     args: &Args,
     ranks: &mut HashMap<RankKey, Rank>,
 ) -> anyhow::Result<()> {
-    // The read timeout bounds how long an exit waits to be reported: exit
-    // reporting must not depend on another instruction arriving, including
-    // while that instruction is partial. `read_until` keeps the bytes it read
-    // before a timeout in `line`, so a partial instruction survives it.
-    reader
-        .get_ref()
-        .set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
-    let mut line = Vec::new();
     // Bound store sockets by worker group, each held until that group's first
     // rank is spawned here and inherits it.
     let mut rendezvous: HashMap<String, TcpListener> = HashMap::new();
     loop {
-        report_exits(writer, ranks)?;
-        let read = match reader.read_until(b'\n', &mut line) {
-            Ok(read) => read,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                ) =>
-            {
+        report_exits(head, ranks)?;
+
+        // A closed connection is the head's instruction to stop: the instance
+        // stopped, the head was lost, or it refused this launcher's build.
+        let instruction = match head.try_recv::<Instruction>() {
+            Ok(Some(instruction)) => instruction,
+            Ok(None) => {
+                head.wait(EXIT_POLL_INTERVAL)
+                    .context("waiting for an instruction from the head")?;
                 continue;
             }
-            Err(error) => return Err(error).context("reading an instruction from the head"),
+            Err(IpcError::Transport(reason)) => {
+                tracing::info!(%reason, "head connection closed; terminating this host's ranks");
+                return Ok(());
+            }
+            Err(error) => return Err(error).context("decoding an instruction from the head"),
         };
-        if read == 0 {
-            tracing::info!("head connection closed; terminating this host's ranks");
-            return Ok(());
-        }
-        let instruction: Instruction =
-            serde_json::from_slice(&line).context("decoding an instruction from the head")?;
-        line.clear();
         match instruction {
             Instruction::Reserve { worker_id } => {
                 // This launcher holds the bound socket until it spawns the
@@ -165,7 +152,7 @@ fn supervise(
                     listen_fd: listener.as_raw_fd(),
                 });
                 rendezvous.insert(worker_id, listener);
-                writeln!(writer, "{}", serde_json::to_string(&reservation)?)?;
+                report(head, &reservation)?;
             }
             Instruction::Spawn(spawn) => {
                 // The group's first rank serves its store on the reserved
@@ -204,7 +191,22 @@ fn supervise(
                 return Ok(());
             }
         }
-        report_exits(writer, ranks)?;
+    }
+}
+
+/// Sends the head one report, waiting while the send queue is full.
+fn report(head: &mut Channel, report: &Report) -> anyhow::Result<()> {
+    let deadline = Instant::now() + HEAD_TIMEOUT;
+    loop {
+        match head.send(report) {
+            Ok(()) => return Ok(()),
+            Err(IpcError::WouldBlock) => {}
+            Err(error) => return Err(error).context("reporting to the head"),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "the head accepts no report");
+        head.wait(remaining)
+            .context("waiting to report to the head")?;
     }
 }
 
@@ -281,7 +283,7 @@ fn die_with_launcher(_command: &mut Command) {}
 /// Reports every rank that has exited since the last report and stops
 /// supervising it. A rank whose exit status cannot be read is reported as
 /// exited.
-fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<RankKey, Rank>) -> anyhow::Result<()> {
+fn report_exits(head: &mut Channel, ranks: &mut HashMap<RankKey, Rank>) -> anyhow::Result<()> {
     let mut exited = Vec::new();
     for (key, owned) in ranks.iter_mut() {
         let status = match owned.child.try_wait() {
@@ -293,16 +295,13 @@ fn report_exits(writer: &mut TcpStream, ranks: &mut HashMap<RankKey, Rank>) -> a
     }
     for ((worker_id, rank), generation, status) in exited {
         ranks.remove(&(worker_id.clone(), rank));
-        let report = serde_json::to_string(&Report::Exit(RankExit {
+        let exit = Report::Exit(RankExit {
             worker_id: worker_id.clone(),
             generation,
             rank,
             status: status.clone(),
-        }))?;
-        writer
-            .write_all(format!("{report}\n").as_bytes())
-            .context("reporting a rank exit to the head")?;
-        writer.flush().context("flushing a rank exit report")?;
+        });
+        report(head, &exit)?;
         tracing::warn!(worker = %worker_id, generation, rank, status = %status, "a rank exited");
     }
     Ok(())
