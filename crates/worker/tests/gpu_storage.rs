@@ -20,7 +20,7 @@ use uniserve_worker::storage::{
 use uniserve_worker::transfer::{
     Capacity, Spans, TransportKind, TransportOptions, Transports, exports, notify,
 };
-use uniserve_worker::{Error, EventPool};
+use uniserve_worker::{Error, ErrorCode, EventPool, WorkerError};
 
 const DEVICE: i32 = 0;
 
@@ -375,10 +375,12 @@ fn cancelled_reads_keep_credits_until_their_copy_drains() {
         .unwrap();
     std::thread::sleep(Duration::from_millis(50));
     read.cancel().unwrap();
-    assert!(matches!(
-        read.result(Some(&submitter)),
-        Err(Error::Transport(_) | Error::Resource(_))
-    ));
+    // The consumer observes the cancellation as a resource failure.
+    let cancelled = read.result(Some(&submitter)).unwrap_err();
+    assert_eq!(
+        WorkerError::classify(cancelled, None).code,
+        ErrorCode::ResourceError
+    );
     assert!(!read.retired());
     assert!(
         capacity.used() > exported,
