@@ -138,7 +138,7 @@ struct Target {
     stream: Option<Stream>,
 }
 
-/// The stream serving `kind` on `device`, borrowed from the lanes.
+/// The lane stream serving `kind` on `device`.
 fn stream(lanes: &Lanes, kind: CallKind, device: Device) -> Result<Option<Stream>> {
     let Some(index) = device.cuda_index() else {
         return Ok(None);
@@ -146,19 +146,7 @@ fn stream(lanes: &Lanes, kind: CallKind, device: Device) -> Result<Option<Stream
     let stream = lanes
         .stream_for(kind, DeviceId(index))
         .ok_or(Error::State("image calls have no execution stream"))?;
-    // SAFETY: the lanes own the stream and close after the runtime.
-    Ok(Some(unsafe {
-        Stream::borrowed(DeviceId(index), stream.handle()?)
-    }?))
-}
-
-fn borrow(stream: &Option<Stream>) -> Result<Option<Stream>> {
-    stream
-        .as_ref()
-        // SAFETY: the lanes own the stream for the runtime's lifetime.
-        .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-        .transpose()
-        .map_err(Error::from)
+    Ok(Some(stream.stream()?.clone()))
 }
 
 /// Tokens one denoising evaluation carries at most: every guidance branch
@@ -260,7 +248,7 @@ impl ImageRuntime {
                     startup.request_slots,
                     kv.plan(),
                     Some(kv.planes().num_units()),
-                    config.primary_device().is_cuda(),
+                    config.device.is_cuda(),
                 )?;
                 let tokens = flow_tokens(&layout, config);
                 let width = bounds.widths.iter().copied().max().unwrap_or(1).max(1) as usize;
@@ -283,7 +271,7 @@ impl ImageRuntime {
                     interface
                         .function("cache.pool")?
                         .call_values(&[tvm_ffi::Any::from(kv.layout()?), views])?,
-                );
+                )?;
                 (Some(bounds), Some(capacity), Some(pool))
             }
             (true, None, _) => {
@@ -405,7 +393,7 @@ impl ImageRuntime {
                         info,
                         &encoder_config,
                         products,
-                        borrow(&target.stream)?,
+                        target.stream.clone(),
                     )?;
                     encoder_routes.insert((target.component.clone(), target.kind), encoders.len());
                     encoders.push(runner);
@@ -457,7 +445,7 @@ impl ImageRuntime {
                             slot_tables,
                             layout: table_layout,
                         },
-                        borrow(&target.stream)?,
+                        target.stream.clone(),
                     )?;
                     units = Some(kv.bind_units(
                         &interface.function("cache.bind_units")?,
@@ -482,7 +470,7 @@ impl ImageRuntime {
                         latents,
                         products,
                         staging,
-                        borrow(&target.stream)?,
+                        target.stream.clone(),
                     )?;
                     decoder = Some((target.component.clone(), runner));
                 }
@@ -513,7 +501,6 @@ impl ImageRuntime {
                 devices.extend(
                     config
                         .devices()
-                        .filter_map(|name| Device::parse(name, "device").ok())
                         .filter_map(Device::cuda_index)
                         .filter(|&device| device != ordinal),
                 );
@@ -553,7 +540,7 @@ impl ImageRuntime {
 
         // Completion words per call plus every image's pixels.
         let max_pixel_words = (max_image_pixels(layout.as_ref()) * 3).div_ceil(8) * max_calls;
-        let device = config.primary_device().cuda_index();
+        let device = config.device.cuda_index();
         let outputs = OutputPool::new(
             device,
             startup.queue_depth.max(1) * 2,

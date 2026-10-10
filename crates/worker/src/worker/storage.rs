@@ -34,8 +34,7 @@ pub struct RankStorage {
     pub transports: Arc<Transports>,
     pub kv: Option<KVCache>,
     /// Stream that orders slot releases after the batches reading them: the
-    /// stream serving token calls. A borrowed view of a stream the worker's
-    /// lanes own; the lanes close after this owner.
+    /// stream serving token calls, shared with its lane.
     release_stream: Option<Stream>,
     /// Finished requests whose guidance prefix slots (image trajectories)
     /// clear with their own slots, once their readers retired.

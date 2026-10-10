@@ -278,7 +278,7 @@ impl VideoRuntime {
             ]
             .into_iter()
             .map(Handle::new)
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
             let configured = task
                 .configure(MediaTask::Prepare {
                     function: denoiser.runner.preparation(),
@@ -356,18 +356,13 @@ impl VideoRuntime {
         kind: MediaCall,
         component: &str,
     ) -> Result<(Device, Option<Stream>)> {
-        let borrowed = |stream: &Stream| -> Result<Stream> {
-            // SAFETY: the runner owns no stream: the worker's lanes own it and
-            // close after the runtime (see `Worker::close`).
-            Ok(unsafe { Stream::borrowed(stream.device(), stream.raw()) }?)
-        };
         match kind {
             MediaCall::TextEncoding | MediaCall::VisionEncoding => {
                 let text = self
                     .text
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?;
-                Ok((text.device, Some(borrowed(text.runner.stream())?)))
+                Ok((text.device, Some(text.runner.stream().clone())))
             }
             MediaCall::LatentPreparation | MediaCall::Denoising => {
                 let denoiser = self
@@ -376,28 +371,28 @@ impl VideoRuntime {
                     .filter(|denoiser| denoiser.name == component);
                 let denoiser = denoiser
                     .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-                Ok((denoiser.device, Some(borrowed(denoiser.runner.stream())?)))
+                Ok((denoiser.device, Some(denoiser.runner.stream().clone())))
             }
             MediaCall::VideoDecoding => {
                 let decoder = self
                     .decoder
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?;
-                Ok((decoder.device, Some(borrowed(decoder.runner.stream())?)))
+                Ok((decoder.device, Some(decoder.runner.stream().clone())))
             }
             MediaCall::AudioDecoding => {
                 let audio = self
                     .audio
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?;
-                Ok((audio.device, Some(borrowed(audio.runner.stream())?)))
+                Ok((audio.device, Some(audio.runner.stream().clone())))
             }
             MediaCall::LatentEncoding => {
                 let latent = self
                     .latent
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
-                Ok((latent.device, Some(borrowed(latent.runner.stream())?)))
+                Ok((latent.device, Some(latent.runner.stream().clone())))
             }
             _ => Ok((Device::Cpu, None)),
         }
@@ -520,14 +515,12 @@ fn decode_range<'a>(plan: &'a BatchPlan, call: &Call) -> Result<&'a uniserve_ipc
         .ok_or_else(|| Error::Invalid("a media round has no unit range".into()))
 }
 
-/// A borrowed view of the batch's stream.
+/// The batch's stream.
 fn stream_of(batch: &MediaBatch) -> Result<Stream> {
-    let stream = batch
+    batch
         .stream
-        .as_ref()
-        .ok_or_else(|| Error::Invariant("a device media call has no stream".into()))?;
-    // SAFETY: the lanes own the stream for the runtime's lifetime.
-    Ok(unsafe { Stream::borrowed(stream.device(), stream.raw()) }?)
+        .clone()
+        .ok_or_else(|| Error::Invariant("a device media call has no stream".into()))
 }
 
 /// The most elements a product holds along one dimension.
@@ -1623,8 +1616,7 @@ const DENOISER_GRAPHS: usize = 1000;
 const DECODER_GRAPHS: usize = 1001;
 const TEXT_GRAPHS: usize = 1002;
 
-/// A stream forked for one component's calls, its workspace allocator, and
-/// a borrowed view of it.
+/// A stream forked for one component's calls and its workspace allocator.
 fn component_stream(
     lanes: &mut crate::worker::Lanes,
     kind: MediaCall,
@@ -1636,9 +1628,7 @@ fn component_stream(
         ));
     };
     let forked = lanes.fork_module(CallKind::Media(kind), uniserve_cuda::DeviceId(index))?;
-    let raw = forked.stream()?.raw();
-    // SAFETY: the lanes own the forked stream and close it after the runtime.
-    let stream = unsafe { Stream::borrowed(uniserve_cuda::DeviceId(index), raw) }?;
+    let stream = forked.stream()?.clone();
     let workspaces = Arc::new(std::sync::Mutex::new(crate::storage::Workspaces::new(
         Some(index),
     )));
@@ -1690,7 +1680,7 @@ impl VideoRuntime {
             })
             .collect();
         let slots = info.request_slots;
-        let capture = config.graph_policy != "off" && config.primary_device().is_cuda();
+        let capture = config.graph_policy != "off" && config.device.is_cuda();
         let create_pool = interface.function("graphs.pool")?;
         let pool = |graphs: &mut crate::runner::GraphStorage<String, Handle>,
                     key: usize,
@@ -1959,7 +1949,7 @@ impl VideoRuntime {
             )?),
             None => None,
         };
-        let device = match config.primary_device() {
+        let device = match config.device {
             crate::config::Device::Cuda(index) => Some(index),
             crate::config::Device::Cpu => None,
         };

@@ -76,8 +76,14 @@ impl Description {
                     )
                     .map(),
             )
-            .text("device", &execution.device)
-            .optional_text("generation_device", execution.generation_device.as_deref())
+            .text("device", &execution.device.to_string())
+            .optional_text(
+                "generation_device",
+                execution
+                    .generation_device
+                    .map(|device| device.to_string())
+                    .as_deref(),
+            )
             .with("components", crate::ffi::json(&components)?)
             .with("rank", execution.rank as i64)
             .text("role", &execution.role)
@@ -99,7 +105,7 @@ impl Description {
             result
                 .get(0)
                 .map_err(|error| Error::numerical("model.describe", &error))?,
-        );
+        )?;
         let info = Record::new(
             "model.describe",
             result
@@ -151,11 +157,11 @@ impl Description {
             )
             .text("model_dtype", &launch.execution.model_dtype)
             .into_any();
-        Ok(Handle::new(
+        Handle::new(
             interface
                 .resolve
                 .call(&[self.handle.view(), (&request).into()])?,
-        ))
+        )
     }
 }
 
@@ -215,10 +221,14 @@ impl LoadedModel {
                 .into_any()
         });
         let request = Fields::new()
-            .text("device", &launch.execution.device)
+            .text("device", &launch.execution.device.to_string())
             .optional_text(
                 "generation_device",
-                launch.execution.generation_device.as_deref(),
+                launch
+                    .execution
+                    .generation_device
+                    .map(|device| device.to_string())
+                    .as_deref(),
             )
             .text("role", &launch.execution.role)
             .with("host_only", host_only)
@@ -251,7 +261,7 @@ impl LoadedModel {
                     .map(),
             )
             .into_any();
-        let handle = Handle::new(interface.load.call(&[resolved.view(), (&request).into()])?);
+        let handle = Handle::new(interface.load.call(&[resolved.view(), (&request).into()])?)?;
         Ok(Self {
             handle,
             model_name: description.model_name,

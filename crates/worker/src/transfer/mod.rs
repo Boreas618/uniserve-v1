@@ -6,12 +6,11 @@
 //! Rust-owned storage ([`Spans`] of [`crate::storage::memory::StorageView`]s),
 //! driver copies and the shared [`EventPool`].
 
-use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use uniserve_cuda::{DeviceGuard, DeviceId, Event, Stream};
+use uniserve_cuda::{DeviceGuard, Event, Stream};
 
 use crate::{Completion, Error, EventPool, Outcome, Result};
 
@@ -318,7 +317,8 @@ enum ReadAccess {
         handoff: Option<Arc<Event>>,
     },
     Borrowed {
-        streams: HashSet<(i32, usize)>,
+        /// Consumer streams not yet fenced, one handle per stream.
+        streams: Vec<Stream>,
         events: Vec<Arc<Event>>,
     },
 }
@@ -350,7 +350,7 @@ impl<V, E, C> TransferTicket<V, E, C> {
             cancelled: false,
             access: if borrowed {
                 ReadAccess::Borrowed {
-                    streams: HashSet::new(),
+                    streams: Vec::new(),
                     events: Vec::new(),
                 }
             } else {
@@ -496,8 +496,10 @@ impl<V, E, C> TransferTicket<V, E, C> {
     pub fn consume(&mut self, stream: &Stream) -> Result<()> {
         if let Some(producer) = &self.producer {
             stream.wait_event(producer)?;
-            if let ReadAccess::Borrowed { streams, .. } = &mut self.access {
-                streams.insert((stream.device().0, stream.raw()));
+            if let ReadAccess::Borrowed { streams, .. } = &mut self.access
+                && !streams.iter().any(|known| known.raw() == stream.raw())
+            {
+                streams.push(stream.clone());
             }
         }
         Ok(())
@@ -511,12 +513,9 @@ impl<V, E, C> TransferTicket<V, E, C> {
     /// these retained event references to deferred source release.
     pub fn record_consumers(&mut self, pool: &EventPool) -> Result<()> {
         if let ReadAccess::Borrowed { streams, events } = &mut self.access {
-            for &(device, stream) in streams.iter() {
-                let _device = DeviceGuard::new(DeviceId(device))?;
-                // SAFETY: consumers keep their streams alive until they close
-                // the borrowed read, which records this fence.
-                let stream = unsafe { Stream::borrowed(DeviceId(device), stream) }?;
-                events.push(pool.fence(&stream, false)?);
+            for stream in streams.iter() {
+                let _device = DeviceGuard::new(stream.device())?;
+                events.push(pool.fence(stream, false)?);
             }
             streams.clear();
         }

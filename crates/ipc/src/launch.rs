@@ -181,6 +181,8 @@ pub struct LaunchDescriptor {
     pub max_model_len: u32,
     pub max_video_seconds: f64,
     pub max_condition_rows: u32,
+    /// Image features the rank's encoder cache keeps resident.
+    pub encoder_cache_entries: u32,
     pub ffmpeg: String,
     pub min_video_seconds: Option<f64>,
 

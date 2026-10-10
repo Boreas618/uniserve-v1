@@ -84,6 +84,9 @@ fn engine() -> anyhow::Result<EngineCore> {
         python: worker_python(),
         model: String::new(),
         stub: true,
+        // The stub rank encodes many small images, so it keeps a larger
+        // encoder cache than a served model's default.
+        encoder_cache_entries: 1024,
         prefill_cuda_graph: false,
         ranks: config.workers[0].ranks.clone(),
         components,

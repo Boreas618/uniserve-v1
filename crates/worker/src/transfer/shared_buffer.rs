@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use uniserve_core::SharedMemory;
-use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, HostRegistration, Stream};
+use uniserve_cuda::{DeviceGuard, Event, EventFlags, HostRegistration, Stream};
 
 use crate::ffi::{Backing, Device};
 use crate::{Error, Result};
@@ -102,9 +102,9 @@ impl Drop for SharedMapping {
     }
 }
 
-/// Owns a producer's segment and optional CUDA host registration. The caller
-/// keeps the device stream alive through close and retains this buffer until
-/// all granted readers have acknowledged it.
+/// Owns a producer's segment and optional CUDA host registration. The buffer
+/// shares its producer's device stream through close; the caller retains the
+/// buffer until all granted readers have acknowledged it.
 pub struct SharedBuffer {
     // Declared before the mapping: the registration ends while it is mapped.
     registration: Option<HostRegistration>,
@@ -113,14 +113,15 @@ pub struct SharedBuffer {
     mapping: Arc<SharedMapping>,
     storage: Option<SharedMemory>,
     consumers: Vec<usize>,
-    device: Option<(i32, usize)>,
+    /// The producer stream of a device source; `None` for a host source.
+    producer: Option<Stream>,
     bytes: usize,
     submitted: bool,
     completion: Option<Event>,
 }
 
 impl SharedBuffer {
-    pub fn new(bytes: usize, consumers: Vec<usize>, device: Option<(i32, usize)>) -> Result<Self> {
+    pub fn new(bytes: usize, consumers: Vec<usize>, producer: Option<Stream>) -> Result<Self> {
         if consumers.iter().any(|slot| *slot >= ACK_SLOTS) {
             return Err(Error::Invalid(
                 "shared buffer acknowledgment slot is out of range".into(),
@@ -138,13 +139,13 @@ impl SharedBuffer {
 
         // Fresh POSIX storage is zero-filled: readiness is PENDING and all
         // reader slots are unclaimed before any locator can escape.
-        let registration = match device {
-            Some((device, _)) => {
+        let registration = match &producer {
+            Some(stream) => {
                 // SAFETY: the mapping owns this full range. Close unregisters
                 // it before releasing the storage; a failed close retains both.
                 Some(unsafe {
                     HostRegistration::new(
-                        DeviceId(device),
+                        stream.device(),
                         mapping.address() as *mut u8,
                         mapping.size(),
                     )
@@ -158,7 +159,7 @@ impl SharedBuffer {
             mapping,
             storage: Some(storage),
             consumers,
-            device,
+            producer,
             bytes,
             submitted: false,
             completion: None,
@@ -182,7 +183,7 @@ impl SharedBuffer {
     }
 
     pub fn is_cuda(&self) -> bool {
-        self.device.is_some()
+        self.producer.is_some()
     }
 
     /// Announce bytes after their last write, either immediately for a CPU
@@ -193,16 +194,13 @@ impl SharedBuffer {
     pub fn mark_ready(&mut self) -> Result<()> {
         let mapping = self.mapping()?;
 
-        if let Some((device, stream)) = self.device {
-            let device = DeviceId(device);
+        if let Some(stream) = &self.producer {
             // A default-stream handle resolves against the current context.
-            let _device = DeviceGuard::new(device)?;
-            // SAFETY: the caller keeps the producer stream alive through close.
-            let stream = unsafe { Stream::borrowed(device, stream) }?;
+            let _device = DeviceGuard::new(stream.device())?;
             stream.launch_host_fn(move || mapping.word(0).store(READY, Ordering::Release))?;
 
             let completion = Event::new(EventFlags::default());
-            completion.record(&stream)?;
+            completion.record(stream)?;
             self.completion = Some(completion);
             Ok(())
         } else {
@@ -233,17 +231,15 @@ impl SharedBuffer {
     /// never scheduled. Normal retirement observes READY and does not wait.
     pub fn synchronize(&self) -> Result<()> {
         if self.submitted
-            && let Some((device, stream)) = self.device
+            && let Some(stream) = &self.producer
             && self.mapping.word(0).load(Ordering::Acquire) == PENDING
         {
             if let Some(completion) = &self.completion {
                 completion.synchronize()?;
             } else {
                 // Submission failed before its completion event was recorded.
-                let device = DeviceId(device);
-                let _device = DeviceGuard::new(device)?;
-                // SAFETY: the caller keeps the producer stream alive through close.
-                unsafe { Stream::borrowed(device, stream) }?.synchronize()?;
+                let _device = DeviceGuard::new(stream.device())?;
+                stream.synchronize()?;
             }
         }
 
@@ -261,7 +257,7 @@ impl SharedBuffer {
             registration.unregister()?;
         }
 
-        self.device = None;
+        self.producer = None;
         self.storage.take();
         Ok(())
     }

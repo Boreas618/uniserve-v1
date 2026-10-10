@@ -83,7 +83,7 @@ from uniserve_models.nn.rng import flow_noise_seed
 
 from . import calls, graphs, regions
 from .attention import AttentionColumns
-from .errors import translate
+from .errors import binding
 
 # Guidance branch mask bits, in evaluation order.
 _BITS = {
@@ -364,7 +364,7 @@ def bind(
         "integrate": integrate,
         "release": lambda graph: graph.release(),
     }
-    return {name: translate(step) for name, step in steps.items()}
+    return binding(steps)
 
 
 def _rows(rows) -> list[tuple[int, ...]]:

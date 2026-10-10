@@ -65,7 +65,7 @@ from uniserve_models.model import (
 from uniserve_models.tensors import BufferConfig
 
 from . import graphs
-from .errors import SetupError, translate
+from .errors import SetupError, binding
 from .workspace import RuntimeWorkspace
 
 _ROLES = (
@@ -562,7 +562,7 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
             _output("vision_pixels", vision.pixels_layout(int(tokens))),
         ]
 
-    return _translated(
+    return binding(
         {
             "describe": describe,
             "legal_frame_count": legal_frame_count,
@@ -604,14 +604,6 @@ def _stream(context: ExecutionContext) -> torch.cuda.Stream:
     # The worker captures only on a device binding, which it creates with
     # its own stream handle; a binding without one never reaches capture.
     return cast(torch.cuda.Stream, context.stream)
-
-
-def _translated(functions: dict[str, Any]) -> dict[str, Any]:
-    """Give a binding's functions the interface's error kinds."""
-    return {
-        name: translate(value) if callable(value) else value
-        for name, value in functions.items()
-    }
 
 
 def _owner(loaded, kind: type) -> str:
@@ -1010,7 +1002,7 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
             contexts.clear()
 
     result.update(kernels=kernels, close=close)
-    return _translated(result)
+    return binding(result)
 
 
 def bind_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -1195,7 +1187,7 @@ def bind_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
             canvases.clear()
             graph_outputs.clear()
 
-    return _translated(
+    return binding(
         {
             "prepare_segment": prepare_segment,
             "prepare_canvas": prepare_canvas,
@@ -1311,7 +1303,7 @@ def bind_audio_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
         if not aborted:
             contexts.clear()
 
-    return _translated(
+    return binding(
         {
             "prepare": prepare,
             "warm": warm,
@@ -1413,7 +1405,7 @@ def bind_latent_encoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
         if not aborted:
             contexts.clear()
 
-    return _translated(
+    return binding(
         {
             "encode_video": encode_video,
             "encode_audio": encode_audio,

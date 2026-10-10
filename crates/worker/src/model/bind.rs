@@ -240,7 +240,7 @@ pub fn prepare(
         result
             .get(0)
             .map_err(|error| Error::numerical("component.prepare", &error))?,
-    );
+    )?;
     let requirements = Record::new(
         "component.prepare",
         result
@@ -345,10 +345,7 @@ impl PeerGroup<'_> {
         }
         let owner = owner
             .ok_or_else(|| Error::Unsupported("stream collectives require a CUDA stream".into()))?;
-        // SAFETY: the lanes own the stream and close after every binding
-        // runtime, which closes its collectives first.
-        let collectives =
-            unsafe { crate::parallel::StreamCollectives::bind(owner, self.group, groups) }?;
+        let collectives = crate::parallel::StreamCollectives::bind(owner, self.group, groups)?;
         interface
             .function("distributed.bind_collectives")?
             .call_values(&[binding.prepared().to_any(), collectives.tables()])?;
