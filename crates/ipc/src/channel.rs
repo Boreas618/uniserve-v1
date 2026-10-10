@@ -23,9 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::iceoryx::{
-    ClientEndpoint, Frame, IpcError, IpcResult, Pending, ServerEndpoint, WakeEvents, WakeSender,
+    ClientEndpoint, IpcError, IpcResult, Pending, ServerEndpoint, WakeEvents, WakeSender,
 };
-use crate::request::WorkerRequest;
+use crate::request::{WorkerRequest, WorkerResponse};
 use crate::socket::{SocketClient, SocketServer};
 
 /// The mechanism name of a channel over iceoryx2 shared storage, served by a
@@ -106,7 +106,7 @@ pub enum RankChannel {
 impl RankChannel {
     /// Binds the channel a rank named, refusing a mechanism the head cannot bind.
     ///
-    /// `max_payload` bounds every frame's payload in bytes. `depth` is the
+    /// `max_payload` bounds every frame's encoded message in bytes. `depth` is the
     /// number of outstanding request handles for shared storage and the number
     /// of queued outgoing frames for a socket. `timeout` bounds only the TCP
     /// connect; a shared-storage connect does not wait for the rank's server.
@@ -161,7 +161,10 @@ impl RankChannel {
     }
 
     /// Takes the response to one outstanding request, if it has arrived.
-    pub fn try_recv_response(&mut self, pending: &Outstanding) -> IpcResult<Option<Frame>> {
+    pub fn try_recv_response(
+        &mut self,
+        pending: &Outstanding,
+    ) -> IpcResult<Option<WorkerResponse>> {
         match (self, pending) {
             (Self::Shared(client), Outstanding::Shared(handle)) => client.try_recv_response(handle),
             (Self::Socket(client), Outstanding::Socket(identity)) => {
@@ -184,7 +187,7 @@ impl RankChannel {
         &mut self,
         pending: &Outstanding,
         timeout: Duration,
-    ) -> IpcResult<Option<Frame>> {
+    ) -> IpcResult<Option<WorkerResponse>> {
         match (self, pending) {
             (Self::Shared(client), Outstanding::Shared(handle)) => {
                 client.recv_response_timeout(handle, timeout)
@@ -313,7 +316,7 @@ impl RankServer {
     }
 
     /// Takes one request, if the engine has sent one.
-    pub fn try_recv(&mut self) -> IpcResult<Option<Frame>> {
+    pub fn try_recv(&mut self) -> IpcResult<Option<WorkerRequest>> {
         match self {
             Self::Shared(server) => server.try_recv(),
             Self::Socket(server) => {
@@ -350,15 +353,15 @@ impl RankServer {
 
     /// Waits for one request, however long it takes.
     ///
-    /// Returns only with a frame or an error; there is no overall deadline.
+    /// Returns only with a request or an error; there is no overall deadline.
     /// Both forms park in bounded steps between receive attempts.
-    pub fn recv(&mut self) -> IpcResult<Frame> {
+    pub fn recv(&mut self) -> IpcResult<WorkerRequest> {
         match self {
             Self::Shared(server) => server.recv(),
             Self::Socket(server) => loop {
                 server.accept_if_pending()?;
-                if let Some(frame) = server.try_recv()? {
-                    return Ok(frame);
+                if let Some(request) = server.try_recv()? {
+                    return Ok(request);
                 }
                 server.wait_incoming(Duration::from_millis(50))?;
             },
@@ -366,27 +369,10 @@ impl RankServer {
     }
 
     /// Answers one request, encoding the response for the channel.
-    pub fn respond(&mut self, response: &crate::request::WorkerResponse) -> IpcResult<()> {
+    pub fn respond(&mut self, response: &WorkerResponse) -> IpcResult<()> {
         match self {
             Self::Shared(server) => server.respond(response),
-            Self::Socket(server) => {
-                let header = crate::iceoryx::header_for_response(response);
-                let payload = crate::codec::encode_response(response)?;
-                server.respond_raw(header, &payload)
-            }
-        }
-    }
-
-    /// Answers one request under the identity it carried.
-    ///
-    /// `header.len` is stamped from `payload`. The shared-storage server fails
-    /// when `header.message_id` matches no request it has received and not yet
-    /// answered; the socket server sends whatever identity it is given, so the
-    /// caller owns that correlation there.
-    pub fn respond_raw(&mut self, header: crate::iceoryx::Header, payload: &[u8]) -> IpcResult<()> {
-        match self {
-            Self::Shared(server) => server.respond_raw(header, payload),
-            Self::Socket(server) => server.respond_raw(header, payload),
+            Self::Socket(server) => server.respond(response),
         }
     }
 }

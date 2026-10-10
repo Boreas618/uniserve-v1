@@ -5,9 +5,9 @@
 //! [`Batch`] (`ExecutionBatch::into_protocol`, which validates it), projects
 //! it onto the calls each rank owns (`rank_projection`, which narrows forward
 //! rows with `ForwardBatch::select` and sets each call's `consumer_slots`),
-//! and [`crate::codec`] encodes it as FlatBuffers. A rank answers with one
-//! [`BatchOutput`] of per-call [`RequestOutput`] completions. The rank
-//! runtime (`uniserve-worker`) consumes these types directly.
+//! and sends it as the message of a [`Frame`](crate::Frame). A rank answers
+//! with one [`BatchOutput`] of per-call [`RequestOutput`] completions. The
+//! rank runtime (`uniserve-worker`) consumes these types directly.
 //!
 //! Types with invariants carry a `validate` method. [`Batch::validate`]
 //! reaches each nested one and adds the checks that span calls. The
@@ -1450,11 +1450,6 @@ impl CacheUnitAllocation {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardBatch {
     /// Physical call index for each row; logical computation IDs remain unchanged.
-    ///
-    /// [`Batch`] flattens this struct; the serialized key matches the
-    /// `forward_call_indices` field of the worker schema and of the Python
-    /// worker's `Batch`.
-    #[serde(rename = "forward_call_indices")]
     pub call_indices: Vec<u32>,
     /// Scheduler-owned request slots, including alternative CFG prefixes.
     pub request_pool_indices: Vec<u32>,
@@ -1677,7 +1672,6 @@ pub struct Batch {
     /// Physical KV units newly allocated for this invocation.
     pub new_cache_units: Vec<CacheUnitAllocation>,
     /// Columnar model inputs carried directly by the worker message.
-    #[serde(flatten)]
     pub forward: ForwardBatch,
     /// Scheduler-owned latent trajectory allocations.
     pub latent_params: Vec<LatentParams>,
