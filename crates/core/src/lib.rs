@@ -327,9 +327,8 @@ pub struct KvCacheDtypeParseError(String);
 /// tensors — so they can cross the worker boundary without carrying device
 /// state.
 ///
-/// The worker receives these fields through the worker IPC codec's flatbuffer
-/// `SamplingParams` table and stages them for the Python samplers in
-/// `uniserve_models.sampling`. All consumers share this FP32 representation
+/// The worker receives these fields in a request's admission message and
+/// stages them for the Python samplers in `uniserve_models.sampling`. All consumers share this FP32 representation
 /// and its numerical validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {

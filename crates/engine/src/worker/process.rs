@@ -10,7 +10,7 @@
 //! `poll_batch` exchange batches and results, and `close_ranks` or
 //! `terminate` retires the rank.
 //!
-//! The host exchanges FlatBuffers descriptors and bounded result values while
+//! The host exchanges batch descriptors and bounded result values while
 //! tensors, KV pages, and latent storage remain worker-resident.
 //!
 //! The module also defines the launch settings `WorkerProcessArgs` carries
@@ -31,7 +31,7 @@ use uniserve_ipc::{
     Batch, DEFAULT_COMPONENT, ExpertParallelDescriptor, LaunchDescriptor, WorkerInfo,
     WorkerRequest, WorkerResponse,
 };
-use uniserve_ipc::{Frame, Outstanding, RankChannel};
+use uniserve_ipc::{Outstanding, RankChannel};
 
 /// How long the head waits for a rank's socket channel to accept.
 ///
@@ -468,7 +468,8 @@ pub(super) struct RankProcess {
     /// not returned yet.
     ready: VecDeque<anyhow::Result<WorkerResult>>,
     /// Next message identity to assign. Identities start at 1 and are never
-    /// zero; `route` treats a zero header identity as absent.
+    /// zero, which is the identity a channel gives a response that states
+    /// none.
     next_message_id: u64,
     /// How far the rank's retirement has progressed.
     retirement: Retirement,
@@ -867,9 +868,7 @@ impl RankProcess {
         request.set_call_id(Some(message_id));
         let pending =
             self.send_request_with_timeout(&request, "Worker startup", WORKER_CONNECT_TIMEOUT)?;
-        let response = self
-            .wait_pending_response(&pending, "Worker startup")?
-            .decode_response()?;
+        let response = self.wait_pending_response(&pending, "Worker startup")?;
 
         let info = match response {
             WorkerResponse::Info { info, .. } => info,
@@ -1036,7 +1035,7 @@ impl RankProcess {
         &mut self,
         pending: &Outstanding,
         context: &str,
-    ) -> anyhow::Result<Frame> {
+    ) -> anyhow::Result<WorkerResponse> {
         let started = Instant::now();
         let mut last_log = started;
         let mut last_worker_check = started;
@@ -1045,8 +1044,8 @@ impl RankProcess {
         // launch deadline belongs to the caller of the launch. Rank death and
         // cancellation remain observable throughout preparation.
         loop {
-            if let Some(frame) = self.client.try_recv_response(pending)? {
-                return Ok(frame);
+            if let Some(response) = self.client.try_recv_response(pending)? {
+                return Ok(response);
             }
             if last_worker_check.elapsed() >= WORKER_CHECK_INTERVAL {
                 self.check_worker(context)?;
@@ -1078,7 +1077,7 @@ impl RankProcess {
             let Some(record) = self.pending.get(&message_id) else {
                 continue;
             };
-            let Some(frame) = self.client.try_recv_response(&record.pending)? else {
+            let Some(response) = self.client.try_recv_response(&record.pending)? else {
                 continue;
             };
             let record = self.pending.remove(&message_id).ok_or_else(|| {
@@ -1088,19 +1087,19 @@ impl RankProcess {
             // shared-storage channel, release its iceoryx2 active-request slot
             // before routing the result.
             let kind = release_consumed_request(record);
-            self.route(message_id, kind, frame)?;
+            self.route(message_id, kind, response)?;
             drained += 1;
         }
         Ok((drained, wakes))
     }
 
-    /// Decodes one batch response and appends its result to `ready`.
+    /// Routes one batch response and appends its result to `ready`.
     ///
     /// The result is received, which claims any media it published
-    /// (`WorkerResult::receive`), before the correlation checks run, so a
+    /// (`WorkerResult::receive`), before the correlation check runs, so a
     /// rejected response still releases that storage. Returns an error and
-    /// appends nothing when the frame does not decode, either stated message
-    /// identity differs from `message_id`, the worker answered with an
+    /// appends nothing when the response's stated message identity differs
+    /// from `message_id`, the worker answered with an
     /// execution error (as a `WorkerExecError`) or an unexpected response
     /// kind, a product locator names an endpoint other than this rank's
     /// reported one, or the result's batch identity differs from the
@@ -1109,10 +1108,9 @@ impl RankProcess {
         &mut self,
         message_id: u64,
         kind: OutstandingKind,
-        frame: Frame,
+        response: WorkerResponse,
     ) -> anyhow::Result<()> {
         let OutstandingKind::Batch { batch_id } = kind;
-        let response = frame.decode_response()?;
         let echoed = response.message_id();
         let report = match response {
             WorkerResponse::Result { result, .. } => Ok(WorkerResult::receive(result)),
@@ -1131,14 +1129,7 @@ impl RankProcess {
                 other.kind()
             )),
         };
-        // A zero header identity means the response carries none
-        // (`header_for_response`); an identity that is stated must match.
-        if frame.header.message_id != 0 && frame.header.message_id != message_id {
-            bail!(
-                "worker response call id mismatch: expected {message_id}, got {}",
-                frame.header.message_id
-            );
-        }
+        // A response may state no identity; one that is stated must match.
         if let Some(echoed) = echoed
             && echoed != message_id
         {

@@ -8,8 +8,8 @@
 //!
 //! [`ComponentConfig::validate`] checks membership and parallel degrees for
 //! launch, worker registration and Python callers. Process-world bounds belong
-//! to the owner of that world. The same configuration crosses worker IPC as
-//! the flatbuffer `ParallelConfig` and `ComponentInfo` tables.
+//! to the owner of that world. The same configuration crosses worker IPC in
+//! the worker's capability message.
 
 use std::collections::HashSet;
 
@@ -29,8 +29,7 @@ const fn one() -> usize {
 /// One mutually exclusive sequence attention strategy.
 ///
 /// Serialized with a `kind` tag (`local`, `ulysses`, `allgather`, `hybrid`);
-/// an omitted degree defaults to one. The flatbuffer schema carries the same
-/// choice as the `SequenceParallel` union.
+/// an omitted degree defaults to one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SequenceParallel {
@@ -154,9 +153,6 @@ impl ParallelConfig {
 }
 
 /// Components may distribute independent temporal decode units over local decoders.
-///
-/// The flatbuffer `ComponentDistribution` enum encodes an absent distribution
-/// (`None` in [`ComponentConfig::distribution`]) as `Local`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentDistribution {

@@ -98,12 +98,11 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
             }
 
             if !self.closing && self.pending.len() < self.info.queue_depth as usize {
-                let frame = self
+                let request = self
                     .endpoint
                     .try_recv()
                     .map_err(|e| self.channel_error(e))?;
-                if let Some(frame) = frame {
-                    let request = frame.decode_request().map_err(|e| self.channel_error(e))?;
+                if let Some(request) = request {
                     self.accept(request)?;
                     continue;
                 }
@@ -134,8 +133,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
             } else if self.experts {
                 self.wait(EXPERT_POLL)?;
             } else {
-                let frame = self.endpoint.recv().map_err(|e| self.channel_error(e))?;
-                let request = frame.decode_request().map_err(|e| self.channel_error(e))?;
+                let request = self.endpoint.recv().map_err(|e| self.channel_error(e))?;
                 self.accept(request)?;
             }
         }
