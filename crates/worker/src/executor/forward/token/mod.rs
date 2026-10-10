@@ -40,12 +40,12 @@ use uniserve_ipc::{
 
 use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
 use super::launch::{Launched, StreamOrder, error_code, failed_output};
+use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
 use crate::executor::lifecycle::RequestStorage;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
-use crate::runner::graphs::GraphMode;
 use crate::runner::text::{
     Executed, RowSource, Staged, StepContext, StepRequest, TextRunner, TokenRow,
 };

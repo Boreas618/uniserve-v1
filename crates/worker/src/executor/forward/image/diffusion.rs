@@ -20,12 +20,12 @@ use uniserve_ipc::{DrawLayout, ForwardStats, LatentParams};
 use super::ImageRuntime;
 use super::batch::ImageBatch;
 use super::latents::Scratch;
+use crate::cuda_graph::GraphMode;
 use crate::executor::forward::experts::ExpertRuntime;
 use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::transfer::latents;
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::diffusion::image::{DenoiseRow, IntegrateRow};
-use crate::runner::graphs::GraphMode;
 use crate::storage::LatentUpdate;
 use crate::{Error, Result};
 

@@ -1,19 +1,22 @@
-"""CUDA graph capture, replay and release shared by every binding.
+"""CUDA graph capture and release shared by every binding.
 
 Rust owns graph policy: shapes, buckets, capture order, allocator pools and
-the decision to capture or replay. A binding's ``capture`` function records
-one bound step with :func:`capture` in the pool Rust passes and returns the
-resulting :class:`Graph` to Rust as an opaque handle; the binding's
-``replay(graph, ...)`` calls :meth:`Graph.replay` and its
-``release(graph)`` calls :meth:`Graph.release`. Graph inputs are the
-binding's fixed buffers, so a replay needs no copies.
+the decision to capture or run a captured graph. A binding's ``capture``
+function records one bound step with :func:`capture` in the pool Rust
+passes and returns it to Rust with :func:`export`: the :class:`Graph` as an
+opaque handle and the raw executable of each of its segments. Rust launches
+the executables of a graph without breaks itself, on the stream the
+binding computes on; a binding whose step does work around its graph
+replays it with :meth:`Graph.replay`. Either way the graph's inputs are the
+binding's fixed buffers, so running it needs no copies. A binding's
+``release(graph)`` calls :meth:`Graph.release`.
 
 The interface entry ``graphs.pool`` creates the allocator pools Rust
 assigns to graph owners. ``graphs.begin_capture`` and ``graphs.end_capture``
 let Rust capture work it submits itself between them, possibly from several
 host threads on streams forked from the capturing one (expert joins of all
-microbatches); ``graphs.replay`` and ``graphs.release`` operate on such
-graphs. Importing this module does not initialize CUDA.
+microbatches); ``graphs.release`` releases such a graph. Importing this
+module does not initialize CUDA.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from typing import Any
 
 import torch
 
-__all__ = ["Capture", "Graph", "capture", "functions", "pool"]
+__all__ = ["Capture", "Graph", "capture", "export", "functions", "pool"]
 
 
 def functions() -> dict[str, Callable[..., Any]]:
@@ -37,7 +40,6 @@ def functions() -> dict[str, Callable[..., Any]]:
         "graphs.pool": pool,
         "graphs.begin_capture": begin_capture,
         "graphs.end_capture": end_capture,
-        "graphs.replay": replay,
         "graphs.release": release,
     }
 
@@ -64,8 +66,9 @@ class Graph:
 
     A step is usually one CUDA graph. Work CUDA cannot record (an eager copy
     submission between segments, see :func:`capture`) splits it into several
-    graphs with the eager calls between them; replay submits them in capture
-    order. The graph keeps its private capture stream: PyTorch frees a
+    graphs, its segments, with a graph break between two of them: the eager
+    call. Replay submits segments and breaks in capture order. The graph
+    keeps its private capture stream: PyTorch frees a
     capture stream's workspaces when the graph resets, so a stream shared
     with other graphs could invalidate their inputs.
     """
@@ -94,10 +97,26 @@ class Graph:
             step()
         return self.output
 
+    def raw_cuda_graph_execs(self) -> list[int]:
+        """The raw executable of each segment, in submission order.
+
+        Each is the ``cudaGraphExec_t`` of one ``torch.cuda.CUDAGraph``
+        (its ``raw_cuda_graph_exec``), valid until :meth:`release`.
+        Launching them in order on one stream runs a graph without breaks.
+        Unlike :meth:`replay`, a launch does not advance the registered
+        generators, so it suits steps that draw no random numbers.
+        """
+        return [graph.raw_cuda_graph_exec() for graph in self._graphs]
+
+    @property
+    def num_breaks(self) -> int:
+        """The eager calls :meth:`replay` makes between segments."""
+        return len(self._steps) - len(self._graphs)
+
     def release(self) -> None:
         """Drop the graph executables and the captured output.
 
-        The caller has drained every stream that replays this graph.
+        The caller has drained every stream this graph ran on.
         """
         graphs, self._graphs, self._steps = self._graphs, (), ()
         self.output = None
@@ -347,6 +366,22 @@ def capture(
     return recording.end(output)
 
 
+def export(graph: Graph, owner: Any = None) -> list[Any]:
+    """Return a captured graph to the worker.
+
+    The worker receives ``[graph, executables, breaks]``: the graph as an
+    opaque handle it passes back to the binding, the raw executable of each
+    segment in submission order, and the number of graph breaks between
+    them. ``owner`` crosses in place of the graph for a binding that wraps
+    it in an object of its own.
+    """
+    return [
+        graph if owner is None else owner,
+        graph.raw_cuda_graph_execs(),
+        graph.num_breaks,
+    ]
+
+
 def begin_capture(pool, stream: int, device: int) -> Capture:
     """Begin capturing work Rust submits on ``stream`` into ``pool``."""
     computation = torch.cuda.ExternalStream(
@@ -357,20 +392,11 @@ def begin_capture(pool, stream: int, device: int) -> Capture:
     return recording
 
 
-def end_capture(recording: Capture) -> Graph:
-    """End a capture begun by :func:`begin_capture` and return its graph."""
-    return recording.end()
-
-
-def replay(graph: Graph, stream: int, device: int) -> None:
-    """Replay a graph on ``stream``."""
-    computation = torch.cuda.ExternalStream(
-        int(stream), device=torch.device("cuda", int(device))
-    )
-    with torch.cuda.device(computation.device), torch.cuda.stream(computation):
-        graph.replay()
+def end_capture(recording: Capture) -> list[Any]:
+    """End a capture begun by :func:`begin_capture` and export its graph."""
+    return export(recording.end())
 
 
 def release(graph: Graph) -> None:
-    """Release a graph after every stream replaying it drained."""
+    """Release a graph after every stream it ran on drained."""
     graph.release()

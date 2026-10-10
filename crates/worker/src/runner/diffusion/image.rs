@@ -34,14 +34,14 @@ use uniserve_core::ImageParams;
 use uniserve_cuda::Stream;
 
 use crate::config::Device;
+use crate::cuda_graph::GraphPool;
+use crate::cuda_graph::{CUDAGraph, GraphMode, GraphTable, Lookup};
 use crate::ffi::{DType, Fields, Function, Functions, Handle, Region, integer_list, list};
 use crate::model::bind::ComponentBinding;
 use crate::model::image::ImageDenoiserLayout;
 use crate::model::interface::Interface;
 use crate::request::diffusion::{BranchSet, GuidancePlan};
-use crate::runner::GraphPool;
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
-use crate::runner::graphs::{GraphMode, GraphTable, Lookup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable};
 use crate::{Error, Result};
@@ -511,7 +511,7 @@ impl ImageDiffusion {
         let graph = match DiffusionShape::of(rows) {
             Some(shape) if self.capturing && self.graphs.contains(&shape, None) => {
                 match self.graphs.lookup(&shape, None)? {
-                    Lookup::Replay(graph) => Some(graph.clone()),
+                    Lookup::Replay(graph) => Some(graph.handle().clone()),
                     Lookup::Capture => None,
                 }
             }
@@ -674,14 +674,14 @@ impl ImageDiffusion {
                     ]))
                 }),
         );
-        let graph = Handle::new(self.steps.capture.call_values(&[
+        let graph = CUDAGraph::captured(self.steps.capture.call_values(&[
             Self::described(&described),
             geometry.to_any(),
             pool.value.to_any(),
             Any::from(peers),
         ])?)?;
         if let Err(error) = check() {
-            if let Err(cleanup) = self.release.invoke(&[graph.view()]) {
+            if let Err(cleanup) = self.release.invoke(&[graph.handle().view()]) {
                 tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
             }
             return Err(error);

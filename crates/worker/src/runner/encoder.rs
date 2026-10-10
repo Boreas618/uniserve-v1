@@ -52,9 +52,9 @@ use std::sync::Arc;
 use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 
-use super::GraphPool;
-use super::graphs::{GraphMode, GraphTable, Lookup};
 use crate::config::Device;
+use crate::cuda_graph::GraphPool;
+use crate::cuda_graph::{CUDAGraph, GraphMode, GraphTable, Lookup};
 use crate::ffi::{
     Backing, DType, Fields, Function, Functions, Handle, Record, Region, integer_list, list,
 };
@@ -410,7 +410,7 @@ pub fn text_capacity(capacities: &[usize], tokens: usize) -> Result<usize> {
     if capacities.is_empty() {
         return Ok(tokens);
     }
-    super::graphs::bucket(capacities, tokens).ok_or_else(|| {
+    crate::cuda_graph::bucket(capacities, tokens).ok_or_else(|| {
         Error::Invalid(format!(
             "prompt of {tokens} tokens exceeds the configured text capacities"
         ))
@@ -1058,7 +1058,7 @@ impl EncoderRunner {
             return Ok((None, GraphMode::Eager));
         };
         let found = match table.lookup(&key, None)? {
-            Lookup::Replay(graph) => Some(graph.clone()),
+            Lookup::Replay(graph) => Some(graph.handle().clone()),
             Lookup::Capture => None,
         };
         let mode = if found.is_some() {
@@ -1146,10 +1146,10 @@ impl EncoderRunner {
         if crate::ffi::is_none(&graph) {
             return Ok(());
         }
-        let graph = Handle::new(graph)?;
+        let graph = CUDAGraph::captured(graph)?;
         if let Err(error) = check() {
             if let Some(release) = &self.release
-                && let Err(cleanup) = release.invoke(&[graph.view()])
+                && let Err(cleanup) = release.invoke(&[graph.handle().view()])
             {
                 tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
             }

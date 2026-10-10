@@ -403,15 +403,17 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
                 )
             return shapes
 
-    def capture_packed(slots: int, pool) -> graphs.Graph:
+    def capture_packed(slots: int, pool) -> list[Any]:
         slots = int(slots)
         with calls.scope(context):
             # Warm eagerly so lazy initialization stays out of the capture.
             run_packed(slots)
-        return graphs.capture(
-            lambda: run_packed(slots),
-            stream=context.stream or torch.cuda.current_stream(device),
-            pool=pool,
+        return graphs.export(
+            graphs.capture(
+                lambda: run_packed(slots),
+                stream=context.stream or torch.cuda.current_stream(device),
+                pool=pool,
+            )
         )
 
     steps.update(
@@ -511,14 +513,17 @@ def _text(encoder: TextEncoder, context, tensors):
                 return []
             return calls.write(regions.view(products, out), features[:count])
 
-    def capture_text(capacity: int, pool) -> graphs.Graph:
+    def capture_text(capacity: int, pool) -> list[Any]:
         capacity = int(capacity)
         with calls.scope(context):
             compute(capacity, False, None)
-        return graphs.capture(
-            lambda: compute(capacity, False, None),
-            stream=context.stream or torch.cuda.current_stream(context.device),
-            pool=pool,
+        return graphs.export(
+            graphs.capture(
+                lambda: compute(capacity, False, None),
+                stream=context.stream
+                or torch.cuda.current_stream(context.device),
+                pool=pool,
+            )
         )
 
     return {

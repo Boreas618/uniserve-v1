@@ -52,7 +52,6 @@ EXPERT_ENTRIES = {
     "experts.bind_prefetch",
     "graphs.begin_capture",
     "graphs.end_capture",
-    "graphs.replay",
     "graphs.release",
     "distributed.bind_collectives",
 }

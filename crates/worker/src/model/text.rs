@@ -8,6 +8,7 @@
 
 use tvm_ffi::{Any, AnyView};
 
+use crate::cuda_graph::CUDAGraph;
 use crate::ffi::{DeferredCall, Fields, Function, Functions, Handle, Record, Shape};
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
@@ -215,7 +216,7 @@ impl TextModel {
         args: &CaptureArgs<'_>,
         pool: &Handle,
         expert_capacity: usize,
-    ) -> Result<Handle> {
+    ) -> Result<CUDAGraph> {
         let values = [
             flag(args.decode),
             integer(args.rows),
@@ -231,7 +232,7 @@ impl TextModel {
             integer(expert_capacity),
         ];
         let views: Vec<AnyView<'_>> = values.iter().map(AnyView::from).collect();
-        Handle::new(self.capture.call(&views)?)
+        CUDAGraph::captured(self.capture.call(&views)?)
     }
 
     /// The function releasing a captured graph.

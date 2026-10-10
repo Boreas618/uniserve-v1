@@ -656,7 +656,7 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
     buffers["positions"][tokens.numel() : 64] = 0
     widths, starts = session.write_attention(lengths, padding)
     padded = [*queries, *padding], [*prefixes, 0, 0]
-    attend = _synchronized(
+    attend, *_ = _synchronized(
         functions["capture"],
         "readout_attend",
         [4, 64, 32, *padded, widths, starts],
@@ -666,7 +666,7 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
     buffers["candidate_logprobs"].zero_()
     buffers["tail_rows"].zero_()
     buffers["tail_rows"][: len(slots)] = torch.tensor(slots).cuda()
-    tail = _synchronized(
+    tail, *_ = _synchronized(
         functions["capture"], "readout_tail", [64], pool, NO_EXPERT_STEP
     )
     buffers["attend_state.0"].zero_()
@@ -707,7 +707,7 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
         results = buffers["step.results"][:2].clone()
 
         restore()
-        graph = _synchronized(
+        graph, *_ = _synchronized(
             functions["capture"],
             "step",
             [2, step == 0, *metadata],

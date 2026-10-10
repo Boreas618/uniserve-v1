@@ -17,11 +17,11 @@ use tvm_ffi::{Any, AnyView};
 use uniserve_core::Canvas;
 use uniserve_cuda::Stream;
 
+use crate::cuda_graph::GraphPool;
+use crate::cuda_graph::{CUDAGraph, GraphMode, GraphTable, Lookup};
 use crate::ffi::{Backing, DType, Fields, Function, Functions, Handle};
 use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize};
-use crate::runner::GraphPool;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
-use crate::runner::graphs::{GraphMode, GraphTable, Lookup};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::storage::{RequestSlots, SlotField};
 use crate::{Error, Result};
@@ -199,7 +199,7 @@ impl VideoDecoding {
             }
             let mut arguments = segment_arguments(segment).to_vec();
             arguments.push(pool.value.to_any());
-            let graph = Handle::new(self.capture_segment.call_values(&arguments)?)?;
+            let graph = CUDAGraph::captured(self.capture_segment.call_values(&arguments)?)?;
             self.graphs.insert(segment, None, graph)?;
             self.graphs.record(GraphMode::Capture);
         }
@@ -227,7 +227,7 @@ impl VideoDecoding {
         out: &StorageView,
     ) -> Result<(u32, GraphMode)> {
         let graph = match self.graphs.lookup(&segment, None) {
-            Ok(Lookup::Replay(graph)) => Some(graph.clone()),
+            Ok(Lookup::Replay(graph)) => Some(graph.handle().clone()),
             _ => None,
         };
         let mode = if graph.is_some() {

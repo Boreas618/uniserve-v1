@@ -1,12 +1,13 @@
-"""Graph capture, replay and release shared by every binding."""
+"""Graph capture, replay, export and release shared by every binding."""
 
+import ctypes
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import pytest
 import torch
 
-from uniserve_models.interface.graphs import capture, pool
+from uniserve_models.interface.graphs import capture, export, pool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -165,5 +166,73 @@ def test_segmented_capture_replays_eager_submissions_in_order():
         # (1 + 1) * 2 + 3: the capture itself ran only the graph segments'
         # recording, so the replay alone produced this value.
         assert torch.equal(value, torch.full_like(value, 7))
+    finally:
+        graph.release()
+
+
+def _launch(executable: int, stream: torch.cuda.Stream) -> None:
+    """Launch a raw graph executable on ``stream`` through the driver."""
+    driver = ctypes.CDLL("libcuda.so.1")
+    driver.cuGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    driver.cuGraphLaunch.restype = ctypes.c_int
+    assert driver.cuGraphLaunch(executable, stream.cuda_stream) == 0
+
+
+@torch.inference_mode()
+def test_exported_executables_launch_to_the_replayed_output():
+    """Launching an exported graph's executable equals replaying it."""
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    module = _linear(device)
+    x = torch.empty(64, 256, device=device, dtype=torch.bfloat16)
+    with torch.cuda.stream(stream):
+        module(x)
+    graph = capture(lambda: module(x), stream=stream)
+    try:
+        exported, executables, breaks = export(graph)
+        assert exported is graph
+        assert len(executables) == 1 and breaks == 0
+
+        outputs = []
+        for run in (graph.replay, lambda: _launch(executables[0], stream)):
+            # The same input before each run, and a cleared output, so the
+            # output read afterwards was written by that run.
+            with torch.cuda.stream(stream):
+                x.copy_(torch.linspace(-1, 1, x.numel()).view_as(x))
+                graph.output.zero_()
+                run()
+                outputs.append(graph.output.clone())
+            stream.synchronize()
+        assert outputs[0].abs().sum() > 0
+        assert torch.equal(outputs[0], outputs[1])
+    finally:
+        graph.release()
+
+
+@torch.inference_mode()
+def test_export_counts_the_breaks_between_segments():
+    """A segmented graph exports one executable per segment."""
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    value = torch.ones(16, device=device)
+    submissions = []
+
+    @contextmanager
+    def segments(submit):
+        submissions.append(submit)
+        yield
+
+    def body():
+        value.add_(1)
+        submissions[-1](lambda: value.mul_(2))
+        value.add_(3)
+
+    owner = object()
+    graph = capture(body, stream=stream, segments=segments)
+    try:
+        exported, executables, breaks = export(graph, owner)
+        assert exported is owner
+        assert len(executables) == 2 and len(set(executables)) == 2
+        assert breaks == 1
     finally:
         graph.release()

@@ -39,7 +39,7 @@ use std::sync::Arc;
 use uniserve_core::CanvasSampling;
 use uniserve_cuda::Stream;
 
-use super::graphs::{GraphMode, GraphTable, Lookup};
+use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::ffi::Handle;
 use crate::model::canvas::{Attention, CanvasFacts, CanvasModel, Capture};
 use crate::storage::canvas::{CanvasBanks, CanvasBuffers, ColumnWrites};
@@ -186,7 +186,7 @@ impl CanvasRunner {
         };
         let mode = match self.graphs.lookup(&key, capacity)? {
             Lookup::Replay(graph) => {
-                self.lane.model.replay(graph, attention)?;
+                self.lane.model.replay(graph.handle(), attention)?;
                 GraphMode::Replay
             }
             Lookup::Capture => {
@@ -223,7 +223,7 @@ impl CanvasRunner {
 
     fn graph(&self, key: &CanvasGraphKey) -> Result<&Handle> {
         match self.graphs.lookup(key, None)? {
-            Lookup::Replay(graph) => Ok(graph),
+            Lookup::Replay(graph) => Ok(graph.handle()),
             Lookup::Capture => Err(Error::Invariant(format!("{key:?} was not captured"))),
         }
     }

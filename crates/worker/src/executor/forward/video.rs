@@ -136,7 +136,7 @@ pub(crate) struct VideoRuntime {
     pub(crate) requests: HashMap<usize, VideoRequest>,
     pub(crate) text: Option<Component<TextEncoding>>,
     /// The text encoder's graph pool, when graphs are captured.
-    pub(crate) text_pool: Option<Arc<crate::runner::GraphPool<Handle>>>,
+    pub(crate) text_pool: Option<Arc<crate::cuda_graph::GraphPool<Handle>>>,
     pub(crate) denoiser: Option<Component<VideoDenoiser>>,
     pub(crate) decoder: Option<Component<VideoDecoding>>,
     pub(crate) audio: Option<Component<AudioDecoding>>,
@@ -1603,7 +1603,7 @@ pub(crate) struct RuntimeSetup<'a> {
     pub(crate) config: &'a crate::config::WorkerConfig,
     pub(crate) components: &'a crate::model::registry::Components,
     pub(crate) lanes: &'a mut crate::worker::Lanes,
-    pub(crate) graphs: &'a mut crate::runner::GraphStorage<String, Handle>,
+    pub(crate) graphs: &'a mut crate::cuda_graph::GraphStorage<String, Handle>,
     /// The attention backend the model loaded with.
     pub(crate) attention: String,
     /// The product arena of the rank's device, which encoder bindings name
@@ -1682,19 +1682,19 @@ impl VideoRuntime {
         let slots = info.request_slots;
         let capture = config.graph_policy != "off" && config.device.is_cuda();
         let create_pool = interface.function("graphs.pool")?;
-        let pool = |graphs: &mut crate::runner::GraphStorage<String, Handle>,
+        let pool = |graphs: &mut crate::cuda_graph::GraphStorage<String, Handle>,
                     key: usize,
                     owner: &str,
                     device: Device,
                     share: Option<usize>|
-         -> Result<Option<Arc<crate::runner::GraphPool<Handle>>>> {
+         -> Result<Option<Arc<crate::cuda_graph::GraphPool<Handle>>>> {
             let Device::Cuda(index) = device else {
                 return Ok(None);
             };
             if !capture {
                 return Ok(None);
             }
-            let pools = crate::runner::graphs::reserve_pools(
+            let pools = crate::cuda_graph::reserve_pools(
                 graphs,
                 &create_pool,
                 key,

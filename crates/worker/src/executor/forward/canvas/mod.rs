@@ -42,13 +42,13 @@ use super::experts::ExpertRuntime;
 use super::launch::{
     Launched, StreamOrder, error_code, failed_output, lock, read_flag, reports_output, seal,
 };
+use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::lifecycle::RequestStorage;
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
 use crate::request::RequestPool;
 use crate::runner::canvas::{CanvasRunner, ReadoutPass, StepRow};
-use crate::runner::graphs::GraphMode;
 use crate::storage::{
     KVCache, OutputLease, OutputPlacement, OutputPool, ProductBuffer, TensorStore,
 };

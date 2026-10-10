@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
-use super::graphs::{GraphMode, GraphTable, Lookup};
 use super::{TextShapes, TokenSelection};
+use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::ffi::{DType, DeferredCall, Handle};
 use crate::model::text::{CaptureArgs, StepArgs, TextModel};
 use crate::request::decode_state::DecodeState;
@@ -298,7 +298,9 @@ impl TextRunner {
         let (mode, graph) = match &staged.plan.choice {
             Choice::Eager => (GraphMode::Eager, None),
             Choice::Graph(key) => match self.graphs.lookup(key, capacity)? {
-                Lookup::Replay(graph) if replay => (GraphMode::Replay, Some(graph.clone())),
+                Lookup::Replay(graph) if replay => {
+                    (GraphMode::Replay, Some(graph.handle().clone()))
+                }
                 Lookup::Replay(_) => (GraphMode::Eager, None),
                 // The eager run is the capture's warmup and produces this
                 // invocation's results; capture records without executing.

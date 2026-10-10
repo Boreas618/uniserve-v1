@@ -29,8 +29,8 @@ use super::{
     request_tensor_window,
 };
 use crate::config::{Device, WorkerConfig, graph_padding_block_count};
+use crate::cuda_graph::graph_storage_budget_bytes;
 use crate::parallel::host::HostGroup;
-use crate::runner::graph_storage_budget_bytes;
 use crate::storage::KVPlan;
 use crate::{Error, Result};
 

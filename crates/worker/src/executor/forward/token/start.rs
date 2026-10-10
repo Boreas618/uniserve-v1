@@ -15,6 +15,8 @@ use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::TextRuntime;
 use crate::config::{Device, PREFILL_ROW_BUCKETS, WorkerConfig};
+use crate::cuda_graph::GraphStorage;
+use crate::cuda_graph::reserve_pools;
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::{DType, Handle};
 use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
@@ -24,11 +26,10 @@ use crate::model::registry::Components;
 use crate::model::text::{self, TextModel};
 use crate::model::{LoadedModel, ModelFacts};
 use crate::request::decode_state::DecodeState;
-use crate::runner::graphs::reserve_pools;
 use crate::runner::text::{
     Dimensions, RunnerParts, TableShape, TextBuffers, TextRunner, model_dtype,
 };
-use crate::runner::{GraphStorage, PrefillShape, TextShapes, prefill_shapes};
+use crate::runner::{PrefillShape, TextShapes, prefill_shapes};
 use crate::storage::{KVCache, KVPlan, OutputPool};
 use crate::worker::Lanes;
 use crate::{Error, Result};

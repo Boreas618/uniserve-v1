@@ -679,7 +679,7 @@ def bind(
 
     def capture(
         function: str, arguments: Sequence, pool, expert_capacity: int
-    ) -> _Graph:
+    ) -> list[Any]:
         """Capture one canvas function for a fixed shape in ``pool``.
 
         ``function`` is ``readout_attend`` (``[rows, tokens, visible,
@@ -706,7 +706,7 @@ def bind(
                     pool=pool,
                     segments=segments,
                 )
-            return _Graph(graph, None)
+            return graphs.export(graph, _Graph(graph, None))
 
         rows = int(arguments[0])
         if name == "readout_attend":
@@ -755,7 +755,7 @@ def bind(
                 views_for(queries, prefixes, starts), replay=True
             )
 
-        return _Graph(graph, rebind)
+        return graphs.export(graph, _Graph(graph, rebind))
 
     def replay(graph: _Graph, queries, prefixes, starts) -> None:
         """Replay a captured function.
