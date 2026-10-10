@@ -10,7 +10,7 @@
 //! a canvas in the sentinel slot zero. Readout tails hold up to 256 slot
 //! rows; a call with more slots replays them in chunks.
 
-use super::super::graphs::bucket;
+use crate::cuda_graph::bucket;
 use crate::{Error, Result};
 
 /// Canvas row buckets. After four rows, each step adds at most half the

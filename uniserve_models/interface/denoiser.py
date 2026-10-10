@@ -304,7 +304,7 @@ def bind(
             timesteps[: len(rows)].zero_()
             evaluate(rows, inputs_batch, features)
 
-    def capture(rows, layout_args, pool, peers) -> graphs.Graph:
+    def capture(rows, layout_args, pool, peers) -> list[Any]:
         if context.stream is None:
             raise ValueError("graph capture requires a CUDA binding")
         rows = _rows(rows)
@@ -319,8 +319,8 @@ def bind(
             with context.activate():
                 evaluate(rows, inputs_batch)
 
-        return graphs.capture(
-            body, stream=context.stream, pool=pool, peers=peers
+        return graphs.export(
+            graphs.capture(body, stream=context.stream, pool=pool, peers=peers)
         )
 
     def integrate(rows: Sequence[Sequence[int]], plans: Sequence) -> None:

@@ -11,6 +11,7 @@
 pub mod capacity;
 mod completion;
 pub mod config;
+mod cuda_graph;
 pub mod error;
 pub mod executor;
 pub mod ffi;
@@ -32,6 +33,10 @@ pub mod worker;
 
 pub use completion::{Completion, Outcome};
 pub use config::WorkerConfig;
+pub use cuda_graph::{
+    CUDAGraph, Capacity, GraphCounts, GraphMode, GraphPool, GraphPools, GraphStorage, GraphTable,
+    Lookup, bucket, capture_order, graph_storage_budget_bytes, reserve_pools,
+};
 pub use error::{Error, ErrorCode, Result, WorkerError};
 pub use executor::{
     Backend, Batch, BatchInputs, BatchResult, Executor, InputReady, InputWait, PendingOutput,
@@ -59,15 +64,12 @@ pub use runner::encoder::{
     MAX_PACKED_IMAGES, PreparedImage, PromptVision, TextEncoder, Tower, VisionEncoder,
     packed_grids, prepare_input, text_capacity,
 };
-pub use runner::graphs::{
-    Capacity, GraphCounts, GraphMode, GraphTable, Lookup, bucket, capture_order, reserve_pools,
-};
 pub use runner::vision::{
     BlockPositions, FeatureInjection, FeatureLayout, PositionLayout, VisionBlock,
 };
 pub use runner::{
-    GraphPool, GraphPools, GraphStorage, ModelBatch, ModelRunners, PrefillShape, TextShapes,
-    TokenSelection, graph_storage_budget_bytes, prefill_shapes, prefill_units,
+    ModelBatch, ModelRunners, PrefillShape, TextShapes, TokenSelection, prefill_shapes,
+    prefill_units,
 };
 pub use sampling::{
     SamplingMetadata, SamplingPath, TOKEN_CONTINUATION_BIT, TOKEN_VALUE_MASK, finish_token_ids,

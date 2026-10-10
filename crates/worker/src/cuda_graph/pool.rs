@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
+use tvm_ffi::Any;
 
+use crate::ffi::{Function, Handle};
 use crate::{Error, Result};
 
 /// The numerical allocator's pool handle and its backing owner.
@@ -180,4 +182,61 @@ impl<O, P> GraphStorage<O, P> {
 /// The worker reserves the same graph share when planning and allocating.
 pub fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
     (total_device_bytes.max(0) as f64 * 0.10) as u64
+}
+
+/// Reserve the allocator pools of graph owner `key` on `devices`.
+///
+/// With `share`, the owner borrows that registered owner's pools (owners on
+/// one stream run serially, so they can share intermediates); devices it
+/// has no pool on get a new one. `create` is the interface's `graphs.pool`,
+/// returning `[pool, id_a, id_b, total_bytes]`. The owner is registered only
+/// after every pool exists, so a failure leaves the storage unchanged.
+pub fn reserve_pools(
+    storage: &mut GraphStorage<String, Handle>,
+    create: &Function,
+    key: usize,
+    owner: String,
+    devices: &[i32],
+    share: Option<usize>,
+) -> Result<Vec<Arc<GraphPool<Handle>>>> {
+    let shared = storage.prepare(key, share)?;
+    let mut pools = Vec::new();
+    let mut defaults = Vec::new();
+    for &device in devices {
+        if pools
+            .iter()
+            .any(|pool: &Arc<GraphPool<Handle>>| pool.device == device)
+        {
+            continue;
+        }
+        if let Some(pool) = shared.iter().find(|pool| pool.device == device) {
+            pools.push(Arc::clone(pool));
+            continue;
+        }
+        let value: tvm_ffi::Array<Any> =
+            create.call_as(&[(&Any::from(i64::from(device))).into()])?;
+        let item = |index: usize| {
+            value
+                .get(index)
+                .map_err(|error| Error::numerical(create.name(), &error))
+        };
+        if value.len() != 4 {
+            return Err(Error::Interface(format!(
+                "{} returns [pool, id_a, id_b, total_bytes]",
+                create.name()
+            )));
+        }
+        let number = |index: usize| -> Result<i64> {
+            i64::try_from(item(index)?).map_err(|error| Error::numerical(create.name(), &error))
+        };
+        let id = (number(1)? as u64, number(2)? as u64);
+        defaults.push((device, graph_storage_budget_bytes(number(3)?)));
+        pools.push(Arc::new(GraphPool {
+            device,
+            id,
+            value: Handle::new(item(0)?)?,
+        }));
+    }
+    storage.commit(key, owner, pools.clone(), defaults);
+    Ok(pools)
 }
