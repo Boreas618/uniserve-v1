@@ -23,7 +23,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::ValidationResult;
-use crate::iceoryx::{IpcError, IpcResult};
+use crate::error::{IpcError, IpcResult};
 
 /// A type that crosses a rank channel as the one message of a [`Frame`].
 pub trait Message: Serialize + DeserializeOwned {
