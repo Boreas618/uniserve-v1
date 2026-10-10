@@ -2,9 +2,11 @@
 //!
 //! A rank on the head's host reaches the engine through shared storage; a rank
 //! on another host has no shared storage to reach, so it carries the same frames
-//! over a stream socket. The frames are identical: a [`Header`] followed by its
-//! encoded payload, so the codec, the protocol version and every message shape
-//! are the ones the shared-storage channel uses.
+//! over a stream socket. The stream is one [`Frame`] after another: each
+//! frame's length field tells the reader where the next one starts.
+//!
+//! A response is matched to its request by the envelope's `message_id`, which
+//! the engine's end reads from each response it decodes.
 //!
 //! Socket readiness advances incoming and outgoing frames. Local process-death
 //! notifications use a separate descriptor.
@@ -22,37 +24,9 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::codec::encode_request;
-use crate::iceoryx::{Frame, Header, IpcError, IpcResult, WakeEvents, header_for_request};
-use crate::request::WorkerRequest;
-
-/// Bytes of one encoded frame header, the same size and field order as the
-/// `#[repr(C)]` [`Header`].
-const HEADER_BYTES: usize = 16;
-
-/// Encodes a header in a fixed little-endian layout.
-///
-/// The shared-storage channel hands the header across as a typed value in one
-/// address space. A socket carries bytes between two, so the layout is stated
-/// here rather than borrowed from the compiler's struct layout.
-fn encode_header(header: &Header) -> [u8; HEADER_BYTES] {
-    let mut out = [0u8; HEADER_BYTES];
-    out[0..8].copy_from_slice(&header.message_id.to_le_bytes());
-    out[8..12].copy_from_slice(&header.len.to_le_bytes());
-    out[12..14].copy_from_slice(&header.version.to_le_bytes());
-    out[14..16].copy_from_slice(&header.reserved.to_le_bytes());
-    out
-}
-
-/// Decodes a header from its fixed little-endian layout.
-fn decode_header(bytes: &[u8; HEADER_BYTES]) -> Header {
-    Header {
-        message_id: u64::from_le_bytes(std::array::from_fn(|i| bytes[i])),
-        len: u32::from_le_bytes(std::array::from_fn(|i| bytes[8 + i])),
-        version: u16::from_le_bytes([bytes[12], bytes[13]]),
-        reserved: u16::from_le_bytes([bytes[14], bytes[15]]),
-    }
-}
+use crate::frame::Frame;
+use crate::iceoryx::{IpcError, IpcResult, WakeEvents};
+use crate::request::{WorkerRequest, WorkerResponse};
 
 /// Reads whole frames from a non-blocking stream without losing a partial one.
 ///
@@ -77,7 +51,7 @@ impl FrameReader {
     /// Takes whatever the stream has without blocking, forming whole frames.
     ///
     /// Returns whether the peer closed the connection. Fails on a read error,
-    /// on a header that fails validation, and on a close that leaves a partial
+    /// on a length field above `bound`, and on a close that leaves a partial
     /// frame; frames completed before the failure stay in `ready`.
     fn fill(&mut self, stream: &mut TcpStream, bound: usize) -> IpcResult<bool> {
         let mut chunk = [0u8; 64 * 1024];
@@ -115,24 +89,19 @@ impl FrameReader {
     /// Forms every whole frame the buffer now holds.
     fn split(&mut self, bound: usize) -> IpcResult<()> {
         loop {
-            if self.buffer.len() < HEADER_BYTES {
+            let Some(field) = self.buffer.first_chunk::<{ Frame::LENGTH_BYTES }>() else {
                 return Ok(());
-            }
-            let mut head = [0u8; HEADER_BYTES];
-            head.copy_from_slice(&self.buffer[..HEADER_BYTES]);
-            let header = decode_header(&head);
-            let len = header.len as usize;
+            };
 
-            // Validate as soon as the header is complete, before waiting for its
-            // payload, so a foreign version or an over-bound length fails
-            // without buffering the bytes it announces.
-            header.validate(bound)?;
-            if self.buffer.len() < HEADER_BYTES + len {
+            // Check the length as soon as its field is complete, before
+            // waiting for the message, so an over-bound length fails without
+            // buffering the bytes it announces.
+            let whole = Frame::LENGTH_BYTES + Frame::message_len(*field, bound)?;
+            if self.buffer.len() < whole {
                 return Ok(());
             }
-            let payload = self.buffer[HEADER_BYTES..HEADER_BYTES + len].to_vec();
-            self.buffer.drain(..HEADER_BYTES + len);
-            self.ready.push_back(Frame { header, payload });
+            let frame = Frame::from_bytes(self.buffer.drain(..whole).collect(), bound)?;
+            self.ready.push_back(frame);
         }
     }
 }
@@ -140,7 +109,7 @@ impl FrameReader {
 /// Retains partial writes until the socket becomes writable. Queue capacity is
 /// the channel's in-flight depth, so a stalled peer cannot grow storage use without bound.
 struct FrameWriter {
-    /// Encoded frames, header then payload, not yet fully written.
+    /// Frames, each as its bytes, not yet fully written.
     pending: VecDeque<Vec<u8>>,
     /// Bytes of the front frame already written.
     offset: usize,
@@ -157,20 +126,15 @@ impl FrameWriter {
         }
     }
 
-    /// Queues one frame after stamping and checking its header.
+    /// Queues one frame.
     ///
-    /// Fails with a transport error when the header is invalid or the payload
-    /// exceeds `bound`, and otherwise with [`IpcError::WouldBlock`] when
-    /// `depth` frames are already queued.
-    fn enqueue(&mut self, header: Header, payload: &[u8], bound: usize) -> IpcResult<()> {
-        let header = header.for_payload(payload.len(), bound)?;
+    /// Fails with [`IpcError::WouldBlock`] when `depth` frames are already
+    /// queued.
+    fn enqueue(&mut self, frame: Frame) -> IpcResult<()> {
         if self.pending.len() >= self.depth {
             return Err(IpcError::WouldBlock);
         }
-        let mut frame = Vec::with_capacity(HEADER_BYTES + payload.len());
-        frame.extend_from_slice(&encode_header(&header));
-        frame.extend_from_slice(payload);
-        self.pending.push_back(frame);
+        self.pending.push_back(frame.into_bytes());
         Ok(())
     }
 
@@ -313,13 +277,14 @@ pub struct SocketClient {
     writer: FrameWriter,
     /// Responses read from the stream before the caller asked for them.
     ///
-    /// Keyed by header identity, so outstanding requests need distinct
-    /// identities: a later response with the same identity replaces an
-    /// untaken one.
-    inbox: HashMap<u64, Frame>,
-    /// Largest payload either direction may carry.
+    /// Keyed by the response's `message_id` (`None` as zero), so outstanding
+    /// requests need distinct identities: a later response with the same
+    /// identity replaces an untaken one.
+    inbox: HashMap<u64, WorkerResponse>,
+    /// Largest encoded message either direction may carry.
     bound: usize,
-    /// Terminal IO failure, reported after complete responses have been delivered.
+    /// Terminal failure, reported after complete responses have been
+    /// delivered: an IO failure, or a frame that is not a valid response.
     failure: Option<String>,
     /// Descriptor the engine's worker-death watcher fires on.
     local: LocalWake,
@@ -328,9 +293,9 @@ pub struct SocketClient {
 impl SocketClient {
     /// Connects to the address a rank reported at registration.
     ///
-    /// `bound` is the largest payload in bytes in either direction, `depth`
-    /// the number of frames the send queue holds, and `timeout` bounds the TCP
-    /// connect only.
+    /// `bound` is the largest encoded message in bytes in either direction,
+    /// `depth` the number of frames the send queue holds, and `timeout` bounds
+    /// the TCP connect only.
     pub fn connect(
         address: &str,
         bound: usize,
@@ -375,44 +340,37 @@ impl SocketClient {
 
     /// Encodes and sends one request, returning the identity of its response.
     ///
-    /// See [`Self::send_raw`] for the queueing and failure behavior.
+    /// The identity is the request's `message_id`, `None` standing for zero.
+    /// Queues the frame and writes as far as the socket accepts. Fails with
+    /// the recorded failure once the channel has failed, when the request is
+    /// invalid or its encoding exceeds the bound, with
+    /// [`IpcError::WouldBlock`] when the send queue is full, and on a write
+    /// error.
     pub fn send_request(&mut self, request: &WorkerRequest) -> IpcResult<u64> {
-        let header = header_for_request(request);
-        let payload = encode_request(request)?;
-        self.send_raw(header, &payload)
-    }
-
-    /// Sends one frame and returns the identity its response will carry.
-    ///
-    /// The frame is queued and written as far as the socket accepts; the rest
-    /// is written by later send, receive and wait calls. Fails after a terminal
-    /// channel failure, when the header is invalid or the payload exceeds the
-    /// bound, with [`IpcError::WouldBlock`] when the send queue is full, and on
-    /// a write error.
-    pub fn send_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<u64> {
         if let Some(error) = &self.failure {
             return Err(IpcError::Transport(error.clone()));
         }
+        let frame = Frame::encode(request, self.bound)?;
 
         // Flush first so frames the socket has since accepted free queue
         // capacity before the depth check.
         self.writer.flush(&mut self.stream)?;
-        self.writer.enqueue(header, payload, self.bound)?;
+        self.writer.enqueue(frame)?;
         self.writer.flush(&mut self.stream)?;
-        Ok(header.message_id)
+        Ok(request.message_id().unwrap_or_default())
     }
 
     /// Takes the response to one outstanding message, if it has arrived.
     ///
     /// A terminal channel failure is returned only once no received response
     /// remains in the inbox, so complete responses are delivered first.
-    pub fn try_recv_response(&mut self, message_id: u64) -> IpcResult<Option<Frame>> {
-        if let Some(frame) = self.inbox.remove(&message_id) {
-            return Ok(Some(frame));
+    pub fn try_recv_response(&mut self, message_id: u64) -> IpcResult<Option<WorkerResponse>> {
+        if let Some(response) = self.inbox.remove(&message_id) {
+            return Ok(Some(response));
         }
         self.pump()?;
-        if let Some(frame) = self.inbox.remove(&message_id) {
-            return Ok(Some(frame));
+        if let Some(response) = self.inbox.remove(&message_id) {
+            return Ok(Some(response));
         }
         if self.inbox.is_empty()
             && let Some(error) = &self.failure
@@ -430,11 +388,11 @@ impl SocketClient {
         &mut self,
         message_id: u64,
         timeout: Duration,
-    ) -> IpcResult<Option<Frame>> {
+    ) -> IpcResult<Option<WorkerResponse>> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(frame) = self.try_recv_response(message_id)? {
-                return Ok(Some(frame));
+            if let Some(response) = self.try_recv_response(message_id)? {
+                return Ok(Some(response));
             }
             if self.failure.is_some() || Instant::now() >= deadline {
                 return Ok(None);
@@ -486,11 +444,12 @@ impl SocketClient {
         })
     }
 
-    /// Moves every frame the stream holds into the inbox, keyed by identity.
+    /// Decodes every frame the stream holds into the inbox, keyed by identity.
     ///
     /// Also flushes queued writes while the stream remains open. Transport
-    /// failures are recorded in `failure` rather than returned, so this returns
-    /// `Ok` in every case.
+    /// failures, and a frame that does not decode to a valid response, are
+    /// recorded in `failure` rather than returned, so this returns `Ok` in
+    /// every case.
     fn pump(&mut self) -> IpcResult<()> {
         if self.failure.is_none() {
             self.failure = match self.reader.fill(&mut self.stream, self.bound) {
@@ -506,7 +465,18 @@ impl SocketClient {
         // A final read may contain complete responses followed by a truncated
         // frame or EOF. Preserve those responses before failing outstanding work.
         while let Some(frame) = self.reader.ready.pop_front() {
-            self.inbox.insert(frame.header.message_id, frame);
+            match frame.decode::<WorkerResponse>() {
+                Ok(response) => {
+                    self.inbox
+                        .insert(response.message_id().unwrap_or_default(), response);
+                }
+                // Frames behind an undecodable one are left unread: the
+                // stream's content can no longer be trusted.
+                Err(error) => {
+                    self.failure.get_or_insert(error.to_string());
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -520,7 +490,7 @@ pub struct SocketServer {
     stream: Option<TcpStream>,
     reader: FrameReader,
     writer: FrameWriter,
-    /// Largest payload either direction may carry.
+    /// Largest encoded message either direction may carry.
     bound: usize,
     /// Terminal IO failure, reported after buffered requests have been taken.
     failure: Option<String>,
@@ -639,13 +609,14 @@ impl SocketServer {
     /// waiting connection itself. When no request is already buffered and no
     /// failure is recorded, it reads the stream and, unless the read fails or
     /// finds the stream closed, flushes queued responses. A terminal failure
-    /// is returned once no complete request remains buffered.
-    pub fn try_recv(&mut self) -> IpcResult<Option<Frame>> {
+    /// is returned once no complete request remains buffered. A frame that
+    /// does not decode to a valid request fails the call that takes it.
+    pub fn try_recv(&mut self) -> IpcResult<Option<WorkerRequest>> {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(None);
         };
         if let Some(frame) = self.reader.ready.pop_front() {
-            return Ok(Some(frame));
+            return frame.decode().map(Some);
         }
         if self.failure.is_none() {
             self.failure = match self.reader.fill(stream, self.bound) {
@@ -659,7 +630,7 @@ impl SocketServer {
             };
         }
         if let Some(frame) = self.reader.ready.pop_front() {
-            return Ok(Some(frame));
+            return frame.decode().map(Some);
         }
         if let Some(error) = &self.failure {
             return Err(IpcError::Transport(error.clone()));
@@ -707,20 +678,22 @@ impl SocketServer {
         Ok(())
     }
 
-    /// Answers one request under the identity it carried.
+    /// Encodes and sends one response, under the identity it states.
     ///
     /// Queues the frame and writes as far as the socket accepts. Fails before
-    /// the engine has connected, when the header is invalid or the payload
+    /// the engine has connected, when the response is invalid or its encoding
     /// exceeds the bound, with [`IpcError::WouldBlock`] when the send queue is
     /// full, and on a write error. Unlike the shared-storage server, it does
-    /// not check `header.message_id` against received requests.
-    pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<()> {
+    /// not check the response's identity against received requests.
+    pub fn respond(&mut self, response: &WorkerResponse) -> IpcResult<()> {
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| IpcError::Transport("rank channel is not connected".into()))?;
+        let frame = Frame::encode(response, self.bound)?;
+
         self.writer.flush(stream)?;
-        self.writer.enqueue(header, payload, self.bound)?;
+        self.writer.enqueue(frame)?;
         self.writer.flush(stream)
     }
 }
@@ -743,64 +716,73 @@ mod tests {
         (client, peer)
     }
 
+    /// An error response whose encoded message is `filler` bytes of text plus
+    /// a fixed envelope.
+    fn response_of(message_id: u64, filler: usize) -> WorkerResponse {
+        let mut response = WorkerResponse::error(crate::WorkerResponseError {
+            message: "m".repeat(filler),
+            code: None,
+            fatal: false,
+            phase: None,
+            route: None,
+            calls: Vec::new(),
+        });
+        response.set_call_id(Some(message_id));
+        response
+    }
+
+    /// The bytes of the frame that carries `message`.
+    fn frame_of<M: crate::Message>(message: &M) -> Vec<u8> {
+        Frame::encode(message, usize::MAX).unwrap().into_bytes()
+    }
+
     #[test]
     fn completed_responses_survive_a_truncated_last_frame() {
         // The peer writes one complete frame a byte at a time, then a frame cut
         // short, then closes. The complete response must still be delivered;
         // only the truncated one fails, and the channel then reports death.
         let (mut client, mut peer) = connected(1024, 2);
-        let header = Header {
-            message_id: 1,
-            len: 5,
-            ..Header::default()
-        };
-        for byte in encode_header(&header).into_iter().chain(*b"hello") {
+        let first = response_of(1, 5);
+        for byte in frame_of(&first) {
             peer.write_all(&[byte]).unwrap();
         }
-        peer.write_all(&encode_header(&Header {
-            message_id: 2,
-            len: 9,
-            ..Header::default()
-        }))
-        .unwrap();
-        peer.write_all(b"partial").unwrap();
+        let second = frame_of(&response_of(2, 9));
+        peer.write_all(&second[..second.len() - 2]).unwrap();
         peer.shutdown(std::net::Shutdown::Write).unwrap();
 
         let response = client
             .recv_response_timeout(1, Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        assert_eq!(response.payload, b"hello");
+        assert_eq!(response, first);
         let error = client
             .recv_response_timeout(2, Duration::from_secs(5))
-            .err()
-            .expect("truncation must fail pending work");
+            .expect_err("truncation must fail pending work");
         assert!(error.to_string().contains("incomplete frame"), "{error}");
         assert!(client.drain_wakes().unwrap().death);
     }
 
     #[test]
-    fn socket_rejects_incompatible_or_oversized_frames() {
-        for header in [
-            Header {
-                version: crate::IPC_VERSION + 1,
-                ..Header::default()
-            },
-            Header {
-                len: 1025,
-                ..Header::default()
-            },
-        ] {
-            // Only the header is sent: it must be refused before any payload
-            // arrives.
-            let (mut client, mut peer) = connected(1024, 1);
-            peer.write_all(&encode_header(&header)).unwrap();
-            assert!(
-                client
-                    .recv_response_timeout(0, Duration::from_secs(5))
-                    .is_err()
-            );
-        }
+    fn socket_rejects_oversized_and_undecodable_frames() {
+        // Only the length field is sent: a length above the bound must be
+        // refused before any of the message arrives.
+        let (mut client, mut peer) = connected(1024, 1);
+        peer.write_all(&1025_u32.to_le_bytes()).unwrap();
+        assert!(
+            client
+                .recv_response_timeout(0, Duration::from_secs(5))
+                .is_err()
+        );
+
+        // A whole frame that holds a request is not a response.
+        let (mut client, mut peer) = connected(1024, 1);
+        peer.write_all(&frame_of(&WorkerRequest::info())).unwrap();
+        assert!(
+            client
+                .recv_response_timeout(0, Duration::from_secs(5))
+                .is_err()
+        );
+        assert!(client.drain_wakes().unwrap().death);
     }
 
     /// A local wake is reported by the first drain after it fires, wakes
@@ -842,13 +824,18 @@ mod tests {
     #[test]
     fn a_stalled_peer_applies_backpressure_and_partial_writes_resume() {
         let size = 1 << 20;
-        let (mut client, mut peer) = connected(size, 1);
+        let bound = 2 * size;
+        let mut server = SocketServer::bind("127.0.0.1", bound, 1).unwrap();
+        let mut peer = TcpStream::connect(server.address()).unwrap();
+        server.accept(Duration::from_secs(5)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
         let capacity: libc::c_int = 4096;
         // Restrict the real socket send buffer so this workload must span writes.
         assert_eq!(
             unsafe {
                 libc::setsockopt(
-                    client.stream.as_raw_fd(),
+                    server.stream.as_ref().unwrap().as_raw_fd(),
                     libc::SOL_SOCKET,
                     libc::SO_SNDBUF,
                     (&capacity as *const libc::c_int).cast(),
@@ -858,32 +845,20 @@ mod tests {
             0
         );
         // With depth 1, the partially written first frame fills the queue.
-        let payload = vec![7; size];
-        client
-            .send_raw(
-                Header {
-                    message_id: 1,
-                    ..Header::default()
-                },
-                &payload,
-            )
-            .unwrap();
+        let first = response_of(1, size);
+        server.respond(&first).unwrap();
         assert!(matches!(
-            client.send_raw(
-                Header {
-                    message_id: 2,
-                    ..Header::default()
-                },
-                b"next"
-            ),
+            server.respond(&response_of(2, 4)),
             Err(IpcError::WouldBlock)
         ));
 
-        // Once the peer reads, driving the client's wait loop resumes the
+        // Once the peer reads, driving the rank's wait loop resumes the
         // partial write until the whole frame arrives.
+        let expected = frame_of(&first);
+        let length = expected.len();
         let (tx, rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
-            let mut bytes = vec![0; HEADER_BYTES + size];
+            let mut bytes = vec![0; length];
             peer.read_exact(&mut bytes).unwrap();
             tx.send(bytes).unwrap();
         });
@@ -896,64 +871,52 @@ mod tests {
                 Instant::now() < deadline,
                 "accepted frame did not finish sending"
             );
-            client.wait_wake(Duration::from_millis(10)).unwrap();
+            server.wait_incoming(Duration::from_millis(10)).unwrap();
         };
         reader.join().unwrap();
-        assert_eq!(&wire[HEADER_BYTES..], payload);
-        assert_eq!(
-            decode_header(wire[..HEADER_BYTES].try_into().unwrap()).message_id,
-            1
-        );
+        assert!(wire == expected, "the frame arrived changed");
     }
 
     #[test]
-    fn a_batch_and_its_result_cross_a_socket_unchanged() {
-        // The channel's contract is that a frame arrives as it was sent, under
-        // the identity it carried, so the engine can match a result to the
-        // batch it answers.
+    fn a_request_and_its_response_cross_a_socket_unchanged() {
+        // The channel's contract is that a message arrives as it was sent, and
+        // that a response is taken under the identity its request carried, so
+        // the engine can match a result to the batch it answers.
         let mut server = SocketServer::bind("127.0.0.1", 1 << 20, 8).expect("rank binds");
         let address = server.address().to_string();
+        let answer = response_of(77, 16);
 
+        let sent_answer = answer.clone();
         let accepted = std::thread::spawn(move || {
             server
                 .accept(Duration::from_secs(5))
                 .expect("engine connects");
             let request = loop {
-                if let Some(frame) = server.try_recv().expect("request readable") {
-                    break frame;
+                if let Some(request) = server.try_recv().expect("request readable") {
+                    break request;
                 }
             };
-            let answer = Header {
-                message_id: request.header.message_id,
-                ..Header::default()
-            };
-            server
-                .respond_raw(answer, b"result-payload")
-                .expect("rank answers");
+            server.respond(&sent_answer).expect("rank answers");
             request
         });
 
         let mut client = SocketClient::connect(&address, 1 << 20, 8, Duration::from_secs(5))
             .expect("engine connects");
-        let sent = Header {
-            message_id: 77,
-            ..Header::default()
-        };
-        let identity = client
-            .send_raw(sent, b"batch-payload")
-            .expect("engine sends");
+        let mut sent = WorkerRequest::info();
+        sent.set_call_id(Some(77));
+        let identity = client.send_request(&sent).expect("engine sends");
         assert_eq!(identity, 77);
 
         let received = accepted.join().expect("rank thread");
-        assert_eq!(received.payload, b"batch-payload");
+        assert_eq!(received, sent);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = loop {
-            if let Some(frame) = client.try_recv_response(77).expect("result readable") {
-                break frame;
+            if let Some(response) = client.try_recv_response(77).expect("result readable") {
+                break response;
             }
             assert!(Instant::now() < deadline, "result did not arrive");
         };
-        assert_eq!(result.payload, b"result-payload");
+        assert_eq!(result, answer);
     }
 }

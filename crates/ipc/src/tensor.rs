@@ -9,9 +9,9 @@
 //! the [`TransferTransport`] a consumer opens. A published KV extent travels as
 //! a [`KvTransfer`] identified by a [`BufferId`] alone.
 //!
-//! The validators here are the wire contract: the codec runs them, through
-//! `Batch::validate` and `BatchOutput::validate`, whenever it encodes or
-//! decodes a batch or a batch result. A rank also checks a product's
+//! The validators here are the wire contract: a [`Frame`](crate::Frame) runs
+//! them, through `Batch::validate` and `BatchOutput::validate`, whenever it
+//! encodes or decodes a batch or a batch result. A rank also checks a product's
 //! descriptor size estimate against [`MAX_TRANSFER_HANDLE_BYTES`] before it
 //! publishes the product.
 
@@ -789,9 +789,8 @@ impl TransferHandle {
 /// [`MAX_TRANSFER_HANDLE_BYTES`].
 ///
 /// The integer constants are per-record overhead allowances rather than exact
-/// FlatBuffers sizes; only string and list lengths are measured. The Python
-/// batch validator uses the corresponding `_tensor_transfers_size` estimate
-/// for inputs. Native output acceptance and the IPC codec share this estimate.
+/// encoded sizes; only string and list lengths are measured. A rank's output
+/// acceptance and the message validators share this estimate.
 fn transfer_encoded_size<'a>(tensors: impl IntoIterator<Item = &'a TensorTransfer>) -> usize {
     let mut size = 512usize;
     for tensor in tensors {

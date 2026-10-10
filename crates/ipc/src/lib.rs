@@ -1,4 +1,4 @@
-//! Versioned scheduler-to-worker protocol and its rank transports.
+//! Scheduler-to-worker protocol and its rank transports.
 //!
 //! [`NewRequest`] admits static state, [`Batch`] submits planned calls, and
 //! [`BatchOutput`] returns completions and products. [`WorkerInfo`] describes a
@@ -6,14 +6,15 @@
 //! and generation identities remain stable across serialization.
 //!
 //! [`WorkerRequest`] and [`WorkerResponse`] are the envelopes exchanged per
-//! rank, encoded by [`codec`] as FlatBuffers payloads behind a fixed
-//! [`Header`]. The engine reaches a rank on the head's host through
-//! [`iceoryx`] shared storage and a rank on another host through a [`socket`]
-//! stream; both carry the same frames, and [`channel`] presents either one as
-//! a [`RankChannel`] (engine side) or [`RankServer`] (rank side). The rank
-//! runtime (`uniserve-worker`) binds [`RankServer`] and is started with a
-//! [`LaunchDescriptor`]; the engine and the worker library must be built with
-//! the same [`IPC_VERSION`].
+//! rank, each as the one message of a [`Frame`]: a length followed by the
+//! message in the binary encoding its `serde` derive describes. These message
+//! types are the only definition of the protocol, so the engine and the worker
+//! library must be built from the same sources. The engine reaches a rank on
+//! the head's host through [`iceoryx`] shared storage and a rank on another
+//! host through a [`socket`] stream; both carry the same frames, and
+//! [`channel`] presents either one as a [`RankChannel`] (engine side) or
+//! [`RankServer`] (rank side). The rank runtime (`uniserve-worker`) binds
+//! [`RankServer`] and is started with a [`LaunchDescriptor`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -80,8 +81,8 @@ macro_rules! ensure_valid {
 
 /// Both ends of a rank channel over either transport.
 pub mod channel;
-/// FlatBuffers encoding and decoding for protocol messages.
-pub mod codec;
+/// The unit both transports carry: a length and one encoded message.
+pub mod frame;
 /// Shared-storage rank transport for ranks on the head's host.
 pub mod iceoryx;
 /// The launch descriptor shared by the engine, `uniserve-host` and the rank.
@@ -90,19 +91,14 @@ pub mod launch;
 pub mod launcher;
 /// Stream-socket rank transport for ranks on other hosts.
 pub mod socket;
-#[allow(missing_docs, warnings)]
-/// FlatBuffers bindings generated from the worker protocol schema.
-pub mod schema {
-    include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
-}
 
 pub use channel::{
     Outstanding, RankChannel, RankReport, RankServer, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL, Wake,
 };
+pub use frame::{Frame, Message};
 pub use iceoryx::{
     ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT,
-    Frame, Header, IPC_VERSION, IpcError, IpcResult, Pending, ServerEndpoint, WakeEvents,
-    WakeSender, header_for_request, header_for_response, is_supported_ipc_version, service_name,
+    IpcError, IpcResult, Pending, ServerEndpoint, WakeEvents, WakeSender, service_name,
 };
 pub use launch::{ExpertParallelDescriptor, LaunchDescriptor};
 pub use socket::{SocketClient, SocketServer};

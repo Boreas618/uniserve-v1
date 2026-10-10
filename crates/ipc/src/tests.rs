@@ -1,16 +1,29 @@
 //! Protocol round trips and validation behavior for every message family.
 //!
-//! Tests drive the public codec (`encode_request`, `decode_request`,
-//! `encode_response`, `decode_response`) and the message validators. The
-//! `batch_with_calls` fixture derives the planner columns `Batch::validate`
-//! expects, so a test can mutate a single field to exercise one rule.
+//! Tests carry messages through a [`Frame`] as a channel does, and drive the
+//! message validators. The `batch_with_calls` fixture derives the planner
+//! columns `Batch::validate` expects, so a test can mutate a single field to
+//! exercise one rule.
 
 use std::collections::BTreeMap;
 
 use uniserve_core::{CfgRenorm, KvGroupKind, RequestId, UnitId};
 
 use super::*;
-use crate::codec::{decode_request, decode_response, encode_request, encode_response};
+
+/// A frame bound no test message approaches.
+const BOUND: usize = 1 << 24;
+
+/// Frames `message` as a sender does: validated, then encoded.
+fn encode<M: Message>(message: &M) -> IpcResult<Frame> {
+    Frame::encode(message, BOUND)
+}
+
+/// Returns `message` as a receiver decodes it from the frame a sender made.
+fn round_trip<M: Message>(message: &M) -> M {
+    let sent = encode(message).unwrap().into_bytes();
+    Frame::from_bytes(sent, BOUND).unwrap().decode().unwrap()
+}
 
 fn request_key() -> RequestKey {
     RequestKey::new(4, RequestId(7), 2)
@@ -334,7 +347,7 @@ fn reference_conditions() -> Vec<uniserve_core::VideoCondition> {
 /// Encodes `batch` as a submit request, decodes it, and returns the decoded batch.
 fn execute_round_trip(batch: Batch) -> Batch {
     let request = WorkerRequest::submit(batch);
-    let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+    let decoded = round_trip(&request);
     decoded.batch().unwrap().clone()
 }
 
@@ -357,14 +370,14 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
     // row naming a call outside the batch are each rejected on encode.
     let mut missing_length = run.clone();
     missing_length.forward.seq_lens.pop();
-    assert!(encode_request(&WorkerRequest::submit(missing_length)).is_err());
+    assert!(encode(&WorkerRequest::submit(missing_length)).is_err());
 
     let mut short_sequence = run.clone();
     short_sequence.forward.seq_lens[2] = 3;
-    assert!(encode_request(&WorkerRequest::submit(short_sequence)).is_err());
+    assert!(encode(&WorkerRequest::submit(short_sequence)).is_err());
 
     run.forward.call_indices[2] = 1;
-    assert!(encode_request(&WorkerRequest::submit(run)).is_err());
+    assert!(encode(&WorkerRequest::submit(run)).is_err());
 }
 
 #[test]
@@ -392,7 +405,7 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
 
     let mut collision = run;
     collision.calls[1].call_id = first.call_id;
-    assert!(encode_request(&WorkerRequest::submit(collision)).is_err());
+    assert!(encode(&WorkerRequest::submit(collision)).is_err());
 }
 
 /// Builds a batch around `calls` with the planner columns `Batch::validate`
@@ -531,9 +544,7 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
     record.product_generations.clear();
     record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
     let report = lane_report(5, vec![record], Vec::new(), None, None);
-    let decoded =
-        decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
-            .unwrap();
+    let decoded = round_trip(&WorkerResponse::result(report.clone()));
     assert_eq!(decoded.report().unwrap(), &report);
 }
 
@@ -627,9 +638,7 @@ fn a_canvas_step_its_sampling_and_its_block_round_trip() {
     record.product_generations.clear();
     record.committed_tokens = (0..256).collect();
     let report = lane_report(6, vec![record], Vec::new(), None, None);
-    let decoded =
-        decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
-            .unwrap();
+    let decoded = round_trip(&WorkerResponse::result(report.clone()));
     assert_eq!(decoded.report().unwrap(), &report);
 }
 
@@ -670,83 +679,6 @@ fn candidate_logprobs_belong_to_a_successful_token_denoising_completion() {
     assert!(record.validate().is_err());
 }
 
-/// Constructs malformed wire input independently of the validated encoder.
-///
-/// The frame holds one call with the given forward and media codes and no
-/// transfer mode. `computed_len` of `None` omits the call's coordinates;
-/// otherwise the coordinates state a visible KV length of four.
-fn malformed_call(
-    forward: crate::schema::uniserve::ipc::ForwardMode,
-    media: crate::schema::uniserve::ipc::MediaCall,
-    computed_len: Option<u32>,
-) -> Vec<u8> {
-    use crate::schema::uniserve::ipc as fbs;
-    let mut builder = flatbuffers::FlatBufferBuilder::new();
-    let component = builder.create_string("model");
-    let key = fbs::RequestKey::create(
-        &mut builder,
-        &fbs::RequestKeyArgs {
-            engine_id: 1,
-            request_id: 1,
-            request_epoch: 1,
-        },
-    );
-    let coordinates = computed_len.map(|kv_computed_len| {
-        fbs::CallCoordinates::create(
-            &mut builder,
-            &fbs::CallCoordinatesArgs {
-                kv_visible_len: 4,
-                kv_computed_len,
-                ..Default::default()
-            },
-        )
-    });
-    let code = fbs::CallKind::new(forward, media, fbs::TransferMode::None);
-    let call = fbs::Call::create(
-        &mut builder,
-        &fbs::CallArgs {
-            request_key: Some(key),
-            call_id: Some(&fbs::CallId::new(1, 0)),
-            component: Some(component),
-            code: Some(&code),
-            coordinates,
-            ..Default::default()
-        },
-    );
-    let calls = builder.create_vector(&[call]);
-    let batch = fbs::Batch::create(
-        &mut builder,
-        &fbs::BatchArgs {
-            batch_id: 1,
-            calls: Some(calls),
-            ..Default::default()
-        },
-    );
-    let root = fbs::WorkerRequest::create(
-        &mut builder,
-        &fbs::WorkerRequestArgs {
-            kind: fbs::ReqKind::Submit,
-            message_id: Some(1),
-            batch: Some(batch),
-        },
-    );
-    builder.finish(root, None);
-    builder.finished_data().to_vec()
-}
-
-#[test]
-fn decoder_requires_one_concrete_computation() {
-    use crate::schema::uniserve::ipc as fbs;
-    for (forward, media) in [
-        (fbs::ForwardMode::None, fbs::MediaCall::None),
-        (fbs::ForwardMode::Decode, fbs::MediaCall::Denoising),
-        (fbs::ForwardMode(255), fbs::MediaCall::None),
-        (fbs::ForwardMode::None, fbs::MediaCall(255)),
-    ] {
-        assert!(decode_request(&malformed_call(forward, media, Some(4))).is_err());
-    }
-}
-
 #[test]
 fn every_computation_variant_round_trips_in_its_own_batch() {
     let batches = comprehensive_batches();
@@ -769,19 +701,6 @@ fn a_batch_carries_one_computation_through_one_entry() {
     let split = batch_with_calls(1, Vec::new(), vec![decode, other_entry]);
     let error = split.validate().unwrap_err().to_string();
     assert!(error.contains("mixes call kinds or components"), "{error}");
-}
-
-#[test]
-fn decoder_requires_every_call_to_state_its_coordinates() {
-    use crate::schema::uniserve::ipc as fbs;
-    for (computed_len, message) in [
-        (None, "call.coordinates"),
-        (Some(1), "visible KV beyond the computed extent"),
-    ] {
-        let bytes = malformed_call(fbs::ForwardMode::Decode, fbs::MediaCall::None, computed_len);
-        let error = decode_request(&bytes).unwrap_err();
-        assert!(error.to_string().contains(message), "{error}");
-    }
 }
 
 #[test]
@@ -969,9 +888,7 @@ fn export_round_trips_its_registered_view_and_endpoint() {
         assert!(original.merge_locations(&stale).is_err());
         assert_eq!(*original, before);
         original.merge_locations(&replica).unwrap();
-        let decoded =
-            decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
-                .unwrap();
+        let decoded = round_trip(&WorkerResponse::result(report.clone()));
         assert_eq!(decoded.report().unwrap(), &report);
 
         // Other product dtypes round-trip with locator byte sizes that follow
@@ -988,10 +905,7 @@ fn export_round_trips_its_registered_view_and_endpoint() {
                 location.dtype = storage_dtype.into();
                 location.nbytes = nbytes;
             }
-            let decoded = decode_response(
-                &encode_response(&WorkerResponse::result(typed_report.clone())).unwrap(),
-            )
-            .unwrap();
+            let decoded = round_trip(&WorkerResponse::result(typed_report.clone()));
             assert_eq!(decoded.report().unwrap(), &typed_report);
         }
     }
@@ -1072,9 +986,7 @@ fn unchanged_kv_export_round_trips_without_physical_tensors() {
         None,
         None,
     );
-    let decoded =
-        decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
-            .unwrap();
+    let decoded = round_trip(&WorkerResponse::result(report.clone()));
     assert_eq!(decoded.report().unwrap(), &report);
 
     // A grown extent must carry the tensors of its suffix.
@@ -1082,7 +994,7 @@ fn unchanged_kv_export_round_trips_without_physical_tensors() {
         exported_extent, ..
     } = report.completions[0].kv_output.as_mut().unwrap();
     *exported_extent = 17;
-    assert!(encode_response(&WorkerResponse::result(report)).is_err());
+    assert!(encode(&WorkerResponse::result(report)).is_err());
 }
 
 /// Shards of a 4x4 tensor: the left half plus the top-right quarter leave the
@@ -1196,9 +1108,7 @@ fn raw_kv_export_round_trips_page_representation_and_exact_request() {
             None,
             None,
         );
-        let decoded =
-            decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
-                .unwrap();
+        let decoded = round_trip(&WorkerResponse::result(report.clone()));
         assert_eq!(decoded.report().unwrap(), &report);
 
         // Zero generations, a zero page size, a group starting before the
@@ -1228,7 +1138,7 @@ fn raw_kv_export_round_trips_page_representation_and_exact_request() {
                     .push(tensor("scales", "float32", vec![2, 2, 2], 4)),
                 _ => unreachable!(),
             }
-            assert!(encode_response(&WorkerResponse::result(invalid)).is_err());
+            assert!(encode(&WorkerResponse::result(invalid)).is_err());
         }
     }
 }
@@ -1239,8 +1149,7 @@ fn error_completion_round_trips_with_its_error_code() {
     record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
     let report = lane_report(6, vec![record.clone()], Vec::new(), None, None);
-    let decoded =
-        decode_response(&encode_response(&WorkerResponse::result(report)).unwrap()).unwrap();
+    let decoded = round_trip(&WorkerResponse::result(report));
     assert_eq!(
         decoded.report().unwrap().completions().next().unwrap(),
         &record
@@ -1273,7 +1182,7 @@ fn request_retirement_requires_unique_buffers_from_its_request() {
             retained_buffers,
         };
         assert!(
-            encode_request(&WorkerRequest::submit(
+            encode(&WorkerRequest::submit(
                 batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
                     .with_commands(vec![command]),
             ))
@@ -1361,7 +1270,7 @@ fn conditioned_media_admission_round_trips() {
         )],
     ));
 
-    let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+    let decoded = round_trip(&request);
     assert_eq!(
         decoded.batch().unwrap().admissions().next(),
         Some(&admission)
@@ -1417,7 +1326,7 @@ fn maximum_media_prompt_round_trips() {
         )],
     ));
 
-    let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+    let decoded = round_trip(&request);
     assert_eq!(
         decoded.batch().unwrap().admissions().next(),
         Some(&admission)
@@ -1551,10 +1460,7 @@ fn call_sampling_state_preserves_whitelist_presence() {
             force_finish: true,
         });
         let request = WorkerRequest::submit(batch_with_calls(1, Vec::new(), vec![call]));
-        assert_eq!(
-            decode_request(&encode_request(&request).unwrap()).unwrap(),
-            request
-        );
+        assert_eq!(round_trip(&request), request);
     }
 }
 
@@ -1585,7 +1491,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
         invalid.code = code;
         invalid.input_image = image;
         let request = WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
-        assert!(encode_request(&request).is_err());
+        assert!(encode(&request).is_err());
     }
 }
 
@@ -1696,7 +1602,7 @@ fn worker_info_round_trips() {
         let mapped = serde_json::to_value(&info).unwrap();
         assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
         let response = WorkerResponse::info(info.clone());
-        let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+        let decoded = round_trip(&response);
         let WorkerResponse::Info { info: decoded, .. } = decoded else {
             panic!("decoded response must preserve its info variant");
         };
@@ -1719,7 +1625,7 @@ fn kv_free_worker_info_round_trips() {
         ..WorkerInfo::default()
     };
     let response = WorkerResponse::info(info.clone());
-    let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+    let decoded = round_trip(&response);
     let WorkerResponse::Info { info: decoded, .. } = decoded else {
         panic!("decoded response must preserve its info variant");
     };
@@ -1737,7 +1643,7 @@ fn worker_info_rejects_duplicate_set_members() {
         ],
         ..Default::default()
     };
-    assert!(encode_response(&WorkerResponse::info(info)).is_err());
+    assert!(encode(&WorkerResponse::info(info)).is_err());
 }
 
 /// A KV pool needs an allocatable unit; every page size must be a power of
@@ -1746,7 +1652,7 @@ fn worker_info_rejects_duplicate_set_members() {
 #[test]
 fn worker_info_rejects_inconsistent_kv_groups() {
     let valid = full_caps();
-    assert!(encode_response(&WorkerResponse::info(valid.clone())).is_ok());
+    assert!(encode(&WorkerResponse::info(valid.clone())).is_ok());
     let cases: [fn(&mut KvCacheInfo); 6] = [
         |cache| cache.num_units = 1,
         |cache| cache.groups[1].page_tokens = 48,
@@ -1763,7 +1669,7 @@ fn worker_info_rejects_inconsistent_kv_groups() {
     for invalidate in cases {
         let mut info = valid.clone();
         invalidate(info.kv_cache.as_mut().unwrap());
-        assert!(encode_response(&WorkerResponse::info(info)).is_err());
+        assert!(encode(&WorkerResponse::info(info)).is_err());
     }
 }
 
@@ -2205,16 +2111,15 @@ fn response_fixtures() -> Vec<WorkerResponse> {
 #[test]
 fn every_request_kind_round_trips_through_ipc() {
     let fixtures = request_fixtures();
-    for kind in RequestKind::ALL {
+    for kind in [RequestKind::Info, RequestKind::Submit, RequestKind::Close] {
         assert!(
             fixtures.iter().any(|request| request.kind() == kind),
             "no fixture covers request kind {kind:?}"
         );
     }
     for request in fixtures {
-        let bytes = encode_request(&request).unwrap();
         assert_eq!(
-            decode_request(&bytes).unwrap(),
+            round_trip(&request),
             request,
             "round trip for {:?}",
             request.kind()
@@ -2237,9 +2142,8 @@ fn every_response_kind_round_trips_through_ipc() {
         );
     }
     for response in fixtures {
-        let bytes = encode_response(&response).unwrap();
         assert_eq!(
-            decode_response(&bytes).unwrap(),
+            round_trip(&response),
             response,
             "round trip for {:?}",
             response.kind()
@@ -2248,18 +2152,95 @@ fn every_response_kind_round_trips_through_ipc() {
 }
 
 #[test]
-fn ipc_decode_rejects_malformed_frames() {
-    let garbage: &[u8] = &[0x01, 0x02, 0x03];
-    assert!(decode_request(garbage).is_err());
-    assert!(decode_response(garbage).is_err());
+fn a_frame_states_the_length_of_the_message_it_carries() {
+    let frame = encode(&WorkerRequest::info()).unwrap();
+    let bytes = frame.as_bytes();
+    let (field, message) = bytes.split_at(Frame::LENGTH_BYTES);
 
-    let mut request = encode_request(&WorkerRequest::info()).unwrap();
-    request.truncate(request.len() / 2);
-    assert!(decode_request(&request).is_err());
+    assert_eq!(
+        Frame::message_len(field.try_into().unwrap(), BOUND).unwrap(),
+        message.len()
+    );
+}
 
-    let mut response = encode_response(&WorkerResponse::ok()).unwrap();
-    response.truncate(response.len() / 2);
-    assert!(decode_response(&response).is_err());
+#[test]
+fn a_truncated_or_overlong_frame_is_refused() {
+    let whole = encode(&WorkerResponse::ok()).unwrap().into_bytes();
+
+    // Fewer bytes than a length field, a message cut short, and bytes past
+    // the stated length are all refused before any decoding.
+    assert!(Frame::from_bytes(whole[..Frame::LENGTH_BYTES - 1].to_vec(), BOUND).is_err());
+    assert!(Frame::from_bytes(whole[..whole.len() - 1].to_vec(), BOUND).is_err());
+    let mut overlong = whole.clone();
+    overlong.push(0);
+    assert!(Frame::from_bytes(overlong, BOUND).is_err());
+
+    // A length field that matches its bytes does not make them a message.
+    let mut cut = whole[Frame::LENGTH_BYTES..whole.len() - 1].to_vec();
+    let mut restated = u32::try_from(cut.len()).unwrap().to_le_bytes().to_vec();
+    restated.append(&mut cut);
+    let frame = Frame::from_bytes(restated, BOUND).unwrap();
+    assert!(matches!(
+        frame.decode::<WorkerResponse>(),
+        Err(IpcError::Encoding(_))
+    ));
+}
+
+#[test]
+fn a_message_above_the_bound_is_refused_by_sender_and_receiver() {
+    let request = WorkerRequest::submit(comprehensive_batches().remove(0));
+    let frame = encode(&request).unwrap();
+    let length = frame.as_bytes().len() - Frame::LENGTH_BYTES;
+
+    // The bound counts the encoded message: exactly at it passes, one byte
+    // under it fails on both sides.
+    assert!(Frame::encode(&request, length).is_ok());
+    assert!(matches!(
+        Frame::encode(&request, length - 1),
+        Err(IpcError::Encoding(_))
+    ));
+    let field: [u8; Frame::LENGTH_BYTES] =
+        frame.as_bytes()[..Frame::LENGTH_BYTES].try_into().unwrap();
+    assert!(Frame::message_len(field, length - 1).is_err());
+    assert!(Frame::from_bytes(frame.into_bytes(), length - 1).is_err());
+}
+
+#[test]
+fn a_frame_decodes_only_as_the_message_it_carries() {
+    let request = encode(&WorkerRequest::info()).unwrap();
+    assert!(matches!(
+        request.decode::<WorkerResponse>(),
+        Err(IpcError::Encoding(_))
+    ));
+
+    let garbage = Frame::from_bytes(vec![3, 0, 0, 0, 0x01, 0x02, 0x03], BOUND).unwrap();
+    assert!(garbage.decode::<WorkerRequest>().is_err());
+    assert!(garbage.decode::<WorkerResponse>().is_err());
+}
+
+#[test]
+fn an_invalid_message_is_refused_on_both_sides_of_a_frame() {
+    // An error response must state its message.
+    let invalid = WorkerResponse::error(WorkerResponseError {
+        message: String::new(),
+        code: None,
+        fatal: true,
+        phase: None,
+        route: None,
+        calls: Vec::new(),
+    });
+    assert!(matches!(encode(&invalid), Err(IpcError::Validation(_))));
+
+    // A receiver validates what it decodes, whatever the sender did: these
+    // are the bytes a sender that skipped validation would have framed.
+    let mut message = rmp_serde::to_vec_named(&invalid).unwrap();
+    let mut bytes = u32::try_from(message.len()).unwrap().to_le_bytes().to_vec();
+    bytes.append(&mut message);
+    let frame = Frame::from_bytes(bytes, BOUND).unwrap();
+    assert!(matches!(
+        frame.decode::<WorkerResponse>(),
+        Err(IpcError::Validation(_))
+    ));
 }
 
 #[test]

@@ -131,8 +131,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             let info = client.send_request(&request(WorkerRequest::info(), 1))?;
             let info = client
                 .recv_response_timeout(&info, Duration::from_secs(60))?
-                .context("Info was not answered")?
-                .decode_response()?;
+                .context("Info was not answered")?;
             let WorkerResponse::Info { info, .. } = info else {
                 anyhow::bail!("Info failed: {info:?}");
             };
@@ -147,8 +146,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 client.send_request(&request(WorkerRequest::submit(started.clone()), 2))?;
             let first = client
                 .recv_response_timeout(&initial, Duration::from_secs(30))?
-                .context("initial submission did not complete")?
-                .decode_response()?;
+                .context("initial submission did not complete")?;
             let WorkerResponse::Result { result: first, .. } = first else {
                 anyhow::bail!("initial submission failed: {first:?}");
             };
@@ -172,8 +170,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             let close = client.send_request(&request(WorkerRequest::close(), 6))?;
             let closed = client
                 .recv_response_timeout(&close, Duration::from_secs(30))?
-                .context("Close did not drain accepted work")?
-                .decode_response()?;
+                .context("Close did not drain accepted work")?;
             anyhow::ensure!(
                 closed
                     == WorkerResponse::Ok {
@@ -184,10 +181,9 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
 
             // Receiving Close first must still leave every accepted response available.
             let receive = |pending| -> anyhow::Result<WorkerResponse> {
-                Ok(client
+                client
                     .try_recv_response(pending)?
-                    .context("Close acknowledged before accepted response delivery")?
-                    .decode_response()?)
+                    .context("Close acknowledged before accepted response delivery")
             };
             let WorkerResponse::Result { result: other, .. } = receive(&accepted)? else {
                 anyhow::bail!("independent submission did not return a result");
@@ -243,8 +239,7 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
             let pending = client.send_request(&request(WorkerRequest::submit(batch), batch_id))?;
             let response = client
                 .recv_response_timeout(&pending, Duration::from_secs(60))?
-                .context("submission did not complete")?
-                .decode_response()?;
+                .context("submission did not complete")?;
             anyhow::ensure!(
                 matches!(response, WorkerResponse::Result { .. }),
                 "submission failed: {response:?}"
@@ -266,8 +261,7 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
         let close = client.send_request(&request(WorkerRequest::close(), 3))?;
         let closed = client
             .recv_response_timeout(&close, Duration::from_secs(30))?
-            .context("Close was not acknowledged")?
-            .decode_response()?;
+            .context("Close was not acknowledged")?;
         anyhow::ensure!(
             closed
                 == WorkerResponse::Ok {
@@ -3306,7 +3300,7 @@ fn media_rank() -> anyhow::Result<()> {
     // Media attaches to rank 1's completion only in "rank-output".
     let media_rank = u32::from(case == "rank-output");
     loop {
-        let request = server.recv()?.decode_request()?;
+        let request = server.recv()?;
         let response = match request {
             WorkerRequest::Info { message_id } => WorkerResponse::Info {
                 message_id,

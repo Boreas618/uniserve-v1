@@ -5,22 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["flatbuffers-build", "flatc-fork", "serde_bytes"]
+ignored = ["serde_bytes"]
 
 [dependencies]
-flatbuffers.workspace = true
 iceoryx2.workspace = true
-iceoryx2-bb-elementary-traits.workspace = true
 libc.workspace = true
+rmp-serde.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uniserve-core.workspace = true
-
-[build-dependencies]
-flatbuffers-build.workspace = true
-flatc-fork.workspace = true
 
 [lints]
 workspace = true
