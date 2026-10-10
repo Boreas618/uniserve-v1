@@ -1,10 +1,12 @@
-//! A rank's registration with the head.
+//! The first frame on a connection to the head.
 //!
-//! A rank is started with the head's address and its own identity. It
+//! A rank is started with the head's address and its own identity, and a
+//! host's launcher with the head's address and its host identity. Each
 //! connects, and the first frame it sends is its [`Registration`]. The head
-//! answers with the rank's [`LaunchDescriptor`](crate::LaunchDescriptor),
+//! answers a rank with its [`LaunchDescriptor`](crate::LaunchDescriptor),
 //! which carries every other launch value, and the connection then carries
-//! requests and responses until it closes.
+//! requests and responses until it closes. A launcher's connection carries
+//! the messages of [`launcher`](crate::launcher) from then on.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,25 +20,53 @@ use crate::{ValidationError, ValidationResult};
 /// registration that states another version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The first frame a rank sends: who it is and what it was built as.
+/// The first frame a rank or a launcher sends: who it is and what it was
+/// built as.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Registration {
-    /// Worker group the rank was started for.
-    pub worker_id: String,
-    /// Rank within that group's process world.
-    pub rank: u32,
-    /// The launch of the group that started this rank. A group relaunched
-    /// after a failure carries the next generation, so a rank of the launch
-    /// it replaces cannot register in its place.
-    pub generation: u64,
-    /// [`VERSION`] of the build the rank runs.
-    pub version: String,
+#[serde(rename_all = "snake_case")]
+pub enum Registration {
+    /// One rank of a worker group.
+    Rank {
+        /// Worker group the rank was started for.
+        worker_id: String,
+        /// Rank within that group's process world.
+        rank: u32,
+        /// The launch of the group that started this rank. A group
+        /// relaunched after a failure carries the next generation, so a rank
+        /// of the launch it replaces cannot register in its place.
+        generation: u64,
+        /// [`VERSION`] of the build the rank runs.
+        version: String,
+    },
+    /// The launcher of one host, which starts the ranks placed there.
+    Launcher {
+        /// The host identity the launcher owns, as the placement names it.
+        host: String,
+        /// [`VERSION`] of the build the launcher runs.
+        version: String,
+    },
+}
+
+impl Registration {
+    /// Returns the build version the registration states.
+    pub fn version(&self) -> &str {
+        match self {
+            Self::Rank { version, .. } | Self::Launcher { version, .. } => version,
+        }
+    }
 }
 
 impl Message for Registration {
-    /// A registration names its worker group.
+    /// A registration names its worker group or its host.
     fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(!self.worker_id.is_empty(), "a registration names no worker");
+        match self {
+            Self::Rank { worker_id, .. } => {
+                ensure_valid!(!worker_id.is_empty(), "a registration names no worker");
+            }
+            Self::Launcher { host, .. } => {
+                ensure_valid!(!host.is_empty(), "a registration names no host");
+            }
+        }
         Ok(())
     }
 }

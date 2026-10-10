@@ -9155,11 +9155,9 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
- "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
- "uniserve-core",
  "uniserve-ipc",
 ]
 
