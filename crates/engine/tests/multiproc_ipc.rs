@@ -4,7 +4,7 @@
 //! These tests launch real rank processes (`uniserve_models.worker` with the
 //! weightless stub model on CPU) and drive them through the engine's
 //! `WorkerGroup`, `WorkerExecutor` or `EngineCore`, or through a raw
-//! `ClientEndpoint` when the worker's own protocol handling is under test.
+//! `Channel` when the worker's own protocol handling is under test.
 //! Lifecycle batches (Start, Finish, Free) exercise registration, startup,
 //! Info, admission, retirement, close and signals; token batches run the
 //! stub's text runtime (prefill, decode, verification, sampling, logprobs and
@@ -88,6 +88,55 @@ fn spawn_raw_worker(
         .spawn()?)
 }
 
+/// The head's end of one rank's channel, driven by a test: it sends requests
+/// and takes each response by the identity its request carried.
+struct RawHead {
+    channel: uniserve_ipc::Channel,
+    /// Responses read while waiting for another one.
+    inbox: std::collections::HashMap<u64, uniserve_ipc::WorkerResponse>,
+}
+
+impl RawHead {
+    fn connect(endpoint: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            channel: uniserve_ipc::Channel::connect(endpoint, 1 << 20, 8, Duration::from_secs(60))?,
+            inbox: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Sends `request` and returns the identity its response will carry.
+    fn send(&mut self, request: &uniserve_ipc::WorkerRequest) -> anyhow::Result<u64> {
+        self.channel.send(request)?;
+        request
+            .message_id()
+            .context("a request states its identity")
+    }
+
+    /// Waits up to `timeout` for the response to `message_id`; a zero timeout
+    /// takes it only if it has already arrived.
+    fn response(
+        &mut self,
+        message_id: u64,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<uniserve_ipc::WorkerResponse>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            while let Some(response) = self.channel.try_recv::<uniserve_ipc::WorkerResponse>()? {
+                self.inbox
+                    .insert(response.message_id().unwrap_or_default(), response);
+            }
+            if let Some(response) = self.inbox.remove(&message_id) {
+                return Ok(Some(response));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            self.channel.wait(remaining)?;
+        }
+    }
+}
+
 /// Waits up to `timeout` for `child` to exit.
 fn wait_exit(
     child: &mut std::process::Child,
@@ -108,7 +157,7 @@ fn wait_exit(
 
 #[test]
 fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
-    use uniserve_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
+    use uniserve_ipc::{WorkerRequest, WorkerResponse};
 
     // Each launch names its own endpoint and reports it here, so a graceful
     // exit is observable as the next launch registering and serving again.
@@ -120,17 +169,16 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             directory.path(),
         )?;
         let result = (|| -> anyhow::Result<()> {
-            let client =
-                ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 1 << 20, 8)?;
+            let mut client = RawHead::connect(&accept_reported_endpoint(&listener)?)?;
             let request = |mut request: WorkerRequest, message_id| {
                 request.set_call_id(Some(message_id));
                 request
             };
 
             // The rank describes itself once warmup is done.
-            let info = client.send_request(&request(WorkerRequest::info(), 1))?;
+            let info = client.send(&request(WorkerRequest::info(), 1))?;
             let info = client
-                .recv_response_timeout(&info, Duration::from_secs(60))?
+                .response(info, Duration::from_secs(60))?
                 .context("Info was not answered")?;
             let WorkerResponse::Info { info, .. } = info else {
                 anyhow::bail!("Info failed: {info:?}");
@@ -142,10 +190,9 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             let first = text_admission(51, 1, 1)?;
             let first_key = first.request_key;
             let started = lifecycle_batch(1, vec![first], Vec::new());
-            let initial =
-                client.send_request(&request(WorkerRequest::submit(started.clone()), 2))?;
+            let initial = client.send(&request(WorkerRequest::submit(started.clone()), 2))?;
             let first = client
-                .recv_response_timeout(&initial, Duration::from_secs(30))?
+                .response(initial, Duration::from_secs(30))?
                 .context("initial submission did not complete")?;
             let WorkerResponse::Result { result: first, .. } = first else {
                 anyhow::bail!("initial submission failed: {first:?}");
@@ -155,7 +202,6 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 first.completions.is_empty(),
                 "a lifecycle batch completed calls"
             );
-            drop(initial);
 
             // A second request starts while the first finishes. The rank's own
             // admission answers the two resubmissions of batch 1: a batch id
@@ -163,13 +209,12 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             // `InvalidDescriptor`. Close is sent behind all of them.
             let other =
                 lifecycle_batch(2, vec![text_admission(52, 1, 2)?], vec![finish(first_key)]);
-            let accepted = client.send_request(&request(WorkerRequest::submit(other), 3))?;
-            let rejected =
-                client.send_request(&request(WorkerRequest::submit(started.clone()), 4))?;
-            let duplicate = client.send_request(&request(WorkerRequest::submit(started), 5))?;
-            let close = client.send_request(&request(WorkerRequest::close(), 6))?;
+            let accepted = client.send(&request(WorkerRequest::submit(other), 3))?;
+            let rejected = client.send(&request(WorkerRequest::submit(started.clone()), 4))?;
+            let duplicate = client.send(&request(WorkerRequest::submit(started), 5))?;
+            let close = client.send(&request(WorkerRequest::close(), 6))?;
             let closed = client
-                .recv_response_timeout(&close, Duration::from_secs(30))?
+                .response(close, Duration::from_secs(30))?
                 .context("Close did not drain accepted work")?;
             anyhow::ensure!(
                 closed
@@ -180,16 +225,16 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             );
 
             // Receiving Close first must still leave every accepted response available.
-            let receive = |pending| -> anyhow::Result<WorkerResponse> {
+            let mut receive = |pending| -> anyhow::Result<WorkerResponse> {
                 client
-                    .try_recv_response(pending)?
+                    .response(pending, Duration::ZERO)?
                     .context("Close acknowledged before accepted response delivery")
             };
-            let WorkerResponse::Result { result: other, .. } = receive(&accepted)? else {
+            let WorkerResponse::Result { result: other, .. } = receive(accepted)? else {
                 anyhow::bail!("independent submission did not return a result");
             };
             anyhow::ensure!(other.batch_id == 2, "independent batch identity changed");
-            for pending in [&rejected, &duplicate] {
+            for pending in [rejected, duplicate] {
                 let WorkerResponse::Error { error, .. } = receive(pending)? else {
                     anyhow::bail!("duplicate submission was accepted");
                 };
@@ -216,7 +261,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
 
 #[test]
 fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Result<()> {
-    use uniserve_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
+    use uniserve_ipc::{WorkerRequest, WorkerResponse};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let directory = tempfile::tempdir()?;
@@ -225,20 +270,20 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
         directory.path(),
     )?;
     let result = (|| -> anyhow::Result<()> {
-        let client = ClientEndpoint::connect(&accept_reported_endpoint(&listener)?, 1 << 20, 8)?;
+        let mut client = RawHead::connect(&accept_reported_endpoint(&listener)?)?;
         let request = |mut request: WorkerRequest, message_id| {
             request.set_call_id(Some(message_id));
             request
         };
-        let serve = |batch_id: u64, request_id: u64, slot: u32| -> anyhow::Result<()> {
+        let mut serve = |batch_id: u64, request_id: u64, slot: u32| -> anyhow::Result<()> {
             let batch = lifecycle_batch(
                 batch_id,
                 vec![text_admission(request_id, 1, slot)?],
                 Vec::new(),
             );
-            let pending = client.send_request(&request(WorkerRequest::submit(batch), batch_id))?;
+            let pending = client.send(&request(WorkerRequest::submit(batch), batch_id))?;
             let response = client
-                .recv_response_timeout(&pending, Duration::from_secs(60))?
+                .response(pending, Duration::from_secs(60))?
                 .context("submission did not complete")?;
             anyhow::ensure!(
                 matches!(response, WorkerResponse::Result { .. }),
@@ -258,9 +303,9 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
         }
         serve(2, 62, 2)?;
 
-        let close = client.send_request(&request(WorkerRequest::close(), 3))?;
+        let close = client.send(&request(WorkerRequest::close(), 3))?;
         let closed = client
-            .recv_response_timeout(&close, Duration::from_secs(30))?
+            .response(close, Duration::from_secs(30))?
             .context("Close was not acknowledged")?;
         anyhow::ensure!(
             closed
@@ -1424,7 +1469,7 @@ fn stub_launch_descriptor(registration: &str) -> LaunchDescriptor {
     LaunchDescriptor {
         worker_id: "worker".into(),
         registration_address: registration.to_owned(),
-        channel_transport: uniserve_ipc::SHARED_STORAGE_CHANNEL.into(),
+        channel_transport: uniserve_ipc::UNIX_CHANNEL.into(),
         acknowledgment_slot: 0,
         host_slots: vec![0],
         products_cross_hosts: false,
@@ -3256,7 +3301,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
 fn media_rank() -> anyhow::Result<()> {
     use std::io::Write as _;
     use uniserve_ipc::{
-        ArtifactHandle, BatchOutput, LaunchDescriptor, MediaOutput, RankReport, RankServer,
+        ArtifactHandle, BatchOutput, LaunchDescriptor, Listener, MediaOutput, RankReport,
         RequestOutput, WorkerRequest, WorkerResponse,
     };
 
@@ -3277,37 +3322,48 @@ fn media_rank() -> anyhow::Result<()> {
     info.endpoint.address_space = format!("rust:{}", std::process::id());
     info.endpoint.incarnation = format!("media-rank-{}-{}", descriptor.rank, std::process::id());
 
-    let service =
-        uniserve_ipc::service_name(&format!("media_{}_{}", std::process::id(), descriptor.rank));
-    let mut server = RankServer::bind(
-        &descriptor.channel_transport,
-        &service,
+    let directory = tempfile::tempdir()?;
+    let address = if descriptor.channel_transport == uniserve_ipc::TCP_CHANNEL {
+        "127.0.0.1:0".to_owned()
+    } else {
+        format!("unix:{}", directory.path().join("media.sock").display())
+    };
+    let listener = Listener::bind(
+        &[&address],
         descriptor.ipc_payload_cap,
         descriptor.queue_depth,
     )?;
     let report = RankReport {
         worker_id: descriptor.worker_id.clone(),
         rank: descriptor.rank,
-        transport: server.transport().to_owned(),
-        endpoint: server.endpoint(&service),
+        transport: descriptor.channel_transport.clone(),
+        endpoint: listener.addresses()[0].clone(),
     };
     let mut registration = std::net::TcpStream::connect(&descriptor.registration_address)?;
     let mut line = serde_json::to_vec(&report)?;
     line.push(b'\n');
     registration.write_all(&line)?;
     drop(registration);
+    let mut server = listener
+        .accept(Duration::from_secs(60))?
+        .context("the head connects to the endpoint a rank reports")?;
 
     // Media attaches to rank 1's completion only in "rank-output".
     let media_rank = u32::from(case == "rank-output");
     loop {
-        let request = server.recv()?;
+        let request = loop {
+            if let Some(request) = server.try_recv::<WorkerRequest>()? {
+                break request;
+            }
+            server.wait(Duration::from_secs(1))?;
+        };
         let response = match request {
             WorkerRequest::Info { message_id } => WorkerResponse::Info {
                 message_id,
                 info: info.clone(),
             },
             WorkerRequest::Close { message_id } => {
-                server.respond(&WorkerResponse::Ok { message_id })?;
+                server.send(&WorkerResponse::Ok { message_id })?;
                 return Ok(());
             }
             WorkerRequest::Submit { message_id, batch } => {
@@ -3368,7 +3424,7 @@ fn media_rank() -> anyhow::Result<()> {
                 }
             }
         };
-        server.respond(&response)?;
+        server.send(&response)?;
     }
 }
 

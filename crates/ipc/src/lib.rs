@@ -9,12 +9,10 @@
 //! rank, each as the one message of a [`Frame`]: a length followed by the
 //! message in the binary encoding its `serde` derive describes. These message
 //! types are the only definition of the protocol, so the engine and the worker
-//! library must be built from the same sources. The engine reaches a rank on
-//! the head's host through [`iceoryx`] shared storage and a rank on another
-//! host through a [`socket`] stream; both carry the same frames, and
-//! [`channel`] presents either one as a [`RankChannel`] (engine side) or
-//! [`RankServer`] (rank side). The rank runtime (`uniserve-worker`) binds
-//! [`RankServer`] and is started with a [`LaunchDescriptor`].
+//! library must be built from the same sources. A [`Channel`] carries the
+//! frames over a stream connection: a Unix socket to a rank on the head's
+//! host, TCP to a rank on another host. The rank runtime (`uniserve-worker`)
+//! serves its end and is started with a [`LaunchDescriptor`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -79,29 +77,24 @@ macro_rules! ensure_valid {
     };
 }
 
-/// Both ends of a rank channel over either transport.
+/// The stream connection that carries frames, and its listener.
 pub mod channel;
-/// The unit both transports carry: a length and one encoded message.
+/// Failures at the channel boundary.
+pub mod error;
+/// The unit a channel carries: a length and one encoded message.
 pub mod frame;
-/// Shared-storage rank transport for ranks on the head's host.
-pub mod iceoryx;
 /// The launch descriptor shared by the engine, `uniserve-host` and the rank.
 pub mod launch;
 /// Messages between the head's engine and a host's `uniserve-host` launcher.
 pub mod launcher;
-/// Stream-socket rank transport for ranks on other hosts.
-pub mod socket;
+/// A rank's report of its channel endpoint.
+pub mod registration;
 
-pub use channel::{
-    Outstanding, RankChannel, RankReport, RankServer, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL, Wake,
-};
+pub use channel::{Channel, Listener, Wake};
+pub use error::{IpcError, IpcResult};
 pub use frame::{Frame, Message};
-pub use iceoryx::{
-    ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT,
-    IpcError, IpcResult, Pending, ServerEndpoint, WakeEvents, WakeSender, service_name,
-};
 pub use launch::{ExpertParallelDescriptor, LaunchDescriptor};
-pub use socket::{SocketClient, SocketServer};
+pub use registration::{RankReport, TCP_CHANNEL, UNIX_CHANNEL};
 
 // Message types are split by concern and re-exported flat at the crate root;
 // each module takes the shared imports through `use super::*` and the

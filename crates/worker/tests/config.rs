@@ -16,7 +16,7 @@ fn defaults() -> Value {
     json!({
         "worker_id": "worker",
         "registration_address": "127.0.0.1:0",
-        "channel_transport": "iceoryx2",
+        "channel_transport": "unix",
         "acknowledgment_slot": 0,
         "host_slots": [0],
         "products_cross_hosts": false,

@@ -99,7 +99,7 @@ pub struct LaunchDescriptor {
     /// `host:port` the rank reports its channel endpoint to.
     pub registration_address: String,
     /// Channel mechanism the rank serves its endpoint over
-    /// (`SHARED_STORAGE_CHANNEL` or `SOCKET_CHANNEL`).
+    /// (`UNIX_CHANNEL` or `TCP_CHANNEL`).
     pub channel_transport: String,
     /// This rank's word in every published product's acknowledgment array.
     pub acknowledgment_slot: u32,
