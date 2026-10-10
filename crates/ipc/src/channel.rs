@@ -396,6 +396,33 @@ impl Channel {
         self.writer.depth = depth.max(1);
     }
 
+    /// Returns this end's address on a TCP connection, and `None` on a Unix
+    /// socket.
+    ///
+    /// It is the address the peer reached this end at, which is how a process
+    /// that binds every interface learns an address its peers route to.
+    pub fn local_addr(&self) -> IpcResult<Option<SocketAddr>> {
+        match &self.stream {
+            Stream::Unix(_) => Ok(None),
+            Stream::Tcp(stream) => stream
+                .local_addr()
+                .map(Some)
+                .map_err(|error| transport("reading a channel's local address", error)),
+        }
+    }
+
+    /// Returns the peer's address on a TCP connection, and `None` on a Unix
+    /// socket.
+    pub fn peer_addr(&self) -> IpcResult<Option<SocketAddr>> {
+        match &self.stream {
+            Stream::Unix(_) => Ok(None),
+            Stream::Tcp(stream) => stream
+                .peer_addr()
+                .map(Some)
+                .map_err(|error| transport("reading a channel's peer address", error)),
+        }
+    }
+
     /// Returns a handle that fires this channel's local wake.
     pub fn wake(&self) -> Wake {
         self.local.wake.clone()
@@ -722,6 +749,13 @@ mod tests {
         for address in listener.addresses() {
             let mut near = Channel::connect(address, TIMEOUT).unwrap();
             let mut far = listener.accept(TIMEOUT).unwrap().expect("a connection");
+
+            // Only a TCP connection has addresses, and each end's local
+            // address is the other's peer address.
+            let tcp = !address.starts_with(UNIX_PREFIX);
+            assert_eq!(near.local_addr().unwrap().is_some(), tcp);
+            assert_eq!(near.local_addr().unwrap(), far.peer_addr().unwrap());
+            assert_eq!(near.peer_addr().unwrap(), far.local_addr().unwrap());
 
             let mut request = WorkerRequest::info();
             request.set_call_id(Some(77));

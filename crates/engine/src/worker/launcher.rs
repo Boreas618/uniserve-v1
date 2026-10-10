@@ -1,10 +1,10 @@
 //! The head's registry of per-host launchers.
 //!
 //! The engine starts no process on another host. Each host of a deployment
-//! runs one `uniserve-host` launcher that connects here and presents its host
-//! identity; the head then sends that launcher the launch descriptors of the
+//! runs one `uniserve-host` launcher that connects to the head and registers
+//! its host identity; the head then sends that launcher the launches of the
 //! ranks the placement put on its host, of every worker group, and the
-//! launcher spawns them. The registry is bound once per deployment and shared
+//! launcher spawns them. The registry is built once per deployment and shared
 //! by its groups, so a host presents one launcher however many workers place
 //! ranks on it; a rank is named to its launcher by worker and rank.
 //!
@@ -13,20 +13,28 @@
 //! can no longer reach without adding a heartbeat.
 //!
 //! The messages are `uniserve_ipc::launcher`'s, which the `uniserve-host`
-//! binary shares. A `Stop` ends a group's generation before the group is
-//! relaunched under the next one. A launcher may report an exit of a stopped
-//! rank before it reads the `Stop`, and the head may read that report only
-//! after the relaunch, so an exit is attributed to a group only when it names
-//! the group's current generation.
+//! binary shares, carried as frames on the connection the launcher registered
+//! on (`head::Head`). A `Stop` ends a group's launch before the group is
+//! relaunched under the next generation. A launcher may report an exit of a
+//! stopped rank before it reads the `Stop`, and the head may read that report
+//! only after the relaunch, so an exit is attributed to a group only when it
+//! names the generation of the group's running launch.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use uniserve_ipc::launcher::{Instruction, Presentation, RankExit, RankSpawn, Report};
+use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report};
+use uniserve_ipc::{Channel, IpcError};
+
+/// Longest a launcher may take to accept an instruction or to answer a
+/// reservation.
+const LAUNCHER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Frames queued for a launcher that reads slowly; a group's launch sends
+/// one instruction per rank without waiting for the launcher in between.
+const INSTRUCTION_DEPTH: usize = 256;
 
 /// The registry of one deployment, shared by every group that places a rank
 /// on another host.
@@ -42,17 +50,25 @@ pub(crate) fn lock(
 }
 
 /// One connected launcher.
-///
-/// `reader` wraps a clone of `stream`'s socket. Reports are read only through
-/// `reader`, so its buffer and `pending` stay coherent, and instructions are
-/// written only through `stream`. Blocking mode and read timeouts belong to
-/// the socket, so setting them on `stream` also governs reads through
-/// `reader`.
 struct Launcher {
-    stream: TcpStream,
-    reader: BufReader<TcpStream>,
-    /// Partial report retained across nonblocking reads.
-    pending: Vec<u8>,
+    channel: Channel,
+}
+
+impl Launcher {
+    /// Sends one instruction, waiting while the send queue is full.
+    fn send(&mut self, instruction: &Instruction) -> anyhow::Result<()> {
+        let deadline = Instant::now() + LAUNCHER_TIMEOUT;
+        loop {
+            match self.channel.send(instruction) {
+                Ok(()) => return Ok(()),
+                Err(IpcError::WouldBlock) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(!remaining.is_zero(), "the launcher accepts no instruction");
+            self.channel.wait(remaining)?;
+        }
+    }
 }
 
 /// Rank exits read from the launchers and not yet taken, and the generation
@@ -111,42 +127,23 @@ impl ExitReports {
     }
 }
 
-/// The head's launcher registration address and the launchers that presented.
+/// The launchers that registered with the head, and the exits they report.
 pub(crate) struct LauncherRegistry {
-    listener: TcpListener,
-    address: String,
-    /// Connected launchers by the host identity each presented.
+    /// Connected launchers by the host identity each registered.
     hosts: HashMap<String, Launcher>,
     /// Exits read from the launchers, kept for the group each belongs to.
     exits: ExitReports,
 }
 
 impl LauncherRegistry {
-    /// Binds the address every host's launcher connects to.
-    ///
-    /// A launcher may run on another machine, so this binds every interface
-    /// rather than loopback; a single-host instance still reaches it locally.
-    pub(crate) fn bind() -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-            .context("binding the launcher registration address")?;
-        let address = listener
-            .local_addr()
-            .context("reading the launcher registration address")?
-            .to_string();
-        Ok(Self {
-            listener,
-            address,
-            hosts: HashMap::new(),
-            exits: ExitReports::default(),
-        })
-    }
-
-    /// Binds a registry and waits for every remote host of a deployment.
+    /// Builds a registry and waits for every remote host of a deployment to
+    /// register its launcher with `head`.
     ///
     /// `host` is this process's own identity; a launcher is awaited for each
     /// other host any of the placements names. A deployment placing every
     /// rank on this host needs no registry.
     pub(crate) fn for_hosts(
+        head: &super::head::SharedHead,
         host: &str,
         placements: impl IntoIterator<Item = impl AsRef<[crate::WorkerRank]>>,
         timeout: Duration,
@@ -167,27 +164,26 @@ impl LauncherRegistry {
         if remote_hosts.is_empty() {
             return Ok(None);
         }
-        let mut registry = Self::bind()?;
+
+        let mut registry = Self {
+            hosts: HashMap::new(),
+            exits: ExitReports::default(),
+        };
         tracing::info!(
-            address = registry.address(),
+            address = super::head::lock(head)?.tcp_address(),
             hosts = ?remote_hosts,
             "awaiting a launcher for each host this instance does not run on"
         );
-        registry.await_hosts(&remote_hosts, timeout)?;
+        registry.await_hosts(head, &remote_hosts, timeout)?;
         Ok(Some(Arc::new(Mutex::new(registry))))
-    }
-
-    /// Returns the address a launcher's command line names.
-    pub(crate) fn address(&self) -> &str {
-        &self.address
     }
 
     /// Returns a host address of this machine that a launcher reached it at.
     ///
     /// The head cannot name itself: its placement identity need not resolve on
     /// another host, and a bound wildcard address names no interface. But a
-    /// launcher has already connected to this listener, so the connection's
-    /// local address is a head address reachable from a launcher host. The
+    /// launcher has already connected to the head, so the connection's local
+    /// address is a head address reachable from a launcher host. The
     /// rendezvous address and the head's address handed to remote ranks must
     /// use that address.
     pub(crate) fn reachable_host(&self) -> anyhow::Result<std::net::IpAddr> {
@@ -197,85 +193,40 @@ impl LauncherRegistry {
             .next()
             .context("no launcher has presented a reachable head address")?;
         Ok(launcher
-            .stream
-            .local_addr()
-            .context("reading the head address a launcher reached")?
+            .channel
+            .local_addr()?
+            .context("a launcher reached the head over a Unix socket")?
             .ip())
     }
 
-    /// Waits until every named host has presented a launcher.
+    /// Waits until every named host has registered a launcher with `head`.
     ///
-    /// A host that never presents fails the launch by name rather than leaving
-    /// the instance waiting for ranks that were never started. Only this
-    /// function accepts connections, so a launcher that connects after the
-    /// last awaited host presented is never read. A presentation that cannot
-    /// be read or decoded fails the wait.
+    /// A host that never registers fails the launch by name rather than
+    /// leaving the instance waiting for ranks that were never started. A
+    /// launcher of another build than the head's fails the wait by name.
     pub(crate) fn await_hosts(
         &mut self,
+        head: &super::head::SharedHead,
         hosts: &[String],
         timeout: Duration,
     ) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
-        self.listener
-            .set_nonblocking(true)
-            .context("polling for launcher connections")?;
-        while hosts.iter().any(|host| !self.hosts.contains_key(host)) {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    let host = Self::present(stream)?;
-                    tracing::info!(host = %host.0, "a launcher presented its host");
-                    self.hosts.insert(host.0, host.1);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    anyhow::ensure!(
-                        Instant::now() < deadline,
-                        "no launcher presented host {} before its deadline",
-                        hosts
-                            .iter()
-                            .find(|host| !self.hosts.contains_key(*host))
-                            .map(String::as_str)
-                            .unwrap_or("<unknown>")
-                    );
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => {
-                    return Err(error).context("accepting a launcher connection");
-                }
+        loop {
+            let mut head = super::head::lock(head)?;
+            for (host, mut channel) in head.take_launchers(hosts)? {
+                tracing::info!(host = %host, "a launcher presented its host");
+                channel.set_capacity(uniserve_ipc::channel::INITIAL_BOUND, INSTRUCTION_DEPTH);
+                self.hosts.insert(host, Launcher { channel });
             }
+            let Some(missing) = hosts.iter().find(|host| !self.hosts.contains_key(*host)) else {
+                return Ok(());
+            };
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "no launcher presented host {missing} before its deadline"
+            );
+            head.park()?;
         }
-        Ok(())
-    }
-
-    /// Reads one launcher's presentation.
-    fn present(stream: TcpStream) -> anyhow::Result<(String, Launcher)> {
-        stream
-            .set_nonblocking(false)
-            .context("reading a launcher presentation")?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .context("bounding a launcher presentation")?;
-        let mut reader = BufReader::new(
-            stream
-                .try_clone()
-                .context("splitting a launcher connection for reading")?,
-        );
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .context("reading a launcher presentation")?;
-        let presentation: Presentation = serde_json::from_str(line.trim())
-            .with_context(|| format!("decoding a launcher presentation: {}", line.trim()))?;
-        stream
-            .set_read_timeout(None)
-            .context("clearing a launcher's read deadline")?;
-        Ok((
-            presentation.host,
-            Launcher {
-                stream,
-                reader,
-                pending: Vec::new(),
-            },
-        ))
     }
 
     /// Returns the rendezvous for a group whose first rank runs on `host`,
@@ -295,42 +246,45 @@ impl LauncherRegistry {
             .hosts
             .get_mut(host)
             .with_context(|| format!("no launcher presented host {host}"))?;
-        let address = launcher.stream.peer_addr()?.ip();
-
-        let reserve = Instruction::Reserve {
+        let address = launcher
+            .channel
+            .peer_addr()?
+            .context("a launcher reached the head over a Unix socket")?
+            .ip();
+        launcher.send(&Instruction::Reserve {
             worker_id: worker_id.to_owned(),
-        };
-        writeln!(launcher.stream, "{}", serde_json::to_string(&reserve)?)?;
-        launcher
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(10)))?;
+        })?;
+
         // The launcher may report rank exits before it answers; those are
-        // kept for their groups and the read continues until the reply. The
-        // closure lets the read deadline be cleared on every exit path.
-        let reservation = (|| {
-            loop {
-                let read = launcher.reader.read_until(b'\n', &mut launcher.pending)?;
-                anyhow::ensure!(read > 0, "launcher disconnected while reserving rendezvous");
-                let report: Report = serde_json::from_slice(&launcher.pending)?;
-                launcher.pending.clear();
-                match report {
-                    Report::Reservation(reservation) => {
-                        anyhow::ensure!(
-                            reservation.worker_id == worker_id && reservation.port > 0,
-                            "invalid rendezvous reservation"
-                        );
-                        return Ok(super::head::Rendezvous {
-                            address: SocketAddr::new(address, reservation.port).to_string(),
-                            listener: None,
-                            listen_fd: Some(reservation.listen_fd),
-                        });
-                    }
-                    Report::Exit(exit) => self.exits.file(host, exit),
+        // kept for their groups and the wait continues until the reply.
+        let deadline = Instant::now() + LAUNCHER_TIMEOUT;
+        loop {
+            match launcher.channel.try_recv::<Report>() {
+                Ok(Some(Report::Reservation(reservation))) => {
+                    anyhow::ensure!(
+                        reservation.worker_id == worker_id && reservation.port > 0,
+                        "invalid rendezvous reservation"
+                    );
+                    return Ok(super::head::Rendezvous {
+                        address: std::net::SocketAddr::new(address, reservation.port).to_string(),
+                        listener: None,
+                        listen_fd: Some(reservation.listen_fd),
+                    });
+                }
+                Ok(Some(Report::Exit(exit))) => self.exits.file(host, exit),
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    anyhow::ensure!(
+                        !remaining.is_zero(),
+                        "the launcher of host {host} did not answer a rendezvous reservation"
+                    );
+                    launcher.channel.wait(remaining)?;
+                }
+                Err(error) => {
+                    return Err(error).context("launcher disconnected while reserving rendezvous");
                 }
             }
-        })();
-        launcher.stream.set_read_timeout(None)?;
-        reservation
+        }
     }
 
     /// Sends one rank's launch to the launcher that owns its host, and takes
@@ -342,45 +296,25 @@ impl LauncherRegistry {
             .hosts
             .get_mut(host)
             .with_context(|| format!("no launcher presented host {host}"))?;
-        let line = serde_json::to_string(&Instruction::Spawn(Box::new(spawn)))
-            .context("encoding a remote launch")?;
         launcher
-            .stream
-            .write_all(format!("{line}\n").as_bytes())
-            .with_context(|| format!("sending a launch to host {host}"))?;
-        launcher
-            .stream
-            .flush()
-            .with_context(|| format!("flushing a launch to host {host}"))
+            .send(&Instruction::Spawn(Box::new(spawn)))
+            .with_context(|| format!("sending a launch to host {host}"))
     }
 
-    /// Takes every exit of one worker group's current generation its
-    /// launchers have reported, keeping the other groups' exits for their own
-    /// owners.
+    /// Takes every exit of one worker group's running launch its launchers
+    /// have reported, keeping the other groups' exits for their own owners.
     ///
     /// The drain is best effort and never blocks: it reads whatever each
-    /// connection holds, keeps a partial line in `pending` for the next call,
-    /// discards lines that do not decode as a `RankExit` and exits of a
-    /// generation a stop has ended, and moves on from a launcher whose socket
-    /// cannot be switched to nonblocking mode or at its first read error or
-    /// end of stream. A closed launcher connection is therefore not reported
-    /// here.
+    /// connection holds, discards exits of a launch a stop has ended, and
+    /// moves on from a launcher at its first receive error or close. A closed
+    /// launcher connection is therefore not reported here.
     pub(crate) fn drain_exits(&mut self, worker_id: &str) -> Vec<(String, RankExit)> {
         for (host, launcher) in self.hosts.iter_mut() {
-            if launcher.stream.set_nonblocking(true).is_err() {
-                continue;
-            }
-            while launcher
-                .reader
-                .read_until(b'\n', &mut launcher.pending)
-                .is_ok_and(|read| read > 0)
-            {
-                if let Ok(Report::Exit(exit)) = serde_json::from_slice(&launcher.pending) {
+            while let Ok(Some(report)) = launcher.channel.try_recv::<Report>() {
+                if let Report::Exit(exit) = report {
                     self.exits.file(host, exit);
                 }
-                launcher.pending.clear();
             }
-            let _ = launcher.stream.set_nonblocking(false);
         }
         self.exits.take(worker_id)
     }
@@ -388,7 +322,7 @@ impl LauncherRegistry {
     /// Stops one worker group's ranks on every launcher, ahead of relaunching
     /// the group; the launchers stay connected for the other groups.
     ///
-    /// The group's generation ends first, even if a stop cannot be sent: its
+    /// The group's launch ends first, even if a stop cannot be sent: its
     /// exits already collected are discarded, and so is any exit of the
     /// stopped ranks read later, including one a launcher wrote before it
     /// read the stop. The launcher drops the stopped ranks from its
@@ -399,16 +333,10 @@ impl LauncherRegistry {
         let stop = Instruction::Stop {
             worker_id: worker_id.to_owned(),
         };
-        let line = serde_json::to_string(&stop).context("encoding a worker stop")?;
         for (host, launcher) in self.hosts.iter_mut() {
             launcher
-                .stream
-                .write_all(format!("{line}\n").as_bytes())
+                .send(&stop)
                 .with_context(|| format!("sending a worker stop to host {host}"))?;
-            launcher
-                .stream
-                .flush()
-                .with_context(|| format!("flushing a worker stop to host {host}"))?;
         }
         Ok(())
     }
@@ -422,14 +350,7 @@ impl Drop for LauncherRegistry {
     /// close does the work either way.
     fn drop(&mut self) {
         for (host, launcher) in self.hosts.iter_mut() {
-            let Ok(line) = serde_json::to_string(&Instruction::Terminate) else {
-                continue;
-            };
-            if launcher
-                .stream
-                .write_all(format!("{line}\n").as_bytes())
-                .is_err()
-            {
+            if launcher.channel.send(&Instruction::Terminate).is_err() {
                 tracing::debug!(host = %host, "a launcher was already gone at shutdown");
             }
         }
@@ -497,16 +418,62 @@ impl RemoteHost<'_> {
 #[cfg(test)]
 mod tests {
     use super::{LauncherRegistry, RankSpawn};
+    use crate::worker::head::{Head, SharedHead, lock};
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
     use std::time::{Duration, Instant};
+    use uniserve_ipc::launcher::{Instruction, RankExit, Report};
+    use uniserve_ipc::{Channel, Message, Registration, VERSION};
 
-    /// Reads one newline-delimited JSON message from the other end.
-    fn receive(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("a message arrives");
-        serde_json::from_str(&line).expect("the message is JSON")
+    /// Binds a head and connects a launcher of host `b` to its TCP port.
+    fn head_and_launcher() -> (SharedHead, Channel) {
+        let head = Head::bind(true).expect("the head binds");
+        let port = lock(&head)
+            .expect("the head locks")
+            .tcp_address()
+            .rsplit_once(':')
+            .expect("a port")
+            .1
+            .to_owned();
+        let mut launcher = Channel::connect(&format!("127.0.0.1:{port}"), Duration::from_secs(5))
+            .expect("the launcher connects");
+        launcher
+            .send(&Registration::Launcher {
+                host: "b".into(),
+                version: VERSION.into(),
+            })
+            .expect("the launcher registers");
+        (head, launcher)
+    }
+
+    /// A registry in which host `b` has presented.
+    fn registry(head: &SharedHead) -> LauncherRegistry {
+        LauncherRegistry::for_hosts(
+            head,
+            "a",
+            [[crate::WorkerRank {
+                node: "b".into(),
+                device: "cpu".into(),
+            }]],
+            Duration::from_secs(5),
+        )
+        .expect("host b presents")
+        .and_then(|registry| std::sync::Arc::try_unwrap(registry).ok())
+        .and_then(|registry| registry.into_inner().ok())
+        .expect("a registry for host b")
+    }
+
+    /// Waits for the launcher's next message from the head.
+    fn receive<M: Message>(launcher: &mut Channel) -> M {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(message) = launcher.try_recv().expect("the head is connected") {
+                return message;
+            }
+            assert!(Instant::now() < deadline, "no message arrived");
+            launcher
+                .wait(Duration::from_millis(20))
+                .expect("the launcher waits");
+        }
     }
 
     /// One rank's launch on host `b`, as the head sends it.
@@ -520,6 +487,16 @@ mod tests {
             head: "127.0.0.1:1".to_owned(),
             environment: HashMap::new(),
         }
+    }
+
+    /// An exit of the rank `spawn` launched.
+    fn exit(spawn: &RankSpawn, status: &str) -> Report {
+        Report::Exit(RankExit {
+            worker_id: spawn.worker_id.clone(),
+            generation: spawn.generation,
+            rank: spawn.rank,
+            status: status.to_owned(),
+        })
     }
 
     /// Returns the statuses of the first nonempty drain of `worker_id`'s
@@ -540,118 +517,85 @@ mod tests {
     /// the group whose ranks it ends.
     #[test]
     fn exits_are_routed_to_their_worker_and_a_stop_names_its_worker() {
-        let mut registry = LauncherRegistry::bind().expect("a registry binds");
-        let address = registry.address().to_owned();
-        let launcher = std::thread::spawn(move || {
-            let mut stream = TcpStream::connect(address).expect("the launcher connects");
-            stream
-                .write_all(b"{\"host\":\"b\"}\n")
-                .expect("the launcher presents");
-            let mut reader = BufReader::new(stream.try_clone().expect("the connection splits"));
+        let (head, mut launcher) = head_and_launcher();
+        let mut registry = registry(&head);
 
-            // Both ranks are launched, and then both exit.
-            receive(&mut reader);
-            receive(&mut reader);
-            stream
-                .write_all(
-                    b"{\"worker_id\":\"model\",\"generation\":1,\"rank\":5,\
-                      \"status\":\"exit status: 1\"}\n\
-                      {\"worker_id\":\"host\",\"generation\":1,\"rank\":1,\
-                      \"status\":\"exit status: 2\"}\n",
-                )
-                .expect("the launcher reports two exits");
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .expect("the launcher reads the stop");
-            line
-        });
-        registry
-            .await_hosts(&["b".to_owned()], Duration::from_secs(5))
-            .expect("host b presents");
+        // Both ranks are launched, and then both exit.
         for (worker, rank) in [("model", 5), ("host", 1)] {
             registry
                 .spawn_remote("b", spawn(worker, rank, 1))
                 .expect("the rank is launched");
         }
+        for status in ["exit status: 1", "exit status: 2"] {
+            let Instruction::Spawn(launched) = receive(&mut launcher) else {
+                panic!("the head launches a rank");
+            };
+            launcher
+                .send(&exit(&launched, status))
+                .expect("the launcher reports an exit");
+        }
 
         // Both exits arrive on one connection; each group takes its own and
         // the other's is kept for its owner.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut model_exits = Vec::new();
-        while model_exits.is_empty() && std::time::Instant::now() < deadline {
-            model_exits = registry.drain_exits("model");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(model_exits.len(), 1);
-        assert_eq!((model_exits[0].0.as_str(), model_exits[0].1.rank), ("b", 5));
+        assert_eq!(await_exits(&mut registry, "model"), ["exit status: 1"]);
         let host_exits = registry.drain_exits("host");
         assert_eq!(host_exits.len(), 1);
         assert_eq!(
-            (host_exits[0].1.worker_id.as_str(), host_exits[0].1.rank),
-            ("host", 1)
+            (
+                host_exits[0].0.as_str(),
+                host_exits[0].1.worker_id.as_str(),
+                host_exits[0].1.rank
+            ),
+            ("b", "host", 1)
         );
         assert!(registry.drain_exits("model").is_empty());
 
         registry.stop_worker("host").expect("the stop is sent");
-        let stop = launcher.join().expect("the launcher thread ends");
-        assert_eq!(stop.trim(), "{\"stop\":{\"worker_id\":\"host\"}}");
+        assert_eq!(
+            receive::<Instruction>(&mut launcher),
+            Instruction::Stop {
+                worker_id: "host".into()
+            }
+        );
     }
 
-    /// A stop ends a group's generation: an exit its launcher reported for
-    /// a stopped rank before reading the stop, and which the head has not
-    /// read when it relaunches the group, is not attributed to the relaunch,
+    /// A stop ends a group's launch: an exit its launcher reported for a
+    /// stopped rank before reading the stop, and which the head has not read
+    /// when it relaunches the group, is not attributed to the relaunch,
     /// while an exit of a relaunched rank is.
     #[test]
     fn an_exit_reported_before_a_stop_is_not_attributed_to_the_relaunch() {
-        let mut registry = LauncherRegistry::bind().expect("a registry binds");
-        let address = registry.address().to_owned();
-        let (reported, stale_exit_written) = std::sync::mpsc::channel();
-        let launcher = std::thread::spawn(move || {
-            let mut stream = TcpStream::connect(address).expect("the launcher connects");
-            stream
-                .write_all(b"{\"host\":\"b\"}\n")
-                .expect("the launcher presents");
-            let mut reader = BufReader::new(stream.try_clone().expect("the connection splits"));
+        let (head, mut launcher) = head_and_launcher();
+        let mut registry = registry(&head);
 
-            // A launcher reports an exit under the generation its rank's
-            // spawn carried.
-            let mut report = |spawn: &serde_json::Value, status: &str| {
-                let exit = serde_json::json!({
-                    "worker_id": spawn["spawn"]["worker_id"],
-                    "generation": spawn["spawn"]["generation"],
-                    "rank": spawn["spawn"]["rank"],
-                    "status": status,
-                });
-                writeln!(stream, "{exit}").expect("the launcher reports an exit");
-            };
-
-            // The failed rank's exit is written before the stop is read.
-            let failed = receive(&mut reader);
-            report(&failed, "signal: 9 (SIGKILL)");
-            reported.send(()).expect("the head awaits the report");
-            let stop = receive(&mut reader);
-            let relaunched = receive(&mut reader);
-            report(&relaunched, "exit status: 1");
-            stop
-        });
-        registry
-            .await_hosts(&["b".to_owned()], Duration::from_secs(5))
-            .expect("host b presents");
-
+        // The failed rank's exit is written before the stop is read.
         registry
             .spawn_remote("b", spawn("model", 5, 1))
             .expect("the rank is launched");
-        stale_exit_written
-            .recv()
+        let Instruction::Spawn(failed) = receive(&mut launcher) else {
+            panic!("the head launches a rank");
+        };
+        launcher
+            .send(&exit(&failed, "signal: 9 (SIGKILL)"))
             .expect("the launcher reports the failed rank");
+
         registry.stop_worker("model").expect("the stop is sent");
         registry
             .spawn_remote("b", spawn("model", 5, 2))
             .expect("the rank is relaunched");
+        assert_eq!(
+            receive::<Instruction>(&mut launcher),
+            Instruction::Stop {
+                worker_id: "model".into()
+            }
+        );
+        let Instruction::Spawn(relaunched) = receive(&mut launcher) else {
+            panic!("the head relaunches the rank");
+        };
+        launcher
+            .send(&exit(&relaunched, "exit status: 1"))
+            .expect("the launcher reports the relaunched rank");
 
         assert_eq!(await_exits(&mut registry, "model"), ["exit status: 1"]);
-        let stop = launcher.join().expect("the launcher thread ends");
-        assert_eq!(stop, serde_json::json!({"stop": {"worker_id": "model"}}));
     }
 }

@@ -441,8 +441,16 @@ impl WorkerGroup {
         // One launcher per host serves every group of the deployment, so the
         // registry is bound and its hosts awaited once, before any group
         // sends a rank to them.
+        // One listener serves every group of the deployment and the launchers
+        // of its other hosts. Its TCP port is routable only when some rank
+        // runs on another host.
+        let remote = arguments
+            .iter()
+            .any(|args| args.ranks.iter().any(|rank| rank.node != args.host));
+        let head = super::head::Head::bind(remote)?;
         let launchers = match arguments.first() {
             Some(first) => super::launcher::LauncherRegistry::for_hosts(
+                &head,
                 &first.host,
                 arguments.iter().map(|args| args.ranks.as_slice()),
                 first.launcher_timeout,
@@ -480,10 +488,6 @@ impl WorkerGroup {
             }
             expert_store = rendezvous.listener;
         }
-
-        // One listener serves every group of the deployment. Its TCP port is
-        // routable only when some rank runs on another host.
-        let head = super::head::Head::bind(launchers.is_some())?;
 
         // Every group's processes start before any group waits for
         // registrations, so their interpreter and library import overlap.

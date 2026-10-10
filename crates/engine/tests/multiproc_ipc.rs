@@ -116,7 +116,7 @@ impl RawHead {
             let registration: uniserve_ipc::Registration = head.receive(Duration::from_secs(60))?;
             anyhow::ensure!(
                 registration
-                    == uniserve_ipc::Registration {
+                    == uniserve_ipc::Registration::Rank {
                         worker_id: descriptor.worker_id.clone(),
                         rank: descriptor.rank,
                         generation,
@@ -1087,39 +1087,35 @@ fn launch_refuses_a_rank_of_another_build() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     // The stand-in registers as the rank it was started as, under a build
-    // the head is not: one frame, a length and then the registration's four
-    // fields in order, and then it waits for the head to close.
+    // the head is not, and then waits for the head to close. The frames are
+    // encoded here, one per rank of the group's first launch.
+    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let frames = (0..args.ranks.len())
+        .map(|rank| {
+            let registration = uniserve_ipc::Registration::Rank {
+                worker_id: args.worker_id.clone(),
+                rank: rank as u32,
+                generation: 1,
+                version: "0.0.0-other".into(),
+            };
+            let frame = uniserve_ipc::Frame::encode(&registration, 1 << 20)?;
+            Ok(frame
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>())
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let directory = tempfile::tempdir()?;
     let wrapper = directory.path().join("worker");
     std::fs::write(
         &wrapper,
-        r#"#!/usr/bin/env python3
-import socket, struct, sys
-
-def argument(name):
-    return sys.argv[sys.argv.index(name) + 1]
-
-def text(value):
-    data = value.encode()
-    return bytes([0xA0 | len(data)]) + data
-
-registration = (
-    b"\x94"
-    + text(argument("--worker-id"))
-    + bytes([int(argument("--rank")), int(argument("--generation"))])
-    + text("0.0.0-other")
-)
-connection = socket.socket(socket.AF_UNIX)
-connection.connect(argument("--head").removeprefix("unix:"))
-connection.sendall(struct.pack("<I", len(registration)) + registration)
-connection.settimeout(60)
-while connection.recv(4096):
-    pass
-"#,
+        format!(
+            "#!/usr/bin/env python3\nimport socket, sys\nframes = {frames:?}\nrank = int(sys.argv[sys.argv.index('--rank') + 1])\nhead = sys.argv[sys.argv.index('--head') + 1]\nconnection = socket.socket(socket.AF_UNIX)\nconnection.connect(head.removeprefix('unix:'))\nconnection.sendall(bytes.fromhex(frames[rank]))\nconnection.settimeout(60)\nwhile connection.recv(4096):\n    pass\n"
+        ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
 
-    let mut args = rank_group_args(1 << 20, 8 << 20);
     args.python = wrapper;
     let reported = match WorkerGroup::spawn(args) {
         Ok(_) => anyhow::bail!("a rank of another build was accepted"),
@@ -3348,7 +3344,7 @@ fn media_rank() -> anyhow::Result<()> {
     // Register with the head as the rank this process was started as, and
     // take the launch descriptor it answers with.
     let mut server = Channel::connect(argument("--head")?, Duration::from_secs(60))?;
-    server.send(&Registration {
+    server.send(&Registration::Rank {
         worker_id: argument("--worker-id")?.clone(),
         rank: argument("--rank")?.parse()?,
         generation: argument("--generation")?.parse()?,

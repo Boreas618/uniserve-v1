@@ -1,33 +1,29 @@
-//! The protocol between the head's engine and a host's launcher.
+//! The messages between the head's engine and a host's launcher.
 //!
 //! The engine starts no process on another host. Each host of a deployment
-//! runs one `uniserve-host` launcher, which connects to the head and keeps one
-//! TCP connection for the deployment's lifetime. The connection carries
-//! newline-delimited JSON in both directions:
+//! runs one `uniserve-host` launcher, which connects to the head and keeps
+//! that connection for the deployment's lifetime. The connection carries
+//! frames in both directions:
 //!
-//! - the launcher sends its [`Presentation`] once, then [`Report`]s: a
-//!   [`Reservation`] answering each [`Instruction::Reserve`], and a
-//!   [`RankExit`] for each rank it still supervises that exits, which excludes
-//!   ranks an [`Instruction::Stop`] ended;
+//! - the launcher sends its [`Registration`](crate::Registration) once, then
+//!   [`Report`]s: a [`Reservation`] answering each [`Instruction::Reserve`],
+//!   and a [`RankExit`] for each rank it still supervises that exits, which
+//!   excludes ranks an [`Instruction::Stop`] ended;
 //! - the head sends [`Instruction`]s.
 //!
 //! Each worker group's launches carry a generation, which every
 //! [`RankSpawn`] names and the launcher echoes in that rank's [`RankExit`].
-//! The head ends a group's generation with a stop before it relaunches the
-//! group under the next one, so an exit the launcher reported just before it
-//! read the stop is recognized as the stopped generation's rather than the
+//! The head ends a group's launch with a stop before it relaunches the group
+//! under the next generation, so an exit the launcher reported just before it
+//! read the stop is recognized as the stopped launch's rather than the
 //! relaunch's.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// What a launcher says when it connects.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Presentation {
-    /// The host identity the launcher owns, as the placement names it.
-    pub host: String,
-}
+use crate::ValidationResult;
+use crate::frame::Message;
 
 /// One instruction the head sends a launcher.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,15 +68,26 @@ pub struct RankSpawn {
     pub environment: HashMap<String, String>,
 }
 
-/// One message a launcher sends after its presentation.
-///
-/// The two reports are distinguished by their fields: only a reservation
-/// carries a port.
+impl Message for Instruction {
+    /// An instruction carries values the launcher acts on as given.
+    fn validate(&self) -> ValidationResult<()> {
+        Ok(())
+    }
+}
+
+/// One message a launcher sends after its registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(rename_all = "snake_case")]
 pub enum Report {
     Reservation(Reservation),
     Exit(RankExit),
+}
+
+impl Message for Report {
+    /// A report states what the launcher observed; the head attributes it.
+    fn validate(&self) -> ValidationResult<()> {
+        Ok(())
+    }
 }
 
 /// A launcher's answer to [`Instruction::Reserve`].
