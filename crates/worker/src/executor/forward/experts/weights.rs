@@ -46,6 +46,17 @@ fn count(value: &AnyView<'_>) -> std::result::Result<usize, tvm_ffi::Error> {
         .map_err(|_| tvm_ffi::Error::new(tvm_ffi::VALUE_ERROR, "expected a count", ""))
 }
 
+/// The compute stream an expert call names by its handle.
+fn compute(
+    weights: &ExpertWeights,
+    handle: &AnyView<'_>,
+) -> std::result::Result<Stream, tvm_ffi::Error> {
+    // SAFETY: the binding names the stream its expert call runs on, which the
+    // rank's lanes own until the weights close.
+    unsafe { crate::stream::external(weights.device(), count(handle)?) }
+        .map_err(|error| ffi_error(&error))
+}
+
 impl WeightRuntime {
     /// Set up the rank's distributed expert weights, collectively over the
     /// expert union. `None` unless the union prefetches weights.
@@ -76,8 +87,7 @@ impl WeightRuntime {
             }
         }
         .ok_or(Error::State("DWDP requires a CUDA stream"))?;
-        // SAFETY: the lanes own the stream and outlive this setup.
-        let stream = unsafe { Stream::borrowed(DeviceId(device), stream.handle()?) }?;
+        let stream = stream.stream()?.clone();
         let union_group = world
             .union
             .as_ref()
@@ -137,7 +147,7 @@ impl WeightRuntime {
             interface
                 .function("experts.bind_prefetch")?
                 .call_values(&[model.handle().to_any(), hooks(&weights)])?,
-        );
+        )?;
         Ok(Some(Self {
             weights,
             prefetch,
@@ -199,7 +209,7 @@ fn hooks(weights: &Arc<ExpertWeights>) -> Any {
                 let [stream] = args else {
                     return Err(ffi_error(&Error::Invalid("end takes a stream".into())));
                 };
-                unit(weights.end(count(stream)?))
+                unit(weights.end(&compute(weights, stream)?))
             })),
         )
         .with(
@@ -211,7 +221,8 @@ fn hooks(weights: &Arc<ExpertWeights>) -> Any {
                     )));
                 };
                 let record = Option::<tvm_ffi::Function>::try_from(*record)?;
-                unit(weights.before(count(layer)?, count(stream)?, |index| {
+                let stream = compute(weights, stream)?;
+                unit(weights.before(count(layer)?, &stream, |index| {
                     let record = record.as_ref().ok_or(Error::State(
                         "capture expert weight reads with a segment recorder",
                     ))?;
@@ -230,7 +241,7 @@ fn hooks(weights: &Arc<ExpertWeights>) -> Any {
                         "after takes a layer and a stream".into(),
                     )));
                 };
-                unit(weights.after(count(layer)?, count(stream)?))
+                unit(weights.after(count(layer)?, &compute(weights, stream)?))
             })),
         )
         .with(

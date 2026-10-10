@@ -33,7 +33,7 @@ use std::sync::Arc;
 use tvm_ffi::Any;
 use uniserve_core::ComponentConfig;
 
-use uniserve_cuda::{DeviceId, HandleType, PrimaryContext, Stream};
+use uniserve_cuda::{DeviceId, HandleType, PrimaryContext};
 use uniserve_ipc::{CallKind, ComponentInfo, ForwardMode, WorkerEndpoint, WorkerInfo};
 
 use crate::capacity::checks;
@@ -95,6 +95,8 @@ fn phase(phase: &'static str) -> impl Fn(Error) -> WorkerError {
     move |error| {
         // Description and process-group setup refuse a launch the rank
         // cannot serve; report input errors there as unsupported setups.
+        // `ValueError` is the kind of a returned value TVM-FFI could not
+        // convert.
         let error = match error {
             Error::Numerical {
                 kind,
@@ -102,10 +104,7 @@ fn phase(phase: &'static str) -> impl Fn(Error) -> WorkerError {
                 traceback,
                 function,
             } if matches!(phase, "describe" | "process groups")
-                && matches!(
-                    kind.as_str(),
-                    "InputError" | "FileNotFound" | "ValueError" | "FileNotFoundError"
-                ) =>
+                && matches!(kind.as_str(), "InputError" | "FileNotFound" | "ValueError") =>
             {
                 Error::Numerical {
                     kind: "UnsupportedSetup".into(),
@@ -238,18 +237,10 @@ impl Worker {
             None
         };
         drop(loading);
-        if launch.stub {
-            // The stub encodes many small images in tests.
-            config.encoder_cache_entries = 1024;
-        }
 
-        let devices: Vec<Device> = config
-            .devices()
-            .filter_map(|name| Device::parse(name, "device").ok())
-            .collect();
-        let mut lanes = Lanes::create(&config, &devices, launch.ipc.queue_depth + 1)
-            .map_err(phase("streams"))?;
-        let node = host_name();
+        let devices: Vec<Device> = config.devices().collect();
+        let mut lanes = Lanes::create(&config, &devices).map_err(phase("streams"))?;
+        let node = host_name().map_err(phase("host"))?;
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.
         let mut experts = ExpertRuntime::start(ExpertStart {
@@ -591,7 +582,7 @@ impl Worker {
                 .placed()
                 .iter()
                 .any(|placed| !placed.calls.is_empty());
-        let cuda = self.config.primary_device().is_cuda();
+        let cuda = self.config.device.is_cuda();
 
         let _warmup = range(c"uniserve.worker.warmup", None);
         if numerical && cuda {
@@ -745,13 +736,13 @@ impl Worker {
         let Some(budget) = &self.budget else {
             return Ok(());
         };
-        let devices: Vec<String> = self.config.devices().map(str::to_owned).collect();
-        for name in devices {
-            let Ok(Device::Cuda(index)) = Device::parse(&name, "device") else {
+        let devices: Vec<Device> = self.config.devices().collect();
+        for device in devices {
+            let Device::Cuda(index) = device else {
                 continue;
             };
             // Product storage lives on the primary device only.
-            let products = if name == self.config.device {
+            let products = if device == self.config.device {
                 self.plan.arena.device_product_bytes
             } else {
                 0
@@ -812,11 +803,7 @@ impl Worker {
         let cuda_devices: Vec<i32> = self
             .config
             .devices()
-            .filter_map(|name| {
-                Device::parse(name, "device")
-                    .ok()
-                    .and_then(Device::cuda_index)
-            })
+            .filter_map(Device::cuda_index)
             .collect();
         if let Some(budget) = &self.budget {
             let mut segments = Vec::new();
@@ -872,19 +859,19 @@ impl Worker {
         if let Some(video) = executor.backend_mut().video_mut() {
             for (label, kernels) in video.kernels().map_err(phase("warmup"))? {
                 records
-                    .add(&label, &self.config.device, &kernels)
+                    .add(&label, &self.config.device.to_string(), &kernels)
                     .map_err(phase("warmup"))?;
             }
         }
         if let Some(canvas) = executor.backend_mut().canvas_mut() {
             for (label, kernels) in canvas.kernels().map_err(phase("warmup"))? {
                 records
-                    .add(&label, &self.config.device, &kernels)
+                    .add(&label, &self.config.device.to_string(), &kernels)
                     .map_err(phase("warmup"))?;
             }
             canvas.seal();
         }
-        records.log("startup", self.config.rank, &self.config.device);
+        records.log("startup", self.config.rank, &self.config.device.to_string());
         if let Some(text) = executor.backend_mut().text_mut() {
             text.seal();
         }
@@ -902,7 +889,7 @@ impl Worker {
             last: choices,
             records,
             rank: self.config.rank,
-            device: self.config.device.clone(),
+            device: self.config.device.to_string(),
         });
         self.graphs.seal();
         Ok(())
@@ -964,7 +951,7 @@ fn allocate_storage(
     // Products: scheduler-placed buffers in the buffer pool and scalar relay
     // lanes, one per request slot and unresolved call, on the primary
     // device where every binding computes.
-    let devices = vec![match config.primary_device() {
+    let devices = vec![match config.device {
         Device::Cuda(index) => StorageDevice::Cuda(index),
         Device::Cpu => StorageDevice::Cpu,
     }];
@@ -982,7 +969,7 @@ fn allocate_storage(
         Arc::clone(&events),
     )?;
 
-    let device = config.primary_device().cuda_index();
+    let device = config.device.cuda_index();
     let preparation = device.and_then(|index| lanes.preparation(DeviceId(index)));
     let kv = match (&plan.cache, &plan.info.kv_cache) {
         (Some(cache), Some(info)) => Some(KVCache::new(
@@ -1005,11 +992,7 @@ fn allocate_storage(
     let release_stream = match device {
         Some(index) => lanes
             .stream_for(CallKind::Forward(ForwardMode::Decode), DeviceId(index))
-            .map(|stream| -> Result<Stream> {
-                // SAFETY: the lanes own the stream and close after the
-                // storage owners (see `Worker::close`).
-                Ok(unsafe { Stream::borrowed(DeviceId(index), stream.handle()?) }?)
-            })
+            .map(|stream| stream.stream().cloned())
             .transpose()?,
         None => None,
     };
@@ -1060,18 +1043,17 @@ fn log_capacity(config: &WorkerConfig, plan: &Plan) {
     );
 }
 
-/// This host's name.
-fn host_name() -> String {
-    let mut name = [0u8; 256];
-    // SAFETY: gethostname writes at most `name.len()` bytes.
-    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
-        let end = name
-            .iter()
-            .position(|&byte| byte == 0)
-            .unwrap_or(name.len());
-        String::from_utf8_lossy(&name[..end]).into_owned()
-    } else {
-        "localhost".to_owned()
+/// This host's node name, the rank's node identity in transfers.
+///
+/// Peers compare node names to decide whether a product location is on their
+/// own host, so a substituted or altered name would misroute transfers: a
+/// name that is empty or not UTF-8 is an error.
+fn host_name() -> Result<String> {
+    let system = rustix::system::uname();
+    let node = system.nodename();
+    match node.to_str() {
+        Ok(name) if !name.is_empty() => Ok(name.to_owned()),
+        _ => Err(Error::HostName(node.to_owned())),
     }
 }
 
@@ -1086,7 +1068,7 @@ fn reserve_join_pools(
     if config.graph_policy == "off" || experts.has_pools() {
         return Ok(());
     }
-    let Device::Cuda(device) = config.primary_device() else {
+    let Device::Cuda(device) = config.device else {
         return Ok(());
     };
     let create = interface.function("graphs.pool")?;
@@ -1108,14 +1090,14 @@ fn reserve_join_pools(
 }
 
 /// The rank's identity for transfers: host, process and incarnation.
-fn endpoint(worker_id: &str, rank: usize) -> WorkerEndpoint {
-    WorkerEndpoint {
+fn endpoint(worker_id: &str, rank: usize) -> Result<WorkerEndpoint> {
+    Ok(WorkerEndpoint {
         worker_id: worker_id.to_owned(),
         rank: rank as u32,
-        node: host_name(),
+        node: host_name()?,
         address_space: format!("{}:{}", std::process::id(), uuid::Uuid::new_v4().simple()),
         incarnation: uuid::Uuid::new_v4().simple().to_string(),
-    }
+    })
 }
 
 /// Resolve the rank's capacity on the loaded model.
@@ -1132,7 +1114,7 @@ fn plan(
     unit_columns: usize,
     video: Option<&VideoModel>,
 ) -> Result<(Plan, Option<VideoCapacity>)> {
-    let device = config.primary_device();
+    let device = config.device;
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
         config.pool_storage_bytes =
             Some(budget.budget(index, config.kv_storage_fraction)?.available as usize);
@@ -1217,8 +1199,8 @@ fn plan(
     };
     let report = Report {
         model_name: facts.model_name.clone(),
-        endpoint: endpoint(&launch.worker_id, config.rank),
-        device: config.device.clone(),
+        endpoint: endpoint(&launch.worker_id, config.rank)?,
+        device: config.device.to_string(),
         transfer_backends: launch.data_plane.backends.clone(),
         fabric_handles,
         attention_backend: facts.attention_backend.clone(),
@@ -1304,10 +1286,10 @@ fn plan(
             import_capacity,
             unit_columns,
         )?;
-        layout.reserve(&config.device, fixed);
+        layout.reserve(config.device, fixed);
         // The text runners' columns and the slot continuation state.
         layout.reserve(
-            &config.device,
+            config.device,
             reserved_bytes(
                 config,
                 layout.info().request_slots as usize,
@@ -1320,7 +1302,7 @@ fn plan(
         if facts.image_flow.is_some() {
             let image = ImageModel::describe(interface, model.handle())?;
             layout.reserve(
-                &config.device,
+                config.device,
                 image_reserved_bytes(
                     config,
                     layout.info().request_slots as usize,
@@ -1330,7 +1312,7 @@ fn plan(
         }
         // The canvas runners' buffers and the resident canvas banks.
         layout.reserve(
-            &config.device,
+            config.device,
             canvas_bytes(
                 interface,
                 model,
@@ -1399,7 +1381,7 @@ fn video_layout(
         .components
         .get("video_codec")
         .map(|component| component.ranks.len());
-    if let (Device::Cuda(index), Some(budget)) = (config.primary_device(), budget) {
+    if let (Device::Cuda(index), Some(budget)) = (config.device, budget) {
         let available = budget.budget(index, config.kv_storage_fraction)?.available;
         let maximum = config.max_request_pool_size;
         let minimum = config.min_request_pool_size.min(maximum).max(1);

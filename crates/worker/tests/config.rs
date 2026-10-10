@@ -59,6 +59,7 @@ fn defaults() -> Value {
         "max_model_len": 8192,
         "max_video_seconds": 15.0,
         "max_condition_rows": 0,
+        "encoder_cache_entries": 256,
         "ffmpeg": "ffmpeg",
         "min_video_seconds": null,
         "graph_policy": "off",
@@ -111,11 +112,8 @@ fn two_rank_model() -> Value {
 fn the_tower_placement_resolves_the_generation_device() {
     for mesh in ["tower=gen:cuda:1", "tower=text:cuda;gen:cuda:1"] {
         let launch = resolved(json!({"device": "cuda:0", "mesh": mesh})).unwrap();
-        assert_eq!(launch.execution.device, "cuda:0");
-        assert_eq!(
-            launch.execution.generation_device.as_deref(),
-            Some("cuda:1")
-        );
+        assert_eq!(launch.execution.device, Device::Cuda(0));
+        assert_eq!(launch.execution.generation_device, Some(Device::Cuda(1)));
         assert_eq!(launch.device(), Device::Cuda(0));
     }
     for mesh in ["tower=text:cuda:2;gen:cuda:1", "tower=gen:cuda"] {
@@ -362,7 +360,7 @@ fn attention_options_and_cuda_representations_are_checked() {
             .unwrap_or("bfloat16")
             .to_owned();
         let cpu = resolved(overrides).unwrap();
-        assert_eq!(cpu.execution.device, "cpu");
+        assert_eq!(cpu.execution.device, Device::Cpu);
         assert_eq!(cpu.execution.model_dtype, requested);
     }
 }
@@ -502,6 +500,24 @@ fn the_stub_model_must_be_acknowledged() {
     assert!(launch.stub && launch.model.is_none());
     assert!(launch_error(json!({"model": "", "no_model": true})).contains("--allow-stub"));
     assert!(launch_error(json!({"model": " "})).contains("--model is required"));
+}
+
+#[test]
+fn the_encoder_cache_holds_the_launched_entry_count() {
+    let launch = resolved(json!({"encoder_cache_entries": 1024})).unwrap();
+    assert_eq!(launch.execution.encoder_cache_entries, 1024);
+
+    // The stub model takes its size from the descriptor like any other.
+    let stub = resolved(json!({
+        "model": "",
+        "no_model": true,
+        "allow_stub": true,
+        "encoder_cache_entries": 32
+    }))
+    .unwrap();
+    assert_eq!(stub.execution.encoder_cache_entries, 32);
+
+    assert!(launch_error(json!({"encoder_cache_entries": 0})).contains("must be positive"));
 }
 
 #[test]

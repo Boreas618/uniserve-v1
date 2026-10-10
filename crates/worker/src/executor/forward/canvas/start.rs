@@ -197,20 +197,14 @@ fn streams(lanes: &Lanes, device: Device) -> Result<Vec<Option<Stream>>> {
     let mut result = Vec::new();
     for lane in lanes.lanes() {
         if lane.config.call_kinds.contains(&CANVAS_KIND) {
-            // SAFETY: the lanes own the stream and close after the runtime.
-            result.push(Some(unsafe {
-                Stream::borrowed(DeviceId(index), lane.stream.handle()?)
-            }?));
+            result.push(Some(lane.stream.stream()?.clone()));
         }
     }
     if lanes.lanes().is_empty() {
         let stream = lanes
             .stream_for(CANVAS_KIND, DeviceId(index))
             .ok_or(Error::State("canvas calls have no execution stream"))?;
-        // SAFETY: as above.
-        result.push(Some(unsafe {
-            Stream::borrowed(DeviceId(index), stream.handle()?)
-        }?));
+        result.push(Some(stream.stream()?.clone()));
     }
     Ok(result)
 }
@@ -334,7 +328,7 @@ impl CanvasRuntime {
                 .interface
                 .function("cache.pool")?
                 .call_values(&[tvm_ffi::Any::from(kv.layout()?), views])?,
-        );
+        )?;
 
         let mut experts = startup.expert_runtime;
         if let Some(experts) = experts.as_ref()
@@ -515,7 +509,7 @@ pub(crate) fn reserved_bytes(
     };
     let facts = CanvasFacts::describe(interface, model.handle(), &path, experts.0, experts.1)?;
     let facts = &facts;
-    let cuda = config.primary_device().cuda_index();
+    let cuda = config.device.cuda_index();
     let bounds = CanvasBounds::new(config, request_slots, cache, None, facts, cuda.is_some())?;
     let banks = config
         .canvas_sampling

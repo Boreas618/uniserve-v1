@@ -231,7 +231,7 @@ impl TextModel {
             integer(expert_capacity),
         ];
         let views: Vec<AnyView<'_>> = values.iter().map(AnyView::from).collect();
-        Ok(Handle::new(self.capture.call(&views)?))
+        Handle::new(self.capture.call(&views)?)
     }
 
     /// The function releasing a captured graph.

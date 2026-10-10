@@ -94,7 +94,7 @@ from uniserve_models.nn.vae import PatchAutoencoder
 from uniserve_models.processing import PatchTransform
 
 from . import calls, graphs, regions
-from .errors import translate
+from .errors import binding
 from .image import image_facts
 
 
@@ -219,7 +219,7 @@ def bind(
         )
     else:
         steps = _text(cast(TextEncoder, module), context, tensors)
-    return {name: translate(step) for name, step in steps.items()}
+    return binding(steps)
 
 
 def _device_pixels(image: PreparedImage, device: torch.device) -> torch.Tensor:

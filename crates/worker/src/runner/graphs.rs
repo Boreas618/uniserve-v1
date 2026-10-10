@@ -130,7 +130,7 @@ pub fn reserve_pools(
         pools.push(Arc::new(GraphPool {
             device,
             id,
-            value: Handle::new(item(0)?),
+            value: Handle::new(item(0)?)?,
         }));
     }
     storage.commit(key, owner, pools.clone(), defaults);
@@ -293,7 +293,7 @@ mod tests {
     }
 
     fn graph(value: i64) -> Handle {
-        Handle::new(Any::from(value))
+        Handle::new(Any::from(value)).unwrap()
     }
 
     #[test]

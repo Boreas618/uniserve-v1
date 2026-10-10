@@ -1112,7 +1112,7 @@ impl VideoDenoiser {
             self.steps
                 .capture
                 .call(&[AnyView::from(&Any::from(id as i64)), pool.value.view()])?,
-        );
+        )?;
         self.graphs.insert(id, None, graph)?;
         self.graphs.record(GraphMode::Capture);
         Ok(true)
@@ -1168,7 +1168,7 @@ impl VideoDenoiser {
             let graph = Handle::new(function.call(&[
                 AnyView::from(&Any::from(i64::from(capacity))),
                 pool.value.view(),
-            ])?);
+            ])?)?;
             self.conditioner_graphs.insert(capacity, None, graph)?;
         }
         Ok(())

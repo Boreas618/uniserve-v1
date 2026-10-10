@@ -90,6 +90,9 @@ fn descriptor(rank: u32, world_size: u32) -> serde_json::Value {
         max_model_len: 1024,
         max_video_seconds: 15.0,
         max_condition_rows: 0,
+        // The stub rank encodes many small images, so it keeps a larger
+        // encoder cache than a served model's default.
+        encoder_cache_entries: 1024,
         ffmpeg: "ffmpeg".into(),
         min_video_seconds: None,
         graph_policy: "auto".into(),

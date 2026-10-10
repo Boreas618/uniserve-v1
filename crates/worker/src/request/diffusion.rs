@@ -392,7 +392,7 @@ mod tests {
 
     fn plan(masks: &[u8]) -> GuidancePlan {
         GuidancePlan {
-            handle: Handle::new(tvm_ffi::Any::default()),
+            handle: Handle::none(),
             timesteps: (0..masks.len()).map(|step| step as f32).collect(),
             branches: masks
                 .iter()

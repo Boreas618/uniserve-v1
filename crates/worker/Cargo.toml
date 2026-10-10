@@ -16,7 +16,7 @@ indexmap.workspace = true
 libc.workspace = true
 nvtx.workspace = true
 png.workspace = true
-rustix = { workspace = true, features = ["pipe", "fs"] }
+rustix = { workspace = true, features = ["pipe", "fs", "system"] }
 serde.workspace = true
 serde_json.workspace = true
 signal-hook-registry.workspace = true

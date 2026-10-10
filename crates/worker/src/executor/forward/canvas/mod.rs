@@ -239,14 +239,7 @@ impl CanvasRuntime {
             )))
         })?;
         let device = self.runners[index].buffers().device();
-        let stream = self.runners[index]
-            .stream()
-            .map(|stream| {
-                // SAFETY: the lanes own the stream for the runtime's lifetime.
-                unsafe { Stream::borrowed(stream.device(), stream.raw()) }
-            })
-            .transpose()
-            .map_err(|error| reserve(error.into()))?;
+        let stream = self.runners[index].stream().cloned();
         let stream = stream.as_ref();
         let reports = reports_output(info, rank, &first.component).map_err(&reserve)?;
 

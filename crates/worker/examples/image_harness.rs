@@ -108,7 +108,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
     (|| -> Result<Array<Any>> {
         let config = Record::new("encode", Any::from(config))?;
         let interface = Interface::from_table(config.get("table")?)?;
-        let loaded = Handle::new(config.value("loaded")?);
+        let loaded = Handle::new(config.value("loaded")?)?;
         let path = config.string("path")?;
         let tower = config.string("tower")?;
         let payloads = config.strings("payloads")?;
@@ -161,7 +161,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             info,
             &settings,
             products.clone(),
-            borrow(stream.as_ref())?,
+            stream.clone(),
         )?;
         if config.optional::<bool>("capture")?.unwrap_or(false) {
             let Device::Cuda(index) = device else {
@@ -223,17 +223,6 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
     .map_err(failure)
 }
 
-/// A borrowed view of the harness's stream, which outlives the runner.
-fn borrow(stream: Option<&Stream>) -> Result<Option<Stream>> {
-    stream
-        .map(|stream| {
-            // SAFETY: the owned stream outlives every runner of the call.
-            unsafe { Stream::borrowed(stream.device(), stream.raw()) }
-        })
-        .transpose()
-        .map_err(Into::into)
-}
-
 /// A graph allocator pool on CUDA `device` (`graphs.pool`).
 fn pool(interface: &Interface, device: i32) -> Result<Arc<GraphPool<Handle>>> {
     let value: Array<Any> = interface
@@ -254,7 +243,7 @@ fn pool(interface: &Interface, device: i32) -> Result<Arc<GraphPool<Handle>>> {
             value
                 .get(0)
                 .map_err(|error| uniserve_worker::Error::numerical("graphs.pool", &error))?,
-        ),
+        )?,
     }))
 }
 
@@ -266,7 +255,7 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
     (|| -> Result<Array<Any>> {
         let config = Record::new("decode", Any::from(config))?;
         let interface = Interface::from_table(config.get("table")?)?;
-        let loaded = Handle::new(config.value("loaded")?);
+        let loaded = Handle::new(config.value("loaded")?)?;
         let path = config.string("path")?;
         let latents: Tensor = config.get("latents")?;
         let sizes = config.list("sizes")?;

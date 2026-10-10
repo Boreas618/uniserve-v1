@@ -22,7 +22,6 @@
 //! the image denoiser this runtime owns.
 
 mod batch;
-mod conditioning;
 mod decode;
 mod diffusion;
 mod encode;
@@ -37,7 +36,7 @@ use std::time::Instant;
 
 use uniserve_ipc::{
     Batch as BatchPlan, BufferId, CallKind, CallStatus, ErrorCode, ForwardStats, MediaCall,
-    RequestKey, TransferMode, Wake,
+    RequestKey, Wake,
 };
 
 use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
@@ -242,11 +241,7 @@ impl ImageRuntime {
         };
         let units = diffusion.layout().latent_rows(shape.height, shape.width)?;
         let padded = units.div_ceil(page_units) * page_units;
-        let stream = diffusion
-            .stream()
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            .map(|stream| unsafe { uniserve_cuda::Stream::borrowed(stream.device(), stream.raw()) })
-            .transpose()?;
+        let stream = diffusion.stream().cloned();
         // Captured samples start from zeros, as fresh scratch pages do.
         workspace
             .narrow(0, 0, i64::from(padded) * shape.images as i64)?
@@ -576,19 +571,6 @@ fn run(
             diffusion::placement(runtime)?
         }
         CallKind::Media(MediaCall::ImageDecoding) => decode::placement(runtime, plan)?,
-        CallKind::Transfer(TransferMode::KvExport) => {
-            // The export reads the pages text batches wrote, on their
-            // stream.
-            let component = &plan
-                .calls
-                .first()
-                .ok_or_else(|| Error::Invariant("an image batch has calls".into()))?
-                .component;
-            let text = text
-                .as_deref()
-                .ok_or_else(|| Error::Unsupported("KV export requires the text runtime".into()))?;
-            text.placement(component)?
-        }
         _ => {
             return Err(Error::Unsupported(format!(
                 "{} is served by another runtime",
@@ -597,9 +579,6 @@ fn run(
             .into());
         }
     };
-    if let (CallKind::Transfer(_), Some(text)) = (kind, text.as_deref()) {
-        text.order().wait(stream.as_ref())?;
-    }
     let mut batch = ImageBatch::open(
         runtime, storage, requests, info, rank, plan, device, stream, words, started,
     )?;
@@ -613,7 +592,6 @@ fn run(
             CallKind::Media(MediaCall::LatentPreparation) => batch.prepare_latents()?,
             CallKind::Media(MediaCall::Denoising) => batch.denoise(text, experts)?,
             CallKind::Media(MediaCall::ImageDecoding) => batch.decode()?,
-            CallKind::Transfer(TransferMode::KvExport) => batch.export_conditioning()?,
             _ => ForwardStats::default(),
         };
         batch.commit()?;

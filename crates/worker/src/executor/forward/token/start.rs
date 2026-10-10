@@ -198,7 +198,7 @@ pub(crate) fn expert_tokens(config: &WorkerConfig) -> usize {
         max_rows = max_rows.min(lane.max_batch_calls.unwrap_or(max_rows));
         tokens = tokens.min(lane.max_batch_tokens.unwrap_or(tokens));
     }
-    let graphs = config.primary_device().is_cuda() && config.graph_policy != "off";
+    let graphs = config.device.is_cuda() && config.graph_policy != "off";
     if !graphs {
         return tokens;
     }
@@ -228,8 +228,7 @@ fn streams(
             .filter(|kind| lane.config.call_kinds.contains(kind))
             .collect();
         if !served.is_empty() {
-            // SAFETY: the lanes own the stream and close after the runtime.
-            let stream = unsafe { Stream::borrowed(DeviceId(index), lane.stream.handle()?) }?;
+            let stream = lane.stream.stream()?.clone();
             result.push((Some(stream), served));
         }
     }
@@ -237,8 +236,7 @@ fn streams(
         let stream = lanes
             .stream_for(kinds[0], DeviceId(index))
             .ok_or(Error::State("text calls have no execution stream"))?;
-        // SAFETY: as above.
-        let stream = unsafe { Stream::borrowed(DeviceId(index), stream.handle()?) }?;
+        let stream = stream.stream()?.clone();
         result.push((Some(stream), kinds.to_vec()));
     }
     Ok(result)
@@ -337,7 +335,7 @@ impl TextRuntime {
                 .interface
                 .function("cache.pool")?
                 .call_values(&[tvm_ffi::Any::from(kv.layout()?), views])?,
-        );
+        )?;
 
         let state = DecodeState::allocate(
             startup.request_slots,
@@ -372,22 +370,10 @@ impl TextRuntime {
                                         .into(),
                                 ));
                             }
-                            let peer = experts.stream(microbatch);
-                            // SAFETY: the lanes own the stream and close
-                            // after the text runtime.
-                            let view = unsafe { Stream::borrowed(peer.device(), peer.raw()) }?;
-                            (Some(view), Some(experts.transport(microbatch).clone()))
+                            let peer = experts.stream(microbatch).clone();
+                            (Some(peer), Some(experts.transport(microbatch).clone()))
                         }
-                        None => (
-                            stream
-                                .as_ref()
-                                // SAFETY: as above.
-                                .map(|stream| unsafe {
-                                    Stream::borrowed(stream.device(), stream.raw())
-                                })
-                                .transpose()?,
-                            None,
-                        ),
+                        None => (stream.clone(), None),
                     };
                     let handle = stream.as_ref().map_or(0, Stream::raw);
                     prepared.push(bind::prepare(
@@ -585,7 +571,7 @@ pub(crate) fn reserved_bytes(
     let Some(vocab) = facts.vocab_size else {
         return Ok(0);
     };
-    let cuda = config.primary_device().is_cuda();
+    let cuda = config.device.is_cuda();
     let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
     let dtype = model_dtype(&config.model_dtype)?;
     let mut dimensions = bounds.dimensions(vocab, vocab, facts.hidden_size.unwrap_or(0), dtype);

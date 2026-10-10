@@ -5,10 +5,11 @@ import sys
 
 import pytest
 import torch
+import tvm_ffi
 from torch import nn
 
 from uniserve_models.cache.units import UnitPool
-from uniserve_models.interface import cache
+from uniserve_models.interface import cache, errors
 from uniserve_models.model import CausalLM, TransformerDecoder
 from uniserve_models.nn.attention import Attention
 
@@ -171,6 +172,16 @@ def test_unit_bindings_reset_the_units_rust_selects():
     bound["mark_initialized"](2)
     assert torch.all(fields["value.initialized"][:, (1, 2)])
     assert torch.all(fields["value.initialized"][:, 0])
+
+
+def test_a_failed_unit_reset_crosses_the_interface_with_its_kind():
+    plan = cache.cache_plan(_model(layers=6), 16, "float8_e4m3fn")
+    # Unit 9 lies outside the four-unit pool.
+    units = torch.tensor([9, 0, 0, 0], dtype=torch.int64)
+    bound = tvm_ffi.convert(cache.bind_units(_fields(plan, 4), units, 0))
+
+    with pytest.raises(errors.InputError):
+        bound["zero"](1)
 
 
 @pytest.mark.parametrize(

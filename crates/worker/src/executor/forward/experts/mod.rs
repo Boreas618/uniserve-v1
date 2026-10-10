@@ -71,9 +71,9 @@ impl ExpertFunctions {
 struct Peer {
     /// The `experts.create_exchange` transport.
     transport: Handle,
-    /// A borrowed view of the microbatch's stream: the execution lane's
-    /// stream for the first microbatch, a fork of it for the others. The
-    /// rank's lanes own the streams and close after this runtime.
+    /// The microbatch's stream: the execution lane's stream for the first
+    /// microbatch, a fork of it for the others. The rank's lanes close the
+    /// streams after this runtime.
     stream: Stream,
     /// The bound `join(capacity)` of this microbatch's binding.
     join: Option<Function>,
@@ -289,7 +289,7 @@ impl ExpertRuntime {
                 None => self.peer_join(peer, capacity),
             })
             .collect::<Result<Vec<_>>>()?;
-        lanes.run(parent, &self.streams()?, calls).map(drop)
+        lanes.run(parent, &self.streams(), calls).map(drop)
     }
 
     /// Join one step of `capacity` with every microbatch: replay the
@@ -311,7 +311,7 @@ impl ExpertRuntime {
                     .map(|peer| self.eager_join(peer, capacity))
                     .collect::<Result<Vec<_>>>()?;
                 lanes
-                    .run(&self.peers[0].stream, &self.streams()?, calls)
+                    .run(&self.peers[0].stream, &self.streams(), calls)
                     .map(drop)
             }
             None => self.eager_join(0, capacity)?(),
@@ -349,16 +349,8 @@ impl ExpertRuntime {
         Ok(Box::new(move || call.invoke()))
     }
 
-    fn streams(&self) -> Result<Vec<Stream>> {
-        self.peers
-            .iter()
-            .map(|peer| {
-                // SAFETY: a second borrowed view of a stream the lanes own
-                // for this runtime's lifetime.
-                unsafe { Stream::borrowed(peer.stream.device(), peer.stream.raw()) }
-                    .map_err(Error::from)
-            })
-            .collect()
+    fn streams(&self) -> Vec<Stream> {
+        self.peers.iter().map(|peer| peer.stream.clone()).collect()
     }
 
     /// Capture the joins every rank replays outside its own steps: one

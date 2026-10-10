@@ -186,6 +186,9 @@ pub struct WorkerProcessArgs {
     /// Most denoiser rows a video request's conditions may take, which bounds
     /// the condition products a video worker provisions.
     pub max_condition_rows: u32,
+    /// Image features each rank's encoder cache keeps resident, which bounds
+    /// the context images one request may pin.
+    pub encoder_cache_entries: u32,
     /// The `ffmpeg` executable a media reader decodes reference videos with.
     pub ffmpeg: std::path::PathBuf,
     /// Shortest video duration in seconds the serving API admits, which

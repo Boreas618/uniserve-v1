@@ -24,6 +24,8 @@ from torch import nn
 from uniserve_models.cache.units import Planes, UnitPool, plan_units
 from uniserve_models.quantization import Quantizer
 
+from .errors import binding
+
 if TYPE_CHECKING:
     from uniserve_models.model import CausalLM
 
@@ -330,11 +332,13 @@ def bind_units(
     def mark_initialized(count: int) -> None:
         fill(count, flags, 1)
 
-    return {
-        "zero": zero,
-        "recycle": recycle,
-        "mark_initialized": mark_initialized,
-    }
+    return binding(
+        {
+            "zero": zero,
+            "recycle": recycle,
+            "mark_initialized": mark_initialized,
+        }
+    )
 
 
 def bind_conversion(
@@ -430,7 +434,7 @@ def bind_conversion(
                 getattr(torch, compute_dtype),
             )
 
-    return {"convert": convert}
+    return binding({"convert": convert})
 
 
 def pool(layout: Mapping, views: Mapping[str, torch.Tensor]) -> UnitPool:

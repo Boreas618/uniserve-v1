@@ -45,6 +45,8 @@ from uniserve_models.distributed import Communicator
 from uniserve_models.nn.moe import FusedMoE
 from uniserve_models.quantization import QuantizedTensor
 
+from .errors import binding
+
 
 def functions() -> dict[str, Callable[..., Any]]:
     return {
@@ -250,7 +252,7 @@ def bind(prepared) -> dict[str, Callable[..., Any]]:
         ):
             pass
 
-    return {"join": join}
+    return binding({"join": join})
 
 
 def warm_thread(device: int) -> None:
