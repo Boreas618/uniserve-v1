@@ -3,8 +3,8 @@
 //! Each host of a deployment runs one of these, started by the cluster; exactly
 //! one host runs the head. The engine does not start processes on other hosts,
 //! so a launcher connects out to the head, presents its host identity, receives
-//! the launch descriptors of the ranks placed on its host, of every worker
-//! group the deployment places there, spawns them, reports their exits by
+//! the launches of the ranks placed on its host, of every worker group the
+//! deployment places there, spawns them, reports their exits by
 //! worker, generation and rank, stops one group's ranks on instruction ahead
 //! of that group's relaunch, and terminates them all when the head's
 //! connection closes. For a group whose first rank it runs, it also holds the
@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::process::{Child, Command};
 
 use anyhow::Context;
@@ -55,9 +56,6 @@ struct Rank {
     child: Child,
     /// The group generation the rank's spawn named.
     generation: u64,
-    /// Retains the descriptor file until the rank has read it; dropping the
-    /// `Rank` deletes the directory.
-    _descriptor: tempfile::TempDir,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -163,6 +161,8 @@ fn supervise(
                 let reservation = Report::Reservation(Reservation {
                     worker_id: worker_id.clone(),
                     port,
+                    // The first rank inherits the socket at this number.
+                    listen_fd: listener.as_raw_fd(),
                 });
                 rendezvous.insert(worker_id, listener);
                 writeln!(writer, "{}", serde_json::to_string(&reservation)?)?;
@@ -208,39 +208,33 @@ fn supervise(
     }
 }
 
-/// Starts one rank from the descriptor the head derived for it.
+/// Starts one rank, which connects to the head and receives its launch
+/// descriptor there.
 ///
 /// `store_listener` is the group's reserved collective store socket when this
-/// rank serves the store. The rank inherits it, and the launch descriptor
-/// records the file descriptor number it inherits it at, which only this
-/// process knows. This process keeps no copy once the rank is started.
+/// rank serves the store. The rank inherits it at the descriptor number this
+/// launcher reported with the reservation, which the head names in the rank's
+/// launch descriptor. This process keeps no copy once the rank is started.
 fn start_rank(
     args: &Args,
-    mut spawn: RankSpawn,
+    spawn: RankSpawn,
     store_listener: Option<TcpListener>,
 ) -> anyhow::Result<Rank> {
-    let directory = tempfile::Builder::new()
-        .prefix("uniserve-worker-launch")
-        .tempdir()
-        .context("creating the launch descriptor directory")?;
-    let path = directory.path().join("launch.json");
-
     let mut command = uniserve_ipc::launch::rank_command(
         &spawn.python,
+        &spawn.head,
         &spawn.worker_id,
         spawn.rank,
         spawn.world_size,
-        &path,
+        spawn.generation,
     );
     for (name, value) in &spawn.environment {
         command.env(name, value);
     }
     die_with_launcher(&mut command);
     if let Some(listener) = store_listener {
-        let fd = uniserve_ipc::launch::inherit_listener(&mut command, listener);
-        spawn.descriptor.rendezvous_listen_fd = Some(fd);
+        uniserve_ipc::launch::inherit_listener(&mut command, listener);
     }
-    std::fs::write(&path, spawn.descriptor.to_json()?).context("writing the launch descriptor")?;
 
     let child = command
         .spawn()
@@ -249,7 +243,6 @@ fn start_rank(
     Ok(Rank {
         child,
         generation: spawn.generation,
-        _descriptor: directory,
     })
 }
 

@@ -244,7 +244,17 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
     fn wait(&mut self, timeout: Duration) -> Result<(), B::Error> {
         self.channel
             .wait(timeout)
-            .map_err(|e| self.channel_error(e))
+            .map_err(|e| self.channel_error(e))?;
+
+        // The connection is the head's liveness: once it closes nothing this
+        // rank computes can be delivered, so serving ends here rather than
+        // when the next response fails to send.
+        if self.channel.is_closed() {
+            return Err(
+                self.channel_error(IpcError::Transport("the head closed the connection".into()))
+            );
+        }
+        Ok(())
     }
 
     fn channel_error(&self, error: IpcError) -> B::Error {

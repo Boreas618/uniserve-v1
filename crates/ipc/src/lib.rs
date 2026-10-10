@@ -11,8 +11,9 @@
 //! types are the only definition of the protocol, so the engine and the worker
 //! library must be built from the same sources. A [`Channel`] carries the
 //! frames over a stream connection: a Unix socket to a rank on the head's
-//! host, TCP to a rank on another host. The rank runtime (`uniserve-worker`)
-//! serves its end and is started with a [`LaunchDescriptor`].
+//! host, TCP to a rank on another host. A rank connects to the head, sends its
+//! [`Registration`] and receives its [`LaunchDescriptor`]; the rank runtime
+//! (`uniserve-worker`) then serves its end until the connection closes.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -87,14 +88,14 @@ pub mod frame;
 pub mod launch;
 /// Messages between the head's engine and a host's `uniserve-host` launcher.
 pub mod launcher;
-/// A rank's report of its channel endpoint.
+/// A rank's registration with the head.
 pub mod registration;
 
 pub use channel::{Channel, Listener, Wake};
 pub use error::{IpcError, IpcResult};
 pub use frame::{Frame, Message};
 pub use launch::{ExpertParallelDescriptor, LaunchDescriptor};
-pub use registration::{RankReport, TCP_CHANNEL, UNIX_CHANNEL};
+pub use registration::{Registration, VERSION};
 
 // Message types are split by concern and re-exported flat at the crate root;
 // each module takes the shared imports through `use super::*` and the

@@ -31,92 +31,6 @@ fn receive(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
     serde_json::from_str(&line).unwrap()
 }
 
-/// A complete launch descriptor for a one-component CPU stub rank, as the
-/// head sends it; the stand-in ranks here read at most its rendezvous socket.
-fn descriptor(rank: u32, world_size: u32) -> serde_json::Value {
-    let descriptor = uniserve_ipc::LaunchDescriptor {
-        worker_id: "group".into(),
-        registration_address: "127.0.0.1:1".into(),
-        channel_transport: "tcp".into(),
-        acknowledgment_slot: rank,
-        host_slots: (0..world_size).collect(),
-        products_cross_hosts: false,
-        queue_depth: 2,
-        ipc_payload_cap: 1 << 20,
-        model: String::new(),
-        base_model: None,
-        device: "cpu".into(),
-        rank,
-        local_rank: rank,
-        world_size,
-        components: std::collections::BTreeMap::from([(
-            "model".to_owned(),
-            uniserve_core::ComponentConfig::parallel(
-                (0..world_size as usize).collect(),
-                uniserve_core::ParallelConfig {
-                    tensor_parallel_size: world_size as usize,
-                    ..Default::default()
-                },
-            ),
-        )]),
-        deployment_components: vec!["model".into()],
-        supported_calls: None,
-        transfer_backends: "local".into(),
-        export_backends: "local".into(),
-        rendezvous_address: Some("127.0.0.1:1".into()),
-        rendezvous_listen_fd: None,
-        expert_parallel: None,
-        role: "model".into(),
-        expert_microbatches: 1,
-        distributed_backend: None,
-        mesh: None,
-        lane: Vec::new(),
-        no_model: true,
-        allow_stub: true,
-        load_format: "auto".into(),
-        download_dir: None,
-        load_threads: None,
-        checksum_manifest: None,
-        model_dtype: "bfloat16".into(),
-        quantization_config: serde_json::json!({}),
-        kv_cache_dtype: None,
-        kv_memory_fraction: 0.7,
-        kv_token_capacity: None,
-        attention_backend: "auto".into(),
-        block_size: None,
-        max_batch_calls: 8,
-        max_batch_tokens: 1024,
-        max_request_pool_size: 8,
-        max_model_len: 1024,
-        max_video_seconds: 15.0,
-        max_condition_rows: 0,
-        // The stub rank encodes many small images, so it keeps a larger
-        // encoder cache than a served model's default.
-        encoder_cache_entries: 1024,
-        ffmpeg: "ffmpeg".into(),
-        min_video_seconds: None,
-        graph_policy: "auto".into(),
-        decode_graph_batch_sizes: None,
-        prefill_cuda_graph: true,
-        prefill_outputs: true,
-        prefill_graph_token_sizes: None,
-        flow_cuda_graph: true,
-        flow_graph_batch_sizes: None,
-        flow_graph_shapes: None,
-        video_text_capacities: None,
-        video_canvases: Vec::new(),
-        canvas_sampling: None,
-        flashinfer_workspace_size: 512 << 20,
-        flashinfer_use_tensor_core: None,
-        flashinfer_decode_backend: "fa2".into(),
-        flashinfer_prefill_backend: "auto".into(),
-        flashinfer_decode_split_tile_size: None,
-        flashinfer_prefill_split_tile_size: None,
-        flashinfer_disable_split_kv: false,
-    };
-    serde_json::to_value(descriptor).unwrap()
-}
-
 /// Starts a launcher against a head bound here and reads its presentation.
 ///
 /// Returns the launcher guard, the head's end of the connection for sending
@@ -182,7 +96,7 @@ fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() 
         "{}",
         serde_json::json!({"spawn": {
             "rank": 0, "worker_id": "first", "generation": 3, "world_size": 1,
-            "python": "/bin/false", "descriptor": descriptor(0, 1), "environment": {}
+            "python": "/bin/false", "head": "127.0.0.1:1", "environment": {}
         }})
     )
     .unwrap();
@@ -207,21 +121,22 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
         serde_json::json!({"reserve": {"worker_id": "group"}})
     )
     .unwrap();
-    let port = receive(&mut reader)["port"].as_u64().unwrap() as u16;
+    let reservation = receive(&mut reader);
+    let port = reservation["port"].as_u64().unwrap() as u16;
 
-    // The rank's module accepts one peer on the socket its descriptor names,
-    // which is how a collective store serves on an inherited socket. The
-    // package is regular so it shadows any installed worker package.
+    // The rank's module accepts one peer on the socket it inherits at the
+    // number the reservation reported, which is how a collective store serves
+    // on an inherited socket. The head names that number in the rank's launch
+    // descriptor; this stand-in is given it in its environment. The package
+    // is regular so it shadows any installed worker package.
     let modules = tempfile::tempdir().unwrap();
     let package = modules.path().join("uniserve_models");
     std::fs::create_dir(&package).unwrap();
     std::fs::write(package.join("__init__.py"), "").unwrap();
     std::fs::write(
         package.join("worker.py"),
-        "import json, socket, sys\n\
-         path = sys.argv[sys.argv.index('--launch-descriptor') + 1]\n\
-         descriptor = json.load(open(path))\n\
-         store = socket.socket(fileno=descriptor['rendezvous_listen_fd'])\n\
+        "import os, socket\n\
+         store = socket.socket(fileno=int(os.environ['STORE_FD']))\n\
          peer, _ = store.accept()\n\
          peer.sendall(b'served\\n')\n",
     )
@@ -231,8 +146,11 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
         "{}",
         serde_json::json!({"spawn": {
             "rank": 0, "worker_id": "group", "generation": 0, "world_size": 2,
-            "python": "python3", "descriptor": descriptor(0, 2),
-            "environment": {"PYTHONPATH": modules.path()}
+            "python": "python3", "head": "127.0.0.1:1",
+            "environment": {
+                "PYTHONPATH": modules.path(),
+                "STORE_FD": reservation["listen_fd"].to_string(),
+            }
         }})
     )
     .unwrap();
@@ -297,7 +215,7 @@ impl StandIn {
             "{}",
             serde_json::json!({"spawn": {
                 "rank": 1, "worker_id": group, "generation": 0, "world_size": 2,
-                "python": script, "descriptor": descriptor(1, 2),
+                "python": script, "head": "127.0.0.1:1",
                 "environment": {"RANK_PID_FILE": pid_file}
             }})
         )

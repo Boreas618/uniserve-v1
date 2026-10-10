@@ -1,29 +1,42 @@
-//! A rank's report of the channel endpoint the head connects to.
+//! A rank's registration with the head.
+//!
+//! A rank is started with the head's address and its own identity. It
+//! connects, and the first frame it sends is its [`Registration`]. The head
+//! answers with the rank's [`LaunchDescriptor`](crate::LaunchDescriptor),
+//! which carries every other launch value, and the connection then carries
+//! requests and responses until it closes.
 
 use serde::{Deserialize, Serialize};
 
-/// The mechanism name of a channel over a Unix socket, served by a rank on
-/// the head's host.
-///
-/// The name travels as a string in the launch descriptor's
-/// `channel_transport` and in the registration report's `transport`.
-pub const UNIX_CHANNEL: &str = "unix";
-/// The mechanism name of a channel over a TCP stream, served by a rank off
-/// the head's host.
-pub const TCP_CHANNEL: &str = "tcp";
+use crate::frame::Message;
+use crate::{ValidationError, ValidationResult};
 
-/// One rank's report of the channel endpoint the engine connects to.
+/// The version of this build, which a registration states.
 ///
-/// The rank sends one JSON line after binding its endpoint and before loading
-/// model weights. The head uses it to connect the rank's channel.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RankReport {
-    /// Worker identity the rank was launched under.
+/// The message types are the only definition of the protocol, so the two
+/// ends of a connection must be the same build. The head refuses a
+/// registration that states another version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The first frame a rank sends: who it is and what it was built as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Registration {
+    /// Worker group the rank was started for.
     pub worker_id: String,
-    /// Global rank within that worker.
+    /// Rank within that group's process world.
     pub rank: u32,
-    /// Channel mechanism the endpoint names.
-    pub transport: String,
-    /// Address the engine connects this rank's channel to.
-    pub endpoint: String,
+    /// The launch of the group that started this rank. A group relaunched
+    /// after a failure carries the next generation, so a rank of the launch
+    /// it replaces cannot register in its place.
+    pub generation: u64,
+    /// [`VERSION`] of the build the rank runs.
+    pub version: String,
+}
+
+impl Message for Registration {
+    /// A registration names its worker group.
+    fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(!self.worker_id.is_empty(), "a registration names no worker");
+        Ok(())
+    }
 }

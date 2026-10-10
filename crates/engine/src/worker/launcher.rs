@@ -56,15 +56,16 @@ struct Launcher {
 }
 
 /// Rank exits read from the launchers and not yet taken, and the generation
-/// each worker group is launched under.
+/// of each worker group's running launch.
 ///
 /// A launcher reports every group's ranks on one connection, and each group
 /// takes its own. Only exits of a group's current generation are kept, so a
 /// report of a rank a stop ended is never attributed to its relaunch.
 #[derive(Default)]
 struct ExitReports {
-    /// Each group's current generation; a group absent here has never been
-    /// stopped and is in generation zero.
+    /// The generation of each group's running launch. A group absent here
+    /// has no launch whose exits are of interest: none has been sent to a
+    /// launcher, or a stop has ended the last one.
     generations: HashMap<String, u64>,
     /// Exits of each group's current generation, with the host that
     /// reported each, by worker group.
@@ -72,15 +73,16 @@ struct ExitReports {
 }
 
 impl ExitReports {
-    /// Returns the generation `worker_id`'s launches currently carry.
-    fn generation(&self, worker_id: &str) -> u64 {
-        self.generations.get(worker_id).copied().unwrap_or(0)
+    /// Records the generation of the launch of `worker_id` being sent to
+    /// the launchers.
+    fn begin_generation(&mut self, worker_id: &str, generation: u64) {
+        self.generations.insert(worker_id.to_owned(), generation);
     }
 
     /// Keeps one exit a launcher on `host` reported for its group, or
     /// discards it when it names a generation a stop has ended.
     fn file(&mut self, host: &str, exit: RankExit) {
-        if exit.generation != self.generation(&exit.worker_id) {
+        if self.generations.get(&exit.worker_id) != Some(&exit.generation) {
             tracing::debug!(
                 host,
                 worker = %exit.worker_id,
@@ -104,7 +106,7 @@ impl ExitReports {
     /// Ends `worker_id`'s current generation: its kept exits are discarded,
     /// as is every exit of that generation read later.
     fn end_generation(&mut self, worker_id: &str) {
-        *self.generations.entry(worker_id.to_owned()).or_default() += 1;
+        self.generations.remove(worker_id);
         self.reported.remove(worker_id);
     }
 }
@@ -186,8 +188,8 @@ impl LauncherRegistry {
     /// another host, and a bound wildcard address names no interface. But a
     /// launcher has already connected to this listener, so the connection's
     /// local address is a head address reachable from a launcher host. The
-    /// rendezvous and registration addresses handed to remote ranks must use
-    /// that address.
+    /// rendezvous address and the head's address handed to remote ranks must
+    /// use that address.
     pub(crate) fn reachable_host(&self) -> anyhow::Result<std::net::IpAddr> {
         let launcher = self
             .hosts
@@ -288,7 +290,7 @@ impl LauncherRegistry {
         &mut self,
         host: &str,
         worker_id: &str,
-    ) -> anyhow::Result<super::registration::Rendezvous> {
+    ) -> anyhow::Result<super::head::Rendezvous> {
         let launcher = self
             .hosts
             .get_mut(host)
@@ -317,9 +319,10 @@ impl LauncherRegistry {
                             reservation.worker_id == worker_id && reservation.port > 0,
                             "invalid rendezvous reservation"
                         );
-                        return Ok(super::registration::Rendezvous {
+                        return Ok(super::head::Rendezvous {
                             address: SocketAddr::new(address, reservation.port).to_string(),
                             listener: None,
+                            listen_fd: Some(reservation.listen_fd),
                         });
                     }
                     Report::Exit(exit) => self.exits.file(host, exit),
@@ -330,16 +333,11 @@ impl LauncherRegistry {
         reservation
     }
 
-    /// Sends one rank's launch to the launcher that owns its host. `launch`
-    /// states the rank's spawn for the generation `worker_id`'s launches
-    /// currently carry, which only the registry knows.
-    pub(crate) fn spawn_remote(
-        &mut self,
-        host: &str,
-        worker_id: &str,
-        launch: impl FnOnce(u64) -> RankSpawn,
-    ) -> anyhow::Result<()> {
-        let spawn = launch(self.exits.generation(worker_id));
+    /// Sends one rank's launch to the launcher that owns its host, and takes
+    /// the launch's generation as the one whose exits belong to its group.
+    pub(crate) fn spawn_remote(&mut self, host: &str, spawn: RankSpawn) -> anyhow::Result<()> {
+        self.exits
+            .begin_generation(&spawn.worker_id, spawn.generation);
         let launcher = self
             .hosts
             .get_mut(host)
@@ -440,24 +438,26 @@ impl Drop for LauncherRegistry {
 
 /// One host's launcher, addressed while a rank's launch is being derived.
 ///
-/// The head builds a rank's descriptor and command the same way whether the
-/// rank runs here or elsewhere; this delivers that launch to the host that
-/// owns it, taking the environment from the command rather than deriving it a
-/// second time.
+/// The head builds a rank's command the same way whether the rank runs here
+/// or elsewhere; this delivers that launch to the host that owns it, taking
+/// the environment from the command rather than deriving it a second time.
 pub(crate) struct RemoteHost<'a> {
     pub registry: &'a Mutex<LauncherRegistry>,
     pub host: &'a str,
 }
 
 impl RemoteHost<'_> {
-    /// Sends one rank's launch to this host's launcher.
+    /// Sends one rank's launch to this host's launcher: a member of launch
+    /// `generation` of its group, which connects to the head at `head`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn deliver(
         &mut self,
         rank: u32,
         world_size: u32,
         python: &std::path::Path,
         worker_id: &str,
-        descriptor: &uniserve_ipc::LaunchDescriptor,
+        generation: u64,
+        head: &str,
         command: &std::process::Command,
     ) -> anyhow::Result<()> {
         let environment = command
@@ -479,15 +479,18 @@ impl RemoteHost<'_> {
             .registry
             .lock()
             .map_err(|_| anyhow::anyhow!("the launcher registry is poisoned"))?;
-        registry.spawn_remote(self.host, worker_id, |generation| RankSpawn {
-            rank,
-            worker_id: worker_id.to_owned(),
-            generation,
-            world_size,
-            python: python.to_owned(),
-            descriptor: descriptor.clone(),
-            environment,
-        })
+        registry.spawn_remote(
+            self.host,
+            RankSpawn {
+                rank,
+                worker_id: worker_id.to_owned(),
+                generation,
+                world_size,
+                python: python.to_owned(),
+                head: head.to_owned(),
+                environment,
+            },
+        )
     }
 }
 
@@ -504,6 +507,19 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).expect("a message arrives");
         serde_json::from_str(&line).expect("the message is JSON")
+    }
+
+    /// One rank's launch on host `b`, as the head sends it.
+    fn spawn(worker_id: &str, rank: u32, generation: u64) -> RankSpawn {
+        RankSpawn {
+            rank,
+            worker_id: worker_id.to_owned(),
+            generation,
+            world_size: 8,
+            python: "python3".to_owned(),
+            head: "127.0.0.1:1".to_owned(),
+            environment: HashMap::new(),
+        }
     }
 
     /// Returns the statuses of the first nonempty drain of `worker_id`'s
@@ -531,16 +547,21 @@ mod tests {
             stream
                 .write_all(b"{\"host\":\"b\"}\n")
                 .expect("the launcher presents");
+            let mut reader = BufReader::new(stream.try_clone().expect("the connection splits"));
+
+            // Both ranks are launched, and then both exit.
+            receive(&mut reader);
+            receive(&mut reader);
             stream
                 .write_all(
-                    b"{\"worker_id\":\"model\",\"generation\":0,\"rank\":5,\
+                    b"{\"worker_id\":\"model\",\"generation\":1,\"rank\":5,\
                       \"status\":\"exit status: 1\"}\n\
-                      {\"worker_id\":\"host\",\"generation\":0,\"rank\":1,\
+                      {\"worker_id\":\"host\",\"generation\":1,\"rank\":1,\
                       \"status\":\"exit status: 2\"}\n",
                 )
                 .expect("the launcher reports two exits");
             let mut line = String::new();
-            BufReader::new(stream)
+            reader
                 .read_line(&mut line)
                 .expect("the launcher reads the stop");
             line
@@ -548,6 +569,11 @@ mod tests {
         registry
             .await_hosts(&["b".to_owned()], Duration::from_secs(5))
             .expect("host b presents");
+        for (worker, rank) in [("model", 5), ("host", 1)] {
+            registry
+                .spawn_remote("b", spawn(worker, rank, 1))
+                .expect("the rank is launched");
+        }
 
         // Both exits arrive on one connection; each group takes its own and
         // the other's is kept for its owner.
@@ -613,27 +639,15 @@ mod tests {
             .await_hosts(&["b".to_owned()], Duration::from_secs(5))
             .expect("host b presents");
 
-        let descriptor = crate::WorkerProcessArgs::default()
-            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
-            .expect("a descriptor");
-        let launch = |generation| RankSpawn {
-            rank: 5,
-            worker_id: "model".to_owned(),
-            generation,
-            world_size: 8,
-            python: "python3".to_owned(),
-            descriptor: descriptor.clone(),
-            environment: HashMap::new(),
-        };
         registry
-            .spawn_remote("b", "model", launch)
+            .spawn_remote("b", spawn("model", 5, 1))
             .expect("the rank is launched");
         stale_exit_written
             .recv()
             .expect("the launcher reports the failed rank");
         registry.stop_worker("model").expect("the stop is sent");
         registry
-            .spawn_remote("b", "model", launch)
+            .spawn_remote("b", spawn("model", 5, 2))
             .expect("the rank is relaunched");
 
         assert_eq!(await_exits(&mut registry, "model"), ["exit status: 1"]);

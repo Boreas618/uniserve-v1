@@ -10,6 +10,11 @@
 //! An address is written `unix:<path>` for a Unix socket and `<host>:<port>`
 //! for TCP, the forms gRPC name resolution uses.
 //!
+//! A new channel carries messages of up to [`INITIAL_BOUND`] bytes, which is
+//! enough for the first exchange on a connection, in which a peer says who it
+//! is and learns what it is to do. Its owner then sets the capacity the
+//! messages that follow need with [`Channel::set_capacity`].
+//!
 //! A channel is non-blocking and makes progress only when called: receive,
 //! wait and send calls flush queued writes as far as the socket accepts, so a
 //! frame larger than the kernel's send buffer finishes sending across later
@@ -34,6 +39,14 @@ use crate::frame::{Frame, Message};
 
 /// The prefix of a Unix socket address; the rest is the socket's path.
 const UNIX_PREFIX: &str = "unix:";
+
+/// Largest encoded message, in bytes, a channel carries until its owner
+/// calls [`Channel::set_capacity`].
+pub const INITIAL_BOUND: usize = 1 << 20;
+
+/// Frames a channel's send queue holds until its owner calls
+/// [`Channel::set_capacity`].
+const INITIAL_DEPTH: usize = 4;
 
 /// Wraps an IO failure with what the channel was doing.
 fn transport(action: &str, error: std::io::Error) -> IpcError {
@@ -347,15 +360,9 @@ pub struct Channel {
 impl Channel {
     /// Connects to a listening address.
     ///
-    /// `bound` is the largest encoded message in bytes in either direction,
-    /// `depth` the number of frames the send queue holds, and `timeout`
-    /// bounds a TCP connect; a Unix socket connects or fails at once.
-    pub fn connect(
-        address: &str,
-        bound: usize,
-        depth: usize,
-        timeout: Duration,
-    ) -> IpcResult<Self> {
+    /// `timeout` bounds a TCP connect; a Unix socket connects or fails at
+    /// once.
+    pub fn connect(address: &str, timeout: Duration) -> IpcResult<Self> {
         let stream = match address.strip_prefix(UNIX_PREFIX) {
             Some(path) => Stream::Unix(
                 UnixStream::connect(path)
@@ -363,19 +370,30 @@ impl Channel {
             ),
             None => Stream::Tcp(connect_tcp(address, timeout)?),
         };
-        Self::over(stream, bound, depth)
+        Self::over(stream)
     }
 
     /// Builds a channel over a connected stream.
-    fn over(stream: Stream, bound: usize, depth: usize) -> IpcResult<Self> {
+    fn over(stream: Stream) -> IpcResult<Self> {
         Ok(Self {
             stream: stream.configure()?,
             reader: FrameReader::new(),
-            writer: FrameWriter::new(depth),
-            bound,
+            writer: FrameWriter::new(INITIAL_DEPTH),
+            bound: INITIAL_BOUND,
             failure: None,
             local: LocalWake::new()?,
         })
+    }
+
+    /// Sets the capacity the messages from here on need: `bound` is the
+    /// largest encoded message in bytes in either direction, and `depth` the
+    /// number of frames the send queue holds.
+    ///
+    /// Both ends of a connection must set the same bound, since each end
+    /// refuses a longer message when it sends and when it receives.
+    pub fn set_capacity(&mut self, bound: usize, depth: usize) {
+        self.bound = bound;
+        self.writer.depth = depth.max(1);
     }
 
     /// Returns a handle that fires this channel's local wake.
@@ -437,11 +455,6 @@ impl Channel {
         self.local.take();
         self.pump();
         Ok(())
-    }
-
-    /// Consumes the local wake and reports whether it had fired.
-    pub fn take_wake(&mut self) -> bool {
-        self.local.take()
     }
 
     /// Returns whether the connection has failed or been closed by the peer.
@@ -582,19 +595,15 @@ pub struct Listener {
     sockets: Vec<Socket>,
     /// The bound addresses, in the order they were given.
     addresses: Vec<String>,
-    /// Sizing every accepted channel takes; see [`Channel::connect`].
-    bound: usize,
-    depth: usize,
 }
 
 impl Listener {
     /// Binds every address in `addresses`.
     ///
     /// A TCP address may name port zero, for which the system picks a free
-    /// port that [`Self::addresses`] then reports. `bound` and `depth` size
-    /// each accepted channel as in [`Channel::connect`]. Fails when an
-    /// address cannot be bound, for example a Unix socket path that exists.
-    pub fn bind(addresses: &[&str], bound: usize, depth: usize) -> IpcResult<Self> {
+    /// port that [`Self::addresses`] then reports. Fails when an address
+    /// cannot be bound, for example a Unix socket path that exists.
+    pub fn bind(addresses: &[&str]) -> IpcResult<Self> {
         let sockets = addresses
             .iter()
             .map(|address| Socket::bind(address))
@@ -603,12 +612,7 @@ impl Listener {
             .iter()
             .map(Socket::address)
             .collect::<IpcResult<_>>()?;
-        Ok(Self {
-            sockets,
-            addresses,
-            bound,
-            depth,
-        })
+        Ok(Self { sockets, addresses })
     }
 
     /// Returns the bound addresses, in the order they were given to
@@ -621,7 +625,7 @@ impl Listener {
     pub fn try_accept(&self) -> IpcResult<Option<Channel>> {
         for socket in &self.sockets {
             if let Some(stream) = socket.accept()? {
-                return Channel::over(stream, self.bound, self.depth).map(Some);
+                return Channel::over(stream).map(Some);
             }
         }
         Ok(None)
@@ -689,7 +693,8 @@ mod tests {
     fn with_raw_peer(bound: usize, depth: usize) -> (Channel, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        let channel = Channel::connect(&address, bound, depth, TIMEOUT).unwrap();
+        let mut channel = Channel::connect(&address, TIMEOUT).unwrap();
+        channel.set_capacity(bound, depth);
         let (peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(TIMEOUT)).unwrap();
         (channel, peer)
@@ -711,11 +716,11 @@ mod tests {
     fn messages_cross_unix_and_tcp_connections_in_both_directions() {
         let directory = tempfile::tempdir().unwrap();
         let unix = format!("unix:{}", directory.path().join("channel.sock").display());
-        let listener = Listener::bind(&[&unix, "127.0.0.1:0"], 1 << 20, 8).unwrap();
+        let listener = Listener::bind(&[&unix, "127.0.0.1:0"]).unwrap();
         assert_eq!(listener.addresses()[0], unix);
 
         for address in listener.addresses() {
-            let mut near = Channel::connect(address, 1 << 20, 8, TIMEOUT).unwrap();
+            let mut near = Channel::connect(address, TIMEOUT).unwrap();
             let mut far = listener.accept(TIMEOUT).unwrap().expect("a connection");
 
             let mut request = WorkerRequest::info();
@@ -735,9 +740,9 @@ mod tests {
         let path = directory.path().join("channel.sock");
         let address = format!("unix:{}", path.display());
 
-        let listener = Listener::bind(&[&address], 1024, 1).unwrap();
+        let listener = Listener::bind(&[&address]).unwrap();
         assert!(path.exists());
-        assert!(Listener::bind(&[&address], 1024, 1).is_err());
+        assert!(Listener::bind(&[&address]).is_err());
 
         drop(listener);
         assert!(!path.exists());
@@ -794,28 +799,38 @@ mod tests {
         ));
     }
 
-    /// A wake ends a wait that no message would have ended, is consumed by
-    /// the wait or the take that observes it, and rearms afterwards.
+    /// A wake ends a wait that no message would have ended, fires coalesce
+    /// into the one wait that observes them, and the wake rearms afterwards.
     #[test]
     fn a_local_wake_interrupts_a_wait_once_and_rearms() {
         let (mut channel, _peer) = with_raw_peer(1024, 1);
         let wake = channel.wake();
-        assert!(!channel.take_wake());
+        let long = Duration::from_secs(30);
+        let short = Duration::from_millis(50);
+        let waited = |channel: &mut Channel, timeout| {
+            let started = Instant::now();
+            channel.wait(timeout).unwrap();
+            started.elapsed()
+        };
+
+        assert!(waited(&mut channel, short) >= short, "nothing had fired");
 
         wake.wake();
         wake.wake();
-        let started = Instant::now();
-        channel.wait(TIMEOUT).unwrap();
-        assert!(started.elapsed() < TIMEOUT, "the wake did not end the wait");
-        assert!(!channel.take_wake(), "the wait consumed both fires");
+        assert!(
+            waited(&mut channel, long) < long,
+            "the wake did not end the wait"
+        );
+        assert!(
+            waited(&mut channel, short) >= short,
+            "one wait consumed both fires"
+        );
 
-        // Every take rearms the wake, however many preceded it, and a wake
-        // may fire from another thread.
+        // A wake may fire from another thread, however many waits preceded it.
         for _ in 0..3 {
             let wake = wake.clone();
             std::thread::spawn(move || wake.wake()).join().unwrap();
-            assert!(channel.take_wake());
-            assert!(!channel.take_wake());
+            assert!(waited(&mut channel, long) < long);
         }
     }
 

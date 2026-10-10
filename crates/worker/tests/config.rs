@@ -1,22 +1,17 @@
-//! Launch descriptor resolution, through the rank's command line.
+//! Launch descriptor resolution.
 
 #![recursion_limit = "256"]
 #![allow(clippy::unwrap_used)]
 
-use std::path::Path;
-
 use serde_json::{Value, json};
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
-use uniserve_worker::config::{Device, WorkerLaunch};
-use uniserve_worker::launch::configure;
+use uniserve_worker::config::{Device, WorkerLaunch, resolve};
 
 /// Neutral values for every descriptor field, as the engine emits them for
 /// a single-rank CPU worker.
 fn defaults() -> Value {
     json!({
         "worker_id": "worker",
-        "registration_address": "127.0.0.1:0",
-        "channel_transport": "unix",
         "acknowledgment_slot": 0,
         "host_slots": [0],
         "products_cross_hosts": false,
@@ -93,15 +88,11 @@ fn resolved(overrides: Value) -> Result<WorkerLaunch, String> {
     resolve_text(&descriptor.to_string())
 }
 
+/// Resolve the descriptor `text` states, as the rank does with the one the
+/// head sends it.
 fn resolve_text(text: &str) -> Result<WorkerLaunch, String> {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("launch.json");
-    std::fs::write(&path, text).unwrap();
-    configure(&["--launch-descriptor", path_text(&path)]).map_err(|error| error.to_string())
-}
-
-fn path_text(path: &Path) -> &str {
-    path.to_str().unwrap()
+    let descriptor = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    resolve(descriptor).map_err(|error| error.to_string())
 }
 
 fn two_rank_model() -> Value {
@@ -521,42 +512,12 @@ fn the_encoder_cache_holds_the_launched_entry_count() {
 }
 
 #[test]
-fn the_descriptor_carries_exactly_the_launch_fields() {
-    let mut extra = defaults();
-    extra
-        .as_object_mut()
-        .unwrap()
-        .insert("tensor_parallel".into(), json!(2));
-    assert!(
-        resolve_text(&extra.to_string())
-            .unwrap_err()
-            .contains("unknown field")
-    );
-
-    let mut missing = defaults();
-    missing.as_object_mut().unwrap().remove("queue_depth");
-    assert!(
-        resolve_text(&missing.to_string())
-            .unwrap_err()
-            .contains("queue_depth")
-    );
-
+fn channel_and_transfer_values_are_checked() {
     assert!(launch_error(json!({"queue_depth": 0})).contains("--queue-depth must be positive"));
     assert!(launch_error(json!({"transfer_backends": "local,local"})).contains("unique"));
     assert!(launch_error(json!({"export_backends": "shm"})).contains("bound transports"));
     assert!(
         launch_error(json!({"transfer_backends": "local,cuda_vmm", "export_backends": "local"}))
             .contains("CUDA VMM")
-    );
-}
-
-#[test]
-fn argument_errors_are_usage_errors() {
-    assert!(configure(&["--rank", "0"]).is_err());
-    assert!(
-        configure(&["--launch-descriptor", "/nonexistent/launch.json"])
-            .unwrap_err()
-            .to_string()
-            .contains("cannot read launch descriptor")
     );
 }
