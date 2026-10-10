@@ -991,7 +991,7 @@ pub struct TimingCounters {
 
 /// Transport handle for a completed media artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "transport", content = "value")]
+#[serde(rename_all = "snake_case")]
 pub enum ArtifactHandle {
     /// Artifact stored in a POSIX shared-storage object.
     PosixShm {
@@ -1128,7 +1128,7 @@ impl RequestOutput {
 
 /// Ordered request and buffer commands carried with logical work.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+#[serde(rename_all = "snake_case")]
 pub enum BatchCommand {
     /// Establish one request before its first call on a pool.
     Start {

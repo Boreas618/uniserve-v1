@@ -186,7 +186,7 @@ pub struct ComponentInfo {
     /// Component name; `WorkerInfo::validate` requires it to be non-empty and
     /// unique within one worker.
     pub name: String,
-    #[serde(flatten)]
+    /// Rank membership and parallel layout of the component.
     pub config: uniserve_core::ComponentConfig,
     /// Named tensor results declared by the loaded computation. Their order
     /// defines product output indices independently of Worker grouping.
@@ -207,7 +207,6 @@ pub struct OutputInfo {
     /// The axes holding a video request's raster, for a result laid out at
     /// the request's canvas. Their extents in `shape_bound` are the largest
     /// height and width the worker admits; a request binds them to its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raster_axes: Option<RasterAxes>,
 }
 

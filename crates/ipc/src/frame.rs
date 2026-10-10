@@ -6,9 +6,13 @@
 //! their `serde` derives describe, and both ends are built from this
 //! workspace, so no schema, generated code or version field accompanies it.
 //!
-//! Structs are encoded as maps keyed by field name rather than as positional
-//! arrays. The message types use tagged, untagged and flattened members and
-//! omit some absent fields, which a positional encoding cannot decode.
+//! The encoding is positional: a struct is the array of its fields in
+//! declaration order, without their names. Every message type must therefore
+//! decode from a sequence, which rules out three `serde` forms in anything a
+//! message reaches: a flattened member, a struct variant of an adjacently
+//! tagged or untagged enum, and a field omitted when absent
+//! (`skip_serializing_if`) anywhere but last in its struct. The round-trip
+//! tests of this crate carry every message family through a frame.
 //!
 //! A [`Message`] is validated on both sides of a frame: [`Frame::encode`]
 //! refuses a message that violates the protocol contract before any byte is
@@ -49,7 +53,7 @@ impl Frame {
 
         // Encode behind a placeholder length, which is known only afterwards.
         let mut bytes = vec![0_u8; Self::LENGTH_BYTES];
-        rmp_serde::encode::write_named(&mut bytes, message)
+        rmp_serde::encode::write(&mut bytes, message)
             .map_err(|error| IpcError::Encoding(format!("encoding a message: {error}")))?;
 
         let length = bytes.len() - Self::LENGTH_BYTES;

@@ -98,7 +98,7 @@ impl DType {
 
 /// One dimension of a bounded shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+#[serde(rename_all = "snake_case")]
 pub enum DimBound {
     /// A host-static extent.
     Static(u32),
@@ -247,7 +247,7 @@ impl TensorRef {
 
 /// Transport used to publish a product between worker pools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "transport", content = "value")]
+#[serde(rename_all = "snake_case")]
 pub enum TransferTransport {
     /// Process-local export resolved through a worker endpoint.
     Local {
@@ -712,7 +712,7 @@ pub enum FeatureKind {
 /// a destination worker. Every variant carries exactly one tensor, which
 /// [`TransferHandle::tensors`] exposes as a slice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+#[serde(rename_all = "snake_case")]
 pub enum TransferHandle {
     /// Encoded vision or latent features.
     Encoder {

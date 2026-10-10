@@ -177,14 +177,18 @@ pub struct ComponentConfig {
     pub ranks: Vec<usize>,
     #[serde(default)]
     pub parallel_config: ParallelConfig,
-    /// How independent units are spread over `ranks`; `None` runs the
-    /// component as one model-parallel group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub distribution: Option<ComponentDistribution>,
     /// Consecutive units each rank takes under `distribution`; must be
     /// positive.
     #[serde(default = "one")]
     pub units_per_rank: usize,
+    /// How independent units are spread over `ranks`; `None` runs the
+    /// component as one model-parallel group.
+    ///
+    /// An absent distribution is omitted when serialized. This field is
+    /// declared last so that a positional encoding, which writes a struct as
+    /// its fields in order, loses only its final element and still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<ComponentDistribution>,
 }
 
 impl ComponentConfig {

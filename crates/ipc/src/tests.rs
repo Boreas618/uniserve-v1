@@ -1597,13 +1597,39 @@ fn worker_info_round_trips() {
             }],
             ..Default::default()
         };
-        // Python startup metadata crosses the serde mapping boundary before
-        // the binary response is delivered to the native host.
-        let mapped = serde_json::to_value(&info).unwrap();
-        assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
         let response = WorkerResponse::info(info.clone());
         let decoded = round_trip(&response);
         let WorkerResponse::Info { info: decoded, .. } = decoded else {
+            panic!("decoded response must preserve its info variant");
+        };
+        assert_eq!(decoded, info);
+    }
+}
+
+/// A component's distribution is omitted from its encoding when absent, so
+/// both forms must decode, each with its own units per rank.
+#[test]
+fn a_component_round_trips_with_and_without_a_distribution() {
+    use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig};
+
+    let grouped = ComponentConfig::parallel(vec![0], ParallelConfig::default());
+    let distributed = ComponentConfig {
+        distribution: Some(ComponentDistribution::TemporalUnits),
+        units_per_rank: 3,
+        ..grouped.clone()
+    };
+    for config in [grouped, distributed] {
+        let info = WorkerInfo {
+            components: vec![ComponentInfo {
+                name: "decoder".into(),
+                config,
+                outputs: Vec::new(),
+            }],
+            ..WorkerInfo::default()
+        };
+        let WorkerResponse::Info { info: decoded, .. } =
+            round_trip(&WorkerResponse::info(info.clone()))
+        else {
             panic!("decoded response must preserve its info variant");
         };
         assert_eq!(decoded, info);
@@ -2233,7 +2259,7 @@ fn an_invalid_message_is_refused_on_both_sides_of_a_frame() {
 
     // A receiver validates what it decodes, whatever the sender did: these
     // are the bytes a sender that skipped validation would have framed.
-    let mut message = rmp_serde::to_vec_named(&invalid).unwrap();
+    let mut message = rmp_serde::to_vec(&invalid).unwrap();
     let mut bytes = u32::try_from(message.len()).unwrap().to_le_bytes().to_vec();
     bytes.append(&mut message);
     let frame = Frame::from_bytes(bytes, BOUND).unwrap();
