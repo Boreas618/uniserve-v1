@@ -53,6 +53,18 @@ fn allocate(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
     }
 }
 
+/// Storage of one field's values. A dense KV export aliases the live pages,
+/// so device planes are exportable allocations: a CUDA VMM export names the
+/// pages where they lie, whatever the pool's size. Every local peer device
+/// may address them, because readers on those devices in this process copy
+/// from the pages directly.
+fn allocate_values(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
+    match device {
+        Some(device) => Memory::exportable(device, bytes, &Memory::peers(device)?),
+        None => Ok(Memory::host(bytes)),
+    }
+}
+
 /// Fill `height` rows of `width` bytes, `pitch` bytes apart, with `value`.
 ///
 /// # Safety
@@ -141,8 +153,8 @@ impl KVPlanes {
         let cells = plan.columns as usize * num_units as usize;
         let plane_bytes = cells * plan.plane_bytes as usize;
         let values = [
-            allocate(device, plane_bytes)?,
-            allocate(device, plane_bytes)?,
+            allocate_values(device, plane_bytes)?,
+            allocate_values(device, plane_bytes)?,
         ];
         let initialized = [allocate(device, cells)?, allocate(device, cells)?];
         let scales = if plan.quantized {
