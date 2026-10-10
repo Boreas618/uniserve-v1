@@ -15,7 +15,7 @@ use uniserve_ipc::{BlockTable, Locator, TransferTransport, WorkerEndpoint};
 use uniserve_worker::ffi::{Backing, DType, Device};
 use uniserve_worker::storage::memory::{Memory, StorageView};
 use uniserve_worker::storage::{
-    BlockTableStorage, BlockTables, GroupShape, OutputBuffer, OutputStorage,
+    BlockTableStorage, BlockTables, GroupShape, LatentStorage, OutputBuffer, OutputStorage,
 };
 use uniserve_worker::transfer::{
     Capacity, Spans, TransportKind, TransportOptions, Transports, exports, notify,
@@ -127,6 +127,16 @@ fn transports(
     let transports =
         Transports::new(kinds, Arc::clone(&capacity), EventPool::new(), &options).unwrap();
     (transports, capacity)
+}
+
+/// Reap `transports` until every export credit has returned.
+fn settle(transports: &Transports, capacity: &Capacity) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while capacity.used() != 0 && std::time::Instant::now() < deadline {
+        transports.reap().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(capacity.used(), 0);
 }
 
 #[test]
@@ -410,14 +420,6 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
     let elements: i64 = 5 << 18;
     let memory = Memory::device(DEVICE, elements as usize * 4).unwrap();
     let spans = Spans::single(counting(&[elements], memory, &stream)).unwrap();
-    let settle = |transports: &Transports, capacity: &Capacity| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while capacity.used() != 0 && std::time::Instant::now() < deadline {
-            transports.reap().unwrap();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(capacity.used(), 0);
-    };
 
     let (device_only, capacity) = transports(
         &[TransportKind::Local, TransportKind::CudaVmm],
@@ -464,6 +466,63 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
     exports::release(&locations).unwrap();
     settle(&with_shared, &capacity);
     with_shared.close().unwrap();
+}
+
+/// Resident KV pages and latent pages reach a VMM consumer where they lie:
+/// an export larger than the VMM pool needs no host mechanism.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
+    let _driver = exclusive_driver();
+    let stream = stream();
+    let (transports, capacity) = transports(
+        &[TransportKind::Local, TransportKind::CudaVmm],
+        "producer",
+        0,
+    );
+
+    // Six tokens of both columns: 6 MiB of bfloat16, more than the 4 MiB
+    // pool `transports` configures.
+    let plan = Arc::new(kv_plan("bfloat16", 1 << 17));
+    let planes = uniserve_worker::KVPlanes::allocate(plan, Some(DEVICE), 2, Some(&stream)).unwrap();
+    let kv_page = Spans::single(planes.page(0, 0, 1, 0, 6).unwrap()).unwrap();
+
+    // One page of 768 units of 2048 f32 elements, also 6 MiB.
+    let latents = LatentStorage::allocate(
+        1,
+        2,
+        768,
+        2048,
+        DType::F32,
+        false,
+        Some(DEVICE),
+        Some(&stream),
+    )
+    .unwrap();
+    let latent_page = latents.spans(0, &[1], 768).unwrap();
+
+    for source in [kv_page, latent_page] {
+        assert_eq!(source.nbytes(), 6 << 20);
+        let locations = exports::export(
+            &transports,
+            &source,
+            None,
+            &[1],
+            false,
+            Some(&stream),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let kinds: Vec<_> = locations
+            .iter()
+            .map(|(_, locator)| TransportKind::of(locator))
+            .collect();
+        assert_eq!(kinds, [TransportKind::Local, TransportKind::CudaVmm]);
+
+        exports::release(&locations).unwrap();
+        settle(&transports, &capacity);
+    }
+    transports.close().unwrap();
 }
 
 /// Producer half: export a device tensor through a CUDA VMM pool chunk to
@@ -569,6 +628,19 @@ fn vmm_export_consumer() {
 /// A one-group FP8 plan: two layers in two columns, 8-token pages of two
 /// 4-wide heads (8-byte rows, 64-byte planes).
 fn fp8_plan() -> uniserve_worker::KVPlan {
+    kv_plan("float8_e4m3fn", 4)
+}
+
+/// A one-group plan storing `dtype`: two layers in two columns, 8-token
+/// pages of two heads of `head_dim` elements.
+fn kv_plan(dtype: &str, head_dim: i64) -> uniserve_worker::KVPlan {
+    let quantized = dtype == "float8_e4m3fn";
+    let element_bytes = if quantized { 1 } else { 2 };
+    let plane_bytes = 8 * 2 * head_dim * element_bytes;
+    // Each plane carries one initialized flag, and an FP8 plane one f32 scale.
+    let metadata_bytes = if quantized { 5 } else { 1 };
+    let unit_bytes = 2 * 2 * (plane_bytes + metadata_bytes);
+
     use tvm_ffi::{Any, Array, Map, String as FfiString};
     let entry = |key: &str, value: Any| (FfiString::from(key), value);
     let names: Array<Any> = ["a", "b"]
@@ -586,8 +658,8 @@ fn fp8_plan() -> uniserve_worker::KVPlan {
         entry("num_kv_heads", Any::from(2_i64)),
         entry("total_kv_heads", Any::from(2_i64)),
         entry("kv_head_offset", Any::from(0_i64)),
-        entry("head_dim", Any::from(4_i64)),
-        entry("dtype", Any::from(FfiString::from("float8_e4m3fn"))),
+        entry("head_dim", Any::from(head_dim)),
+        entry("dtype", Any::from(FfiString::from(dtype))),
         entry("compute_dtype", Any::from(FfiString::from("bfloat16"))),
     ]
     .into_iter()
@@ -595,10 +667,10 @@ fn fp8_plan() -> uniserve_worker::KVPlan {
     let groups: Array<Any> = [Any::from(group)].into_iter().collect();
     let plan: Map<FfiString, Any> = [
         entry("columns", Any::from(2_i64)),
-        entry("plane_bytes", Any::from(64_i64)),
-        entry("quantized", Any::from(true)),
-        entry("unit_bytes", Any::from(2 * 2 * (64 + 5_i64))),
-        entry("dtype", Any::from(FfiString::from("float8_e4m3fn"))),
+        entry("plane_bytes", Any::from(plane_bytes)),
+        entry("quantized", Any::from(quantized)),
+        entry("unit_bytes", Any::from(unit_bytes)),
+        entry("dtype", Any::from(FfiString::from(dtype))),
         entry("groups", Any::from(groups)),
     ]
     .into_iter()
