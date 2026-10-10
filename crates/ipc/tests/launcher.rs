@@ -8,12 +8,14 @@ use uniserve_ipc::launcher::{Instruction, RankExit, Report, Reservation};
 /// tells them apart by their fields.
 #[test]
 fn reports_decode_by_their_fields() {
-    let reservation: Report = serde_json::from_str(r#"{"worker_id":"model","port":4100}"#).unwrap();
+    let reservation: Report =
+        serde_json::from_str(r#"{"worker_id":"model","port":4100,"listen_fd":7}"#).unwrap();
     assert_eq!(
         reservation,
         Report::Reservation(Reservation {
             worker_id: "model".into(),
             port: 4100,
+            listen_fd: 7,
         })
     );
 

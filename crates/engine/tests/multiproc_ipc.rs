@@ -73,23 +73,9 @@ fn finish(request_key: RequestKey) -> BatchCommand {
     }
 }
 
-/// Starts the stub worker with `descriptor` as a raw process, outside any
-/// group.
-fn spawn_raw_worker(
-    descriptor: &LaunchDescriptor,
-    directory: &Path,
-) -> anyhow::Result<std::process::Child> {
-    let path = directory.join("launch.json");
-    std::fs::write(&path, descriptor.to_json()?)?;
-    Ok(std::process::Command::new(worker_python())
-        .args(["-m", "uniserve_models.worker"])
-        .arg("--launch-descriptor")
-        .arg(&path)
-        .spawn()?)
-}
-
-/// The head's end of one rank's channel, driven by a test: it sends requests
-/// and takes each response by the identity its request carried.
+/// The head's end of one rank's channel, driven by a test: it starts a stub
+/// rank, answers its registration, sends requests and takes each response by
+/// the identity its request carried.
 struct RawHead {
     channel: uniserve_ipc::Channel,
     /// Responses read while waiting for another one.
@@ -97,11 +83,76 @@ struct RawHead {
 }
 
 impl RawHead {
-    fn connect(endpoint: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            channel: uniserve_ipc::Channel::connect(endpoint, 1 << 20, 8, Duration::from_secs(60))?,
-            inbox: std::collections::HashMap::new(),
-        })
+    /// Starts the stub worker as a raw process, outside any group, as a
+    /// member of launch `generation`, and answers its registration with
+    /// `descriptor`.
+    ///
+    /// The head listens at `address`, so the rank reaches it over a Unix
+    /// socket (`unix:<path>`) or over TCP (`127.0.0.1:0`).
+    fn launch(
+        address: &str,
+        descriptor: &LaunchDescriptor,
+        generation: u64,
+    ) -> anyhow::Result<(Self, std::process::Child)> {
+        let listener = uniserve_ipc::Listener::bind(&[address])?;
+        let mut child = std::process::Command::new(worker_python())
+            .args(["-m", "uniserve_models.worker"])
+            .args(["--head", &listener.addresses()[0]])
+            .args(["--worker-id", &descriptor.worker_id])
+            .args(["--rank", &descriptor.rank.to_string()])
+            .args(["--generation", &generation.to_string()])
+            .spawn()?;
+        let registered = (|| -> anyhow::Result<Self> {
+            // A worker that fails before registering never connects, so the
+            // wait for its registration is bounded.
+            let channel = listener
+                .accept(Duration::from_secs(60))?
+                .context("no rank connected within 60 seconds")?;
+            let mut head = Self {
+                channel,
+                inbox: std::collections::HashMap::new(),
+            };
+
+            let registration: uniserve_ipc::Registration = head.receive(Duration::from_secs(60))?;
+            anyhow::ensure!(
+                registration
+                    == uniserve_ipc::Registration {
+                        worker_id: descriptor.worker_id.clone(),
+                        rank: descriptor.rank,
+                        generation,
+                        version: uniserve_ipc::VERSION.into(),
+                    },
+                "the rank registered as {registration:?}"
+            );
+            head.channel.send(descriptor)?;
+            head.channel
+                .set_capacity(descriptor.ipc_payload_cap, descriptor.queue_depth);
+            Ok(head)
+        })();
+        match registered {
+            Ok(head) => Ok((head, child)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error)
+            }
+        }
+    }
+
+    /// Waits up to `timeout` for the next message of type `M`.
+    fn receive<M: uniserve_ipc::Message>(&mut self, timeout: Duration) -> anyhow::Result<M> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(message) = self.channel.try_recv()? {
+                return Ok(message);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "no message arrived within {timeout:?}"
+            );
+            self.channel.wait(remaining)?;
+        }
     }
 
     /// Sends `request` and returns the identity its response will carry.
@@ -159,17 +210,13 @@ fn wait_exit(
 fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
     use uniserve_ipc::{WorkerRequest, WorkerResponse};
 
-    // Each launch names its own endpoint and reports it here, so a graceful
-    // exit is observable as the next launch registering and serving again.
-    for _ in 0..2 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let directory = tempfile::tempdir()?;
-        let mut child = spawn_raw_worker(
-            &stub_launch_descriptor(&listener.local_addr()?.to_string()),
-            directory.path(),
-        )?;
+    // Each launch registers under its own generation, so a graceful exit is
+    // observable as the next launch registering and serving again. The rank
+    // reaches the head over loopback TCP, as a rank on another host would.
+    for generation in 1..=2 {
+        let (mut client, mut child) =
+            RawHead::launch("127.0.0.1:0", &stub_launch_descriptor(), generation)?;
         let result = (|| -> anyhow::Result<()> {
-            let mut client = RawHead::connect(&accept_reported_endpoint(&listener)?)?;
             let request = |mut request: WorkerRequest, message_id| {
                 request.set_call_id(Some(message_id));
                 request
@@ -263,14 +310,10 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
 fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Result<()> {
     use uniserve_ipc::{WorkerRequest, WorkerResponse};
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let directory = tempfile::tempdir()?;
-    let mut child = spawn_raw_worker(
-        &stub_launch_descriptor(&listener.local_addr()?.to_string()),
-        directory.path(),
-    )?;
+    let address = format!("unix:{}", directory.path().join("head.sock").display());
+    let (mut client, mut child) = RawHead::launch(&address, &stub_launch_descriptor(), 1)?;
     let result = (|| -> anyhow::Result<()> {
-        let mut client = RawHead::connect(&accept_reported_endpoint(&listener)?)?;
         let request = |mut request: WorkerRequest, message_id| {
             request.set_call_id(Some(message_id));
             request
@@ -334,9 +377,8 @@ fn a_starting_rank_stops_on_interrupt_and_dies_of_termination() -> anyhow::Resul
         // Rank 1 of a two-rank group whose rank 0 never starts: the rank
         // registers, then waits in its group's rendezvous for a peer that
         // never answers, so it stays in startup until the signal.
-        let registration = std::net::TcpListener::bind("127.0.0.1:0")?;
         let rendezvous = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let mut descriptor = stub_launch_descriptor(&registration.local_addr()?.to_string());
+        let mut descriptor = stub_launch_descriptor();
         descriptor.rank = 1;
         descriptor.local_rank = 1;
         descriptor.world_size = 2;
@@ -345,9 +387,9 @@ fn a_starting_rank_stops_on_interrupt_and_dies_of_termination() -> anyhow::Resul
         descriptor.components = WorkerConfig::single_component("model", 2);
         descriptor.rendezvous_address = Some(rendezvous.local_addr()?.to_string());
         let directory = tempfile::tempdir()?;
-        let mut child = spawn_raw_worker(&descriptor, directory.path())?;
+        let address = format!("unix:{}", directory.path().join("head.sock").display());
+        let (_head, mut child) = RawHead::launch(&address, &descriptor, 1)?;
         let result = (|| -> anyhow::Result<()> {
-            accept_reported_endpoint(&registration)?;
             // The rank connects to the rendezvous once it has described its
             // model; it is then blocked waiting for the address table.
             rendezvous.set_nonblocking(false)?;
@@ -567,15 +609,23 @@ fn a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow::
 fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    // Killing rank zero relaunches the group. The wrapper merges
-    // replacement.json into each relaunched rank's launch descriptor, so the
-    // replacement describes a different numerical policy or capacity; the
-    // head must refuse it and stop using the group.
-    for change in [
-        serde_json::json!({"model_dtype": "float32"}),
-        serde_json::json!({"max_batch_tokens": 128}),
-        serde_json::json!({"kv_token_capacity": 2048}),
-    ] {
+    // Killing rank zero relaunches the group. Once replacement.json exists
+    // the wrapper starts each relaunched rank as a `media_rank` process,
+    // which answers Info with that file's worker info, so the replacement
+    // describes a different numerical policy or capacity; the head must
+    // refuse it and stop using the group.
+    type Change = fn(&mut uniserve_ipc::WorkerInfo);
+    let changes: [(&str, Change); 3] = [
+        ("model dtype", |info| info.model_dtype = "float32".into()),
+        ("batch tokens", |info| info.max_batch_tokens = 128),
+        ("KV capacity", |info| {
+            if let Some(kv_cache) = info.kv_cache.as_mut() {
+                kv_cache.num_units /= 2;
+            }
+        }),
+    ];
+    let executable = serde_json::to_string(&std::env::current_exe()?)?;
+    for (change, apply) in changes {
         let directory = tempfile::tempdir()?;
         let wrapper = directory.path().join("python");
         let python = serde_json::to_string(&worker_python())?;
@@ -583,7 +633,7 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
         std::fs::write(
             &wrapper,
             format!(
-                "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\nstate = Path({state})\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(state / (rank + '.pid')).write_text(str(os.getpid()))\nchange = state / 'replacement.json'\nif change.exists():\n    path = sys.argv[sys.argv.index('--launch-descriptor') + 1]\n    descriptor = json.loads(Path(path).read_text())\n    descriptor.update(json.loads(change.read_text()))\n    Path(path).write_text(json.dumps(descriptor))\nos.execv({python}, [{python}, *sys.argv[1:]])\n"
+                "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\nstate = Path({state})\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(state / (rank + '.pid')).write_text(str(os.getpid()))\nchange = state / 'replacement.json'\nif change.exists():\n    env = dict(os.environ, {MEDIA_RANK_ARGS}=json.dumps(sys.argv[3:]), {MEDIA_RANK_INFO}=str(change), {MEDIA_RANK_CASE}='none', {MEDIA_RANK_NAME}=str(state / 'media-name'))\n    os.execve({executable}, [{executable}, '--exact', 'media_rank', '--ignored', '--nocapture', '--test-threads', '1'], env)\nos.execv({python}, [{python}, *sys.argv[1:]])\n"
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
@@ -591,9 +641,15 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
         args.python = wrapper;
         let mut worker = WorkerGroup::spawn(args)?;
 
+        let mut changed = worker.info().clone();
+        apply(&mut changed);
+        anyhow::ensure!(
+            &changed != worker.info(),
+            "{change} did not change the info"
+        );
         std::fs::write(
             directory.path().join("replacement.json"),
-            serde_json::to_vec(&change)?,
+            serde_json::to_vec(&changed)?,
         )?;
         let pid =
             std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
@@ -632,7 +688,7 @@ fn closing_a_group_lets_every_rank_finish_a_collective_teardown() -> anyhow::Res
     std::fs::write(
         &wrapper,
         format!(
-            "#!/usr/bin/env python3\nimport json, subprocess, sys, time\nfrom pathlib import Path\nrecords = Path({records})\nrank = sys.argv[sys.argv.index('--rank') + 1]\npath = sys.argv[sys.argv.index('--launch-descriptor') + 1]\nfd = json.loads(Path(path).read_text())['rendezvous_listen_fd']\nstatus = subprocess.call([{python}, *sys.argv[1:]], pass_fds=() if fd is None else (fd,))\n(records / (rank + '.served')).write_text(str(status))\ndeadline = time.monotonic() + 60\nwhile len(list(records.glob('*.served'))) < {WORLD_SIZE}:\n    if time.monotonic() > deadline:\n        sys.exit(3)\n    time.sleep(0.05)\n(records / (rank + '.closed')).write_text('')\nsys.exit(status)\n"
+            "#!/usr/bin/env python3\nimport subprocess, sys, time\nfrom pathlib import Path\nrecords = Path({records})\nrank = sys.argv[sys.argv.index('--rank') + 1]\nstatus = subprocess.call([{python}, *sys.argv[1:]], close_fds=False)\n(records / (rank + '.served')).write_text(str(status))\ndeadline = time.monotonic() + 60\nwhile len(list(records.glob('*.served'))) < {WORLD_SIZE}:\n    if time.monotonic() > deadline:\n        sys.exit(3)\n    time.sleep(0.05)\n(records / (rank + '.closed')).write_text('')\nsys.exit(status)\n"
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
@@ -1023,67 +1079,42 @@ fn command_batch(batch_id: u64, command: BatchCommand) -> Batch {
     Batch::new(batch_id, Vec::new(), Vec::new()).with_commands(vec![command])
 }
 
-/// Reads one rank's registration report and returns the endpoint it names.
-///
-/// Accepts a single connection on the registration listener and parses the
-/// first line it sends as a JSON report. The accept has no timeout; each read
-/// on the accepted connection times out after 60 seconds. Fails on an I/O or
-/// JSON error, or when the report has no string `endpoint` field.
-fn accept_reported_endpoint(listener: &std::net::TcpListener) -> anyhow::Result<String> {
-    use std::io::BufRead as _;
-
-    // A worker that fails before registering never connects, so the wait
-    // for its registration is bounded like the read of its report.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    listener.set_nonblocking(true)?;
-    let stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "no rank registered within 60 seconds"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
-    listener.set_nonblocking(false)?;
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-    let mut line = String::new();
-    std::io::BufReader::new(stream).read_line(&mut line)?;
-    let report: serde_json::Value = serde_json::from_str(line.trim())?;
-    Ok(report["endpoint"]
-        .as_str()
-        .context("rank registration named no endpoint")?
-        .to_owned())
-}
-
+/// The head and its ranks must be one build, since the message types are the
+/// only definition of their protocol. A rank states its build when it
+/// registers, and a launch fails by naming a rank of another one.
 #[test]
-fn launch_refuses_a_rank_that_offers_an_unsupported_channel() -> anyhow::Result<()> {
+fn launch_refuses_a_rank_of_another_build() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    // A rank names its own endpoint, so the mechanism it offers is data the
-    // head has to check rather than a value it chose.
+    // The stand-in registers as the rank it was started as, under a build
+    // the head is not: one frame, a length and then the registration's four
+    // fields in order, and then it waits for the head to close.
     let directory = tempfile::tempdir()?;
     let wrapper = directory.path().join("worker");
     std::fs::write(
         &wrapper,
         r#"#!/usr/bin/env python3
-import json, socket, sys
+import socket, struct, sys
 
-descriptor = json.load(open(sys.argv[sys.argv.index("--launch-descriptor") + 1]))
-host, _, port = descriptor["registration_address"].rpartition(":")
-report = {
-    "worker_id": descriptor["worker_id"],
-    "rank": descriptor["rank"],
-    "transport": "socket",
-    "endpoint": "unreachable",
-}
-with socket.create_connection((host, int(port)), timeout=60) as connection:
-    connection.sendall(json.dumps(report).encode() + b"\n")
+def argument(name):
+    return sys.argv[sys.argv.index(name) + 1]
+
+def text(value):
+    data = value.encode()
+    return bytes([0xA0 | len(data)]) + data
+
+registration = (
+    b"\x94"
+    + text(argument("--worker-id"))
+    + bytes([int(argument("--rank")), int(argument("--generation"))])
+    + text("0.0.0-other")
+)
+connection = socket.socket(socket.AF_UNIX)
+connection.connect(argument("--head").removeprefix("unix:"))
+connection.sendall(struct.pack("<I", len(registration)) + registration)
+connection.settimeout(60)
+while connection.recv(4096):
+    pass
 "#,
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
@@ -1091,12 +1122,12 @@ with socket.create_connection((host, int(port)), timeout=60) as connection:
     let mut args = rank_group_args(1 << 20, 8 << 20);
     args.python = wrapper;
     let reported = match WorkerGroup::spawn(args) {
-        Ok(_) => anyhow::bail!("an unsupported channel transport was accepted"),
+        Ok(_) => anyhow::bail!("a rank of another build was accepted"),
         Err(error) => format!("{error:#}"),
     };
     assert!(
-        reported.contains("unsupported channel transport socket"),
-        "launch failure did not name the offered transport: {reported}"
+        reported.contains("0.0.0-other") && reported.contains(uniserve_ipc::VERSION),
+        "launch failure did not name both builds: {reported}"
     );
     Ok(())
 }
@@ -1465,11 +1496,9 @@ fn rank_group_args(
 /// Production launches receive the same typed descriptor from the engine;
 /// these tests state one directly because they drive the worker process
 /// without a group.
-fn stub_launch_descriptor(registration: &str) -> LaunchDescriptor {
+fn stub_launch_descriptor() -> LaunchDescriptor {
     LaunchDescriptor {
         worker_id: "worker".into(),
-        registration_address: registration.to_owned(),
-        channel_transport: uniserve_ipc::UNIX_CHANNEL.into(),
         acknowledgment_slot: 0,
         host_slots: vec![0],
         products_cross_hosts: false,
@@ -3299,9 +3328,8 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
 #[test]
 #[ignore = "runs as a rank process of the media result test"]
 fn media_rank() -> anyhow::Result<()> {
-    use std::io::Write as _;
     use uniserve_ipc::{
-        ArtifactHandle, BatchOutput, LaunchDescriptor, Listener, MediaOutput, RankReport,
+        ArtifactHandle, BatchOutput, Channel, LaunchDescriptor, MediaOutput, Registration,
         RequestOutput, WorkerRequest, WorkerResponse,
     };
 
@@ -3309,44 +3337,36 @@ fn media_rank() -> anyhow::Result<()> {
         return Ok(());
     };
     let arguments: Vec<String> = serde_json::from_str(&arguments)?;
-    let descriptor = arguments
-        .iter()
-        .position(|argument| argument == "--launch-descriptor")
-        .and_then(|index| arguments.get(index + 1))
-        .context("a rank launch names its descriptor")?;
-    let descriptor = LaunchDescriptor::from_json(&std::fs::read_to_string(descriptor)?)?;
+    let argument = |name: &str| {
+        arguments
+            .iter()
+            .position(|argument| argument == name)
+            .and_then(|index| arguments.get(index + 1))
+            .with_context(|| format!("a rank launch names {name}"))
+    };
+
+    // Register with the head as the rank this process was started as, and
+    // take the launch descriptor it answers with.
+    let mut server = Channel::connect(argument("--head")?, Duration::from_secs(60))?;
+    server.send(&Registration {
+        worker_id: argument("--worker-id")?.clone(),
+        rank: argument("--rank")?.parse()?,
+        generation: argument("--generation")?.parse()?,
+        version: uniserve_ipc::VERSION.into(),
+    })?;
+    let descriptor: LaunchDescriptor = loop {
+        if let Some(descriptor) = server.try_recv()? {
+            break descriptor;
+        }
+        server.wait(Duration::from_secs(60))?;
+    };
+    server.set_capacity(descriptor.ipc_payload_cap, descriptor.queue_depth);
     let case = std::env::var(MEDIA_RANK_CASE)?;
     let mut info: uniserve_ipc::WorkerInfo =
         serde_json::from_slice(&std::fs::read(std::env::var(MEDIA_RANK_INFO)?)?)?;
     info.endpoint.rank = descriptor.rank;
     info.endpoint.address_space = format!("rust:{}", std::process::id());
     info.endpoint.incarnation = format!("media-rank-{}-{}", descriptor.rank, std::process::id());
-
-    let directory = tempfile::tempdir()?;
-    let address = if descriptor.channel_transport == uniserve_ipc::TCP_CHANNEL {
-        "127.0.0.1:0".to_owned()
-    } else {
-        format!("unix:{}", directory.path().join("media.sock").display())
-    };
-    let listener = Listener::bind(
-        &[&address],
-        descriptor.ipc_payload_cap,
-        descriptor.queue_depth,
-    )?;
-    let report = RankReport {
-        worker_id: descriptor.worker_id.clone(),
-        rank: descriptor.rank,
-        transport: descriptor.channel_transport.clone(),
-        endpoint: listener.addresses()[0].clone(),
-    };
-    let mut registration = std::net::TcpStream::connect(&descriptor.registration_address)?;
-    let mut line = serde_json::to_vec(&report)?;
-    line.push(b'\n');
-    registration.write_all(&line)?;
-    drop(registration);
-    let mut server = listener
-        .accept(Duration::from_secs(60))?
-        .context("the head connects to the endpoint a rank reports")?;
 
     // Media attaches to rank 1's completion only in "rank-output".
     let media_rank = u32::from(case == "rank-output");
