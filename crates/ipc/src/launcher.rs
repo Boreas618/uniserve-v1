@@ -22,8 +22,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::launch::LaunchDescriptor;
-
 /// What a launcher says when it connects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presentation {
@@ -35,8 +33,8 @@ pub struct Presentation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Instruction {
-    /// Start one rank from the descriptor the head derived for it, as a
-    /// member of its group's current generation.
+    /// Start one rank, as a member of its group's current generation. The
+    /// rank connects to the head and receives its launch descriptor there.
     Spawn(Box<RankSpawn>),
     /// Bind and hold a collective store socket for one worker group, which
     /// the launcher hands to that group's first rank when it spawns it. The
@@ -64,10 +62,9 @@ pub struct RankSpawn {
     pub world_size: u32,
     /// Interpreter that runs the worker module.
     pub python: String,
-    /// The launch descriptor the rank reads, as the head derived it for a
-    /// local spawn. The launcher sets the inherited rendezvous socket's
-    /// number in the first rank's copy, which only it knows.
-    pub descriptor: LaunchDescriptor,
+    /// The head's address as this host reaches it, which the rank connects
+    /// to and registers at.
+    pub head: String,
     /// The variables the head's spawn command for this rank sets, applied
     /// over the environment the launcher inherited. A variable the head's
     /// command removes arrives with an empty value and is set empty rather
@@ -93,6 +90,10 @@ pub struct Reservation {
     pub worker_id: String,
     /// Port the launcher bound on its host for the group's collective store.
     pub port: u16,
+    /// The descriptor number the launcher holds the bound socket at. The
+    /// group's first rank inherits the socket at the same number, which the
+    /// head names in that rank's launch descriptor.
+    pub listen_fd: i32,
 }
 
 /// What a launcher says when one of its ranks exits.
