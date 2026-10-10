@@ -196,6 +196,22 @@ impl ShareableHandle {
     }
 }
 
+/// Reserved virtual address ranges by base address, with their lengths. Every
+/// mapping this process creates (exportable allocations, imports and aliases)
+/// lies in one of them.
+static RESERVED: Mutex<BTreeMap<u64, usize>> = Mutex::new(BTreeMap::new());
+
+/// Whether `address` lies in a virtual address range reserved here, that is,
+/// in memory addressed through `cuMemMap` rather than a linear allocation or
+/// host memory.
+pub(crate) fn is_mapped(address: u64) -> bool {
+    let reserved = RESERVED.lock().unwrap_or_else(PoisonError::into_inner);
+    reserved
+        .range(..=address)
+        .next_back()
+        .is_some_and(|(&base, &bytes)| address - base < bytes as u64)
+}
+
 /// A reserved virtual address range, the segments mapped into it and the
 /// physical allocation references that back them.
 ///
@@ -254,6 +270,10 @@ impl VirtualRange {
         )?;
         self.address = address;
         self.reserved = bytes;
+        RESERVED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(address, bytes);
         Ok(())
     }
 
@@ -309,6 +329,15 @@ impl Drop for VirtualRange {
         let handles = std::mem::take(&mut self.handles);
         if address == 0 && handles.is_empty() {
             return;
+        }
+        if address != 0 {
+            // The owner retired every access before dropping the range, and
+            // the driver cannot hand the address out again until the queued
+            // teardown frees it.
+            RESERVED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&address);
         }
 
         reclaim::defer(move || {

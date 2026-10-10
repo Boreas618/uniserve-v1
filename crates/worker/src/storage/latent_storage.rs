@@ -39,6 +39,18 @@ fn allocate(device: Option<i32>, bytes: usize) -> Result<Arc<dyn Backing>> {
     })
 }
 
+/// Storage of the page banks. A latent export aliases the pages its
+/// trajectory occupies, so device banks are one exportable allocation: a
+/// CUDA VMM export names the pages where they lie, whatever the pool's size.
+/// Every local peer device may address them, because readers on those
+/// devices in this process copy from the pages directly.
+fn allocate_banks(device: Option<i32>, bytes: usize) -> Result<Arc<dyn Backing>> {
+    Ok(match device {
+        Some(device) => Memory::exportable(device, bytes.max(1), &Memory::peers(device)?)?,
+        None => Memory::host(bytes.max(1)),
+    })
+}
+
 impl LatentStorage {
     /// Device bytes of a pool's storage.
     pub fn bytes(
@@ -95,7 +107,7 @@ impl LatentStorage {
             i64::from(width),
         );
         let page_bytes = (2 * pages_count * units * width_i) as usize * dtype.bytes();
-        let banks = allocate(device, page_bytes)?;
+        let banks = allocate_banks(device, page_bytes)?;
         let pages = StorageView::contiguous(
             Arc::clone(&banks),
             0,

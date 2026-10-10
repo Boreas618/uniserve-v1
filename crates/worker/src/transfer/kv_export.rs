@@ -38,11 +38,12 @@ fn pages(start: u64, end: u64, page_tokens: u64) -> Vec<(u64, u32, u32)> {
     pages
 }
 
-/// Staging for frozen exports: device memory of the pool's device, or host
-/// memory for a CPU pool.
+/// Staging for frozen exports: exportable memory of the pool's device, which
+/// a CUDA VMM export names where it lies and local peer devices may address,
+/// or host memory for a CPU pool.
 fn staging(planes: &KVPlanes, bytes: usize) -> Result<Arc<Memory>> {
     match planes.device() {
-        Some(device) => Memory::device(device, bytes.max(1)),
+        Some(device) => Memory::exportable(device, bytes.max(1), &Memory::peers(device)?),
         None => Ok(Memory::host(bytes.max(1))),
     }
 }
