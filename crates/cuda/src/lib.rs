@@ -11,6 +11,7 @@
 //! | Primary context | [`PrimaryContext`], [`DeviceGuard`] | release / pop on drop |
 //! | Stream | [`Stream`], [`GreenContext`] (SM partitions) | `cuStreamDestroy` on drop |
 //! | Event | [`Event`] | `cuEventDestroy` on drop |
+//! | Graph executable | [`GraphExec`] (borrowed) | by its owner |
 //! | Device memory | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
 //! | Host memory | [`PinnedBuffer`] (deferred), [`HostRegistration`] (synchronous) | on drop |
 //! | NCCL | [`nccl::Communicator`], [`nccl::Buffer`] | explicit `destroy` / deferred |
@@ -30,6 +31,7 @@ mod device;
 mod driver;
 mod error;
 mod event;
+mod graph;
 mod green;
 mod memory;
 pub mod nccl;
@@ -48,6 +50,7 @@ pub use device::{
 };
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
+pub use graph::GraphExec;
 pub use green::GreenContext;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use nvml::{Nvml, NvmlMemory};
@@ -67,6 +70,7 @@ mod tests {
 
         shared::<Stream>();
         shared::<Event>();
+        shared::<GraphExec>();
         shared::<PrimaryContext>();
         shared::<GreenContext>();
         shared::<DeviceAllocation>();

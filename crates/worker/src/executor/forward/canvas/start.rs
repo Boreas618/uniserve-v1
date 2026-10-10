@@ -19,6 +19,8 @@ use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::CanvasRuntime;
 use crate::config::{Device, WorkerConfig};
+use crate::cuda_graph::GraphStorage;
+use crate::cuda_graph::reserve_pools;
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::Handle;
 use crate::model::LoadedModel;
@@ -27,11 +29,9 @@ use crate::model::canvas::{CanvasFacts, CanvasModel, StepOptions, TableLayout, s
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
-use crate::runner::GraphStorage;
 use crate::runner::canvas::{
     CANDIDATES, CanvasLane, CanvasRunner, CanvasShapes, SLOT_BUCKETS, step_rows,
 };
-use crate::runner::graphs::reserve_pools;
 use crate::storage::canvas::{BankLayout, CanvasBanks, CanvasBuffers, CanvasLayout, StepLayout};
 use crate::storage::{GroupShape, KVCache, KVPlan, OutputPool};
 use crate::worker::Lanes;

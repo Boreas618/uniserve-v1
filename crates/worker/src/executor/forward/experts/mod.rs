@@ -297,7 +297,7 @@ impl ExpertRuntime {
     pub(crate) fn join(&self, capacity: usize) -> Result<()> {
         let _range = range(c"uniserve.expert.join", None);
         if let (Some(joins), Some(_)) = (&self.joins, &self.graphs) {
-            return joins.replay(capacity, self.peers[0].stream.raw(), self.device);
+            return joins.launch(capacity, &self.peers[0].stream);
         }
         self.join_eager(capacity)
     }
@@ -334,8 +334,9 @@ impl ExpertRuntime {
     fn peer_join(&self, peer: usize, capacity: usize) -> Result<MicrobatchCall<()>> {
         let state = &self.peers[peer];
         if let Some(joins) = &state.graphs {
-            let replay = joins.replay_call(capacity, state.stream.raw(), self.device)?;
-            return Ok(Box::new(move || replay.invoke()));
+            let graph = joins.graph(capacity)?.clone();
+            let stream = state.stream.clone();
+            return Ok(Box::new(move || graph.launch(&stream)));
         }
         self.eager_join(peer, capacity)
     }

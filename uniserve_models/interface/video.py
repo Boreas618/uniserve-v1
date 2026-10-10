@@ -585,20 +585,6 @@ def model(loaded, denoiser: str) -> dict[str, Any]:
     )
 
 
-def _replayer(stream: torch.cuda.Stream | None) -> Callable[[Any], None]:
-    """Replay a captured graph on the binding's stream.
-
-    A CUDA graph launches on the current stream; the worker orders its
-    inputs and outputs on the binding's stream, so replay must join it.
-    """
-
-    def replay(graph) -> None:
-        with torch.cuda.stream(stream):
-            graph.replay()
-
-    return replay
-
-
 def _stream(context: ExecutionContext) -> torch.cuda.Stream:
     """The worker's stream of a binding that captures graphs."""
     # The worker captures only on a device binding, which it creates with
@@ -806,15 +792,21 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
         with torch.inference_mode(), context.activate():
             _compute(plan)
 
-    def capture(identifier: int, pool) -> graphs.Graph:
-        """Capture the layout's step into the worker's graph pool."""
+    def capture(identifier: int, pool) -> list[Any]:
+        """Capture the layout's step into the worker's graph pool.
+
+        The worker launches the captured step itself, on the binding's
+        stream, after it has written the step's inputs there.
+        """
         plan = plans[int(identifier)]
 
         def body() -> None:
             with context.activate():
                 _compute(plan)
 
-        return graphs.capture(body, stream=_stream(context), pool=pool)
+        return graphs.export(
+            graphs.capture(body, stream=_stream(context), pool=pool)
+        )
 
     def _host_views(slot: int, plan: _Plan) -> dict[str, torch.Tensor]:
         resolved = plan.layout
@@ -925,7 +917,6 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
         "release_layout": release_layout,
         "step": run,
         "capture": capture,
-        "replay": _replayer(context.stream),
         "release": lambda graph: graph.release(),
         "prepare_request": prepare_request,
         "encode_conditions": encode_conditions,
@@ -968,7 +959,11 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
             with torch.inference_mode(), contexts[capacity].activate():
                 _condition(capacity)
 
-        def capture_conditioner(capacity: int, pool) -> graphs.Graph:
+        def capture_conditioner(capacity: int, pool) -> list[Any]:
+            """Capture the refinement of prompts padded to ``capacity``.
+
+            The worker launches it on the binding's stream.
+            """
             capacity = int(capacity)
             prepared = contexts[capacity]
 
@@ -976,7 +971,9 @@ def bind_denoiser(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
                 with prepared.activate():
                     _condition(capacity)
 
-            return graphs.capture(body, stream=_stream(prepared), pool=pool)
+            return graphs.export(
+                graphs.capture(body, stream=_stream(prepared), pool=pool)
+            )
 
         result.update(
             prepare_conditioner=prepare_conditioner,
@@ -1071,7 +1068,7 @@ def bind_decoder(loaded, request: Mapping[str, Any]) -> dict[str, Any]:
 
         graph = graphs.capture(body, stream=_stream(prepared), pool=pool)
         graph_outputs[key] = graph
-        return graph
+        return graphs.export(graph)
 
     def warm_segment(frames: int, width: int, height: int) -> None:
         """Decode a zero window of one segment eagerly, before capture."""

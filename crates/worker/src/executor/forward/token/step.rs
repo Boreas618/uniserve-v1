@@ -18,8 +18,8 @@ use super::StepParts;
 use super::batch::TokenBatch;
 use super::calls::{self, Prepared};
 use super::context::{self, Sources};
+use crate::cuda_graph::GraphMode;
 use crate::runner::diffusion::image::ConditionRow;
-use crate::runner::graphs::GraphMode;
 use crate::runner::text::{
     Embeddings, Executed, RowSource, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };

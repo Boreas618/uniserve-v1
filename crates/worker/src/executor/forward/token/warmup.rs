@@ -21,10 +21,10 @@ use uniserve_ipc::{
 
 use super::super::experts::ExpertRuntime;
 use super::{StepParts, TextRuntime};
+use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::runner::TokenSelection;
-use crate::runner::graphs::capture_order;
 use crate::runner::text::{RowSource, StepRequest, TokenRow};
 use crate::storage::KVCache;
 use crate::warmup::{Scenarios, WarmupHooks};

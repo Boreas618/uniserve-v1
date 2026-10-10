@@ -9,6 +9,7 @@
 
 use tvm_ffi::{Any, AnyView};
 
+use crate::cuda_graph::CUDAGraph;
 use crate::ffi::{DType, Fields, Function, Functions, Handle, Record, Shape};
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
@@ -383,7 +384,7 @@ impl CanvasModel {
         capture: Capture<'_>,
         pool: &Handle,
         expert_capacity: usize,
-    ) -> Result<Handle> {
+    ) -> Result<CUDAGraph> {
         let (name, arguments): (&str, Vec<Any>) = match capture {
             Capture::Attend { tokens, attention } => {
                 let [queries, prefixes, widths, starts] = attention.arguments();
@@ -423,7 +424,7 @@ impl CanvasModel {
             pool.view(),
             (&integer(expert_capacity)).into(),
         ])?;
-        Handle::new(graph)
+        CUDAGraph::captured(graph)
     }
 
     /// Replay a captured function, planning its attention for the live host

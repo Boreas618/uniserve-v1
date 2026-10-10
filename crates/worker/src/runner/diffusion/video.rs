@@ -24,12 +24,12 @@ use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memcpy_async, memset_d8, memset_d32};
 use uniserve_ipc::{Call, LatentParams};
 
+use crate::cuda_graph::GraphPool;
+use crate::cuda_graph::{CUDAGraph, GraphMode, GraphTable, Lookup};
 use crate::executor::forward::transfer::latents::Pool;
 use crate::ffi::{Backing, DType, Fields, Function, Functions, Handle, integer_list, list};
 use crate::model::video::{LayoutFields, VideoModel};
 use crate::request::video::VideoLayout;
-use crate::runner::GraphPool;
-use crate::runner::graphs::{GraphMode, GraphTable, Lookup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{RequestSlots, SlotField};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
@@ -274,7 +274,6 @@ struct Steps {
     release_layout: Function,
     step: Function,
     capture: Function,
-    replay: Function,
     release: Function,
     prepare_request: Function,
     encode_conditions: Function,
@@ -495,7 +494,6 @@ impl VideoDenoiser {
             release_layout: functions.get("release_layout")?,
             step: functions.get("step")?,
             capture: functions.get("capture")?,
-            replay: functions.get("replay")?,
             release: functions.get("release")?,
             prepare_request: functions.get("prepare_request")?,
             encode_conditions: functions.get("encode_conditions")?,
@@ -866,7 +864,7 @@ impl VideoDenoiser {
         };
         let mode = match lookup {
             Lookup::Replay(graph) => {
-                self.steps.replay.invoke(&[graph.view()])?;
+                graph.launch(&self.stream)?;
                 GraphMode::Replay
             }
             Lookup::Capture => {
@@ -968,7 +966,7 @@ impl VideoDenoiser {
         let argument = Any::from(id as i64);
         let mode = match self.graphs.lookup(&id, None) {
             Ok(Lookup::Replay(graph)) => {
-                self.steps.replay.invoke(&[graph.view()])?;
+                graph.launch(&self.stream)?;
                 GraphMode::Replay
             }
             // Transient layouts and uncaptured startup layouts run eagerly.
@@ -1108,7 +1106,7 @@ impl VideoDenoiser {
         if self.graphs.contains(&id, None) {
             return Ok(false);
         }
-        let graph = Handle::new(
+        let graph = CUDAGraph::captured(
             self.steps
                 .capture
                 .call(&[AnyView::from(&Any::from(id as i64)), pool.value.view()])?,
@@ -1165,7 +1163,7 @@ impl VideoDenoiser {
             return Ok(());
         };
         for capacity in capacities {
-            let graph = Handle::new(function.call(&[
+            let graph = CUDAGraph::captured(function.call(&[
                 AnyView::from(&Any::from(i64::from(capacity))),
                 pool.value.view(),
             ])?)?;

@@ -4,15 +4,17 @@
 //! expert layer of it with no tokens of its own (a join), so its peers'
 //! tokens routed to its experts are computed and returned. [`JoinGraphs`]
 //! holds one CUDA graph of that layer sequence per step capacity; a join
-//! replays the graph of the agreed capacity instead of running the layers
+//! launches the graph of the agreed capacity instead of running the layers
 //! eagerly. All ranks warm and capture the same capacities in the same
 //! order, largest first, because each warmup is a collective expert step.
 
 use std::collections::BTreeMap;
 
 use tvm_ffi::Any;
+use uniserve_cuda::Stream;
 
-use crate::ffi::{DeferredCall, Function, Handle};
+use crate::cuda_graph::CUDAGraph;
+use crate::ffi::{Function, Handle};
 use crate::{Error, Result};
 
 /// The shared graph interface (`uniserve_models.interface.graphs`).
@@ -20,10 +22,8 @@ use crate::{Error, Result};
 pub struct GraphFunctions {
     /// `graphs.begin_capture(pool, stream, device) -> capture`.
     pub begin: Function,
-    /// `graphs.end_capture(capture) -> graph`.
+    /// `graphs.end_capture(capture) -> [graph, executables, breaks]`.
     pub end: Function,
-    /// `graphs.replay(graph, stream, device)`.
-    pub replay: Function,
     /// `graphs.release(graph)`.
     pub release: Function,
 }
@@ -33,7 +33,6 @@ impl GraphFunctions {
         Ok(Self {
             begin: interface.function("graphs.begin_capture")?,
             end: interface.function("graphs.end_capture")?,
-            replay: interface.function("graphs.replay")?,
             release: interface.function("graphs.release")?,
         })
     }
@@ -47,19 +46,22 @@ impl GraphFunctions {
         stream: usize,
         device: i32,
         body: impl FnOnce() -> Result<()>,
-    ) -> Result<Handle> {
+    ) -> Result<CUDAGraph> {
         let capture = Handle::new(self.begin.call_values(&[
             pool.to_any(),
             Any::from(stream as i64),
             Any::from(i64::from(device)),
         ])?)?;
         let ran = body();
-        let ended = self.end.call(&[capture.view()]).and_then(Handle::new);
+        let ended = self
+            .end
+            .call(&[capture.view()])
+            .and_then(CUDAGraph::captured);
         match ran {
             Ok(()) => ended,
             Err(error) => {
                 if let Ok(graph) = ended {
-                    let _ = self.release.invoke(&[graph.view()]);
+                    let _ = self.release.invoke(&[graph.handle().view()]);
                 }
                 Err(error)
             }
@@ -69,7 +71,7 @@ impl GraphFunctions {
 
 /// One captured join per step capacity.
 pub struct JoinGraphs {
-    graphs: BTreeMap<usize, Handle>,
+    graphs: BTreeMap<usize, CUDAGraph>,
     functions: GraphFunctions,
 }
 
@@ -116,26 +118,17 @@ impl JoinGraphs {
     }
 
     /// Join a step of `capacity` tokens per rank on `stream`.
-    pub fn replay(&self, capacity: usize, stream: usize, device: i32) -> Result<()> {
-        self.replay_call(capacity, stream, device)?.invoke()
+    pub fn launch(&self, capacity: usize, stream: &Stream) -> Result<()> {
+        self.graph(capacity)?.launch(stream)
     }
 
-    /// The replay of `capacity`'s join on `stream`, as a call another
-    /// thread can make.
-    pub fn replay_call(&self, capacity: usize, stream: usize, device: i32) -> Result<DeferredCall> {
-        let graph = self.graphs.get(&capacity).ok_or_else(|| {
+    /// The captured join of `capacity`, which another thread can launch.
+    pub fn graph(&self, capacity: usize) -> Result<&CUDAGraph> {
+        self.graphs.get(&capacity).ok_or_else(|| {
             Error::Invalid(format!(
                 "no captured expert join serves step capacity {capacity}"
             ))
-        })?;
-        Ok(DeferredCall::new(
-            self.functions.replay.clone(),
-            vec![
-                graph.to_any(),
-                Any::from(stream as i64),
-                Any::from(i64::from(device)),
-            ],
-        ))
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -146,7 +139,7 @@ impl JoinGraphs {
         self.graphs.is_empty()
     }
 
-    /// Release the graphs after every stream replaying them drained. An
+    /// Release the graphs after every stream they were launched on drained. An
     /// aborted close keeps them (and the storage they address) until exit.
     #[allow(clippy::mem_forget)]
     pub fn close(&mut self, aborted: bool) -> Result<()> {
@@ -157,7 +150,7 @@ impl JoinGraphs {
         }
         let mut failure = None;
         for graph in graphs.into_values().rev() {
-            if let Err(error) = self.functions.release.invoke(&[graph.view()]) {
+            if let Err(error) = self.functions.release.invoke(&[graph.handle().view()]) {
                 failure.get_or_insert(error);
             }
         }

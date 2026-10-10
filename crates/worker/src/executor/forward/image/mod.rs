@@ -41,6 +41,7 @@ use uniserve_ipc::{
 
 use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
 use super::launch::{HostStage, Launched, error_code, failed_output};
+use crate::cuda_graph::GraphPool;
 use crate::error::WorkerError;
 use crate::executor::forward::token::warmup::with_scratch;
 use crate::executor::lifecycle::RequestStorage;
@@ -50,7 +51,6 @@ use crate::ffi::Handle;
 use crate::host::{HostLane, HostTask};
 use crate::model::image::{ImageModel, ImagePolicy};
 use crate::request::diffusion::Trajectories;
-use crate::runner::GraphPool;
 use crate::runner::decoder::{DecodeImage, DecoderRunner};
 use crate::runner::diffusion::image::{DenoiseRow, ImageDiffusion};
 use crate::runner::encoder::{EncoderRunner, PreparedImage, Tower};

@@ -781,7 +781,7 @@ def bind(
         cache_only: int,
         pool,
         expert_capacity: int,
-    ) -> graphs.Graph:
+    ) -> list[Any]:
         """Capture the forward of the shapes the last eager step prepared.
 
         Inputs are the fixed columns, so the graph reads whatever the next
@@ -812,8 +812,10 @@ def bind(
         segments = None
         if context.weights is not None:
             segments = context.weights.capture
-        return graphs.capture(
-            body, stream=computation, pool=pool, segments=segments
+        return graphs.export(
+            graphs.capture(
+                body, stream=computation, pool=pool, segments=segments
+            )
         )
 
     def release(graph) -> None:

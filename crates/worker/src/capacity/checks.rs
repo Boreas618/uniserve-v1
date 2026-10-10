@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::device::{DeviceBudget, total_bytes};
 use crate::config::{Device, WorkerConfig};
-use crate::runner::graph_storage_budget_bytes;
+use crate::cuda_graph::graph_storage_budget_bytes;
 use crate::{Error, Result};
 
 /// Every CUDA device other than the primary one needs its own grant for its
