@@ -7,8 +7,8 @@
 //! copy addressed until process exit.
 //!
 //! Copies run on transfer-pool threads, on one ordinary (non-partitioned)
-//! stream per thread and device: green-context streams cannot batch-copy
-//! mapped peer windows.
+//! stream per thread and device: on an SM-partition stream the driver takes
+//! copies of mapped peer windows only one call each (`uniserve_cuda::copy`).
 
 use std::any::Any;
 use std::collections::HashMap;
