@@ -64,7 +64,7 @@ use crate::executor::forward::transfer::TransferRuntime;
 use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
-use crate::launch::Endpoint;
+use crate::launch::Connection;
 use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
 use crate::model::image::ImageModel;
@@ -647,7 +647,7 @@ impl Worker {
 
     /// Serve the channel until the engine closes the rank or a fatal
     /// response ends admission.
-    pub fn run(&mut self, endpoint: &mut Endpoint) -> std::result::Result<(), WorkerError> {
+    pub fn run(&mut self, connection: &mut Connection) -> std::result::Result<(), WorkerError> {
         self.warmup()?;
         let info = self.info.clone();
         let executor = self
@@ -658,8 +658,8 @@ impl Worker {
         let experts = executor.backend().experts().is_some();
         executor
             .backend()
-            .set_storage_wake(Some(endpoint.completion_wake()));
-        let served = Service::new(executor, endpoint.server(), info, experts).run();
+            .set_storage_wake(Some(connection.completion_wake()));
+        let served = Service::new(executor, connection.channel(), info, experts).run();
         executor.backend().set_storage_wake(None);
         served
     }

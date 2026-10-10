@@ -19,7 +19,7 @@ mod endpoint;
 mod signals;
 
 pub use arguments::{Arguments, USAGE};
-pub use endpoint::Endpoint;
+pub use endpoint::{Connection, Endpoint};
 pub use signals::Signals;
 
 use tvm_ffi::Map;
@@ -95,18 +95,20 @@ fn run(
 ) -> std::result::Result<(), WorkerError> {
     let interface = Interface::from_table(table)?;
     let rank = launch.execution.rank as u32;
-    let mut endpoint = Endpoint::bind(&launch.ipc, rank)?;
+    let endpoint = Endpoint::bind(&launch.ipc, rank)?;
     endpoint.register(&launch.ipc, &launch.worker_id, rank)?;
 
     let mut worker = Worker::start(launch, interface)?;
     tracing::info!(target: "uniserve_worker.launch", "worker IPC endpoint bound");
+    let mut connection = None;
     let served = worker.warmup().and_then(|()| {
+        let connection = connection.insert(endpoint.accept()?);
         signals.serving();
-        worker.run(&mut endpoint)
+        worker.run(connection)
     });
     let closed = worker.close(served.is_err());
-    // The worker's readers retire before the endpoint is released.
+    // The worker's readers retire before the connection is released.
     drop(worker);
-    drop(endpoint);
+    drop(connection);
     served.and(closed)
 }

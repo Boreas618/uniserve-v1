@@ -28,7 +28,7 @@ const ACCEPT_INTERVAL: Duration = Duration::from_millis(20);
 /// Deadline for one accepted connection to deliver its report line.
 const REPORT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 // The two channel mechanisms a rank may report; `collect` refuses any other.
-use uniserve_ipc::{RankReport, SHARED_STORAGE_CHANNEL, SOCKET_CHANNEL};
+use uniserve_ipc::{RankReport, TCP_CHANNEL, UNIX_CHANNEL};
 
 /// A worker group's collective rendezvous.
 pub(crate) struct Rendezvous {
@@ -184,14 +184,10 @@ impl RankRegistry {
                 "rank registration names worker {} instead of {worker_id}",
                 report.worker_id
             );
-            // A rank on the head's host offers shared storage and a rank
-            // elsewhere offers a socket. Any other mechanism is refused by
-            // name rather than bound with the wrong transport.
+            // A rank on the head's host offers a Unix socket and a rank
+            // elsewhere a TCP port. Any other mechanism is refused by name.
             anyhow::ensure!(
-                matches!(
-                    report.transport.as_str(),
-                    SHARED_STORAGE_CHANNEL | SOCKET_CHANNEL
-                ),
+                matches!(report.transport.as_str(), UNIX_CHANNEL | TCP_CHANNEL),
                 "rank {} offers the unsupported channel transport {}",
                 report.rank,
                 report.transport

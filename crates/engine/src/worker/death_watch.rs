@@ -1,6 +1,6 @@
 //! Edge-triggered worker-exit notification for event-driven executors.
 //!
-//! A watcher fires the rank channel's death `Wake` (`RankChannel::death_wake`)
+//! A watcher fires the rank channel's local `Wake` (`Channel::wake`)
 //! when a child exits, allowing the scheduler to share one wait boundary for
 //! results, commands, and worker death.
 //!

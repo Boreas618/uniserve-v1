@@ -8,7 +8,6 @@ license.workspace = true
 ignored = ["serde_bytes"]
 
 [dependencies]
-iceoryx2.workspace = true
 libc.workspace = true
 rmp-serde.workspace = true
 serde = { workspace = true, features = ["rc"] }
@@ -16,6 +15,9 @@ serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uniserve-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
