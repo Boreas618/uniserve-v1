@@ -110,8 +110,22 @@ unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
 
 impl Handle {
-    pub fn new(value: Any) -> Self {
-        Self(value)
+    /// Hold `value` as an opaque handle.
+    ///
+    /// A handle may move to and be shared with other threads, so a tensor is
+    /// refused with [`Error::TensorHandle`]: a TVM-FFI tensor stays on the
+    /// thread that received it, and tensor data crosses threads only as
+    /// Rust-owned storage.
+    pub fn new(value: Any) -> Result<Self> {
+        if value.type_index() == tvm_ffi::TypeIndex::kTVMFFITensor as i32 {
+            return Err(Error::TensorHandle);
+        }
+        Ok(Self(value))
+    }
+
+    /// The handle of no object, as Python's `None` crosses the interface.
+    pub fn none() -> Self {
+        Self(Any::default())
     }
 
     pub fn view(&self) -> AnyView<'_> {
@@ -206,5 +220,27 @@ impl Functions {
 
     pub fn keys(&self) -> impl Iterator<Item = String> + '_ {
         self.functions.keys().map(|key| key.as_str().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::storage::memory::{Memory, StorageView};
+
+    #[test]
+    fn a_tensor_is_refused_as_an_opaque_handle() -> Result<()> {
+        let memory: Arc<dyn Backing> = Memory::host(16);
+        let tensor = StorageView::contiguous(memory, 0, DType::F32, &[4])?.to_tensor()?;
+
+        assert!(matches!(
+            Handle::new(Any::from(tensor)),
+            Err(Error::TensorHandle)
+        ));
+        assert!(Handle::new(Any::from(7_i64)).is_ok());
+        assert!(Handle::none().is_none());
+        Ok(())
     }
 }

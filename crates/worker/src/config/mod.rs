@@ -39,8 +39,8 @@ impl From<Error> for DescriptorError {
 /// Numerical backend options remain with their backend, outside this value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerConfig {
-    /// Execution device; numerical binding resolves an unspecified CUDA index.
-    pub device: String,
+    /// The rank's primary device, where every binding computes.
+    pub device: Device,
     pub rank: usize,
     pub world_size: usize,
     pub role: String,
@@ -73,8 +73,10 @@ pub struct WorkerConfig {
     /// Sampling shared by all generating canvases of this deployment.
     pub canvas_sampling: Option<CanvasSampling>,
     pub max_request_pool_size: usize,
+    /// Image features the encoder cache keeps resident.
     pub encoder_cache_entries: usize,
-    pub generation_device: Option<String>,
+    /// Device of the generation tower when it is placed apart from `device`.
+    pub generation_device: Option<Device>,
     pub min_request_pool_size: usize,
     /// Device-storage grant after loaded weights and fixed overhead, in bytes.
     pub pool_storage_bytes: Option<usize>,
@@ -98,7 +100,7 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            device: "cpu".into(),
+            device: Device::Cpu,
             rank: 0,
             world_size: 1,
             role: "model".into(),
@@ -174,12 +176,6 @@ pub fn graph_padding_block_count(block_size: usize) -> usize {
 }
 
 impl WorkerConfig {
-    /// The rank's primary device. `device` holds a canonical name produced by
-    /// [`resolve`]; an unparsable name means CPU only in hand-built configs.
-    pub fn primary_device(&self) -> Device {
-        Device::parse(&self.device, "--device").unwrap_or(Device::Cpu)
-    }
-
     /// Bound request concurrency for a model that decodes resident media.
     ///
     /// Each resident media request keeps two unresolved outputs and one
@@ -208,10 +204,9 @@ impl WorkerConfig {
     }
 
     /// Distinct execution devices whose resident storage belongs to this rank.
-    pub fn devices(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.device.as_str()).chain(
+    pub fn devices(&self) -> impl Iterator<Item = Device> {
+        std::iter::once(self.device).chain(
             self.generation_device
-                .as_deref()
                 .filter(|device| *device != self.device),
         )
     }
@@ -229,10 +224,6 @@ impl WorkerConfig {
 
         if !(1..=4).contains(&self.expert_microbatches) {
             return Err(invalid("expert microbatches must be from one to four"));
-        }
-
-        if self.device.is_empty() {
-            return Err(invalid("worker device must be named"));
         }
 
         if self.world_size == 0 || self.rank >= self.world_size {

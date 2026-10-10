@@ -199,9 +199,8 @@ impl TextRuntime {
 
         let lane = self.runners[peers[0]]
             .stream()
-            .ok_or(Error::State("expert steps run on a CUDA stream"))?;
-        // SAFETY: the lanes own the stream for the runtime's lifetime.
-        let lane = unsafe { uniserve_cuda::Stream::borrowed(lane.device(), lane.raw()) }?;
+            .ok_or(Error::State("expert steps run on a CUDA stream"))?
+            .clone();
         experts.fork(&lane)?;
         let mut staged = Vec::with_capacity(peers.len());
         for (&runner, request) in peers.iter().zip(requests) {
@@ -279,11 +278,7 @@ impl TextRuntime {
     ) -> Result<(Option<i32>, Option<Stream>, usize)> {
         let (lane, _) = self.prefill_lane(component)?;
         let runner = &self.runners[lane];
-        let stream = runner
-            .stream()
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-            .transpose()?;
+        let stream = runner.stream().cloned();
         Ok((runner.device(), stream, 0))
     }
 
@@ -330,11 +325,7 @@ impl TextRuntime {
                 })
             })
             .collect::<Result<_>>()?;
-        let stream = self.runners[lane]
-            .stream()
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-            .transpose()?;
+        let stream = self.runners[lane].stream().cloned();
         self.order.wait(stream.as_ref())?;
 
         // The lane's runner evaluates every prefix.

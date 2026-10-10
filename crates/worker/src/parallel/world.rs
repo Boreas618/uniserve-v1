@@ -101,12 +101,12 @@ impl World {
             .with("rank", execution.rank as i64)
             .with("local_rank", launch.local_rank as i64)
             .with("world_size", execution.world_size as i64)
-            .text("device", &execution.device)
+            .text("device", &execution.device.to_string())
             .optional_text("backend", launch.distributed_backend.as_deref())
             .optional("store", store.map(Fields::map))
             .optional("union", union_store)
             .into_any();
-        let torch = Handle::new(interface.initialize.call(&[(&request).into()])?);
+        let torch = Handle::new(interface.initialize.call(&[(&request).into()])?)?;
         Ok(Self {
             host,
             union,
@@ -165,7 +165,7 @@ impl World {
                 "distributed.create_groups returns one value per plan entry".into(),
             ));
         }
-        let groups: Vec<Handle> = groups.iter().map(Handle::new).collect();
+        let groups: Vec<Handle> = groups.iter().map(Handle::new).collect::<Result<_>>()?;
 
         for component in plan.components {
             let mesh = component
@@ -256,9 +256,7 @@ impl World {
             .with("rank", binding.rank as i64)
             .with("groups", communicators.map())
             .into_any();
-        Ok(Handle::new(
-            interface.mesh.call(&[self.torch.view(), (&spec).into()])?,
-        ))
+        Handle::new(interface.mesh.call(&[self.torch.view(), (&spec).into()])?)
     }
 
     /// Destroy the torch groups after every communication user retired.
@@ -271,10 +269,7 @@ impl World {
         };
         self.components.clear();
         if aborted {
-            std::mem::forget(std::mem::replace(
-                &mut self.torch,
-                Handle::new(tvm_ffi::Any::default()),
-            ));
+            std::mem::forget(std::mem::replace(&mut self.torch, Handle::none()));
             return Ok(());
         }
         destroy.invoke(&[self.torch.view()])

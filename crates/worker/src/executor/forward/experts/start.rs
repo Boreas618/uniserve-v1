@@ -69,8 +69,7 @@ fn primary_stream(lanes: &Lanes, device: i32) -> Result<Stream> {
             ));
         }
     };
-    // SAFETY: the lanes own the stream and close after the expert runtime.
-    Ok(unsafe { Stream::borrowed(DeviceId(device), stream.handle()?) }?)
+    Ok(stream.stream()?.clone())
 }
 
 impl ExpertRuntime {
@@ -151,8 +150,7 @@ impl ExpertRuntime {
         let mut streams = vec![primary_stream(start.lanes, device)?];
         for _ in 1..microbatches {
             let fork = start.lanes.fork_microbatch()?;
-            // SAFETY: the lanes own the fork and close after this runtime.
-            streams.push(unsafe { Stream::borrowed(DeviceId(device), fork.handle()?) }?);
+            streams.push(fork.stream()?.clone());
         }
         let hooks = (microbatches > 1).then(|| {
             Any::from(tvm_ffi::Function::from_packed(|_| {
@@ -237,7 +235,7 @@ impl ExpertRuntime {
                 storage.unwrap_or_default(),
             ])?;
             runtime.peers.push(Peer {
-                transport: Handle::new(created),
+                transport: Handle::new(created)?,
                 stream,
                 join: None,
                 graphs: None,

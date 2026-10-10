@@ -69,6 +69,7 @@ from uniserve_models.sampling.select import (
 from uniserve_models.sampling.state import commit as commit_state
 
 from . import graphs
+from .errors import binding
 
 __all__ = ["bind", "functions"]
 
@@ -842,10 +843,12 @@ def bind(
         if not aborted:
             b.clear()
 
-    return {
-        "step": step,
-        "capture": capture,
-        "release": release,
-        "commit": commit,
-        "close": close,
-    }
+    return binding(
+        {
+            "step": step,
+            "capture": capture,
+            "release": release,
+            "commit": commit,
+            "close": close,
+        }
+    )

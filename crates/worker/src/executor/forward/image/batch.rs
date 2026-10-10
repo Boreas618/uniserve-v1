@@ -21,7 +21,6 @@ use uniserve_ipc::{
 
 use super::super::launch::{read_flag, reports_output, seal as seal_lease};
 use super::super::products::Publications;
-use super::super::transfer::kv::{self, Published};
 use super::ImageRuntime;
 use super::host::ImageTask;
 use crate::executor::PendingOutput;
@@ -103,8 +102,6 @@ pub(super) struct ImageBatch<'a> {
     pub(super) updates: Vec<(usize, LatentUpdate)>,
     /// Image encodings to run once the batch's pixels reached the host.
     pub(super) encodings: Vec<Encoding>,
-    /// Conditioning KV exports, resident once the batch commits.
-    pub(super) published: Vec<Published>,
     /// Product exports (encoder features, trajectory versions),
     /// registered once the batch commits.
     pub(super) publications: Publications,
@@ -199,24 +196,12 @@ impl<'a> ImageBatch<'a> {
             reads: Vec::new(),
             updates: Vec::new(),
             encodings: Vec::new(),
-            published: Vec::new(),
             publications: Publications::default(),
             latent_exports: Vec::new(),
             retirement: Arc::new(Retirement::default()),
             latents_entered: false,
             started,
         })
-    }
-
-    /// Another view of the batch's stream, for work the batch issues while
-    /// it is borrowed mutably.
-    pub(super) fn borrow_stream(&self) -> Result<Option<Stream>> {
-        self.stream
-            .as_ref()
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            .map(|stream| unsafe { Stream::borrowed(stream.device(), stream.raw()) })
-            .transpose()
-            .map_err(Error::from)
     }
 
     /// The batch's product device.
@@ -310,7 +295,6 @@ impl<'a> ImageBatch<'a> {
         if !updates.is_empty() {
             self.runtime.latents()?.pool.validate_updates(&updates)?;
         }
-        kv::validate(self.storage, &self.published, &[])?;
         self.publications.validate(&self.storage.tensors)?;
         self.leave_latents()?;
         self.seal()?;
@@ -344,8 +328,6 @@ impl<'a> ImageBatch<'a> {
                 transfer.read().cancel().map_err(fatal)?;
             }
         }
-        let published = std::mem::take(&mut self.published);
-        kv::apply(self.storage, published, Vec::new()).map_err(fatal)?;
         self.publications
             .register(&self.storage.tensors)
             .map_err(fatal)?;
@@ -375,7 +357,7 @@ impl<'a> ImageBatch<'a> {
     /// storage returns once the fences recorded here complete.
     pub(super) fn discard(&mut self) -> Result<()> {
         let left = self.leave_latents();
-        let revoked = self.revoke_conditioning().and(self.publications.revoke());
+        let revoked = self.publications.revoke();
         let exported = std::mem::take(&mut self.latent_exports);
         if !exported.is_empty()
             && let Ok(latents) = self.runtime.latents()

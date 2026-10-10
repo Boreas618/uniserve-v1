@@ -258,6 +258,26 @@ fn events_order_streams_and_measure_time() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn a_shared_stream_handle_outlives_the_handle_it_was_cloned_from() {
+    let _driver = exclusive_driver();
+    let created = Stream::new(DEVICE).unwrap();
+    let shared = created.clone();
+    assert_eq!(shared.raw(), created.raw());
+    drop(created);
+
+    // The remaining handle still submits to the stream and orders its work.
+    let device = DeviceAllocation::linear(DEVICE, 1024).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 1024).unwrap();
+    // SAFETY: the ranges outlive the synchronization below.
+    unsafe { memset_d8(device.address(), 5, 1024, &shared).unwrap() };
+    // SAFETY: as above.
+    unsafe { memcpy_async(host.address(), device.address(), 1024, &shared).unwrap() };
+    shared.synchronize().unwrap();
+    assert!(read(&host).iter().all(|byte| *byte == 5));
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn interprocess_events_export_and_open() {
     let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE).unwrap();

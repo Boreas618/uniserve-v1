@@ -41,6 +41,19 @@ pub enum Error {
     /// The interface table or a binding does not satisfy its contract.
     #[error("{0}")]
     Interface(String),
+    /// A failure every party of one operation observes: the result of a
+    /// read, the state of a pool or an export that several owners consult.
+    /// It reports and classifies as the failure it shares.
+    #[error(transparent)]
+    Shared(std::sync::Arc<Error>),
+    /// Python returned a tensor where the interface expects an opaque
+    /// object. Handles cross threads; a tensor handle must not.
+    #[error("a tensor cannot be held as an opaque handle")]
+    TensorHandle,
+    /// The host's node name cannot identify this rank's node to transfer
+    /// peers: it is empty or not UTF-8.
+    #[error("host name {0:?} cannot identify the rank's node in transfers")]
+    HostName(std::ffi::CString),
 }
 
 impl Error {
@@ -113,8 +126,13 @@ impl std::fmt::Display for ErrorCode {
     }
 }
 
-/// Context-corrupting CUDA failures require teardown, even if allocation
-/// also failed.
+/// Failure texts that mark a context-corrupting CUDA failure, which requires
+/// teardown even if allocation also failed.
+///
+/// A driver failure the worker observed itself carries its result code and
+/// is classified by it. These texts classify failures that carry only a
+/// message: an exception the numerical library raised, or a worker error
+/// whose message embeds a lower-level failure.
 const FATAL_CUDA_MESSAGES: &[&str] = &[
     "illegal memory access",
     "cudaerrorillegaladdress",
@@ -126,6 +144,8 @@ const FATAL_CUDA_MESSAGES: &[&str] = &[
     "misaligned address",
 ];
 
+/// Failure texts that mark an allocation failure, used like
+/// [`FATAL_CUDA_MESSAGES`].
 const OUT_OF_MEMORY_MESSAGES: &[&str] =
     &["out of memory", "cuda oom", "cublas_status_alloc_failed"];
 
@@ -176,27 +196,32 @@ impl WorkerError {
     /// Classify an internal error. `context` prefixes the message, naming
     /// the operation that failed.
     ///
-    /// Order: fatal CUDA messages, then out-of-memory messages or kinds,
-    /// then the error's own kind.
+    /// A CUDA driver failure is classified by its result code. Any other
+    /// failure is classified, in order, by a fatal CUDA text in its message,
+    /// an out-of-memory text in its message, then its own kind.
     pub fn classify(error: Error, context: Option<&str>) -> Self {
         let mut message = error_message(&error);
         if let Some(context) = context.filter(|context| !context.is_empty()) {
             message = format!("{context}: {message}");
         }
-        let lowered = message.to_lowercase();
-        let code = if FATAL_CUDA_MESSAGES
-            .iter()
-            .any(|text| lowered.contains(text))
-        {
-            ErrorCode::FatalWorkerFailure
-        } else if OUT_OF_MEMORY_MESSAGES
-            .iter()
-            .any(|text| lowered.contains(text))
-            || matches!(&error, Error::Numerical { kind, .. } if kind.to_lowercase().contains("outofmemory"))
-        {
-            ErrorCode::ResourceError
-        } else {
-            kind_code(&error)
+        let code = match driver_failure(&error) {
+            Some(failure) => driver_code(failure),
+            None => {
+                let lowered = message.to_lowercase();
+                if FATAL_CUDA_MESSAGES
+                    .iter()
+                    .any(|text| lowered.contains(text))
+                {
+                    ErrorCode::FatalWorkerFailure
+                } else if OUT_OF_MEMORY_MESSAGES
+                    .iter()
+                    .any(|text| lowered.contains(text))
+                {
+                    ErrorCode::ResourceError
+                } else {
+                    kind_code(&error)
+                }
+            }
         };
         let mut classified = Self::new(code, message);
         classified.detail.traceback = traceback(&error);
@@ -285,6 +310,7 @@ impl From<Error> for WorkerError {
 /// is kept so a reader sees which exception the library raised.
 fn error_message(error: &Error) -> String {
     match error {
+        Error::Shared(shared) => error_message(shared),
         Error::Numerical {
             function,
             kind,
@@ -304,34 +330,63 @@ fn error_message(error: &Error) -> String {
 
 fn traceback(error: &Error) -> Option<String> {
     match error {
+        Error::Shared(shared) => traceback(shared),
         Error::Numerical { traceback, .. } if !traceback.is_empty() => Some(traceback.clone()),
         _ => None,
+    }
+}
+
+/// The CUDA failure an error is, directly or as a shared failure.
+fn driver_failure(error: &Error) -> Option<&uniserve_cuda::Error> {
+    match error {
+        Error::Cuda(failure) => Some(failure),
+        Error::Shared(shared) => driver_failure(shared),
+        _ => None,
+    }
+}
+
+/// The code of a CUDA failure, by the result its call returned.
+fn driver_code(failure: &uniserve_cuda::Error) -> ErrorCode {
+    if failure.is_unrecoverable() {
+        ErrorCode::FatalWorkerFailure
+    } else if failure.is_out_of_memory() {
+        ErrorCode::ResourceError
+    } else {
+        ErrorCode::ComputeError
     }
 }
 
 /// The code an error's own kind maps to.
 fn kind_code(error: &Error) -> ErrorCode {
     match error {
+        Error::Shared(shared) => kind_code(shared),
         Error::Invalid(_) => ErrorCode::InvalidDescriptor,
         Error::Resource(_) | Error::ReadBackpressure { .. } => ErrorCode::ResourceError,
-        Error::Unsupported(_) | Error::Interface(_) => ErrorCode::UnsupportedSetup,
+        Error::Unsupported(_) | Error::Interface(_) | Error::TensorHandle | Error::HostName(_) => {
+            ErrorCode::UnsupportedSetup
+        }
         Error::Invariant(_) => ErrorCode::InvariantViolation,
         Error::Transport(_) | Error::Cuda(_) | Error::State(_) => ErrorCode::ComputeError,
         Error::Numerical { kind, .. } => numerical_code(kind),
     }
 }
 
-/// Map a translated Python error kind (or a raw exception class name, for a
-/// function the interface did not wrap) to a code.
+/// Map the kind of a failed interface call to a code.
+///
+/// The numerical library translates every exception its functions raise to
+/// one of its interface kinds (`uniserve_models.interface.errors`). The
+/// remaining kinds are the ones TVM-FFI itself reports when a value that
+/// crossed the interface cannot be converted: a wrong type, a missing key,
+/// an index out of range or a value out of range.
 pub fn numerical_code(kind: &str) -> ErrorCode {
     match kind {
         "UnsupportedSetup" => ErrorCode::UnsupportedSetup,
         "OutOfMemory" => ErrorCode::ResourceError,
-        "UnsupportedCall" | "NotImplementedError" => ErrorCode::UnsupportedCall,
+        "UnsupportedCall" => ErrorCode::UnsupportedCall,
         "InputError" | "KeyError" | "IndexError" | "TypeError" | "ValueError" => {
             ErrorCode::InputError
         }
-        "InvariantViolation" | "AssertionError" => ErrorCode::InvariantViolation,
+        "InvariantViolation" => ErrorCode::InvariantViolation,
         _ => ErrorCode::ComputeError,
     }
 }
@@ -383,19 +438,57 @@ mod tests {
     #[test]
     fn library_kinds_keep_their_classification() {
         let cases = [
-            ("NotImplementedError", ErrorCode::UnsupportedCall),
             ("UnsupportedCall", ErrorCode::UnsupportedCall),
-            ("ValueError", ErrorCode::InputError),
             ("InputError", ErrorCode::InputError),
-            ("AssertionError", ErrorCode::InvariantViolation),
+            ("InvariantViolation", ErrorCode::InvariantViolation),
             ("UnsupportedSetup", ErrorCode::UnsupportedSetup),
-            ("RuntimeError", ErrorCode::ComputeError),
+            ("ComputeError", ErrorCode::ComputeError),
+            // A value TVM-FFI could not convert.
+            ("TypeError", ErrorCode::InputError),
         ];
         for (kind, code) in cases {
             let error = WorkerError::classify(numerical(kind, "failed"), None);
             assert_eq!(error.code, code, "{kind}");
             assert_eq!(error.fatal, code == ErrorCode::InvariantViolation);
         }
+    }
+
+    #[test]
+    fn driver_failures_are_classified_by_their_result_code() {
+        let driver = |code, message| {
+            Error::Cuda(uniserve_cuda::Error::Driver {
+                call: "cuMemcpyBatchAsync_v2",
+                code,
+                name: "CUDA_ERROR",
+                message,
+            })
+        };
+
+        // The result code decides, whatever the driver's text says.
+        let exhausted = WorkerError::classify(driver(2, "failed"), Some("batch export"));
+        assert_eq!(exhausted.code, ErrorCode::ResourceError);
+        assert!(!exhausted.fatal);
+
+        let faulted = WorkerError::classify(driver(700, "failed"), None);
+        assert_eq!(faulted.code, ErrorCode::FatalWorkerFailure);
+        assert!(faulted.fatal);
+
+        // CUDA_ERROR_INVALID_VALUE is a rejected call, even with this text.
+        let rejected = WorkerError::classify(driver(1, "out of memory"), None);
+        assert_eq!(rejected.code, ErrorCode::ComputeError);
+    }
+
+    #[test]
+    fn a_shared_failure_keeps_the_class_of_the_failure_it_shares() {
+        let cancelled = std::sync::Arc::new(Error::Resource("transfer read was cancelled"));
+        let observed = WorkerError::classify(Error::Shared(cancelled), None);
+        assert_eq!(observed.code, ErrorCode::ResourceError);
+        assert_eq!(observed.message(), "transfer read was cancelled");
+
+        let failed = std::sync::Arc::new(numerical("OutOfMemory", "tried to allocate"));
+        let observed = WorkerError::classify(Error::Shared(failed), Some("decode"));
+        assert_eq!(observed.code, ErrorCode::ResourceError);
+        assert_eq!(observed.traceback(), Some("Traceback"));
     }
 
     #[test]

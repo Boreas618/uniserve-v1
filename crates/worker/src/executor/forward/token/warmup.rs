@@ -187,11 +187,7 @@ fn capture(
             .max()
             .unwrap_or(usize::MAX)
             .max(1);
-        let stream = runtime.runners[index].stream().map(|stream| {
-            // SAFETY: the lanes own the stream for the runtime's lifetime.
-            unsafe { uniserve_cuda::Stream::borrowed(stream.device(), stream.raw()) }
-        });
-        let stream = stream.transpose()?;
+        let stream = runtime.runners[index].stream().cloned();
         let stream = stream.as_ref();
         let run = |runtime: &mut TextRuntime,
                    kv: &mut KVCache,

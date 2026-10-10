@@ -42,7 +42,7 @@ struct DevicePool {
 /// An export whose producer stream could not be drained. Everything it
 /// touched stays retained, its bytes stay reserved, and later exports fail.
 struct FailedExport {
-    error: String,
+    error: Arc<Error>,
     _retained: Vec<Box<dyn std::any::Any + Send>>,
 }
 
@@ -88,7 +88,7 @@ impl CudaExports {
 
     pub(crate) fn check(&self) -> Result<()> {
         match &*lock(&self.failed) {
-            Some(failed) => Err(Error::Transport(failed.error.clone())),
+            Some(failed) => Err(Error::Shared(Arc::clone(&failed.error))),
             None => Ok(()),
         }
     }
@@ -155,7 +155,7 @@ impl CudaExports {
                 }
                 None => {
                     let pool = self.pool(device)?;
-                    let chunk = lock(&pool.pool).reserve(nbytes as usize, stream.raw())?;
+                    let chunk = lock(&pool.pool).reserve(nbytes as usize, stream)?;
                     let Some(chunk) = chunk else {
                         return Ok(None);
                     };
@@ -296,11 +296,12 @@ impl CudaExports {
             Ok(())
         })();
         if let Err(cleanup) = cleanup {
+            let cleanup = Arc::new(cleanup);
             *lock(&self.failed) = Some(FailedExport {
-                error: cleanup.to_string(),
+                error: Arc::clone(&cleanup),
                 _retained: vec![Box::new(state)],
             });
-            return Err(cleanup);
+            return Err(Error::Shared(cleanup));
         }
         if let Some(grants) = &state.grants {
             grants.release(export_id);

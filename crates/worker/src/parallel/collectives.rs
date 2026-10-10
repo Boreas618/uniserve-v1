@@ -6,7 +6,7 @@ use tvm_ffi::{Any, AnyView};
 
 use indexmap::IndexMap;
 use uniserve_cuda::nccl::{self, Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
-use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
+use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
 
 use crate::{CUDAStream, Error, Result};
 
@@ -24,7 +24,7 @@ pub struct StreamCommunicator<T> {
 
 struct Resources<T> {
     communicator: Communicator,
-    // A borrowed view of the owner's stream; the owner outlives this value.
+    // The owner's stream, which synchronous operations run on.
     computation: Stream,
     transfer: CUDAStream,
     // The latest asynchronous operation not yet joined on the computation
@@ -40,15 +40,11 @@ impl<T> StreamCommunicator<T> {
     /// Communicators of full-device streams use NCCL's copy-engine algorithms
     /// for registered windows; SM-partitioned streams use its CTA algorithms.
     ///
-    /// # Safety
-    /// `owner` outlives the returned communicator: operations keep submitting
-    /// to its stream until [`Self::close`].
-    pub unsafe fn new(owner: &CUDAStream, size: i32, rank: i32, id: &UniqueId) -> Result<Self> {
+    /// The communicator shares `owner`'s stream and keeps submitting to it
+    /// until [`Self::close`].
+    pub fn new(owner: &CUDAStream, size: i32, rank: i32, id: &UniqueId) -> Result<Self> {
         let device = owner.device();
-        // A borrowed default-stream owner resolves against the current context.
-        let _device = DeviceGuard::new(device)?;
-        // SAFETY: the caller keeps the owner, and therefore its stream, alive.
-        let computation = unsafe { Stream::borrowed(device, owner.handle()?) }?;
+        let computation = owner.stream()?.clone();
 
         let policy = if owner.full_device() {
             CtaPolicy::Zero
@@ -75,6 +71,11 @@ impl<T> StreamCommunicator<T> {
                 windows: IndexMap::new(),
             }),
         })
+    }
+
+    /// The device the communicator's streams run on.
+    pub fn device(&self) -> DeviceId {
+        self.device
     }
 
     /// Members of the communicator.
@@ -120,7 +121,7 @@ impl<T> StreamCommunicator<T> {
     }
 
     fn start(&mut self, call: impl FnOnce(&mut Self) -> Result<()>) -> Result<Arc<Event>> {
-        let resources = self.resources()?;
+        let resources = self.resources_mut()?;
         resources.transfer.wait(&resources.computation)?;
         let completed = Arc::new(Event::new(EventFlags::default()));
         let result = call(self);
@@ -137,12 +138,11 @@ impl<T> StreamCommunicator<T> {
     }
 
     /// Orders `consumer` after an asynchronous operation's completion.
-    pub fn join(&mut self, event: &Arc<Event>, consumer: usize) -> Result<()> {
-        // SAFETY: the caller joins on a live stream of this device.
-        unsafe { Stream::borrowed(self.device, consumer) }?.wait_event(event)?;
+    pub fn join(&mut self, event: &Arc<Event>, consumer: &Stream) -> Result<()> {
+        consumer.wait_event(event)?;
 
         let resources = self.resources_mut()?;
-        if consumer == resources.computation.raw()
+        if consumer.raw() == resources.computation.raw()
             && resources
                 .pending
                 .as_ref()
@@ -421,10 +421,9 @@ impl StreamCollectives {
     /// creates its NCCL unique id and sends it over `host`. `rank` is this
     /// rank's index in `host`.
     ///
-    /// # Safety
-    /// `owner` outlives the communicators: they submit to its stream until
+    /// The communicators share `owner`'s stream and submit to it until
     /// [`Self::close`].
-    pub unsafe fn bind(
+    pub fn bind(
         owner: &CUDAStream,
         host: &super::host::HostGroup,
         groups: &[CollectiveGroup],
@@ -468,8 +467,7 @@ impl StreamCollectives {
                 )
             };
             // SAFETY: forwarded from the caller.
-            let comm =
-                unsafe { StreamCommunicator::new(owner, members.len() as i32, rank as i32, &id) }?;
+            let comm = StreamCommunicator::new(owner, members.len() as i32, rank as i32, &id)?;
             bound.groups.push(GroupComm {
                 group: group.clone(),
                 comm: Arc::new(std::sync::Mutex::new(comm)),
@@ -641,7 +639,11 @@ fn table(group: &GroupComm) -> Any {
                     .1
                     .remove(&integer(token)?)
                     .ok_or_else(|| Error::Invalid("unknown collective token".into()))?;
-                comm.join(&event, integer(stream)? as usize)?;
+                // SAFETY: the binding names the stream it computes on, which
+                // the rank's lanes own until the collectives close.
+                let consumer =
+                    unsafe { crate::stream::external(comm.device(), integer(stream)? as usize) }?;
+                comm.join(&event, &consumer)?;
                 Ok(Any::default())
             },
         ) as Box<Call>
