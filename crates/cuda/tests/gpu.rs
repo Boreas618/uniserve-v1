@@ -11,8 +11,8 @@ use std::time::Duration;
 use uniserve_cuda::nccl::{Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceId, Error, Event,
-    EventFlags, HandleType, Nvml, PeerMapping, PinnedBuffer, SourceOrder, Stream, Strided,
-    StridedCopy, memcpy_async, memset_d8, memset_d32, reclaim,
+    EventFlags, HandleType, Nvml, PeerMapping, PinnedBuffer, Pitched, PitchedBatch, SourceOrder,
+    Stream, Strided, StridedCopy, memcpy_async, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -445,6 +445,116 @@ fn sm_partitions_create_streams_of_the_requested_size() {
         Stream::partition(DEVICE, &[total + 1]),
         Err(Error::InvalidArgument(_))
     ));
+}
+
+/// Batched copies on an SM-partition stream deliver their bytes whether an
+/// entry addresses mapped (exportable) or linear memory, in both source
+/// orders, and a source read during the call may change once `submit`
+/// returns.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn batched_copies_reach_mapped_memory_on_partition_streams() {
+    let _driver = exclusive_driver();
+    let stream = Stream::partition(DEVICE, &[8, 16]).unwrap().remove(0);
+    let pattern: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
+
+    for (order, page_locked) in [
+        (SourceOrder::Stream, true),
+        (SourceOrder::DuringCall, false),
+        (SourceOrder::DuringCall, true),
+    ] {
+        let mapped = DeviceAllocation::exportable(DEVICE, 4096, &[]).unwrap();
+        let linear = DeviceAllocation::linear(DEVICE, 4096).unwrap();
+        let readback = PinnedBuffer::new(DEVICE, 4096).unwrap();
+        let mut pinned = PinnedBuffer::new(DEVICE, 4096).unwrap();
+        // SAFETY: no copy is pending on the buffer.
+        unsafe { pinned.as_mut_slice() }.copy_from_slice(&pattern);
+        let mut pageable = pattern.clone();
+        // A source read in stream order is page-locked; one read during the
+        // call may also be ordinary host memory.
+        let source = if page_locked {
+            pinned.address()
+        } else {
+            pageable.as_ptr() as u64
+        };
+
+        // The first half goes to mapped memory and the second to linear.
+        let mut upload = CopyBatch::new(order);
+        upload.push(mapped.address(), source, 2048);
+        upload.push(linear.address(), source + 2048, 2048);
+        // SAFETY: every range outlives the synchronization below; a source
+        // read during the call is not needed after `submit` returns.
+        unsafe { upload.submit(&stream).unwrap() };
+        if order == SourceOrder::DuringCall {
+            pageable.fill(0xff);
+            // SAFETY: the batch has read its sources.
+            unsafe { pinned.as_mut_slice() }.fill(0xff);
+        }
+
+        // The mapped half moves on through device memory.
+        let transit = DeviceAllocation::linear(DEVICE, 2048).unwrap();
+        let mut forward = CopyBatch::new(SourceOrder::Stream);
+        forward.push(transit.address(), mapped.address(), 2048);
+        let mut download = CopyBatch::new(SourceOrder::Stream);
+        download.push(readback.address(), transit.address(), 2048);
+        download.push(readback.address() + 2048, linear.address(), 2048);
+        // SAFETY: as above.
+        unsafe {
+            forward.submit(&stream).unwrap();
+            download.submit(&stream).unwrap();
+        }
+        stream.synchronize().unwrap();
+
+        assert_eq!(
+            read(&readback),
+            pattern,
+            "{order:?} with a page-locked source: {page_locked}"
+        );
+    }
+}
+
+/// Pitched batches on an SM-partition stream deliver their rows into and
+/// out of mapped (exportable) memory.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn pitched_batches_reach_mapped_memory_on_partition_streams() {
+    let _driver = exclusive_driver();
+    let stream = Stream::partition(DEVICE, &[8, 16]).unwrap().remove(0);
+    let mapped = DeviceAllocation::exportable(DEVICE, 4096, &[]).unwrap();
+    let linear = DeviceAllocation::linear(DEVICE, 4096).unwrap();
+    let readback = PinnedBuffer::new(DEVICE, 1024).unwrap();
+    let mut pinned = PinnedBuffer::new(DEVICE, 1024).unwrap();
+    let pattern: Vec<u8> = (0..1024).map(|index| (index % 251) as u8).collect();
+    // SAFETY: no copy is pending on the buffer.
+    unsafe { pinned.as_mut_slice() }.copy_from_slice(&pattern);
+
+    // 16 rows of 64 bytes: packed on the host, 256 bytes apart on the device.
+    let rows = |destination, destination_pitch, source, source_pitch| Pitched {
+        destination,
+        destination_pitch,
+        destination_layer: 16,
+        source,
+        source_pitch,
+        source_layer: 16,
+        width: 64,
+        height: 16,
+        depth: 1,
+    };
+    for (destination, source) in [
+        ((mapped.address(), 256), (pinned.address(), 64)),
+        ((linear.address(), 256), (mapped.address(), 256)),
+        ((readback.address(), 64), (linear.address(), 256)),
+    ] {
+        let mut batch = PitchedBatch::new(SourceOrder::Stream);
+        batch
+            .push(rows(destination.0, destination.1, source.0, source.1))
+            .unwrap();
+        // SAFETY: every row outlives the synchronization below.
+        unsafe { batch.submit(&stream).unwrap() };
+    }
+    stream.synchronize().unwrap();
+
+    assert_eq!(read(&readback), pattern);
 }
 
 #[test]
