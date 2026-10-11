@@ -25,7 +25,7 @@ impl DecoderRunners {
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
         let device = placed_device(placed);
-        let (stream, allocate) = setup.stream(MediaCall::VideoDecoding, device)?;
+        let (stream, scratch) = setup.stream(MediaCall::VideoDecoding, device)?;
         let graph_pool = setup.graph_pool(DECODER_GRAPHS, &placed.name, device)?;
         let mut capacity = DecodeCapacity {
             latent: [0, 0],
@@ -64,7 +64,7 @@ impl DecoderRunners {
                 stream,
                 device: device_index(device)?,
                 attention: attention.clone(),
-                allocate,
+                scratch,
             },
             capacity,
             setup.info.request_slots,
@@ -89,7 +89,7 @@ impl DecoderRunners {
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
         let device = placed_device(placed);
-        let (stream, allocate) = setup.stream(MediaCall::AudioDecoding, device)?;
+        let (stream, scratch) = setup.stream(MediaCall::AudioDecoding, device)?;
         let graph_pool = setup.graph_pool(AUDIO_GRAPHS, &placed.name, device)?;
         // A track's latent does not depend on the canvas.
         let layout = model.layout_size(&VideoSize::plain(
@@ -109,7 +109,7 @@ impl DecoderRunners {
                 stream,
                 device: device_index(device)?,
                 attention: attention.clone(),
-                allocate,
+                scratch,
             },
             [rows, width],
             model.track_samples(plan.max_frames())?,

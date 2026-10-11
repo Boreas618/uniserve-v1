@@ -25,7 +25,6 @@ from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
 from uniserve_models.interface import calls, regions
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
-from uniserve_models.interface.workspace import execution_context
 from uniserve_models.media import image, video
 from uniserve_models.media.pixels import quantize_image_hwc
 from uniserve_models.model import (
@@ -34,6 +33,7 @@ from uniserve_models.model import (
     VideoDecoder,
     VideoPostprocessor,
 )
+from uniserve_models.runner.context import execution_context
 from uniserve_models.tensors import BufferConfig
 
 __all__ = ["DecoderRunner"]
@@ -94,8 +94,8 @@ class DecoderRunner:
         path: The decoder module's path in the model.
         stream: The CUDA stream handle every forward enqueues on.
         attention: The attention backend the model loaded with.
-        allocate: The caller's allocation function for workspace torch
-            cannot provide.
+        scratch: The stream's shared work areas
+            (``uniserve_models.bindings.context.Scratch``).
         size: ``[frames, width, height]`` of a video decoder's segment, or
             ``[latent_frames]`` of an audio decoder's track.
     """
@@ -112,7 +112,7 @@ class DecoderRunner:
         path: str,
         stream: int,
         attention: str,
-        allocate,
+        scratch,
         size: Sequence[int],
     ) -> None:
         module = loaded.module.get_submodule(str(path))
@@ -124,11 +124,7 @@ class DecoderRunner:
             self._decoder = module
             self._segment = _video(frames, width, height)
             self._context: ExecutionContext = execution_context(
-                module,
-                int(stream),
-                str(attention),
-                allocate,
-                f"decoder.{(frames, width, height)}",
+                module, int(stream), str(attention), scratch
             )
             self._context.prepare(self._segment)
             self._postprocessor = _require(loaded, VideoPostprocessor)
@@ -175,7 +171,7 @@ class DecoderRunner:
             (frames,) = extents
             self._audio = module
             self._context = execution_context(
-                module, int(stream), str(attention), allocate, f"audio.{frames}"
+                module, int(stream), str(attention), scratch
             )
             self._context.prepare(frames)
             self._decode = self._decode_audio
