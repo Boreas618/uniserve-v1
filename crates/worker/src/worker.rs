@@ -74,6 +74,7 @@ use crate::runner::denoiser::warmup::DenoiserWarmup;
 use crate::runner::denoiser::{VideoModel, placed_denoiser};
 use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
 use crate::runner::encoder::warmup::EncoderWarmup;
+use crate::runner::scratch::Scratches;
 use crate::runner::start::{
     ImageOwners, Startup as ImageStartup, reserved_bytes as image_reserved_bytes, start_video,
 };
@@ -129,6 +130,9 @@ pub struct Worker {
     graphs: GraphStorage<String, Handle>,
     /// Shared workspaces of every binding, by stream.
     workspaces: StreamWorkspaces,
+    /// The shared work areas of every stream runners construct their
+    /// execution contexts on.
+    _scratches: Scratches,
     executor: Option<Executor<WorkerBackend>>,
     hooks: Vec<Box<dyn WarmupHooks>>,
     /// Retained for the rank's lifetime: torch, the driver owners and the
@@ -165,9 +169,6 @@ impl Worker {
 
         let describing = range(c"uniserve.worker.describe", None);
         let description = Description::describe(&interface, &launch).map_err(phase("describe"))?;
-        let resolved = description
-            .resolve(&interface, &launch)
-            .map_err(phase("describe"))?;
 
         drop(describing);
         let mut world = World::initialize(&interface, &launch, startup_timeout())
@@ -215,16 +216,8 @@ impl Worker {
                 .map_err(phase("load"))?;
         }
         let loading = range(c"uniserve.worker.load", None);
-        let model = LoadedModel::load(
-            &interface,
-            description,
-            resolved,
-            &launch,
-            meshes,
-            experts,
-            host_only,
-        )
-        .map_err(phase("load"))?;
+        let model = LoadedModel::load(&interface, description, &launch, meshes, experts, host_only)
+            .map_err(phase("load"))?;
         let facts = model.facts(&interface, &launch).map_err(phase("load"))?;
         let video = if model.video_decoder {
             let denoiser = placed_denoiser(&model.declarations, &config.deployment_components)
@@ -304,6 +297,7 @@ impl Worker {
             .map_err(phase("capacity"))?;
         let mut graphs = GraphStorage::new(budgets);
         let mut workspaces = StreamWorkspaces::default();
+        let mut scratches = Scratches::default();
 
         let storage = allocate_storage(&launch, &interface, &config, &plan, &lanes)
             .map_err(phase("storage"))?;
@@ -380,7 +374,7 @@ impl Worker {
             lanes: &lanes,
             kv: storage.kv.as_ref(),
             components: &mut components,
-            workspaces: &mut workspaces,
+            scratches: &mut scratches,
             graphs: &mut graphs,
             preparation,
             peers: Some(&peers),
@@ -391,7 +385,7 @@ impl Worker {
         if let Some(experts) = experts.as_mut() {
             if dedicated {
                 experts
-                    .bind_experts(&interface, &model, &mut workspaces)
+                    .bind_experts(&interface, &model, &mut scratches)
                     .map_err(phase("bind"))?;
             }
             reserve_join_pools(&interface, &config, experts, &mut graphs).map_err(phase("bind"))?;
@@ -533,6 +527,7 @@ impl Worker {
             lanes,
             graphs,
             workspaces,
+            _scratches: scratches,
             executor: Some(executor),
             hooks,
             context,
