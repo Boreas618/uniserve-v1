@@ -46,23 +46,15 @@ use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
-use crate::executor::forward::image::ImageRuntime;
-use crate::executor::forward::image::start::{
-    Startup as ImageStartup, reserved_bytes as image_reserved_bytes,
-};
-use crate::executor::forward::image::warmup::ImageWarmup;
 use crate::executor::forward::transfer::TransferRuntime;
-use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle};
 use crate::lane::Lanes;
 use crate::launch::Endpoint;
 use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
-use crate::model::image::ImageModel;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
-use crate::model::video::{VideoModel, placed_denoiser};
 use crate::model::{
     ComponentMesh, Description, ExpertPartition, LoadedModel, ModelFacts, sequence_kind,
 };
@@ -71,10 +63,20 @@ use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
+use crate::request::video::VideoRequests;
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::causal_lm::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
 use crate::runner::causal_lm::warmup::CausalLMWarmup;
+use crate::runner::component::VideoSetup;
+use crate::runner::decoder::warmup::DecoderWarmup;
+use crate::runner::denoiser::image_model::ImageModel;
+use crate::runner::denoiser::warmup::DenoiserWarmup;
+use crate::runner::denoiser::{VideoModel, placed_denoiser};
 use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
+use crate::runner::encoder::warmup::EncoderWarmup;
+use crate::runner::start::{
+    ImageOwners, Startup as ImageStartup, reserved_bytes as image_reserved_bytes, start_video,
+};
 use crate::service::Service;
 use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
 use crate::stream::{CUDAStream, EventPool};
@@ -335,11 +337,11 @@ impl Worker {
             weights: weights.as_ref(),
         })
         .map_err(phase("bind"))?;
-        // A video model's encoders and denoiser run in the video runtime.
+        // A video model's encoders and denoiser run as media batches.
         let image = if video.is_some() {
             None
         } else {
-            ImageRuntime::start(ImageStartup {
+            ImageOwners::start(ImageStartup {
                 interface: &interface,
                 config: &config,
                 request_slots: info.request_slots as usize,
@@ -384,27 +386,38 @@ impl Worker {
             reserve_join_pools(&interface, &config, experts, &mut graphs).map_err(phase("bind"))?;
         }
         let mut lanes = lanes;
-        let video_runtime = match (video, video_capacity) {
-            (Some(video), Some(capacity)) => Some(
-                VideoRuntime::create(RuntimeSetup {
-                    interface: &interface,
-                    loaded: model.handle(),
-                    model: video,
-                    capacity,
-                    info: &info,
-                    config: &config,
-                    components: &components,
-                    lanes: &mut lanes,
-                    graphs: &mut graphs,
-                    attention: facts.attention_backend.clone(),
-                    products: device
-                        .cuda_index()
-                        .map(|index| storage.tensors.arena(StorageDevice::Cuda(index)))
-                        .transpose()
-                        .map_err(phase("storage"))?,
-                })
-                .map_err(phase("storage"))?,
-            ),
+        let video_owners = match (video, video_capacity) {
+            (Some(video), Some(capacity)) => {
+                let (encoders, denoisers, decoders, media) = start_video(
+                    VideoSetup {
+                        interface: &interface,
+                        loaded: model.handle(),
+                        model: &video,
+                        capacity: &capacity,
+                        info: &info,
+                        config: &config,
+                        lanes: &mut lanes,
+                        graphs: &mut graphs,
+                        attention: facts.attention_backend.clone(),
+                    },
+                    &components,
+                )
+                .map_err(phase("storage"))?;
+                let device = match config.device {
+                    crate::config::Device::Cuda(index) => Some(index),
+                    crate::config::Device::Cpu => None,
+                };
+                let leases = 2 * info.queue_depth as usize + 2;
+                let words = info.max_batch_calls.max(1) as usize;
+                Some((
+                    VideoRequests::new(video, capacity.media),
+                    encoders,
+                    denoisers,
+                    decoders,
+                    media,
+                    crate::OutputPool::new(device, leases, words),
+                ))
+            }
             _ => None,
         };
         let mut backend =
@@ -412,9 +425,9 @@ impl Worker {
         backend.set_rank_storage(storage);
         backend.set_job_queues(lanes.job_queues());
         let text_warmup = text.is_some();
-        let video_warmup = video_runtime.is_some();
-        if let Some(runtime) = video_runtime {
-            backend.set_video(runtime);
+        let video_warmup = video_owners.is_some();
+        if let Some((requests, encoders, denoisers, decoders, media, outputs)) = video_owners {
+            backend.set_video(requests, encoders, denoisers, decoders, media, outputs);
         }
         if let Some(text) = text {
             backend.set_text(text);
@@ -474,11 +487,11 @@ impl Worker {
         )
         .map_err(|error| error.with_phase("executor"))?;
         let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
-        if video_warmup {
-            hooks.push(Box::new(VideoWarmup));
-        }
-        if image_warmup {
-            hooks.push(Box::new(ImageWarmup));
+        if video_warmup || image_warmup {
+            // Prepared and captured in this order on every rank.
+            hooks.push(Box::new(EncoderWarmup));
+            hooks.push(Box::new(DenoiserWarmup));
+            hooks.push(Box::new(DecoderWarmup));
         }
         if text_warmup {
             hooks.push(Box::new(CausalLMWarmup {
@@ -771,15 +784,10 @@ impl Worker {
     }
 
     fn require_codecs(&self) -> std::result::Result<(), WorkerError> {
-        let function = self
-            .interface
-            .optional("media.require_codecs")
-            .ok_or_else(|| {
-                WorkerError::from(Error::Unsupported(
-                    "video encoding and muxing are served by the host media runtime".into(),
-                ))
-            })?;
-        function.invoke(&[]).map_err(phase("warmup"))
+        self.interface
+            .import("uniserve_models.media.codec.require_codecs")
+            .and_then(|function| function.invoke(&[]))
+            .map_err(phase("warmup"))
     }
 
     /// Check graph residency, report memory and kernels, then seal.
@@ -838,8 +846,18 @@ impl Worker {
                 .add(&label, &binding.device.to_string(), &kernels)
                 .map_err(phase("warmup"))?;
         }
-        if let Some(video) = executor.backend_mut().video_mut() {
-            for (label, kernels) in video.kernels().map_err(phase("warmup"))? {
+        if executor.backend().serves_video() {
+            let backend = executor.backend();
+            let mut video = backend.encoders().text_kernels().map_err(phase("warmup"))?;
+            video.extend(backend.denoisers().kernels().map_err(phase("warmup"))?);
+            video.extend(backend.decoders().kernels().map_err(phase("warmup"))?);
+            video.extend(
+                backend
+                    .encoders()
+                    .latent_kernels()
+                    .map_err(phase("warmup"))?,
+            );
+            for (label, kernels) in video {
                 records
                     .add(&label, &self.config.device.to_string(), &kernels)
                     .map_err(phase("warmup"))?;
@@ -856,8 +874,9 @@ impl Worker {
         if let Some(text) = executor.backend_mut().text_mut() {
             text.seal();
         }
-        if let Some(image) = executor.backend_mut().image_mut() {
-            image.seal();
+        if let Some(image) = executor.backend_mut().parts().image {
+            image.encoders.seal_image();
+            image.denoisers.seal_image();
         }
         self.workspaces.seal();
         let choices: i64 = self
@@ -1279,7 +1298,7 @@ fn plan(
                 unit_columns,
             )?,
         );
-        // The image runtime's denoiser columns and decoder staging.
+        // The image denoiser's columns and the image decoder's staging.
         if facts.image_flow.is_some() {
             let image = ImageModel::describe(interface, model.handle())?;
             layout.reserve(

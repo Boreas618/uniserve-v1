@@ -81,12 +81,12 @@ def require_codecs() -> None:
         av.CodecContext.create(name, "w")
 
 
-def encode_video_unit(rgb24: np.ndarray, *, frame_rate: int) -> bytes:
+def encode_video_unit(rgb24, frame_rate: int) -> bytes:
     """Encode one media unit as a self-contained MP4 starting at a keyframe.
 
-    ``rgb24`` holds the unit's uint8 frames as ``[frames, height, width,
-    3]``. Frame timestamps start at zero in every unit; the assembly shifts
-    them onto the request's timeline.
+    ``rgb24`` (an array or a CPU tensor) holds the unit's uint8 frames as
+    ``[frames, height, width, 3]``. Frame timestamps start at zero in every
+    unit; the assembly shifts them onto the request's timeline.
 
     Raises:
         ValueError: ``rgb24`` holds no frame or is not RGB24, or the frame
@@ -95,6 +95,7 @@ def encode_video_unit(rgb24: np.ndarray, *, frame_rate: int) -> bytes:
     """
     import av
 
+    rgb24 = np.asarray(rgb24)
     if (
         rgb24.ndim != 4
         or rgb24.shape[0] < 1
@@ -130,10 +131,11 @@ def encode_video_unit(rgb24: np.ndarray, *, frame_rate: int) -> bytes:
     return buffer.getvalue()
 
 
-def encode_audio_track(pcm: np.ndarray, *, samples: int, rate: int) -> bytes:
+def encode_audio_track(pcm, samples: int, rate: int) -> bytes:
     """Encode stereo PCM as a self-contained AAC MP4.
 
-    ``pcm`` holds interleaved int16 samples as ``[samples, 2]``. The track
+    ``pcm`` (an array or a CPU tensor) holds interleaved int16 samples as
+    ``[samples, 2]``. The track
     is truncated or zero-padded to ``samples`` (the video's duration at
     ``rate``) and encoded in planar frames of 1024 samples; the last frame
     is zero-padded to that size when the track does not fill it.
@@ -145,6 +147,7 @@ def encode_audio_track(pcm: np.ndarray, *, samples: int, rate: int) -> bytes:
     """
     import av
 
+    pcm = np.asarray(pcm)
     if pcm.ndim != 2 or pcm.shape[1] != 2 or pcm.dtype != np.int16:
         raise ValueError("audio capture has invalid stereo dimensions")
     if type(samples) is not int or samples < 1 or type(rate) is not int:
@@ -188,7 +191,7 @@ def encode_audio_track(pcm: np.ndarray, *, samples: int, rate: int) -> bytes:
 def _read(payload: bytes):
     import av
 
-    return av.open(io.BytesIO(payload), mode="r")
+    return av.open(io.BytesIO(bytes(payload)), mode="r")
 
 
 @dataclass
@@ -210,7 +213,7 @@ class Container:
 
     @classmethod
     def open(
-        cls, first_unit: bytes, *, frame_rate: int, audio_rate: int
+        cls, first_unit: bytes, frame_rate: int, audio_rate: int
     ) -> Container:
         """Open an empty container whose streams match the request's codecs.
 

@@ -81,10 +81,46 @@ class VideoDecoder(BaseVideoDecoder):
             (1, self.config.latent_channels, 7, height, width), torch.float32
         )
 
-    def unpack_latents(self, latent, frames, size, *, out):
-        config = self.window_input(self.segment(size, frames))
+    def window_rows(self, frames, size):
+        height, width = latent_raster(size.frame)
+        tokens_per_frame = (height // 2) * (width // 2)
+
+        # Unit k decodes latent frames [5k, 5k + 7): five frames that advance
+        # the timeline and two trailing frames that the next unit's window
+        # also reads. Their raster rows are [start, stop).
+        unit = frames.start // 17
+        start = unit * 5 * tokens_per_frame
+        stop = start + 7 * tokens_per_frame
+        if isinstance(self.attention, DenseAttention):
+            # Dense packing keeps the raster order.
+            return torch.arange(start, stop)
+        # Tile and region packing order the rows tile-major, which depends
+        # on the frame count; the argsort maps each raster row to its
+        # position among the packed rows.
+        return torch.argsort(
+            video_order(
+                self.attention,
+                num_frames=size.num_frames,
+                canvas=size.frame,
+            )
+        )[start:stop]
+
+    def unpack_window(self, tokens, segment, *, out):
+        config = self.window_input(segment)
         if tuple(out.shape) != config.shape or out.dtype != config.dtype:
             raise ValueError("video window input has an incompatible layout")
+        height, width = latent_raster(segment.frame)
+        unpatchify_video_into(
+            tokens,
+            out,
+            frames=7,
+            height=height,
+            width=width,
+            channels=self.config.latent_channels,
+        )
+
+    def unpack_latents(self, latent, frames, size, *, out):
+        segment = self.segment(size, frames)
         height, width = latent_raster(size.frame)
         tokens_per_frame = (height // 2) * (width // 2)
         shape = (
@@ -97,41 +133,14 @@ class VideoDecoder(BaseVideoDecoder):
                 f"with shape {shape}"
             )
 
-        # Unit k decodes latent frames [5k, 5k + 7): five frames that advance
-        # the timeline and two trailing frames that the next unit's window
-        # also reads. Their raster rows are [start, stop).
-        unit = frames.start // 17
-        start = unit * 5 * tokens_per_frame
-        stop = start + 7 * tokens_per_frame
-        if isinstance(self.attention, DenseAttention):
-            # Dense packing keeps the raster order.
-            tokens = latent[start:stop]
-        else:
-            # Tile and region packing order the rows tile-major, which
-            # depends on the frame count; the argsort maps each raster row to
-            # its position among the packed rows.
-            positions = torch.argsort(
-                video_order(
-                    self.attention,
-                    num_frames=size.num_frames,
-                    canvas=size.frame,
-                )
-            )[start:stop]
-            if latent.device.type == "cuda":
-                # A pinned source keeps the transfer asynchronous; a pageable
-                # one would wait for the work already queued on the stream.
-                positions = positions.pin_memory().to(
-                    latent.device, non_blocking=True
-                )
-            tokens = latent.index_select(0, positions)
-        unpatchify_video_into(
-            tokens,
-            out,
-            frames=7,
-            height=height,
-            width=width,
-            channels=self.config.latent_channels,
-        )
+        positions = self.window_rows(frames, size)
+        if latent.device.type == "cuda":
+            # A pinned source keeps the transfer asynchronous; a pageable
+            # one would wait for the work already queued on the stream.
+            positions = positions.pin_memory().to(
+                latent.device, non_blocking=True
+            )
+        self.unpack_window(latent.index_select(0, positions), segment, out=out)
 
 
 class AudioDecoder(BaseAudioDecoder):
