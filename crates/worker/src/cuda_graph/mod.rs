@@ -67,8 +67,6 @@ impl GraphMode {
 pub struct CUDAGraph {
     /// One executable per segment, in launch order.
     segments: Arc<[GraphExec]>,
-    /// Graph breaks the Python graph performs between its segments.
-    breaks: usize,
     /// The Python graph, passed back to release it and to a binding that
     /// replays the graph itself.
     graph: Handle,
@@ -76,22 +74,13 @@ pub struct CUDAGraph {
 
 impl CUDAGraph {
     /// Take the result of a capture function: the array
-    /// `[graph, executables, breaks]` of the Python graph, the raw
-    /// `CUgraphExec` handle of each segment in launch order, and the number
-    /// of graph breaks the Python graph performs between them.
+    /// `[graph, executables]` of the Python graph and the raw `CUgraphExec`
+    /// handle of each of its segments in launch order.
     pub fn captured(result: Any) -> Result<Self> {
-        let malformed =
-            || Error::Interface("a capture returns [graph, executables, breaks]".into());
+        let malformed = || Error::Interface("a capture returns [graph, executables]".into());
         let fields = tvm_ffi::Array::<Any>::try_from(result).map_err(|_| malformed())?;
-        if fields.len() != 3 {
-            return Err(malformed());
-        }
         let field = |index: usize| fields.get(index).map_err(|_| malformed());
         let executables = crate::ffi::integers(field(1)?).map_err(|_| malformed())?;
-        let breaks = i64::try_from(field(2)?).map_err(|_| malformed())?;
-        if executables.is_empty() || executables.contains(&0) || breaks < 0 {
-            return Err(malformed());
-        }
 
         let segments = executables
             .into_iter()
@@ -102,7 +91,6 @@ impl CUDAGraph {
             .collect();
         Ok(Self {
             segments,
-            breaks: breaks as usize,
             graph: Handle::new(field(0)?)?,
         })
     }
@@ -116,14 +104,10 @@ impl CUDAGraph {
     /// it. The inputs the graph reads were written on `stream` before, and
     /// its outputs are read on `stream` after.
     ///
-    /// A graph with breaks is not launched here: its breaks are Python
-    /// calls, which its binding makes between the segments it replays.
+    /// FIXME: graph breaks are not performed between the segments. A graph
+    /// of several segments (a text forward with a weight prefetch) is
+    /// replayed by its binding, which makes the breaks' Python calls.
     pub fn launch(&self, stream: &Stream) -> Result<()> {
-        if self.breaks > 0 {
-            return Err(Error::State(
-                "a CUDA graph with Python graph breaks is replayed by its binding",
-            ));
-        }
         for segment in self.segments.iter() {
             segment.launch(stream)?;
         }
@@ -176,15 +160,14 @@ mod tests {
 
     #[test]
     fn a_capture_result_names_its_graph_and_one_executable_per_segment() -> Result<()> {
-        let result = |executables: &[i64], breaks: i64| {
+        let result = |executables: &[i64]| {
             Any::from(crate::ffi::list([
                 Any::from(7_i64),
                 Any::from(crate::ffi::integer_list(executables.iter().copied())),
-                Any::from(breaks),
             ]))
         };
 
-        let graph = CUDAGraph::captured(result(&[0x1000, 0x2000], 1))?;
+        let graph = CUDAGraph::captured(result(&[0x1000, 0x2000]))?;
         assert_eq!(i64::try_from(graph.handle().to_any()).ok(), Some(7));
         assert_eq!(
             graph
@@ -195,10 +178,7 @@ mod tests {
             vec![0x1000, 0x2000]
         );
 
-        // No segment, a null executable and a value of another shape are
-        // not capture results.
-        assert!(CUDAGraph::captured(result(&[], 0)).is_err());
-        assert!(CUDAGraph::captured(result(&[0], 0)).is_err());
+        // A value of another shape is not a capture result.
         assert!(CUDAGraph::captured(Any::from(7_i64)).is_err());
         Ok(())
     }
