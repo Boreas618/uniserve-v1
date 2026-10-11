@@ -163,9 +163,6 @@ impl Worker {
 
         let describing = range(c"uniserve.worker.describe", None);
         let description = Description::describe(&interface, &launch).map_err(phase("describe"))?;
-        let resolved = description
-            .resolve(&interface, &launch)
-            .map_err(phase("describe"))?;
 
         drop(describing);
         let mut world = World::initialize(&interface, &launch, startup_timeout())
@@ -213,16 +210,8 @@ impl Worker {
                 .map_err(phase("load"))?;
         }
         let loading = range(c"uniserve.worker.load", None);
-        let model = LoadedModel::load(
-            &interface,
-            description,
-            resolved,
-            &launch,
-            meshes,
-            experts,
-            host_only,
-        )
-        .map_err(phase("load"))?;
+        let model = LoadedModel::load(&interface, description, &launch, meshes, experts, host_only)
+            .map_err(phase("load"))?;
         let facts = model.facts(&interface, &launch).map_err(phase("load"))?;
         let video = if model.video_decoder {
             let denoiser = placed_denoiser(&model.declarations, &config.deployment_components)
