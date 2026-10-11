@@ -1,24 +1,29 @@
 //! Decoders: completed latents to delivered pixels and samples.
 //!
+//! A [`DecoderRunner`] is the Rust half of the Python
+//! `uniserve_models.runner.decoder.DecoderRunner` for one decoder of a
+//! model: an image, a video or an audio decoder. The three capabilities
+//! share the type and differ in the tensors and graphs of their forwards.
+//!
 //! **Video and audio.** A video decoding round hands each rank of the
-//! decoder's unit ring one media unit. [`VideoDecoding`] runs the Python
-//! half's `DecoderRunner.decode` (`uniserve_models.runner.decoder`) for it:
+//! decoder's unit ring one media unit. The runner launches the Python
+//! half's `decode` for it:
 //! the forward unpacks the unit's window of the request's packed latent,
 //! decodes it at its segment and cross-fades and quantizes it into the
 //! unit's RGB frames, exchanging decoded overlaps with its ring neighbours.
 //! It is captured into one graph per unit shape and launched natively. The
 //! request's retained overlap lives in its slot's row of the overlap bank.
-//! [`AudioDecoding`] decodes a contiguous run of audio units into their
-//! sample span. A Python runner serves one module at one size, so each type
-//! holds one runner per size it serves: a video decoder per segment, an
+//! An audio decoder decodes a contiguous run of audio units into their
+//! sample span. A Python runner serves one module at one size, so the
+//! runner holds one per size it serves: a video decoder per segment, an
 //! audio decoder per track length.
 //!
 //! **Images.**
-//! A [`DecoderRunner`] serves one bound `ImageDecoder`. It decodes images
+//! An image decoder of a bound component decodes images
 //! whose latent rows the caller gathered into the latent pool's step
 //! workspace, optionally publishes the decoded values as image products,
 //! and quantizes every image to packed 8-bit HWC pixels in its staging
-//! bytes (`uniserve_models.interface.decoder`). The caller copies each
+//! bytes. The caller copies each
 //! image's staged pixels to host memory on the runner's stream and encodes
 //! them there ([`crate::host::image::png_base64`]).
 //!
@@ -76,8 +81,244 @@ impl DecodeImage {
     }
 }
 
-/// The runner of one bound image decoder.
+/// The decoder capability a runner serves, with its state.
+enum Family {
+    Image(Box<ImageDecoder>),
+    Video(Box<VideoDecoder>),
+    Audio(Box<AudioDecoder>),
+}
+
+/// The runner of one decoder of a model.
 pub struct DecoderRunner {
+    family: Family,
+}
+
+impl DecoderRunner {
+    /// Bind the image decoder at `path` of `binding` over the latent pool's
+    /// step workspace `latents`, the device's product arena and
+    /// `staging_bytes` of staging. `stream` borrows the binding's stream.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the binding's complete resources"
+    )]
+    pub fn bind(
+        interface: &Interface,
+        binding: &ComponentBinding,
+        path: &str,
+        range: (f32, f32),
+        latents: StorageView,
+        products: StorageView,
+        staging_bytes: usize,
+        stream: Option<Stream>,
+    ) -> Result<Self> {
+        let image = ImageDecoder::bind(
+            interface,
+            binding,
+            path,
+            range,
+            latents,
+            products,
+            staging_bytes,
+            stream,
+        )?;
+        Ok(Self {
+            family: Family::Image(Box::new(image)),
+        })
+    }
+
+    /// The runner of a video decoder and its RGB post-processor.
+    pub(crate) fn video(
+        setup: RunnerSetup<'_>,
+        capacity: DecodeCapacity,
+        slots: u32,
+        pool: Option<Arc<GraphPool<Handle>>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            family: Family::Video(Box::new(VideoDecoder::new(setup, capacity, slots, pool)?)),
+        })
+    }
+
+    /// The runner of an audio decoder. `latent` is the `[rows, width]` of
+    /// the longest track's complete latent and `samples` that track's
+    /// samples.
+    pub(crate) fn audio(
+        setup: RunnerSetup<'_>,
+        latent: [u64; 2],
+        samples: u64,
+        pool: Option<Arc<GraphPool<Handle>>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            family: Family::Audio(Box::new(AudioDecoder::new(setup, latent, samples, pool)?)),
+        })
+    }
+
+    fn image(&self) -> Result<&ImageDecoder> {
+        match &self.family {
+            Family::Image(image) => Ok(image),
+            _ => Err(Error::Invariant("the decoder decodes no images".into())),
+        }
+    }
+
+    fn video_decoder(&mut self) -> Result<&mut VideoDecoder> {
+        match &mut self.family {
+            Family::Video(video) => Ok(video),
+            _ => Err(Error::Invariant("the decoder decodes no video".into())),
+        }
+    }
+
+    fn audio_decoder(&mut self) -> Result<&mut AudioDecoder> {
+        match &mut self.family {
+            Family::Audio(audio) => Ok(audio),
+            _ => Err(Error::Invariant("the decoder decodes no audio".into())),
+        }
+    }
+
+    pub fn device(&self) -> Device {
+        match &self.family {
+            Family::Image(image) => image.device,
+            Family::Video(video) => Device::Cuda(video.device),
+            Family::Audio(audio) => Device::Cuda(audio.device),
+        }
+    }
+
+    /// The runner's stream; `None` on the host.
+    pub fn stream(&self) -> Option<&Stream> {
+        match &self.family {
+            Family::Image(image) => image.stream.as_ref(),
+            Family::Video(video) => Some(&video.methods.stream),
+            Family::Audio(audio) => Some(&audio.methods.stream),
+        }
+    }
+
+    /// An image decoder's pixel range, `(low, high)`.
+    pub fn range(&self) -> Result<(f32, f32)> {
+        Ok(self.image()?.range)
+    }
+
+    /// Decode `images`, handing each image's staged pixels (in input
+    /// order) to `stage`, which must enqueue their consumption on the
+    /// runner's stream before it returns: the next sub-batch reuses the
+    /// staging bytes.
+    pub fn decode(
+        &self,
+        images: &[DecodeImage],
+        stage: impl FnMut(usize, StorageView) -> Result<()>,
+    ) -> Result<()> {
+        self.image()?.decode(images, stage)
+    }
+
+    /// Quantize a resident image product holding values in `range` and
+    /// hand its staged pixels to `stage`.
+    pub fn quantize(
+        &self,
+        image: &Region,
+        range: (f32, f32),
+        stage: impl FnOnce(StorageView) -> Result<()>,
+    ) -> Result<()> {
+        self.image()?.quantize(image, range, stage)
+    }
+
+    /// Construct a video decoder's Python runner of every segment, the
+    /// largest first.
+    pub(crate) fn prepare_segments(&mut self, segments: &[Segment]) -> Result<()> {
+        self.video_decoder()?.prepare(segments)
+    }
+
+    /// Decode and reconstruct a zero latent as a media unit of `shape`
+    /// whose window reads `rows` rows, so kernels compile and the ring's
+    /// exchange of the round shape is prepared. Every ring member holding
+    /// a unit of the round calls it, in the same order.
+    pub(crate) fn warm_unit(&mut self, shape: UnitShape, rows: u64, longest: u32) -> Result<()> {
+        self.video_decoder()?.warm(shape, rows, longest)
+    }
+
+    /// Capture the forward of a warmed unit `shape`.
+    pub(crate) fn capture_unit(&mut self, shape: UnitShape, rows: u64, longest: u32) -> Result<()> {
+        self.video_decoder()?.capture(shape, rows, longest)
+    }
+
+    /// Decode and reconstruct media unit `unit` of a `frames`-frame video
+    /// into the leading `written` frames of `out` (`[longest, height,
+    /// width, 3]` uint8). `latent` is the request's complete packed latent,
+    /// `shape` the unit's.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one unit's complete reconstruction inputs"
+    )]
+    pub(crate) fn decode_unit(
+        &mut self,
+        slot: usize,
+        latent: &StorageView,
+        frames: u32,
+        unit: u32,
+        shape: UnitShape,
+        longest: u32,
+        written: u32,
+        out: &StorageView,
+    ) -> Result<GraphMode> {
+        self.video_decoder()?
+            .decode(slot, latent, frames, unit, shape, longest, written, out)
+    }
+
+    /// Construct an audio decoder's Python runner of tracks of
+    /// `latent_frames` latent frames.
+    pub(crate) fn prepare_track(&mut self, latent_frames: u32) -> Result<()> {
+        self.audio_decoder()?.prepare(latent_frames)
+    }
+
+    /// Decode `units` of a zero track whose complete latent has `rows`
+    /// rows, so kernels compile before any capture.
+    pub(crate) fn warm_track(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
+        self.audio_decoder()?.warm(units, rows)
+    }
+
+    /// Capture the forward of warmed track `units`.
+    pub(crate) fn capture_track(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
+        self.audio_decoder()?.capture(units, rows)
+    }
+
+    /// Decode `units` of a track into `out` (`[span, 2]` int16). `latent`
+    /// is the request's complete audio latent.
+    pub(crate) fn decode_track(
+        &mut self,
+        latent: &StorageView,
+        units: TrackUnits,
+        out: &StorageView,
+    ) -> Result<GraphMode> {
+        self.audio_decoder()?.decode(latent, units, out)
+    }
+
+    /// Refuse further captures.
+    pub(crate) fn seal(&mut self) {
+        match &mut self.family {
+            Family::Image(_) => {}
+            Family::Video(video) => video.graphs.seal(),
+            Family::Audio(audio) => audio.graphs.seal(),
+        }
+    }
+
+    /// The kernels the operators of a video or audio decoder selected.
+    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+        match &self.family {
+            Family::Image(_) => Ok(Vec::new()),
+            Family::Video(video) => video.kernels(label),
+            Family::Audio(audio) => audio.kernels(label),
+        }
+    }
+
+    /// Release the graphs and Python runners of a video or audio decoder;
+    /// an image decoder's component binding owns its resources.
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
+        match &mut self.family {
+            Family::Image(_) => Ok(()),
+            Family::Video(video) => video.close(aborted),
+            Family::Audio(audio) => audio.close(aborted),
+        }
+    }
+}
+
+/// An image decoder of a bound component.
+struct ImageDecoder {
     owner: String,
     device: Device,
     stream: Option<Stream>,
@@ -90,15 +331,12 @@ pub struct DecoderRunner {
     staging: StorageView,
 }
 
-impl DecoderRunner {
-    /// Bind the image decoder at `path` of `binding` over the latent pool's
-    /// step workspace `latents`, the device's product arena and
-    /// `staging_bytes` of staging. `stream` borrows the binding's stream.
+impl ImageDecoder {
     #[expect(
         clippy::too_many_arguments,
         reason = "the binding's complete resources"
     )]
-    pub fn bind(
+    fn bind(
         interface: &Interface,
         binding: &ComponentBinding,
         path: &str,
@@ -144,25 +382,11 @@ impl DecoderRunner {
         })
     }
 
-    pub fn device(&self) -> Device {
-        self.device
-    }
-
-    /// The runner's stream; `None` on the host.
-    pub fn stream(&self) -> Option<&Stream> {
-        self.stream.as_ref()
-    }
-
-    /// The decoder's pixel range, `(low, high)`.
-    pub fn range(&self) -> (f32, f32) {
-        self.range
-    }
-
     /// Decode `images`, handing each image's staged pixels (in input
     /// order) to `stage`, which must enqueue their consumption on the
     /// runner's stream before it returns: the next sub-batch reuses the
     /// staging bytes.
-    pub fn decode(
+    fn decode(
         &self,
         images: &[DecodeImage],
         mut stage: impl FnMut(usize, StorageView) -> Result<()>,
@@ -236,7 +460,7 @@ impl DecoderRunner {
 
     /// Quantize a resident image product holding values in `range` and
     /// hand its staged pixels to `stage` (see [`Self::decode`]).
-    pub fn quantize(
+    fn quantize(
         &self,
         image: &Region,
         range: (f32, f32),
@@ -326,7 +550,7 @@ impl ImageBatch<'_> {
             .runtime
             .decoder()
             .ok_or_else(|| Error::Unsupported("image decoding requires a decoder".into()))?
-            .range();
+            .range()?;
 
         // One encoding task per reporting call, reserved before any device
         // work so a full host lane fails the batch cleanly.
@@ -629,14 +853,14 @@ pub(crate) struct DecodeCapacity {
     pub(crate) overlap: (u64, DType),
 }
 
-/// One rank's video decoder and RGB post-processor.
+/// A video decoder and its RGB post-processor on one rank.
 ///
 /// A forward reads and writes four tensors at fixed addresses, so one
 /// captured graph per [`UnitShape`] serves every request: the request's
 /// packed latent, the rows of it the unit's window reads, the request's
 /// retained overlap and the unit's RGB frames. The runner copies a
 /// request's values in and out of them natively around the forward.
-pub(crate) struct VideoDecoding {
+struct VideoDecoder {
     methods: Methods,
     device: i32,
     /// The runner of each segment, in preparation order.
@@ -663,7 +887,7 @@ pub(crate) struct VideoDecoding {
     pool: Option<Arc<GraphPool<Handle>>>,
 }
 
-impl VideoDecoding {
+impl VideoDecoder {
     pub(crate) fn new(
         setup: RunnerSetup<'_>,
         capacity: DecodeCapacity,
@@ -822,11 +1046,6 @@ impl VideoDecoding {
         Ok(())
     }
 
-    /// Refuse further captures.
-    pub(crate) fn seal(&mut self) {
-        self.graphs.seal();
-    }
-
     /// Decode and reconstruct media unit `unit` of a `frames`-frame video
     /// into the leading `written` frames of `out` (`[longest, height,
     /// width, 3]` uint8). `latent` is the request's complete packed latent,
@@ -949,7 +1168,7 @@ pub(crate) struct TrackUnits {
 /// A forward reads the request's audio latent and writes its samples at
 /// fixed addresses, so one captured graph per [`TrackUnits`] serves every
 /// request; the runner copies a request's values in and out natively.
-pub(crate) struct AudioDecoding {
+struct AudioDecoder {
     methods: Methods,
     device: i32,
     /// The runner of each track length, by its latent frames.
@@ -965,7 +1184,7 @@ pub(crate) struct AudioDecoding {
     pool: Option<Arc<GraphPool<Handle>>>,
 }
 
-impl AudioDecoding {
+impl AudioDecoder {
     /// `latent` is the `[rows, width]` of the longest track's complete
     /// latent and `samples` that track's samples.
     pub(crate) fn new(
@@ -1048,11 +1267,6 @@ impl AudioDecoding {
         self.graphs.insert(units, None, graph)?;
         self.graphs.record(GraphMode::Capture);
         Ok(())
-    }
-
-    /// Refuse further captures.
-    pub(crate) fn seal(&mut self) {
-        self.graphs.seal();
     }
 
     /// Decode `units` of a track into `out` (`[span, 2]` int16). `latent`
@@ -1214,7 +1428,7 @@ pub(crate) fn decode_video(
         .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?
         .runner;
     let written = units[unit as usize];
-    decoder.decode(
+    decoder.decode_unit(
         slot,
         latent.value(),
         frames,
@@ -1313,7 +1527,7 @@ pub(crate) fn decode_audio(
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?
         .runner;
-    audio.decode(
+    audio.decode_track(
         latent.value(),
         TrackUnits {
             samples,
