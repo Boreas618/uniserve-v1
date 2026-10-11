@@ -23,7 +23,7 @@ use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::Device;
 use crate::request::RequestPool;
 use crate::storage::{OutputBuffer, OutputLease, TensorStore};
-use crate::stream::EventPool;
+use crate::stream::{EventPool, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
 
@@ -166,14 +166,19 @@ pub(crate) fn read_flag(
 pub(crate) fn seal(
     events: &EventPool,
     buffer: &OutputLease,
-    stream: Option<&Stream>,
+    stream: impl Issue,
     retirement: &Arc<Retirement>,
 ) -> Result<()> {
-    let streams: Vec<&Stream> = stream.into_iter().collect();
+    // A lease of host storage is sealed on no stream.
+    let streams = if stream.stream().is_some() {
+        vec![stream]
+    } else {
+        Vec::new()
+    };
     let fences = lock(buffer).seal(&streams, events)?.unwrap_or_default();
     let notify: Vec<_> = lock(buffer).fences().cloned().collect();
     for event in &notify {
-        events.wake_after(event)?;
+        stream.wake(events, event)?;
     }
     let lease = Arc::clone(buffer);
     let retirement = Arc::clone(retirement);
@@ -279,34 +284,36 @@ pub(crate) fn abandon(requests: &mut RequestPool, mut launched: Launched) -> Res
 /// each batch waits for the previous batch recorded on another stream.
 #[derive(Default)]
 pub(crate) struct StreamOrder {
-    last: Option<(usize, uniserve_cuda::Event)>,
+    last: Option<(usize, Arc<uniserve_cuda::Event>)>,
 }
 
 impl StreamOrder {
     /// Order `stream` after the previous batch on another stream.
-    pub(crate) fn wait(&self, stream: Option<&Stream>) -> Result<()> {
-        let Some(stream) = stream else {
+    pub(crate) fn wait(&self, stream: impl Issue) -> Result<()> {
+        let Some(raw) = stream.stream().map(Stream::raw) else {
             return Ok(());
         };
         if let Some((previous, event)) = &self.last
-            && *previous != stream.raw()
+            && *previous != raw
         {
-            stream.wait_event(event)?;
+            stream.wait(event)?;
         }
         Ok(())
     }
 
     /// Record the end of this batch's work on `stream` for other streams.
-    pub(crate) fn record(&mut self, stream: Option<&Stream>) -> Result<()> {
-        let Some(stream) = stream else {
+    pub(crate) fn record(&mut self, stream: impl Issue) -> Result<()> {
+        let Some(raw) = stream.stream().map(Stream::raw) else {
             return Ok(());
         };
         let event = match self.last.take() {
             Some((_, event)) => event,
-            None => uniserve_cuda::Event::new(uniserve_cuda::EventFlags::default()),
+            None => Arc::new(uniserve_cuda::Event::new(
+                uniserve_cuda::EventFlags::default(),
+            )),
         };
-        event.record(stream)?;
-        self.last = Some((stream.raw(), event));
+        stream.record(&event)?;
+        self.last = Some((raw, event));
         Ok(())
     }
 }
