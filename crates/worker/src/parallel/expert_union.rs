@@ -59,10 +59,8 @@ use crate::executor::backend::WorkerBackend;
 use crate::ffi::{Backing, Fields, Function, Handle, Record, integer_list};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
-use crate::model::bind::{
-    self, Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize,
-};
 use crate::model::interface::Interface;
+use crate::runner::scratch::Scratches;
 use crate::transfer::PeerStorage;
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
@@ -82,6 +80,8 @@ pub(super) struct ExpertFunctions {
     pub(super) join: Function,
     warm_thread: Function,
     close: Function,
+    /// `ExpertLayers.close(layers)`.
+    close_layers: Function,
 }
 
 impl ExpertFunctions {
@@ -95,6 +95,7 @@ impl ExpertFunctions {
             join: function("join")?,
             warm_thread: function("warm_thread")?,
             close: function("close_exchange")?,
+            close_layers: function("ExpertLayers.close")?,
         })
     }
 }
@@ -107,8 +108,9 @@ pub(super) struct Microbatch {
     /// microbatch, a fork of it for the others. The rank's lanes close the
     /// streams after this member.
     pub(super) stream: Stream,
-    /// The prepared component whose expert layers this microbatch's joins
-    /// run.
+    /// The owner of the execution context whose expert layers this
+    /// microbatch's joins run: a runner, a prepared component or an
+    /// expert-only rank's `ExpertLayers`.
     pub(super) prepared: Option<Handle>,
     /// This microbatch's captured joins, so an empty microbatch of a
     /// populated step launches them on its own stream.
@@ -134,8 +136,8 @@ pub(crate) struct ExpertUnion {
     /// Startup warmup: source ranks announce each eager expert step
     /// instead of agreeing on it.
     warming: AtomicBool,
-    /// The component bindings of an expert-only rank.
-    bindings: Vec<ComponentBinding>,
+    /// The `ExpertLayers` of an expert-only rank, one per microbatch.
+    layers_owners: Vec<Handle>,
     /// One graph pool per microbatch for captured joins.
     pub(super) pools: Vec<Handle>,
     /// The layers that exchange tokens, compared across the union.
@@ -251,8 +253,12 @@ impl ExpertUnion {
                 record(lanes.close());
             }
         }
-        for binding in &mut self.bindings {
-            record(binding.close(aborted));
+        // An aborted close keeps the layers' contexts: device work may
+        // still address their workspace.
+        if !aborted {
+            for owner in std::mem::take(&mut self.layers_owners) {
+                record(self.functions.close_layers.invoke(&[owner.view()]));
+            }
         }
         let peers = std::mem::take(&mut self.microbatches);
         if aborted {
@@ -439,7 +445,7 @@ impl ExpertUnion {
             lanes: None,
             joins: None,
             warming: AtomicBool::new(true),
-            bindings: Vec::new(),
+            layers_owners: Vec::new(),
             pools: Vec::new(),
             layers,
             _hooks: hooks,
@@ -541,45 +547,29 @@ impl ExpertUnion {
             .invoke(&[(&Any::from(exchanges)).into()])
     }
 
-    /// Bind a dedicated expert rank's layers once per microbatch, each on
-    /// its stream with its transport, over Rust workspaces sized for the
-    /// sources' token bound.
+    /// Construct an expert-only rank's layers once per microbatch
+    /// (`ExpertLayers`), each on its stream with its exchange and the
+    /// stream's scratch, prepared for the sources' token bound.
     pub(crate) fn bind_experts(
         &mut self,
         interface: &Interface,
         model: &LoadedModel,
-        workspaces: &mut StreamWorkspaces,
+        scratches: &mut Scratches,
     ) -> Result<()> {
-        let mut prepared = Vec::new();
+        let construct = interface.import(&format!("{MODULE}.ExpertLayers"))?;
         for peer in &self.microbatches {
-            prepared.push(bind::prepare(
-                interface,
-                model.handle(),
-                BindingRequest {
-                    component: "experts".into(),
-                    path: String::new(),
-                    device: Device::Cuda(self.device),
-                    stream: peer.stream.raw(),
-                    size: Some(TextSize {
-                        tokens: self.parallel.max_tokens(),
-                        rows: 1,
-                    }),
-                    backends: Backends::default(),
-                    derive_host_lengths: false,
-                    experts: Some(peer.exchange.clone()),
-                    weights: None,
-                    cache: None,
-                },
-            )?);
+            let stream = peer.stream.raw();
+            let scratch = scratches.get(interface, stream, Some(self.device))?;
+            self.layers_owners.push(Handle::new(construct.call_values(&[
+                model.handle().to_any(),
+                Any::from(stream as i64),
+                scratch.to_any(),
+                peer.exchange.to_any(),
+                Any::from(self.parallel.max_tokens() as i64),
+            ])?)?);
         }
-        // Expert layers declare no symmetric workspace.
-        self.bindings = bind::bind(interface, workspaces, prepared)?;
-        let handles: Vec<Handle> = self
-            .bindings
-            .iter()
-            .map(|binding| binding.prepared().clone())
-            .collect();
-        self.bind_joins(&handles.iter().collect::<Vec<_>>())
+        let owners = self.layers_owners.clone();
+        self.bind_joins(&owners.iter().collect::<Vec<_>>())
     }
 
     /// Compare every rank's plan before warmup enters collectives. `calls`

@@ -31,10 +31,10 @@ from tests.python.fixtures.checkpoints import (
     diffusion_gemma_checkpoint,
 )
 from uniserve_models import catalog as models
-from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.bindings.context import ExecutionContext, Scratch
 from uniserve_models.cache.units import UnitPool
 from uniserve_models.diffusion import canvas as sampler
-from uniserve_models.interface import binding, graphs
+from uniserve_models.interface import graphs
 from uniserve_models.interface.loading import Loaded
 from uniserve_models.loading import weights
 from uniserve_models.model import DiffusionLMInput, TextInput, TextSize
@@ -144,47 +144,35 @@ class _Session:
             module=self.model, description=None, attention=setup.attention
         )
         self.loaded = loaded
-        prepared, requirements = binding.prepare(
-            loaded,
-            {
-                "component": "diffusion_gemma",
-                "path": "denoiser",
-                "stream": 0 if self.stream is None else self.stream.cuda_stream,
-                "attention": setup.attention,
-                "vsa": "auto",
-                "matmul": "auto",
-                "moe": "auto",
-                "derive_host_lengths": True,
-                "cache": self.pool,
-                "size": {"tokens": TOKENS, "rows": 2 * ROWS},
-            },
-        )
-        workspaces = {
-            item["name"]: torch.zeros(
-                item["shape"],
-                dtype=getattr(torch, item["dtype"]),
-                device=setup.device if item["device"] >= 0 else "cpu",
-            )
-            for item in requirements["workspaces"]
-        }
-        binding.bind(prepared, {"workspaces": workspaces})
         self.buffers = self._buffers(sampling)
         groups = [self.pool.groups[table.group] for table in self.pool.tables]
-        page_tokens = [group.page_tokens for group in groups]
-        windowed = [group.window is not None for group in groups]
+        # The constructor's arguments up to the sampling: the model and its
+        # stream, the stream's scratch, the prefix cache, no expert
+        # exchange, weight prefetch or stream collectives, and the largest
+        # forward.
+        construction = [
+            loaded,
+            "denoiser",
+            0 if self.stream is None else self.stream.cuda_stream,
+            Scratch(),
+            self.pool,
+            None,
+            None,
+            None,
+            TOKENS,
+            2 * ROWS,
+            [group.page_tokens for group in groups],
+            [group.window is not None for group in groups],
+        ]
         if sampling:
             self.runner = diffusion_lm.DiffusionLMRunner(
-                prepared,
-                page_tokens,
-                windowed,
+                *construction,
                 2,
                 *SAMPLING,
                 *(self.buffers[f"bank.{name}"] for name in BANKS),
             )
         else:
-            self.runner = diffusion_lm.DiffusionLMRunner(
-                prepared, page_tokens, windowed, 0
-            )
+            self.runner = diffusion_lm.DiffusionLMRunner(*construction, 0)
 
     def attention(self) -> list[torch.Tensor]:
         """The attention metadata tensors, in parameter order."""
