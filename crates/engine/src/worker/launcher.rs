@@ -32,6 +32,10 @@ use uniserve_ipc::{Channel, IpcError};
 /// reservation.
 const LAUNCHER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longest the head waits, when it stops, for a launcher to take the
+/// instructions still queued for it.
+const TERMINATE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Frames queued for a launcher that reads slowly; a group's launch sends
 /// one instruction per rank without waiting for the launcher in between.
 const INSTRUCTION_DEPTH: usize = 256;
@@ -350,7 +354,13 @@ impl Drop for LauncherRegistry {
     /// close does the work either way.
     fn drop(&mut self) {
         for (host, launcher) in self.hosts.iter_mut() {
-            if launcher.channel.send(&Instruction::Terminate).is_err() {
+            // Dropping the channel discards what is still queued, so the
+            // instruction is written out first, within a short bound.
+            let sent = launcher
+                .channel
+                .send(&Instruction::Terminate)
+                .and_then(|()| launcher.channel.flush(TERMINATE_FLUSH_TIMEOUT));
+            if sent.is_err() {
                 tracing::debug!(host = %host, "a launcher was already gone at shutdown");
             }
         }

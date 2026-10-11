@@ -20,10 +20,16 @@
 //! frame larger than the kernel's send buffer finishes sending across later
 //! calls. Its owner blocks in [`Channel::wait`] on the socket together with
 //! one local [`Wake`], which the owner's other threads fire for work that did
-//! not arrive on the socket.
+//! not arrive on the socket. An owner that closes a connection on purpose
+//! calls [`Channel::flush`] first, since dropping a channel discards the
+//! frames still queued.
 //!
 //! A closed connection is terminal. Frames that arrived whole before the
-//! close are still delivered; every call after them fails.
+//! close are still delivered; every call after them fails. A TCP connection
+//! probes an idle peer (see [`KEEPALIVE_IDLE_SECS`]), so a peer whose host
+//! has died closes the connection like one that exited. [`Hangup`] observes
+//! the peer's close without reading the connection, for an owner whose
+//! thread is not in a position to call the channel.
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
@@ -48,6 +54,20 @@ pub const INITIAL_BOUND: usize = 1 << 20;
 /// [`Channel::set_capacity`].
 const INITIAL_DEPTH: usize = 4;
 
+/// Seconds a TCP connection stays idle before it probes its peer.
+pub const KEEPALIVE_IDLE_SECS: libc::c_int = 30;
+
+/// Seconds between the probes of an idle TCP connection.
+pub const KEEPALIVE_INTERVAL_SECS: libc::c_int = 10;
+
+/// Unanswered probes after which a TCP connection fails. With the idle time
+/// and the interval, a peer whose host died is noticed within a minute.
+pub const KEEPALIVE_PROBES: libc::c_int = 3;
+
+/// Milliseconds sent data may stay unacknowledged before a TCP connection
+/// fails, which bounds a send to a dead peer as the probes bound an idle one.
+pub const USER_TIMEOUT_MILLIS: libc::c_int = 60_000;
+
 /// Wraps an IO failure with what the channel was doing.
 fn transport(action: &str, error: std::io::Error) -> IpcError {
     IpcError::Transport(format!("{action}: {error}"))
@@ -70,12 +90,59 @@ impl Stream {
                 stream
                     .set_nodelay(true)
                     .map_err(|error| transport("disabling Nagle", error))?;
+                keep_alive(stream)?;
                 stream.set_nonblocking(true)
             }
         }
         .map_err(|error| transport("making a channel pollable", error))?;
         Ok(self)
     }
+}
+
+/// Makes a TCP connection fail when its peer's host stops answering.
+///
+/// A host that dies sends no close, so without probes its connection stays
+/// open for as long as nothing is sent to it.
+fn keep_alive(stream: &TcpStream) -> IpcResult<()> {
+    let set = |level: libc::c_int, option: libc::c_int, value: libc::c_int| {
+        // SAFETY: the descriptor is this live stream's, and the option value
+        // is a `c_int` whose address and size are passed together.
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                level,
+                option,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(transport(
+                "enabling keepalive",
+                std::io::Error::last_os_error(),
+            ))
+        }
+    };
+
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    #[cfg(target_os = "linux")]
+    {
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS)?;
+        set(
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            KEEPALIVE_INTERVAL_SECS,
+        )?;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES)?;
+        set(
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            USER_TIMEOUT_MILLIS,
+        )?;
+    }
+    Ok(())
 }
 
 impl Read for Stream {
@@ -467,21 +534,108 @@ impl Channel {
         }
     }
 
-    /// Waits until a message is readable, the local wake fires, the
-    /// connection fails, or `timeout` passes.
+    /// Blocks until something happens that the owner can act on, or
+    /// `timeout` passes.
     ///
-    /// Returns at once when a frame is buffered, the channel has failed, or a
-    /// wake is already pending, which it consumes. Otherwise it polls, then
-    /// reads the stream and flushes queued writes. It does not say which
-    /// occurred, so the caller re-checks every progress source afterwards.
+    /// It returns `Ok` when a message arrives, when a queued frame has been
+    /// written out so that the send queue has room again, when the local wake
+    /// fires (a wake already pending is consumed and ends the wait at once),
+    /// and at the timeout. It does not say which occurred, so the caller
+    /// re-checks every progress source afterwards.
+    ///
+    /// Messages already buffered do not end the wait. A caller that can take
+    /// a message calls [`Self::try_recv`] until it returns `None` before it
+    /// waits; a caller that cannot take one right now, because it is busy or
+    /// its own queue is full, therefore still blocks here instead of
+    /// spinning.
+    ///
+    /// Fails with the terminal failure once the connection has failed or
+    /// been closed by the peer: at once when that is already known, and
+    /// otherwise when it is observed without a new message arriving first.
     pub fn wait(&mut self, timeout: Duration) -> IpcResult<()> {
-        if !self.reader.ready.is_empty() || self.failure.is_some() || self.local.take() {
+        if let Some(error) = &self.failure {
+            return Err(IpcError::Transport(error.clone()));
+        }
+        if self.local.take() {
             return Ok(());
         }
-        wait_ready(&mut self.poll_fds(), timeout)?;
-        self.local.take();
-        self.pump();
-        Ok(())
+
+        let deadline = Instant::now() + timeout;
+        let buffered = self.reader.ready.len();
+        let queued = self.writer.pending.len();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            wait_ready(&mut self.poll_fds(), remaining)?;
+            let woken = self.local.take();
+            self.pump();
+
+            // A message that arrived with the close is reported first; the
+            // next wait reports the close.
+            let arrived = self.reader.ready.len() > buffered;
+            let sent = self.writer.pending.len() < queued;
+            if woken || arrived || sent {
+                return Ok(());
+            }
+            if let Some(error) = &self.failure {
+                return Err(IpcError::Transport(error.clone()));
+            }
+
+            // Readiness that completed neither a frame nor a write, such as
+            // part of a large message, is not progress the owner can use.
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Writes out every queued frame, waiting up to `timeout` for the socket
+    /// to accept them.
+    ///
+    /// An owner calls this before it closes a connection on purpose, so that
+    /// its last messages, such as an acknowledgment queued behind a large
+    /// result, reach the peer. Fails when the connection has failed, on a
+    /// write error, and when frames remain queued at the deadline.
+    pub fn flush(&mut self, timeout: Duration) -> IpcResult<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(error) = &self.failure {
+                return Err(IpcError::Transport(error.clone()));
+            }
+            self.writer.flush(&mut self.stream)?;
+            if self.writer.pending.is_empty() {
+                return Ok(());
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(IpcError::Transport(format!(
+                    "{} frames were still queued when the channel closed",
+                    self.writer.pending.len()
+                )));
+            }
+            let mut writable = [libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            }];
+            wait_ready(&mut writable, remaining)?;
+        }
+    }
+
+    /// Returns an observer of the peer's close that does not read the
+    /// connection, and that another thread may hold while this channel is in
+    /// use.
+    pub fn hangup(&self) -> IpcResult<Hangup> {
+        let duplicate = |descriptor: std::os::fd::BorrowedFd<'_>| {
+            descriptor
+                .try_clone_to_owned()
+                .map_err(|error| transport("duplicating a channel's descriptor", error))
+        };
+        let stream = match &self.stream {
+            Stream::Unix(stream) => duplicate(std::os::fd::AsFd::as_fd(stream))?,
+            Stream::Tcp(stream) => duplicate(std::os::fd::AsFd::as_fd(stream))?,
+        };
+        Ok(Hangup { stream })
     }
 
     /// Returns whether the connection has failed or been closed by the peer.
@@ -528,6 +682,41 @@ impl Channel {
             Ok(true) => Some("channel closed by its peer".into()),
             Err(error) => Some(error.to_string()),
         };
+    }
+}
+
+/// Observes whether a connection's peer has closed it, without reading it.
+///
+/// A channel notices its peer's close only when its owner calls it. An owner
+/// whose thread is occupied elsewhere, for example while it loads a model,
+/// gives a `Hangup` to a thread that can wait. The observer holds its own
+/// descriptor of the connection, so it stays valid whatever happens to the
+/// channel it came from.
+pub struct Hangup {
+    stream: std::os::fd::OwnedFd,
+}
+
+impl Hangup {
+    /// Waits up to `timeout` and returns whether the peer has closed the
+    /// connection or the connection has failed.
+    ///
+    /// Data the peer sent and the channel has not read yet does not hide the
+    /// close: the peer's hangup is reported by `poll` separately from
+    /// readability (`POLLRDHUP`).
+    pub fn wait(&self, timeout: Duration) -> IpcResult<bool> {
+        #[cfg(target_os = "linux")]
+        let closing = libc::POLLRDHUP;
+        #[cfg(not(target_os = "linux"))]
+        let closing = 0;
+
+        let mut descriptor = [libc::pollfd {
+            fd: self.stream.as_raw_fd(),
+            events: closing,
+            revents: 0,
+        }];
+        wait_ready(&mut descriptor, timeout)?;
+        let closed = closing | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+        Ok(descriptor[0].revents & closed != 0)
     }
 }
 
@@ -868,12 +1057,80 @@ mod tests {
         }
     }
 
+    /// An owner that cannot take a message right now still blocks in `wait`:
+    /// a message it has left buffered does not end the wait, and a new one
+    /// does.
     #[test]
-    fn a_stalled_peer_applies_backpressure_and_partial_writes_resume() {
-        let size = 1 << 20;
-        let (mut channel, mut peer) = with_raw_peer(2 * size, 1);
+    fn a_buffered_message_does_not_end_a_wait_and_a_new_one_does() {
+        let (mut channel, mut peer) = with_raw_peer(1024, 1);
+        let short = Duration::from_millis(100);
+        for message_id in [1, 2] {
+            peer.write_all(&frame_of(&response_of(message_id, 5)))
+                .unwrap();
+        }
+        assert_eq!(
+            recv::<WorkerResponse>(&mut channel).unwrap(),
+            response_of(1, 5)
+        );
+
+        // The second response stays buffered, and nothing else happens.
+        let started = Instant::now();
+        channel.wait(short).unwrap();
+        assert!(
+            started.elapsed() >= short,
+            "a buffered message ended the wait"
+        );
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(short);
+            peer.write_all(&frame_of(&response_of(3, 5))).unwrap();
+            peer
+        });
+        let started = Instant::now();
+        channel.wait(TIMEOUT).unwrap();
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "a new message did not end the wait"
+        );
+        let _peer = writer.join().unwrap();
+        for message_id in [2, 3] {
+            assert_eq!(
+                channel.try_recv::<WorkerResponse>().unwrap(),
+                Some(response_of(message_id, 5))
+            );
+        }
+    }
+
+    /// A wait reports the peer's close as an error, after the message that
+    /// arrived with it, and at once from then on, so a caller that waits on
+    /// a closed channel neither blocks for its timeout nor spins.
+    #[test]
+    fn a_wait_fails_once_the_peer_has_closed() {
+        let (mut channel, mut peer) = with_raw_peer(1024, 1);
+        peer.write_all(&frame_of(&response_of(1, 5))).unwrap();
+        drop(peer);
+
+        // The last message and the close may be observed by one wait or two.
+        let deadline = Instant::now() + TIMEOUT;
+        while channel.wait(Duration::from_millis(50)).is_ok() {
+            assert!(Instant::now() < deadline, "the close was never reported");
+        }
+        let started = Instant::now();
+        assert!(matches!(channel.wait(TIMEOUT), Err(IpcError::Transport(_))));
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "a closed channel blocked a wait"
+        );
+        assert_eq!(
+            channel.try_recv::<WorkerResponse>().unwrap(),
+            Some(response_of(1, 5))
+        );
+    }
+
+    /// Restricts `channel`'s socket send buffer so that a large frame spans
+    /// several writes.
+    fn restrict_send_buffer(channel: &Channel) {
         let capacity: libc::c_int = 4096;
-        // Restrict the real socket send buffer so this workload must span writes.
         assert_eq!(
             unsafe {
                 libc::setsockopt(
@@ -886,6 +1143,73 @@ mod tests {
             },
             0
         );
+    }
+
+    /// A message queued behind a large, partly written one reaches the peer
+    /// when the owner flushes before it closes the connection.
+    #[test]
+    fn a_flush_delivers_queued_messages_before_a_close() {
+        let size = 1 << 20;
+        let (mut channel, mut peer) = with_raw_peer(2 * size, 4);
+        restrict_send_buffer(&channel);
+        let large = response_of(1, size);
+        let last = response_of(2, 4);
+        channel.send(&large).unwrap();
+        channel.send(&last).unwrap();
+
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        channel.flush(TIMEOUT).unwrap();
+        drop(channel);
+
+        let mut expected = frame_of(&large);
+        expected.extend(frame_of(&last));
+        assert!(
+            reader.join().unwrap() == expected,
+            "the peer missed a message"
+        );
+    }
+
+    #[test]
+    fn a_flush_fails_at_its_deadline_when_the_peer_does_not_read() {
+        let size = 4 << 20;
+        let (mut channel, _peer) = with_raw_peer(2 * size, 4);
+        restrict_send_buffer(&channel);
+        channel.send(&response_of(1, size)).unwrap();
+        assert!(channel.flush(Duration::from_millis(100)).is_err());
+    }
+
+    /// A hangup observer sees the peer's close without the channel being
+    /// called, and unread data from the peer does not hide or fake it.
+    #[test]
+    fn a_hangup_reports_the_peers_close_and_nothing_else() {
+        for address in ["tcp", "unix"] {
+            let directory = tempfile::tempdir().unwrap();
+            let address = match address {
+                "unix" => format!("unix:{}", directory.path().join("channel.sock").display()),
+                _ => "127.0.0.1:0".to_owned(),
+            };
+            let listener = Listener::bind(&[&address]).unwrap();
+            let channel = Channel::connect(&listener.addresses()[0], TIMEOUT).unwrap();
+            let mut peer = listener.accept(TIMEOUT).unwrap().expect("a connection");
+            let hangup = channel.hangup().unwrap();
+
+            peer.send(&WorkerRequest::info()).unwrap();
+            assert!(!hangup.wait(Duration::from_millis(100)).unwrap());
+
+            drop(peer);
+            assert!(hangup.wait(TIMEOUT).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_stalled_peer_applies_backpressure_and_partial_writes_resume() {
+        let size = 1 << 20;
+        let (mut channel, mut peer) = with_raw_peer(2 * size, 1);
+        restrict_send_buffer(&channel);
         // With depth 1, the partially written first frame fills the queue.
         let first = response_of(1, size);
         channel.send(&first).unwrap();

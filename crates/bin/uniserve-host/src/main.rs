@@ -126,9 +126,14 @@ fn supervise(
         let instruction = match head.try_recv::<Instruction>() {
             Ok(Some(instruction)) => instruction,
             Ok(None) => {
-                head.wait(EXIT_POLL_INTERVAL)
-                    .context("waiting for an instruction from the head")?;
-                continue;
+                // A close observed by the wait is reported by the receive
+                // that follows, which is where the launcher acts on it.
+                match head.wait(EXIT_POLL_INTERVAL) {
+                    Ok(()) | Err(IpcError::Transport(_)) => continue,
+                    Err(error) => {
+                        return Err(error).context("waiting for an instruction from the head");
+                    }
+                }
             }
             Err(IpcError::Transport(reason)) => {
                 tracing::info!(%reason, "head connection closed; terminating this host's ranks");

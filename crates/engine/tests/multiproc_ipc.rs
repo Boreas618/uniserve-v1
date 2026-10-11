@@ -419,6 +419,56 @@ fn a_starting_rank_stops_on_interrupt_and_dies_of_termination() -> anyhow::Resul
     Ok(())
 }
 
+/// The head's connection is a rank's liveness in every state. A rank that is
+/// still starting, here one waiting in its group's rendezvous for a peer that
+/// never answers, exits when the head closes the connection, and so does a
+/// rank that is serving.
+#[test]
+fn a_rank_exits_when_its_head_closes_the_connection() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let address = |name: &str| format!("unix:{}", directory.path().join(name).display());
+    let exits_with_failure = |mut child: std::process::Child| -> anyhow::Result<()> {
+        let status = wait_exit(&mut child, Duration::from_secs(30)).inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
+        anyhow::ensure!(
+            status.code() == Some(1),
+            "the rank ended with {status} after its head closed"
+        );
+        Ok(())
+    };
+
+    // Starting: rank 1 of a two-rank group whose rank 0 never starts.
+    let rendezvous = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let mut descriptor = stub_launch_descriptor();
+    descriptor.rank = 1;
+    descriptor.local_rank = 1;
+    descriptor.world_size = 2;
+    descriptor.acknowledgment_slot = 1;
+    descriptor.host_slots = vec![0, 1];
+    descriptor.components = WorkerConfig::single_component("model", 2);
+    descriptor.rendezvous_address = Some(rendezvous.local_addr()?.to_string());
+    let (head, child) = RawHead::launch(&address("starting.sock"), &descriptor, 1)?;
+    let (_peer, _) = rendezvous.accept()?;
+    drop(head);
+    exits_with_failure(child)?;
+
+    // Serving: a rank that has answered Info waits for its next request.
+    let (mut head, child) =
+        RawHead::launch(&address("serving.sock"), &stub_launch_descriptor(), 1)?;
+    let mut info = uniserve_ipc::WorkerRequest::info();
+    info.set_call_id(Some(1));
+    let info = head.send(&info)?;
+    let answered = head.response(info, Duration::from_secs(60))?;
+    anyhow::ensure!(
+        matches!(answered, Some(uniserve_ipc::WorkerResponse::Info { .. })),
+        "the rank did not become ready: {answered:?}"
+    );
+    drop(head);
+    exits_with_failure(child)
+}
+
 /// A two-rank group reports its launch in its Info, retires finished
 /// requests, refuses a repeated batch, and once closed reports nothing and
 /// refuses work.
