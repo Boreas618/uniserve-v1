@@ -771,16 +771,16 @@ impl ImageDiffusion {
 // of solver steps: the committed bank is gathered into the step workspace;
 // every step fills the slot's timestep, resolves the guidance branches it
 // evaluates (prefilling missing guidance prefixes through the text
-// runtime), predicts every branch of every image (one numerical call per
+// image), predicts every branch of every image (one numerical call per
 // image size) and integrates each image's predictions; the interval's
 // result is scattered into the other bank. Commits become visible when the
 // batch commits.
 
 /// The denoiser serving a batch, with its device and stream.
 pub(crate) fn image_placement(
-    runtime: &ImageParts<'_>,
+    image: &ImageParts<'_>,
 ) -> Result<(Option<i32>, Option<Stream>, usize)> {
-    let runner = runtime.diffusion().ok_or_else(|| {
+    let runner = image.diffusion().ok_or_else(|| {
         Error::Unsupported("image trajectories are served by an image denoiser".into())
     })?;
     let stream = runner.stream().cloned();
@@ -823,7 +823,7 @@ impl ImageBatch<'_> {
             })?;
         let params = self.latent_params(index)?;
         let layout = *self
-            .runtime
+            .parts
             .diffusion()
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?
             .layout();
@@ -883,7 +883,7 @@ impl ImageBatch<'_> {
         if !self.reports || !self.storage.transports.exports_remotely() {
             return Ok(());
         }
-        let (pool, storage) = self.runtime.latent_pool()?;
+        let (pool, storage) = self.parts.latent_pool()?;
         let buffer = latents::export(
             pool,
             storage,
@@ -904,7 +904,7 @@ impl ImageBatch<'_> {
 
     /// Open the batch's use of the latent pool and place its trajectories.
     fn place(&mut self, trajectories: &[Trajectory]) -> Result<Vec<Scratch>> {
-        let latents = self.runtime.latents()?;
+        let latents = self.parts.latents()?;
         latents.enter(self.stream.as_ref())?;
         self.latents_entered = true;
         let params: Vec<&LatentParams> = trajectories.iter().map(|value| &value.params).collect();
@@ -970,11 +970,11 @@ impl ImageBatch<'_> {
         let stream = self.stream.clone();
         for ((trajectory, image, rng), scratch) in trajectories.iter().zip(&scratch) {
             let call = &self.plan.calls[trajectory.index];
-            let diffusion = self.runtime.diffusion().ok_or_else(|| {
+            let diffusion = self.parts.diffusion().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
             })?;
             let plan = diffusion.plan(image)?;
-            let latents = self.runtime.latents()?;
+            let latents = self.parts.latents()?;
             let page_units = latents.pool.page_units();
             latents
                 .pool
@@ -992,7 +992,7 @@ impl ImageBatch<'_> {
             )?;
             latents.scatter(1, scratch, stream.as_ref())?;
             self.publish_latent(trajectory.index, 1, 0, &trajectory.params, stream.as_ref())?;
-            self.runtime.trajectories.open(
+            self.parts.trajectories.open(
                 trajectory.slot,
                 ImageTrajectory::new(
                     call.request_key,
@@ -1037,7 +1037,7 @@ impl ImageBatch<'_> {
             .map(|row| row.slot)
             .chain(active.iter().map(|&index| self.calls[index].slot as u32))
             .collect();
-        let units = self.runtime.denoisers.units.as_ref();
+        let units = self.parts.denoisers.units.as_ref();
         let kv =
             self.storage.kv.as_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a KV cache".into())
@@ -1153,20 +1153,20 @@ impl ImageBatch<'_> {
             let size = (params.height, params.width);
             let key = call.request_key;
             let reopen = self
-                .runtime
+                .parts
                 .trajectories
                 .get(trajectory.slot, key)
                 .is_none_or(|open| open.size != size);
             if reopen {
-                let diffusion = self.runtime.diffusion().ok_or_else(|| {
+                let diffusion = self.parts.diffusion().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a denoiser".into())
                 })?;
                 let guidance = diffusion.plan(&image)?;
-                self.runtime
+                self.parts
                     .trajectories
                     .open(trajectory.slot, ImageTrajectory::new(key, size, guidance));
             }
-            if let Some(open) = self.runtime.trajectories.get(trajectory.slot, key) {
+            if let Some(open) = self.parts.trajectories.get(trajectory.slot, key) {
                 open.begin_call(conditioning);
             }
             trajectories.push((trajectory, image));
@@ -1186,7 +1186,7 @@ impl ImageBatch<'_> {
 
         // Gather each committed version into the step workspace.
         {
-            let latents = self.runtime.latents()?;
+            let latents = self.parts.latents()?;
             for ((trajectory, _), scratch) in trajectories.iter().zip(&scratch) {
                 let call = &plan.calls[trajectory.index];
                 let params = &trajectory.params;
@@ -1208,7 +1208,7 @@ impl ImageBatch<'_> {
         }
 
         let layout = *self
-            .runtime
+            .parts
             .diffusion()
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?
             .layout();
@@ -1236,7 +1236,7 @@ impl ImageBatch<'_> {
                     .get(&trajectory.index)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                let policy = self.runtime.policy.clone();
+                let policy = self.parts.policy.clone();
                 let kv = self.storage.kv.as_ref().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a KV cache".into())
                 })?;
@@ -1250,7 +1250,7 @@ impl ImageBatch<'_> {
                     .map(|ar| ar.negative_token_ids.clone())
                     .unwrap_or_default();
                 let open = self
-                    .runtime
+                    .parts
                     .trajectories
                     .get(trajectory.slot, key)
                     .ok_or_else(|| Error::Invariant("an image trajectory closed".into()))?;
@@ -1270,7 +1270,7 @@ impl ImageBatch<'_> {
                         .into_iter()
                         .map(|fill| (position, fill.slot, fill.tokens)),
                 );
-                self.runtime.latents()?.fill_timestep(
+                self.parts.latents()?.fill_timestep(
                     trajectory.slot as u32,
                     time,
                     stream.as_ref(),
@@ -1282,7 +1282,7 @@ impl ImageBatch<'_> {
             // them.
             if !fills.is_empty() {
                 let text = text.as_deref_mut().ok_or_else(|| {
-                    Error::Unsupported("guidance prefixes require the text runtime".into())
+                    Error::Unsupported("guidance prefixes require the text image".into())
                 })?;
                 let kv = self.storage.kv.as_mut().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a KV cache".into())
@@ -1297,7 +1297,7 @@ impl ImageBatch<'_> {
                 for (position, slot, tokens) in &fills {
                     let (trajectory, _) = &trajectories[*position];
                     let key = plan.calls[trajectory.index].request_key;
-                    if let Some(open) = self.runtime.trajectories.get(trajectory.slot, key) {
+                    if let Some(open) = self.parts.trajectories.get(trajectory.slot, key) {
                         open.prefilled(*slot, tokens.len() as u64);
                     }
                 }
@@ -1314,7 +1314,7 @@ impl ImageBatch<'_> {
                     .progress
                     .logical_position;
                 let open = self
-                    .runtime
+                    .parts
                     .trajectories
                     .get(trajectory.slot, key)
                     .ok_or_else(|| Error::Invariant("an image trajectory closed".into()))?;
@@ -1348,7 +1348,7 @@ impl ImageBatch<'_> {
                 let kv = self.storage.kv.as_ref().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a KV cache".into())
                 })?;
-                let diffusion = self.runtime.diffusion_mut().ok_or_else(|| {
+                let diffusion = self.parts.diffusion_mut().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a denoiser".into())
                 })?;
                 let predicted = diffusion.predict(rows, kv.tables(), |_, _, _| Ok(()))?;
@@ -1366,7 +1366,7 @@ impl ImageBatch<'_> {
                         .ok_or_else(|| Error::Invariant("a stepping image lost its step".into()))?;
                     let key = plan.calls[trajectory.index].request_key;
                     let open = self
-                        .runtime
+                        .parts
                         .trajectories
                         .get(trajectory.slot, key)
                         .ok_or_else(|| Error::Invariant("an image trajectory closed".into()))?;
@@ -1380,7 +1380,7 @@ impl ImageBatch<'_> {
                         plan: open.plan.handle.clone(),
                     });
                 }
-                self.runtime
+                self.parts
                     .diffusion()
                     .ok_or_else(|| {
                         Error::Unsupported("image trajectories require a denoiser".into())
@@ -1394,7 +1394,7 @@ impl ImageBatch<'_> {
                 if offset + 1 != trajectory.params.step_count {
                     continue;
                 }
-                let latents = self.runtime.latents()?;
+                let latents = self.parts.latents()?;
                 let bank = latents.pool.next_bank(trajectory.slot);
                 latents.pool.require_writable(bank, &scratch.pages)?;
                 latents.scatter(bank, scratch, stream.as_ref())?;

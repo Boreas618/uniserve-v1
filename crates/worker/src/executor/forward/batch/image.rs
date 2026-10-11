@@ -104,7 +104,7 @@ pub(crate) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocatio
 
 /// An image batch's borrowed owners and the resources it reserved.
 pub(crate) struct ImageBatch<'a> {
-    pub(crate) runtime: ImageParts<'a>,
+    pub(crate) parts: ImageParts<'a>,
     pub(crate) storage: &'a mut RankStorage,
     pub(crate) requests: &'a mut RequestPool,
     pub(crate) plan: &'a BatchPlan,
@@ -142,7 +142,7 @@ impl<'a> ImageBatch<'a> {
     /// words the batch reads back beside one completion word per call.
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(crate) fn open(
-        runtime: ImageParts<'a>,
+        parts: ImageParts<'a>,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
         info: &uniserve_ipc::WorkerInfo,
@@ -193,7 +193,7 @@ impl<'a> ImageBatch<'a> {
             }
         }
         let devices: Vec<i32> = device.into_iter().collect();
-        let buffer = runtime.outputs.lease(
+        let buffer = parts.outputs.lease(
             plan.calls.len(),
             (plan.calls.len() + words).max(1),
             &devices,
@@ -203,7 +203,7 @@ impl<'a> ImageBatch<'a> {
             lock(&buffer).begin_device(device, stream, &storage.events)?;
         }
         Ok(Self {
-            runtime,
+            parts,
             storage,
             requests,
             plan,
@@ -313,7 +313,7 @@ impl<'a> ImageBatch<'a> {
             .map(|(_, update)| update.clone())
             .collect();
         if !updates.is_empty() {
-            self.runtime.latents()?.pool.validate_updates(&updates)?;
+            self.parts.latents()?.pool.validate_updates(&updates)?;
         }
         self.publications.validate(&self.storage.tensors)?;
         self.leave_latents()?;
@@ -337,7 +337,7 @@ impl<'a> ImageBatch<'a> {
         self.storage.tensors.commit_writes(&writes).map_err(fatal)?;
         if !updates.is_empty() {
             let cancelled = self
-                .runtime
+                .parts
                 .latents_mut()
                 .map_err(fatal)?
                 .pool
@@ -368,7 +368,7 @@ impl<'a> ImageBatch<'a> {
     /// End the batch's use of the latent pool on its stream.
     fn leave_latents(&mut self) -> Result<()> {
         if std::mem::take(&mut self.latents_entered) {
-            self.runtime.latents_mut()?.leave(self.stream.as_ref())?;
+            self.parts.latents_mut()?.leave(self.stream.as_ref())?;
         }
         Ok(())
     }
@@ -380,7 +380,7 @@ impl<'a> ImageBatch<'a> {
         let revoked = self.publications.revoke();
         let exported = std::mem::take(&mut self.latent_exports);
         if !exported.is_empty()
-            && let Ok(latents) = self.runtime.latents()
+            && let Ok(latents) = self.parts.latents()
         {
             // The versions retire once their transports drop them.
             latents.pool.release_exports(&exported);
@@ -546,18 +546,18 @@ fn run(
         experts,
         ..
     } = parts;
-    let (Some(runtime), Some(storage)) = (image, storage) else {
+    let (Some(image), Some(storage)) = (image, storage) else {
         return Ok(None);
     };
     let (device, stream, words) = match kind {
         CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-            crate::runner::encoder::image_placement(&runtime, plan)?
+            crate::runner::encoder::image_placement(&image, plan)?
         }
         CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
-            crate::runner::denoiser::image::image_placement(&runtime)?
+            crate::runner::denoiser::image::image_placement(&image)?
         }
         CallKind::Media(MediaCall::ImageDecoding) => {
-            crate::runner::decoder::image_placement(&runtime, plan)?
+            crate::runner::decoder::image_placement(&image, plan)?
         }
         _ => {
             return Err(Error::Unsupported(format!(
@@ -568,7 +568,7 @@ fn run(
         }
     };
     let mut batch = ImageBatch::open(
-        runtime, storage, requests, info, rank, plan, device, stream, words, started,
+        image, storage, requests, info, rank, plan, device, stream, words, started,
     )?;
     let result = (|| -> std::result::Result<ForwardStats, Failure> {
         batch.bind_flags()?;

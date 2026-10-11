@@ -1987,14 +1987,14 @@ pub(crate) fn tower(call: MediaCall) -> Result<Tower> {
 
 /// The encoder serving a batch, with its device and stream.
 pub(crate) fn image_placement(
-    runtime: &ImageParts<'_>,
+    image: &ImageParts<'_>,
     plan: &BatchPlan,
 ) -> Result<(Option<i32>, Option<Stream>, usize)> {
     let first = plan
         .calls
         .first()
         .ok_or_else(|| Error::Invariant("an image batch has calls".into()))?;
-    let runner = &runtime.encoders.image[runtime.encoders.route(&first.component, first.code)?];
+    let runner = &image.encoders.image[image.encoders.route(&first.component, first.code)?];
     let stream = runner.stream().cloned();
     Ok((runner.device().cuda_index(), stream, 0))
 }
@@ -2014,7 +2014,7 @@ impl ImageBatch<'_> {
             return Ok(ForwardStats::default());
         };
         let route = self
-            .runtime
+            .parts
             .encoders
             .route(&plan.calls[first].component, CallKind::Media(call))?;
         let target = self.target();
@@ -2051,7 +2051,7 @@ impl ImageBatch<'_> {
                             ));
                         }
                     };
-                    let runner = &self.runtime.encoders.image[route];
+                    let runner = &self.parts.encoders.image[route];
                     let region = Region::within(runner.products()?, read.value());
                     self.reads.push(read);
                     runner.prepare_resident(&region?, tower, range == ValueRange::SignedUnit)?
@@ -2078,7 +2078,7 @@ impl ImageBatch<'_> {
             OutputPlacement::default(),
         )?;
         self.writes.extend(writes.iter().cloned());
-        let runner = &mut self.runtime.encoders.image[route];
+        let runner = &mut self.parts.encoders.image[route];
         let regions = writes
             .iter()
             .map(|write| Region::within(runner.products()?, &write.view()))

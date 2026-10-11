@@ -1,11 +1,12 @@
-//! Numerical execution of a batch's calls, by capability runtime.
+//! Numerical execution of a batch's calls, by capability.
 //!
 //! Every batch carries calls of one kind on one component. [`execute`]
-//! routes it to the runtime that serves the kind: text (`runner::causal_lm`), canvas,
-//! image, video, host media (`media`), transfers (`transfer`); expert-only
-//! ranks participate in expert steps through `experts`. These modules are
-//! the integration seam of the capability runtimes: each owns its runners,
-//! its own input preparation and result materialization. Inputs imported
+//! routes it to what serves the kind: text (`runner::causal_lm`), canvas,
+//! image batches (`batch::image`), a video model's media batches (`batch`),
+//! host media (`media`), transfers (`transfer`); expert-only ranks
+//! participate in expert steps through `experts`. These modules are the
+//! integration seam of the capabilities: each owns its runners, its own
+//! input preparation and result materialization. Inputs imported
 //! from other ranks and workers are prepared for every runtime alike
 //! (`inputs`), and products are published to them alike (`products`). A
 //! runtime that has not been integrated reports its call kind as
