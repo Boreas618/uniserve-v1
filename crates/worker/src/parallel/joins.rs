@@ -13,8 +13,11 @@ use std::collections::BTreeMap;
 use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 
+use super::expert_union::ExpertUnion;
+use super::microbatches::{MicrobatchCall, turn};
 use crate::cuda_graph::CUDAGraph;
-use crate::ffi::{Function, Handle};
+use crate::ffi::{DeferredCall, Function, Handle};
+use crate::profiling::range;
 use crate::{Error, Result};
 
 /// The shared graph interface (`uniserve_models.interface.graphs`).
@@ -155,5 +158,150 @@ impl JoinGraphs {
             }
         }
         failure.map_or(Ok(()), Err)
+    }
+}
+
+impl ExpertUnion {
+    /// Whether every microbatch has its prepared join.
+    pub(crate) fn has_joins(&self) -> bool {
+        self.microbatches.iter().all(|peer| peer.prepared.is_some())
+    }
+
+    /// Whether captured joins have their graph pools.
+    pub(crate) fn has_pools(&self) -> bool {
+        !self.pools.is_empty()
+    }
+
+    /// Use `pools`, one per microbatch, for captured joins.
+    pub(crate) fn set_pools(&mut self, pools: Vec<Handle>) {
+        self.pools = pools;
+    }
+
+    /// Whether this rank's forwards may replay their captured graphs.
+    ///
+    /// A replayed forward submits its whole step in one launch, without
+    /// passing the host turn, and its thread then waits in the driver for
+    /// that stream to finish before it can launch more: the driver holds
+    /// about a thousand unfinished launches per stream and blocks the next
+    /// one. A rank that joins eagerly submits its microbatches in rotation
+    /// behind kernels that wait for this rank's other microbatches, reaches
+    /// the same limit and keeps its own turn. Neither rank then submits what
+    /// the other waits for. A replayed join submits each microbatch whole
+    /// and waits on no host turn, so forwards replay only once the union's
+    /// joins are captured; until then they run eagerly, in the same rotation
+    /// as every rank's joins. Without microbatch threads no turn is held.
+    pub(crate) fn replays(&self) -> bool {
+        self.lanes.is_none() || self.joins.is_some()
+    }
+
+    /// Join one step of `capacity` with every microbatch: replay the
+    /// captured joins, or join eagerly before they exist.
+    pub(crate) fn join(&self, capacity: usize) -> Result<()> {
+        let _range = range(c"uniserve.expert.join", None);
+        if let (Some(joins), Some(_)) = (&self.joins, &self.graphs) {
+            return joins.launch(capacity, &self.microbatches[0].stream);
+        }
+        self.join_eager(capacity)
+    }
+
+    /// Join one step of `capacity` eagerly with every microbatch, in
+    /// rotation.
+    pub(crate) fn join_eager(&self, capacity: usize) -> Result<()> {
+        match &self.lanes {
+            Some(lanes) => {
+                let calls = (0..self.microbatches.len())
+                    .map(|peer| self.eager_join(peer, capacity).map(turn))
+                    .collect::<Result<Vec<_>>>()?;
+                lanes
+                    .run(&self.microbatches[0].stream, &self.streams(), calls)
+                    .map(drop)
+            }
+            None => self.eager_join(0, capacity)?(),
+        }
+    }
+
+    /// The join of microbatch `peer` within a populated step: its captured
+    /// graph, or its eager join before capture.
+    pub(super) fn peer_join(&self, peer: usize, capacity: usize) -> Result<MicrobatchCall<()>> {
+        let state = &self.microbatches[peer];
+        if let Some(joins) = &state.graphs {
+            let graph = joins.graph(capacity)?.clone();
+            let stream = state.stream.clone();
+            return Ok(Box::new(move || graph.launch(&stream)));
+        }
+        let join = self.eager_join(peer, capacity)?;
+        Ok(if self.lanes.is_some() {
+            turn(join)
+        } else {
+            join
+        })
+    }
+
+    /// The eager join of microbatch `peer`: the library's `join` over its
+    /// prepared component.
+    fn eager_join(&self, peer: usize, capacity: usize) -> Result<MicrobatchCall<()>> {
+        let prepared = self.microbatches[peer]
+            .prepared
+            .as_ref()
+            .ok_or(Error::State("an expert microbatch has no prepared join"))?;
+        let call = DeferredCall::new(
+            self.functions.join.clone(),
+            vec![prepared.to_any(), Any::from(capacity as i64)],
+        );
+        Ok(Box::new(move || call.invoke()))
+    }
+
+    /// Capture the joins every rank replays outside its own steps: one
+    /// graph per capacity of every microbatch's join on the first stream,
+    /// warmed eagerly first (a collective step on every rank). Source ranks
+    /// with microbatches also capture each microbatch's join alone in its
+    /// own pool, which an empty microbatch of a populated step replays.
+    pub(crate) fn capture_joins(&mut self) -> Result<()> {
+        let Some(graphs) = self.graphs.clone() else {
+            return Ok(());
+        };
+        let pools = self.pools.clone();
+        if pools.len() != self.microbatches.len() {
+            return Err(Error::Invariant(
+                "expert joins need one graph pool per microbatch".into(),
+            ));
+        }
+        let capacities = self.parallel().capacities().to_vec();
+        let primary = JoinGraphs::capture(
+            &capacities,
+            true,
+            &pools[0],
+            self.microbatches[0].stream.raw(),
+            self.device,
+            &|capacity| self.join_eager(capacity),
+            &graphs,
+        )?;
+        self.joins = Some(primary);
+        if self.microbatches.len() > 1 && !self.dedicated {
+            for (peer, pool) in pools.iter().enumerate() {
+                let captured = JoinGraphs::capture(
+                    &capacities,
+                    false,
+                    pool,
+                    self.microbatches[peer].stream.raw(),
+                    self.device,
+                    &|capacity| self.eager_join(peer, capacity)?(),
+                    &graphs,
+                )?;
+                self.microbatches[peer].graphs = Some(captured);
+            }
+        }
+        let captured: usize = self.joins.iter().map(JoinGraphs::len).sum::<usize>()
+            + self
+                .microbatches
+                .iter()
+                .filter_map(|peer| peer.graphs.as_ref())
+                .map(JoinGraphs::len)
+                .sum::<usize>();
+        tracing::info!(
+            target: "uniserve_worker.warmup",
+            "captured {captured} expert join graphs for capacities {capacities:?}"
+        );
+        Ok(())
     }
 }

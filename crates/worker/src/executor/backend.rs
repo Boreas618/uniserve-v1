@@ -57,9 +57,9 @@ pub struct WorkerBackend {
     /// The runner of each diffusion LM component placed on the rank.
     diffusion_lm: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
     /// The expert-parallel runtime, on ranks of an expert union.
-    experts: Option<forward::experts::ExpertRuntime>,
+    experts: Option<crate::parallel::ExpertUnion>,
     /// Distributed expert weights, on ranks that prefetch them.
-    weights: Option<forward::experts::WeightRuntime>,
+    weights: Option<crate::parallel::DwdpManager>,
     /// The transfer runtime: tensor transfers, KV exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<forward::transfer::TransferRuntime>,
@@ -84,7 +84,7 @@ pub(crate) struct Parts<'a> {
     pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
     pub image: Option<&'a mut forward::image::ImageRuntime>,
     pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
-    pub experts: Option<&'a forward::experts::ExpertRuntime>,
+    pub experts: Option<&'a crate::parallel::ExpertUnion>,
     pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
 }
 
@@ -354,20 +354,20 @@ impl WorkerBackend {
     }
 
     /// Install the expert-parallel runtime.
-    pub(crate) fn set_experts(&mut self, experts: forward::experts::ExpertRuntime) {
+    pub(crate) fn set_experts(&mut self, experts: crate::parallel::ExpertUnion) {
         self.experts = Some(experts);
     }
 
     /// Install the distributed expert weights.
-    pub(crate) fn set_weights(&mut self, weights: forward::experts::WeightRuntime) {
+    pub(crate) fn set_weights(&mut self, weights: crate::parallel::DwdpManager) {
         self.weights = Some(weights);
     }
 
-    pub(crate) fn experts(&self) -> Option<&forward::experts::ExpertRuntime> {
+    pub(crate) fn experts(&self) -> Option<&crate::parallel::ExpertUnion> {
         self.experts.as_ref()
     }
 
-    pub(crate) fn experts_mut(&mut self) -> Option<&mut forward::experts::ExpertRuntime> {
+    pub(crate) fn experts_mut(&mut self) -> Option<&mut crate::parallel::ExpertUnion> {
         self.experts.as_mut()
     }
 
@@ -1028,7 +1028,7 @@ impl ServiceBackend for WorkerBackend {
     fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
         // A join launches on the lane the union's forwards run on.
         self.jobs.run(CallKind::Forward(ForwardMode::Decode), || {
-            forward::experts::join_step(self, leaving)
+            crate::parallel::join_step(self, leaving)
         })
     }
 }
