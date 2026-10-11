@@ -1,106 +1,82 @@
-//! The canvas runtime: System One readouts and block-diffusion canvas steps.
+//! One batch of the diffusion LM runner: readouts or denoising steps.
 //!
-//! A token-denoising batch runs in four stages on the executor thread:
+//! A batch runs in four stages on its lane's execution thread:
 //!
 //! 1. **Reservation.** Bind every call's pending output and the batch's
-//!    output lease; install its block tables and retain the KV prefixes it
-//!    reads until its device work retires; bind the completion flags of its
-//!    canvas steps. A readout whose host predicate is false is skipped
-//!    (`Predicated`). A canvas step's predicate is never read: whether its
-//!    block continues is decided on the device from its slot's resident
-//!    continuation flag, so a step queued behind the one that stopped its
-//!    block runs as a no-op and reports itself skipped.
-//! 2. **Invocation.** Validate the calls into one readout pass or one list
-//!    of step rows (a batch carries one form) and run it on the component's
-//!    runner. A step advances its request's submitted canvas coordinates.
-//! 3. **Capture and commit.** Copy candidate values or step results into
+//!    output lease; install its block tables and retain the prefix cache
+//!    spans it reads until its device work retires; bind the completion
+//!    flags of its denoising steps. A readout whose host predicate is false
+//!    is skipped (`Predicated`). A denoising step's predicate is never
+//!    read: whether its block continues is decided on the device from its
+//!    slot's resident continuation flag, so a step queued behind the one
+//!    that stopped its block runs as a no-op and reports itself skipped.
+//! 2. **Forward.** Validate the calls into one readout or one list of
+//!    denoising rows (a batch carries one form) and run it. A step advances
+//!    its request's submitted block and step.
+//! 3. **Outputs and commit.** Copy candidate values or step results into
 //!    the output lease, publish the steps' completion flags, then commit
 //!    products and pending calls together. A failure before the commit
 //!    point retires everything the batch reserved and reports every call as
 //!    failed; a failure after it is fatal.
-//! 4. **Materialization** ([`super::launch::materialize`]). Once the
-//!    lease's device fences complete, decode each call's result and accept
-//!    its progress. Canvas calls write no KV: each keeps its visible length.
-
-mod calls;
-pub(crate) mod start;
-pub(crate) mod warmup;
+//! 4. **Completion** ([`crate::executor::forward::launch::materialize`]).
+//!    Once the lease's device fences complete, decode each call's result
+//!    and accept its progress. These calls write no prefix cache: each
+//!    keeps its visible length.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use uniserve_core::CanvasSampling;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferId, CallKind, CallStatus, DType, ForwardStats, RequestKey, TensorRef,
     WorkerInfo,
 };
 
-use super::super::backend::{WorkerBackend, WorkerBatch};
-use super::experts::ExpertRuntime;
-use super::launch::{
-    Launched, StreamOrder, error_code, failed_output, lock, read_flag, reports_output, seal,
-};
+use super::calls::{self, DenoiseRow, ReadoutPass, Readouts};
+use super::{DiffusionLMRunner, Executed, KIND};
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
+use crate::executor::backend::{WorkerBackend, WorkerBatch};
+use crate::executor::forward::launch::{
+    Launched, StreamOrder, error_code, failed_output, lock, read_flag, reports_output, seal,
+};
 use crate::executor::lifecycle::RequestStorage;
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
+use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
-use crate::runner::canvas::{CanvasRunner, ReadoutPass, StepRow};
-use crate::storage::{
-    KVCache, OutputLease, OutputPlacement, OutputPool, ProductBuffer, TensorStore,
-};
+use crate::storage::{KVCache, OutputLease, OutputPlacement, ProductBuffer, TensorStore};
 use crate::stream::EventPool;
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
-use calls::Readouts;
-pub(crate) use start::{CANVAS_KIND, Startup, reserved_bytes};
-
-/// The canvas runtime of a rank: one runner per lane binding, the resident
-/// banks they share and their output storage.
-pub(crate) struct CanvasRuntime {
-    runners: Vec<CanvasRunner>,
-    /// The NCCL communicators of the runners' bindings, destroyed after
-    /// their graphs.
-    collectives: Vec<crate::parallel::StreamCollectives>,
-    routes: HashMap<String, usize>,
-    /// The block-diffusion sampling a generating rank serves.
-    sampling: Option<CanvasSampling>,
-    outputs: OutputPool,
-    /// Orders the banks across runner streams: a step's gather follows the
-    /// previous batch's commits on any other stream.
-    order: StreamOrder,
-}
-
-/// What a canvas batch borrows from the rank.
-pub(crate) struct Context<'a> {
+/// What a batch borrows from the rank.
+struct Context<'a> {
     pub(crate) info: &'a WorkerInfo,
     pub(crate) rank: usize,
     pub(crate) requests: &'a mut RequestPool,
     pub(crate) kv: &'a mut KVCache,
     pub(crate) tensors: &'a TensorStore,
     pub(crate) events: &'a Arc<EventPool>,
-    /// The text runtime's batch order: canvases read the KV its prefills
-    /// write, possibly on another stream.
+    /// The text runtime's batch order: these forwards read the prefix
+    /// cache its prefills write, possibly on another stream.
     pub(crate) text: Option<&'a StreamOrder>,
-    /// The rank's expert runtime, when canvas invocations are expert steps.
-    pub(crate) experts: Option<&'a ExpertRuntime>,
+    /// The rank's expert union member, when forwards are expert steps.
+    pub(crate) experts: Option<&'a ExpertUnion>,
 }
 
-/// The expert call kind of canvas runner `index`: distinct from the text
-/// runtime's kinds, so the union's ready kinds take turns.
-pub(crate) fn expert_kind(index: usize) -> i64 {
+/// The expert call kind of diffusion LM runner `index`: distinct from the
+/// text runtime's kinds, so the union's ready kinds take turns.
+fn expert_kind(index: usize) -> i64 {
     64 + index as i64
 }
 
-/// The coordinator of canvas runner `index`'s expert steps: agreement while
+/// The coordinator of runner `index`'s expert steps: agreement while
 /// serving, announced or `forced` capacities during warmup.
-pub(crate) fn coordinator<'a>(
-    experts: Option<&'a ExpertRuntime>,
+pub(super) fn coordinator<'a>(
+    experts: Option<&'a ExpertUnion>,
     index: usize,
     forced: Option<usize>,
 ) -> impl FnMut(usize) -> Result<Option<usize>> + 'a {
@@ -113,10 +89,10 @@ pub(crate) fn coordinator<'a>(
 
 /// A failure, the batch phase it happened in and whether the batch had
 /// passed its commit point.
-pub(crate) struct Failure {
-    pub(crate) error: Error,
-    pub(crate) phase: &'static str,
-    pub(crate) committed: bool,
+struct Failure {
+    error: Error,
+    phase: &'static str,
+    committed: bool,
 }
 
 impl Failure {
@@ -152,58 +128,9 @@ struct Reserved {
     retirement: Arc<Retirement>,
 }
 
-impl CanvasRuntime {
-    /// The warmup and capture plan every source of an expert union must
-    /// share: each runner's readout and step buckets.
-    pub(crate) fn capture_plan(&self) -> serde_json::Value {
-        serde_json::Value::Array(
-            self.runners
-                .iter()
-                .map(|runner| {
-                    let shapes = runner.shapes();
-                    serde_json::json!({
-                        "rows": shapes.rows(),
-                        "lengths": shapes.lengths(),
-                        "steps": runner.sampling().is_some(),
-                    })
-                })
-                .collect(),
-        )
-    }
-
-    /// Seal every runner's graphs.
-    pub(crate) fn seal(&mut self) {
-        for runner in &mut self.runners {
-            runner.seal();
-        }
-    }
-
-    /// Release graphs and output storage after the lanes drained.
-    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
-        let mut result = Ok(());
-        for runner in &mut self.runners {
-            result = result.and(runner.close(aborted));
-        }
-        for collectives in &mut self.collectives {
-            result = result.and(collectives.close(aborted));
-        }
-        self.outputs.begin_close();
-        if !aborted {
-            self.outputs.finish_close();
-        }
-        result
-    }
-
-    /// Kernel records of every runner's binding, by owner.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<crate::ffi::Record>)>> {
-        self.runners
-            .iter()
-            .map(|runner| Ok((runner.owner().to_owned(), runner.model().kernels()?)))
-            .collect()
-    }
-
-    /// Launch a token-denoising batch.
-    pub(crate) fn launch(
+impl DiffusionLMRunner {
+    /// Run one batch of diffusion LM calls up to its commit point.
+    fn forward(
         &mut self,
         context: Context<'_>,
         plan: &BatchPlan,
@@ -221,27 +148,19 @@ impl CanvasRuntime {
             experts,
         } = context;
         let calls = &plan.calls;
-        let first = calls
-            .first()
-            .ok_or_else(|| reserve(Error::Invariant("a canvas batch has calls".into())))?;
         if calls
             .iter()
-            .any(|call| call.code != CANVAS_KIND || call.component != first.component)
+            .any(|call| call.code != KIND || call.component != self.component)
         {
-            return Err(reserve(Error::Invalid(
-                "a canvas batch carries token-denoising calls of one component".into(),
-            )));
+            return Err(reserve(Error::Invalid(format!(
+                "a diffusion LM batch carries token-denoising calls of component {:?}",
+                self.component
+            ))));
         }
-        let index = *self.routes.get(&first.component).ok_or_else(|| {
-            reserve(Error::Unsupported(format!(
-                "component {:?} has no canvas binding",
-                first.component
-            )))
-        })?;
-        let device = self.runners[index].buffers().device();
-        let stream = self.runners[index].stream().cloned();
+        let device = self.buffers.device();
+        let stream = self.stream.clone();
         let stream = stream.as_ref();
-        let reports = reports_output(info, rank, &first.component).map_err(&reserve)?;
+        let reports = reports_output(info, rank, &self.component).map_err(&reserve)?;
 
         // Output rows, bound to their requests' live epochs and slots.
         let bound = calls
@@ -266,7 +185,6 @@ impl CanvasRuntime {
 
         // Readouts gate on host predicates. A step's continuation stays on
         // the device: reading it here would serialize steps that can run.
-        self.order.wait(stream).map_err(&reserve)?;
         if let Some(text) = text {
             text.wait(stream).map_err(&reserve)?;
         }
@@ -281,9 +199,9 @@ impl CanvasRuntime {
             }
         }
 
-        // The output lease: a step's outcome and canvas, or a readout's
+        // The output lease: a step's outcome and block, or a readout's
         // candidate values, per call.
-        let length = self.runners[index].facts().canvas_length;
+        let length = self.facts.sequence_length;
         let words = calls.iter().fold(0usize, |total, call| {
             total.saturating_add(match &call.readout {
                 Some(readout) => readout.candidate_count().max(1),
@@ -306,8 +224,7 @@ impl CanvasRuntime {
             retirement: Arc::new(Retirement::default()),
         };
         let batch = Batch {
-            runtime: self,
-            index,
+            runner: self,
             experts,
             requests,
             kv,
@@ -357,9 +274,9 @@ impl CanvasRuntime {
     }
 }
 
-impl RequestStorage for CanvasRuntime {
+impl RequestStorage for DiffusionLMRunner {
     fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
-        // A request's first canvas step starts its canvas in the banks
+        // A request's first denoising step starts its block in the banks
         // before any step reads them; admission resets nothing.
         Ok(())
     }
@@ -395,11 +312,10 @@ impl RequestStorage for CanvasRuntime {
     }
 }
 
-/// One canvas batch on its runner.
+/// One batch on the runner.
 struct Batch<'a> {
-    runtime: &'a mut CanvasRuntime,
-    index: usize,
-    experts: Option<&'a ExpertRuntime>,
+    runner: &'a mut DiffusionLMRunner,
+    experts: Option<&'a ExpertUnion>,
     requests: &'a mut RequestPool,
     kv: &'a mut KVCache,
     tensors: &'a TensorStore,
@@ -431,7 +347,7 @@ impl Batch<'_> {
             .any(|allocation| slots.contains(&allocation.request_pool_idx))
         {
             return Err(reserve(Error::Invalid(
-                "canvas calls write no KV and receive no new units".into(),
+                "diffusion LM calls write no prefix cache and receive no new units".into(),
             )));
         }
         let assignments: Vec<_> = plan
@@ -469,7 +385,7 @@ impl Batch<'_> {
             );
         }
 
-        // Completion flags of canvas steps; canvas calls publish nothing
+        // Completion flags of denoising steps; these calls publish nothing
         // else.
         let requests: HashMap<RequestKey, usize> = calls
             .iter()
@@ -493,7 +409,7 @@ impl Batch<'_> {
             if let Some(flag) = &call.completion_output {
                 if flag.dtype != DType::U8 {
                     return Err(reserve(Error::Invalid(
-                        "a canvas step's completion flag is a uint8 scalar".into(),
+                        "a denoising step's completion flag is a uint8 scalar".into(),
                     )));
                 }
                 flags.push((flag.clone(), target));
@@ -544,7 +460,7 @@ impl Batch<'_> {
                 .any(|&row| calls[row].canvas.is_some() != steps)
             {
                 return Err(execute(Error::Invalid(
-                    "a canvas batch carries readouts or canvas steps, not both".into(),
+                    "a batch carries readouts or denoising steps, not both".into(),
                 )));
             }
             let rows = calls::rows_by_call(plan).map_err(&execute)?;
@@ -605,34 +521,36 @@ impl Batch<'_> {
         // is copied to the lease per call, so a call's words stay adjacent.
         let mut spans: Vec<Option<(usize, usize)>> = vec![None; active.len()];
         let (stream, events) = (self.stream, self.events);
-        let runner = &mut self.runtime.runners[self.index];
-        let mut coordinate = coordinator(self.experts, self.index, None);
-        let run = {
+        let mut coordinate = coordinator(self.experts, self.runner.index, None);
+        let executed = {
             let mut output = lock(buffer);
-            runner.readout(&pass, &mut coordinate, |range, values| {
-                for (call, candidates) in ranges.iter().enumerate() {
-                    let start = range.start.max(candidates.start);
-                    let end = range.end.min(candidates.end);
-                    if start >= end {
-                        continue;
-                    }
-                    // FP32 values read back as their 32-bit patterns.
-                    let source = values
-                        .narrow(0, (start - range.start) as i64, (end - start) as i64)?
-                        .reshape(crate::ffi::DType::U32, &[(end - start) as i64])?;
-                    let (offset, count) = output.capture(&source, stream, events)?;
-                    spans[call] = Some(match spans[call] {
-                        None => (offset, count),
-                        Some((first, total)) if first + total == offset => (first, total + count),
-                        Some(_) => {
-                            return Err(Error::Invariant(
-                                "a readout's candidate words are not adjacent".into(),
-                            ));
+            self.runner
+                .readout(&pass, &mut coordinate, |range, values| {
+                    for (call, candidates) in ranges.iter().enumerate() {
+                        let start = range.start.max(candidates.start);
+                        let end = range.end.min(candidates.end);
+                        if start >= end {
+                            continue;
                         }
-                    });
-                }
-                Ok(())
-            })
+                        // FP32 values read back as their 32-bit patterns.
+                        let source = values
+                            .narrow(0, (start - range.start) as i64, (end - start) as i64)?
+                            .reshape(crate::ffi::DType::U32, &[(end - start) as i64])?;
+                        let (offset, count) = output.capture(&source, stream, events)?;
+                        spans[call] = Some(match spans[call] {
+                            None => (offset, count),
+                            Some((first, total)) if first + total == offset => {
+                                (first, total + count)
+                            }
+                            Some(_) => {
+                                return Err(Error::Invariant(
+                                    "a readout's candidate words are not adjacent".into(),
+                                ));
+                            }
+                        });
+                    }
+                    Ok(())
+                })
         }
         .map_err(&execute)?;
         for ((&row, span), candidates) in active.iter().zip(spans).zip(&ranges) {
@@ -647,14 +565,10 @@ impl Batch<'_> {
             let visible = state.output.progress.kv_visible_len;
             state.output.set_cache_length(visible);
         }
-        Ok(Executed {
-            mode: run.mode,
-            tokens: run.tokens,
-            padded_tokens: run.padded_tokens,
-        })
+        Ok(executed)
     }
 
-    /// Step the active calls' canvases once and capture their results.
+    /// Step the active calls' blocks once and capture their results.
     fn steps(
         &mut self,
         states: &mut [CallState],
@@ -664,8 +578,9 @@ impl Batch<'_> {
     ) -> std::result::Result<Executed, Failure> {
         let execute = Failure::new("batch execution");
         let calls = &self.plan.calls;
-        let served = self.runtime.sampling.as_ref();
-        let mut steps: Vec<StepRow> = Vec::with_capacity(active.len());
+        let served = self.runner.sampling;
+        let length = self.runner.facts.sequence_length;
+        let mut steps: Vec<DenoiseRow> = Vec::with_capacity(active.len());
         let mut attention = Vec::with_capacity(active.len());
         for &row in active {
             let call = &calls[row];
@@ -680,7 +595,7 @@ impl Batch<'_> {
                 call,
                 &rows[row],
                 request.admission(),
-                served,
+                served.as_ref(),
                 progress.kv_visible_len,
                 progress.logical_position,
             )
@@ -691,7 +606,7 @@ impl Batch<'_> {
             attention.push(crate::storage::AttentionRow {
                 slot: step.slot,
                 prefix: step.prefix,
-                query: self.runtime.runners[self.index].facts().canvas_length as u32,
+                query: length as u32,
                 write: false,
             });
             steps.push(step);
@@ -701,15 +616,19 @@ impl Batch<'_> {
             .tables()
             .prepare_attention(&attention, |_, _, _| Ok(()))
             .map_err(&execute)?;
-        let runner = &mut self.runtime.runners[self.index];
-        let mut coordinate = coordinator(self.experts, self.index, None);
-        let run = runner
-            .step(&steps, &pages, &mut coordinate)
+        let mut coordinate = coordinator(self.experts, self.runner.index, None);
+        let executed = self
+            .runner
+            .denoise(&steps, &pages, &mut coordinate)
             .map_err(&execute)?;
-        let length = runner.facts().canvas_length;
 
-        // One copy of every row's `[outcome | canvas]` result.
-        let results = runner.step_results(steps.len()).map_err(&execute)?;
+        // One copy of every row's `[outcome | block]` result.
+        let results = self
+            .runner
+            .buffers
+            .column("denoise.results")
+            .and_then(|results| results.prefix(steps.len() as i64))
+            .map_err(&execute)?;
         let (offset, _) = lock(buffer)
             .capture(&results, self.stream, self.events)
             .map_err(&execute)?;
@@ -722,7 +641,11 @@ impl Batch<'_> {
         }
 
         // Publish each step's continuation flag, in runs of adjacent rows.
-        let continued = runner.buffers().view("step.continued").map_err(&execute)?;
+        let continued = self
+            .runner
+            .buffers
+            .column("denoise.continued")
+            .map_err(&execute)?;
         let mut start = 0;
         while start < active.len() {
             if states[active[start]].completion.is_none() {
@@ -748,11 +671,7 @@ impl Batch<'_> {
                 .map_err(&execute)?;
             start = end;
         }
-        Ok(Executed {
-            mode: run.mode,
-            tokens: run.rows * length,
-            padded_tokens: run.padded_rows * length,
-        })
+        Ok(executed)
     }
 
     /// Validate every owner's update, then commit them together.
@@ -789,23 +708,12 @@ impl Batch<'_> {
         self.tensors
             .commit_writes(&writes)
             .map_err(Failure::fatal)?;
-        self.runtime
-            .order
-            .record(self.stream)
-            .map_err(Failure::fatal)?;
         self.requests.add_pending(&pending).map_err(Failure::fatal)
     }
 }
 
-/// How one invocation ran.
-struct Executed {
-    mode: GraphMode,
-    tokens: usize,
-    padded_tokens: usize,
-}
-
 fn record(stats: &mut ForwardStats, executed: Executed) {
-    let mode = CANVAS_KIND.as_str();
+    let mode = KIND.as_str();
     *stats.mode_counts.entry(mode.into()).or_default() += 1;
     *stats.mode_tokens.entry(mode.into()).or_default() += executed.tokens as u64;
     match executed.mode {
@@ -833,8 +741,23 @@ pub(crate) fn execute(
     let plan = Arc::clone(batch.shared_plan());
     let predecessors = batch.predecessors().to_vec();
     let parts = backend.parts();
-    let (Some(runtime), Some(storage)) = (parts.canvas, parts.storage) else {
-        return Err(super::unsupported(kind, "canvas"));
+    // A batch carries calls of one component, which names its runner.
+    let component = plan.calls.first().map(|call| call.component.as_str());
+    let runner = parts
+        .diffusion_lm
+        .iter_mut()
+        .find(|runner| Some(runner.component.as_str()) == component);
+    let Some(runner) = runner else {
+        return Err(WorkerError::classify(
+            Error::Unsupported(format!(
+                "component {:?} has no diffusion LM runner on this rank",
+                component.unwrap_or_default()
+            )),
+            None,
+        ));
+    };
+    let Some(storage) = parts.storage else {
+        return Err(crate::executor::forward::unsupported(kind, "diffusion LM"));
     };
     let RankStorage {
         kv: Some(kv),
@@ -843,7 +766,7 @@ pub(crate) fn execute(
         ..
     } = storage
     else {
-        return Err(super::unsupported(kind, "canvas"));
+        return Err(crate::executor::forward::unsupported(kind, "diffusion LM"));
     };
     let context = Context {
         info: parts.info,
@@ -855,7 +778,7 @@ pub(crate) fn execute(
         text: parts.text.map(|text| text.order()),
         experts: parts.experts,
     };
-    let failure = match runtime.launch(context, &plan) {
+    let failure = match runner.forward(context, &plan) {
         Ok(launched) => {
             batch.launch(launched);
             return Ok(());
@@ -873,7 +796,7 @@ pub(crate) fn execute(
     }
     tracing::warn!(
         target: "uniserve_worker.execution",
-        "canvas batch {} failed: {error}{}",
+        "diffusion LM batch {} failed: {error}{}",
         plan.batch_id,
         error
             .traceback()

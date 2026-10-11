@@ -19,16 +19,14 @@
 //! is bound, so the shared backings never grow after a graph captured them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use tvm_ffi::Any;
 
 use crate::config::Device;
-use crate::ffi::{Backing, DType, Fields, Function, Functions, Handle, Record};
+use crate::ffi::{DType, Fields, Function, Functions, Handle, Record};
 use crate::parallel::host::HostGroup;
 use crate::storage::memory::StorageView;
 use crate::storage::{WorkspaceRequest, Workspaces};
-use crate::transfer::PeerStorage;
 use crate::{Error, Result};
 
 use super::interface::Interface;
@@ -92,9 +90,6 @@ pub struct Requirement {
     pub host: bool,
     /// CUDA ordinal, `-1` for the host.
     pub device: i32,
-    /// Process ranks, in member order, whose allocations of this field
-    /// must be peer-mapped; empty for local storage.
-    pub symmetric: Vec<usize>,
 }
 
 impl Requirement {
@@ -110,14 +105,6 @@ impl Requirement {
             })?,
             shape: record.shape("shape")?,
             host: record.flag("host")?,
-            symmetric: match record.optional_value("symmetric")? {
-                Some(ranks) => crate::ffi::integers(ranks)
-                    .map_err(|error| Error::numerical("component.prepare", &error))?
-                    .into_iter()
-                    .map(|rank| rank as usize)
-                    .collect(),
-                None => Vec::new(),
-            },
             device: i32::try_from(record.get::<i64>("device")?)
                 .map_err(|_| Error::Interface("component.prepare device is invalid".into()))?,
         })
@@ -146,8 +133,6 @@ pub struct ComponentBinding {
     /// Workspaces retained until every graph and call that addresses them
     /// has retired; Python views also retain them.
     workspaces: Vec<StorageView>,
-    /// Symmetric workspaces' allocations and peer mappings.
-    peered: Vec<PeerStorage>,
     closed: bool,
 }
 
@@ -168,14 +153,6 @@ impl ComponentBinding {
             .collect()
     }
 
-    /// Bytes of the Rust allocations backing this binding.
-    pub fn workspace_bytes(&self) -> usize {
-        self.workspaces
-            .iter()
-            .map(|view| view.byte_len().unwrap_or(0))
-            .sum()
-    }
-
     /// Release operators. An aborted close drops Python references without
     /// waiting for device work, and keeps the workspaces until exit.
     #[allow(clippy::mem_forget)]
@@ -184,15 +161,12 @@ impl ComponentBinding {
             return Ok(());
         }
         if aborted {
-            // Device work, local or a peer's, may still address the
-            // workspaces; keep them.
+            // Device work may still address the workspaces; keep them.
             std::mem::forget(std::mem::take(&mut self.workspaces));
-            std::mem::forget(std::mem::take(&mut self.peered));
             return Ok(());
         }
         let closed = self.close.call_values(&[Any::from(false)]).map(drop);
         self.workspaces.clear();
-        self.peered.clear();
         closed
     }
 }
@@ -270,7 +244,6 @@ impl StreamWorkspaces {
             .requirements
             .iter()
             .filter(|requirement| requirement.device == device)
-            .filter(|requirement| requirement.symmetric.is_empty())
             .map(|requirement| WorkspaceRequest {
                 name: requirement.name.clone(),
                 dtype: requirement.dtype,
@@ -297,11 +270,6 @@ impl StreamWorkspaces {
             .or_insert_with(|| Workspaces::new((device >= 0).then_some(device)))
     }
 
-    /// Bytes allocated for every stream's workspaces.
-    pub fn bytes(&self) -> u64 {
-        self.streams.values().map(Workspaces::bytes).sum()
-    }
-
     /// Refuse new workspace storage: captured graphs address the current
     /// backings.
     pub fn seal(&mut self) {
@@ -309,13 +277,10 @@ impl StreamWorkspaces {
     }
 }
 
-/// The worker's ranks a symmetric workspace is peer-mapped across, and the
-/// mesh groups bindings communicate over.
+/// The worker's ranks and the mesh groups bindings communicate over.
 pub struct PeerGroup<'a> {
     /// Host collectives over the worker's ranks; member `i` is rank `i`.
     pub group: &'a HostGroup,
-    /// This host's name, which identifies descriptor-shared storage.
-    pub node: &'a str,
     /// Each component's multi-member mesh groups on this rank.
     pub collectives: BTreeMap<String, Vec<crate::parallel::CollectiveGroup>>,
 }
@@ -353,70 +318,14 @@ impl PeerGroup<'_> {
     }
 }
 
-/// One symmetric field: this rank's allocation and every member's mapping
-/// of the field, in member order.
-fn symmetric(
-    requirement: &Requirement,
-    peers: Option<&PeerGroup<'_>>,
-) -> Result<(PeerStorage, Vec<(String, StorageView)>)> {
-    let peers = peers.ok_or_else(|| {
-        Error::Unsupported(format!(
-            "symmetric workspace {} needs the worker's host group",
-            requirement.name
-        ))
-    })?;
-    if requirement.host || requirement.device < 0 {
-        return Err(Error::Unsupported(format!(
-            "symmetric workspace {} must be device memory",
-            requirement.name
-        )));
-    }
-    let bytes = requirement
-        .shape
-        .iter()
-        .try_fold(requirement.dtype.bytes(), |bytes, &size| {
-            usize::try_from(size)
-                .ok()
-                .and_then(|size| bytes.checked_mul(size))
-        })
-        .ok_or_else(|| Error::Invalid(format!("workspace {} is too large", requirement.name)))?;
-    let members = peers.group.subgroup(&requirement.symmetric)?;
-    let storage = PeerStorage::allocate(requirement.device, bytes.max(1), peers.node, &members)?;
-    let mut views = vec![(
-        requirement.name.clone(),
-        StorageView::contiguous(
-            Arc::clone(storage.local()) as Arc<dyn Backing>,
-            0,
-            requirement.dtype,
-            &requirement.shape,
-        )?,
-    )];
-    for member in 0..requirement.symmetric.len() {
-        views.push((
-            format!("{}.peer{member}", requirement.name),
-            StorageView::contiguous(
-                Arc::clone(storage.peers()) as Arc<dyn Backing>,
-                member * storage.bytes_each(),
-                requirement.dtype,
-                &requirement.shape,
-            )?,
-        ));
-    }
-    Ok((storage, views))
-}
-
 /// Allocate every prepared binding's workspaces and bind them, in order.
 ///
 /// All bindings are declared to their streams' workspaces before any
-/// allocation, so a shared field's backing holds the largest of them. A
-/// symmetric field is allocated collectively over its members (`peers`),
-/// in binding and declaration order, which is identical on every member,
-/// and served with its peer views `{name}.peer{index}`.
+/// allocation, so a shared field's backing holds the largest of them.
 pub fn bind(
     interface: &Interface,
     workspaces: &mut StreamWorkspaces,
     prepared: Vec<Prepared>,
-    peers: Option<&PeerGroup<'_>>,
 ) -> Result<Vec<ComponentBinding>> {
     let _range = crate::profiling::range(c"uniserve.worker.bind", None);
     for binding in &prepared {
@@ -431,20 +340,7 @@ pub fn bind(
     let mut bound = Vec::with_capacity(prepared.len());
     for binding in prepared {
         let mut views = Vec::new();
-        let mut peered = Vec::new();
         let mut tensors = Fields::new();
-        for requirement in binding
-            .requirements
-            .iter()
-            .filter(|requirement| !requirement.symmetric.is_empty())
-        {
-            let (storage, fields) = symmetric(requirement, peers)?;
-            for (name, view) in fields {
-                tensors = tensors.with(&name, view.to_tensor()?);
-                views.push(view);
-            }
-            peered.push(storage);
-        }
         for device in StreamWorkspaces::devices(&binding) {
             let requests = StreamWorkspaces::requests(&binding, device);
             for (name, view) in workspaces
@@ -474,7 +370,6 @@ pub fn bind(
             kernels: functions.get("kernels")?,
             close: functions.get("close")?,
             workspaces: views,
-            peered,
             closed: false,
         });
     }

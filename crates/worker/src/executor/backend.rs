@@ -77,12 +77,12 @@ pub struct WorkerBackend {
     arenas: HashMap<Device, StorageView>,
     /// The lane preparing input images and encoding output images.
     image_host: Option<HostLane<ImageTask>>,
-    /// The canvas runtime, on ranks holding a token denoiser.
-    canvas: Option<forward::canvas::CanvasRuntime>,
+    /// The runner of each diffusion LM component placed on the rank.
+    diffusion_lm: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
     /// The expert-parallel runtime, on ranks of an expert union.
-    experts: Option<forward::experts::ExpertRuntime>,
+    experts: Option<crate::parallel::ExpertUnion>,
     /// Distributed expert weights, on ranks that prefetch them.
-    weights: Option<forward::experts::WeightRuntime>,
+    weights: Option<crate::parallel::DwdpManager>,
     /// The transfer runtime: tensor transfers, KV exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<forward::transfer::TransferRuntime>,
@@ -114,14 +114,14 @@ pub(crate) struct Parts<'a> {
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
     pub image: Option<ImageParts<'a>>,
-    pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
-    pub experts: Option<&'a forward::experts::ExpertRuntime>,
+    pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
+    pub experts: Option<&'a crate::parallel::ExpertUnion>,
     pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, the text
 /// runners, an image model's trajectories, output leases and latent pool,
-/// the canvas and transfer runtimes, a video model's requests, denoiser
+/// the diffusion LM runners, the transfer runtime, a video model's requests, denoiser
 /// runners and output leases, then the other runtimes' owners.
 #[expect(
     clippy::too_many_arguments,
@@ -133,7 +133,7 @@ fn owners<'a>(
     image: bool,
     trajectories: &'a mut Trajectories,
     latents: &'a mut Option<ImageLatents>,
-    canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
+    diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
     transfer: &'a mut Option<forward::transfer::TransferRuntime>,
     video: &'a mut Option<VideoRequests>,
     denoisers: &'a mut DenoiserRunners,
@@ -157,8 +157,8 @@ fn owners<'a>(
             owners.push(latents);
         }
     }
-    if let Some(canvas) = canvas {
-        owners.push(canvas);
+    for runner in diffusion_lm {
+        owners.push(runner);
     }
     if let Some(transfer) = transfer {
         owners.push(transfer);
@@ -297,7 +297,7 @@ impl WorkerBackend {
             trajectories: Trajectories::default(),
             arenas: HashMap::new(),
             image_host: None,
-            canvas: None,
+            diffusion_lm: Vec::new(),
             experts: None,
             weights: None,
             transfer: None,
@@ -441,30 +441,35 @@ impl WorkerBackend {
         self.media = None;
     }
 
-    /// Install the canvas runtime.
-    pub(crate) fn set_canvas(&mut self, canvas: forward::canvas::CanvasRuntime) {
-        self.canvas = Some(canvas);
+    /// Install the diffusion LM runners.
+    pub(crate) fn set_diffusion_lm(
+        &mut self,
+        runners: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
+    ) {
+        self.diffusion_lm = runners;
     }
 
-    pub(crate) fn canvas_mut(&mut self) -> Option<&mut forward::canvas::CanvasRuntime> {
-        self.canvas.as_mut()
+    pub(crate) fn diffusion_lm_mut(
+        &mut self,
+    ) -> &mut [crate::runner::diffusion_lm::DiffusionLMRunner] {
+        &mut self.diffusion_lm
     }
 
     /// Install the expert-parallel runtime.
-    pub(crate) fn set_experts(&mut self, experts: forward::experts::ExpertRuntime) {
+    pub(crate) fn set_experts(&mut self, experts: crate::parallel::ExpertUnion) {
         self.experts = Some(experts);
     }
 
     /// Install the distributed expert weights.
-    pub(crate) fn set_weights(&mut self, weights: forward::experts::WeightRuntime) {
+    pub(crate) fn set_weights(&mut self, weights: crate::parallel::DwdpManager) {
         self.weights = Some(weights);
     }
 
-    pub(crate) fn experts(&self) -> Option<&forward::experts::ExpertRuntime> {
+    pub(crate) fn experts(&self) -> Option<&crate::parallel::ExpertUnion> {
         self.experts.as_ref()
     }
 
-    pub(crate) fn experts_mut(&mut self) -> Option<&mut forward::experts::ExpertRuntime> {
+    pub(crate) fn experts_mut(&mut self) -> Option<&mut crate::parallel::ExpertUnion> {
         self.experts.as_mut()
     }
 
@@ -534,7 +539,7 @@ impl WorkerBackend {
                 }),
                 _ => None,
             },
-            canvas: self.canvas.as_mut(),
+            diffusion_lm: &mut self.diffusion_lm,
             experts: self.experts.as_ref(),
             transfer: self.transfer.as_mut(),
         }
@@ -634,7 +639,7 @@ impl WorkerBackend {
                 self.image.is_some(),
                 &mut self.trajectories,
                 &mut self.latents,
-                &mut self.canvas,
+                &mut self.diffusion_lm,
                 &mut self.transfer,
                 &mut self.video,
                 &mut self.denoisers,
@@ -780,8 +785,8 @@ impl WorkerBackend {
     }
 
     /// Close every storage owner, newest first (other runtimes, a video
-    /// model's owners, the transfer, canvas, image and text runtimes, then
-    /// rank storage), after
+    /// model's owners, the transfer runtime, the diffusion LM runners, the
+    /// image and text owners, then rank storage), after
     /// the executor drained; returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
@@ -808,8 +813,8 @@ impl WorkerBackend {
         if let Some(mut transfer) = self.transfer.take() {
             result = result.and(transfer.close(aborted));
         }
-        if let Some(mut canvas) = self.canvas.take() {
-            result = result.and(canvas.close(aborted));
+        for mut runner in std::mem::take(&mut self.diffusion_lm) {
+            result = result.and(runner.close(aborted));
         }
         result = result.and(self.close_image(aborted));
         if let Some(mut text) = self.text.take() {
@@ -821,20 +826,20 @@ impl WorkerBackend {
         result
     }
 
-    /// Close the canvas, image and text runtimes (graphs, then steps)
+    /// Close the diffusion LM, image and text runtimes (graphs, then steps)
     /// before the bindings they run close; attempts every one before
     /// returning the first failure.
     pub fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
-        let canvas = self
-            .canvas
-            .take()
-            .map_or(Ok(()), |mut canvas| canvas.close(aborted));
+        let mut diffusion_lm = Ok(());
+        for mut runner in std::mem::take(&mut self.diffusion_lm) {
+            diffusion_lm = diffusion_lm.and(runner.close(aborted));
+        }
         let image = self.close_image(aborted);
         let text = self
             .text
             .take()
             .map_or(Ok(()), |mut text| text.close(aborted));
-        canvas.and(image).and(text)
+        diffusion_lm.and(image).and(text)
     }
 
     /// Release the outputs of the predecessors this batch's calls follow.
@@ -940,7 +945,7 @@ impl Backend for WorkerBackend {
             self.image.is_some(),
             &mut self.trajectories,
             &mut self.latents,
-            &mut self.canvas,
+            &mut self.diffusion_lm,
             &mut self.transfer,
             &mut self.video,
             &mut self.denoisers,
@@ -1025,7 +1030,7 @@ impl Backend for WorkerBackend {
             self.image.is_some(),
             &mut self.trajectories,
             &mut self.latents,
-            &mut self.canvas,
+            &mut self.diffusion_lm,
             &mut self.transfer,
             &mut self.video,
             &mut self.denoisers,
@@ -1065,7 +1070,7 @@ impl Backend for WorkerBackend {
             self.image.is_some(),
             &mut self.trajectories,
             &mut self.latents,
-            &mut self.canvas,
+            &mut self.diffusion_lm,
             &mut self.transfer,
             &mut self.video,
             &mut self.denoisers,
@@ -1115,7 +1120,7 @@ impl Backend for WorkerBackend {
             self.image.is_some(),
             &mut self.trajectories,
             &mut self.latents,
-            &mut self.canvas,
+            &mut self.diffusion_lm,
             &mut self.transfer,
             &mut self.video,
             &mut self.denoisers,
@@ -1195,7 +1200,7 @@ impl ServiceBackend for WorkerBackend {
     fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
         // A join launches on the lane the union's forwards run on.
         self.jobs.run(CallKind::Forward(ForwardMode::Decode), || {
-            forward::experts::join_step(self, leaving)
+            crate::parallel::join_step(self, leaving)
         })
     }
 }
