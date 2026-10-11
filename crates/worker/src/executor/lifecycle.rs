@@ -13,7 +13,7 @@
 //!   readers keep their leases.
 //!
 //! Request storage (tensor store, KV cache, latent pool, block tables,
-//! decode and canvas state) is owned by the storage and capability runtimes
+//! decode and diffusion LM state) is owned by the storage and capability runtimes
 //! and takes part through [`RequestStorage`].
 
 use std::collections::HashSet;
