@@ -1,19 +1,18 @@
-"""Model description, checkpoint resolution, loading and model facts.
+"""Reading a checkpoint's configuration, loading a rank's model, and facts.
 
-The worker loads a model in phases around process-group creation:
+A rank loads a model in two calls around process-group creation, each
+reached by import path with explicit arguments:
 
-1. ``model.describe`` reads the checkpoint configuration, builds a meta
+1. :func:`read_config` reads the checkpoint configuration, builds a meta
    skeleton and reports the declared components, their capability tags and
    the axes they communicate over, before any collective exists.
-2. ``model.resolve`` narrows the checkpoint to this rank's modules and the
-   launch's weight choices.
-3. ``model.load`` materializes the resident modules on the meshes Rust
+2. :func:`load_model` narrows the checkpoint to this rank's modules and the
+   launch's weight choices and materializes them on the meshes the rank
    created.
-4. ``model.facts`` reports every model-derived quantity capacity planning
-   and reporting need, so the worker never inspects Python objects.
 
-Requests arrive as TVM-FFI maps and arrays; handles returned here are opaque
-to the worker and passed back unchanged.
+``model.facts`` reports model-derived quantities capacity planning and
+reporting need. Objects returned here are opaque to the rank and passed
+back unchanged.
 """
 
 from __future__ import annotations

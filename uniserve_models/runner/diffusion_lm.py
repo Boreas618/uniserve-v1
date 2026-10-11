@@ -48,7 +48,7 @@ from torch import nn
 
 from uniserve_models.bindings import capturing
 from uniserve_models.diffusion import canvas as sampler
-from uniserve_models.model import DiffusionLM, DiffusionLMInput
+from uniserve_models.model import DiffusionLM, DiffusionLMInput, TextSize
 from uniserve_models.model.logits import Logits
 from uniserve_models.nn.attention import (
     AttentionBatch,
@@ -57,6 +57,7 @@ from uniserve_models.nn.attention import (
     SequenceLengths,
 )
 from uniserve_models.nn.moe import FusedMoE
+from uniserve_models.runner.context import execution_context
 
 __all__ = [
     "STEP_CONTINUED",
@@ -256,9 +257,21 @@ class DiffusionLMRunner:
     """The forwards of one diffusion language model on one stream.
 
     Args:
-        prepared: The prepared component: its module is the ``DiffusionLM``
-            and its execution context holds the operators and the prefix
-            cache on the runner's stream.
+        loaded: The loaded model.
+        path: The ``DiffusionLM``'s module path in it.
+        stream: The CUDA stream handle every forward enqueues on (0 for the
+            current stream).
+        scratch: The stream's shared work areas, which the runner's
+            execution context borrows.
+        cache: The prefix cache view object the attention layers read.
+        experts: The expert exchange of an expert-parallel deployment, or
+            ``None``.
+        weights: The distributed expert weights' prefetch object, or
+            ``None``.
+        collectives: The collective functions of the model's communicators
+            on the stream, by communicator name, or ``None``.
+        tokens: The most tokens one forward evaluates.
+        rows: The most sequences one forward evaluates.
         page_tokens: Tokens per page of each numerical block table.
         windowed: Whether each numerical block table retires pages behind
             an attention window.
@@ -275,12 +288,22 @@ class DiffusionLMRunner:
             latest distribution.
         bank_live: ``[S]`` uint8, whether each slot's block continues.
 
-    A generating runner allocates its sampler workspace here.
+    The runner prepares its execution context here, for the largest
+    forward, and a generating runner allocates its sampler workspace.
     """
 
     def __init__(
         self,
-        prepared,
+        loaded,
+        path: str,
+        stream: int,
+        scratch,
+        cache,
+        experts,
+        weights,
+        collectives,
+        tokens: int,
+        rows: int,
         page_tokens: Sequence[int],
         windowed: Sequence[int],
         chunk_rows: int,
@@ -295,11 +318,20 @@ class DiffusionLMRunner:
         bank_self_conditioning: torch.Tensor | None = None,
         bank_live: torch.Tensor | None = None,
     ) -> None:
-        context = prepared.context
-        if context is None:
-            raise ValueError("a runner requires a bound component")
-        self._context = context
-        self._model = _model(prepared.module)
+        self._model = _placed(loaded, path)
+        context = execution_context(
+            self._model,
+            int(stream),
+            loaded.attention,
+            scratch,
+            cache=cache,
+            experts=experts,
+            weights=weights,
+            collectives=collectives,
+        )
+        context.prepare(TextSize(int(tokens), int(rows)))
+        # Expert joins of the rank run through this context.
+        self.context = self._context = context
         self._page_tokens = tuple(int(value) for value in page_tokens)
         self._windowed = tuple(bool(value) for value in windowed)
 
@@ -374,6 +406,10 @@ class DiffusionLMRunner:
                 device=table.device,
             )
 
+    def close(self) -> None:
+        """Release the execution context after every graph retired."""
+        self._context.close()
+
     # Facts.
 
     def plans_attention(self) -> bool:
@@ -386,13 +422,14 @@ class DiffusionLMRunner:
         return self._context.plans_attention()
 
     def kernels(self) -> list[dict[str, Any]]:
-        """Kernel records of the sampler's self-conditioning product.
+        """Kernel records of the model's layers and of the sampler.
 
-        On CUDA, one ``product`` record per chunk shape the product has run:
-        its positions, vocabulary and hidden sizes and the cuBLASLt
-        algorithm it uses.
+        The selected kernel of every operator of the execution context,
+        then, on CUDA, one ``product`` record per chunk shape the sampler's
+        self-conditioning product has run: its positions, vocabulary and
+        hidden sizes and the cuBLASLt algorithm it uses.
         """
-        records: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = list(self._context.kernels())
         workspace, table = self._workspace, self._table
         if (
             workspace is None
