@@ -4,9 +4,11 @@
 //! smaller captures reuse pool blocks), then its decode buckets (largest
 //! first). Each bucket's rows get startup scratch units installed as block
 //! tables of reserved slots `1..=rows`; nothing else is resident during
-//! startup. A decode bucket first prefills one real token per row, so the
-//! captured decode attends to model-produced K/V. Every capture runs its step
-//! eagerly first, which also compiles the step's kernels.
+//! startup. A decode bucket first prefills one real token per row and
+//! commits its cache length, so the captured decode attends to
+//! model-produced K/V; that commit captures the bucket's commit graph. Every
+//! capture runs its step eagerly first, which also compiles the step's
+//! kernels.
 //!
 //! The scenario then admits one request, prefills one token with a token
 //! relay output, decodes from that relay and finishes, through the serving
@@ -25,7 +27,7 @@ use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::runner::TokenSelection;
-use crate::runner::text::{RowSource, StepRequest, TokenRow};
+use crate::runner::text::{COMMIT_CACHE, RowSource, StepRequest, TokenRow};
 use crate::storage::KVCache;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
@@ -220,8 +222,8 @@ fn capture(
             with_scratch(kv, &vec![2; size], stream, |kv| {
                 // One real token per row, prefilled in batches no larger than
                 // the scheduler admits (the largest prefill bucket's live
-                // rows), then the decode the graph captures with every row's
-                // continuation flag set.
+                // rows) and committed as each slot's cache; then the decode
+                // the graph captures with every row's continuation flag set.
                 for first in (0..size).step_by(prime) {
                     let count = prime.min(size - first);
                     run(
@@ -233,6 +235,11 @@ fn capture(
                     )?;
                 }
                 let slots: Vec<usize> = (1..=size).collect();
+                let prefilled: Vec<[i64; 8]> = slots
+                    .iter()
+                    .map(|&slot| [slot as i64, COMMIT_CACHE, -1, 1, 0, 0, 0, 0])
+                    .collect();
+                runtime.runners[index].commit(&prefilled)?;
                 runtime.state.set_predicates(&slots, true, stream)?;
                 let mut captured = Ok(());
                 for capacity in variants(size) {
@@ -281,6 +288,7 @@ fn step(
     let request = StepRequest {
         decode,
         rows,
+        finish_ids: &[],
         sampling: None,
         prompt: &[],
         embeddings: &[],

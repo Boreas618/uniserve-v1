@@ -19,7 +19,8 @@ use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{DeviceId, Stream};
 
 use crate::config::{Device, WorkerLaunch};
-use crate::ffi::{Fields, Handle, Record};
+use crate::cuda_graph::GraphBreaks;
+use crate::ffi::{Fields, Function, Handle, Record};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::interface::Interface;
@@ -32,6 +33,9 @@ pub(crate) struct WeightRuntime {
     weights: Arc<ExpertWeights>,
     /// `experts.bind_prefetch`'s object, passed to every binding.
     prefetch: Handle,
+    /// The weight copies noted as graph breaks of the forward being
+    /// captured.
+    breaks: GraphBreaks,
     closed: bool,
 }
 
@@ -143,14 +147,17 @@ impl WeightRuntime {
         );
 
         let weights = Arc::new(weights);
-        let prefetch = Handle::new(
-            interface
-                .function("experts.bind_prefetch")?
-                .call_values(&[model.handle().to_any(), hooks(&weights)])?,
-        )?;
+        let breaks = GraphBreaks::default();
+        let break_graph = interface.import("uniserve_models.interface.graphs.break_graph")?;
+        let prefetch =
+            Handle::new(interface.function("experts.bind_prefetch")?.call_values(&[
+                model.handle().to_any(),
+                hooks(&weights, &break_graph, &breaks),
+            ])?)?;
         Ok(Some(Self {
             weights,
             prefetch,
+            breaks,
             closed: false,
         }))
     }
@@ -158,6 +165,12 @@ impl WeightRuntime {
     /// The object bindings pass to their expert calls.
     pub(crate) fn prefetch(&self) -> &Handle {
         &self.prefetch
+    }
+
+    /// The graph breaks of the forward being captured: whoever captures a
+    /// forward that reads these weights takes them for its graph.
+    pub(crate) fn breaks(&self) -> &GraphBreaks {
+        &self.breaks
     }
 
     /// Drain the copy stream and release the weights after every binding
@@ -184,10 +197,14 @@ impl Drop for WeightRuntime {
 
 /// The prefetch hooks as TVM-FFI functions closed over `weights`:
 /// `begin()`, `end(stream)`, `before(layer, stream, record)`,
-/// `after(layer, stream)` and `copy(index)`. `record` is `None` or, under
-/// graph capture, a function of a copy index that submits it between graph
-/// segments. They block on no peer.
-fn hooks(weights: &Arc<ExpertWeights>) -> Any {
+/// `after(layer, stream)` and `copy(index)`. They block on no peer.
+///
+/// Under graph capture a copy is a graph break. With `record`, a function
+/// of a copy index, the binding that records the capture in Python submits
+/// the copy between its segments. Without it the capture is the runtime's:
+/// `before` ends the segment with `break_graph` and notes the copy in
+/// `breaks`, and the runtime performs it at every launch.
+fn hooks(weights: &Arc<ExpertWeights>, break_graph: &Function, breaks: &GraphBreaks) -> Any {
     type Hook = dyn Fn(&ExpertWeights, &[AnyView<'_>]) -> std::result::Result<Any, tvm_ffi::Error>;
     let function = |call: Box<Hook>| {
         let weights = Arc::clone(weights);
@@ -212,8 +229,10 @@ fn hooks(weights: &Arc<ExpertWeights>) -> Any {
                 unit(weights.end(&compute(weights, stream)?))
             })),
         )
-        .with(
-            "before",
+        .with("before", {
+            let owner = Arc::clone(weights);
+            let break_graph = break_graph.clone();
+            let breaks = breaks.clone();
             function(Box::new(move |weights, args| {
                 let [layer, stream, record] = args else {
                     return Err(ffi_error(&Error::Invalid(
@@ -223,16 +242,19 @@ fn hooks(weights: &Arc<ExpertWeights>) -> Any {
                 let record = Option::<tvm_ffi::Function>::try_from(*record)?;
                 let stream = compute(weights, stream)?;
                 unit(weights.before(count(layer)?, &stream, |index| {
-                    let record = record.as_ref().ok_or(Error::State(
-                        "capture expert weight reads with a segment recorder",
-                    ))?;
-                    record
-                        .call_packed(&[(&Any::from(index as i64)).into()])
-                        .map(drop)
-                        .map_err(|error| Error::numerical("experts.prefetch.record", &error))
+                    if let Some(record) = &record {
+                        return record
+                            .call_packed(&[(&Any::from(index as i64)).into()])
+                            .map(drop)
+                            .map_err(|error| Error::numerical("experts.prefetch.record", &error));
+                    }
+                    break_graph.invoke(&[])?;
+                    let owner = Arc::clone(&owner);
+                    breaks.note(Arc::new(move || owner.copy(index)));
+                    Ok(())
                 }))
-            })),
-        )
+            }))
+        })
         .with(
             "after",
             function(Box::new(move |weights, args| {

@@ -10,7 +10,7 @@
 //!    completion flags); lease its predicates. A call whose host predicate
 //!    is false is skipped (`Predicated`) and only publishes false flags.
 //! 2. **Step** ([`step`]): one input row per active call, the sampling tasks
-//!    and prompt scoring, and one invocation on the call kind's runner.
+//!    and prompt scoring, and one forward on the call kind's runner.
 //! 3. **Capture and commit** ([`commit`]): advance each call's progress, copy
 //!    completion and logprob words to the output lease, relay sampled tokens
 //!    and transitions into their products, then commit products, slot state
@@ -153,8 +153,8 @@ impl TextRuntime {
     /// are staged; the ranks agree on the step's capacity (or, during
     /// warmup, it is `forced` or derived and announced); then the
     /// microbatches run in rotation, empty ones joining, and the lane stream
-    /// waits on every microbatch stream. Microbatches replay their graphs
-    /// only once the union joins by replay
+    /// waits on every microbatch stream. Microbatches launch their graphs
+    /// only once the union joins by launching its own
     /// ([`super::experts::ExpertRuntime::replays`]).
     pub(crate) fn invoke(
         &mut self,
@@ -192,7 +192,7 @@ impl TextRuntime {
                 .ok_or(Error::State("a text step has an invocation"))?;
             let staged = step(&self.runners[runner], request)?;
             let launch = self.runners[runner].launch(&staged, None, true)?;
-            launch.call.invoke()?;
+            (launch.call)()?;
             let executed = self.runners[runner].finish(staged, None, launch.mode)?;
             return Ok(vec![Some(executed)]);
         };
@@ -228,7 +228,7 @@ impl TextRuntime {
                     modes.push(Some(launch.mode));
                     calls.push(Some(super::experts::MicrobatchForward {
                         call: launch.call,
-                        yields: launch.mode != GraphMode::Replay,
+                        yields: launch.yields,
                     }));
                 }
                 None => {
@@ -335,6 +335,7 @@ impl TextRuntime {
         let mut requests: Vec<Option<StepRequest<'_>>> = vec![Some(StepRequest {
             decode: false,
             rows: &rows,
+            finish_ids: &[],
             sampling: None,
             prompt: &[],
             embeddings: &[],
