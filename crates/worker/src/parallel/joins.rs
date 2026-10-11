@@ -22,7 +22,7 @@ use crate::{Error, Result};
 pub struct GraphFunctions {
     /// `graphs.begin_capture(pool, stream, device) -> capture`.
     pub begin: Function,
-    /// `graphs.end_capture(capture) -> [graph, executables, breaks]`.
+    /// `graphs.end_capture(capture) -> [graph, executables]`.
     pub end: Function,
     /// `graphs.release(graph)`.
     pub release: Function,

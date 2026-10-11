@@ -189,9 +189,9 @@ def test_exported_executables_launch_to_the_replayed_output():
         module(x)
     graph = capture(lambda: module(x), stream=stream)
     try:
-        exported, executables, breaks = export(graph)
+        exported, executables = export(graph)
         assert exported is graph
-        assert len(executables) == 1 and breaks == 0
+        assert len(executables) == 1
 
         outputs = []
         for run in (graph.replay, lambda: _launch(executables[0], stream)):
@@ -210,7 +210,7 @@ def test_exported_executables_launch_to_the_replayed_output():
 
 
 @torch.inference_mode()
-def test_export_counts_the_breaks_between_segments():
+def test_export_names_one_executable_per_segment():
     """A segmented graph exports one executable per segment."""
     device = torch.device("cuda:0")
     stream = torch.cuda.Stream(device=device)
@@ -230,9 +230,8 @@ def test_export_counts_the_breaks_between_segments():
     owner = object()
     graph = capture(body, stream=stream, segments=segments)
     try:
-        exported, executables, breaks = export(graph, owner)
+        exported, executables = export(graph, owner)
         assert exported is owner
         assert len(executables) == 2 and len(set(executables)) == 2
-        assert breaks == 1
     finally:
         graph.release()
