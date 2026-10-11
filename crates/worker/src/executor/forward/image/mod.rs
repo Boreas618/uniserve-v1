@@ -22,9 +22,8 @@
 //! the image denoiser this runtime owns.
 
 pub(crate) mod batch;
-mod diffusion;
 pub(crate) mod host;
-mod latents;
+pub(crate) mod latents;
 pub(crate) mod start;
 pub(crate) mod warmup;
 
@@ -64,7 +63,7 @@ use latents::{ImageLatents, Pool};
 /// The image runtime of a rank.
 pub(crate) struct ImageRuntime {
     facts: ImageModel,
-    policy: ImagePolicy,
+    pub(crate) policy: ImagePolicy,
     /// Encoders by (component, call kind).
     pub(crate) encoders: Vec<EncoderRunner>,
     encoder_routes: HashMap<(String, CallKind), usize>,
@@ -74,11 +73,11 @@ pub(crate) struct ImageRuntime {
     /// The image decoder of a component serving image decoding.
     pub(crate) decoder: Option<(String, DecoderRunner)>,
     latents: Option<ImageLatents>,
-    trajectories: Trajectories,
+    pub(crate) trajectories: Trajectories,
     /// The product arena of each device, which bindings name products in.
     arenas: HashMap<Device, StorageView>,
     /// Resets newly assigned KV units on the denoiser's stream.
-    units: Option<UnitColumn>,
+    pub(crate) units: Option<UnitColumn>,
     /// Graph pools of packed vision encoders, by encoder.
     pools: HashMap<usize, Arc<GraphPool<Handle>>>,
     /// The denoising steps captured at startup, largest first, and their
@@ -566,7 +565,7 @@ fn run(
             crate::runner::encoder::image_placement(runtime, plan)?
         }
         CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
-            diffusion::placement(runtime)?
+            crate::runner::diffusion::image::image_placement(runtime)?
         }
         CallKind::Media(MediaCall::ImageDecoding) => {
             crate::runner::decoder::image_placement(runtime, plan)?
