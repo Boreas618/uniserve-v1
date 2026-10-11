@@ -79,13 +79,11 @@ pub(crate) struct VideoSetup<'a> {
 }
 
 impl VideoSetup<'_> {
-    /// A stream forked for one component's calls and its workspace
-    /// allocator.
-    pub(crate) fn stream(
-        &mut self,
-        kind: MediaCall,
-        device: Device,
-    ) -> Result<(Stream, tvm_ffi::Function)> {
+    /// A stream forked for one component's calls and the shared work areas
+    /// of the execution contexts serialized on it: a Python `Scratch`,
+    /// which grows to the largest context prepared and keeps what captured
+    /// graphs address.
+    pub(crate) fn stream(&mut self, kind: MediaCall, device: Device) -> Result<(Stream, Handle)> {
         let lanes = &mut *self.lanes;
         let Device::Cuda(index) = device else {
             return Err(Error::Unsupported(
@@ -94,10 +92,12 @@ impl VideoSetup<'_> {
         };
         let forked = lanes.fork_module(CallKind::Media(kind), uniserve_cuda::DeviceId(index))?;
         let stream = forked.stream()?.clone();
-        let workspaces = Arc::new(std::sync::Mutex::new(crate::storage::Workspaces::new(
-            Some(index),
-        )));
-        Ok((stream, crate::runner::allocate::allocator(workspaces)))
+        let scratch = Handle::new(
+            self.interface
+                .import("uniserve_models.bindings.context.Scratch")?
+                .call_values(&[])?,
+        )?;
+        Ok((stream, scratch))
     }
 
     /// The graph pool of `owner` on `device` under graph storage `key`;

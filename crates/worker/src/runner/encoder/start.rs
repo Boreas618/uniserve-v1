@@ -36,7 +36,7 @@ impl EncoderRunners {
             .find(|call| call.is(crate::model::components::Capability::TextEncoder))
             .map(|call| call.path.clone())
             .unwrap_or_default();
-        let (stream, _) = setup.stream(MediaCall::TextEncoding, device)?;
+        let (stream, scratch) = setup.stream(MediaCall::TextEncoding, device)?;
         self.text_pool = setup.graph_pool(TEXT_GRAPHS, &placed.name, device)?;
         let (runner, tower) = EncoderRunner::text(TextSetup {
             interface,
@@ -45,6 +45,7 @@ impl EncoderRunners {
             path: &path,
             device: device_index(device)?,
             stream,
+            scratch,
             attention: attention.clone(),
             dtype: crate::runner::causal_lm::model_dtype(&config.model_dtype)?,
             config: EncoderConfig {
@@ -80,7 +81,7 @@ impl EncoderRunners {
         let (interface, loaded) = (setup.interface, setup.loaded);
         let attention = setup.attention.clone();
         let device = placed_device(placed);
-        let (stream, allocate) = setup.stream(MediaCall::LatentEncoding, device)?;
+        let (stream, scratch) = setup.stream(MediaCall::LatentEncoding, device)?;
         let setup = |capability| -> Result<RunnerSetup<'_>> {
             Ok(RunnerSetup {
                 interface,
@@ -89,7 +90,7 @@ impl EncoderRunners {
                 stream: stream.clone(),
                 device: device_index(device)?,
                 attention: attention.clone(),
-                allocate: allocate.clone(),
+                scratch: scratch.clone(),
             })
         };
         let runner = EncoderRunner::conditions(

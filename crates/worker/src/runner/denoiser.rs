@@ -407,8 +407,8 @@ pub(crate) struct DenoiserSetup<'a> {
     pub(crate) conditioning: Option<Conditioning>,
     pub(crate) conditioning_width: u64,
     pub(crate) attention: String,
-    /// The worker's workspace allocation callback.
-    pub(crate) allocate: tvm_ffi::Function,
+    /// The stream's shared work areas, a Python `Scratch`.
+    pub(crate) scratch: Handle,
     pub(crate) graph_pool: Option<Arc<GraphPool<Handle>>>,
     pub(crate) transient_layouts: usize,
 }
@@ -471,7 +471,7 @@ impl DenoiserRunner {
             text(setup.component),
             stream.clone(),
             text(&setup.attention),
-            Any::from(setup.allocate.clone()),
+            setup.scratch.to_any(),
             setup.maximum.descriptor(),
         ])?;
         let methods = Methods {
@@ -507,7 +507,7 @@ impl DenoiserRunner {
                         text(&path),
                         stream.clone(),
                         text(&setup.attention),
-                        Any::from(setup.allocate.clone()),
+                        setup.scratch.to_any(),
                         Any::from(integer_list([i64::from(capacity), width as i64])),
                     ])?;
                     runners.insert(capacity, Handle::new(runner)?);

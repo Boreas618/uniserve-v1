@@ -20,7 +20,6 @@ from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.interface import calls, regions
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
-from uniserve_models.interface.workspace import execution_context
 from uniserve_models.media.pixels import (
     PreparedImage,
     Tower,
@@ -32,11 +31,13 @@ from uniserve_models.model import (
     PatchEncoder,
     TextConditioner,
     TextEncoder,
+    TextSize,
     VideoEncoder,
     VisionInput,
 )
 from uniserve_models.nn.vae import PatchAutoencoder
 from uniserve_models.processing import PatchTransform
+from uniserve_models.runner.context import execution_context
 
 __all__ = ["EncoderRunner"]
 
@@ -83,12 +84,14 @@ class EncoderRunner:
         path: The encoder module's path in the model.
         stream: The CUDA stream handle every forward enqueues on.
         attention: The attention backend the model loaded with.
-        allocate: The caller's allocation function for workspace torch
-            cannot provide.
-        size: The shapes of the encoder's inputs, flattened: ``[rows,
-            width]`` of a text conditioner's features, ``[frames, height,
-            width, 3]`` of each visual unit of a video encoder's call,
-            ``[samples, 2]`` of each track of an audio encoder's call.
+        scratch: The stream's shared work areas
+            (``uniserve_models.bindings.context.Scratch``).
+        size: The size the operators are prepared for, flattened:
+            ``[tokens, rows]`` of a text encoder's largest call (its own
+            and its vision tower's, see :meth:`tower`), ``[rows, width]``
+            of a text conditioner's features, ``[frames, height, width,
+            3]`` of each visual unit of a video encoder's call, ``[samples,
+            2]`` of each track of an audio encoder's call.
     """
 
     # The encoder, of one of the capability classes :meth:`encode` lists.
@@ -103,28 +106,48 @@ class EncoderRunner:
         path: str,
         stream: int,
         attention: str,
-        allocate,
+        scratch,
         size: Sequence[int],
     ) -> None:
-        module = loaded.module.get_submodule(str(path))
-        if isinstance(module, TextConditioner):
-            rank, name = 2, "conditioner"
+        path, attention = str(path), str(attention)
+        module = loaded.module.get_submodule(path) if path else loaded.module
+        prepared: Any
+        if isinstance(module, TextEncoder):
+            tokens, rows = (int(value) for value in size)
+            prepared = TextSize(tokens, rows)
+            if attention == "auto":
+                attention = loaded.attention
+        elif isinstance(module, TextConditioner):
+            prepared = tuple(_chunks(size, 2))
         elif isinstance(module, VideoEncoder):
-            rank, name = 4, "encoder.video"
+            prepared = tuple(_chunks(size, 4))
         elif isinstance(module, AudioEncoder):
-            rank, name = 2, "encoder.audio"
+            prepared = tuple(_chunks(size, 2))
         else:
             raise SetupError(
                 f"{type(module).__qualname__} is not constructed with a size"
             )
-        shapes = tuple(_chunks(size, rank))
-        context = execution_context(
-            module, int(stream), str(attention), allocate, f"{name}.{shapes}"
-        )
-        # The context is keyed by its inputs' shapes, as one numerical
-        # signature of the encoder.
-        context.prepare(shapes)
+        context = execution_context(module, int(stream), attention, scratch)
+        # A condition encoder's context is keyed by its inputs' shapes, as
+        # one numerical signature of the encoder.
+        context.prepare(prepared)
         self._bind(module, context)
+
+    def tower(self, path: str) -> EncoderRunner:
+        """A runner of the encoder at ``path`` below this runner's module.
+
+        The tower (a text encoder's ``"vision"`` patch encoder) computes
+        with this runner's execution context, whose operators were prepared
+        for the larger of the two encoders' calls; this runner releases it.
+        """
+        module = self._module.get_submodule(str(path))
+        if not isinstance(module, PatchEncoder):
+            raise SetupError(
+                f"{type(module).__qualname__} is not a patch encoder"
+            )
+        runner = type(self).__new__(type(self))
+        runner._bind(module, self._context)
+        return runner
 
     @classmethod
     def bound(
@@ -133,29 +156,23 @@ class EncoderRunner:
         """A runner of the encoder at ``path`` of a bound component.
 
         ``path`` is relative to the component's root (``""`` for the root
-        itself, ``"vision"`` for a text encoder's vision tower); the runner
-        computes with the component's execution context. An image model's
-        vision or latent encoder also takes ``loaded``, whose image policy
-        prepares resident images, and ``products``, the device's uint8
-        product arena in which its products are regions.
+        itself); the runner computes with the component's execution
+        context. It takes ``loaded``, whose image policy prepares resident
+        images, and ``products``, the device's uint8 product arena in which
+        its products are regions.
         """
-        # FIXME: a text encoder and its vision tower are still prepared by
-        # the component binding, which sizes their operators and declares
-        # their workspace before the caller allocates it. They take the
-        # constructor above once that binding is replaced by the caller's
-        # allocation function.
+        # FIXME: an image model's encoders are still prepared by the
+        # component binding, which sizes their operators and declares their
+        # workspace before the caller allocates it.
         context = prepared.context
         if context is None:
             raise ValueError("a runner requires a bound component")
         path = str(path)
         root = prepared.module
         module = root.get_submodule(path) if path else root
-        if not isinstance(
-            module, (TextEncoder, PatchEncoder, PatchAutoencoder)
-        ):
+        if not isinstance(module, (PatchEncoder, PatchAutoencoder)):
             raise SetupError(
-                f"{type(module).__qualname__} is not a text, patch or "
-                "latent encoder"
+                f"{type(module).__qualname__} is not a patch or latent encoder"
             )
         runner = cls.__new__(cls)
         runner._loaded = loaded
