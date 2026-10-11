@@ -197,6 +197,11 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             EncoderInfo::Vision(vision) => vision.output_dtype,
             EncoderInfo::Latent(latent) => latent.output_dtype,
             EncoderInfo::Text(text) => text.output_dtype,
+            EncoderInfo::Condition => {
+                return Err(uniserve_worker::Error::Invalid(
+                    "the harness encodes images".into(),
+                ));
+            }
         };
         let mut results = Vec::new();
         let mut next = 0;

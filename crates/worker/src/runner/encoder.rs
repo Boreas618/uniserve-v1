@@ -1,5 +1,5 @@
 //! Encoder runners: vision patch encoders, latent encoders, text encoders
-//! and a video model's condition latent encoders ([`LatentEncoding`]).
+//! and a video model's condition latent encoders.
 //!
 //! An [`EncoderRunner`] serves one encoder call of a bound component: the
 //! module at a path within the binding's root (the root itself, or a nested
@@ -239,6 +239,9 @@ pub enum EncoderInfo {
     Vision(VisionEncoder),
     Latent(LatentEncoder),
     Text(TextEncoder),
+    /// A video model's condition latent encoders (`VideoEncoder` and
+    /// `AudioEncoder`), whose Python runners serve one input shape each.
+    Condition,
 }
 
 impl EncoderInfo {
@@ -283,7 +286,6 @@ impl EncoderInfo {
                     rows: config.max_images.max(1),
                 },
             }),
-            Self::Latent(_) => None,
             Self::Text(_) => Some(TextSize {
                 tokens: config
                     .text_capacities
@@ -294,6 +296,7 @@ impl EncoderInfo {
                     .max(1),
                 rows: 1,
             }),
+            Self::Latent(_) | Self::Condition => None,
         }
     }
 
@@ -564,6 +567,11 @@ pub struct EncoderRunner {
     graphs: Option<GraphTable<EncoderGraph>>,
     /// Capture is enabled: graph pools were supplied at startup.
     capturing: bool,
+    /// The component binding a video model's text encoder owns, with its
+    /// workspaces; its vision tower computes with the same binding.
+    binding: Option<Box<(ComponentBinding, StreamWorkspaces)>>,
+    /// The Python runners of condition latent encoders.
+    conditions: Option<Box<Conditions>>,
 }
 
 fn allocate(device: Device, dtype: DType, shape: &[i64]) -> Result<StorageView> {
@@ -646,9 +654,9 @@ impl EncoderRunner {
                 }
             }
             EncoderInfo::Latent(_) => {}
-            EncoderInfo::Text(_) => {
+            EncoderInfo::Text(_) | EncoderInfo::Condition => {
                 return Err(Error::Invariant(
-                    "a text encoder is constructed without a product arena".into(),
+                    "only an image model's encoder is bound with a product arena".into(),
                 ));
             }
         }
@@ -681,6 +689,8 @@ impl EncoderRunner {
             text_capacities: Vec::new(),
             config: config.clone(),
             capturing: false,
+            binding: None,
+            conditions: None,
         })
     }
 
@@ -746,9 +756,9 @@ impl EncoderRunner {
                 )
             }
             EncoderInfo::Vision(_) => (None, None),
-            EncoderInfo::Latent(_) => {
+            EncoderInfo::Latent(_) | EncoderInfo::Condition => {
                 return Err(Error::Invariant(
-                    "a latent encoder is constructed with a product arena".into(),
+                    "only a text encoder and its vision tower share a binding".into(),
                 ));
             }
         };
@@ -765,6 +775,8 @@ impl EncoderRunner {
             text_capacities,
             config: config.clone(),
             capturing: false,
+            binding: None,
+            conditions: None,
         })
     }
 
@@ -891,7 +903,7 @@ impl EncoderRunner {
                     result.record(GraphMode::Eager);
                 }
             }
-            (EncoderInfo::Text(_), _) => {
+            (EncoderInfo::Text(_) | EncoderInfo::Condition, _) => {
                 return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
             }
         }
@@ -1259,14 +1271,28 @@ impl EncoderRunner {
         if let Some(table) = &mut self.graphs {
             table.seal();
         }
+        if let Some(binding) = &mut self.binding {
+            // Graphs captured the binding's workspaces: they stop growing.
+            binding.1.seal();
+        }
     }
 
-    /// Release the runner's graphs; the caller drained its stream. An
-    /// aborted close keeps them until the process exits.
+    /// Release the runner's graphs, then what it owns: the Python runners
+    /// of condition encoders and a text encoder's component binding. The
+    /// caller drained its stream. An aborted close keeps everything until
+    /// the process exits.
     pub fn close(&mut self, aborted: bool) -> Result<()> {
-        self.graphs
+        let mut result = self
+            .graphs
             .as_mut()
-            .map_or(Ok(()), |table| table.close(aborted))
+            .map_or(Ok(()), |table| table.close(aborted));
+        if let Some(conditions) = &mut self.conditions {
+            result = result.and(conditions.close(aborted));
+        }
+        if let Some(binding) = &mut self.binding {
+            result = result.and(binding.0.close(aborted));
+        }
+        result
     }
 }
 
@@ -1339,8 +1365,9 @@ fn grid_bytes(layout: &[[i64; 2]]) -> Vec<u8> {
         .collect()
 }
 
-/// One rank's condition latent encoders.
-pub(crate) struct LatentEncoding {
+/// The condition latent encoders of a video model: the Python runners of
+/// its video encoder and of its audio encoder, one per input shapes.
+struct Conditions {
     video: Methods,
     audio: Methods,
     /// Frames of each visual unit of a condition of some frame count.
@@ -1350,10 +1377,8 @@ pub(crate) struct LatentEncoding {
     audio_runners: HashMap<Vec<i64>, Handle>,
 }
 
-impl LatentEncoding {
-    /// `video` and `audio` are the encoders' module paths; the other
-    /// fields of the setups agree.
-    pub(crate) fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
+impl Conditions {
+    fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
         Ok(Self {
             unit_frames: video.interface.import(&format!("{ENCODER}.unit_frames"))?,
             video: Methods::new(&video, ENCODER, "encode")?,
@@ -1363,13 +1388,9 @@ impl LatentEncoding {
         })
     }
 
-    pub(crate) fn stream(&self) -> &Stream {
-        &self.video.stream
-    }
-
     /// Encode visual units, each `[pixel_offset, frames, width, height,
     /// unit]`, into consecutive rows of `out`.
-    pub(crate) fn encode_video(
+    fn encode_video(
         &mut self,
         pixels: &StorageView,
         units: &[[i64; 5]],
@@ -1407,7 +1428,7 @@ impl LatentEncoding {
 
     /// Encode audio tracks of `lengths` samples into consecutive rows of
     /// `out`.
-    pub(crate) fn encode_audio(
+    fn encode_audio(
         &mut self,
         samples: &StorageView,
         lengths: &[u64],
@@ -1466,20 +1487,11 @@ pub(crate) struct TextSetup<'a> {
     pub(crate) dtype: DType,
 }
 
-/// One rank's text encoder: the component binding, the prompt encoder and,
-/// for conditioned tasks, the vision tower bound with it. The encoders
-/// write prompt features and vision features into their products.
-pub(crate) struct TextEncoding {
-    binding: ComponentBinding,
-    /// The binding's workspaces; sealed once graphs captured them.
-    workspaces: StreamWorkspaces,
-    pub(crate) text: EncoderRunner,
-    pub(crate) vision: Option<EncoderRunner>,
-    stream: Stream,
-}
-
-impl TextEncoding {
-    pub(crate) fn new(setup: TextSetup<'_>) -> Result<Self> {
+impl EncoderRunner {
+    /// The runners of a video model's text encoder component: the prompt
+    /// encoder, which owns the component's binding, and, for conditioned
+    /// tasks, the vision tower bound with it.
+    pub(crate) fn text(setup: TextSetup<'_>) -> Result<(Self, Option<Self>)> {
         let TextSetup {
             interface,
             loaded,
@@ -1551,59 +1563,77 @@ impl TextEncoding {
         let binding = crate::model::bind::bind(interface, &mut workspaces, vec![prepared], None)?
             .pop()
             .ok_or_else(|| Error::Invariant("the text encoder was not bound".into()))?;
-        let text =
+        let mut text =
             EncoderRunner::over(interface, &binding, "", text_info, &config, stream.clone())?;
         let vision = vision_info
             .map(|info| {
                 EncoderRunner::over(interface, &binding, "vision", info, &config, stream.clone())
             })
             .transpose()?;
+        text.binding = Some(Box::new((binding, workspaces)));
+        Ok((text, vision))
+    }
+
+    /// The runner of a video model's condition latent encoders. `video`
+    /// and `audio` name the encoders' module paths; the other fields of
+    /// the setups agree.
+    pub(crate) fn conditions(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
+        let interface = video.interface;
         Ok(Self {
-            binding,
-            workspaces,
-            text,
-            vision,
-            stream,
+            owner: video.path.to_owned(),
+            info: EncoderInfo::Condition,
+            device: Device::Cuda(video.device),
+            stream: Some(video.stream.clone()),
+            methods: EncoderMethods::new(interface, Handle::none())?,
+            products: None,
+            packed: None,
+            text: None,
+            text_capacities: Vec::new(),
+            config: EncoderConfig::default(),
+            graphs: None,
+            capturing: false,
+            binding: None,
+            conditions: Some(Box::new(Conditions::new(video, audio)?)),
         })
     }
 
-    pub(crate) fn stream(&self) -> &Stream {
-        &self.stream
+    fn condition_encoders(&mut self) -> Result<&mut Conditions> {
+        self.conditions
+            .as_deref_mut()
+            .ok_or_else(|| Error::Invalid(format!("{} encodes no conditions", self.owner)))
     }
 
-    /// Warm the prompt capacities and, with `pool`, capture one graph per
-    /// capacity; `check` bounds graph storage after each capture.
-    pub(crate) fn capture(
+    /// Encode a condition's visual units, each `[pixel_offset, frames,
+    /// width, height, unit]`, into consecutive rows of `out`.
+    pub(crate) fn encode_condition_units(
         &mut self,
-        pool: Option<&Arc<GraphPool<Handle>>>,
-        check: &mut dyn FnMut() -> Result<()>,
+        pixels: &StorageView,
+        units: &[[i64; 5]],
+        out: &StorageView,
     ) -> Result<()> {
-        self.text.capture(pool, check)?;
-        self.stream.synchronize()?;
-        Ok(())
+        self.condition_encoders()?.encode_video(pixels, units, out)
     }
 
-    /// Refuse further captures and workspace growth.
-    pub(crate) fn seal(&mut self) {
-        self.text.seal();
-        if let Some(vision) = &mut self.vision {
-            vision.seal();
+    /// Encode condition audio tracks of `lengths` samples into consecutive
+    /// rows of `out`.
+    pub(crate) fn encode_condition_tracks(
+        &mut self,
+        samples: &StorageView,
+        lengths: &[u64],
+        out: &StorageView,
+    ) -> Result<()> {
+        self.condition_encoders()?
+            .encode_audio(samples, lengths, out)
+    }
+
+    /// The kernels the operators of a text encoder's binding or of the
+    /// condition encoders selected.
+    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+        match (&self.binding, &self.conditions) {
+            (Some(binding), _) => binding.0.kernels(),
+            (_, Some(conditions)) => conditions.kernels(label),
+            _ => Ok(Vec::new()),
         }
-        self.workspaces.seal();
-    }
-
-    /// The binding's selected kernels.
-    pub(crate) fn kernels(&self) -> Result<Vec<crate::ffi::Record>> {
-        self.binding.kernels()
-    }
-
-    /// Release the encoders' graphs, then the binding.
-    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
-        let mut result = self.text.close(aborted);
-        if let Some(vision) = &mut self.vision {
-            result = result.and(vision.close(aborted));
-        }
-        result.and(self.binding.close(aborted))
     }
 }
 
@@ -1688,7 +1718,7 @@ pub(crate) fn encode_text(
         video_grids: &video_grids,
         rows: read.value(),
     });
-    text.text.encode_text(&tokens, &write.view(), vision)?;
+    text.encode_text(&tokens, &write.view(), vision)?;
     publish(
         parts,
         batch,
@@ -1750,13 +1780,8 @@ pub(crate) fn encode_vision(
         placement,
     )?;
 
-    let text = &mut parts
+    let vision = parts
         .video
-        .text
-        .as_mut()
-        .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?
-        .runner;
-    let vision = text
         .vision
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank's text encoder reads no vision".into()))?;
@@ -1877,7 +1902,7 @@ pub(crate) fn encode_conditions(
             batch.calls[index].writes.push(write.clone());
             latent
                 .runner
-                .encode_video(pixels.value(), &units, &write.view())?;
+                .encode_condition_units(pixels.value(), &units, &write.view())?;
             publish_bound(parts, batch, call, index, &write, false)?;
         }
         "condition_audio_latents" => {
@@ -1917,7 +1942,7 @@ pub(crate) fn encode_conditions(
             batch.calls[index].writes.push(write.clone());
             latent
                 .runner
-                .encode_audio(samples.value(), &lengths, &write.view())?;
+                .encode_condition_tracks(samples.value(), &lengths, &write.view())?;
             publish_bound(parts, batch, call, index, &write, false)?;
         }
         other => {
