@@ -23,6 +23,9 @@
 
 pub(crate) mod image;
 pub(crate) mod image_model;
+pub(crate) mod runners;
+mod start;
+pub(crate) mod warmup;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Range;
@@ -38,9 +41,9 @@ use uniserve_ipc::{
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::{MediaBatch, Trajectories};
+use crate::executor::forward::batch::{Parts, latent_params, product_name, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, export};
 use crate::executor::forward::transfer::latents::Pool;
-use crate::executor::forward::video::{Parts, latent_params, stream_of};
 use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list, integers};
 use crate::model::components::{Capability, Declarations};
 use crate::model::interface::Interface;
@@ -1383,8 +1386,8 @@ pub(crate) fn prepare(
         })
         .collect::<Result<_>>()?;
     let denoiser = parts
+        .denoisers
         .video
-        .denoiser
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
     // The request's noise and the host sources its slot is initialized from.
@@ -1402,8 +1405,8 @@ pub(crate) fn prepare(
         let request = parts.video.request(slot, call.request_key)?;
         let latents = condition_latents(&request.conditions, &conditions)?;
         let denoiser = parts
+            .denoisers
             .video
-            .denoiser
             .as_ref()
             .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
         denoiser
@@ -1530,11 +1533,11 @@ pub(crate) fn denoise(
     let names: Vec<String> = call
         .outputs
         .iter()
-        .map(|output| parts.video.product_name(call, output).map(str::to_owned))
+        .map(|output| product_name(parts.info, call, output).map(str::to_owned))
         .collect::<Result<_>>()?;
     let denoiser = parts
+        .denoisers
         .video
-        .denoiser
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
     let (update, _) = denoiser.runner.denoise(id, slot, call, params)?;

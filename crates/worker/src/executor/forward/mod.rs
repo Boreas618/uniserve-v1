@@ -21,7 +21,6 @@ pub(crate) mod launch;
 pub(crate) mod placement;
 pub(crate) mod products;
 pub(crate) mod transfer;
-pub(crate) mod video;
 
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
 
@@ -125,7 +124,7 @@ pub(crate) fn execute(
         Media(VideoDecoding | AudioDecoding) => {
             let (plan, borrowed, state) = batch.media_parts();
             let mut parts = backend.media_parts()?;
-            video::execute(&mut parts, plan, borrowed, state)
+            batch::execute(&mut parts, plan, borrowed, state)
         }
         // Encoders and denoisers serve both image and video models; the
         // rank's model decides.
@@ -133,7 +132,7 @@ pub(crate) fn execute(
             if backend.serves_video() {
                 let (plan, borrowed, state) = batch.media_parts();
                 let mut parts = backend.media_parts()?;
-                video::execute(&mut parts, plan, borrowed, state)
+                batch::execute(&mut parts, plan, borrowed, state)
             } else {
                 image::execute(backend, batch, kind)
             }

@@ -9,15 +9,19 @@
 //! layouts it prepares; [`MediaPlan::admit`] resolves a request's exact size
 //! and the smallest prepared prompt capacity whose layout holds it.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, ConditionRole, VideoCondition};
-use uniserve_ipc::RequestKey;
+use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
+use crate::executor::lifecycle::RequestStorage;
 use crate::ffi::integer_list;
-use crate::host::mux::MuxSession;
+use crate::host::mux::{MuxConfig, MuxSession};
 use crate::runner::denoiser::VideoModel;
+use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::media::MediaRunner;
 use crate::{Error, Result};
 
 /// A layout descriptor: `[frames, width, height, text_rows, condition_rows]`.
@@ -483,6 +487,179 @@ impl VideoRequest {
     /// The longest media unit's frames.
     pub(crate) fn longest(&self) -> u32 {
         self.units.iter().copied().max().unwrap_or(0)
+    }
+}
+
+/// The video requests admitted on a rank, with the model and the plan that
+/// admit them.
+pub(crate) struct VideoRequests {
+    pub(crate) model: VideoModel,
+    pub(crate) plan: MediaPlan,
+    /// Admitted requests by slot.
+    requests: HashMap<usize, VideoRequest>,
+}
+
+impl VideoRequests {
+    pub(crate) fn new(model: VideoModel, plan: MediaPlan) -> Self {
+        Self {
+            model,
+            plan,
+            requests: HashMap::new(),
+        }
+    }
+
+    /// Admit a started video request: resolve its size and, on a denoising
+    /// rank, the layout `denoisers` holds for it.
+    pub(crate) fn admit(
+        &mut self,
+        admission: &NewRequest,
+        denoisers: &mut DenoiserRunners,
+    ) -> Result<()> {
+        let (Some(media), Some(video)) = (&admission.diffusion, &admission.video) else {
+            return Ok(());
+        };
+        let slot = admission.request_pool_idx as usize;
+        let canvas = Canvas {
+            width: media.width,
+            height: media.height,
+        };
+        if (video.task == uniserve_core::VideoTask::T2va) != video.conditions.is_empty() {
+            return Err(Error::Invalid(
+                "a video request's task disagrees with its conditions".into(),
+            ));
+        }
+        if !self.plan.frame_counts.contains(&media.num_frames)
+            || !self.plan.canvases.contains(&canvas)
+        {
+            return Err(Error::Invalid(
+                "media input exceeds the worker frame, canvas, conditioning or condition capacity"
+                    .into(),
+            ));
+        }
+        let units: Arc<[u32]> = self.model.unit_frames(media.num_frames)?.into();
+        if media.video_units as usize != units.len()
+            || media.num_inference_steps != self.model.facts.num_steps
+        {
+            return Err(Error::Invalid(
+                "video request has invalid computation bounds".into(),
+            ));
+        }
+        let conditions: Arc<[VideoCondition]> = video.conditions.clone().into();
+        let size = VideoSize {
+            frames: media.num_frames,
+            canvas,
+            tokens: admission.prompt_token_ids.len() as u32,
+            conditions: condition_shapes(&conditions),
+            spans: vision_spans(&video.text_tags).into(),
+        };
+        let mut request = VideoRequest {
+            key: admission.request_key,
+            frames: media.num_frames,
+            canvas,
+            tokens: admission
+                .prompt_token_ids
+                .iter()
+                .map(|&token| i64::from(token))
+                .collect(),
+            conditions,
+            admission: None,
+            layout: None,
+            audio_samples: self.model.track_samples(media.num_frames)?,
+            units,
+            seed: media.seed,
+            mux: None,
+        };
+        if denoisers.video.is_some() {
+            let admitted = self.plan.admit(&self.model, size)?;
+            request.layout = denoisers.admit(slot, &self.model, admitted.layout)?;
+            request.admission = Some(admitted);
+        }
+        self.requests.insert(slot, request);
+        Ok(())
+    }
+
+    pub(crate) fn request(&self, slot: usize, key: RequestKey) -> Result<&VideoRequest> {
+        self.requests
+            .get(&slot)
+            .filter(|request| request.key == key)
+            .ok_or_else(|| Error::Invalid("video call has no admitted media dimensions".into()))
+    }
+
+    /// The MP4 session of a request on the muxer rank, created on first use.
+    pub(crate) fn mux_session(
+        &mut self,
+        slot: usize,
+        key: RequestKey,
+        media: Option<&MediaRunner>,
+    ) -> Result<Arc<MuxSession>> {
+        let functions = media
+            .ok_or_else(|| Error::Invalid("this rank holds no muxer".into()))?
+            .mux
+            .clone();
+        let frame_rate = self.model.facts.frame_rate;
+        let audio_rate = self.model.facts.sample_rate;
+        let request = self
+            .requests
+            .get_mut(&slot)
+            .filter(|request| request.key == key)
+            .ok_or_else(|| Error::Invalid("video call has no admitted media dimensions".into()))?;
+        if let Some(session) = &request.mux {
+            return Ok(Arc::clone(session));
+        }
+        let config = MuxConfig::new(
+            request.canvas.width,
+            request.canvas.height,
+            frame_rate,
+            audio_rate,
+            Arc::clone(&request.units),
+        )?;
+        let session = Arc::new(MuxSession::new(config, functions));
+        request.mux = Some(Arc::clone(&session));
+        Ok(session)
+    }
+}
+
+impl RequestStorage for VideoRequests {
+    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+        // A request's state is created when its admission is installed.
+        Ok(())
+    }
+
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_requests(
+        &mut self,
+        _requests: &HashSet<RequestKey>,
+        _retained: &HashSet<BufferId>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn retirement_ready(
+        &mut self,
+        _buffers: &HashSet<BufferId>,
+        _requests: &HashSet<RequestKey>,
+        _retained: &HashSet<BufferId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
+        for slot in slots {
+            self.requests.remove(slot);
+        }
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn close(&mut self, _aborted: bool) -> Result<()> {
+        self.requests.clear();
+        Ok(())
     }
 }
 
