@@ -37,6 +37,7 @@ impl Vocab {
 pub(crate) enum Argument {
     Integer(i64),
     Integers(Vec<i64>),
+    Floats(Vec<f64>),
     Tensor(StorageView),
     Handle(Handle),
     None,
@@ -84,6 +85,9 @@ impl MethodCall {
                 Ok(match argument {
                     Argument::Integer(value) => Any::from(value),
                     Argument::Integers(values) => Any::from(Shape::from(values.as_slice())),
+                    Argument::Floats(values) => {
+                        Any::from(crate::ffi::list(values.into_iter().map(Any::from)))
+                    }
                     Argument::Tensor(view) => Any::from(view.to_tensor()?),
                     Argument::Handle(handle) => handle.to_any(),
                     Argument::None => Any::default(),
@@ -102,6 +106,8 @@ pub(crate) struct Methods {
     pub(crate) prefill: Function,
     pub(crate) plan_prefill: Function,
     pub(crate) sample: Function,
+    pub(crate) sample_top_k: Function,
+    pub(crate) sample_greedy: Function,
     pub(crate) verify: Function,
     pub(crate) prompt_logprobs: Function,
     pub(crate) commit: Function,
@@ -158,6 +164,8 @@ impl Methods {
             prefill: method("prefill")?,
             plan_prefill: method("plan_prefill")?,
             sample: method("sample")?,
+            sample_top_k: method("sample_top_k")?,
+            sample_greedy: method("sample_greedy")?,
             verify: method("verify")?,
             prompt_logprobs: method("prompt_logprobs")?,
             commit: method("commit")?,
