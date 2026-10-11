@@ -65,7 +65,6 @@ use crate::lane::Lanes;
 use crate::launch::Endpoint;
 use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
-use crate::model::image::ImageModel;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::model::{
@@ -78,6 +77,7 @@ use crate::profiling::range;
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::causal_lm::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
 use crate::runner::causal_lm::warmup::CausalLMWarmup;
+use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::denoiser::{VideoModel, placed_denoiser};
 use crate::service::Service;
 use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};

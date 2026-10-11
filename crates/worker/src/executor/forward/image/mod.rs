@@ -45,11 +45,11 @@ use crate::executor::{BatchResult, PendingOutput, Submission};
 use crate::ffi::Device;
 use crate::ffi::Handle;
 use crate::host::{HostLane, HostTask};
-use crate::model::image::{ImageModel, ImagePolicy};
 use crate::request::diffusion::Trajectories;
 use crate::runner::causal_lm::warmup::with_scratch;
 use crate::runner::decoder::{DecodeImage, DecoderRunner};
-use crate::runner::diffusion::image::{DenoiseRow, ImageDiffusion};
+use crate::runner::denoiser::image::{DenoiseRow, ImageDiffusion};
+use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
 use crate::runner::encoder::{EncoderRunner, PreparedImage, Tower};
 use crate::storage::KVCache;
 use crate::storage::memory::StorageView;
@@ -62,10 +62,11 @@ use latents::{ImageLatents, Pool};
 
 /// The image runtime of a rank.
 ///
-/// FIXME: as with the video runtime, the composition of the encoder,
-/// denoiser and decoder runners with a rank's image requests is the
-/// executor's and the request pool's. `executor/forward/token/` names this
-/// type and path.
+/// FIXME: as with the video runtime, this composition of the encoder,
+/// denoiser and decoder runners with a rank's image requests, latent
+/// pools, product arenas, host tasks and batch execution is the executor's
+/// and the request pool's; it stays here until `executor/backend.rs` holds
+/// runners and requests instead of one runtime per model family.
 pub(crate) struct ImageRuntime {
     facts: ImageModel,
     pub(crate) policy: ImagePolicy,
@@ -570,7 +571,7 @@ fn run(
             crate::runner::encoder::image_placement(runtime, plan)?
         }
         CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
-            crate::runner::diffusion::image::image_placement(runtime)?
+            crate::runner::denoiser::image::image_placement(runtime)?
         }
         CallKind::Media(MediaCall::ImageDecoding) => {
             crate::runner::decoder::image_placement(runtime, plan)?

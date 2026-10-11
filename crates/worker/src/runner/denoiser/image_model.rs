@@ -12,9 +12,9 @@
 //! `DenoiserRunner.guidance_prefix` (a guidance prefix's tokens, by the
 //! model's prompt framing and tokenizer).
 //!
-//! FIXME: these facts and host functions belong with the runners they
-//! describe. The file stays while `executor/forward/token/` names
-//! `model::image::ROPE_ADVANCE`.
+//! FIXME: one record carries the image processing, the denoiser's latent
+//! layout and the decoder's pixel range; each fact goes to the runner it
+//! describes with the fact records.
 
 use std::sync::Arc;
 
@@ -32,20 +32,20 @@ const DENOISER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
 /// Language positions a generated image spans in its conversation: its
 /// closing framing token sits this far past the opening one, and the
 /// request's logical position advances by it after the image.
-pub const ROPE_ADVANCE: u64 = 2;
+pub(crate) const ROPE_ADVANCE: u64 = 2;
 
 /// A model's image processing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageProcessing {
+pub(crate) struct ImageProcessing {
     /// The understanding tower (vision encoding) is declared.
-    pub vit: bool,
+    pub(crate) vit: bool,
     /// The latent tower (latent encoding) is declared.
-    pub vae: bool,
+    pub(crate) vae: bool,
     /// The understanding tower packs patch rows (its features' positions
     /// follow its patch grid).
-    pub patch_tower: bool,
-    pub pixel_dtype: DType,
-    pub injection: Option<FeatureInjection>,
+    pub(crate) patch_tower: bool,
+    pub(crate) pixel_dtype: DType,
+    pub(crate) injection: Option<FeatureInjection>,
 }
 
 /// An image denoiser's latent layout (`ImageDenoiser`).
@@ -130,11 +130,11 @@ impl ImageDenoiserLayout {
 
 /// The image facts of a loaded model.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ImageModel {
-    pub processing: Option<ImageProcessing>,
-    pub denoiser: Option<ImageDenoiserLayout>,
+pub(crate) struct ImageModel {
+    pub(crate) processing: Option<ImageProcessing>,
+    pub(crate) denoiser: Option<ImageDenoiserLayout>,
     /// The image decoder's `(low, high)` pixel range.
-    pub decoder_range: Option<(f32, f32)>,
+    pub(crate) decoder_range: Option<(f32, f32)>,
 }
 
 fn dtype(record: &Record, key: &str) -> Result<DType> {
@@ -164,7 +164,7 @@ fn token(record: &Record, key: &str) -> Result<Option<u32>> {
 
 impl ImageModel {
     /// Describe a loaded model's image facts.
-    pub fn describe(interface: &Interface, loaded: &Handle) -> Result<Self> {
+    pub(crate) fn describe(interface: &Interface, loaded: &Handle) -> Result<Self> {
         // FIXME: the image facts still cross as one record.
         let function = interface.import(&format!("{DENOISER}.describe"))?;
         Self::from_record(&Record::new(
@@ -268,7 +268,7 @@ impl ImageModel {
 
 /// The host functions of the image policy.
 #[derive(Clone)]
-pub struct ImagePolicy {
+pub(crate) struct ImagePolicy {
     loaded: Handle,
     prepare_input: Function,
     patch_grid: Function,
@@ -276,7 +276,7 @@ pub struct ImagePolicy {
 }
 
 impl ImagePolicy {
-    pub fn new(interface: &Interface, loaded: Handle) -> Result<Self> {
+    pub(crate) fn new(interface: &Interface, loaded: Handle) -> Result<Self> {
         Ok(Self {
             loaded,
             prepare_input: interface.import(&format!("{ENCODER}.prepare_image"))?,
@@ -285,18 +285,18 @@ impl ImagePolicy {
         })
     }
 
-    pub fn loaded(&self) -> &Handle {
+    pub(crate) fn loaded(&self) -> &Handle {
         &self.loaded
     }
 
     /// `EncoderRunner.prepare_image` (called from host lanes).
-    pub fn prepare_input(&self) -> &Function {
+    pub(crate) fn prepare_input(&self) -> &Function {
         &self.prepare_input
     }
 
     /// The vision tower's patch grid of an image; `input_images` is the
     /// request's input image count, `None` for a generated image.
-    pub fn patch_grid(
+    pub(crate) fn patch_grid(
         &self,
         height: u32,
         width: u32,
@@ -321,7 +321,7 @@ impl ImagePolicy {
 
     /// The prefix a guidance branch of `source` conditions on. Admitted
     /// negative tokens take precedence over the negative prompt.
-    pub fn guidance_prefix(
+    pub(crate) fn guidance_prefix(
         &self,
         source: BranchSource,
         image_prompt: &str,

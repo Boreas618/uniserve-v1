@@ -21,6 +21,9 @@
 //! prepares a transient layout, evaluated eagerly, which the least recently
 //! used transient layout makes room for once no request uses it.
 
+pub(crate) mod image;
+pub(crate) mod image_model;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;

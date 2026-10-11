@@ -6,7 +6,6 @@ pub(crate) mod canvas;
 pub(crate) mod causal_lm;
 pub(crate) mod decoder;
 pub(crate) mod denoiser;
-pub(crate) mod diffusion;
 pub(crate) mod encoder;
 pub(crate) mod media;
 pub(crate) mod vision;
