@@ -4,88 +4,23 @@ import pytest
 import torch
 import tvm_ffi
 
+from tests.python.fixtures.stub import load_model, read_config
 from uniserve_models import interface
 from uniserve_models.interface.errors import UnsupportedSetup
+from uniserve_models.runner import causal_lm
 
 pytestmark = pytest.mark.unit
-
-LOCAL = {
-    "ranks": [0],
-    "parallel_config": {
-        "tensor_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "sequence_parallel": {"kind": "local"},
-    },
-    "units_per_rank": 1,
-}
-IO = {
-    "format": "auto",
-    "mode": "eager",
-    "download_dir": None,
-    "num_threads": None,
-    "checksum_manifest": None,
-}
-ATTENTION = {
-    "workspace_size": 1 << 20,
-    "decode_backend": "fa2",
-    "prefill_backend": "auto",
-    "disable_split_kv": False,
-    "decode_split_tile_size": None,
-    "prefill_split_tile_size": None,
-    "use_tensor_core": None,
-}
-
-
-def describe(table, **overrides):
-    # Requests arrive as TVM-FFI containers, as the worker sends them.
-    request = {
-        "stub": True,
-        "path": None,
-        "base_model": None,
-        "io": IO,
-        "device": "cpu",
-        "generation_device": None,
-        "components": {"model": LOCAL},
-        "rank": 0,
-        "role": "model",
-        "expert_split": False,
-        **overrides,
-    }
-    return table["model.describe"](tvm_ffi.convert(request))
 
 
 @pytest.fixture(scope="module")
 def loaded():
     table = interface.table()
-    description, _ = describe(table)
-    resolved = table["model.resolve"](
-        description,
-        {
-            "modules": [],
-            "exclude_modules": [],
-            "quantization": "{}",
-            "model_dtype": "bfloat16",
-        },
-    )
-    return table, table["model.load"](
-        resolved,
-        tvm_ffi.convert(
-            {
-                "device": "cpu",
-                "generation_device": None,
-                "role": "model",
-                "host_only": False,
-                "meshes": [],
-                "experts": None,
-                "attention_backend": "auto",
-                "attention": ATTENTION,
-            }
-        ),
-    )
+    description, _ = read_config()
+    return table, load_model(description)
 
 
 def test_description_reports_calls_with_capability_tags():
-    _, info = describe(interface.table())
+    _, info = read_config()
     assert info["model_name"] == "uniserve_models.stub.model.Model"
     entries = {entry["name"]: entry["calls"] for entry in info["entries"]}
     assert set(entries) == {"model", "vision_encoder"}
@@ -105,13 +40,13 @@ def test_description_reports_calls_with_capability_tags():
 
 def test_a_generation_device_places_the_flow_route():
     # The stub's image denoiser and decoder form a flow route to place.
-    _, info = describe(interface.table(), generation_device="cpu")
+    _, info = read_config(generation_device="cpu")
     assert info["entries"]
 
 
 def test_split_experts_require_routed_expert_layers():
     with pytest.raises(UnsupportedSetup, match="routed expert layers"):
-        describe(interface.table(), expert_split=True)
+        read_config(expert_split=True)
 
 
 def test_facts_report_text_geometry_and_formats(loaded):
@@ -121,15 +56,12 @@ def test_facts_report_text_geometry_and_formats(loaded):
         {
             "max_sequence_tokens": 64,
             "model_dtype": "bfloat16",
-            "kv_cache_dtype": None,
             "role": "model",
-            "deployment_components": ["model"],
-            "max_condition_rows": 0,
         },
     )
     assert facts["attention_backend"] == "torch"
-    assert facts["vocab_size"] == 151671
-    assert facts["hidden_size"] == 4
+    assert causal_lm.vocab_size(model) == 151671
+    assert causal_lm.hidden_size(model) == 4
     assert facts["weight_formats"] == ["dense"]
     assert facts["outputs"] == {}
     assert facts["image_flow"] == {

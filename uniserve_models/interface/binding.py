@@ -56,13 +56,10 @@ def prepare(loaded, request: Mapping[str, Any]) -> list[Any]:
 
     Returns:
         ``[prepared, {"workspaces": [{"name", "role", "dtype", "shape",
-        "host", "symmetric", "device"}]}]``. ``role`` names a shared
-        scratch area (one backing per stream sized for every binding
-        prepared on it); ``None`` marks storage owned by this binding alone.
-        ``symmetric`` lists the process ranks, in member order, across which
-        a field must be peer-mapped (``None`` for local storage); its peer
-        views are bound as ``{name}.peer{index}``. ``device`` is the CUDA
-        ordinal, ``-1`` for CPU.
+        "host", "device"}]}]``. ``role`` names a shared scratch area (one
+        backing per stream sized for every binding prepared on it);
+        ``None`` marks storage owned by this binding alone. ``device`` is
+        the CUDA ordinal, ``-1`` for CPU.
     """
     path = str(request["path"])
     module = loaded.module.get_submodule(path) if path else loaded.module
@@ -108,9 +105,6 @@ def prepare(loaded, request: Mapping[str, Any]) -> list[Any]:
                 "dtype": str(item.dtype).removeprefix("torch."),
                 "shape": list(item.shape),
                 "host": item.host,
-                "symmetric": None
-                if item.symmetric is None
-                else list(item.symmetric),
                 "device": -1
                 if item.device.type != "cuda"
                 else (item.device.index or 0),

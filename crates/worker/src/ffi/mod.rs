@@ -17,12 +17,10 @@ mod function;
 mod handle;
 mod interpreter;
 mod record;
-mod region;
 
 pub use dlpack::{Backing, DType, Device, contiguous_strides, export};
 pub use function::{DeferredCall, Function, Functions};
 pub use handle::Handle;
 pub use interpreter::{Interpreter, cooperative};
 pub use record::{Fields, Record, integer_list, integers, is_none, json, list, strings, to_json};
-pub use region::Region;
 pub use tvm_ffi::{Array, Map, Shape, Tensor};
