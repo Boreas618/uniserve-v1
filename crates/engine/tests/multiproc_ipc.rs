@@ -1323,6 +1323,13 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
 struct PausedProcess(Option<i32>);
 
 impl PausedProcess {
+    /// Stops the process and returns once every one of its threads has
+    /// stopped.
+    ///
+    /// `kill` returns when the signal is queued. The kernel hands it to one
+    /// thread, and the others keep running until that thread starts the group
+    /// stop, so a rank whose channel is served off its main thread could
+    /// still answer a request sent right after `kill`.
     fn new(pid: i32) -> anyhow::Result<Self> {
         anyhow::ensure!(pid > 0, "worker process id must be positive");
         anyhow::ensure!(
@@ -1330,7 +1337,17 @@ impl PausedProcess {
             "failed to pause the selected worker: {}",
             std::io::Error::last_os_error()
         );
-        Ok(Self(Some(pid)))
+        let paused = Self(Some(pid));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !all_threads_stopped(pid)? {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "worker process {pid} did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(paused)
     }
 
     fn resume(&mut self) -> anyhow::Result<()> {
@@ -1356,10 +1373,32 @@ impl PausedProcess {
         Ok(())
     }
 }
+
 impl Drop for PausedProcess {
     fn drop(&mut self) {
         let _ = self.resume();
     }
+}
+
+/// Whether every thread of process `pid` is in the stopped state (`T` in
+/// `/proc/<pid>/task/<tid>/stat`).
+fn all_threads_stopped(pid: i32) -> anyhow::Result<bool> {
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+        // A thread that exited between the listing and the read has no file.
+        let Ok(stat) = std::fs::read_to_string(task?.path().join("stat")) else {
+            continue;
+        };
+        // The state follows the command name, which is parenthesized and may
+        // itself contain spaces and parentheses.
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .context("malformed task stat")?;
+        if state != "T" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Spawns the default two-rank stub group from `rank_group_args`.
