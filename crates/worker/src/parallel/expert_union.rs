@@ -56,7 +56,7 @@ use super::{ExpertParallel, ExpertTransport, MicrobatchLanes, yield_microbatch};
 use crate::config::{Device, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
-use crate::ffi::{Backing, Fields, Function, Handle, Record, integer_list};
+use crate::ffi::{Backing, Fields, Function, Handle, integer_list};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::interface::Interface;
@@ -355,25 +355,29 @@ impl ExpertUnion {
         };
         let functions = ExpertFunctions::import(start.interface)?;
 
-        let layers: tvm_ffi::Array<Any> = functions.layers.call_as(&[
-            start.model.handle().view(),
-            (&Any::from(i64::from(disaggregated))).into(),
+        // `num_experts, top_k, hidden_size` of each layer, back to back.
+        let sizes = functions.layers.call_values(&[
+            start.model.handle().to_any(),
+            Any::from(i64::from(disaggregated)),
         ])?;
-        let layers = layers
+        let sizes = crate::ffi::integers(sizes)
+            .map_err(|error| Error::numerical(&format!("{MODULE}.layers"), &error))?;
+        let layers: Vec<ExpertLayer> = sizes
+            .as_chunks::<3>()
+            .0
             .iter()
-            .enumerate()
-            .map(|(index, layer)| Record::new(format!("{MODULE}.layers[{index}]"), layer))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|&[num_experts, top_k, hidden_size]| ExpertLayer {
+                num_experts: num_experts as usize,
+                top_k: top_k as usize,
+                hidden_size: hidden_size as usize,
+            })
+            .collect();
         let microbatches = config.expert_microbatches;
         if layers.is_empty() {
             return Err(Error::Unsupported(
                 "expert parallelism requires routed expert layers that exchange tokens".into(),
             ));
         }
-        let layers = layers
-            .iter()
-            .map(ExpertLayer::from_record)
-            .collect::<Result<Vec<_>>>()?;
         if layers.iter().any(|layer| *layer != layers[0]) {
             return Err(Error::Unsupported(
                 "expert-parallel layers share one expert count, top-k and hidden size".into(),

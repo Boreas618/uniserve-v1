@@ -321,9 +321,7 @@ impl CausalLMRunners {
                 experts.parallel().max_tokens()
             )));
         }
-        let vocab = startup.facts.vocab_size.ok_or_else(|| {
-            Error::Interface("a causal language model reports no vocabulary".into())
-        })?;
+        let vocab = methods::vocab_size(startup.interface, startup.model.handle())?;
         let dtype = model_dtype(&config.model_dtype)?;
 
         // The attention layers' view of the pool, bound once.
@@ -482,7 +480,7 @@ impl CausalLMRunners {
 
             // The runner's vocabulary shard sizes its logits columns.
             let shard = methods::vocab(&methods)?;
-            let hidden = methods::hidden_size(&methods)?;
+            let hidden = methods::hidden_size(startup.interface, startup.model.handle())?;
             let plans_attention = methods::plans_attention(&methods)?;
             if shard.size != vocab {
                 return Err(Error::Interface(format!(
@@ -580,19 +578,24 @@ impl CausalLMRunners {
 
 /// Device bytes the causal LM runners allocate beside the KV pool.
 pub(crate) fn reserved_bytes(
+    interface: &Interface,
+    model: &LoadedModel,
     config: &WorkerConfig,
     request_slots: usize,
     cache: &KVPlan,
     facts: &ModelFacts,
     streams: usize,
 ) -> Result<u64> {
-    let Some(vocab) = facts.vocab_size else {
+    // A rank without a causal language model reports no vocabulary.
+    let vocab = methods::vocab_size(interface, model.handle())?;
+    if vocab == 0 {
         return Ok(0);
-    };
+    }
+    let hidden = methods::hidden_size(interface, model.handle())?;
     let cuda = config.device.is_cuda();
     let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
     let dtype = model_dtype(&config.model_dtype)?;
-    let mut dimensions = bounds.dimensions(vocab, vocab, facts.hidden_size.unwrap_or(0), dtype);
+    let mut dimensions = bounds.dimensions(vocab, vocab, hidden, dtype);
     dimensions.embeddings = facts.image_processor;
     Ok(InputBuffers::bytes(&dimensions) * streams.max(1) as u64
         + DecodeState::bytes(request_slots, vocab, dtype))

@@ -11,7 +11,7 @@ use crate::{Error, Result};
 const RUNNER: &str = "uniserve_models.runner.causal_lm.CausalLMRunner";
 
 /// The methods of the Python runner the rank calls.
-const METHODS: [&str; 11] = [
+const METHODS: [&str; 10] = [
     "decode",
     "plan_decode",
     "prefill",
@@ -21,7 +21,6 @@ const METHODS: [&str; 11] = [
     "prompt_logprobs",
     "commit",
     "vocab",
-    "hidden_size",
     "plans_attention",
 ];
 
@@ -76,6 +75,27 @@ pub(crate) fn construct(interface: &Interface, construction: &Construction<'_>) 
     Methods::construct(interface, RUNNER, &METHODS, arguments)
 }
 
+/// A size of the loaded model's causal LM, read before a runner exists:
+/// the library function `name` over the loaded model.
+fn size(interface: &Interface, loaded: &Handle, name: &str) -> Result<usize> {
+    let function = format!("uniserve_models.runner.causal_lm.{name}");
+    let value = interface.import(&function)?.call(&[loaded.view()])?;
+    let value = i64::try_from(value).map_err(|error| Error::numerical(&function, &error))?;
+    Ok(value as usize)
+}
+
+/// Real vocabulary entries of the loaded model's causal LM; zero on a rank
+/// without one.
+pub(crate) fn vocab_size(interface: &Interface, loaded: &Handle) -> Result<usize> {
+    size(interface, loaded, "vocab_size")
+}
+
+/// The hidden width of the loaded model's causal LM; zero on a rank without
+/// one.
+pub(crate) fn hidden_size(interface: &Interface, loaded: &Handle) -> Result<usize> {
+    size(interface, loaded, "hidden_size")
+}
+
 /// The vocabulary shard of this rank's logits.
 pub(crate) fn vocab(methods: &Methods) -> Result<Vocab> {
     let malformed = || Error::Interface(format!("{RUNNER}.vocab returns four integers"));
@@ -89,13 +109,6 @@ pub(crate) fn vocab(methods: &Methods) -> Result<Vocab> {
         start: start as usize,
         stop: stop as usize,
     })
-}
-
-/// The width of the model's hidden states.
-pub(crate) fn hidden_size(methods: &Methods) -> Result<usize> {
-    let size = i64::try_from(methods.call("hidden_size", Vec::new())?.invoke()?)
-        .map_err(|_| Error::Interface(format!("{RUNNER}.hidden_size returns an integer")))?;
-    Ok(size as usize)
 }
 
 /// Whether an attention operator plans each launch on the host, so a
