@@ -16,6 +16,7 @@ configuration alone, so a rank without the decoders' weights asks them too.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, cast
 
@@ -492,9 +493,13 @@ class DecoderRunner:
                 raise ValueError("audio units disagree with their output rows")
             torch.cat(outputs, out=out)
 
-    def kernels(self) -> list[dict]:
-        """The kernels the runner's operators selected."""
-        return list(self._context.kernels())
+    def kernels(self) -> str:
+        """The kernels the runner's operators selected.
+
+        A JSON array of records, one per prepared operator, each with its
+        layer ``path``.
+        """
+        return json.dumps(list(self._context.kernels()))
 
     def close(self, aborted: bool) -> None:
         """Release the runner's operators and workspace.

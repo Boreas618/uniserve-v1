@@ -858,7 +858,7 @@ impl Worker {
             .map_err(phase("warmup"))?
         {
             records
-                .add(&label, &device, &kernels)
+                .add_listings(&label, &device, &kernels)
                 .map_err(phase("warmup"))?;
         }
         if executor.backend().serves_video() {
@@ -874,7 +874,7 @@ impl Worker {
             );
             for (label, kernels) in video {
                 records
-                    .add(&label, &self.config.device.to_string(), &kernels)
+                    .add_listings(&label, &self.config.device.to_string(), &kernels)
                     .map_err(phase("warmup"))?;
             }
         }

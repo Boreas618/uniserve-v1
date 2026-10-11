@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 use super::{DecodeImage, DecoderRunner, Segment, TrackUnits, UnitShape};
 use crate::Result;
-use crate::ffi::Record;
 use crate::request::video::{MediaPlan, VideoSize};
 use crate::runner::component::Component;
 use crate::runner::denoiser::VideoModel;
@@ -181,13 +180,13 @@ impl DecoderRunners {
     }
 
     /// The kernels the decoders' operators selected.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<Record>)>> {
+    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<String>)>> {
         let mut kernels = Vec::new();
         if let Some(decoder) = &self.video {
-            kernels.push((decoder.name.clone(), decoder.runner.kernels(&decoder.name)?));
+            kernels.push((decoder.name.clone(), decoder.runner.kernels()?));
         }
         if let Some(audio) = &self.audio {
-            kernels.push((audio.name.clone(), audio.runner.kernels(&audio.name)?));
+            kernels.push((audio.name.clone(), audio.runner.kernels()?));
         }
         Ok(kernels)
     }

@@ -140,3 +140,90 @@ impl Methods {
         }
     }
 }
+
+/// A runner class whose Python runners are constructed one per size, after
+/// startup resolved everything they are reached through: the constructor,
+/// the arguments every construction takes first and the methods each
+/// runner is called with.
+pub(crate) struct RunnerClass {
+    class: &'static str,
+    constructor: Function,
+    fixed: Vec<Argument>,
+    graphs: GraphFunctions,
+    /// The forward method of the class.
+    pub(crate) forward: Function,
+    kernels: Function,
+    close: Function,
+}
+
+impl RunnerClass {
+    /// The class at import path `class`, whose forward method is `forward`
+    /// and whose constructor takes `fixed` before each runner's size.
+    pub(crate) fn new(
+        interface: &Interface,
+        class: &'static str,
+        forward: &str,
+        fixed: Vec<Argument>,
+    ) -> Result<Self> {
+        let method = |name: &str| interface.import(&format!("{class}.{name}"));
+        Ok(Self {
+            class,
+            constructor: interface.import(class)?,
+            fixed,
+            graphs: GraphFunctions::from_interface(interface)?,
+            forward: method(forward)?,
+            kernels: method("kernels")?,
+            close: method("close")?,
+        })
+    }
+
+    /// Construct the Python runner `class(*fixed, *arguments)`.
+    pub(crate) fn construct(&self, arguments: Vec<Argument>) -> Result<Methods> {
+        let mut all = self.fixed.clone();
+        all.extend(arguments);
+        let runner = MethodCall {
+            function: self.constructor.clone(),
+            arguments: all,
+        }
+        .invoke()?;
+        Ok(Methods {
+            class: self.class,
+            runner: Handle::new(runner)?,
+            graphs: self.graphs.clone(),
+        })
+    }
+
+    /// The kernels the operators of `runners` selected: each runner's
+    /// listing, a JSON array of records.
+    pub(crate) fn kernels<'a>(
+        &self,
+        runners: impl IntoIterator<Item = &'a Methods>,
+    ) -> Result<Vec<String>> {
+        runners
+            .into_iter()
+            .map(|runner| kernel_listing(&self.kernels, runner.runner()))
+            .collect()
+    }
+
+    /// Close `runners`; an aborted close keeps what device work may still
+    /// address.
+    pub(crate) fn close<'a>(
+        &self,
+        aborted: bool,
+        runners: impl IntoIterator<Item = &'a Methods>,
+    ) -> Result<()> {
+        let flag = Any::from(aborted);
+        let mut result = Ok(());
+        for runner in runners {
+            result = result.and(self.close.invoke(&[runner.runner().view(), (&flag).into()]));
+        }
+        result
+    }
+}
+
+/// The kernel listing of a Python runner: the JSON array of records its
+/// `kernels` method returns.
+pub(crate) fn kernel_listing(kernels: &Function, runner: &Handle) -> Result<String> {
+    let listing: tvm_ffi::String = kernels.call_as(&[runner.view()])?;
+    Ok(listing.as_str().to_owned())
+}
