@@ -16,11 +16,11 @@ use std::time::Instant;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{Batch as BatchPlan, BufferId, CallStatus, DType, RequestKey, TensorRef};
 
-use super::super::image::ImageRuntime;
 use super::super::launch::{lock, read_flag, reports_output, seal};
 use super::super::products::Publications;
 use super::kv::{self, Installation, Published};
 use crate::executor::PendingOutput;
+use crate::executor::forward::batch::image::ImageParts;
 use crate::ffi::Device;
 use crate::request::RequestPool;
 use crate::storage::{
@@ -298,7 +298,7 @@ impl<'a> TransferBatch<'a> {
     /// Retire every reservation after a failure before the commit point;
     /// storage returns once the fences recorded here complete. Trajectory
     /// versions exported from `image`'s latent pool are released from it.
-    pub(super) fn discard(&mut self, image: Option<&mut ImageRuntime>) -> Result<()> {
+    pub(super) fn discard(&mut self, image: Option<&mut ImageParts<'_>>) -> Result<()> {
         let revoked = self.publications.revoke();
         let exported = std::mem::take(&mut self.latent_exports);
         let released = match (exported.is_empty(), image) {

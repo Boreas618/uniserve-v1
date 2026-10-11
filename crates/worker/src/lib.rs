@@ -57,10 +57,11 @@ pub use runner::attention::{
     AttentionCapacity, AttentionColumns, AttentionGeometry, ROW_SECTIONS, pack_rows,
 };
 pub use runner::decoder::{DecodeImage, DecoderRunner};
-pub use runner::diffusion::image::{
+pub use runner::denoiser::image::{
     ConditionRow, DenoiseRow, DiffusionCapacity, DiffusionShape, DiffusionStorage, ImageDiffusion,
     IntegrateRow, Predicted,
 };
+pub use runner::denoiser::image_model::ImageDenoiserLayout;
 pub use runner::encoder::{
     Encoded, EncoderConfig, EncoderGraph, EncoderInfo, EncoderRunner, LatentEncoder,
     MAX_PACKED_IMAGES, PreparedImage, PromptVision, TextEncoder, Tower, VisionEncoder,

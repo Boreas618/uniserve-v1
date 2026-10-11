@@ -726,3 +726,49 @@ impl OutputPool {
         self.available.clear();
     }
 }
+
+impl crate::executor::lifecycle::RequestStorage for OutputPool {
+    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_buffers(
+        &mut self,
+        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_requests(
+        &mut self,
+        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
+        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn retirement_ready(
+        &mut self,
+        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
+        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn retire_slots(&mut self, _slots: &[usize]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return the storage of retired leases to the pool.
+    fn reap(&mut self) -> Result<()> {
+        OutputPool::reap(self);
+        Ok(())
+    }
+
+    fn close(&mut self, _aborted: bool) -> Result<()> {
+        self.begin_close();
+        self.finish_close();
+        Ok(())
+    }
+}

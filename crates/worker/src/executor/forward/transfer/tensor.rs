@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 use uniserve_ipc::{BufferAllocation, BufferId, DType as ProductDType, TensorRef};
 
-use super::super::image::ImageRuntime;
 use super::batch::TransferBatch;
 use super::latents;
+use crate::executor::forward::batch::image::ImageParts;
 use crate::ffi::Device;
 use crate::storage::memory::parse_dtype;
 use crate::storage::{OutputPlacement, ProductBuffer};
@@ -42,7 +42,7 @@ impl TransferBatch<'_> {
     /// Copy every active call's input product into its output product and
     /// publish the copy; export trajectory transfers' versions from the
     /// latent pool of `image`.
-    pub(super) fn copy_products(&mut self, image: Option<&mut ImageRuntime>) -> Result<()> {
+    pub(super) fn copy_products(&mut self, image: Option<&mut ImageParts<'_>>) -> Result<()> {
         let plan = self.plan;
         let target = self.target();
         let allocations: HashMap<BufferId, BufferAllocation> = plan
@@ -119,7 +119,7 @@ impl TransferBatch<'_> {
     /// Export the committed trajectory version each of `calls` names (its
     /// latent input) as its latent output, ordered after the latent pool's
     /// previous user on the batch's stream.
-    fn export_trajectories(&mut self, image: &mut ImageRuntime, calls: &[usize]) -> Result<()> {
+    fn export_trajectories(&mut self, image: &mut ImageParts<'_>, calls: &[usize]) -> Result<()> {
         let plan = self.plan;
         let stream = self.stream.as_ref();
         image.enter_latents(stream)?;

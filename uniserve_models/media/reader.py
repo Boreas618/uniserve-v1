@@ -22,6 +22,7 @@ server probed fails the request instead of misaligning its rows.
 from __future__ import annotations
 
 import io
+from collections.abc import Sequence
 from typing import BinaryIO
 
 import numpy as np
@@ -30,12 +31,19 @@ import torch
 __all__ = ["read_audio", "read_image"]
 
 
+def _encoded(source) -> bytes:
+    """The encoded bytes a caller holds as bytes or as a uint8 CPU tensor."""
+    if isinstance(source, torch.Tensor):
+        return source.numpy().tobytes()
+    return bytes(source)
+
+
 def read_image(
-    data: bytes | memoryview,
-    *,
-    resized: tuple[int, int],
-    window: tuple[int, int, int, int],
-) -> np.ndarray:
+    data: bytes | memoryview | torch.Tensor,
+    resized: Sequence[int],
+    window: Sequence[int],
+    out: torch.Tensor | None = None,
+) -> np.ndarray | None:
     """Decode an image and put it on its planned raster.
 
     ``resized`` is the ``(width, height)`` the decoded image is resized to,
@@ -43,14 +51,18 @@ def read_image(
     image.
 
     Returns:
-        ``[1, height, width, 3]`` uint8 RGB of the kept window.
+        ``[1, height, width, 3]`` uint8 RGB of the kept window, or None
+        after writing it into ``out`` when the caller supplies one.
 
     Raises:
-        ValueError: The image decodes to another raster than planned.
+        ValueError: The image decodes to another raster than planned, or
+            ``out`` has another shape.
     """
     from PIL import Image, ImageOps
 
-    image = ImageOps.exif_transpose(Image.open(io.BytesIO(bytes(data))))
+    resized = (int(resized[0]), int(resized[1]))
+    window = tuple(int(extent) for extent in window)
+    image = ImageOps.exif_transpose(Image.open(io.BytesIO(_encoded(data))))
     image = image.convert("RGB")
     # Pillow returns a copy for a resize to the image's own size, so an
     # image already at its raster passes through unchanged.
@@ -63,18 +75,23 @@ def read_image(
     pixels = np.array(image)
     if pixels.shape != (height, width, 3):
         raise ValueError("a condition image decoded to another raster")
-    return pixels[None]
+    if out is None:
+        return pixels[None]
+    if tuple(out.shape) != (1, height, width, 3):
+        raise ValueError("a condition image's rows disagree with its plan")
+    out.copy_(torch.from_numpy(pixels[None]))
+    return None
 
 
 def read_audio(
-    source: bytes | memoryview | BinaryIO,
-    *,
+    source: bytes | memoryview | torch.Tensor | BinaryIO,
     native_rate: int,
     start: int,
     source_samples: int,
     samples: int,
     rate: int,
-) -> torch.Tensor:
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
     """Decode an audio track's kept samples at the model's rate.
 
     ``source`` holds the container's encoded bytes or an open binary file;
@@ -83,17 +100,19 @@ def read_audio(
     stereo, and one resample brings the track to ``rate``.
 
     Returns:
-        ``[samples, 2]`` FP32 sample-major PCM.
+        ``[samples, 2]`` FP32 sample-major PCM, or None after writing it
+        into ``out`` when the caller supplies one.
 
     Raises:
         ValueError: The track has no audio stream, another rate, too few
-            samples, or resamples to another count.
+            samples, or resamples to another count, or ``out`` has another
+            shape.
     """
     import av
 
     container = av.open(
-        io.BytesIO(bytes(source))
-        if isinstance(source, (bytes, memoryview))
+        io.BytesIO(_encoded(source))
+        if isinstance(source, (bytes, memoryview, torch.Tensor))
         else source,
         mode="r",
     )
@@ -139,4 +158,10 @@ def read_audio(
             f"an audio track resampled to {waveform.shape[-1]} samples, "
             f"{samples} were planned"
         )
-    return waveform.transpose(0, 1).contiguous()
+    waveform = waveform.transpose(0, 1).contiguous()
+    if out is None:
+        return waveform
+    if out.shape != waveform.shape:
+        raise ValueError("a condition track's rows disagree with its plan")
+    out.copy_(waveform)
+    return None

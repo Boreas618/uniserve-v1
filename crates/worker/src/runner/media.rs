@@ -1,33 +1,99 @@
-//! The host media runtime: condition reading, video unit and audio encoding
-//! and MP4 assembly on host ranks.
+//! Host media on CPU ranks: condition reading, video unit and audio encoding
+//! and MP4 assembly.
 //!
-//! Host calls run as tasks on the rank's host lane (see
+//! Host media has no model. [`MediaRunner`] calls the functions of the
+//! Python library's `uniserve_models.media` (and the model's patch packing)
+//! by import path. Host calls run as tasks on the rank's host lane (see
 //! [`crate::host::task`]); execution reserves their outputs, configures and
 //! submits the tasks and commits the batch. Their outputs stay deferred
 //! until the tasks finish, when the batch publishes them (the decoded
 //! condition products, the encoded unit rows) or delivers the finished MP4
 //! before its result is sent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use uniserve_core::ComponentConfig;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, CallKind, DimBound, MediaCall, TensorRef,
     TransferTransport,
 };
 
-use super::batch::{MediaBatch, Publication, request_slots};
-use super::video::{Parts, units};
 use crate::error::WorkerError;
+use crate::executor::forward::batch::{MediaBatch, Publication, request_slots};
+use crate::executor::forward::batch::{Parts, open, product_name};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, supplied};
-use crate::ffi::Device;
-use crate::host::HostTask;
-use crate::host::mux::read_unit;
-use crate::host::reader::ConditionProducts;
+use crate::ffi::{Device, Function, Handle};
+use crate::host::mux::{MuxFunctions, read_unit};
+use crate::host::reader::{ConditionProducts, ConditionReader, ReaderFunctions};
 use crate::host::task::{MediaTask, UnitFrames};
+use crate::host::{HostLane, HostTask};
+use crate::model::interface::Interface;
+use crate::runner::component::units;
 use crate::transfer::TransportKind;
 use crate::{Error, ProductBuffer, Result};
+
+/// The host media of a rank: the library functions its calls run and the
+/// lane they run on.
+pub(crate) struct MediaRunner {
+    pub(crate) reader: Option<Arc<ConditionReader>>,
+    /// `uniserve_models.media.codec.encode_video_unit`.
+    encode_video: Function,
+    /// `uniserve_models.media.codec.encode_audio_track`.
+    encode_audio: Function,
+    pub(crate) mux: MuxFunctions,
+    pub(crate) lane: HostLane<MediaTask>,
+    /// Host component placements, by name.
+    components: BTreeMap<String, ComponentConfig>,
+}
+
+impl MediaRunner {
+    /// The runner of the host `components` placed on this rank. A rank
+    /// placing the media reader reads conditions with `ffmpeg` at the
+    /// model's `frame_rate`; `capacity` bounds the lane's queued tasks.
+    pub(crate) fn new(
+        interface: &Interface,
+        loaded: &Handle,
+        components: BTreeMap<String, ComponentConfig>,
+        ffmpeg: String,
+        frame_rate: u32,
+        capacity: usize,
+    ) -> Result<Self> {
+        let reader = if components.contains_key("media_reader") {
+            let functions = ReaderFunctions::new(interface, loaded)?;
+            Some(Arc::new(ConditionReader::new(
+                functions, ffmpeg, frame_rate,
+            )))
+        } else {
+            None
+        };
+        Ok(Self {
+            reader,
+            encode_video: interface.import("uniserve_models.media.codec.encode_video_unit")?,
+            encode_audio: interface.import("uniserve_models.media.codec.encode_audio_track")?,
+            mux: MuxFunctions::new(interface)?,
+            lane: HostLane::new(capacity, 1, "uniserve-media")?,
+            components,
+        })
+    }
+
+    /// Stop the host lane: abandon its tasks when `aborted`, otherwise
+    /// finish them and report every failure.
+    pub(crate) fn close(&self, aborted: bool) -> Result<()> {
+        let mut result = Ok(());
+        if aborted {
+            self.lane.abort();
+        } else {
+            for error in self.lane.close() {
+                result = result.and(Err(Error::Invariant(format!(
+                    "closing a host lane failed: {error}"
+                ))));
+            }
+        }
+        result
+    }
+}
 
 /// Execute a batch of host media calls and commit it.
 pub(crate) fn execute(
@@ -36,7 +102,7 @@ pub(crate) fn execute(
     borrowed: HashSet<BufferId>,
     state: &mut Option<MediaBatch>,
 ) -> std::result::Result<(), WorkerError> {
-    let batch = super::video::open(parts, plan, borrowed, state)?;
+    let batch = open(parts, plan, borrowed, state)?;
     let slots = request_slots(plan, parts.requests)?;
     let allocations: HashMap<BufferId, BufferAllocation> = plan
         .buffer_allocations
@@ -77,9 +143,7 @@ pub(crate) fn execute(
 /// Reserve a host task, configure it with `action` and submit it.
 fn submit(parts: &Parts<'_>, action: MediaTask) -> Result<Arc<HostTask<MediaTask>>> {
     let host = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .ok_or_else(|| Error::Invalid("this rank holds no host media component".into()))?;
     let task = host.lane.reserve()?;
     if let Err(error) = task.configure(action).and_then(|()| task.submit()) {
@@ -139,9 +203,7 @@ fn read_media(
         ));
     }
     let reader = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .and_then(|host| host.reader.clone())
         .ok_or_else(|| Error::Invalid("media reading requires the condition encoders".into()))?;
     let mut products = ConditionProducts {
@@ -151,7 +213,7 @@ fn read_media(
     };
     let mut written = Vec::new();
     for output in &call.outputs {
-        let name = parts.video.product_name(call, output)?.to_owned();
+        let name = product_name(parts.info, call, output)?.to_owned();
         let (rows, width): (u64, u64) = match name.as_str() {
             "condition_pixels" => (
                 conditions
@@ -267,13 +329,11 @@ fn encode_units(
         (request.canvas, Arc::clone(&request.units))
     };
     let config = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .and_then(|host| host.components.get(&call.component))
         .cloned()
         .ok_or_else(|| Error::Invalid("video encoding has no codec component".into()))?;
-    let run = units(&config, parts.video.rank, 0, range.max_units)?;
+    let run = units(&config, parts.rank, 0, range.max_units)?;
     if run.is_empty() {
         return Ok(());
     }
@@ -298,9 +358,7 @@ fn encode_units(
     };
     let frame_rate = parts.video.model.facts.frame_rate;
     let function = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .map(|host| host.encode_video.clone())
         .ok_or_else(|| Error::Invalid("this rank holds no video codec".into()))?;
     let mut tasks = Vec::new();
@@ -368,13 +426,13 @@ fn encode_audio(
     let pcm = batch
         .inputs
         .read(store, &call.inputs[0], call.call_id, Device::Cpu, None)?;
-    let session = parts.video.mux_session(slot, call.request_key)?;
+    let session = parts
+        .video
+        .mux_session(slot, call.request_key, parts.media)?;
     let samples = session.config().audio_samples();
     let rate = parts.video.model.facts.sample_rate;
     let function = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .map(|host| host.encode_audio.clone())
         .ok_or_else(|| Error::Invalid("this rank holds no muxer".into()))?;
     let task = submit(
@@ -470,7 +528,9 @@ fn mux(
     call: &Call,
     slot: usize,
 ) -> Result<()> {
-    let session = parts.video.mux_session(slot, call.request_key)?;
+    let session = parts
+        .video
+        .mux_session(slot, call.request_key, parts.media)?;
     let (action, publication) = if call.inputs.is_empty() {
         (MediaTask::Finalize { session }, Some(Publication::Media))
     } else {

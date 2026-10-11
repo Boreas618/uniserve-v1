@@ -50,10 +50,31 @@ impl GraphFunctions {
         device: i32,
         body: impl FnOnce() -> Result<()>,
     ) -> Result<CUDAGraph> {
+        self.capture_with_peers(pool, &[], stream, device, body)
+    }
+
+    /// [`Self::capture`] of work whose modules also run on other devices
+    /// (a generation tower): `peers` pairs each such device with the pool
+    /// receiving the work's allocations there.
+    pub fn capture_with_peers(
+        &self,
+        pool: &Handle,
+        peers: &[(i32, Handle)],
+        stream: usize,
+        device: i32,
+        body: impl FnOnce() -> Result<()>,
+    ) -> Result<CUDAGraph> {
+        let peers = crate::ffi::list(peers.iter().map(|(device, pool)| {
+            Any::from(crate::ffi::list([
+                Any::from(i64::from(*device)),
+                pool.to_any(),
+            ]))
+        }));
         let capture = Handle::new(self.begin.call_values(&[
             pool.to_any(),
             Any::from(stream as i64),
             Any::from(i64::from(device)),
+            Any::from(peers),
         ])?)?;
         let ran = body();
         let ended = self

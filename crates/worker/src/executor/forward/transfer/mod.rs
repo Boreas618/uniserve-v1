@@ -231,7 +231,7 @@ fn run(
         }
         match kind {
             CallKind::Transfer(TransferMode::Tensor) => {
-                batch.copy_products(parts.image.as_deref_mut())?
+                batch.copy_products(parts.image.as_mut())?
             }
             CallKind::Transfer(TransferMode::KvExport) => batch.export_cache()?,
             CallKind::Transfer(TransferMode::KvInstall) => batch.install_cache(inputs)?,
@@ -273,7 +273,7 @@ fn run(
         }
         Err(failure) if failure.committed => Err(failure),
         Err(failure) => {
-            if let Err(cleanup) = batch.discard(parts.image) {
+            if let Err(cleanup) = batch.discard(parts.image.as_mut()) {
                 // Storage the cleanup could not retire stays reserved; the
                 // rank cannot reuse it safely.
                 return Err(Failure {
