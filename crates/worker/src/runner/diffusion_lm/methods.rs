@@ -9,9 +9,9 @@
 
 use tvm_ffi::Any;
 
-use crate::cuda_graph::CUDAGraph;
 use crate::ffi::{DType, Function, Handle, Record, Shape};
 use crate::model::interface::Interface;
+use crate::parallel::joins::GraphFunctions;
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
 
@@ -184,16 +184,6 @@ pub(crate) enum Method {
     Denoise,
 }
 
-impl Method {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Attend => "attend",
-            Self::Readout => "readout",
-            Self::Denoise => "denoise",
-        }
-    }
-}
-
 /// The Python runner and its methods.
 pub(crate) struct Methods {
     runner: Handle,
@@ -202,11 +192,10 @@ pub(crate) struct Methods {
     denoise: Function,
     plan_attention: Function,
     plans_attention: Function,
-    capture: Function,
-    replay: Function,
     kernels: Function,
-    /// `graphs.release(graph)`, for the runner's graph table.
-    pub(crate) release: Function,
+    /// Captures the methods called between its begin and end, and releases
+    /// their graphs.
+    pub(crate) graphs: GraphFunctions,
 }
 
 impl Methods {
@@ -222,53 +211,33 @@ impl Methods {
             denoise: method("denoise")?,
             plan_attention: method("plan_attention")?,
             plans_attention: method("plans_attention")?,
-            capture: method("capture")?,
-            replay: method("replay")?,
             kernels: method("kernels")?,
-            release: interface.function("graphs.release")?,
+            graphs: GraphFunctions::from_interface(interface)?,
         })
     }
 
-    fn invoke(&self, function: &Function, leading: &[Any], arguments: &[Argument]) -> Result<Any> {
-        let mut all = Vec::with_capacity(1 + leading.len() + arguments.len());
+    fn invoke(&self, function: &Function, arguments: &[Argument]) -> Result<Any> {
+        let mut all = Vec::with_capacity(1 + arguments.len());
         all.push(self.runner.to_any());
-        all.extend_from_slice(leading);
         all.extend(values(arguments)?);
         function.call_values(&all)
     }
 
-    /// Run `method` eagerly on the Python thread.
+    /// Call `method` on the Python thread: an eager forward, or the
+    /// forward a capture in progress records.
     pub(crate) fn call(&self, method: Method, arguments: &[Argument]) -> Result<()> {
         let function = match method {
             Method::Attend => &self.attend,
             Method::Readout => &self.readout,
             Method::Denoise => &self.denoise,
         };
-        self.invoke(function, &[], arguments).map(drop)
-    }
-
-    /// Capture `method` called with `arguments` into `pool`. The caller ran
-    /// the same call eagerly first.
-    pub(crate) fn capture(
-        &self,
-        pool: &Handle,
-        method: Method,
-        arguments: &[Argument],
-    ) -> Result<CUDAGraph> {
-        let leading = [pool.to_any(), text(method.name())];
-        CUDAGraph::captured(self.invoke(&self.capture, &leading, arguments)?)
-    }
-
-    /// Run a captured forward whose segments have graph breaks.
-    pub(crate) fn replay(&self, graph: &CUDAGraph) -> Result<()> {
-        self.replay
-            .invoke(&[self.runner.view(), graph.handle().view()])
+        self.invoke(function, arguments).map(drop)
     }
 
     /// Build the plans a captured `attend` or `denoise` reads, for
     /// attention operators that plan each launch on the host.
     pub(crate) fn plan_attention(&self, arguments: &[Argument]) -> Result<()> {
-        self.invoke(&self.plan_attention, &[], arguments).map(drop)
+        self.invoke(&self.plan_attention, arguments).map(drop)
     }
 
     /// Whether an attention operator plans each launch on the host.

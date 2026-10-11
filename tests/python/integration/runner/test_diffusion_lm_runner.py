@@ -649,6 +649,16 @@ GPU = _Setup(
 )
 
 
+def _capture(session, pool, method, *arguments) -> graphs.Graph:
+    """Capture one call of a runner method that already ran eagerly."""
+    torch.cuda.synchronize()
+    recording = graphs.begin_capture(pool, session.stream.cuda_stream, 0)
+    method(*arguments)
+    graph, _ = graphs.end_capture(recording)
+    torch.cuda.synchronize()
+    return graph
+
+
 def _synchronized(function, *arguments):
     """Call a runner method on its stream and wait for it."""
     torch.cuda.synchronize()
@@ -717,17 +727,17 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
         4, 64, 32, [*queries, *padding], [*prefixes, 0, 0], widths, starts
     )
     _synchronized(runner.attend, *arguments)
-    attend, _ = _synchronized(runner.capture, pool, "attend", *arguments)
+    attend = _capture(session, pool, runner.attend, *arguments)
     buffers["candidate_logprobs"].zero_()
     buffers["slot_rows"][len(slots) : 64] = 0
     arguments = session.readout_arguments(64, 256)
     _synchronized(runner.readout, *arguments)
-    readout, _ = _synchronized(runner.capture, pool, "readout", *arguments)
+    readout = _capture(session, pool, runner.readout, *arguments)
     buffers["candidate_logprobs"].zero_()
     buffers["attend_state.0"].zero_()
     buffers["attend_state.1"].zero_()
-    _synchronized(runner.replay, attend)
-    _synchronized(runner.replay, readout)
+    _synchronized(attend.replay)
+    _synchronized(readout.replay)
     torch.testing.assert_close(
         buffers["candidate_logprobs"][:count], eager, rtol=2e-2, atol=2e-2
     )
@@ -760,10 +770,10 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
         results = buffers["step.results"][:2].clone()
 
         restore()
-        graph, _ = _synchronized(runner.capture, pool, "denoise", *arguments)
+        graph = _capture(session, pool, runner.denoise, *arguments)
         restore()
         buffers["step.results"].zero_()
-        _synchronized(runner.replay, graph)
+        _synchronized(graph.replay)
         assert torch.equal(buffers["step.results"][:2], results)
         for name in names:
             assert torch.equal(buffers[f"bank.{name}"], expected[name]), name

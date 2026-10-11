@@ -24,8 +24,11 @@
 //!   flag: the whole step, from the model through the sampler to the commit
 //!   of the stepped state to the banks.
 //!
-//! A graph of one segment is launched natively. Without a pool (CPU lanes,
-//! graph policy off) every forward calls its method on the Python thread. A
+//! A graph is captured by calling its method between the begin and the end
+//! of a capture, after one eager call of the same shape, and launched
+//! natively; a distributed expert weight prefetch is a graph break its
+//! launch performs between two segments. Without a pool (CPU lanes, graph
+//! policy off) every forward calls its method on the Python thread. A
 //! `readout` that exchanges tokens with expert peers also runs there, once
 //! over every slot of the forward.
 //!
@@ -48,7 +51,7 @@ use std::sync::Arc;
 use uniserve_core::CanvasSampling;
 use uniserve_cuda::Stream;
 
-use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
+use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::executor::forward::experts::ExpertRuntime;
@@ -99,6 +102,11 @@ pub(crate) struct DiffusionLMRunner {
     /// The lane's stream; `None` for a CPU lane.
     stream: Option<Stream>,
     graphs: GraphTable<ShapeKey>,
+    /// The graph breaks of a forward being captured, noted by the
+    /// distributed expert weights its layers prefetch.
+    breaks: Option<GraphBreaks>,
+    /// Segments of the captured graph with the most graph breaks.
+    segments: usize,
     /// An attention operator plans each launch on the host, so a launch of
     /// `attend` or `denoise` follows `plan_attention`. Known once every
     /// shape has run; until then every launch plans.
@@ -204,7 +212,11 @@ impl DiffusionLMRunner {
         arguments: &[Argument],
         plan: Option<&[Argument]>,
     ) -> Result<GraphMode> {
-        let (Some(pool), Some(stream)) = (&self.pool, &self.stream) else {
+        let (Some(pool), Some(stream), Some(device)) = (
+            self.pool.clone(),
+            self.stream.clone(),
+            self.buffers.device(),
+        ) else {
             self.methods.call(method, arguments)?;
             self.graphs.record(GraphMode::Eager);
             return Ok(GraphMode::Eager);
@@ -214,23 +226,30 @@ impl DiffusionLMRunner {
                 if let (true, Some(plan)) = (self.plans_attention, plan) {
                     self.methods.plan_attention(plan)?;
                 }
-                if graph.segments() == 1 {
-                    graph.launch(stream)?;
-                } else {
-                    // FIXME: a graph with breaks (a distributed expert
-                    // weight prefetch) is replayed by the Python runner,
-                    // which makes the breaks' Python calls
-                    // (`CUDAGraph::launch`).
-                    self.methods.replay(graph)?;
-                }
+                graph.launch(&stream)?;
                 GraphMode::Replay
             }
             Lookup::Capture => {
-                // The eager call produces this forward's results and warms
-                // the capture, which records without executing.
+                // The eager call produces this forward's results, plans its
+                // attention and warms the capture, which records the same
+                // call without executing it.
                 self.methods.call(method, arguments)?;
-                let graph = self.methods.capture(pool, method, arguments)?;
-                self.graphs.insert(key, capacity, graph)?;
+                let captured = self
+                    .methods
+                    .graphs
+                    .capture(&pool, stream.raw(), device, || {
+                        self.methods.call(method, arguments)
+                    });
+
+                // The breaks the forward reached (weight prefetches) belong
+                // to this capture, whether or not it succeeded.
+                let breaks = self
+                    .breaks
+                    .as_ref()
+                    .map_or_else(Vec::new, GraphBreaks::take);
+                self.segments = self.segments.max(breaks.len() + 1);
+                self.graphs
+                    .insert(key, capacity, captured?.with_breaks(breaks))?;
                 GraphMode::Capture
             }
         };
@@ -594,9 +613,10 @@ impl DiffusionLMRunner {
         }
         tracing::info!(
             target: "uniserve_worker.warmup",
-            "{}: captured {} graphs: {} attend, {} readout and {} denoise buckets; attention launches are planned on the {}",
+            "{}: captured {} graphs of up to {} segments: {} attend, {} readout and {} denoise buckets; attention launches are planned on the {}",
             self.owner,
             counts.iter().sum::<usize>(),
+            self.segments,
             counts[0],
             counts[1],
             counts[2],

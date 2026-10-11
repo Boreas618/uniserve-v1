@@ -25,9 +25,10 @@ constructor: the banks with one row per request slot (slot zero is the
 padding sentinel). The tensors of one forward are parameters of its method.
 Every value that changes between forwards is the contents of a tensor, the
 sampler derives its random bits on the device from the seed, block and step
-columns, and no method keeps state between calls, so each method is captured
-into one CUDA graph per shape (:meth:`DiffusionLMRunner.capture`) and
-launched without Python.
+columns, and no method keeps state between calls. The caller captures a
+method into one CUDA graph per shape by calling it between
+``graphs.begin_capture`` and ``graphs.end_capture`` after one eager call of
+the same shape, and launches the graph without Python.
 
 Attention operators that plan a launch on the host read the host mirrors of
 the lengths; :meth:`DiffusionLMRunner.plan_attention` builds their plans
@@ -45,8 +46,8 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from uniserve_models.bindings import capturing
 from uniserve_models.diffusion import canvas as sampler
-from uniserve_models.interface import graphs
 from uniserve_models.model import DiffusionLM, DiffusionLMInput
 from uniserve_models.model.logits import Logits
 from uniserve_models.nn.attention import (
@@ -289,6 +290,7 @@ class DiffusionLMRunner:
         backbone = self._model.backbone
         self._pipeline = backbone._pipeline
         self._last = self._pipeline.rank == self._pipeline.size - 1
+        self._device = next(backbone.layers.parameters()).device
         self._length = self._model.canvas.length
 
         # With an exchanging final layer, a readout's expert step spans
@@ -305,10 +307,6 @@ class DiffusionLMRunner:
         self._attended = context.expert_layers(
             self._model
         ) - context.expert_layers(final)
-
-        # The allocator pool and the result of a capture in progress.
-        self._pool = None
-        self._graph: graphs.Graph | None = None
 
         self._chunk_rows = int(chunk_rows)
         # The embedding table the sampler embeds every distribution with.
@@ -816,60 +814,14 @@ class DiffusionLMRunner:
     def _forward(
         self, batch: AttentionBatch | None, body: Callable[[], None]
     ) -> None:
-        """Run a forward's numerical work eagerly, or record it.
+        """Run a forward's numerical work on the runner's stream.
 
         ``batch`` is the attention the body reads (``None`` without
-        attention). During :meth:`capture` the body is recorded into a
-        graph instead of run.
+        attention). An eager forward plans it here; a forward that is being
+        captured reads the plans of the eager call that preceded it.
         """
         context = self._context
-        if batch is not None:
-            context.bind_attention(batch)
-        if self._pool is None:
-            with context.activate(), torch.inference_mode():
-                body()
-            return
-        # Distributed expert weights submit peer reads between segments.
-        segments = None if context.weights is None else context.weights.capture
-        with context.activate():
-            self._graph = graphs.capture(
-                body, stream=context.stream, pool=self._pool, segments=segments
-            )
-
-    # Graphs.
-
-    def capture(self, pool, method: str, *arguments) -> list[Any]:
-        """Capture one forward: ``method`` called with ``arguments``.
-
-        The caller ran the same call eagerly first, so lazy initialization
-        and algorithm selection (which may synchronize the device) happened
-        outside the capture. The graph addresses the tensors among
-        ``arguments``; launching it runs the forward on their contents.
-
-        Returns:
-            ``[graph, executables]`` (:func:`graphs.export`).
-
-        FIXME: a capture belongs between ``capture_begin`` and
-        ``capture_end`` issued by the control plane. It is recorded here
-        because a distributed expert weight prefetch splits the graph at
-        calls the execution context's activation must bracket.
-        """
-        self._pool = pool
-        try:
-            getattr(self, str(method))(*arguments)
-            graph = self._graph
-            if graph is None:
-                raise ValueError(f"{method} is not a forward of the runner")
-            return graphs.export(graph)
-        finally:
-            self._pool = self._graph = None
-
-    def replay(self, graph: graphs.Graph) -> None:
-        """Run a captured forward whose segments have graph breaks.
-
-        FIXME: the caller launches a one-segment graph itself; the breaks
-        of a distributed expert weight prefetch are Python calls, which run
-        here inside the execution context's activation.
-        """
-        with self._context.activate():
-            graph.replay()
+        with torch.inference_mode(), context.activate():
+            if batch is not None and not capturing(self._device):
+                context.bind_attention(batch)
+            body()
