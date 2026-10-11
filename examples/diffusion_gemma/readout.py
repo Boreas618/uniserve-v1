@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 from uniserve_models import catalog
 from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.cache.units import UnitPool, plan_units
-from uniserve_models.model import CanvasInput, TextInput, TextSize
+from uniserve_models.model import DiffusionLMInput, TextInput, TextSize
 from uniserve_models.nn.attention import (
     AttentionBatch,
     BlockTable,
@@ -115,7 +115,7 @@ def read_candidates(model, prompt, canvas, position, candidates):
         )
         context.bind_attention(readout)
         hidden = model.denoiser(
-            CanvasInput(
+            DiffusionLMInput(
                 canvas,
                 torch.arange(length, length + count, device=device),
                 readout,

@@ -152,8 +152,8 @@ class CanvasState:
     - ``history``: int64 ``[R, stability, C]``, the previous argmax
       canvases, oldest first; -1 at the start of a block.
     - ``self_conditioning``: ``[R * C, H]`` in the embedding dtype, the soft
-      embedding the next pass reads (``CanvasInput.self_conditioning``); zero
-      on a block's first pass.
+      embedding the next pass reads
+      (``DiffusionLMInput.self_conditioning``); zero on a block's first pass.
     """
 
     seed: torch.Tensor

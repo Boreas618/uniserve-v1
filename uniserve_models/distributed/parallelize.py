@@ -290,8 +290,8 @@ def parallelize_(
     # Deferred import: uniserve_models.model depends on the modules bound here.
     from uniserve_models.model import (
         CausalLM,
+        DiffusionLM,
         Encoder,
-        TokenDenoiser,
         TransformerDecoder,
     )
 
@@ -366,7 +366,7 @@ def parallelize_(
         # Vocabulary heads project only on the last stage, including a head
         # a causal model and a token denoiser share.
         if (
-            isinstance(child, (CausalLM, TokenDenoiser))
+            isinstance(child, (CausalLM, DiffusionLM))
             and child.backbone._pipeline.rank != pipeline.size - 1
         ):
             child.lm_head = None
