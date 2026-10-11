@@ -143,7 +143,7 @@ class _Session:
         loaded = Loaded(
             module=self.model, description=None, attention=setup.attention
         )
-        self.facts = diffusion_lm.describe(loaded, "denoiser", False, 0)
+        self.loaded = loaded
         prepared, requirements = binding.prepare(
             loaded,
             {
@@ -203,7 +203,9 @@ class _Session:
     def attend_state(self) -> list[torch.Tensor]:
         return [
             self.buffers[f"attend_state.{index}"]
-            for index in range(len(self.facts["attend_widths"]))
+            for index in range(
+                len(diffusion_lm.attend_widths(self.loaded, "denoiser"))
+            )
         ]
 
     def attend_arguments(
@@ -303,7 +305,8 @@ class _Session:
         """Allocate the tensors of the forwards, as the worker does."""
         tables, tokens, rows = len(self.pool.tables), TOKENS, 2 * ROWS
         setup = self.setup
-        hidden, dtype = self.facts["hidden_size"], setup.dtype
+        hidden = diffusion_lm.hidden_size(self.loaded, "denoiser")
+        dtype = setup.dtype
         canvas, device = setup.canvas, setup.device
         long = {"dtype": torch.int64, "device": device}
         ints = {"dtype": torch.int32, "device": device}
@@ -324,7 +327,8 @@ class _Session:
                 256, dtype=torch.float32, device=device
             ),
         }
-        for index, width in enumerate(self.facts["attend_widths"]):
+        widths = diffusion_lm.attend_widths(self.loaded, "denoiser")
+        for index, width in enumerate(widths):
             buffers[f"attend_state.{index}"] = torch.zeros(
                 (tokens, width), dtype=dtype, device=device
             )
@@ -441,10 +445,11 @@ def test_a_readout_reads_every_candidate_of_rows_of_different_lengths(
     tmp_path,
 ):
     session = _Session(tmp_path, sampling=False)
-    assert session.facts["sequence_length"] == CANVAS
-    assert session.facts["vocab_size"] == VOCAB
-    assert session.facts["eos_token_ids"] == [1, 6]
-    assert session.facts["generates"] and session.facts["local_tail"]
+    loaded = session.loaded
+    assert diffusion_lm.sequence_length(loaded, "denoiser") == CANVAS
+    assert diffusion_lm.vocab_size(loaded, "denoiser") == VOCAB
+    assert diffusion_lm.generates(loaded, "denoiser")
+    assert not diffusion_lm.exchanges_readout(loaded, "denoiser", False, 0)
 
     generator = torch.Generator().manual_seed(9)
     canvases = [

@@ -305,7 +305,7 @@ impl DiffusionLMRunner {
         let mut prepared = Vec::new();
         for (component, path, device) in placed {
             let cuda = device.cuda_index();
-            let facts = Facts::describe(
+            let facts = Facts::read(
                 interface,
                 startup.model.handle(),
                 &path,
@@ -516,7 +516,7 @@ pub(crate) fn reserved_bytes(
     let cuda = config.device.cuda_index().is_some();
     let mut bytes = 0;
     for (_, path, _) in placed(components)? {
-        let facts = Facts::describe(interface, model.handle(), &path, experts.0, experts.1)?;
+        let facts = Facts::read(interface, model.handle(), &path, experts.0, experts.1)?;
         let bounds = Bounds::new(config, request_slots, cache, None, &facts, cuda)?;
         let banks = config
             .canvas_sampling
