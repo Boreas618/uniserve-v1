@@ -108,7 +108,7 @@ impl ImageDenoiserLayout {
     /// The positions of a latent image inserted as conditioning (a latent
     /// ingest or feedback prefill): the image's positions one past the
     /// conditioning position, with the opening framing token at it and the
-    /// closing one [`ROPE_ADVANCE`] past it.
+    /// closing one `ROPE_ADVANCE` past it.
     pub fn conditioning_positions(
         &self,
         height: u32,

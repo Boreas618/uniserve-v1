@@ -181,7 +181,7 @@ pub struct PrefixFill {
 /// combines predictions with.
 #[derive(Clone, Debug)]
 pub struct GuidancePlan {
-    /// Opaque schedules and guidance (`interface.denoiser` plan).
+    /// Opaque schedules and guidance (`DenoiserRunner.plan`).
     pub handle: Handle,
     /// The model timestep of each solver step.
     pub timesteps: Vec<f32>,
