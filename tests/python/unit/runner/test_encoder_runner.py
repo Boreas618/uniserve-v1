@@ -1,4 +1,4 @@
-"""An image model's encoders write their encodings into product regions."""
+"""An image model's encoders write their encodings into product tensors."""
 
 import base64
 import io
@@ -18,9 +18,6 @@ from uniserve_models.model import VisionInput
 from uniserve_models.runner.encoder import EncoderRunner
 
 pytestmark = pytest.mark.unit
-
-# A product arena larger than every product of these tests.
-ARENA_BYTES = 1 << 16
 
 
 @pytest.fixture(scope="module")
@@ -51,10 +48,9 @@ def bound(table, model, component, root, path):
     )
     assert not requirements["workspaces"]
     table["component.bind"](prepared, {"workspaces": {}})
-    arena = torch.zeros(ARENA_BYTES, dtype=torch.uint8)
     module = ".".join(part for part in (root, path) if part)
-    runner = EncoderRunner.bound(prepared, path, model, arena)
-    return (model, module), runner, arena
+    runner = EncoderRunner.bound(prepared, path, model)
+    return (model, module), runner
 
 
 def payload(height, width, seed=0):
@@ -66,15 +62,14 @@ def payload(height, width, seed=0):
     return base64.b64encode(encoded.getvalue()).decode()
 
 
-def region(offset, dtype, elements):
-    return [offset, dtype, [elements]]
+def product(elements):
+    """A BF16 product tensor of ``elements`` values."""
+    return torch.zeros(elements, dtype=torch.bfloat16)
 
 
-def test_vision_features_fill_their_product_regions(loaded):
+def test_vision_features_fill_their_products(loaded):
     table, model = loaded
-    info, runner, arena = bound(
-        table, model, "vision_encoder", "vision_encoder", ""
-    )
+    info, runner = bound(table, model, "vision_encoder", "vision_encoder", "")
     assert EncoderRunner.kind(*info) == "vision"
     assert EncoderRunner.patch_size(*info) == 16
     assert EncoderRunner.downsample(*info) == 1
@@ -86,8 +81,8 @@ def test_vision_features_fill_their_product_regions(loaded):
         for seed in (1, 2)
     ]
     assert [list(image["grid"]) for image in images] == [[2, 3], [2, 3]]
-    out = [region(0, "bfloat16", 4096), region(8192, "bfloat16", 4096)]
-    shapes = runner.encode([image["image"] for image in images], out)
+    out = [product(4096), product(4096)]
+    shapes = runner.encode([image["image"] for image in images], *out)
 
     processor = model.image_processor
     for index, (image, shape) in enumerate(zip(images, shapes, strict=True)):
@@ -102,27 +97,23 @@ def test_vision_features_fill_their_product_regions(loaded):
             )
         )
         assert list(shape) == list(expected.shape)
-        written = interface.regions.view(
-            arena, [index * 8192, "bfloat16", list(shape)]
-        )
+        written = out[index][: expected.numel()].reshape(list(shape))
         torch.testing.assert_close(written, expected, rtol=0, atol=0)
 
 
 def test_resident_images_encode_like_their_decoded_pixels(loaded):
     table, model = loaded
-    _, runner, arena = bound(table, model, "model", "", "latent_encoder")
+    _, runner = bound(table, model, "model", "", "latent_encoder")
 
     # A generated [3, 32, 32] BF16 image product in [-1, 1].
     pixels = torch.linspace(-1, 1, 3 * 32 * 32).reshape(3, 32, 32)
-    image = interface.regions.view(arena, [0, "bfloat16", [3, 32, 32]])
-    image.copy_(pixels)
-    prepared = runner.prepare_resident([0, "bfloat16", [3, 32, 32]], "vae", 1)
+    image = pixels.to(torch.bfloat16)
+    prepared = runner.prepare_resident(image, "vae", 1)
     assert (prepared["height"], prepared["width"]) == (32, 32)
     assert prepared["grid"] is None
 
-    (shape,) = runner.encode(
-        [prepared["image"]], [region(8192, "bfloat16", 4096)]
-    )
+    out = product(4096)
+    (shape,) = runner.encode([prepared["image"]], out)
     decoded = prepare_tensor_image(
         model.image_processor,
         "vae",
@@ -132,16 +123,16 @@ def test_resident_images_encode_like_their_decoded_pixels(loaded):
     )
     expected = model.module.latent_encoder.encode(decoded.pixels[None])[0]
     assert list(shape) == list(expected.shape) == [4, 3 * 16 * 16]
-    written = interface.regions.view(arena, [8192, "bfloat16", list(shape)])
+    written = out[: expected.numel()].reshape(list(shape))
     torch.testing.assert_close(written, expected, rtol=0, atol=0)
 
 
-def test_products_beyond_their_region_are_refused(loaded):
+def test_encodings_larger_than_their_product_are_refused(loaded):
     table, model = loaded
-    _, runner, _ = bound(table, model, "vision_encoder", "vision_encoder", "")
+    _, runner = bound(table, model, "vision_encoder", "vision_encoder", "")
     image = EncoderRunner.prepare_image(model, "vit", payload(32, 48), 1, 0)
     with pytest.raises(Exception, match="exceeds its product bound"):
-        runner.encode([image["image"]], [region(0, "bfloat16", 8)])
+        runner.encode([image["image"]], product(8))
 
 
 def test_inline_images_are_validated_on_the_host(loaded):

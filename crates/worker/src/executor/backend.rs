@@ -9,7 +9,7 @@
 //! admission, dependencies, retirement and result delivery are handled
 //! here for every batch, with or without calls.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use uniserve_core::CallId;
@@ -23,7 +23,7 @@ use super::forward::{self, launch::Launched};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
-use crate::ffi::{Device, Function};
+use crate::ffi::Function;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::JobQueues;
@@ -42,7 +42,6 @@ use crate::runner::media::MediaRunner;
 use crate::runner::start::ImageOwners;
 use crate::service::ServiceBackend;
 use crate::storage::ImageLatents;
-use crate::storage::memory::StorageView;
 use crate::worker::RankStorage;
 use crate::{Error, OutputPool, Result};
 
@@ -73,8 +72,6 @@ pub struct WorkerBackend {
     latents: Option<ImageLatents>,
     /// The open image trajectory of each request slot.
     trajectories: Trajectories,
-    /// The product arena of each device, which bindings name products in.
-    arenas: HashMap<Device, StorageView>,
     /// The lane preparing input images and encoding output images.
     image_host: Option<HostLane<ImageTask>>,
     /// The runner of each diffusion LM component placed on the rank.
@@ -295,7 +292,6 @@ impl WorkerBackend {
             image: None,
             latents: None,
             trajectories: Trajectories::default(),
-            arenas: HashMap::new(),
             image_host: None,
             diffusion_lm: Vec::new(),
             experts: None,
@@ -397,7 +393,6 @@ impl WorkerBackend {
         self.denoisers = owners.denoisers;
         self.decoders = owners.decoders;
         self.latents = owners.latents;
-        self.arenas = owners.arenas;
         self.media_outputs = Some(owners.outputs);
         self.image_host = Some(owners.host);
     }
@@ -437,7 +432,6 @@ impl WorkerBackend {
         self.decoders = DecoderRunners::default();
         self.latents = None;
         self.trajectories = Trajectories::default();
-        self.arenas.clear();
         self.media = None;
     }
 
@@ -533,7 +527,6 @@ impl WorkerBackend {
                     decoders: &mut self.decoders,
                     latents: self.latents.as_mut(),
                     trajectories: &mut self.trajectories,
-                    arenas: &self.arenas,
                     outputs,
                     host,
                 }),
