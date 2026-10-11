@@ -2,4 +2,3 @@
 //! denoising and video denoising over latent pages.
 
 pub(crate) mod image;
-pub(crate) mod video;

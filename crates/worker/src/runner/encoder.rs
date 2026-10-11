@@ -1,22 +1,28 @@
-//! Encoder runners: vision patch encoders, latent encoders and text encoders.
+//! Encoder runners: vision patch encoders, latent encoders, text encoders
+//! and a video model's condition latent encoders ([`LatentEncoding`]).
 //!
 //! An [`EncoderRunner`] serves one encoder call of a bound component: the
 //! module at a path within the binding's root (the root itself, or a nested
 //! encoder such as a text encoder's vision tower bound with it). It owns the
-//! encoder's Rust buffers, its graph table and its call policy; the module
-//! computes through the binding functions of
-//! `uniserve_models.interface.encoder`, created once over the buffers:
+//! encoder's Rust buffers, its graph table and its call policy.
+//!
+//! A text encoder and the vision tower that encodes its prompt's packed
+//! vision blocks compute through the Python half,
+//! `uniserve_models.runner.encoder.EncoderRunner` ([`EncoderRunner::over`]):
+//! its `encode` takes the tensors of one forward as arguments.
+//!
+//! An image model's vision and latent encoders compute through the binding
+//! functions of `uniserve_models.interface.encoder`, created once over the
+//! buffers ([`EncoderRunner::bind`]):
 //!
 //! | kind | module | calls |
 //! | --- | --- | --- |
-//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `encode_patches`, `prepare_resident`; packed: `encode_packed`, `capture_packed`, `release` |
+//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `prepare_resident`; packed: `encode_packed`, `capture_packed`, `release` |
 //! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident` |
-//! | [`EncoderInfo::Text`] | `TextEncoder` | `text_positions`, `encode_text`, `capture_text`, `release` |
 //!
-//! Every binding receives its device's product arena once; results are
+//! Such a binding receives its device's product arena once; results are
 //! written into product [`Region`]s of it, in the product's dtype, and each
-//! call returns the results' shapes, which the caller publishes. Inputs and
-//! outputs never import DLPack tensors per call.
+//! call returns the results' shapes, which the caller publishes.
 //!
 //! **Images.** Inline request images are decoded and transformed on a host
 //! lane by `image.prepare_input` ([`prepare_input`]), which returns an
@@ -39,29 +45,42 @@
 //! **Text.** Prompts are zero-padded to the smallest configured text
 //! capacity that holds them ([`text_capacity`]); causal attention keeps the
 //! padding out of the prompt's rows, and one captured graph per capacity
-//! serves every prompt length up to it. Without configured capacities a
-//! prompt is encoded at its exact length, eagerly. Prompts with vision
-//! tokens (rotary coordinates and vision rows) always run eagerly.
+//! serves every prompt length up to it: the runner writes the padded tokens,
+//! launches the graph and copies the prompt's feature rows into the product,
+//! all natively. Prompts with vision tokens (rotary coordinates and vision
+//! rows) run on the Python thread.
 //!
 //! Every runner call is ordered on the runner's stream; the caller orders
 //! that stream after the producers of its inputs and records the producer
 //! fence of its outputs on it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tvm_ffi::Any;
-use uniserve_cuda::Stream;
+use uniserve_core::{Canvas, VideoCondition};
+use uniserve_cuda::{Stream, memcpy_async};
+use uniserve_ipc::Batch as BatchPlan;
 
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{CUDAGraph, GraphMode, GraphTable, Lookup};
+use crate::executor::forward::batch::MediaBatch;
+use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
+use crate::executor::forward::video::{
+    Parts, bind_rows, decode_range, publish, publish_bound, row_width, stream_of,
+};
 use crate::ffi::{
     Backing, DType, Fields, Function, Functions, Handle, Record, Region, integer_list, list,
 };
-use crate::model::bind::{ComponentBinding, TextSize};
+use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize};
 use crate::model::interface::Interface;
+use crate::parallel::joins::GraphFunctions;
+use crate::runner::{Methods, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
+
+const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
 
 /// The largest packed vision slot count: it bounds retained activations
 /// independently of the admitted batch size. Larger batches replay full
@@ -426,7 +445,7 @@ pub struct PromptVision<'a> {
     /// The same for its video blocks.
     pub video_grids: &'a [[u32; 3]],
     /// The vision rows of its placeholders, in placeholder order.
-    pub rows: &'a Region,
+    pub rows: &'a StorageView,
 }
 
 /// Startup bounds of an encoder's buffers.
@@ -486,7 +505,6 @@ struct PackedVision {
 enum Steps {
     Vision {
         encode: Function,
-        patches: Function,
         prepare_resident: Function,
         warm: Function,
         packed: Option<(Function, Function)>,
@@ -496,11 +514,28 @@ enum Steps {
         prepare_resident: Function,
         warm: Function,
     },
-    Text {
-        positions: Function,
+    /// The Python half of a text encoder or of the vision tower bound
+    /// with it: the runner and its methods, each called with it first.
+    Runner {
+        runner: Handle,
         encode: Function,
-        capture: Function,
+        position_ids: Function,
+        /// Captures a forward between its begin and end.
+        capture: GraphFunctions,
     },
+}
+
+/// The buffers of a text encoder's forward.
+struct TextBuffers {
+    /// The `[max capacity]` int64 prompt, zero-padded.
+    tokens: StorageView,
+    /// The `[max capacity, hidden]` features of the padded prompt.
+    features: StorageView,
+    /// The `[3, max capacity]` int64 rotary coordinates of a prompt with
+    /// vision tokens, for an encoder that places them.
+    positions: Option<StorageView>,
+    /// Whether this rank's pipeline stage emits the features.
+    final_stage: bool,
 }
 
 /// The runner of one bound encoder call.
@@ -511,11 +546,11 @@ pub struct EncoderRunner {
     /// The binding's stream, shared with its lane; `None` on the host.
     stream: Option<Stream>,
     steps: Steps,
-    /// The device's product arena, as the binding received it.
-    products: StorageView,
+    /// The device's product arena, as an image encoder's binding received
+    /// it.
+    products: Option<StorageView>,
     packed: Option<PackedVision>,
-    /// The text token column `[max capacity]` int64.
-    tokens: Option<StorageView>,
+    text: Option<TextBuffers>,
     text_capacities: Vec<usize>,
     config: EncoderConfig,
     graphs: Option<GraphTable<EncoderGraph>>,
@@ -575,7 +610,6 @@ impl EncoderRunner {
 
         let mut buffers = vec![("products", products.clone())];
         let mut packed = None;
-        let mut tokens = None;
         match info {
             EncoderInfo::Vision(vision) => {
                 if let (Some(max_patches), Some(slot_tokens)) =
@@ -614,28 +648,10 @@ impl EncoderRunner {
                 }
             }
             EncoderInfo::Latent(_) => {}
-            EncoderInfo::Text(text) => {
-                let capacity = config
-                    .text_capacities
-                    .iter()
-                    .copied()
-                    .max()
-                    .unwrap_or(config.max_text_tokens)
-                    .max(1) as i64;
-                let column = allocate(device, DType::I64, &[capacity])?;
-                buffers.push(("tokens", column.clone()));
-                buffers.push((
-                    "features",
-                    allocate(
-                        device,
-                        text.output_dtype,
-                        &[capacity, i64::from(text.hidden_size)],
-                    )?,
+            EncoderInfo::Text(_) => {
+                return Err(Error::Invariant(
+                    "a text encoder computes through its Python runner".into(),
                 ));
-                if text.positions {
-                    buffers.push(("positions", allocate(device, DType::I64, &[3, capacity])?));
-                }
-                tokens = Some(column);
             }
         }
         if let Some(stream) = &stream {
@@ -675,7 +691,6 @@ impl EncoderRunner {
                 (
                     Steps::Vision {
                         encode: functions.get("encode")?,
-                        patches: functions.get("encode_patches")?,
                         prepare_resident: functions.get("prepare_resident")?,
                         warm: functions.get("warm")?,
                         packed: packed_steps,
@@ -691,18 +706,12 @@ impl EncoderRunner {
                 },
                 None,
             ),
-            EncoderInfo::Text(_) => (
-                Steps::Text {
-                    positions: functions.get("text_positions")?,
-                    encode: functions.get("encode_text")?,
-                    capture: functions.get("capture_text")?,
-                },
-                Some(functions.get("release")?),
-            ),
+            EncoderInfo::Text(_) => {
+                return Err(Error::Invariant(
+                    "a text encoder computes through its Python runner".into(),
+                ));
+            }
         };
-        let mut text_capacities = config.text_capacities.clone();
-        text_capacities.sort_unstable();
-        text_capacities.dedup();
         Ok(Self {
             graphs: release
                 .clone()
@@ -713,13 +722,104 @@ impl EncoderRunner {
             device,
             stream,
             steps,
-            products,
+            products: Some(products),
             packed,
-            tokens,
-            text_capacities,
+            text: None,
+            text_capacities: Vec::new(),
             config: config.clone(),
             capturing: false,
             _buffers: buffers.into_iter().map(|(_, view)| view).collect(),
+        })
+    }
+
+    /// The runner of a text encoder (`path` `""`) or of the vision tower
+    /// bound with it (`"vision"`) over the Python half
+    /// `uniserve_models.runner.encoder.EncoderRunner`, which computes with
+    /// `binding`'s execution context. A text encoder's token, feature and
+    /// position buffers are allocated here for the largest prompt capacity.
+    pub fn over(
+        interface: &Interface,
+        binding: &ComponentBinding,
+        path: &str,
+        info: EncoderInfo,
+        config: &EncoderConfig,
+        stream: Stream,
+    ) -> Result<Self> {
+        const RUNNER: &str = "uniserve_models.runner.encoder.EncoderRunner";
+        let owner = if path.is_empty() {
+            binding.component.clone()
+        } else {
+            format!("{}.{path}", binding.component)
+        };
+        let device = binding.device;
+        let runner = Handle::new(
+            interface
+                .import(&format!("{RUNNER}.bound"))?
+                .call_values(&[
+                    binding.prepared().to_any(),
+                    Any::from(tvm_ffi::String::from(path)),
+                ])?,
+        )?;
+        let capture = GraphFunctions::from_interface(interface)?;
+
+        let mut text_capacities = config.text_capacities.clone();
+        text_capacities.sort_unstable();
+        text_capacities.dedup();
+        let (text, graphs) = match info {
+            EncoderInfo::Text(text) => {
+                let capacity = text_capacities
+                    .last()
+                    .copied()
+                    .unwrap_or(config.max_text_tokens)
+                    .max(1) as i64;
+                let final_stage = interface
+                    .import(&format!("{RUNNER}.final_stage"))?
+                    .call_as::<bool>(&[runner.view()])?;
+                let buffers = TextBuffers {
+                    tokens: allocate(device, DType::I64, &[capacity])?,
+                    features: allocate(
+                        device,
+                        text.output_dtype,
+                        &[capacity, i64::from(text.hidden_size)],
+                    )?,
+                    positions: text
+                        .positions
+                        .then(|| allocate(device, DType::I64, &[3, capacity]))
+                        .transpose()?,
+                    final_stage,
+                };
+                (
+                    Some(buffers),
+                    Some(GraphTable::new(owner.clone(), capture.release.clone())),
+                )
+            }
+            EncoderInfo::Vision(_) => (None, None),
+            EncoderInfo::Latent(_) => {
+                return Err(Error::Invariant(
+                    "a latent encoder computes through its binding".into(),
+                ));
+            }
+        };
+        Ok(Self {
+            graphs,
+            release: Some(capture.release.clone()),
+            owner,
+            info,
+            device,
+            stream: Some(stream),
+            steps: Steps::Runner {
+                runner,
+                encode: interface.import(&format!("{RUNNER}.encode"))?,
+                position_ids: interface.import(&format!("{RUNNER}.position_ids"))?,
+                capture,
+            },
+            products: None,
+            packed: None,
+            text,
+            text_capacities,
+            config: config.clone(),
+            capturing: false,
+            _buffers: Vec::new(),
         })
     }
 
@@ -736,9 +836,11 @@ impl EncoderRunner {
         self.stream.as_ref()
     }
 
-    /// The product arena regions name.
-    pub fn products(&self) -> &StorageView {
-        &self.products
+    /// The product arena an image encoder's regions name.
+    pub fn products(&self) -> Result<&StorageView> {
+        self.products
+            .as_ref()
+            .ok_or_else(|| Error::Invariant(format!("{} names no products by region", self.owner)))
     }
 
     /// Images one packed numerical call encodes; `None` when unpacked.
@@ -783,7 +885,7 @@ impl EncoderRunner {
             | Steps::Latent {
                 prepare_resident, ..
             } => prepare_resident,
-            Steps::Text { .. } => {
+            Steps::Runner { .. } => {
                 return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
             }
         };
@@ -850,7 +952,7 @@ impl EncoderRunner {
                     result.record(GraphMode::Eager);
                 }
             }
-            Steps::Text { .. } => {
+            Steps::Runner { .. } => {
                 return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
             }
         }
@@ -897,7 +999,7 @@ impl EncoderRunner {
             grids
                 .prefix(2 * slots as i64)?
                 .upload(grid_bytes(&layout).as_slice(), self.stream.as_ref())?;
-            let (graph, mode) = self.graph(EncoderGraph::Packed { slots })?;
+            let (graph, mode) = self.packed_graph(EncoderGraph::Packed { slots })?;
             let shapes = call_shapes(
                 &encode,
                 &[
@@ -922,81 +1024,73 @@ impl EncoderRunner {
     ///
     /// `rows` holds every block's patch rows back to back, in block order;
     /// `grids` holds each block's `(time, height, width)` patch grid, whose
-    /// product is the block's row count. Block `i`'s features are written
-    /// into `out[i]`. Each block is one sample of one numerical call, so a
-    /// block's features do not depend on the other blocks. Returns each
-    /// block's feature shape.
+    /// product is the block's row count. The blocks' features fill `out`'s
+    /// rows in block order. Each block is one sample of one numerical call,
+    /// so a block's features do not depend on the other blocks.
     pub fn encode_patches(
         &mut self,
-        rows: &Region,
+        rows: &StorageView,
         grids: &[[u32; 3]],
-        out: &[Region],
-    ) -> Result<Encoded> {
-        let Steps::Vision { patches, .. } = &self.steps else {
+        out: &StorageView,
+    ) -> Result<()> {
+        let (Steps::Runner { runner, encode, .. }, EncoderInfo::Vision(_)) =
+            (&self.steps, &self.info)
+        else {
             return Err(Error::Invalid(format!(
                 "{} encodes no vision blocks",
                 self.owner
             )));
         };
-        if grids.len() != out.len() {
-            return Err(Error::Invariant(
-                "vision blocks and products must align".into(),
-            ));
-        }
-        let total: u64 = grids
-            .iter()
-            .map(|grid| {
-                grid.iter()
-                    .map(|&extent| u64::from(extent))
-                    .product::<u64>()
-            })
-            .sum();
-        if rows.shape().first().map(|&extent| extent as u64) != Some(total) {
-            return Err(Error::Invalid(
-                "vision patch rows disagree with their blocks' grids".into(),
-            ));
-        }
-        let mut result = Encoded::default();
-        if grids.is_empty() {
-            return Ok(result);
-        }
-        let grid_list = list(
-            grids
-                .iter()
-                .map(|grid| Any::from(integer_list(grid.iter().map(|&extent| i64::from(extent))))),
-        );
-        result.shapes = call_shapes(
-            &patches.clone(),
-            &[rows.to_any(), Any::from(grid_list), region_list(out.iter())],
-            grids.len(),
-        )?;
-        result.record(GraphMode::Eager);
-        Ok(result)
+        encode.call_values(&[
+            runner.to_any(),
+            Any::from(rows.to_tensor()?),
+            Any::from(out.to_tensor()?),
+            Any::from(integer_list(
+                grids.iter().flatten().map(|&extent| i64::from(extent)),
+            )),
+        ])?;
+        Ok(())
     }
 
-    /// Encode one prompt of `tokens` ids into `out`.
+    /// The arguments of the Python half's `encode` of a prompt padded to
+    /// `capacity`, without vision tokens.
+    fn text_arguments(&self, capacity: usize) -> Result<Vec<Any>> {
+        let (Steps::Runner { runner, .. }, Some(text)) = (&self.steps, &self.text) else {
+            return Err(Error::Invalid(format!("{} encodes no text", self.owner)));
+        };
+        Ok(vec![
+            runner.to_any(),
+            Any::from(text.tokens.prefix(capacity as i64)?.to_tensor()?),
+            Any::from(text.features.prefix(capacity as i64)?.to_tensor()?),
+        ])
+    }
+
+    /// Encode one prompt of `tokens` ids into `out`, its `[tokens, hidden]`
+    /// feature rows in the product's dtype.
     ///
     /// `vision` carries the prompt's vision tokens, for an encoder that
-    /// places them. Returns the features' shape,
-    /// or `None` on a pipeline stage that computes no features.
+    /// places them. A pipeline stage that emits no features writes nothing.
     pub fn encode_text(
         &mut self,
         tokens: &[i64],
-        out: &Region,
+        out: &StorageView,
         vision: Option<PromptVision<'_>>,
-    ) -> Result<(Option<Vec<i64>>, GraphMode)> {
+    ) -> Result<GraphMode> {
         let (
-            Steps::Text {
-                positions, encode, ..
+            Steps::Runner {
+                encode,
+                position_ids,
+                ..
             },
-            Some(column),
-        ) = (&self.steps, &self.tokens)
+            Some(text),
+            Some(stream),
+        ) = (&self.steps, &self.text, &self.stream)
         else {
             return Err(Error::Invalid(format!("{} encodes no text", self.owner)));
         };
-        let (positions, encode) = (positions.clone(), encode.clone());
+        let (encode, position_ids, stream) = (encode.clone(), position_ids.clone(), stream.clone());
         let capacity = text_capacity(&self.text_capacities, tokens.len())?;
-        if capacity as i64 > column.shape()[0] {
+        if capacity as i64 > text.tokens.shape()[0] {
             return Err(Error::Invalid(
                 "text encoder input exceeds its token capacity".into(),
             ));
@@ -1008,65 +1102,99 @@ impl EncoderRunner {
             .iter()
             .flat_map(|token| token.to_ne_bytes())
             .collect();
-        column.upload(&bytes, self.stream.as_ref())?;
+        text.tokens.upload(&bytes, Some(&stream))?;
+        let (features, final_stage) = (text.features.clone(), text.final_stage);
 
-        let (graph, mode, place, visual) = match vision {
+        let mut arguments = self.text_arguments(capacity)?;
+        let mode = match vision {
             Some(PromptVision {
                 image_grids,
                 video_grids,
                 rows,
             }) => {
-                let grids =
-                    |grids: &[[u32; 3]]| {
-                        list(grids.iter().map(|grid| {
-                            Any::from(integer_list(grid.iter().map(|&x| i64::from(x))))
-                        }))
-                    };
-                positions.invoke(&[
-                    (&Any::from(capacity as i64)).into(),
-                    (&Any::from(integer_list(padded.iter().copied()))).into(),
-                    (&Any::from(grids(image_grids))).into(),
-                    (&Any::from(grids(video_grids))).into(),
+                let positions = self
+                    .text
+                    .as_ref()
+                    .and_then(|text| text.positions.as_ref())
+                    .ok_or_else(|| {
+                        Error::Invalid(format!("{} places no vision tokens", self.owner))
+                    })?;
+                let grids = |grids: &[[u32; 3]]| {
+                    Any::from(integer_list(
+                        grids.iter().flatten().map(|&extent| i64::from(extent)),
+                    ))
+                };
+                position_ids.call_values(&[
+                    arguments[0].clone(),
+                    Any::from(integer_list(padded.iter().copied())),
+                    grids(image_grids),
+                    grids(video_grids),
+                    Any::from(positions.to_tensor()?),
                 ])?;
-                (None, GraphMode::Eager, true, rows.to_any())
+                arguments.push(Any::from(positions.to_tensor()?));
+                arguments.push(Any::from(rows.to_tensor()?));
+                encode.call_values(&arguments)?;
+                GraphMode::Eager
             }
+            // Without configured capacities a prompt is encoded at its
+            // exact length, which no graph serves.
             None if self.text_capacities.is_empty() => {
-                (None, GraphMode::Eager, false, Any::default())
+                encode.call_values(&arguments)?;
+                GraphMode::Eager
             }
-            None => {
-                let (graph, mode) = self.graph(EncoderGraph::Text { capacity })?;
-                (graph, mode, false, Any::default())
-            }
+            None => match self.graph(EncoderGraph::Text { capacity })? {
+                Some(graph) => {
+                    graph.launch(&stream)?;
+                    GraphMode::Replay
+                }
+                None => {
+                    encode.call_values(&arguments)?;
+                    GraphMode::Eager
+                }
+            },
         };
-        let value = encode.call_values(&[
-            Any::from(capacity as i64),
-            Any::from(tokens.len() as i64),
-            graph.map_or_else(Any::default, |graph| graph.to_any()),
-            Any::from(place),
-            visual,
-            out.to_any(),
-        ])?;
-        let shape =
-            crate::ffi::integers(value).map_err(|error| Error::numerical(encode.name(), &error))?;
-        Ok(((!shape.is_empty()).then_some(shape), mode))
+        if let Some(table) = &mut self.graphs {
+            table.record(mode);
+        }
+        if final_stage {
+            // The features and the product share the model dtype, so the
+            // prompt's rows are copied as they are.
+            let count = out.numel() * out.dtype().bytes() as u64;
+            // SAFETY: the features hold at least the prompt's rows, the
+            // caller bound `out` for them, and the copy follows the encode
+            // on the stream.
+            unsafe { memcpy_async(out.address(), features.address(), count as usize, &stream)? };
+        }
+        Ok(mode)
     }
 
-    /// The resident graph of `key`, or eager execution when capture is
-    /// disabled. After seal a missing graph is an error.
-    fn graph(&mut self, key: EncoderGraph) -> Result<(Option<Handle>, GraphMode)> {
-        let Some(table) = self.graphs.as_mut().filter(|_| self.capturing) else {
-            return Ok((None, GraphMode::Eager));
+    /// The captured graph of `key`, or `None` for eager execution: capture
+    /// is disabled or no capacity was configured. After seal a missing
+    /// graph is an error.
+    fn graph(&mut self, key: EncoderGraph) -> Result<Option<&crate::cuda_graph::CUDAGraph>> {
+        let capturing = self.capturing;
+        let Some(table) = self.graphs.as_mut().filter(|_| capturing) else {
+            return Ok(None);
         };
-        let found = match table.lookup(&key, None)? {
-            Lookup::Replay(graph) => Some(graph.handle().clone()),
+        Ok(match table.lookup(&key, None)? {
+            Lookup::Replay(graph) => Some(graph),
             Lookup::Capture => None,
-        };
+        })
+    }
+
+    /// The resident graph handle of a packed vision encode of `key`, which
+    /// its binding replays, or eager execution when capture is disabled.
+    /// After seal a missing graph is an error.
+    fn packed_graph(&mut self, key: EncoderGraph) -> Result<(Option<Handle>, GraphMode)> {
+        let found = self.graph(key)?.map(|graph| graph.handle().clone());
         let mode = if found.is_some() {
             GraphMode::Replay
         } else {
             GraphMode::Eager
         };
-        table.record(mode);
+        if let Some(table) = &mut self.graphs {
+            table.record(mode);
+        }
         Ok((found, mode))
     }
 
@@ -1114,16 +1242,43 @@ impl EncoderRunner {
                     captured.push((EncoderGraph::Packed { slots }, graph));
                 }
             }
-            (EncoderInfo::Text(_), _, Steps::Text { capture, .. }) => {
-                let capture = capture.clone();
+            (
+                EncoderInfo::Text(_),
+                _,
+                Steps::Runner {
+                    encode, capture, ..
+                },
+            ) => {
+                let (encode, capture) = (encode.clone(), capture.clone());
+                let (Some(text), Some(stream), Device::Cuda(device)) =
+                    (&self.text, self.stream.clone(), self.device)
+                else {
+                    return Err(Error::Invariant(
+                        "a text encoder captures on its CUDA stream".into(),
+                    ));
+                };
+                text.tokens.zero(Some(&stream))?;
                 for &capacity in self.text_capacities.clone().iter().rev() {
-                    let zeros = vec![0u8; capacity * 8];
-                    if let Some(column) = &self.tokens {
-                        column.upload(&zeros, self.stream.as_ref())?;
+                    // An eager forward first, so kernels compile outside the
+                    // capture.
+                    let arguments = self.text_arguments(capacity)?;
+                    encode.call_values(&arguments)?;
+                    let Some(pool) = pool else {
+                        continue;
+                    };
+                    let graph = capture.capture(&pool.value, stream.raw(), device, || {
+                        encode.call_values(&arguments).map(drop)
+                    })?;
+                    if let Err(error) = check() {
+                        if let Err(cleanup) = capture.release.invoke(&[graph.handle().view()]) {
+                            tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
+                        }
+                        return Err(error);
                     }
-                    let graph =
-                        capture.call_values(&[Any::from(capacity as i64), pool_value.clone()])?;
-                    self.keep(EncoderGraph::Text { capacity }, graph, check)?;
+                    self.graphs
+                        .as_mut()
+                        .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
+                        .insert(EncoderGraph::Text { capacity }, None, graph)?;
                 }
             }
             _ => {}
@@ -1244,6 +1399,596 @@ fn grid_bytes(layout: &[[i64; 2]]) -> Vec<u8> {
         .flatten()
         .flat_map(|value| value.to_ne_bytes())
         .collect()
+}
+
+/// One rank's condition latent encoders.
+pub(crate) struct LatentEncoding {
+    video: Methods,
+    audio: Methods,
+    /// Frames of each visual unit of a condition of some frame count.
+    unit_frames: Function,
+    /// The runner of each call's input shapes, created at its first call.
+    video_runners: HashMap<Vec<i64>, Handle>,
+    audio_runners: HashMap<Vec<i64>, Handle>,
+}
+
+impl LatentEncoding {
+    /// `video` and `audio` are the encoders' module paths; the other
+    /// fields of the setups agree.
+    pub(crate) fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
+        Ok(Self {
+            unit_frames: video.interface.import(&format!("{ENCODER}.unit_frames"))?,
+            video: Methods::new(&video, ENCODER, "encode")?,
+            audio: Methods::new(&audio, ENCODER, "encode")?,
+            video_runners: HashMap::new(),
+            audio_runners: HashMap::new(),
+        })
+    }
+
+    pub(crate) fn stream(&self) -> &Stream {
+        &self.video.stream
+    }
+
+    /// Encode visual units, each `[pixel_offset, frames, width, height,
+    /// unit]`, into consecutive rows of `out`.
+    pub(crate) fn encode_video(
+        &mut self,
+        pixels: &StorageView,
+        units: &[[i64; 5]],
+        out: &StorageView,
+    ) -> Result<()> {
+        // The call's input shapes: each unit's frames at its raster.
+        let mut shapes = Vec::with_capacity(units.len() * 4);
+        for &[_, frames, width, height, unit] in units {
+            let value = self
+                .unit_frames
+                .call_values(&[self.video.loaded.to_any(), Any::from(frames)])?;
+            let lengths = crate::ffi::integers(value)
+                .map_err(|error| Error::numerical(self.unit_frames.name(), &error))?;
+            let length = lengths.get(unit as usize).copied().ok_or_else(|| {
+                Error::Invalid("a condition unit lies outside its condition".into())
+            })?;
+            shapes.extend([length, height, width, 3]);
+        }
+        let runner = match self.video_runners.get(&shapes) {
+            Some(runner) => runner.clone(),
+            None => {
+                let runner = self.video.runner(shapes.iter().copied())?;
+                self.video_runners.insert(shapes, runner.clone());
+                runner
+            }
+        };
+        self.video.forward.call_values(&[
+            runner.to_any(),
+            Any::from(pixels.to_tensor()?),
+            Any::from(out.to_tensor()?),
+            Any::from(integer_list(units.iter().flatten().copied())),
+        ])?;
+        Ok(())
+    }
+
+    /// Encode audio tracks of `lengths` samples into consecutive rows of
+    /// `out`.
+    pub(crate) fn encode_audio(
+        &mut self,
+        samples: &StorageView,
+        lengths: &[u64],
+        out: &StorageView,
+    ) -> Result<()> {
+        let shapes: Vec<i64> = lengths
+            .iter()
+            .flat_map(|&length| [length as i64, 2])
+            .collect();
+        let runner = match self.audio_runners.get(&shapes) {
+            Some(runner) => runner.clone(),
+            None => {
+                let runner = self.audio.runner(shapes.iter().copied())?;
+                self.audio_runners.insert(shapes, runner.clone());
+                runner
+            }
+        };
+        self.audio.forward.call_values(&[
+            runner.to_any(),
+            Any::from(samples.to_tensor()?),
+            Any::from(out.to_tensor()?),
+            Any::from(integer_list(lengths.iter().map(|&length| length as i64))),
+        ])?;
+        Ok(())
+    }
+
+    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+        let mut records = self.video.kernels(label, self.video_runners.values())?;
+        records.extend(self.audio.kernels(label, self.audio_runners.values())?);
+        Ok(records)
+    }
+
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
+        let video = self.video.close(aborted, self.video_runners.values());
+        video.and(self.audio.close(aborted, self.audio_runners.values()))
+    }
+}
+
+/// What a video model's text encoder component is bound with.
+pub(crate) struct TextSetup<'a> {
+    pub(crate) interface: &'a crate::model::interface::Interface,
+    pub(crate) loaded: &'a Handle,
+    pub(crate) component: &'a str,
+    /// The component's root module path.
+    pub(crate) path: &'a str,
+    pub(crate) device: i32,
+    pub(crate) stream: Stream,
+    pub(crate) attention: String,
+    /// Prompt capacities, the longest admitted prompt and, as the row
+    /// budget, the most vision patch rows one request carries.
+    pub(crate) config: EncoderConfig,
+    /// Whether the component also encodes condition media with its vision
+    /// tower.
+    pub(crate) vision: bool,
+    /// The model dtype the encoders compute in.
+    pub(crate) dtype: DType,
+}
+
+/// One rank's text encoder: the component binding, the prompt encoder and,
+/// for conditioned tasks, the vision tower bound with it. The encoders
+/// write prompt features and vision features into their products.
+pub(crate) struct TextEncoding {
+    binding: ComponentBinding,
+    /// The binding's workspaces; sealed once graphs captured them.
+    workspaces: StreamWorkspaces,
+    pub(crate) text: EncoderRunner,
+    pub(crate) vision: Option<EncoderRunner>,
+    stream: Stream,
+}
+
+impl TextEncoding {
+    pub(crate) fn new(setup: TextSetup<'_>) -> Result<Self> {
+        let TextSetup {
+            interface,
+            loaded,
+            component,
+            path,
+            device,
+            stream,
+            attention,
+            config,
+            vision,
+            dtype,
+        } = setup;
+        let text_info = EncoderInfo::describe(interface, loaded, path, dtype)?;
+        let vision_info = if vision {
+            Some(EncoderInfo::describe(
+                interface,
+                loaded,
+                &format!("{path}.vision"),
+                dtype,
+            )?)
+        } else {
+            None
+        };
+        // One vision call encodes every vision block of a request. Their
+        // patch rows together are within the row budget, and a block holds
+        // at least one feature, so the budget also bounds the blocks.
+        let config = match &vision_info {
+            Some(EncoderInfo::Vision(tower)) => EncoderConfig {
+                max_images: (config.row_budget / (tower.downsample as usize).pow(2)).max(1),
+                ..config
+            },
+            _ => config,
+        };
+        let prepared = crate::model::bind::prepare(
+            interface,
+            loaded,
+            BindingRequest {
+                component: component.to_owned(),
+                path: path.to_owned(),
+                device: crate::config::Device::Cuda(device),
+                stream: stream.raw(),
+                // The binding serves both encoders, so its operators are
+                // declared for the larger of their workloads: a prompt
+                // padded to the largest capacity, and a request's vision
+                // blocks.
+                size: [
+                    text_info.binding_size(&config),
+                    vision_info.and_then(|info| info.binding_size(&config)),
+                ]
+                .into_iter()
+                .flatten()
+                .reduce(|left, right| TextSize {
+                    tokens: left.tokens.max(right.tokens),
+                    rows: left.rows.max(right.rows),
+                }),
+                backends: Backends {
+                    attention,
+                    ..Backends::default()
+                },
+                derive_host_lengths: false,
+                experts: None,
+                weights: None,
+                cache: None,
+            },
+        )?;
+        let mut workspaces = StreamWorkspaces::default();
+        // The encoders declare no symmetric workspace, so none is
+        // allocated over the worker's ranks.
+        let binding = crate::model::bind::bind(interface, &mut workspaces, vec![prepared], None)?
+            .pop()
+            .ok_or_else(|| Error::Invariant("the text encoder was not bound".into()))?;
+        let text =
+            EncoderRunner::over(interface, &binding, "", text_info, &config, stream.clone())?;
+        let vision = vision_info
+            .map(|info| {
+                EncoderRunner::over(interface, &binding, "vision", info, &config, stream.clone())
+            })
+            .transpose()?;
+        Ok(Self {
+            binding,
+            workspaces,
+            text,
+            vision,
+            stream,
+        })
+    }
+
+    pub(crate) fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    /// Warm the prompt capacities and, with `pool`, capture one graph per
+    /// capacity; `check` bounds graph storage after each capture.
+    pub(crate) fn capture(
+        &mut self,
+        pool: Option<&Arc<GraphPool<Handle>>>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.text.capture(pool, check)?;
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Refuse further captures and workspace growth.
+    pub(crate) fn seal(&mut self) {
+        self.text.seal();
+        if let Some(vision) = &mut self.vision {
+            vision.seal();
+        }
+        self.workspaces.seal();
+    }
+
+    /// The binding's selected kernels.
+    pub(crate) fn kernels(&self) -> Result<Vec<crate::ffi::Record>> {
+        self.binding.kernels()
+    }
+
+    /// Release the encoders' graphs, then the binding.
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
+        let mut result = self.text.close(aborted);
+        if let Some(vision) = &mut self.vision {
+            result = result.and(vision.close(aborted));
+        }
+        result.and(self.binding.close(aborted))
+    }
+}
+
+/// The patch grids of a request's vision blocks, images and videos apart,
+/// each in request order as the text encoder places them.
+fn vision_grids(conditions: &[VideoCondition]) -> (Vec<[u32; 3]>, Vec<[u32; 3]>) {
+    let mut images = Vec::new();
+    let mut videos = Vec::new();
+    for condition in conditions {
+        let Some(vision) = &condition.vision else {
+            continue;
+        };
+        let grid = [vision.grid.t, vision.grid.h, vision.grid.w];
+        match condition.media {
+            uniserve_core::ConditionMedia::Video { .. } => videos.push(grid),
+            _ => images.push(grid),
+        }
+    }
+    (images, videos)
+}
+
+/// Encode a request's prompt into its `conditioning` rows, splicing the
+/// vision features of its condition media in at their placeholders when the
+/// call reads them. Every rank of the text encoder computes the features
+/// and publishes its copy.
+pub(crate) fn encode_text(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    batch: &mut MediaBatch,
+    index: usize,
+    slot: usize,
+    placement: &Placement<'_>,
+) -> Result<()> {
+    let call = &plan.calls[index];
+    if call.outputs.len() != 1 || call.inputs.len() > 1 {
+        return Err(Error::Invalid(
+            "text encoding reads at most one vision product and writes its conditioning".into(),
+        ));
+    }
+    let (tokens, conditions) = {
+        let request = parts.video.request(slot, call.request_key)?;
+        (Arc::clone(&request.tokens), Arc::clone(&request.conditions))
+    };
+    if tokens.is_empty() {
+        return Err(Error::Invalid(
+            "text conditioning requires admitted prompt tokens".into(),
+        ));
+    }
+    let width = row_width(&call.outputs[0])?;
+    let stream = stream_of(batch)?;
+    let visual = call
+        .inputs
+        .first()
+        .map(|input| {
+            batch.inputs.read(
+                parts.owners().store,
+                input,
+                call.call_id,
+                batch.device,
+                Some(&stream),
+            )
+        })
+        .transpose()?;
+    let write = bind_rows(
+        parts,
+        batch,
+        index,
+        &call.outputs[0],
+        vec![tokens.len() as u64, width],
+        placement,
+    )?;
+
+    let text = &mut parts
+        .video
+        .text
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?
+        .runner;
+    let (image_grids, video_grids) = vision_grids(&conditions);
+    let vision = visual.as_ref().map(|read| PromptVision {
+        image_grids: &image_grids,
+        video_grids: &video_grids,
+        rows: read.value(),
+    });
+    text.text.encode_text(&tokens, &write.view(), vision)?;
+    publish(
+        parts,
+        batch,
+        call,
+        index,
+        &write,
+        &[tokens.len() as u64, width],
+    )
+}
+
+/// Encode the vision blocks of a request's condition media into one
+/// `vision_features` row per vision placeholder, in request order.
+pub(crate) fn encode_vision(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    batch: &mut MediaBatch,
+    index: usize,
+    slot: usize,
+    placement: &Placement<'_>,
+) -> Result<()> {
+    let call = &plan.calls[index];
+    if call.inputs.len() != 1 || call.outputs.len() != 1 {
+        return Err(Error::Invalid(
+            "vision encoding requires one input and one output".into(),
+        ));
+    }
+    let conditions = Arc::clone(&parts.video.request(slot, call.request_key)?.conditions);
+    let blocks: Vec<([u32; 3], u64)> = conditions
+        .iter()
+        .filter_map(|condition| condition.vision.as_ref())
+        .map(|vision| {
+            (
+                [vision.grid.t, vision.grid.h, vision.grid.w],
+                u64::from(vision.tokens),
+            )
+        })
+        .collect();
+    if blocks.is_empty() {
+        return Err(Error::Invalid(
+            "vision encoding requires a vision block".into(),
+        ));
+    }
+    let width = row_width(&call.outputs[0])?;
+    let tokens: u64 = blocks.iter().map(|block| block.1).sum();
+    let stream = stream_of(batch)?;
+    let patches = batch.inputs.read(
+        parts.owners().store,
+        &call.inputs[0],
+        call.call_id,
+        batch.device,
+        Some(&stream),
+    )?;
+    let write = bind_rows(
+        parts,
+        batch,
+        index,
+        &call.outputs[0],
+        vec![tokens, width],
+        placement,
+    )?;
+
+    let text = &mut parts
+        .video
+        .text
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?
+        .runner;
+    let vision = text
+        .vision
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank's text encoder reads no vision".into()))?;
+    // Each block's features are consecutive rows of the product.
+    let grids: Vec<[u32; 3]> = blocks.iter().map(|block| block.0).collect();
+    vision.encode_patches(patches.value(), &grids, &write.view())?;
+    publish(parts, batch, call, index, &write, &[tokens, width])
+}
+
+/// Encode a request's conditions into denoiser rows: a round of visual
+/// units, this rank's of them, or every audio track.
+pub(crate) fn encode_conditions(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    batch: &mut MediaBatch,
+    index: usize,
+    slot: usize,
+    placement: &Placement<'_>,
+) -> Result<()> {
+    let call = &plan.calls[index];
+    if call.inputs.len() != 1 || call.outputs.len() != 1 {
+        return Err(Error::Invalid(
+            "condition encoding requires one input and one output".into(),
+        ));
+    }
+    let name = parts.video.product_name(call, &call.outputs[0])?.to_owned();
+    let conditions = Arc::clone(&parts.video.request(slot, call.request_key)?.conditions);
+    if conditions.is_empty() {
+        return Err(Error::Invalid(
+            "condition encoding requires admitted conditions".into(),
+        ));
+    }
+    let rank = parts.video.rank;
+    let owners = parts.owners();
+    let latent = parts
+        .video
+        .latent
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
+    let stream = stream_of(batch)?;
+    let width = row_width(&call.outputs[0])?;
+    match name.as_str() {
+        "condition_video_latents" => {
+            let range = decode_range(plan, call)?;
+            // Every visual unit as (condition, unit, rows), in encoding order.
+            let all: Vec<(usize, u32, u64)> = conditions
+                .iter()
+                .enumerate()
+                .flat_map(|(index, condition)| {
+                    condition
+                        .latent_units
+                        .iter()
+                        .enumerate()
+                        .map(move |(unit, &rows)| (index, unit as u32, u64::from(rows)))
+                })
+                .collect();
+            let (cursor, count) = (range.cursor as usize, range.max_units as usize);
+            if count == 0 || cursor + count > all.len() {
+                return Err(Error::Invalid(
+                    "condition encoding exceeds the admitted units".into(),
+                ));
+            }
+            let round = &all[cursor..cursor + count];
+            let run = latent.units(rank, 0, count as u32)?;
+            if run.is_empty() {
+                return Err(Error::Invalid(
+                    "condition encoding assigns this rank no unit".into(),
+                ));
+            }
+            let rows: u64 = round.iter().map(|unit| unit.2).sum();
+            let first: u64 = round[..run.start as usize].iter().map(|unit| unit.2).sum();
+            let last: u64 = round[..run.end as usize].iter().map(|unit| unit.2).sum();
+            let pixels = batch.inputs.read(
+                owners.store,
+                &call.inputs[0],
+                call.call_id,
+                batch.device,
+                Some(&stream),
+            )?;
+            let mut offsets = Vec::new();
+            let mut cursor_pixels = 0u64;
+            for condition in conditions.iter() {
+                offsets.push(cursor_pixels);
+                cursor_pixels += condition.pixel_bytes() / 3;
+            }
+            let units: Vec<[i64; 5]> = round[run.start as usize..run.end as usize]
+                .iter()
+                .map(|&(condition, unit, _)| {
+                    let (frames, canvas) = conditions[condition].media.pixels().unwrap_or((
+                        0,
+                        Canvas {
+                            width: 0,
+                            height: 0,
+                        },
+                    ));
+                    [
+                        offsets[condition] as i64,
+                        i64::from(frames),
+                        i64::from(canvas.width),
+                        i64::from(canvas.height),
+                        i64::from(unit),
+                    ]
+                })
+                .collect();
+            let write = bind_outputs(
+                owners.store,
+                &[OutputShape {
+                    product: call.outputs[0].clone(),
+                    shape: vec![rows, width],
+                    region: Some(vec![first..last, 0..width]),
+                }],
+                batch.device,
+                placement,
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
+            batch.calls[index].writes.push(write.clone());
+            latent
+                .runner
+                .encode_video(pixels.value(), &units, &write.view())?;
+            publish_bound(parts, batch, call, index, &write, false)?;
+        }
+        "condition_audio_latents" => {
+            // The audio call is one unit, the component's first rank's.
+            let run = latent.units(rank, 0, 1)?;
+            if run.is_empty() {
+                return Ok(());
+            }
+            let lengths: Vec<u64> = conditions
+                .iter()
+                .filter_map(|condition| condition.media.audio().map(|track| track.samples))
+                .collect();
+            let rows: u64 = conditions
+                .iter()
+                .map(|condition| u64::from(condition.audio_rows))
+                .sum();
+            let samples = batch.inputs.read(
+                owners.store,
+                &call.inputs[0],
+                call.call_id,
+                batch.device,
+                Some(&stream),
+            )?;
+            let write = bind_outputs(
+                owners.store,
+                &[OutputShape {
+                    product: call.outputs[0].clone(),
+                    shape: vec![rows, width],
+                    region: None,
+                }],
+                batch.device,
+                placement,
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
+            batch.calls[index].writes.push(write.clone());
+            latent
+                .runner
+                .encode_audio(samples.value(), &lengths, &write.view())?;
+            publish_bound(parts, batch, call, index, &write, false)?;
+        }
+        other => {
+            return Err(Error::Invalid(format!(
+                "latent encoding does not produce {other}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
