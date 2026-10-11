@@ -54,8 +54,8 @@ pub struct WorkerBackend {
     /// The image runtime, on ranks holding encoders, image denoisers or
     /// image decoders of a model that is not a video model.
     image: Option<forward::image::ImageRuntime>,
-    /// The diffusion LM runner, on ranks holding a diffusion LM.
-    diffusion_lm: Option<crate::runner::diffusion_lm::DiffusionLMRunner>,
+    /// The runner of each diffusion LM component placed on the rank.
+    diffusion_lm: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
     /// The expert-parallel runtime, on ranks of an expert union.
     experts: Option<forward::experts::ExpertRuntime>,
     /// Distributed expert weights, on ranks that prefetch them.
@@ -83,7 +83,7 @@ pub(crate) struct Parts<'a> {
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut forward::token::TextRuntime>,
     pub image: Option<&'a mut forward::image::ImageRuntime>,
-    pub diffusion_lm: Option<&'a mut crate::runner::diffusion_lm::DiffusionLMRunner>,
+    pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
     pub experts: Option<&'a forward::experts::ExpertRuntime>,
     pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
 }
@@ -95,7 +95,7 @@ fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<forward::token::TextRuntime>,
     image: &'a mut Option<forward::image::ImageRuntime>,
-    diffusion_lm: &'a mut Option<crate::runner::diffusion_lm::DiffusionLMRunner>,
+    diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
     transfer: &'a mut Option<forward::transfer::TransferRuntime>,
     video: &'a mut Option<forward::video::VideoRuntime>,
     others: &'a mut [Box<dyn RequestStorage>],
@@ -110,8 +110,8 @@ fn owners<'a>(
     if let Some(image) = image {
         owners.push(image);
     }
-    if let Some(diffusion_lm) = diffusion_lm {
-        owners.push(diffusion_lm);
+    for runner in diffusion_lm {
+        owners.push(runner);
     }
     if let Some(transfer) = transfer {
         owners.push(transfer);
@@ -242,7 +242,7 @@ impl WorkerBackend {
             rank_storage: None,
             text: None,
             image: None,
-            diffusion_lm: None,
+            diffusion_lm: Vec::new(),
             experts: None,
             weights: None,
             transfer: None,
@@ -339,18 +339,18 @@ impl WorkerBackend {
         self.image.as_mut()
     }
 
-    /// Install the diffusion LM runner.
+    /// Install the diffusion LM runners.
     pub(crate) fn set_diffusion_lm(
         &mut self,
-        diffusion_lm: crate::runner::diffusion_lm::DiffusionLMRunner,
+        runners: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
     ) {
-        self.diffusion_lm = Some(diffusion_lm);
+        self.diffusion_lm = runners;
     }
 
     pub(crate) fn diffusion_lm_mut(
         &mut self,
-    ) -> Option<&mut crate::runner::diffusion_lm::DiffusionLMRunner> {
-        self.diffusion_lm.as_mut()
+    ) -> &mut [crate::runner::diffusion_lm::DiffusionLMRunner] {
+        &mut self.diffusion_lm
     }
 
     /// Install the expert-parallel runtime.
@@ -423,7 +423,7 @@ impl WorkerBackend {
             storage: self.rank_storage.as_mut(),
             text: self.text.as_mut(),
             image: self.image.as_mut(),
-            diffusion_lm: self.diffusion_lm.as_mut(),
+            diffusion_lm: &mut self.diffusion_lm,
             experts: self.experts.as_ref(),
             transfer: self.transfer.as_mut(),
         }
@@ -652,8 +652,8 @@ impl WorkerBackend {
         if let Some(mut transfer) = self.transfer.take() {
             result = result.and(transfer.close(aborted));
         }
-        if let Some(mut diffusion_lm) = self.diffusion_lm.take() {
-            result = result.and(diffusion_lm.close(aborted));
+        for mut runner in std::mem::take(&mut self.diffusion_lm) {
+            result = result.and(runner.close(aborted));
         }
         if let Some(mut image) = self.image.take() {
             result = result.and(image.close(aborted));
@@ -671,10 +671,10 @@ impl WorkerBackend {
     /// before the bindings they run close; attempts every one before
     /// returning the first failure.
     pub fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
-        let diffusion_lm = self
-            .diffusion_lm
-            .take()
-            .map_or(Ok(()), |mut diffusion_lm| diffusion_lm.close(aborted));
+        let mut diffusion_lm = Ok(());
+        for mut runner in std::mem::take(&mut self.diffusion_lm) {
+            diffusion_lm = diffusion_lm.and(runner.close(aborted));
+        }
         let image = self
             .image
             .take()

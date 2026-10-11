@@ -429,9 +429,9 @@ impl Worker {
         if let Some(image) = image {
             backend.set_image(image);
         }
-        let diffusion_lm_warmup = diffusion_lm.is_some();
-        if let Some(runner) = diffusion_lm {
-            backend.set_diffusion_lm(runner);
+        let diffusion_lm_warmup = !diffusion_lm.is_empty();
+        if diffusion_lm_warmup {
+            backend.set_diffusion_lm(diffusion_lm);
         }
         if let Some(weights) = weights {
             backend.set_weights(weights);
@@ -860,12 +860,11 @@ impl Worker {
                     .map_err(phase("warmup"))?;
             }
         }
-        if let Some(runner) = executor.backend_mut().diffusion_lm_mut() {
-            for (label, kernels) in runner.kernels().map_err(phase("warmup"))? {
-                records
-                    .add(&label, &self.config.device.to_string(), &kernels)
-                    .map_err(phase("warmup"))?;
-            }
+        for runner in executor.backend_mut().diffusion_lm_mut() {
+            let (label, kernels) = runner.kernels().map_err(phase("warmup"))?;
+            records
+                .add(&label, &self.config.device.to_string(), &kernels)
+                .map_err(phase("warmup"))?;
             runner.seal();
         }
         records.log("startup", self.config.rank, &self.config.device.to_string());
@@ -1307,7 +1306,7 @@ fn plan(
                 ),
             );
         }
-        // The diffusion LM runner's buffers, banks and sampler workspace.
+        // The diffusion LM runners' buffers, banks and sampler workspaces.
         layout.reserve(
             config.device,
             diffusion_lm::reserved_bytes(

@@ -67,21 +67,22 @@ struct Context<'a> {
     pub(crate) experts: Option<&'a ExpertRuntime>,
 }
 
-/// The expert call kind of the runner's forwards: distinct from the text
-/// runtime's kinds, so the union's ready kinds take turns.
-fn expert_kind() -> i64 {
-    64
+/// The expert call kind of diffusion LM runner `index`: distinct from the
+/// text runtime's kinds, so the union's ready kinds take turns.
+fn expert_kind(index: usize) -> i64 {
+    64 + index as i64
 }
 
-/// The coordinator of the runner's expert steps: agreement while serving,
-/// announced or `forced` capacities during warmup.
+/// The coordinator of runner `index`'s expert steps: agreement while
+/// serving, announced or `forced` capacities during warmup.
 pub(super) fn coordinator<'a>(
     experts: Option<&'a ExpertRuntime>,
+    index: usize,
     forced: Option<usize>,
 ) -> impl FnMut(usize) -> Result<Option<usize>> + 'a {
     move |extent| {
         experts
-            .map(|experts| experts.capacity(extent, expert_kind(), forced))
+            .map(|experts| experts.capacity(extent, expert_kind(index), forced))
             .transpose()
     }
 }
@@ -151,8 +152,8 @@ impl DiffusionLMRunner {
             .iter()
             .any(|call| call.code != KIND || call.component != self.component)
         {
-            return Err(reserve(Error::Unsupported(format!(
-                "a diffusion LM batch carries calls of component {:?}",
+            return Err(reserve(Error::Invalid(format!(
+                "a diffusion LM batch carries token-denoising calls of component {:?}",
                 self.component
             ))));
         }
@@ -520,7 +521,7 @@ impl Batch<'_> {
         // is copied to the lease per call, so a call's words stay adjacent.
         let mut spans: Vec<Option<(usize, usize)>> = vec![None; active.len()];
         let (stream, events) = (self.stream, self.events);
-        let mut coordinate = coordinator(self.experts, None);
+        let mut coordinate = coordinator(self.experts, self.runner.index, None);
         let executed = {
             let mut output = lock(buffer);
             self.runner
@@ -615,7 +616,7 @@ impl Batch<'_> {
             .tables()
             .prepare_attention(&attention, |_, _, _| Ok(()))
             .map_err(&execute)?;
-        let mut coordinate = coordinator(self.experts, None);
+        let mut coordinate = coordinator(self.experts, self.runner.index, None);
         let executed = self
             .runner
             .denoise(&steps, &pages, &mut coordinate)
@@ -740,7 +741,22 @@ pub(crate) fn execute(
     let plan = Arc::clone(batch.shared_plan());
     let predecessors = batch.predecessors().to_vec();
     let parts = backend.parts();
-    let (Some(runner), Some(storage)) = (parts.diffusion_lm, parts.storage) else {
+    // A batch carries calls of one component, which names its runner.
+    let component = plan.calls.first().map(|call| call.component.as_str());
+    let runner = parts
+        .diffusion_lm
+        .iter_mut()
+        .find(|runner| Some(runner.component.as_str()) == component);
+    let Some(runner) = runner else {
+        return Err(WorkerError::classify(
+            Error::Unsupported(format!(
+                "component {:?} has no diffusion LM runner on this rank",
+                component.unwrap_or_default()
+            )),
+            None,
+        ));
+    };
+    let Some(storage) = parts.storage else {
         return Err(crate::executor::forward::unsupported(kind, "diffusion LM"));
     };
     let RankStorage {
