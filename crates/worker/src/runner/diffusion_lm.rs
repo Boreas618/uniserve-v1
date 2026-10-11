@@ -83,13 +83,14 @@ const CANDIDATES: usize = 1 << 16;
 const RUNNER: &str = "uniserve_models.runner.diffusion_lm.DiffusionLMRunner";
 
 /// The methods of the Python half the rank calls.
-const METHODS: [&str; 6] = [
+const METHODS: [&str; 7] = [
     "attend",
     "readout",
     "denoise",
     "plan_attention",
     "plans_attention",
     "kernels",
+    "close",
 ];
 
 /// The runner of one diffusion language model component on the rank.
@@ -192,9 +193,14 @@ impl DiffusionLMRunner {
         self.graphs.seal();
     }
 
-    /// Release graphs and output storage after the lane drained.
+    /// Release graphs, the Python runner's execution context and output
+    /// storage after the lane drained. An aborted close keeps the context:
+    /// device work may still address its workspace.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let mut result = self.graphs.close(aborted);
+        if !aborted {
+            result = result.and(self.call("close", &[]));
+        }
         for collectives in &mut self.collectives {
             result = result.and(collectives.close(aborted));
         }

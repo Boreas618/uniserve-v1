@@ -10,6 +10,7 @@ pub(crate) mod encoder;
 pub(crate) mod input_buffers;
 pub(crate) mod media;
 pub(crate) mod methods;
+pub(crate) mod scratch;
 pub(crate) mod start;
 pub(crate) mod vision;
 

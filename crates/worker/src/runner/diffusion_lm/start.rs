@@ -6,9 +6,10 @@
 //! capacity planning (bytes to reserve beside the prefix cache pool) and
 //! again for allocation, so both agree. [`DiffusionLMRunner::start`] then
 //! creates one runner per diffusion LM component placed on the rank: it
-//! prepares the component on the lane's stream (operators over Rust
-//! workspaces and the prefix cache pool), allocates the runner's buffers,
-//! banks and graph pool, and constructs the Python runner over the banks.
+//! allocates the runner's buffers, banks and graph pool and constructs the
+//! Python runner on the lane's stream, which prepares the model's execution
+//! context over the stream's scratch, the prefix cache pool and the model's
+//! stream collectives.
 
 use uniserve_core::CanvasSampling;
 use uniserve_cuda::{DeviceId, Stream};
@@ -23,13 +24,14 @@ use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
 use crate::ffi::Handle;
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
-use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
+use crate::model::bind;
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::parallel::{DwdpManager, ExpertUnion};
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::methods::{Argument, Methods};
+use crate::runner::scratch::Scratches;
 use crate::storage::{GroupShape, KVCache, KVPlan, OutputPool};
 use crate::{Error, Result};
 
@@ -214,7 +216,8 @@ pub(crate) struct Startup<'a> {
     pub(crate) lanes: &'a Lanes,
     pub(crate) kv: Option<&'a KVCache>,
     pub(crate) components: &'a mut Components,
-    pub(crate) workspaces: &'a mut StreamWorkspaces,
+    /// The shared work areas of the rank's streams.
+    pub(crate) scratches: &'a mut Scratches,
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The device's startup stream, which zeroes new storage.
     pub(crate) preparation: Option<&'a Stream>,
@@ -254,6 +257,8 @@ fn placed(components: &Components) -> Result<Vec<(String, String, Device)>> {
 /// One component between its preparation and its runner.
 struct Planned {
     component: String,
+    path: String,
+    device: Device,
     cuda: Option<i32>,
     facts: Facts,
     bounds: Bounds,
@@ -299,10 +304,7 @@ impl DiffusionLMRunner {
             ));
         }
 
-        // Prepare every component before binding any, so shared workspaces
-        // hold the largest of them.
         let mut planned = Vec::new();
-        let mut prepared = Vec::new();
         for (component, path, device) in placed {
             let cuda = device.cuda_index();
             let facts = Facts::read(
@@ -346,28 +348,10 @@ impl DiffusionLMRunner {
                     "expert parallelism runs every forward on one execution lane".into(),
                 ));
             }
-            prepared.push(bind::prepare(
-                interface,
-                startup.model.handle(),
-                BindingRequest {
-                    component: component.clone(),
-                    path,
-                    device,
-                    stream: stream.as_ref().map_or(0, Stream::raw),
-                    size: Some(TextSize {
-                        tokens: bounds.tokens,
-                        rows: bounds.rows,
-                    }),
-                    // The loaded model resolved its attention backend.
-                    backends: Backends::default(),
-                    derive_host_lengths: false,
-                    experts: experts.as_ref().map(|experts| experts.transport(0).clone()),
-                    weights: startup.weights.map(|weights| weights.prefetch().clone()),
-                    cache: Some(cache.clone()),
-                },
-            )?);
             planned.push(Planned {
                 component,
+                path,
+                device,
                 cuda,
                 facts,
                 bounds,
@@ -376,12 +360,13 @@ impl DiffusionLMRunner {
                 stream,
             });
         }
-        let bindings = bind::bind(interface, startup.workspaces, prepared)?;
 
         let mut runners = Vec::new();
-        for (index, (plan, binding)) in planned.into_iter().zip(&bindings).enumerate() {
+        for (index, plan) in planned.into_iter().enumerate() {
             let Planned {
                 component,
+                path,
+                device,
                 cuda,
                 facts,
                 bounds,
@@ -389,20 +374,20 @@ impl DiffusionLMRunner {
                 banks,
                 stream,
             } = plan;
-            let mut collectives = Vec::new();
-            if let Some(peers) = startup.peers {
-                let owner = stream
-                    .as_ref()
-                    .and_then(|stream| startup.lanes.owner(stream.raw()));
-                collectives.extend(peers.bind_collectives(interface, binding, owner)?);
-            }
-            // Idle ranks join expert steps through the model's expert
-            // layers; a text binding may already provide them.
-            if let Some(experts) = experts.as_deref_mut()
-                && !experts.has_joins()
-            {
-                experts.bind_joins(&[binding.prepared()])?;
-            }
+            // The model's collectives on the lane's stream, which its
+            // execution context is constructed with.
+            let collectives = match startup.peers {
+                Some(peers) => {
+                    let owner = stream
+                        .as_ref()
+                        .and_then(|stream| startup.lanes.owner(stream.raw()));
+                    peers.stream_collectives(&component, device, owner)?
+                }
+                None => None,
+            };
+            let handle = stream.as_ref().map_or(0, Stream::raw);
+            let scratch = startup.scratches.get(interface, handle, cuda)?;
+            let optional = |handle: Option<Handle>| handle.map_or(Argument::None, Argument::Handle);
 
             let dimensions = bounds.dimensions(&facts, banks);
             let banks = banks
@@ -412,7 +397,21 @@ impl DiffusionLMRunner {
             let state = DenoiseViews::of(&buffers)?;
             let chunk_rows = bounds.denoise.map_or(0, |(_, chunk_rows)| chunk_rows);
             let mut arguments = vec![
-                Argument::Handle(binding.prepared().clone()),
+                Argument::Handle(startup.model.handle().clone()),
+                Argument::Text(path),
+                handle.into(),
+                Argument::Handle(scratch),
+                Argument::Handle(cache.clone()),
+                optional(experts.as_ref().map(|experts| experts.transport(0).clone())),
+                optional(startup.weights.map(|weights| weights.prefetch().clone())),
+                // The functions of each communicator's collectives on the
+                // stream, by communicator name.
+                match &collectives {
+                    Some(collectives) => Argument::Handle(Handle::new(collectives.tables())?),
+                    None => Argument::None,
+                },
+                bounds.tokens.into(),
+                bounds.rows.into(),
                 bounds.page_tokens.as_slice().into(),
                 bounds.windowed.as_slice().into(),
                 chunk_rows.into(),
@@ -431,6 +430,13 @@ impl DiffusionLMRunner {
                 }
             }
             let methods = Methods::construct(interface, RUNNER, &METHODS, arguments)?;
+            // Idle ranks join expert steps through the model's expert
+            // layers; a text binding may already provide them.
+            if let Some(experts) = experts.as_deref_mut()
+                && !experts.has_joins()
+            {
+                experts.bind_joins(&[methods.runner()])?;
+            }
 
             let owner = format!("diffusion_lm:{component}");
             let pool = match (cuda, bounds.graphs) {
@@ -488,11 +494,10 @@ impl DiffusionLMRunner {
                 pool,
                 stream,
                 plans_attention: true,
-                collectives,
+                collectives: collectives.into_iter().collect(),
                 outputs,
             });
         }
-        startup.components.add_bindings(bindings);
         if let Some(stream) = startup.preparation {
             stream.synchronize()?;
         }

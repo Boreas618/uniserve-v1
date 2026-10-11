@@ -21,7 +21,7 @@ from PIL import Image
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
 from tests.python.fixtures.image_harness import image_harness
-from tests.python.fixtures.stub import ATTENTION, IO, LOCAL
+from tests.python.fixtures.stub import load_model, read_config
 from uniserve_models import catalog as models
 from uniserve_models import interface
 from uniserve_models.bindings.context import ExecutionContext
@@ -148,54 +148,16 @@ def _payload(height: int, width: int, seed: int) -> str:
     return base64.b64encode(encoded.getvalue()).decode()
 
 
-def _load(table, root):
-    description, _ = table["model.describe"](
-        tvm_ffi.convert(
-            {
-                "stub": False,
-                "path": str(root),
-                "base_model": None,
-                "io": IO,
-                "device": "cuda:0",
-                "generation_device": None,
-                "components": {"model": LOCAL},
-                "rank": 0,
-                "role": "model",
-                "expert_split": False,
-            }
-        )
-    )
-    resolved = table["model.resolve"](
-        description,
-        {
-            "modules": ["vision_encoder"],
-            "exclude_modules": [],
-            "quantization": "{}",
-            "model_dtype": "bfloat16",
-        },
-    )
-    return table["model.load"](
-        resolved,
-        tvm_ffi.convert(
-            {
-                "device": "cuda:0",
-                "generation_device": None,
-                "role": "model",
-                "host_only": False,
-                "meshes": [],
-                "experts": None,
-                "attention_backend": "auto",
-                "attention": ATTENTION,
-            }
-        ),
-    )
+def _load(root):
+    description, _ = read_config(stub=False, path=str(root), device="cuda:0")
+    return load_model(description, modules=["vision_encoder"], device="cuda:0")
 
 
 @torch.inference_mode()
 def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
     diffusion_gemma_checkpoint(tmp_path, vision=VISION)
     table = interface.table()
-    model = _load(table, tmp_path)
+    model = _load(tmp_path)
     # The processor scales each image to the tower's patch budget, so
     # aspect ratios near one keep every grid side within the fixture's
     # position table.
