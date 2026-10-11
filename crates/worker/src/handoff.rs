@@ -1,9 +1,8 @@
 //! Work handed from one thread to another, whose submitter waits for it.
 //!
-//! The control thread hands a forward to its lane's execution thread, and
-//! every thread hands its Python calls to the Python thread. In both cases
-//! the work borrows the submitter's stack, so the submitter stays parked
-//! until the receiving thread has run it.
+//! Every thread hands its Python calls to the Python thread. The work
+//! borrows the submitter's stack, so the submitter stays parked until the
+//! receiving thread has run it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::Thread;

@@ -1,15 +1,22 @@
 //! `Issue`: where a function issues the work of a stream.
 //!
 //! A lane's execution thread is the only issuer of work on its stream. The
-//! owners of request storage decide that work: which copies, fills and
-//! fences a batch needs, in which order. They take what they issue to as an
-//! [`Issue`], so the same function serves a caller that holds the stream
-//! and one that does not. A [`Stream`] (`&Stream`, or `Option<&Stream>`
-//! where host storage has no stream) issues at once, on the calling thread.
+//! owners of request storage decide that work on the control thread: which
+//! copies, fills and fences a batch needs, in which order. They take what
+//! they issue to as an [`Issue`]:
 //!
-//! Host bookkeeping happens when the function is called, whatever it issues
-//! to. When the device sees the work is the issuer's matter, so a function
-//! generic over [`Issue`] never reads back what it issued.
+//! - a [`Stream`] (`&Stream`, or `Option<&Stream>` where host storage has no
+//!   stream) issues at once, on the calling thread;
+//! - a job's recorder ([`crate::lane::Job::on`]) appends the same work to
+//!   the job as operations, which the lane's execution thread performs when
+//!   the job reaches it.
+//!
+//! Host bookkeeping is the same either way and happens when the function is
+//! called. What differs is when the device sees the work, so a function
+//! generic over [`Issue`] never reads back what it issued. An event recorded
+//! into a job reports itself incomplete until the record is made
+//! ([`uniserve_cuda::Event::queue_record`]), so storage fenced by it is not
+//! returned early.
 
 use std::sync::Arc;
 
