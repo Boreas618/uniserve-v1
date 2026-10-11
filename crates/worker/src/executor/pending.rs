@@ -9,7 +9,8 @@ use uniserve_ipc::{
 use crate::{Error, LatentUpdate, OutputBuffer, RequestPool, RequestProgress, Result};
 
 // sampling_columns packs [valid | active | token | accepted draft count],
-// with one word per row in each field. Canvas completion starts with its outcome.
+// with one word per row in each field. A denoising step's completion starts with
+// its outcome.
 const SAMPLING_FIELDS: usize = 4;
 const STEP_STOPPED: i64 = 1;
 const STEP_SKIPPED: i64 = 2;
