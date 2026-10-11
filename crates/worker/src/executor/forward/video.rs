@@ -38,7 +38,7 @@ use crate::runner::RunnerSetup;
 use crate::runner::decoder::{DecodeCapacity, DecoderRunner, Segment, TrackUnits, UnitShape};
 use crate::runner::denoiser::{Conditioning, DenoiserRunner, VideoModel};
 use crate::runner::encoder::EncoderConfig;
-use crate::runner::encoder::{LatentEncoding, TextEncoding, TextSetup};
+use crate::runner::encoder::{EncoderRunner, TextSetup};
 use crate::runner::media::MediaRunner;
 use crate::worker::RankStorage;
 use crate::{Error, OutputPool, Result};
@@ -118,7 +118,9 @@ pub(crate) struct VideoRuntime {
     pub(crate) rank: usize,
     /// Admitted requests by slot.
     pub(crate) requests: HashMap<usize, VideoRequest>,
-    pub(crate) text: Option<Component<TextEncoding>>,
+    pub(crate) text: Option<Component<EncoderRunner>>,
+    /// The vision tower bound with the text encoder, for conditioned tasks.
+    pub(crate) vision: Option<EncoderRunner>,
     /// The text encoder's graph pool, when graphs are captured.
     pub(crate) text_pool: Option<Arc<crate::cuda_graph::GraphPool<Handle>>>,
     pub(crate) denoiser: Option<Component<DenoiserRunner>>,
@@ -130,7 +132,7 @@ pub(crate) struct VideoRuntime {
     /// its track's latent rows.
     audio_units: Vec<(TrackUnits, u64)>,
     pub(crate) audio: Option<Component<DecoderRunner>>,
-    pub(crate) latent: Option<Component<LatentEncoding>>,
+    pub(crate) latent: Option<Component<EncoderRunner>>,
     pub(crate) host: Option<MediaRunner>,
     pub(crate) outputs: OutputPool,
     /// Product names of every component's outputs, by output index.
@@ -314,7 +316,7 @@ impl VideoRuntime {
                     .text
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?;
-                Ok((text.device, Some(text.runner.stream().clone())))
+                Ok((text.device, text.runner.stream().cloned()))
             }
             MediaCall::LatentPreparation | MediaCall::Denoising => {
                 let denoiser = self
@@ -344,7 +346,7 @@ impl VideoRuntime {
                     .latent
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
-                Ok((latent.device, Some(latent.runner.stream().clone())))
+                Ok((latent.device, latent.runner.stream().cloned()))
             }
             _ => Ok((Device::Cpu, None)),
         }
@@ -659,6 +661,11 @@ impl crate::executor::lifecycle::RequestStorage for VideoRuntime {
             }
         }
         self.requests.clear();
+        // The vision tower computes with the text encoder's binding, which
+        // the text encoder releases.
+        if let Some(vision) = &mut self.vision {
+            result = result.and(vision.close(aborted));
+        }
         if let Some(text) = &mut self.text {
             result = result.and(text.runner.close(aborted));
         }
@@ -794,6 +801,7 @@ impl VideoRuntime {
         };
 
         let mut text = None;
+        let mut vision = None;
         let mut text_pool = None;
         let mut denoiser = None;
         let mut decoder = None;
@@ -844,7 +852,7 @@ impl VideoRuntime {
                     .unwrap_or_default();
                 let (stream, _) = component_stream(lanes, MediaCall::TextEncoding, device)?;
                 text_pool = pool(graphs, TEXT_GRAPHS, &placed.name, device, None)?;
-                let runner = TextEncoding::new(TextSetup {
+                let (runner, tower) = EncoderRunner::text(TextSetup {
                     interface,
                     loaded,
                     component: &placed.name,
@@ -873,6 +881,7 @@ impl VideoRuntime {
                     device,
                     runner,
                 });
+                vision = tower;
             }
             if placed.name == model.denoiser {
                 let envelope = envelope
@@ -1043,7 +1052,7 @@ impl VideoRuntime {
                         allocate: allocate.clone(),
                     })
                 };
-                let runner = LatentEncoding::new(
+                let runner = EncoderRunner::conditions(
                     setup(crate::model::components::Capability::VideoEncoder)?,
                     setup(crate::model::components::Capability::AudioEncoder)?,
                 )?;
@@ -1081,6 +1090,7 @@ impl VideoRuntime {
             rank: config.rank,
             requests: HashMap::new(),
             text,
+            vision,
             text_pool,
             denoiser,
             decoder,
@@ -1099,7 +1109,7 @@ impl VideoRuntime {
     pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<Record>)>> {
         let mut kernels = Vec::new();
         if let Some(text) = &self.text {
-            kernels.push((text.name.clone(), text.runner.kernels()?));
+            kernels.push((text.name.clone(), text.runner.kernels(&text.name)?));
         }
         if let Some(denoiser) = &self.denoiser {
             kernels.push((
@@ -1235,7 +1245,13 @@ impl VideoRuntime {
             // same order on every rank of a tensor-parallel encoder.
             text.runner
                 .capture(self.text_pool.as_ref(), &mut || Ok(()))?;
+            if let Some(stream) = text.runner.stream() {
+                stream.synchronize()?;
+            }
             text.runner.seal();
+            if let Some(vision) = &mut self.vision {
+                vision.seal();
+            }
         }
         if let Some(denoiser) = &mut self.denoiser {
             let runner = &mut denoiser.runner;
