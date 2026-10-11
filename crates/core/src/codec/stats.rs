@@ -76,96 +76,66 @@ pub struct PrefillStats {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForwardStats {
     /// Forward executions grouped by runtime mode.
-    #[serde(default)]
     pub mode_counts: BTreeMap<String, u64>,
     /// Query tokens computed by runtime mode. Modes without a token notion
     /// (encoder and decoder calls, standalone module invocations) have no
     /// entry, while `mode_counts` and `mode_us` still count them.
-    #[serde(default)]
     pub mode_tokens: BTreeMap<String, u64>,
     /// Forward time in microseconds by runtime mode.
-    #[serde(default)]
     pub mode_us: BTreeMap<String, u64>,
     /// Component execution time in microseconds.
-    #[serde(default)]
     pub component_us: BTreeMap<String, u64>,
     /// Attention kernel launch count.
-    #[serde(default)]
     pub attention_launches: u64,
     /// Cumulative attention kernel time in microseconds.
-    #[serde(default)]
     pub attention_us: u64,
     /// Attention launches grouped by backend.
-    #[serde(default)]
     pub attention_backend_counts: BTreeMap<String, u64>,
     /// CUDA graph capture count.
-    #[serde(default)]
     pub cuda_graph_captures: u64,
     /// CUDA graph replay count.
-    #[serde(default)]
     pub cuda_graph_replays: u64,
     /// CUDA graph lookup misses.
-    #[serde(default)]
     pub cuda_graph_misses: u64,
     /// Executions that fell back from graph replay.
-    #[serde(default)]
     pub cuda_graph_fallbacks: u64,
     /// Real query tokens of the batches CUDA graph executions computed.
-    #[serde(default)]
     pub cuda_graph_unpadded_tokens: u64,
     /// Padding token slots CUDA graph buckets added beyond the real tokens.
-    #[serde(default)]
     pub cuda_graph_padded_tokens: u64,
     /// CUDA graph dispatches grouped by runtime mode.
-    #[serde(default)]
     pub cuda_graph_runtime_mode_counts: BTreeMap<String, u64>,
     /// Decode tokens served from the token relay.
-    #[serde(default)]
     pub text_decode_token_relay_hits: u64,
     /// Decode token relay misses.
-    #[serde(default)]
     pub text_decode_token_relay_misses: u64,
     /// Decode positions served from the position relay.
-    #[serde(default)]
     pub text_decode_position_relay_hits: u64,
     /// Decode position relay misses.
-    #[serde(default)]
     pub text_decode_position_relay_misses: u64,
     /// FlashInfer decode plan construction count.
-    #[serde(default)]
     pub flashinfer_decode_plan_calls: u64,
     /// FlashInfer decode plan reuse count.
-    #[serde(default)]
     pub flashinfer_decode_plan_reuses: u64,
     /// Rows represented by FlashInfer decode plans.
-    #[serde(default)]
     pub flashinfer_decode_plan_rows: u64,
     /// Indices represented by FlashInfer decode plans.
-    #[serde(default)]
     pub flashinfer_decode_plan_indices: u64,
     /// FlashInfer graph-decode plan construction count.
-    #[serde(default)]
     pub flashinfer_decode_graph_plan_calls: u64,
     /// FlashInfer graph-decode plan reuse count.
-    #[serde(default)]
     pub flashinfer_decode_graph_plan_reuses: u64,
     /// Rows processed by speculative verification.
-    #[serde(default)]
     pub spec_verify_rows: u64,
     /// Draft tokens presented for speculative verification.
-    #[serde(default)]
     pub spec_verify_draft_tokens: u64,
     /// Draft tokens accepted by speculative verification.
-    #[serde(default)]
     pub spec_verify_accepted_tokens: u64,
     /// Draft tokens rejected by speculative verification.
-    #[serde(default)]
     pub spec_verify_rejected_tokens: u64,
     /// Tokens committed after speculative verification.
-    #[serde(default)]
     pub spec_verify_committed_tokens: u64,
     /// Speculative verification rows grouped by resolution path.
-    #[serde(default)]
     pub spec_verify_path_counts: BTreeMap<String, u64>,
 }
 

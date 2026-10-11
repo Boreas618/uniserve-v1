@@ -11,8 +11,11 @@
 //! decode from a sequence, which rules out three `serde` forms in anything a
 //! message reaches: a flattened member, a struct variant of an adjacently
 //! tagged or untagged enum, and a field omitted when absent
-//! (`skip_serializing_if`) anywhere but last in its struct. The round-trip
-//! tests of this crate carry every message family through a frame.
+//! (`skip_serializing_if`) anywhere but last in its struct. A message type
+//! also gives none of its fields a default: a shorter array, as another
+//! build would send, must fail to decode rather than be completed. The
+//! round-trip tests of this crate carry every message family through a
+//! frame.
 //!
 //! A [`Message`] is validated on both sides of a frame: [`Frame::encode`]
 //! refuses a message that violates the protocol contract before any byte is
