@@ -63,7 +63,15 @@ __all__ = [
     "STEP_SKIPPED",
     "STEP_STOPPED",
     "DiffusionLMRunner",
-    "describe",
+    "attend_widths",
+    "compute_dtype",
+    "embedding_dtype",
+    "exchanges_readout",
+    "generates",
+    "hidden_size",
+    "sequence_length",
+    "stage",
+    "vocab_size",
     "workspace_bytes",
 ]
 
@@ -110,68 +118,76 @@ def _tail_exchanges(
     )
 
 
-def describe(
+def _placed(loaded, path: str) -> DiffusionLM:
+    """The diffusion LM at ``path`` of a loaded model."""
+    path = str(path)
+    root = loaded.module
+    return _model(root.get_submodule(path) if path else root)
+
+
+# Facts of the diffusion LM at ``path`` of a loaded model, which a caller
+# sizes its tensors from before a runner exists. Each is the model's own
+# read-only method of the same name; the functions exist because a rank
+# reaches the library by import path with values it can hold, and a module
+# is not one (a callable object crosses as a function).
+
+
+def sequence_length(loaded, path: str) -> int:
+    """Tokens of one generated block."""
+    return _placed(loaded, path).sequence_length()
+
+
+def vocab_size(loaded, path: str) -> int:
+    """Real vocabulary entries, the same on every pipeline stage."""
+    return _placed(loaded, path).vocab_size()
+
+
+def hidden_size(loaded, path: str) -> int:
+    """The width of the hidden states and token embeddings."""
+    return _placed(loaded, path).hidden_size()
+
+
+def compute_dtype(loaded, path: str) -> str:
+    """The name of the element type the layers compute in."""
+    return _placed(loaded, path).compute_dtype()
+
+
+def embedding_dtype(loaded, path: str) -> str:
+    """The name of the token embedding's element type."""
+    return _placed(loaded, path).embedding_dtype()
+
+
+def attend_widths(loaded, path: str) -> list[int]:
+    """Per-token widths of the state ``attend`` writes on the last stage."""
+    return _placed(loaded, path).attend_widths()
+
+
+def stage(loaded, path: str) -> list[int]:
+    """``[rank, size]`` of this rank in the model's pipeline."""
+    return _placed(loaded, path).stage()
+
+
+def generates(loaded, path: str) -> bool:
+    """Whether this rank can denoise blocks."""
+    return _placed(loaded, path).generates()
+
+
+def exchanges_readout(
     loaded, path: str, exchange: bool, attention_ranks: int
-) -> dict[str, Any]:
-    """Describe the diffusion LM at ``path`` of a loaded model.
+) -> bool:
+    """Whether ``readout`` of the model exchanges tokens across ranks.
 
     ``exchange`` says routed experts communicate through an expert exchange
     and ``attention_ranks`` counts the attention ranks of a disaggregated
-    expert union (zero when every rank holds its experts).
-
-    Returns:
-        ``sequence_length`` (tokens of one generated block), ``vocab_size``
-        (unpadded), ``hidden_size``, ``dtype`` (the self-conditioning
-        embedding dtype; the compute dtype on a stage without the
-        embedding), ``eos_token_ids``, ``pad_token_id``, ``attend_widths``
-        (per-token widths of the final stage's ``attend`` state, empty on
-        other stages), ``attend_dtype``, ``generates`` (this rank denoises
-        resident blocks: one pipeline stage holding the unsharded embedding
-        table the sampler embeds every distribution with), ``local_tail``
-        (``readout`` exchanges no tokens across ranks, so it runs once per
-        slot chunk), ``pipeline_rank`` and ``pipeline_size``.
-
-    FIXME: the facts cross as one map read by key; they belong in read-only
-    runner methods returning scalars or flat lists.
+    expert union (zero when every rank holds its experts). A ``readout``
+    that exchanges runs once over every slot of a forward; one that does
+    not runs once per slot chunk and is captured per slot bucket.
     """
-    path = str(path)
-    root = loaded.module
-    model = _model(root.get_submodule(path) if path else root)
-    backbone = model.backbone
-    pipeline = backbone._pipeline
-    last = pipeline.rank == pipeline.size - 1
-    embedding = backbone.embedding
-    head = model.lm_head
-    stream_dtype = next(backbone.layers.parameters()).dtype
-
-    def name(dtype: torch.dtype) -> str:
-        return str(dtype).removeprefix("torch.")
-
-    return {
-        "sequence_length": model.canvas.length,
-        # Every stage validates candidate ids against the same vocabulary.
-        "vocab_size": head.vocab.size
-        if last and head is not None
-        else backbone.vocab_size,
-        "hidden_size": backbone.hidden_size,
-        "dtype": name(
-            stream_dtype if embedding is None else _table(embedding).dtype
-        ),
-        "eos_token_ids": list(model.canvas.eos_token_ids),
-        "pad_token_id": model.canvas.pad_token_id,
-        "attend_widths": list(backbone.attend_widths) if last else [],
-        "attend_dtype": name(stream_dtype),
-        "generates": pipeline.size == 1
-        and embedding is not None
-        and embedding.group.size == 1,
-        "local_tail": not _tail_exchanges(
-            model,
-            exchange=bool(exchange),
-            attention_ranks=int(attention_ranks),
-        ),
-        "pipeline_rank": pipeline.rank,
-        "pipeline_size": pipeline.size,
-    }
+    return _tail_exchanges(
+        _placed(loaded, path),
+        exchange=bool(exchange),
+        attention_ranks=int(attention_ranks),
+    )
 
 
 def workspace_bytes(
