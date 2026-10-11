@@ -11,21 +11,22 @@
 //! `uniserve_models.runner.encoder.EncoderRunner` ([`EncoderRunner::over`]):
 //! its `encode` takes the tensors of one forward as arguments.
 //!
-//! An image model's vision and latent encoders compute through the binding
-//! functions of `uniserve_models.interface.encoder`, created once over the
-//! buffers ([`EncoderRunner::bind`]):
+//! An image model's vision and latent encoders compute through the same
+//! Python class, constructed over a bound component by
+//! `EncoderRunner.bound` ([`EncoderRunner::bind`]):
 //!
-//! | kind | module | calls |
+//! | kind | module | methods |
 //! | --- | --- | --- |
-//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `prepare_resident`; packed: `encode_packed`, `capture_packed`, `release` |
-//! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident` |
+//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `prepare_resident`, `warm`; packed: `encode` over the slot tensors, `pack_images` |
+//! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident`, `warm` |
 //!
-//! Such a binding receives its device's product arena once; results are
-//! written into product [`Region`]s of it, in the product's dtype, and each
-//! call returns the results' shapes, which the caller publishes.
+//! Such a runner receives its device's product arena once; an unpacked
+//! `encode` writes its results into product [`Region`]s of it, in the
+//! product's dtype, and returns the results' shapes, which the caller
+//! publishes.
 //!
 //! **Images.** Inline request images are decoded and transformed on a host
-//! lane by `image.prepare_input` ([`prepare_input`]), which returns an
+//! lane by `EncoderRunner.prepare_image` ([`prepare_input`]), which returns an
 //! opaque [`PreparedImage`] in page-locked memory; resident image products
 //! are transformed on the device by `prepare_resident`. Both reach `encode`
 //! as handles. Unpacked encoders encode images of one pixel shape per
