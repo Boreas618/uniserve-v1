@@ -15,6 +15,13 @@
 //! launcher registry (`launcher`).
 //!
 //! A host that runs ranks therefore accepts no inbound connection.
+//!
+//! The listener is served while a launch or the launcher registry waits on
+//! it. Each pass accepts what is waiting, reads the registrations that have
+//! arrived, and closes whatever nobody will take: a connection that sent no
+//! registration in time, a registration no launch claimed within the
+//! registration deadline, a rank of a launch its group has since replaced,
+//! and a launcher nobody is waiting for.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -108,6 +115,8 @@ struct RegisteredRank {
     rank: u32,
     generation: u64,
     channel: Channel,
+    /// When the registration was read, which bounds how long it is kept.
+    registered: Instant,
 }
 
 /// The address ranks and launchers connect to, and those that have
@@ -123,11 +132,13 @@ pub(crate) struct Head {
     connecting: Vec<(Channel, Instant)>,
     /// Registered ranks no launch has taken yet.
     ranks: Vec<RegisteredRank>,
-    /// Registered launchers the registry has not taken yet, by host.
+    /// Launchers that registered during the current pass of
+    /// `take_launchers`, by host.
     launchers: Vec<(String, Channel)>,
-    /// Registrations refused for stating another build, kept so whoever
-    /// waits for such a rank or launcher fails by name.
-    refused: Vec<Registration>,
+    /// Registrations refused for stating another build, with the time each
+    /// was refused, kept so whoever waits for such a rank or launcher fails
+    /// by name.
+    refused: Vec<(Registration, Instant)>,
 }
 
 impl Head {
@@ -184,7 +195,15 @@ impl Head {
 
     /// Starts a launch of `worker_id` and returns its generation, which
     /// every rank of the launch states when it registers.
+    ///
+    /// The group's earlier launches end here: what their ranks registered or
+    /// were refused for is dropped, which closes those ranks' connections.
     pub(crate) fn begin_launch(&mut self, worker_id: &str) -> u64 {
+        self.ranks.retain(|rank| rank.worker_id != worker_id);
+        self.refused.retain(|(refused, _)| {
+            !matches!(refused, Registration::Rank { worker_id: refused, .. } if refused == worker_id)
+        });
+
         let generation = self.generations.entry(worker_id.to_owned()).or_default();
         *generation += 1;
         *generation
@@ -212,10 +231,9 @@ impl Head {
         let deadline = Instant::now() + REGISTRATION_TIMEOUT;
         let mut ranks = BTreeMap::<usize, Channel>::new();
         loop {
-            self.accept()?;
-            self.read_registrations();
+            self.serve(false);
 
-            for refused in &self.refused {
+            for (refused, _) in &self.refused {
                 if let Registration::Rank {
                     worker_id: refused_worker,
                     rank,
@@ -293,9 +311,8 @@ impl Head {
         &mut self,
         hosts: &[String],
     ) -> anyhow::Result<Vec<(String, Channel)>> {
-        self.accept()?;
-        self.read_registrations();
-        for refused in &self.refused {
+        self.serve(true);
+        for (refused, _) in &self.refused {
             if let Registration::Launcher { host, version } = refused
                 && hosts.contains(host)
             {
@@ -317,16 +334,44 @@ impl Head {
         super::park_descriptors(&descriptors, ACCEPT_INTERVAL)
     }
 
-    /// Takes every waiting connection.
-    fn accept(&mut self) -> anyhow::Result<()> {
-        while let Some(channel) = self
-            .listener
-            .try_accept()
-            .context("accepting a rank's connection")?
-        {
-            self.connecting.push((channel, Instant::now()));
+    /// Serves the listener once: accepts what is waiting, reads the
+    /// registrations that have arrived, and drops what nobody will take.
+    ///
+    /// `launchers` says whether the launcher registry is waiting for
+    /// launchers; one that registers at any other time is closed.
+    fn serve(&mut self, launchers: bool) {
+        self.accept();
+        self.read_registrations();
+        if !launchers {
+            for (host, _) in self.launchers.drain(..) {
+                tracing::warn!(host = %host, "closing a launcher nobody is waiting for");
+            }
         }
-        Ok(())
+
+        // A registration nobody claimed within the deadline of a launch
+        // belongs to no launch that still waits for it.
+        let kept = |since: &Instant| since.elapsed() < REGISTRATION_TIMEOUT;
+        self.ranks.retain(|rank| kept(&rank.registered));
+        self.refused.retain(|(_, refused)| kept(refused));
+    }
+
+    /// Takes every waiting connection.
+    ///
+    /// An accept can fail for reasons that pass, such as a connection its
+    /// peer aborted or a shortage of descriptors, so a failure ends this
+    /// pass and the next one tries again. A launch whose ranks cannot
+    /// connect at all fails at its registration deadline.
+    fn accept(&mut self) {
+        loop {
+            match self.listener.try_accept() {
+                Ok(Some(channel)) => self.connecting.push((channel, Instant::now())),
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "the head could not accept a connection");
+                    return;
+                }
+            }
+        }
     }
 
     /// Reads the registration of each connection that has sent one.
@@ -351,7 +396,7 @@ impl Head {
                         head = VERSION,
                         "refusing a registration of another build"
                     );
-                    self.refused.push(registration);
+                    self.refused.push((registration, Instant::now()));
                 }
                 Ok(Some(registration)) => {
                     let (channel, _) = self.connecting.swap_remove(index);
@@ -366,6 +411,7 @@ impl Head {
                             rank,
                             generation,
                             channel,
+                            registered: Instant::now(),
                         }),
                         Registration::Launcher { host, .. } => self.launchers.push((host, channel)),
                     }
@@ -533,6 +579,73 @@ mod tests {
             "{error}"
         );
         assert!(closed(&mut foreign));
+    }
+
+    #[test]
+    fn a_rank_outside_the_group_and_a_rank_registered_twice_fail_the_launch() {
+        let head = Head::bind(false).unwrap();
+        let mut head = lock(&head).unwrap();
+        let address = head.address(None).unwrap();
+
+        let generation = head.begin_launch("text");
+        let _outside = register(&address, "text", 2, generation, VERSION);
+        let error = head
+            .collect("text", generation, 2, || Ok(()))
+            .err()
+            .expect("a rank outside the group fails the launch")
+            .to_string();
+        assert!(error.contains("rank 2"), "{error}");
+
+        let generation = head.begin_launch("text");
+        let _first = register(&address, "text", 0, generation, VERSION);
+        let _again = register(&address, "text", 0, generation, VERSION);
+        let error = head
+            .collect("text", generation, 2, || Ok(()))
+            .err()
+            .expect("a rank registered twice fails the launch")
+            .to_string();
+        assert!(error.contains("registered twice"), "{error}");
+    }
+
+    /// A connection that never registers, and one that sends something that
+    /// is not a registration, do not keep a launch from completing.
+    #[test]
+    fn a_launch_completes_beside_connections_that_never_register() {
+        let head = Head::bind(false).unwrap();
+        let mut head = lock(&head).unwrap();
+        let address = head.address(None).unwrap();
+
+        let _silent = Channel::connect(&address, Duration::from_secs(5)).unwrap();
+        let mut stray = Channel::connect(&address, Duration::from_secs(5)).unwrap();
+        stray.send(&uniserve_ipc::WorkerRequest::info()).unwrap();
+
+        let generation = head.begin_launch("text");
+        let _rank = register(&address, "text", 0, generation, VERSION);
+        assert_eq!(
+            head.collect("text", generation, 1, || Ok(()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(closed(&mut stray), "the stray connection stayed open");
+    }
+
+    /// A group's new launch ends its earlier ones: a rank that registered for
+    /// a launch nobody collected is closed when the next one begins.
+    #[test]
+    fn a_new_launch_closes_the_ranks_registered_for_the_last_one() {
+        let head = Head::bind(false).unwrap();
+        let mut head = lock(&head).unwrap();
+        let address = head.address(None).unwrap();
+
+        let abandoned = head.begin_launch("text");
+        let mut stale = register(&address, "text", 0, abandoned, VERSION);
+        let _other = register(&address, "image", 0, head.begin_launch("image"), VERSION);
+        // The launch of the other group reads both registrations.
+        assert_eq!(head.collect("image", 1, 1, || Ok(())).unwrap().len(), 1);
+
+        head.begin_launch("text");
+        assert!(closed(&mut stale));
     }
 
     #[test]
