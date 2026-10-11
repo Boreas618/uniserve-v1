@@ -17,15 +17,17 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{BlockTable, BufferId, KvTransfer, RequestKey, Wake};
 
-use super::kv_plan::KVPlan;
+use super::kv_plan::{CACHE, KVPlan};
 use super::kv_planes::{KVPlanes, UnitColumn};
 use super::memory::StorageView;
 use super::{BlockTableStorage, BlockTables, GroupTable, KVCacheManager};
-use crate::ffi::Function;
+use crate::ffi::{Function, Handle, strings};
 use crate::host::HostLane;
+use crate::model::interface::Interface;
 use crate::transfer::exports::Location;
 use crate::transfer::{
     CacheImporter, ImportCopy, ImportEntry, ImportTask, ImportWorkspace, KVImport, KVImportBackend,
@@ -245,9 +247,24 @@ impl KVCache {
         Ok(views)
     }
 
-    /// The plan map with the unit count, as cache bindings receive it.
-    pub fn layout(&self) -> Result<tvm_ffi::Map<tvm_ffi::String, tvm_ffi::Any>> {
-        self.plan().layout(self.planes.num_units())
+    /// The attention layers' view of the unit pool (the library's `pool`
+    /// over the plan, the unit count and the unit fields by name), which
+    /// execution contexts read prefixes through.
+    pub fn pool(&self, interface: &Interface) -> Result<Handle> {
+        let fields = self.planes.views()?;
+        let mut arguments = vec![
+            self.plan().handle.to_any(),
+            Any::from(i64::from(self.planes.num_units())),
+            Any::from(strings(fields.iter().map(|(name, _)| name))),
+        ];
+        for (_, view) in &fields {
+            arguments.push(Any::from(view.to_tensor()?));
+        }
+        Handle::new(
+            interface
+                .import(&format!("{CACHE}.pool"))?
+                .call_values(&arguments)?,
+        )
     }
 
     /// Bind the unit resets to another stream (one per executing lane).

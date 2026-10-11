@@ -11,11 +11,8 @@ pytestmark = pytest.mark.unit
 
 # Entries the worker resolves at startup; a missing one fails the rank.
 STARTUP_ENTRIES = {
-    "model.cache_plan",
-    "model.reads_pages",
     "cache.bind_units",
     "cache.bind_conversion",
-    "cache.pool",
     "graphs.pool",
     "component.prepare",
     "component.bind",
