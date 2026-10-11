@@ -1,4 +1,7 @@
-//! An image batch's reservation, commit and retirement.
+//! An image batch: the parts of the backend it executes with
+//! ([`ImageParts`]), its reservation, commit and retirement
+//! ([`ImageBatch`]), and the dispatch of its calls to the encoder, denoiser
+//! and decoder forwards ([`execute`]).
 //!
 //! [`ImageBatch::open`] binds every call's pending output, resolves
 //! host-gated predicates (a false one skips its call, which only publishes
@@ -16,23 +19,40 @@ use std::time::Instant;
 
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
-    Batch as BatchPlan, BufferAllocation, BufferId, CallStatus, DType, RequestKey, TensorRef,
+    Batch as BatchPlan, BufferAllocation, BufferId, CallKind, CallStatus, DType, ErrorCode,
+    ForwardStats, MediaCall, RequestKey, TensorRef,
 };
 
-use super::super::launch::{read_flag, reports_output, seal as seal_lease};
-use super::super::products::Publications;
-use super::ImageRuntime;
-use super::host::ImageTask;
-use crate::executor::PendingOutput;
+use crate::error::WorkerError;
+use crate::executor::backend::{Parts, WorkerBackend, WorkerBatch};
+use crate::executor::forward::launch::{
+    HostStage, Launched, error_code, failed_output, read_flag, reports_output, seal as seal_lease,
+};
+use crate::executor::forward::products::Publications;
+use crate::executor::forward::transfer::latents::Pool;
+use crate::executor::forward::unsupported;
+use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
-use crate::host::HostTask;
+use crate::host::image::ImageResult;
+use crate::host::image::ImageTask;
+use crate::host::{HostLane, HostTask};
 use crate::request::RequestPool;
+use crate::request::diffusion::Trajectories;
+use crate::runner::decoder::DecoderRunner;
+use crate::runner::decoder::runners::DecoderRunners;
+use crate::runner::denoiser::image::ImageDiffusion;
+use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
+use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::encoder::inputs::Inputs;
+use crate::runner::encoder::runners::EncoderRunners;
+use crate::storage::memory::StorageView;
 use crate::storage::{
-    LatentUpdate, OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar,
+    ImageLatents, LatentStorage, LatentUpdate, OutputLease, OutputPlacement, OutputPool,
+    ProductBuffer, ProductRead, Scalar,
 };
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
-use crate::{Error, Result};
+use crate::{Error, Outcome, Result};
 
 /// One call's state through its batch.
 pub(crate) struct CallState {
@@ -84,7 +104,7 @@ pub(crate) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocatio
 
 /// An image batch's borrowed owners and the resources it reserved.
 pub(crate) struct ImageBatch<'a> {
-    pub(crate) runtime: &'a mut ImageRuntime,
+    pub(crate) runtime: ImageParts<'a>,
     pub(crate) storage: &'a mut RankStorage,
     pub(crate) requests: &'a mut RequestPool,
     pub(crate) plan: &'a BatchPlan,
@@ -122,7 +142,7 @@ impl<'a> ImageBatch<'a> {
     /// words the batch reads back beside one completion word per call.
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(crate) fn open(
-        runtime: &'a mut ImageRuntime,
+        runtime: ImageParts<'a>,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
         info: &uniserve_ipc::WorkerInfo,
@@ -381,5 +401,283 @@ impl<'a> ImageBatch<'a> {
         };
         lock(&self.buffer).abandon();
         left.and(revoked).and(completed).and(abandoned).and(sealed)
+    }
+}
+
+/// The parts of the backend an image batch executes with: the image
+/// model's facts and host policy, the rank's runners, and the storage its
+/// trajectories and products live in.
+pub(crate) struct ImageParts<'a> {
+    pub(crate) model: &'a ImageModel,
+    pub(crate) policy: &'a ImagePolicy,
+    pub(crate) encoders: &'a mut EncoderRunners,
+    pub(crate) denoisers: &'a mut DenoiserRunners,
+    pub(crate) decoders: &'a mut DecoderRunners,
+    pub(crate) latents: Option<&'a mut ImageLatents>,
+    pub(crate) trajectories: &'a mut Trajectories,
+    /// The product arena of each device, which bindings name products in.
+    pub(crate) arenas: &'a HashMap<Device, StorageView>,
+    /// The output leases of image batches.
+    pub(crate) outputs: &'a mut OutputPool,
+    pub(crate) host: &'a HostLane<ImageTask>,
+}
+
+impl ImageParts<'_> {
+    pub(crate) fn facts(&self) -> &ImageModel {
+        self.model
+    }
+
+    pub(crate) fn policy(&self) -> &ImagePolicy {
+        self.policy
+    }
+
+    pub(crate) fn diffusion(&self) -> Option<&ImageDiffusion> {
+        self.denoisers.image.as_ref().map(|(_, runner)| runner)
+    }
+
+    pub(crate) fn diffusion_mut(&mut self) -> Option<&mut ImageDiffusion> {
+        self.denoisers.image.as_mut().map(|(_, runner)| runner)
+    }
+
+    pub(crate) fn latents(&self) -> Result<&ImageLatents> {
+        self.latents
+            .as_deref()
+            .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))
+    }
+
+    fn latents_mut(&mut self) -> Result<&mut ImageLatents> {
+        self.latents
+            .as_deref_mut()
+            .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))
+    }
+
+    /// The latent pool and its storage, for trajectory transfers.
+    pub(crate) fn latent_pool(&mut self) -> Result<(&mut Pool, &LatentStorage)> {
+        let latents = self.latents_mut()?;
+        Ok((&mut latents.pool, &latents.storage))
+    }
+
+    /// Order work on `stream` that reads the latent pool's pages after the
+    /// pool's previous user; [`Self::leave_latents`] ends it.
+    pub(crate) fn enter_latents(&self, stream: Option<&Stream>) -> Result<()> {
+        self.latents()?.enter(stream)
+    }
+
+    /// End work on `stream` that used the latent pool's pages.
+    pub(crate) fn leave_latents(&mut self, stream: Option<&Stream>) -> Result<()> {
+        self.latents_mut()?.leave(stream)
+    }
+
+    /// The product arena of `device`.
+    pub(crate) fn arena(&self, device: Device) -> Result<&StorageView> {
+        self.arenas
+            .get(&device)
+            .ok_or_else(|| Error::Invariant("no product arena is bound on this device".into()))
+    }
+
+    /// The image decoder.
+    pub(crate) fn decoder(&self) -> Option<&DecoderRunner> {
+        self.decoders.image.as_ref().map(|(_, runner)| runner)
+    }
+}
+
+/// Execute a batch of `kind` calls.
+pub(crate) fn execute(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    kind: CallKind,
+) -> std::result::Result<(), WorkerError> {
+    let plan = Arc::clone(batch.shared_plan());
+    let predecessors = batch.predecessors().to_vec();
+    let inputs = batch.take_image_inputs();
+    let failure = match run(backend.parts(), &plan, kind, inputs) {
+        Ok(Some(launched)) => {
+            batch.launch(launched);
+            return Ok(());
+        }
+        Ok(None) => return Err(unsupported(kind, "image")),
+        Err(failure) => failure,
+    };
+    let mut error = WorkerError::classify(failure.error, Some("image batch"));
+    if failure.committed {
+        error.fatal = true;
+    }
+    if error.fatal {
+        return Err(error);
+    }
+    tracing::warn!(
+        target: "uniserve_worker.execution",
+        "image batch {} failed: {error}{}",
+        plan.batch_id,
+        error
+            .traceback()
+            .map(|trace| format!("\n{trace}"))
+            .unwrap_or_default()
+    );
+    let output = failed_output(
+        backend.requests(),
+        &plan,
+        &predecessors,
+        error_code(error.code),
+    )?;
+    batch.complete(BatchResult {
+        output,
+        media: Vec::new(),
+    });
+    Ok(())
+}
+
+/// Reserve, compute and commit one batch. `None` on a rank without an
+/// image model.
+fn run(
+    parts: Parts<'_>,
+    plan: &BatchPlan,
+    kind: CallKind,
+    inputs: Option<Inputs>,
+) -> std::result::Result<Option<Launched>, Failure> {
+    let started = Instant::now();
+    let Parts {
+        info,
+        rank,
+        requests,
+        storage,
+        text,
+        image,
+        experts,
+        ..
+    } = parts;
+    let (Some(runtime), Some(storage)) = (image, storage) else {
+        return Ok(None);
+    };
+    let (device, stream, words) = match kind {
+        CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
+            crate::runner::encoder::image_placement(&runtime, plan)?
+        }
+        CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
+            crate::runner::denoiser::image::image_placement(&runtime)?
+        }
+        CallKind::Media(MediaCall::ImageDecoding) => {
+            crate::runner::decoder::image_placement(&runtime, plan)?
+        }
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "{} is served by another runtime",
+                kind.as_str()
+            ))
+            .into());
+        }
+    };
+    let mut batch = ImageBatch::open(
+        runtime, storage, requests, info, rank, plan, device, stream, words, started,
+    )?;
+    let result = (|| -> std::result::Result<ForwardStats, Failure> {
+        batch.bind_flags()?;
+        let stats = match kind {
+            CallKind::Media(call @ (MediaCall::VisionEncoding | MediaCall::LatentEncoding)) => {
+                let images = inputs.map(Inputs::take).transpose()?.unwrap_or_default();
+                batch.encode(call, images)?
+            }
+            CallKind::Media(MediaCall::LatentPreparation) => batch.prepare_latents()?,
+            CallKind::Media(MediaCall::Denoising) => batch.denoise(text, experts)?,
+            CallKind::Media(MediaCall::ImageDecoding) => batch.decode()?,
+            _ => ForwardStats::default(),
+        };
+        batch.commit()?;
+        Ok(stats)
+    })();
+    match result {
+        Ok(mut stats) => {
+            let elapsed = batch.started.elapsed().as_micros() as u64;
+            stats.component_us.insert("image_execute".into(), elapsed);
+            let encodings = std::mem::take(&mut batch.encodings);
+            Ok(Some(Launched {
+                outputs: batch.calls.into_iter().map(|state| state.output).collect(),
+                host: (!encodings.is_empty()).then(|| {
+                    Box::new(Encodings {
+                        encodings,
+                        submitted: false,
+                    }) as Box<dyn HostStage>
+                }),
+                buffer: batch.buffer,
+                started,
+                stats,
+                timer: "image_materialize",
+            }))
+        }
+        Err(failure) if failure.committed => Err(failure),
+        Err(failure) => {
+            if let Err(cleanup) = batch.discard() {
+                return Err(Failure {
+                    error: cleanup,
+                    committed: true,
+                });
+            }
+            Err(failure)
+        }
+    }
+}
+
+/// The PNG encodings of a decoding batch's images, run once their pixels
+/// reached the host.
+struct Encodings {
+    encodings: Vec<Encoding>,
+    submitted: bool,
+}
+
+impl HostStage for Encodings {
+    fn poll(&mut self) -> Result<bool> {
+        if !self.submitted {
+            // The output fences completed: the pixels are on the host.
+            for encoding in &self.encodings {
+                encoding.task.submit()?;
+            }
+            self.submitted = true;
+        }
+        Ok(self
+            .encodings
+            .iter()
+            .all(|encoding| encoding.task.completion.done()))
+    }
+
+    fn finish(&mut self, outputs: &mut [PendingOutput]) -> Result<()> {
+        for encoding in std::mem::take(&mut self.encodings) {
+            let output = outputs
+                .get_mut(encoding.call)
+                .ok_or_else(|| Error::Invariant("an image encoding names no call".into()))?;
+            match encoding.task.completion.outcome() {
+                Some(Outcome::Success(result)) => {
+                    if let ImageResult::Encoded(bytes) = &*result
+                        && output.reports_output
+                    {
+                        let source =
+                            uniserve_core::MediaSource::publish(bytes).map_err(|error| {
+                                Error::Invalid(format!(
+                                    "publishing an encoded image failed: {error}"
+                                ))
+                            })?;
+                        output.set_media(source)?;
+                    }
+                }
+                Some(Outcome::Failed(error)) => {
+                    tracing::error!(
+                        target: "uniserve_worker.execution",
+                        "image encoding failed: {error}"
+                    );
+                    output.output.status = CallStatus::Error;
+                    output.output.error_code = Some(ErrorCode::InvalidCall);
+                }
+                Some(Outcome::Cancelled) | None => {
+                    output.output.status = CallStatus::Error;
+                    output.output.error_code = Some(ErrorCode::Internal);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel(&mut self) {
+        for encoding in &self.encodings {
+            let _ = encoding.task.cancel(false);
+        }
     }
 }

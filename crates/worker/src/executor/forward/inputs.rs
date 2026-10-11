@@ -274,7 +274,7 @@ fn latent_hazards(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Vec<A
     if writes.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(image) = backend.image_mut() else {
+    let Some(mut image) = backend.parts().image else {
         return Ok(Vec::new());
     };
     let Ok((pool, _)) = image.latent_pool() else {
@@ -607,10 +607,10 @@ fn import_latent(
     let storage = parts
         .storage
         .ok_or_else(|| Error::Unsupported("latent imports require rank storage".into()))?;
-    let (pool, latent) = parts
+    let mut image = parts
         .image
-        .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?
-        .latent_pool()?;
+        .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?;
+    let (pool, latent) = image.latent_pool()?;
     let input = latents::import(
         pool,
         latent,
@@ -911,10 +911,13 @@ fn publish(
 fn latent_pool(
     backend: &mut WorkerBackend,
 ) -> Result<(&mut latents::Pool, &crate::storage::LatentStorage)> {
-    backend
-        .image_mut()
+    let latents = backend
+        .parts()
+        .image
         .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?
-        .latent_pool()
+        .latents
+        .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))?;
+    Ok((&mut latents.pool, &latents.storage))
 }
 
 /// The call kind of a product's consumers, whose stream publishes it.

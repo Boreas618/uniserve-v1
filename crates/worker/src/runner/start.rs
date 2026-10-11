@@ -1,22 +1,12 @@
-//! Startup of the image runtime: bounds, bindings and owned storage.
-//!
-//! The runtime serves every encoder, image denoiser and image decoder call
-//! of a model that is not a video model. [`ImageRuntime::start`] prepares
-//! and binds one component binding per call (at the call's module path, on
-//! the stream serving its call kind), then binds the call's runner over
-//! Rust-owned storage: encoders over the device's product arena, the image
-//! denoiser over the latent pool's step workspace and the KV cache's slot
-//! tables, the image decoder over the step workspace and its staging
-//! bytes. The latent pool of image trajectories is allocated here, on the
-//! denoiser's device.
+//! Startup of a rank's media runners: the runners of a video model's
+//! placed components, and the bindings and runners of an image model's
+//! encoders, denoiser and decoder.
 
 use std::collections::HashMap;
 
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{CallKind, MediaCall};
 
-use super::ImageRuntime;
-use super::latents::ImageLatents;
 use crate::capacity::plan::LatentPlan;
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
@@ -24,39 +14,31 @@ use crate::cuda_graph::reserve_pools;
 use crate::executor::forward::decodes_video;
 use crate::ffi::{DType, Device as StorageDevice, Handle};
 use crate::host::HostLane;
+use crate::host::image::ImageTask;
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
 use crate::model::components::Capability;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
-use crate::request::diffusion::Trajectories;
 use crate::runner::causal_lm::model_dtype;
 use crate::runner::causal_lm::start::TextBounds;
+use crate::runner::component::VideoSetup;
 use crate::runner::decoder::DecoderRunner;
+use crate::runner::decoder::runners::DecoderRunners;
 use crate::runner::denoiser::image::{DiffusionCapacity, DiffusionStorage, ImageDiffusion};
 use crate::runner::denoiser::image_model::{ImageDenoiserLayout, ImageModel, ImagePolicy};
+use crate::runner::denoiser::runners::{DenoiserRunners, FlowShape};
+use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
-use crate::storage::{LatentPool, LatentStorage, OutputPool, TensorStore};
+use crate::runner::media::MediaRunner;
+use crate::storage::memory::StorageView;
+use crate::storage::{ImageLatents, LatentPool, LatentStorage, OutputPool, TensorStore};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
 /// Guidance branches one image evaluates at most per step.
 const MAX_BRANCHES: usize = 3;
-
-/// Prefix tokens of each scratch slot a captured denoising step reads; host
-/// prefix lengths are rebound when the step replays.
-pub(crate) const CAPTURE_PREFIX: usize = 16;
-
-/// A denoising step captured at startup: `images` images of one size, each
-/// evaluating `branches` guidance branches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FlowShape {
-    pub(crate) images: usize,
-    pub(crate) branches: usize,
-    pub(crate) height: u32,
-    pub(crate) width: u32,
-}
 
 /// The configured denoising steps that fit the denoiser's columns and the
 /// latent pool, largest footprint first: every configured image size and
@@ -175,7 +157,24 @@ fn max_image_pixels(layout: Option<&ImageDenoiserLayout>) -> usize {
     })
 }
 
-impl ImageRuntime {
+/// What serves an image model on this rank, as startup built it.
+pub(crate) struct ImageOwners {
+    pub(crate) model: ImageModel,
+    pub(crate) policy: ImagePolicy,
+    pub(crate) encoders: EncoderRunners,
+    pub(crate) denoisers: DenoiserRunners,
+    pub(crate) decoders: DecoderRunners,
+    /// The latent pool of a rank holding an image denoiser.
+    pub(crate) latents: Option<ImageLatents>,
+    /// The product arena of each device, which bindings name products in.
+    pub(crate) arenas: HashMap<StorageDevice, StorageView>,
+    /// The output leases of image batches.
+    pub(crate) outputs: OutputPool,
+    /// The lane preparing input images and encoding output images.
+    pub(crate) host: HostLane<ImageTask>,
+}
+
+impl ImageOwners {
     /// Create the runners of every image call on this rank, or `None` on
     /// a rank without one.
     pub(crate) fn start(startup: Startup<'_>) -> Result<Option<Self>> {
@@ -551,20 +550,13 @@ impl ImageRuntime {
             stream.synchronize()?;
         }
         Ok(Some(Self {
-            facts,
+            model: facts,
             policy,
-            encoders,
-            encoder_routes,
-            diffusion,
-            decoder,
+            encoders: EncoderRunners::image(encoders, encoder_routes, pools),
+            denoisers: DenoiserRunners::image(diffusion, flow, flow_pools, units),
+            decoders: DecoderRunners::image(decoder, max_pixel_words),
             latents,
-            trajectories: Trajectories::default(),
             arenas,
-            units,
-            pools,
-            flow,
-            flow_pools,
-            max_pixel_words,
             outputs,
             host,
         }))
@@ -593,7 +585,7 @@ fn arena(
     Ok(view)
 }
 
-/// Device bytes the image runtime allocates beside the KV and latent pools:
+/// Device bytes an image model's runners allocate beside the KV and latent pools:
 /// the denoiser's columns and the decoder's staging.
 pub(crate) fn reserved_bytes(
     config: &WorkerConfig,
@@ -610,4 +602,59 @@ pub(crate) fn reserved_bytes(
     let columns = tokens * (3 * 8 + 8 * 4) + rows * 64;
     let staging = (max_image_pixels(Some(layout)) * 3 * calls) as u64;
     predictions + columns + staging
+}
+
+/// Start the runners of a video model's components placed on this rank, in
+/// placement order, and the host media of its host components.
+pub(crate) fn start_video(
+    mut setup: VideoSetup<'_>,
+    components: &Components,
+) -> Result<(
+    EncoderRunners,
+    DenoiserRunners,
+    DecoderRunners,
+    Option<MediaRunner>,
+)> {
+    use crate::model::components::Capability;
+
+    let mut encoders = EncoderRunners::default();
+    let mut denoisers = DenoiserRunners::default();
+    let mut decoders = DecoderRunners::default();
+    let mut host_components = std::collections::BTreeMap::new();
+    for placed in components.placed() {
+        if placed.host() {
+            host_components.insert(placed.name.clone(), placed.config.clone());
+            continue;
+        }
+        if placed.has(Capability::TextEncoder) {
+            encoders.start_text(&mut setup, placed)?;
+        }
+        if placed.name == setup.model.denoiser {
+            denoisers.start_video(&mut setup, placed)?;
+        }
+        if placed.has(Capability::VideoDecoder) {
+            decoders.start_video(&mut setup, placed)?;
+        }
+        if placed.has(Capability::AudioDecoder) {
+            decoders.start_audio(&mut setup, placed)?;
+        }
+        if placed.has(Capability::VideoEncoder) {
+            encoders.start_conditions(&mut setup, placed)?;
+        }
+    }
+    let media = if host_components.is_empty() {
+        None
+    } else {
+        let info = setup.info;
+        let capacity = (info.queue_depth as usize * info.max_batch_calls.max(1) as usize).max(1);
+        Some(MediaRunner::new(
+            setup.interface,
+            setup.loaded,
+            host_components,
+            setup.config.ffmpeg.clone(),
+            setup.model.facts.frame_rate,
+            capacity,
+        )?)
+    };
+    Ok((encoders, denoisers, decoders, media))
 }

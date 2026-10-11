@@ -2,7 +2,7 @@
 //! prefixes each guidance branch conditions on.
 //!
 //! An image request denoises one trajectory per generated image. When its
-//! latent is prepared, the image runtime opens an [`ImageTrajectory`]: the
+//! latent is prepared, its batch opens an [`ImageTrajectory`]: the
 //! guidance plan the model's schedules and guidance select per step (built
 //! by Python once per trajectory and kept as an opaque handle the solver
 //! update receives back), and the request's guidance prefixes.
@@ -381,6 +381,47 @@ impl Trajectories {
         for slot in slots {
             self.slots.remove(slot);
         }
+    }
+}
+
+impl crate::executor::lifecycle::RequestStorage for Trajectories {
+    fn admit_slots(&mut self, slots: &[usize]) -> Result<()> {
+        // A reused slot never continues an earlier request's trajectory.
+        self.release(slots);
+        Ok(())
+    }
+
+    fn release_buffers(
+        &mut self,
+        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_requests(
+        &mut self,
+        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
+        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn retirement_ready(
+        &mut self,
+        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
+        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
+        self.release(slots);
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 

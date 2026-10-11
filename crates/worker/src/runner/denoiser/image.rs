@@ -46,10 +46,9 @@ use uniserve_ipc::{DrawLayout, ForwardStats, LatentParams};
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
+use crate::executor::forward::batch::image::ImageBatch;
+use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::experts::ExpertRuntime;
-use crate::executor::forward::image::ImageRuntime;
-use crate::executor::forward::image::batch::ImageBatch;
-use crate::executor::forward::image::latents::Scratch;
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, Region, integer_list, list};
 use crate::model::bind::ComponentBinding;
@@ -61,6 +60,7 @@ use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeo
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::storage::LatentUpdate;
+use crate::storage::Scratch;
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable};
 use crate::{Error, Result};
@@ -778,7 +778,7 @@ impl ImageDiffusion {
 
 /// The denoiser serving a batch, with its device and stream.
 pub(crate) fn image_placement(
-    runtime: &ImageRuntime,
+    runtime: &ImageParts<'_>,
 ) -> Result<(Option<i32>, Option<Stream>, usize)> {
     let runner = runtime.diffusion().ok_or_else(|| {
         Error::Unsupported("image trajectories are served by an image denoiser".into())
@@ -1037,7 +1037,7 @@ impl ImageBatch<'_> {
             .map(|row| row.slot)
             .chain(active.iter().map(|&index| self.calls[index].slot as u32))
             .collect();
-        let units = self.runtime.units.as_ref();
+        let units = self.runtime.denoisers.units.as_ref();
         let kv =
             self.storage.kv.as_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a KV cache".into())

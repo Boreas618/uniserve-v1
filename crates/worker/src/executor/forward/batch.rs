@@ -9,6 +9,8 @@
 //! fences are query-ready) and its host tasks finished; host tasks publish
 //! the products they wrote before the result is delivered.
 
+pub(crate) mod image;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError};
 

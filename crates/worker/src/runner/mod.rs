@@ -9,6 +9,7 @@ pub(crate) mod decoder;
 pub(crate) mod denoiser;
 pub(crate) mod encoder;
 pub(crate) mod media;
+pub(crate) mod start;
 pub(crate) mod vision;
 
 use std::collections::{HashMap, HashSet};

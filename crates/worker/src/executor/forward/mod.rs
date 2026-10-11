@@ -15,7 +15,6 @@
 pub(crate) mod batch;
 pub(crate) mod canvas;
 pub(crate) mod experts;
-pub(crate) mod image;
 pub(crate) mod inputs;
 pub(crate) mod launch;
 pub(crate) mod placement;
@@ -120,7 +119,7 @@ pub(crate) fn execute(
             let mut parts = backend.media_parts()?;
             crate::runner::media::execute(&mut parts, plan, borrowed, state)
         }
-        Media(ImageDecoding) => image::execute(backend, batch, kind),
+        Media(ImageDecoding) => batch::image::execute(backend, batch, kind),
         Media(VideoDecoding | AudioDecoding) => {
             let (plan, borrowed, state) = batch.media_parts();
             let mut parts = backend.media_parts()?;
@@ -134,7 +133,7 @@ pub(crate) fn execute(
                 let mut parts = backend.media_parts()?;
                 batch::execute(&mut parts, plan, borrowed, state)
             } else {
-                image::execute(backend, batch, kind)
+                batch::image::execute(backend, batch, kind)
             }
         }
     }

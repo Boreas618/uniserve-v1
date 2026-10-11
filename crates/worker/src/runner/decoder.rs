@@ -47,13 +47,13 @@ use uniserve_ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 use crate::config::Device;
 use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
+use crate::executor::forward::batch::image::ImageParts;
+use crate::executor::forward::batch::image::{Encoding, ImageBatch, allocations, lock};
 use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
-use crate::executor::forward::image::ImageRuntime;
-use crate::executor::forward::image::batch::{Encoding, ImageBatch, allocations, lock};
-use crate::executor::forward::image::host::{ImageTask, ImageWork};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{DType, Function, Handle, Record, Region, integer_list, list};
 use crate::host::HostTask;
+use crate::host::image::{ImageTask, ImageWork};
 use crate::model::bind::ComponentBinding;
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
@@ -506,7 +506,7 @@ impl ImageDecoder {
 /// The decoder serving a batch, with its device and stream, and the
 /// output words its pixels need.
 pub(crate) fn image_placement(
-    runtime: &ImageRuntime,
+    runtime: &ImageParts<'_>,
     plan: &BatchPlan,
 ) -> Result<(Option<i32>, Option<Stream>, usize)> {
     let runner = runtime
@@ -524,7 +524,7 @@ pub(crate) fn image_placement(
     Ok((
         runner.device().cuda_index(),
         stream,
-        words.min(runtime.max_pixel_words),
+        words.min(runtime.decoders.max_pixel_words),
     ))
 }
 
@@ -758,7 +758,8 @@ impl ImageBatch<'_> {
             };
         let runner = self
             .runtime
-            .decoder
+            .decoders
+            .image
             .as_ref()
             .map(|(_, runner)| runner)
             .ok_or_else(|| Error::Unsupported("image decoding requires a decoder".into()))?;
@@ -829,13 +830,6 @@ impl ImageBatch<'_> {
             .iter()
             .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
             .map(|params| (params.height, params.width)))
-    }
-}
-
-impl ImageRuntime {
-    /// The bound image decoder.
-    pub(crate) fn decoder(&self) -> Option<&crate::runner::decoder::DecoderRunner> {
-        self.decoder.as_ref().map(|(_, runner)| runner)
     }
 }
 

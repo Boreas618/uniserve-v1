@@ -1,12 +1,15 @@
 //! The encoder runners of a rank.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use uniserve_ipc::CallKind;
+
 use super::EncoderRunner;
-use crate::Result;
 use crate::cuda_graph::GraphPool;
 use crate::ffi::{Handle, Record};
 use crate::runner::component::Component;
+use crate::{Error, Result};
 
 /// The encoder runners of a rank.
 #[derive(Default)]
@@ -19,9 +22,81 @@ pub(crate) struct EncoderRunners {
     pub(crate) text_pool: Option<Arc<GraphPool<Handle>>>,
     /// A video model's condition latent encoders.
     pub(crate) latent: Option<Component<EncoderRunner>>,
+    /// An image model's encoders, in binding order.
+    pub(crate) image: Vec<EncoderRunner>,
+    /// The image encoder serving each component's call kind.
+    routes: HashMap<(String, CallKind), usize>,
+    /// Graph pools of packed vision encoders, by encoder.
+    pools: HashMap<usize, Arc<GraphPool<Handle>>>,
 }
 
 impl EncoderRunners {
+    /// The encoders of an image model, routed by component and call kind,
+    /// with the graph pools of the packed ones.
+    pub(crate) fn image(
+        encoders: Vec<EncoderRunner>,
+        routes: HashMap<(String, CallKind), usize>,
+        pools: HashMap<usize, Arc<GraphPool<Handle>>>,
+    ) -> Self {
+        Self {
+            image: encoders,
+            routes,
+            pools,
+            ..Self::default()
+        }
+    }
+
+    /// The image encoder serving `kind` calls of `component`.
+    pub(crate) fn route(&self, component: &str, kind: CallKind) -> Result<usize> {
+        self.routes
+            .get(&(component.to_owned(), kind))
+            .copied()
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "component {component:?} has no {} encoder",
+                    kind.as_str()
+                ))
+            })
+    }
+
+    /// Warm every unpacked image encoder on one black `side` x `side`
+    /// image, in binding order, as serving prepares its images.
+    pub(crate) fn warm_image(&self, side: u32) -> Result<()> {
+        for runner in &self.image {
+            runner.warm(side)?;
+            if let Some(stream) = runner.stream() {
+                stream.synchronize()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture every packed vision encoder's graphs into its pool.
+    pub(crate) fn capture_packed(&mut self) -> Result<()> {
+        for (index, runner) in self.image.iter_mut().enumerate() {
+            if let Some(pool) = self.pools.get(&index) {
+                runner.capture(Some(pool), &mut || Ok(()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Seal every image encoder's graphs.
+    pub(crate) fn seal_image(&mut self) {
+        for runner in &mut self.image {
+            runner.seal();
+        }
+    }
+
+    /// Release the image encoders.
+    pub(crate) fn close_image(&mut self, aborted: bool) -> Result<()> {
+        let mut result = Ok(());
+        for runner in &mut self.image {
+            result = result.and(runner.close(aborted));
+        }
+        result
+    }
+
     /// Capture the text encoder's prompt capacities, then refuse further
     /// captures.
     pub(crate) fn capture_text(&mut self) -> Result<()> {

@@ -201,7 +201,7 @@ impl Batch<'_> {
                 let scores = call.writes_context() && admitted.prompt_logprobs_requested();
                 let sources = Sources {
                     tensors: &self.storage.tensors,
-                    image: self.image.as_deref(),
+                    image: self.image.as_ref(),
                     tables,
                     device: self.device,
                     stream: self.stream.as_ref(),
@@ -579,7 +579,7 @@ impl Batch<'_> {
     /// image denoiser on its stream, ordered between this batch's text
     /// work.
     fn condition_latents(&mut self, rows: &[ConditionRow]) -> Result<()> {
-        let image = self.image.as_deref_mut().ok_or_else(|| {
+        let image = self.image.as_mut().ok_or_else(|| {
             Error::Unsupported("latent conditioning requires the image runtime".into())
         })?;
         let diffusion = image.diffusion_mut().ok_or_else(|| {
