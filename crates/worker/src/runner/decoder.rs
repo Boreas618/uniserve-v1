@@ -31,6 +31,10 @@
 //! bytes; a batch with more images decodes in consecutive sub-batches.
 //! Images of one size decode together within a sub-batch.
 
+pub(crate) mod runners;
+mod start;
+pub(crate) mod warmup;
+
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
@@ -43,11 +47,11 @@ use uniserve_ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 use crate::config::Device;
 use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
+use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
 use crate::executor::forward::image::ImageRuntime;
 use crate::executor::forward::image::batch::{Encoding, ImageBatch, allocations, lock};
 use crate::executor::forward::image::host::{ImageTask, ImageWork};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::executor::forward::video::{Parts, decode_range, publish_bound, stream_of};
 use crate::ffi::{DType, Function, Handle, Record, Region, integer_list, list};
 use crate::host::HostTask;
 use crate::model::bind::ComponentBinding;
@@ -1374,10 +1378,10 @@ pub(crate) fn decode_video(
             "media decoder assignment exceeds its media unit range".into(),
         ));
     }
-    let rank = parts.video.rank;
+    let rank = parts.rank;
     let decoder = parts
+        .decoders
         .video
-        .decoder
         .as_ref()
         .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?;
     let run = decoder.units(rank, range.cursor, range.max_units)?;
@@ -1428,8 +1432,8 @@ pub(crate) fn decode_video(
     let view = write.view();
     let out = view.select(0, 0)?;
     let decoder = &mut parts
+        .decoders
         .video
-        .decoder
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?
         .runner;
@@ -1484,9 +1488,9 @@ pub(crate) fn decode_audio(
             "media reconstruction requires one tensor input and output".into(),
         ));
     }
-    let rank = parts.video.rank;
+    let rank = parts.rank;
     let audio = parts
-        .video
+        .decoders
         .audio
         .as_ref()
         .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?;
@@ -1528,7 +1532,7 @@ pub(crate) fn decode_audio(
     .ok_or_else(|| Error::Invariant("an audio span was not bound".into()))?;
     batch.calls[index].writes.push(write.clone());
     let audio = &mut parts
-        .video
+        .decoders
         .audio
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?

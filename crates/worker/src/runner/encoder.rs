@@ -55,6 +55,10 @@
 //! that stream after the producers of its inputs and records the producer
 //! fence of its outputs on it.
 
+pub(crate) mod runners;
+mod start;
+pub(crate) mod warmup;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -67,12 +71,12 @@ use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
+use crate::executor::forward::batch::{
+    Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
+};
 use crate::executor::forward::image::ImageRuntime;
 use crate::executor::forward::image::batch::{ImageBatch, allocations};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::executor::forward::video::{
-    Parts, bind_rows, decode_range, publish, publish_bound, row_width, stream_of,
-};
 use crate::ffi::{Backing, DType, Function, Handle, Record, Region, integer_list, list};
 use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize};
 use crate::model::interface::Interface;
@@ -1713,7 +1717,7 @@ pub(crate) fn encode_text(
     )?;
 
     let text = &mut parts
-        .video
+        .encoders
         .text
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?
@@ -1787,7 +1791,7 @@ pub(crate) fn encode_vision(
     )?;
 
     let vision = parts
-        .video
+        .encoders
         .vision
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank's text encoder reads no vision".into()))?;
@@ -1813,17 +1817,17 @@ pub(crate) fn encode_conditions(
             "condition encoding requires one input and one output".into(),
         ));
     }
-    let name = parts.video.product_name(call, &call.outputs[0])?.to_owned();
+    let name = product_name(parts.info, call, &call.outputs[0])?.to_owned();
     let conditions = Arc::clone(&parts.video.request(slot, call.request_key)?.conditions);
     if conditions.is_empty() {
         return Err(Error::Invalid(
             "condition encoding requires admitted conditions".into(),
         ));
     }
-    let rank = parts.video.rank;
+    let rank = parts.rank;
     let owners = parts.owners();
     let latent = parts
-        .video
+        .encoders
         .latent
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;

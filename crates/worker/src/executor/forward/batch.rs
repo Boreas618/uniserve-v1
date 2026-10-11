@@ -15,20 +15,29 @@ use std::sync::{Arc, PoisonError};
 use uniserve_core::MediaSource;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
-    Batch as BatchPlan, BatchOutput, BufferId, CallStatus, ErrorCode, RequestKey, TensorExport,
-    TensorRef,
+    Batch as BatchPlan, BatchOutput, BufferAllocation, BufferId, Call, CallKind, CallStatus,
+    ErrorCode, MediaCall, RequestKey, TensorExport, TensorRef, WorkerInfo,
 };
 
 use super::products::Publications;
-use crate::executor::forward::placement::{ProductOwners, Reads, export};
+use crate::error::WorkerError;
+use crate::executor::forward::placement::{
+    OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export, skipped,
+};
 use crate::executor::pending::{BatchResult, PendingOutput};
 use crate::ffi::Device;
 use crate::host::HostTask;
 use crate::host::task::{MediaTask, TaskOutput};
 use crate::request::RequestPool;
+use crate::request::video::VideoRequests;
+use crate::runner::decoder::runners::DecoderRunners;
+use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::encoder::runners::EncoderRunners;
+use crate::runner::media::MediaRunner;
 use crate::storage::OutputLease;
 use crate::storage::Scalar;
 use crate::transfer::exports::Location;
+use crate::worker::RankStorage;
 use crate::{Error, LatentUpdate, OutputPool, ProductBuffer, Result};
 
 /// How a call publishes what its host tasks wrote.
@@ -474,4 +483,361 @@ pub(crate) fn request_slots(
             Ok((call.request_key, request.slot()))
         })
         .collect()
+}
+
+/// The parts of the backend a media batch executes with.
+pub(crate) struct Parts<'a> {
+    pub(crate) requests: &'a mut RequestPool,
+    pub(crate) storage: &'a RankStorage,
+    pub(crate) info: &'a WorkerInfo,
+    pub(crate) rank: usize,
+    /// The rank's video requests, with the model and plan that admit them.
+    pub(crate) video: &'a mut VideoRequests,
+    pub(crate) encoders: &'a mut EncoderRunners,
+    pub(crate) denoisers: &'a mut DenoiserRunners,
+    pub(crate) decoders: &'a mut DecoderRunners,
+    /// The host media of a rank holding host components.
+    pub(crate) media: Option<&'a MediaRunner>,
+    /// The output leases of media batches.
+    pub(crate) outputs: &'a mut OutputPool,
+}
+
+impl<'a> Parts<'a> {
+    /// The product owners, borrowed for the parts' lifetime rather than
+    /// from the parts themselves.
+    pub(crate) fn owners(&self) -> ProductOwners<'a> {
+        let storage: &'a RankStorage = self.storage;
+        ProductOwners {
+            store: &storage.tensors,
+            transports: &storage.transports,
+            events: &storage.events,
+        }
+    }
+
+    /// The stream and device a batch of `kind` on `component` runs on.
+    pub(crate) fn placement(
+        &self,
+        kind: MediaCall,
+        component: &str,
+    ) -> Result<(Device, Option<Stream>)> {
+        match kind {
+            MediaCall::TextEncoding | MediaCall::VisionEncoding => {
+                let text = self
+                    .encoders
+                    .text
+                    .as_ref()
+                    .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?;
+                Ok((text.device, text.runner.stream().cloned()))
+            }
+            MediaCall::LatentPreparation | MediaCall::Denoising => {
+                let denoiser = self
+                    .denoisers
+                    .video
+                    .as_ref()
+                    .filter(|denoiser| denoiser.name == component);
+                let denoiser = denoiser
+                    .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
+                Ok((denoiser.device, Some(denoiser.runner.stream().clone())))
+            }
+            MediaCall::VideoDecoding => {
+                let decoder = self
+                    .decoders
+                    .video
+                    .as_ref()
+                    .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?;
+                Ok((decoder.device, decoder.runner.stream().cloned()))
+            }
+            MediaCall::AudioDecoding => {
+                let audio = self
+                    .decoders
+                    .audio
+                    .as_ref()
+                    .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?;
+                Ok((audio.device, audio.runner.stream().cloned()))
+            }
+            MediaCall::LatentEncoding => {
+                let latent =
+                    self.encoders.latent.as_ref().ok_or_else(|| {
+                        Error::Invalid("this rank holds no latent encoder".into())
+                    })?;
+                Ok((latent.device, latent.runner.stream().cloned()))
+            }
+            _ => Ok((Device::Cpu, None)),
+        }
+    }
+}
+
+/// The name of a call's output product.
+pub(crate) fn product_name<'a>(
+    info: &'a WorkerInfo,
+    call: &Call,
+    output: &TensorRef,
+) -> Result<&'a str> {
+    info.components
+        .iter()
+        .find(|component| component.name == call.component)
+        .and_then(|component| component.outputs.get(output.output_index as usize))
+        .map(|output| output.name.as_str())
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "component {} declares no output {}",
+                call.component, output.output_index
+            ))
+        })
+}
+
+/// Whether `rank` reports a component's host results: its first rank does.
+pub(crate) fn reports(info: &WorkerInfo, rank: usize, component: &str) -> bool {
+    info.components
+        .iter()
+        .find(|placed| placed.name == component)
+        .and_then(|placed| placed.config.ranks.first())
+        .is_none_or(|&first| first == rank)
+}
+
+fn media_kind(call: &Call) -> MediaCall {
+    match call.code {
+        CallKind::Media(kind) => kind,
+        _ => MediaCall::Denoising,
+    }
+}
+
+/// Open a video batch: its output lease on the stream of its kind, its
+/// calls' pending results, and the calls its false predicates skip.
+/// `borrowed` names the inputs host codecs read in place.
+pub(crate) fn open<'b>(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    borrowed: HashSet<BufferId>,
+    state: &'b mut Option<MediaBatch>,
+) -> Result<&'b mut MediaBatch> {
+    let first = plan
+        .calls
+        .first()
+        .ok_or_else(|| Error::Invariant("a video batch has calls".into()))?;
+    let (device, stream) = parts.placement(media_kind(first), &first.component)?;
+    let batch = state.insert(MediaBatch::new(
+        device,
+        stream,
+        parts.outputs,
+        plan.calls.len(),
+        Reads::new(borrowed),
+    )?);
+    let (info, rank) = (parts.info, parts.rank);
+    batch.open_calls(plan, parts.requests, |component| {
+        reports(info, rank, component)
+    })?;
+    let skipped = skipped(
+        &parts.storage.tensors,
+        plan,
+        batch.device,
+        batch.stream.as_ref(),
+    )?;
+    batch.skip(&skipped);
+    Ok(batch)
+}
+
+/// Execute a batch of device video calls and commit it.
+pub(crate) fn execute(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    borrowed: HashSet<BufferId>,
+    state: &mut Option<MediaBatch>,
+) -> std::result::Result<(), WorkerError> {
+    let batch = open(parts, plan, borrowed, state)?;
+
+    let slots = request_slots(plan, parts.requests)?;
+    let allocations: HashMap<BufferId, BufferAllocation> = plan
+        .buffer_allocations
+        .iter()
+        .map(|allocation| (allocation.buffer, *allocation))
+        .collect();
+    let placement = Placement {
+        allocations: &allocations,
+        slots: &slots,
+    };
+    for index in 0..plan.calls.len() {
+        let call = &plan.calls[index];
+        let slot = slots[&call.request_key];
+        let owners = parts.owners();
+        let completion = bind_completion(owners.store, call, batch.device, &slots)?;
+        batch.calls[index].completion = completion;
+        if batch.calls[index].skipped {
+            continue;
+        }
+        match call.code {
+            CallKind::Media(MediaCall::TextEncoding) => {
+                crate::runner::encoder::encode_text(parts, plan, batch, index, slot, &placement)?
+            }
+            CallKind::Media(MediaCall::VisionEncoding) => {
+                crate::runner::encoder::encode_vision(parts, plan, batch, index, slot, &placement)?
+            }
+            CallKind::Media(MediaCall::LatentPreparation) => {
+                crate::runner::denoiser::prepare(parts, plan, batch, index, slot)?
+            }
+            CallKind::Media(MediaCall::Denoising) => {
+                crate::runner::denoiser::denoise(parts, plan, batch, index, slot, &placement)?
+            }
+            CallKind::Media(MediaCall::VideoDecoding) => {
+                crate::runner::decoder::decode_video(parts, plan, batch, index, slot, &placement)?
+            }
+            CallKind::Media(MediaCall::AudioDecoding) => {
+                crate::runner::decoder::decode_audio(parts, plan, batch, index, slot, &placement)?
+            }
+            CallKind::Media(MediaCall::LatentEncoding) => {
+                crate::runner::encoder::encode_conditions(
+                    parts, plan, batch, index, slot, &placement,
+                )?
+            }
+            kind => {
+                return Err(Error::Unsupported(format!(
+                    "{} is not a device video call",
+                    kind.as_str()
+                ))
+                .into());
+            }
+        }
+    }
+    let owners = parts.owners();
+    let trajectories = parts
+        .denoisers
+        .video
+        .as_mut()
+        .map(|denoiser| &mut denoiser.runner as &mut dyn Trajectories);
+    batch.commit(plan, owners, parts.requests, trajectories)?;
+    Ok(())
+}
+
+pub(crate) fn latent_params<'a>(
+    plan: &'a BatchPlan,
+    call: &Call,
+) -> Result<&'a uniserve_ipc::LatentParams> {
+    plan.latent_params
+        .iter()
+        .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
+        .ok_or_else(|| Error::Invalid("a video trajectory call has no latent pages".into()))
+}
+
+pub(crate) fn decode_range<'a>(
+    plan: &'a BatchPlan,
+    call: &Call,
+) -> Result<&'a uniserve_ipc::DecodeRange> {
+    plan.decode_ranges
+        .iter()
+        .find(|range| range.request_key == call.request_key && range.call_id == call.call_id)
+        .ok_or_else(|| Error::Invalid("a media round has no unit range".into()))
+}
+
+/// The batch's stream.
+pub(crate) fn stream_of(batch: &MediaBatch) -> Result<Stream> {
+    batch
+        .stream
+        .clone()
+        .ok_or_else(|| Error::Invariant("a device media call has no stream".into()))
+}
+
+/// The most elements a product holds along one dimension.
+pub(crate) fn extent(dim: &uniserve_ipc::DimBound) -> u64 {
+    match dim {
+        uniserve_ipc::DimBound::Static(extent) | uniserve_ipc::DimBound::Device { max: extent } => {
+            u64::from(*extent)
+        }
+    }
+}
+
+/// Rows' width of a two-dimensional product.
+pub(crate) fn row_width(output: &TensorRef) -> Result<u64> {
+    output
+        .shape_bound
+        .dims
+        .get(1)
+        .map(extent)
+        .ok_or_else(|| Error::Invalid("the product is not rows".into()))
+}
+
+/// Bind a call's single output as rows of `shape` on every rank that
+/// computes it.
+pub(crate) fn bind_rows(
+    parts: &Parts<'_>,
+    batch: &mut MediaBatch,
+    index: usize,
+    output: &TensorRef,
+    shape: Vec<u64>,
+    placement: &Placement<'_>,
+) -> Result<crate::ProductBuffer> {
+    let owners = parts.owners();
+    let write = bind_outputs(
+        owners.store,
+        &[OutputShape {
+            product: output.clone(),
+            shape,
+            region: None,
+        }],
+        batch.device,
+        placement,
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| Error::Invariant("an encoder product was not bound".into()))?;
+    batch.calls[index].writes.push(write.clone());
+    Ok(write)
+}
+
+/// Publish a call's output, written at `shape` from its leading elements,
+/// and export it to its readers.
+pub(crate) fn publish(
+    parts: &Parts<'_>,
+    batch: &mut MediaBatch,
+    call: &Call,
+    index: usize,
+    write: &crate::ProductBuffer,
+    shape: &[u64],
+) -> Result<()> {
+    let owners = parts.owners();
+    let stream = stream_of(batch)?;
+    owners.store.produced(write, shape, Some(&stream), None)?;
+    let (exported, locations) = export(
+        owners,
+        call,
+        &call.outputs[0],
+        write,
+        false,
+        None,
+        Some(&stream),
+    )?;
+    batch.calls[index].publish(write.id(), locations, exported)?;
+    Ok(())
+}
+
+/// Publish a call's first output, whose bound view the producer filled, and
+/// export it to its readers (`host` readers read it from host memory).
+///
+/// The bound view is this rank's share of the product: its region when
+/// other ranks hold the rest, the whole product when the round assigns
+/// this rank all of it. Publishing the view itself is right in both cases;
+/// the store tracks a share that covers the product as a whole product.
+pub(crate) fn publish_bound(
+    parts: &Parts<'_>,
+    batch: &mut MediaBatch,
+    call: &Call,
+    index: usize,
+    write: &crate::ProductBuffer,
+    host: bool,
+) -> Result<()> {
+    let owners = parts.owners();
+    let stream = stream_of(batch)?;
+    owners
+        .store
+        .write(write, &write.view(), Some(&stream), None)?;
+    let (exported, locations) = export(
+        owners,
+        call,
+        &call.outputs[0],
+        write,
+        host,
+        None,
+        Some(&stream),
+    )?;
+    batch.calls[index].publish(write.id(), locations, exported)?;
+    Ok(())
 }
