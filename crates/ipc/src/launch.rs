@@ -112,7 +112,6 @@ pub struct LaunchDescriptor {
     /// Checkpoint path or repository; empty for the stub model.
     pub model: String,
     /// Base checkpoint an adapter checkpoint extends.
-    #[serde(default)]
     pub base_model: Option<String>,
     /// Torch device name of the rank's primary device (`cpu`, `cuda`, `cuda:N`).
     pub device: String,
