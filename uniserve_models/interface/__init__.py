@@ -29,7 +29,6 @@ _AREAS = (
     "encoder",
     "decoder",
     "denoiser",
-    "memory",
     "kernels",
     "profiling",
     "runtime",
