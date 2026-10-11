@@ -49,14 +49,14 @@ use std::sync::{Arc, Mutex};
 use tvm_ffi::Any;
 use uniserve_cuda::{DeviceId, Stream};
 
-use super::experts::{ExpertLayer, ExpertPlan, host_functions};
+use super::experts::{ExpertLayer, ExpertPlan, host_bootstrap};
 use super::joins::{GraphFunctions, JoinGraphs};
 use super::world::World;
 use super::{ExpertParallel, ExpertTransport, MicrobatchLanes, yield_microbatch};
 use crate::config::{Device, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
-use crate::ffi::{Backing, Fields, Function, Handle, integer_list};
+use crate::ffi::{Backing, Function, Handle, integer_list};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::interface::Interface;
@@ -67,6 +67,9 @@ use crate::{Error, Result};
 
 /// The library module of expert exchanges.
 const MODULE: &str = "uniserve_models.distributed.experts";
+
+/// The library class over the worker's host collectives.
+const HOST_BOOTSTRAP: &str = "uniserve_models.backends.experts.HostBootstrap";
 
 /// The library functions of expert exchanges, reached by import path.
 #[derive(Clone)]
@@ -143,7 +146,7 @@ pub(crate) struct ExpertUnion {
     /// The layers that exchange tokens, compared across the union.
     layers: Vec<ExpertLayer>,
     /// The yield hook given to every exchange, retained for its lifetime.
-    _hooks: Option<Any>,
+    _yield_turn: Option<Any>,
     closed: bool,
 }
 
@@ -419,7 +422,7 @@ impl ExpertUnion {
             let fork = start.lanes.fork_microbatch()?;
             streams.push(fork.stream()?.clone());
         }
-        let hooks = (microbatches > 1).then(|| {
+        let yield_turn = (microbatches > 1).then(|| {
             Any::from(tvm_ffi::Function::from_packed(|_| {
                 yield_microbatch().map_err(|error| {
                     tvm_ffi::Error::new(tvm_ffi::RUNTIME_ERROR, &error.to_string(), "")
@@ -427,13 +430,12 @@ impl ExpertUnion {
                 Ok(Any::default())
             }))
         });
-        let group = Fields::new()
-            .with("rank", rank as i64)
-            .with("size", size as i64)
-            .with("attention_ranks", union.attention_ranks as i64)
-            .into_any();
-        let hook_map = Fields::new().optional("yield", hooks.clone()).into_any();
-        let bootstrap = host_functions(&host);
+        // The library's host collectives over the union, which every
+        // microbatch's exchange bootstraps its communicators with.
+        let bootstrap = start
+            .interface
+            .import(HOST_BOOTSTRAP)?
+            .call_values(&host_bootstrap(&host))?;
 
         let mut runtime = Self {
             parallel,
@@ -452,14 +454,15 @@ impl ExpertUnion {
             layers_owners: Vec::new(),
             pools: Vec::new(),
             layers,
-            _hooks: hooks,
+            _yield_turn: yield_turn.clone(),
             closed: false,
         };
         for stream in streams {
             let bytes: i64 = functions.symmetric_bytes.call_as(&[
                 start.model.handle().view(),
                 (&Any::from(tvm_ffi::String::from(transport.as_str()))).into(),
-                (&group).into(),
+                (&Any::from(size as i64)).into(),
+                (&Any::from(union.attention_ranks as i64)).into(),
                 (&Any::from(max_tokens as i64)).into(),
             ])?;
             let symmetric = if bytes > 0 {
@@ -474,9 +477,10 @@ impl ExpertUnion {
             } else {
                 None
             };
-            let storage = symmetric
-                .as_ref()
-                .map(|storage| -> Result<Any> {
+            // This rank's view of the mapped storage and every member's
+            // address of its share; neither without mapped storage.
+            let (storage, pointers) = match &symmetric {
+                Some(storage) => {
                     let view = crate::storage::memory::StorageView::whole(
                         Arc::clone(storage.local()) as Arc<dyn crate::ffi::Backing>,
                         crate::ffi::DType::I8,
@@ -484,22 +488,23 @@ impl ExpertUnion {
                     let base = storage.peers().address();
                     let pointers = (0..size)
                         .map(|member| (base + (member * storage.bytes_each()) as u64) as i64);
-                    Ok(Fields::new()
-                        .with("storage", view.to_tensor()?)
-                        .with("pointers", integer_list(pointers))
-                        .into_any())
-                })
-                .transpose()?;
+                    (Any::from(view.to_tensor()?), integer_list(pointers))
+                }
+                None => (Any::default(), integer_list([])),
+            };
             let created = functions.create.call_values(&[
                 start.model.handle().to_any(),
                 Any::from(tvm_ffi::String::from(transport.as_str())),
-                group.clone(),
+                Any::from(rank as i64),
+                Any::from(size as i64),
+                Any::from(union.attention_ranks as i64),
                 bootstrap.clone(),
                 Any::from(max_tokens as i64),
                 Any::from(i64::from(device)),
                 Any::from(stream.raw() as i64),
-                hook_map.clone(),
-                storage.unwrap_or_default(),
+                yield_turn.clone().unwrap_or_default(),
+                storage,
+                Any::from(pointers),
             ])?;
             runtime.microbatches.push(Microbatch {
                 exchange: Handle::new(created)?,
