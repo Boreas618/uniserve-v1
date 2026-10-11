@@ -1,33 +1,82 @@
-//! The host media runtime: condition reading, video unit and audio encoding
-//! and MP4 assembly on host ranks.
+//! Host media on CPU ranks: condition reading, video unit and audio encoding
+//! and MP4 assembly.
 //!
-//! Host calls run as tasks on the rank's host lane (see
+//! Host media has no model. [`MediaRunner`] calls the functions of the
+//! Python library's `uniserve_models.media` (and the model's patch packing)
+//! by import path. Host calls run as tasks on the rank's host lane (see
 //! [`crate::host::task`]); execution reserves their outputs, configures and
 //! submits the tasks and commits the batch. Their outputs stay deferred
 //! until the tasks finish, when the batch publishes them (the decoded
 //! condition products, the encoded unit rows) or delivers the finished MP4
 //! before its result is sent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use uniserve_core::ComponentConfig;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, CallKind, DimBound, MediaCall, TensorRef,
     TransferTransport,
 };
 
-use super::batch::{MediaBatch, Publication, request_slots};
-use super::video::{Parts, units};
 use crate::error::WorkerError;
+use crate::executor::forward::batch::{MediaBatch, Publication, request_slots};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, supplied};
-use crate::ffi::Device;
-use crate::host::HostTask;
-use crate::host::mux::read_unit;
-use crate::host::reader::ConditionProducts;
+use crate::executor::forward::video::{Parts, open, units};
+use crate::ffi::{Device, Function, Handle};
+use crate::host::mux::{MuxFunctions, read_unit};
+use crate::host::reader::{ConditionProducts, ConditionReader, ReaderFunctions};
 use crate::host::task::{MediaTask, UnitFrames};
+use crate::host::{HostLane, HostTask};
+use crate::model::interface::Interface;
 use crate::transfer::TransportKind;
 use crate::{Error, ProductBuffer, Result};
+
+/// The host media of a rank: the library functions its calls run and the
+/// lane they run on.
+pub(crate) struct MediaRunner {
+    pub(crate) reader: Option<Arc<ConditionReader>>,
+    /// `uniserve_models.media.codec.encode_video_unit`.
+    encode_video: Function,
+    /// `uniserve_models.media.codec.encode_audio_track`.
+    encode_audio: Function,
+    pub(crate) mux: MuxFunctions,
+    pub(crate) lane: HostLane<MediaTask>,
+    /// Host component placements, by name.
+    components: BTreeMap<String, ComponentConfig>,
+}
+
+impl MediaRunner {
+    /// The runner of the host `components` placed on this rank. A rank
+    /// placing the media reader reads conditions with `ffmpeg` at the
+    /// model's `frame_rate`; `capacity` bounds the lane's queued tasks.
+    pub(crate) fn new(
+        interface: &Interface,
+        loaded: &Handle,
+        components: BTreeMap<String, ComponentConfig>,
+        ffmpeg: String,
+        frame_rate: u32,
+        capacity: usize,
+    ) -> Result<Self> {
+        let reader = if components.contains_key("media_reader") {
+            let functions = ReaderFunctions::new(interface, loaded)?;
+            Some(Arc::new(ConditionReader::new(
+                functions, ffmpeg, frame_rate,
+            )))
+        } else {
+            None
+        };
+        Ok(Self {
+            reader,
+            encode_video: interface.import("uniserve_models.media.codec.encode_video_unit")?,
+            encode_audio: interface.import("uniserve_models.media.codec.encode_audio_track")?,
+            mux: MuxFunctions::new(interface)?,
+            lane: HostLane::new(capacity, 1, "uniserve-media")?,
+            components,
+        })
+    }
+}
 
 /// Execute a batch of host media calls and commit it.
 pub(crate) fn execute(
@@ -36,7 +85,7 @@ pub(crate) fn execute(
     borrowed: HashSet<BufferId>,
     state: &mut Option<MediaBatch>,
 ) -> std::result::Result<(), WorkerError> {
-    let batch = super::video::open(parts, plan, borrowed, state)?;
+    let batch = open(parts, plan, borrowed, state)?;
     let slots = request_slots(plan, parts.requests)?;
     let allocations: HashMap<BufferId, BufferAllocation> = plan
         .buffer_allocations

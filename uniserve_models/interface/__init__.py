@@ -34,8 +34,6 @@ _AREAS = (
     "kernels",
     "profiling",
     "runtime",
-    "video",
-    "media",
 )
 
 

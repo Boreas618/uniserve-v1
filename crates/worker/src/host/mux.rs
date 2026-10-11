@@ -10,7 +10,7 @@
 //!
 //! The session owns the assembly's state: how many units arrived, the decode
 //! time the next unit starts at, the encoded audio track and completion.
-//! PyAV performs the container operations (`media.mux_*`), on a container
+//! PyAV performs the container operations (`media.codec.Container`), on a container
 //! the session holds as an opaque handle and never calls concurrently.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -147,7 +147,9 @@ impl MuxConfig {
     }
 }
 
-/// The interface's container operations.
+const CONTAINER: &str = "uniserve_models.media.codec.Container";
+
+/// The library's container operations.
 #[derive(Clone)]
 pub(crate) struct MuxFunctions {
     open: Function,
@@ -159,10 +161,10 @@ pub(crate) struct MuxFunctions {
 impl MuxFunctions {
     pub(crate) fn new(interface: &Interface) -> Result<Self> {
         Ok(Self {
-            open: interface.function("media.mux_open")?,
-            append: interface.function("media.mux_append")?,
-            finish: interface.function("media.mux_finish")?,
-            close: interface.function("media.mux_close")?,
+            open: interface.import(&format!("{CONTAINER}.open"))?,
+            append: interface.import(&format!("{CONTAINER}.append"))?,
+            finish: interface.import(&format!("{CONTAINER}.finish"))?,
+            close: interface.import(&format!("{CONTAINER}.close"))?,
         })
     }
 
