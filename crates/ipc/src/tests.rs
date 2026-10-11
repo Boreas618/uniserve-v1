@@ -11,18 +11,10 @@ use uniserve_core::{CfgRenorm, KvGroupKind, RequestId, UnitId};
 
 use super::*;
 
-/// A frame bound no test message approaches.
-const BOUND: usize = 1 << 24;
-
-/// Frames `message` as a sender does: validated, then encoded.
-fn encode<M: Message>(message: &M) -> IpcResult<Frame> {
-    Frame::encode(message, BOUND)
-}
-
 /// Returns `message` as a receiver decodes it from the frame a sender made.
-fn round_trip<M: Message>(message: &M) -> M {
-    let sent = encode(message).unwrap().into_bytes();
-    Frame::from_bytes(sent, BOUND).unwrap().decode().unwrap()
+fn round_trip<M: Serialize + serde::de::DeserializeOwned>(message: &M) -> M {
+    let sent = Frame::encode(message).unwrap().into_bytes();
+    Frame::from_bytes(sent).decode().unwrap()
 }
 
 fn request_key() -> RequestKey {
@@ -367,17 +359,17 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
     assert_eq!(execute_round_trip(run.clone()), run);
 
     // Columns of different lengths, a sequence shorter than its query, and a
-    // row naming a call outside the batch are each rejected on encode.
+    // row naming a call outside the batch are each rejected.
     let mut missing_length = run.clone();
     missing_length.forward.seq_lens.pop();
-    assert!(encode(&WorkerRequest::submit(missing_length)).is_err());
+    assert!(missing_length.validate().is_err());
 
     let mut short_sequence = run.clone();
     short_sequence.forward.seq_lens[2] = 3;
-    assert!(encode(&WorkerRequest::submit(short_sequence)).is_err());
+    assert!(short_sequence.validate().is_err());
 
     run.forward.call_indices[2] = 1;
-    assert!(encode(&WorkerRequest::submit(run)).is_err());
+    assert!(run.validate().is_err());
 }
 
 #[test]
@@ -405,7 +397,7 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
 
     let mut collision = run;
     collision.calls[1].call_id = first.call_id;
-    assert!(encode(&WorkerRequest::submit(collision)).is_err());
+    assert!(collision.validate().is_err());
 }
 
 /// Builds a batch around `calls` with the planner columns `Batch::validate`
@@ -994,7 +986,7 @@ fn unchanged_kv_export_round_trips_without_physical_tensors() {
         exported_extent, ..
     } = report.completions[0].kv_output.as_mut().unwrap();
     *exported_extent = 17;
-    assert!(encode(&WorkerResponse::result(report)).is_err());
+    assert!(report.validate().is_err());
 }
 
 /// Shards of a 4x4 tensor: the left half plus the top-right quarter leave the
@@ -1138,7 +1130,7 @@ fn raw_kv_export_round_trips_page_representation_and_exact_request() {
                     .push(tensor("scales", "float32", vec![2, 2, 2], 4)),
                 _ => unreachable!(),
             }
-            assert!(encode(&WorkerResponse::result(invalid)).is_err());
+            assert!(invalid.validate().is_err());
         }
     }
 }
@@ -1182,11 +1174,10 @@ fn request_retirement_requires_unique_buffers_from_its_request() {
             retained_buffers,
         };
         assert!(
-            encode(&WorkerRequest::submit(
-                batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
-                    .with_commands(vec![command]),
-            ))
-            .is_err()
+            batch_with_calls(3, vec![admission()], vec![ar_decode_call()])
+                .with_commands(vec![command])
+                .validate()
+                .is_err()
         );
     }
 }
@@ -1490,8 +1481,8 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
         let mut invalid = call.clone();
         invalid.code = code;
         invalid.input_image = image;
-        let request = WorkerRequest::submit(batch_with_calls(1, vec![admission()], vec![invalid]));
-        assert!(encode(&request).is_err());
+        let batch = batch_with_calls(1, vec![admission()], vec![invalid]);
+        assert!(batch.validate().is_err());
     }
 }
 
@@ -1669,7 +1660,7 @@ fn worker_info_rejects_duplicate_set_members() {
         ],
         ..Default::default()
     };
-    assert!(encode(&WorkerResponse::info(info)).is_err());
+    assert!(info.validate().is_err());
 }
 
 /// A KV pool needs an allocatable unit; every page size must be a power of
@@ -1678,7 +1669,7 @@ fn worker_info_rejects_duplicate_set_members() {
 #[test]
 fn worker_info_rejects_inconsistent_kv_groups() {
     let valid = full_caps();
-    assert!(encode(&WorkerResponse::info(valid.clone())).is_ok());
+    assert!(valid.clone().validate().is_ok());
     let cases: [fn(&mut KvCacheInfo); 6] = [
         |cache| cache.num_units = 1,
         |cache| cache.groups[1].page_tokens = 48,
@@ -1695,7 +1686,7 @@ fn worker_info_rejects_inconsistent_kv_groups() {
     for invalidate in cases {
         let mut info = valid.clone();
         invalidate(info.kv_cache.as_mut().unwrap());
-        assert!(encode(&WorkerResponse::info(info)).is_err());
+        assert!(info.validate().is_err());
     }
 }
 
@@ -2179,94 +2170,24 @@ fn every_response_kind_round_trips_through_ipc() {
 
 #[test]
 fn a_frame_states_the_length_of_the_message_it_carries() {
-    let frame = encode(&WorkerRequest::info()).unwrap();
-    let bytes = frame.as_bytes();
-    let (field, message) = bytes.split_at(Frame::LENGTH_BYTES);
+    let frame = Frame::encode(&WorkerRequest::info()).unwrap();
+    let (field, message) = frame.as_bytes().split_at(Frame::LENGTH_BYTES);
 
-    assert_eq!(
-        Frame::message_len(field.try_into().unwrap(), BOUND).unwrap(),
-        message.len()
-    );
-}
-
-#[test]
-fn a_truncated_or_overlong_frame_is_refused() {
-    let whole = encode(&WorkerResponse::ok()).unwrap().into_bytes();
-
-    // Fewer bytes than a length field, a message cut short, and bytes past
-    // the stated length are all refused before any decoding.
-    assert!(Frame::from_bytes(whole[..Frame::LENGTH_BYTES - 1].to_vec(), BOUND).is_err());
-    assert!(Frame::from_bytes(whole[..whole.len() - 1].to_vec(), BOUND).is_err());
-    let mut overlong = whole.clone();
-    overlong.push(0);
-    assert!(Frame::from_bytes(overlong, BOUND).is_err());
-
-    // A length field that matches its bytes does not make them a message.
-    let mut cut = whole[Frame::LENGTH_BYTES..whole.len() - 1].to_vec();
-    let mut restated = u32::try_from(cut.len()).unwrap().to_le_bytes().to_vec();
-    restated.append(&mut cut);
-    let frame = Frame::from_bytes(restated, BOUND).unwrap();
-    assert!(matches!(
-        frame.decode::<WorkerResponse>(),
-        Err(IpcError::Encoding(_))
-    ));
-}
-
-#[test]
-fn a_message_above_the_bound_is_refused_by_sender_and_receiver() {
-    let request = WorkerRequest::submit(comprehensive_batches().remove(0));
-    let frame = encode(&request).unwrap();
-    let length = frame.as_bytes().len() - Frame::LENGTH_BYTES;
-
-    // The bound counts the encoded message: exactly at it passes, one byte
-    // under it fails on both sides.
-    assert!(Frame::encode(&request, length).is_ok());
-    assert!(matches!(
-        Frame::encode(&request, length - 1),
-        Err(IpcError::Encoding(_))
-    ));
-    let field: [u8; Frame::LENGTH_BYTES] =
-        frame.as_bytes()[..Frame::LENGTH_BYTES].try_into().unwrap();
-    assert!(Frame::message_len(field, length - 1).is_err());
-    assert!(Frame::from_bytes(frame.into_bytes(), length - 1).is_err());
+    assert_eq!(Frame::message_len(field.try_into().unwrap()), message.len());
 }
 
 #[test]
 fn a_frame_decodes_only_as_the_message_it_carries() {
-    let request = encode(&WorkerRequest::info()).unwrap();
+    let request = Frame::encode(&WorkerRequest::info()).unwrap();
     assert!(matches!(
         request.decode::<WorkerResponse>(),
         Err(IpcError::Encoding(_))
     ));
 
-    let garbage = Frame::from_bytes(vec![3, 0, 0, 0, 0x01, 0x02, 0x03], BOUND).unwrap();
-    assert!(garbage.decode::<WorkerRequest>().is_err());
-    assert!(garbage.decode::<WorkerResponse>().is_err());
-}
-
-#[test]
-fn an_invalid_message_is_refused_on_both_sides_of_a_frame() {
-    // An error response must state its message.
-    let invalid = WorkerResponse::error(WorkerResponseError {
-        message: String::new(),
-        code: None,
-        fatal: true,
-        phase: None,
-        route: None,
-        calls: Vec::new(),
-    });
-    assert!(matches!(encode(&invalid), Err(IpcError::Validation(_))));
-
-    // A receiver validates what it decodes, whatever the sender did: these
-    // are the bytes a sender that skipped validation would have framed.
-    let mut message = rmp_serde::to_vec(&invalid).unwrap();
-    let mut bytes = u32::try_from(message.len()).unwrap().to_le_bytes().to_vec();
-    bytes.append(&mut message);
-    let frame = Frame::from_bytes(bytes, BOUND).unwrap();
-    assert!(matches!(
-        frame.decode::<WorkerResponse>(),
-        Err(IpcError::Validation(_))
-    ));
+    // A message cut short, as a frame of another build may be, is refused.
+    let whole = Frame::encode(&WorkerResponse::ok()).unwrap().into_bytes();
+    let cut = Frame::from_bytes(whole[..whole.len() - 1].to_vec());
+    assert!(cut.decode::<WorkerResponse>().is_err());
 }
 
 #[test]

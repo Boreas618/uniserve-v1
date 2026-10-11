@@ -83,16 +83,14 @@ struct RawHead {
 }
 
 impl RawHead {
-    /// Starts the stub worker as a raw process, outside any group, as a
-    /// member of launch `generation`, and answers its registration with
-    /// `descriptor`.
+    /// Starts the stub worker as a raw process, outside any group, and
+    /// answers its registration with `descriptor`.
     ///
     /// The head listens at `address`, so the rank reaches it over a Unix
     /// socket (`unix:<path>`) or over TCP (`127.0.0.1:0`).
     fn launch(
         address: &str,
         descriptor: &LaunchDescriptor,
-        generation: u64,
     ) -> anyhow::Result<(Self, std::process::Child)> {
         let listener = uniserve_ipc::Listener::bind(&[address])?;
         let mut child = std::process::Command::new(worker_python())
@@ -100,14 +98,21 @@ impl RawHead {
             .args(["--head", &listener.addresses()[0]])
             .args(["--worker-id", &descriptor.worker_id])
             .args(["--rank", &descriptor.rank.to_string()])
-            .args(["--generation", &generation.to_string()])
             .spawn()?;
         let registered = (|| -> anyhow::Result<Self> {
             // A worker that fails before registering never connects, so the
             // wait for its registration is bounded.
-            let channel = listener
-                .accept(Duration::from_secs(60))?
-                .context("no rank connected within 60 seconds")?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let channel = loop {
+                if let Some(channel) = listener.try_accept()? {
+                    break channel;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "no rank connected within 60 seconds"
+                );
+                thread::sleep(Duration::from_millis(5));
+            };
             let mut head = Self {
                 channel,
                 inbox: std::collections::HashMap::new(),
@@ -119,14 +124,12 @@ impl RawHead {
                     == uniserve_ipc::Registration::Rank {
                         worker_id: descriptor.worker_id.clone(),
                         rank: descriptor.rank,
-                        generation,
                         version: uniserve_ipc::VERSION.into(),
                     },
                 "the rank registered as {registration:?}"
             );
             head.channel.send(descriptor)?;
-            head.channel
-                .set_capacity(descriptor.ipc_payload_cap, descriptor.queue_depth);
+            head.channel.set_bound(descriptor.ipc_payload_cap);
             Ok(head)
         })();
         match registered {
@@ -140,7 +143,7 @@ impl RawHead {
     }
 
     /// Waits up to `timeout` for the next message of type `M`.
-    fn receive<M: uniserve_ipc::Message>(&mut self, timeout: Duration) -> anyhow::Result<M> {
+    fn receive<M: serde::de::DeserializeOwned>(&mut self, timeout: Duration) -> anyhow::Result<M> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(message) = self.channel.try_recv()? {
@@ -210,12 +213,11 @@ fn wait_exit(
 fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
     use uniserve_ipc::{WorkerRequest, WorkerResponse};
 
-    // Each launch registers under its own generation, so a graceful exit is
-    // observable as the next launch registering and serving again. The rank
-    // reaches the head over loopback TCP, as a rank on another host would.
-    for generation in 1..=2 {
-        let (mut client, mut child) =
-            RawHead::launch("127.0.0.1:0", &stub_launch_descriptor(), generation)?;
+    // A graceful exit is observable as the next launch registering and
+    // serving again. The rank reaches the head over loopback TCP, as a rank
+    // on another host would.
+    for _ in 0..2 {
+        let (mut client, mut child) = RawHead::launch("127.0.0.1:0", &stub_launch_descriptor())?;
         let result = (|| -> anyhow::Result<()> {
             let request = |mut request: WorkerRequest, message_id| {
                 request.set_call_id(Some(message_id));
@@ -312,7 +314,7 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
 
     let directory = tempfile::tempdir()?;
     let address = format!("unix:{}", directory.path().join("head.sock").display());
-    let (mut client, mut child) = RawHead::launch(&address, &stub_launch_descriptor(), 1)?;
+    let (mut client, mut child) = RawHead::launch(&address, &stub_launch_descriptor())?;
     let result = (|| -> anyhow::Result<()> {
         let request = |mut request: WorkerRequest, message_id| {
             request.set_call_id(Some(message_id));
@@ -388,7 +390,7 @@ fn a_starting_rank_stops_on_interrupt_and_dies_of_termination() -> anyhow::Resul
         descriptor.rendezvous_address = Some(rendezvous.local_addr()?.to_string());
         let directory = tempfile::tempdir()?;
         let address = format!("unix:{}", directory.path().join("head.sock").display());
-        let (_head, mut child) = RawHead::launch(&address, &descriptor, 1)?;
+        let (_head, mut child) = RawHead::launch(&address, &descriptor)?;
         let result = (|| -> anyhow::Result<()> {
             // The rank connects to the rendezvous once it has described its
             // model; it is then blocked waiting for the address table.
@@ -449,14 +451,13 @@ fn a_rank_exits_when_its_head_closes_the_connection() -> anyhow::Result<()> {
     descriptor.host_slots = vec![0, 1];
     descriptor.components = WorkerConfig::single_component("model", 2);
     descriptor.rendezvous_address = Some(rendezvous.local_addr()?.to_string());
-    let (head, child) = RawHead::launch(&address("starting.sock"), &descriptor, 1)?;
+    let (head, child) = RawHead::launch(&address("starting.sock"), &descriptor)?;
     let (_peer, _) = rendezvous.accept()?;
     drop(head);
     exits_with_failure(child)?;
 
     // Serving: a rank that has answered Info waits for its next request.
-    let (mut head, child) =
-        RawHead::launch(&address("serving.sock"), &stub_launch_descriptor(), 1)?;
+    let (mut head, child) = RawHead::launch(&address("serving.sock"), &stub_launch_descriptor())?;
     let mut info = uniserve_ipc::WorkerRequest::info();
     info.set_call_id(Some(1));
     let info = head.send(&info)?;
@@ -1138,17 +1139,16 @@ fn launch_refuses_a_rank_of_another_build() -> anyhow::Result<()> {
 
     // The stand-in registers as the rank it was started as, under a build
     // the head is not, and then waits for the head to close. The frames are
-    // encoded here, one per rank of the group's first launch.
+    // encoded here, one per rank of the group.
     let mut args = rank_group_args(8 << 20);
     let frames = (0..args.ranks.len())
         .map(|rank| {
             let registration = uniserve_ipc::Registration::Rank {
                 worker_id: args.worker_id.clone(),
                 rank: rank as u32,
-                generation: 1,
                 version: "0.0.0-other".into(),
             };
-            let frame = uniserve_ipc::Frame::encode(&registration, 1 << 20)?;
+            let frame = uniserve_ipc::Frame::encode(&registration)?;
             Ok(frame
                 .as_bytes()
                 .iter()
@@ -3379,11 +3379,10 @@ fn media_rank() -> anyhow::Result<()> {
 
     // Register with the head as the rank this process was started as, and
     // take the launch descriptor it answers with.
-    let mut server = Channel::connect(argument("--head")?, Duration::from_secs(60))?;
+    let mut server = Channel::connect(argument("--head")?)?;
     server.send(&Registration::Rank {
         worker_id: argument("--worker-id")?.clone(),
         rank: argument("--rank")?.parse()?,
-        generation: argument("--generation")?.parse()?,
         version: uniserve_ipc::VERSION.into(),
     })?;
     let descriptor: LaunchDescriptor = loop {
@@ -3392,7 +3391,7 @@ fn media_rank() -> anyhow::Result<()> {
         }
         server.wait(Duration::from_secs(60))?;
     };
-    server.set_capacity(descriptor.ipc_payload_cap, descriptor.queue_depth);
+    server.set_bound(descriptor.ipc_payload_cap);
     let case = std::env::var(MEDIA_RANK_CASE)?;
     let mut info: uniserve_ipc::WorkerInfo =
         serde_json::from_slice(&std::fs::read(std::env::var(MEDIA_RANK_INFO)?)?)?;

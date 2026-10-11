@@ -91,10 +91,14 @@ fn start_launcher_with(stdout: Stdio, stderr: Stdio) -> (Launcher, Channel) {
             .spawn()
             .unwrap(),
     );
-    let mut head = listener
-        .accept(Duration::from_secs(30))
-        .unwrap()
-        .expect("the launcher connects to the head");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut head = loop {
+        if let Some(head) = listener.try_accept().unwrap() {
+            break head;
+        }
+        assert!(Instant::now() < deadline, "the launcher did not connect");
+        std::thread::sleep(Duration::from_millis(5));
+    };
 
     // The launcher's first frame says which host it owns and what it was
     // built as.
