@@ -7,6 +7,7 @@ import tvm_ffi
 from tests.python.fixtures.stub import load_model, read_config
 from uniserve_models import interface
 from uniserve_models.interface.errors import UnsupportedSetup
+from uniserve_models.runner import causal_lm
 
 pytestmark = pytest.mark.unit
 
@@ -59,8 +60,8 @@ def test_facts_report_text_geometry_and_formats(loaded):
         },
     )
     assert facts["attention_backend"] == "torch"
-    assert facts["vocab_size"] == 151671
-    assert facts["hidden_size"] == 4
+    assert causal_lm.vocab_size(model) == 151671
+    assert causal_lm.hidden_size(model) == 4
     assert facts["weight_formats"] == ["dense"]
     assert facts["outputs"] == {}
     assert facts["image_flow"] == {
