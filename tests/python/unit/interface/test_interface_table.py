@@ -39,16 +39,6 @@ STARTUP_ENTRIES = {
 
 # Entries an expert-parallel rank resolves; a missing one fails the rank.
 EXPERT_ENTRIES = {
-    "experts.layers",
-    "experts.symmetric_bytes",
-    "experts.create_exchange",
-    "experts.bind_microbatches",
-    "experts.bind",
-    "experts.warm_thread",
-    "experts.close_exchange",
-    "experts.weight_fields",
-    "experts.bind_weights",
-    "experts.bind_prefetch",
     "graphs.begin_capture",
     "graphs.end_capture",
     "graphs.release",

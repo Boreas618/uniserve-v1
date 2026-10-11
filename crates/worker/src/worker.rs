@@ -46,8 +46,6 @@ use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
-use crate::executor::forward::experts::warmup::ExpertWarmup;
-use crate::executor::forward::experts::{ExpertRuntime, ExpertStart, WeightRuntime};
 use crate::executor::forward::image::ImageRuntime;
 use crate::executor::forward::image::start::{
     Startup as ImageStartup, reserved_bytes as image_reserved_bytes,
@@ -69,6 +67,7 @@ use crate::model::{
     ComponentMesh, Description, ExpertPartition, LoadedModel, ModelFacts, sequence_kind,
 };
 use crate::parallel::world::{World, startup_timeout};
+use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
@@ -239,7 +238,7 @@ impl Worker {
         let node = host_name().map_err(phase("host"))?;
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.
-        let mut experts = ExpertRuntime::start(ExpertStart {
+        let mut experts = ExpertUnion::start(ExpertStart {
             interface: &interface,
             launch: &launch,
             world: &world,
@@ -249,7 +248,7 @@ impl Worker {
             node: &node,
         })
         .map_err(phase("experts"))?;
-        let weights = WeightRuntime::start(&interface, &launch, &world, &model, &lanes, &node)
+        let weights = DwdpManager::start(&interface, &launch, &world, &model, &lanes, &node)
             .map_err(phase("experts"))?;
         let budget = match device {
             Device::Cuda(_) => Some(
@@ -1053,12 +1052,12 @@ fn host_name() -> Result<String> {
     }
 }
 
-/// Graph pools for an expert runtime's captured joins, one per microbatch,
+/// Graph pools for an expert union member's captured joins, one per microbatch,
 /// when no text runner shares its pools on the microbatch streams.
 fn reserve_join_pools(
     interface: &Interface,
     config: &WorkerConfig,
-    experts: &mut ExpertRuntime,
+    experts: &mut ExpertUnion,
     graphs: &mut GraphStorage<String, Handle>,
 ) -> Result<()> {
     if config.graph_policy == "off" || experts.has_pools() {

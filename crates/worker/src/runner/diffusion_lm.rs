@@ -56,8 +56,8 @@ use super::methods::{Argument, Methods};
 use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
-use crate::executor::forward::experts::ExpertRuntime;
 use crate::ffi::{Backing, DType, Handle, Record};
+use crate::parallel::ExpertUnion;
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{GroupShape, GroupTable, KVCache, OutputPool, TablePages, table_pages};
 use crate::warmup::WarmupHooks;
@@ -615,7 +615,7 @@ impl DiffusionLMRunner {
     /// With expert-parallel layers every graph is captured at every expert
     /// capacity holding its tokens, largest first, each warmup an announced
     /// expert step; every rank warms the same sequence.
-    fn warm(&mut self, kv: &mut KVCache, experts: Option<&ExpertRuntime>) -> Result<()> {
+    fn warm(&mut self, kv: &mut KVCache, experts: Option<&ExpertUnion>) -> Result<()> {
         let row_units: usize = self
             .groups
             .iter()
@@ -666,7 +666,7 @@ impl DiffusionLMRunner {
         &mut self,
         first_unit: usize,
         row_units: usize,
-        experts: Option<&ExpertRuntime>,
+        experts: Option<&ExpertUnion>,
     ) -> Result<()> {
         // The expert capacities a forward of `tokens` is captured at.
         let variants = |tokens: usize| -> Vec<Option<usize>> {

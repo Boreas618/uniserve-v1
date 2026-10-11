@@ -24,7 +24,6 @@ _AREAS = (
     "cache",
     "binding",
     "distributed",
-    "experts",
     "graphs",
     "image",
     "encoder",

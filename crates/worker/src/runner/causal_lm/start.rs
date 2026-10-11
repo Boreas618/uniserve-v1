@@ -34,7 +34,7 @@ use crate::runner::input_buffers::InputBuffers;
 use crate::storage::{KVCache, KVPlan, OutputPool};
 use crate::{Error, Result};
 
-use crate::executor::forward::experts::{ExpertRuntime, WeightRuntime};
+use crate::parallel::{DwdpManager, ExpertUnion};
 
 /// The text call kinds a runner may serve.
 pub(crate) const TEXT_KINDS: [CallKind; 3] = [
@@ -265,11 +265,11 @@ pub(crate) struct Startup<'a> {
     pub(crate) preparation: Option<&'a Stream>,
     /// The expert runtime, when forwards are expert steps: each lane binding
     /// gets one runner per microbatch, bound to its transport and stream.
-    pub(crate) experts: Option<&'a mut ExpertRuntime>,
+    pub(crate) experts: Option<&'a mut ExpertUnion>,
     /// The worker's ranks, across which symmetric workspaces are mapped.
     pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
     /// The distributed expert weights, with DWDP.
-    pub(crate) weights: Option<&'a WeightRuntime>,
+    pub(crate) weights: Option<&'a DwdpManager>,
 }
 
 impl CausalLMRunners {

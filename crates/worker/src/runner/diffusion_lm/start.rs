@@ -20,7 +20,6 @@ use super::shapes::{SLOT_BUCKETS, Shapes, chunk_rows};
 use super::{CANDIDATES, DiffusionLMRunner, METHODS, RUNNER};
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
-use crate::executor::forward::experts::{ExpertRuntime, WeightRuntime};
 use crate::ffi::Handle;
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
@@ -28,6 +27,7 @@ use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextS
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
+use crate::parallel::{DwdpManager, ExpertUnion};
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::methods::{Argument, Methods};
 use crate::storage::{GroupShape, KVCache, KVPlan, OutputPool};
@@ -220,11 +220,11 @@ pub(crate) struct Startup<'a> {
     pub(crate) preparation: Option<&'a Stream>,
     /// The worker's ranks, across which symmetric workspaces are mapped.
     pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
-    /// The expert runtime, when forwards are expert steps: the component
+    /// The expert union member, when forwards are expert steps: the component
     /// exchanges through its transport on its stream.
-    pub(crate) expert_runtime: Option<&'a mut ExpertRuntime>,
+    pub(crate) expert_runtime: Option<&'a mut ExpertUnion>,
     /// The distributed expert weights, with DWDP.
-    pub(crate) weights: Option<&'a WeightRuntime>,
+    pub(crate) weights: Option<&'a DwdpManager>,
 }
 
 /// The diffusion LM components placed on this rank: name, module path and

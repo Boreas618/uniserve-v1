@@ -58,7 +58,7 @@ pub(super) struct Batch<'a> {
     /// The runner group serving the batch.
     pub(super) group: usize,
     /// The rank's expert runtime, when its forwards are expert steps.
-    pub(super) experts: Option<&'a crate::executor::forward::experts::ExpertRuntime>,
+    pub(super) experts: Option<&'a crate::parallel::ExpertUnion>,
     /// The group's lane stream.
     pub(super) stream: Option<Stream>,
     pub(super) device: Option<i32>,
@@ -82,7 +82,7 @@ impl<'a> Batch<'a> {
         image: Option<&'a mut ImageRuntime>,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
-        experts: Option<&'a crate::executor::forward::experts::ExpertRuntime>,
+        experts: Option<&'a crate::parallel::ExpertUnion>,
         info: &uniserve_ipc::WorkerInfo,
         rank: usize,
         plan: &'a BatchPlan,
