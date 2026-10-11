@@ -37,6 +37,7 @@ use crate::executor::BatchResult;
 use crate::executor::backend::{Parts, WorkerBackend, WorkerBatch};
 use crate::executor::forward::launch::{Launched, StreamOrder, error_code, failed_output};
 use crate::executor::lifecycle::RequestStorage;
+use crate::ffi::Record;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{
@@ -64,10 +65,13 @@ pub(super) const COMPLETION_FIELDS: usize = 4;
 /// their output storage.
 pub(crate) struct CausalLMRunners {
     pub(super) runners: Vec<CausalLMRunner>,
+    /// Each runner's kernel-table label (component and module path) and its
+    /// device name.
+    pub(super) labels: Vec<(String, String)>,
     /// Each lane binding's runners, one per expert microbatch; the first
     /// runs on the lane's stream, the others on its forks.
     pub(super) groups: Vec<Vec<usize>>,
-    /// The NCCL communicators of the runners' bindings, destroyed after
+    /// The NCCL communicators of the runners' streams, destroyed after
     /// their graphs.
     pub(super) collectives: Vec<crate::parallel::StreamCollectives>,
     /// The unit reset column of each runner's stream.
@@ -353,11 +357,44 @@ impl CausalLMRunners {
 
     pub(crate) fn set_wake(&self, _wake: Option<Wake>) {}
 
-    /// Release graphs, steps and output storage after the lanes drained.
+    /// Each runner's kernel-table label, device name and the kernels its
+    /// operators selected, after numerical warmup.
+    pub(crate) fn kernels(&self) -> Result<Vec<(String, String, Vec<Record>)>> {
+        self.runners
+            .iter()
+            .zip(&self.labels)
+            .map(|(runner, (label, device))| {
+                let records = runner
+                    .methods
+                    .call(&runner.functions.kernels, Vec::new())
+                    .invoke()?;
+                let records = tvm_ffi::Array::<tvm_ffi::Any>::try_from(records)
+                    .map_err(|error| Error::numerical("kernels", &error))?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+                    .collect::<Result<_>>()?;
+                Ok((label.clone(), device.clone(), records))
+            })
+            .collect()
+    }
+
+    /// Release graphs, the Python runners' execution contexts and output
+    /// storage after the lanes drained, newest runner first. An aborted
+    /// close keeps the contexts: device work may still address their
+    /// workspaces.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
-        for runner in &mut self.runners {
+        for runner in self.runners.iter_mut().rev() {
             result = result.and(runner.close(aborted));
+            if !aborted {
+                let closed = runner
+                    .methods
+                    .call(&runner.functions.close, Vec::new())
+                    .invoke()
+                    .map(drop);
+                result = result.and(closed);
+            }
         }
         for collectives in &mut self.collectives {
             result = result.and(collectives.close(aborted));

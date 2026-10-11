@@ -81,7 +81,6 @@ use crate::executor::forward::batch::{
 };
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list, list};
-use crate::model::bind::TextSize;
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::runner::{ImageSetup, Methods, RunnerSetup};
@@ -194,6 +193,13 @@ pub fn prepare_input(
         Any::from(pin),
     ])?;
     PreparedImage::from_value(function.name(), value)
+}
+
+/// The text workload an encoder's execution context is prepared for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSize {
+    pub tokens: usize,
+    pub rows: usize,
 }
 
 /// A vision patch encoder (`PatchEncoder`).

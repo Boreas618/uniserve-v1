@@ -595,15 +595,15 @@ const MODULE: &str = "uniserve_models.distributed.experts";
 // places each layer's weights for its kernels and lists this rank's shards;
 // [`ExpertWeights::build`] publishes them and maps every field's full
 // extent; `bind_weights` installs the full views as the layers' parameters,
-// and `bind_prefetch` returns the object prepared components pass to their
+// and `bind_prefetch` returns the object execution contexts pass to their
 // expert calls, over the manager's hooks. A prefetch a captured forward
 // reaches is a graph break: the hook ends the segment and notes the copy,
 // which the forward's graph performs at every launch.
 
-/// The rank's distributed expert weights and their binding-side object.
+/// The rank's distributed expert weights and their prefetch object.
 pub(crate) struct DwdpManager {
     weights: Arc<ExpertWeights>,
-    /// `bind_prefetch`'s object, passed to every prepared component.
+    /// `bind_prefetch`'s object, passed to every runner's constructor.
     prefetch: Handle,
     /// The weight copies noted as graph breaks of the forward being
     /// captured.

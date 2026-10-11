@@ -385,6 +385,10 @@ impl WorkerBackend {
         self.text = Some(text);
     }
 
+    pub(crate) fn text(&self) -> Option<&crate::runner::causal_lm::CausalLMRunners> {
+        self.text.as_ref()
+    }
+
     pub(crate) fn text_mut(&mut self) -> Option<&mut crate::runner::causal_lm::CausalLMRunners> {
         self.text.as_mut()
     }
@@ -774,11 +778,12 @@ impl WorkerBackend {
         }
         watch.last = choices;
         let mut current = KernelRecords::default();
-        for binding in self.components.bindings() {
-            let label = binding_label(binding);
-            let added = binding
-                .kernels()
-                .and_then(|records| current.add(&label, &binding.device.to_string(), &records));
+        if let Some(text) = &self.text {
+            let added = text.kernels().and_then(|listed| {
+                listed
+                    .iter()
+                    .try_for_each(|(label, device, records)| current.add(label, device, records))
+            });
             if let Err(error) = added {
                 tracing::warn!(target: "uniserve_worker.profiling", "kernel report failed: {error}");
                 return;
@@ -976,15 +981,6 @@ fn image_kernels(
         listed.push((name.clone(), device, kernels));
     }
     Ok(listed)
-}
-
-/// A binding's kernel-table label: component, root path and call kinds.
-pub fn binding_label(binding: &crate::model::bind::ComponentBinding) -> String {
-    if binding.path.is_empty() {
-        binding.component.clone()
-    } else {
-        format!("{}.{}", binding.component, binding.path)
-    }
 }
 
 impl Backend for WorkerBackend {

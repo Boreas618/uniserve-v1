@@ -18,7 +18,6 @@
 //! Component bindings ([`bind`]) and the registry of placed components by
 //! capability ([`registry`]) follow.
 
-pub mod bind;
 pub mod components;
 pub mod interface;
 pub mod registry;

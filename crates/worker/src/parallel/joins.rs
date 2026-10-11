@@ -259,7 +259,7 @@ impl ExpertUnion {
     }
 
     /// The eager join of microbatch `peer`: the library's `join` over its
-    /// prepared component.
+    /// context owner.
     fn eager_join(&self, peer: usize, capacity: usize) -> Result<MicrobatchCall<()>> {
         let prepared = self.microbatches[peer]
             .prepared

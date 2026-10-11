@@ -21,7 +21,6 @@ from .errors import translate
 # Interface modules in this package, each exposing ``functions()``.
 _AREAS = (
     "cache",
-    "binding",
     "distributed",
     "graphs",
     "kernels",

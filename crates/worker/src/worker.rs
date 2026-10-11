@@ -12,13 +12,13 @@
 //! 4. Loading, model facts, execution streams.
 //! 5. Capacity: page size, request slots, KV units and latent pages, all
 //!    agreed over the group; the auxiliary-device check.
-//! 6. Request storage and component bindings, created by the storage and
-//!    capability runtimes on the plan and registered with the backend.
+//! 6. Request storage and the runners, created by the storage and
+//!    capability runtimes on the plan and handed to the backend.
 //! 7. The executor and the profiler.
 //!
 //! [`Worker::warmup`] runs the warmup phases ([`crate::warmup`]),
 //! [`Worker::run`] serves the channel, and [`Worker::close`] releases owners
-//! in dependency order: execution, bindings, streams, requests, the process
+//! in dependency order: execution, runners, streams, requests, the process
 //! world, then deferred device memory.
 
 mod storage;
@@ -43,19 +43,18 @@ use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
-use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
+use crate::executor::backend::{KernelWatch, WorkerBackend};
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle};
 use crate::lane::Lanes;
 use crate::launch::Endpoint;
-use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::model::{ComponentMesh, Description, ExpertPartition, LoadedModel, sequence_kind};
 use crate::parallel::world::{World, startup_timeout};
-use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup};
+use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, PeerGroup};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
@@ -125,8 +124,6 @@ pub struct Worker {
     budget: Option<DeviceBudget>,
     lanes: Lanes,
     graphs: GraphStorage<String, Handle>,
-    /// Shared workspaces of every binding, by stream.
-    workspaces: StreamWorkspaces,
     /// The shared work areas of every stream runners construct their
     /// execution contexts on.
     _scratches: Scratches,
@@ -293,7 +290,6 @@ impl Worker {
             .collect::<Result<BTreeMap<_, _>>>()
             .map_err(phase("capacity"))?;
         let mut graphs = GraphStorage::new(budgets);
-        let mut workspaces = StreamWorkspaces::default();
         let mut scratches = Scratches::default();
 
         let storage = allocate_storage(&launch, &interface, &config, &plan, &lanes)
@@ -306,7 +302,7 @@ impl Worker {
             .map(CUDAStream::stream)
             .transpose()
             .map_err(phase("bind"))?;
-        // Numerical collectives of each binding run on NCCL communicators
+        // Numerical collectives of each runner run on NCCL communicators
         // bound to its stream, over its component's mesh groups.
         let first = launch
             .expert_parallel
@@ -330,8 +326,8 @@ impl Worker {
             image_processor: image.processing.is_some(),
             lanes: &lanes,
             kv: storage.kv.as_ref(),
-            components: &mut components,
-            workspaces: &mut workspaces,
+            components: &components,
+            scratches: &mut scratches,
             graphs: &mut graphs,
             preparation,
             experts: experts.as_mut(),
@@ -523,7 +519,6 @@ impl Worker {
             budget,
             lanes,
             graphs,
-            workspaces,
             _scratches: scratches,
             executor: Some(executor),
             hooks,
@@ -698,12 +693,10 @@ impl Worker {
             if !aborted {
                 record(executor.close());
             }
-            // Graphs and steps release before the bindings they run.
+            // Each runner releases its graphs, then its execution context.
             let closed = executor.backend_mut().close_runtimes(aborted);
             record(closed.map_err(WorkerError::from));
-            let closed = executor.backend_mut().components_mut().close(aborted);
-            record(closed.map_err(WorkerError::from));
-            // Transports retire after every binding and graph using them;
+            // Transports retire after every context and graph using them;
             // their close is collective over the expert union.
             let closed = executor.backend_mut().close_experts(aborted);
             record(closed.map_err(WorkerError::from));
@@ -842,12 +835,12 @@ impl Worker {
             .as_mut()
             .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
         let mut records = KernelRecords::default();
-        for binding in executor.backend().components().bindings() {
-            let label = binding_label(binding);
-            let kernels = binding.kernels().map_err(phase("warmup"))?;
-            records
-                .add(&label, &binding.device.to_string(), &kernels)
-                .map_err(phase("warmup"))?;
+        if let Some(text) = executor.backend().text() {
+            for (label, device, kernels) in text.kernels().map_err(phase("warmup"))? {
+                records
+                    .add(&label, &device, &kernels)
+                    .map_err(phase("warmup"))?;
+            }
         }
         for (label, device, kernels) in executor
             .backend()
@@ -890,7 +883,6 @@ impl Worker {
             image.encoders.seal_image();
             image.denoisers.seal_image();
         }
-        self.workspaces.seal();
         let choices: i64 = self
             .interface
             .kernel_choices
