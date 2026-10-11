@@ -2,6 +2,7 @@
 
 use tvm_ffi::{Any, Array, Map};
 
+use super::values::{integers, is_none, list};
 use crate::{Error, Result};
 
 /// A `Map<String, Any>` describing loaded state, for example the cache plan or
@@ -145,20 +146,6 @@ impl Record {
     }
 }
 
-/// Whether a value is Python's `None`.
-pub fn is_none(value: &Any) -> bool {
-    value.type_index() == tvm_ffi::TypeIndex::kTVMFFINone as i32
-}
-
-/// Convert a `Shape` or a list of integers.
-pub fn integers(value: Any) -> std::result::Result<Vec<i64>, tvm_ffi::Error> {
-    if value.type_index() == tvm_ffi::TypeIndex::kTVMFFIShape as i32 {
-        return Ok(tvm_ffi::Shape::try_from(value)?.as_slice().to_vec());
-    }
-    let values: Array<Any> = Array::try_from(value)?;
-    values.iter().map(i64::try_from).collect()
-}
-
 /// A map argument for an interface function, built field by field.
 #[derive(Default)]
 pub struct Fields {
@@ -208,24 +195,6 @@ impl Fields {
     pub fn into_any(self) -> Any {
         Any::from(self.map())
     }
-}
-
-/// A list of strings as a TVM-FFI array.
-pub fn strings<S: AsRef<str>>(values: impl IntoIterator<Item = S>) -> Array<tvm_ffi::String> {
-    values
-        .into_iter()
-        .map(|value| tvm_ffi::String::from(value.as_ref()))
-        .collect()
-}
-
-/// A list of integers as a TVM-FFI array.
-pub fn integer_list(values: impl IntoIterator<Item = i64>) -> Array<Any> {
-    values.into_iter().map(Any::from).collect()
-}
-
-/// A list of arbitrary values as a TVM-FFI array.
-pub fn list(values: impl IntoIterator<Item = Any>) -> Array<Any> {
-    values.into_iter().collect()
 }
 
 /// Convert a JSON value: objects become maps, arrays become arrays, integers
