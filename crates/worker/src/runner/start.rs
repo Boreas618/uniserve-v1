@@ -405,10 +405,7 @@ impl ImageOwners {
                         },
                     )?;
                     order.push((ImageRunner::Denoiser, setup.owner()));
-                    units = Some(kv.bind_units(
-                        &interface.function("cache.bind_units")?,
-                        target.stream.as_ref(),
-                    )?);
+                    units = Some(kv.bind_units(interface, target.stream.as_ref())?);
                     diffusion = Some((target.component.clone(), runner));
                 }
                 CallKind::Media(MediaCall::ImageDecoding) => {

@@ -17,15 +17,16 @@ use std::ops::{Deref, Range};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use tvm_ffi::AnyView;
+use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::Stream;
 use uniserve_ipc::{KvTransfer, Locator, Wake};
 
 use super::copy::{ImportBackend, ImportCopy};
 use super::{KVImport, KVImporter};
-use crate::ffi::{Backing, DType, Function, Functions};
+use crate::ffi::{Backing, DType, Function, Handle};
+use crate::model::interface::Interface;
 use crate::storage::memory::{Memory, StorageView, dtype_name, parse_dtype};
-use crate::storage::{GroupTable, KVPlanes, UnitColumn, tensor_map};
+use crate::storage::{GroupTable, KVPlanes, UnitColumn};
 use crate::transfer::fetch;
 use crate::transfer::read::{Read, ReadRef};
 use crate::transfer::{Notify, Retirement, Spans, Transports, notify};
@@ -37,8 +38,13 @@ pub struct ImportWorkspace {
     scratch: Arc<Memory>,
     elements: u64,
     units: UnitColumn,
+    /// The library's `PageConversion` over the scratch and the pool.
+    conversion: Handle,
     convert: Function,
 }
+
+/// The library class converting imported pages.
+const PAGE_CONVERSION: &str = "uniserve_models.interface.cache.PageConversion";
 
 impl ImportWorkspace {
     /// Scratch bytes of one workspace: two raw source pages of up to 8-byte
@@ -48,13 +54,9 @@ impl ImportWorkspace {
         20 * elements + 8 * scales
     }
 
-    /// Allocate a workspace for `planes` on its own ordinary stream and bind
-    /// the unit operations and the conversion to it.
-    pub fn bind(
-        planes: &KVPlanes,
-        bind_units: &Function,
-        bind_conversion: &Function,
-    ) -> Result<Self> {
+    /// Allocate a workspace for `planes` on its own ordinary stream and
+    /// construct the unit resets and the page conversion on it.
+    pub fn bind(planes: &KVPlanes, interface: &Interface) -> Result<Self> {
         let (elements, scales) = planes.plan().page_extents();
         let bytes = Self::scratch_bytes(elements, scales) as usize;
         let (stream, scratch) = match planes.device() {
@@ -64,38 +66,31 @@ impl ImportWorkspace {
             ),
             None => (None, Memory::host(bytes.max(1))),
         };
-        let units = UnitColumn::bind(planes, bind_units, stream.as_deref())?;
+        let units = UnitColumn::bind(planes, interface, stream.as_deref())?;
 
-        let plan = &planes.plan().handle;
-        let num_units = i64::from(planes.num_units());
-        let cache = tensor_map(&planes.views()?)?;
         let scratch_view = StorageView::contiguous(
             Arc::clone(&scratch) as Arc<dyn Backing>,
             0,
             DType::U8,
             &[bytes as i64],
         )?;
-        let tensor = scratch_view.to_tensor()?;
-        let (elements_arg, scales_arg) = (elements as i64, scales as i64);
-        let handle = stream.as_ref().map_or(0, |stream| stream.raw() as i64);
-        let functions = Functions::new(
-            bind_conversion.name(),
-            bind_conversion.call(&[
-                plan.view(),
-                AnyView::from(&num_units),
-                AnyView::from(&cache),
-                AnyView::from(&tensor),
-                AnyView::from(&elements_arg),
-                AnyView::from(&scales_arg),
-                AnyView::from(&handle),
-            ])?,
-        )?;
+        let mut arguments = vec![
+            planes.plan().handle.to_any(),
+            Any::from(i64::from(planes.num_units())),
+            Any::from(scratch_view.to_tensor()?),
+            Any::from(elements as i64),
+            Any::from(scales as i64),
+            Any::from(stream.as_ref().map_or(0, |stream| stream.raw() as i64)),
+        ];
+        arguments.extend(planes.field_arguments()?);
+        let conversion = Handle::new(interface.import(PAGE_CONVERSION)?.call_values(&arguments)?)?;
         Ok(Self {
             stream,
             scratch,
             elements,
             units,
-            convert: functions.get("convert")?,
+            conversion,
+            convert: interface.import(&format!("{PAGE_CONVERSION}.convert"))?,
         })
     }
 
@@ -560,6 +555,7 @@ impl GroupCopy<'_> {
             // span's reads record their handoff after it, so no transport
             // overwrites the scratch before the conversion consumed it.
             workspace.convert.invoke(&[
+                workspace.conversion.view(),
                 AnyView::from(&arguments.0),
                 AnyView::from(&arguments.1),
                 AnyView::from(&arguments.2),

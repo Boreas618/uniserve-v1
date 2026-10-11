@@ -6,12 +6,12 @@ what only the numerical library knows: the pool's layout for a loaded model
 (``cache_plan``, a :class:`CachePlan` the worker reads column by column and
 passes back unchanged), whether an attention backend reads a page shape
 (``reads_pages``), the attention layers' view of the pool (``pool``), the
-scattered unit resets (``bind_units``) and the dtype/FP8 conversion of
-imported pages (``bind_conversion``).
+scattered unit resets (:class:`UnitResets`) and the dtype/FP8 conversion of
+imported pages (:class:`PageConversion`).
 
-Binding functions run once, at bind time, over Rust-owned tensors and a
-Rust-owned stream; the returned per-call functions take only integers.
-Importing this module does not initialize CUDA.
+The two classes are constructed once over Rust-owned tensors and a
+Rust-owned stream; their methods take only integers and names. Importing
+this module does not initialize CUDA.
 """
 
 from __future__ import annotations
@@ -28,17 +28,14 @@ from uniserve_models.cache import mha
 from uniserve_models.cache.units import Planes, UnitPool, plan_units
 from uniserve_models.quantization import Quantizer
 
-from .errors import binding
-
 if TYPE_CHECKING:
     from uniserve_models.model import CausalLM
 
 __all__ = [
     "CachePlan",
-    "bind_conversion",
-    "bind_units",
+    "PageConversion",
+    "UnitResets",
     "cache_plan",
-    "functions",
     "pool",
     "reads_pages",
 ]
@@ -355,96 +352,78 @@ def _stream_scope(stream: int, device: torch.device) -> Callable:
     return lambda: torch.cuda.stream(external)
 
 
-def _tensor(value) -> torch.Tensor:
-    """View a worker-owned DLPack tensor (or a torch tensor) in torch."""
-    return (
-        value if isinstance(value, torch.Tensor) else torch.from_dlpack(value)
-    )
+def _named(
+    names: Sequence[str], fields: Sequence[torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """The pool's unit fields by name."""
+    return {str(name): field for name, field in zip(names, fields, strict=True)}
 
 
-def _fields(cache: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Select the unit fields of a cache tensor map, viewed in torch."""
-    return {
-        str(name): _tensor(tensor)
-        for name, tensor in cache.items()
-        if str(name).split(".", 1)[0] in {"key", "value"}
-    }
-
-
-def bind_units(
-    cache: Mapping[str, torch.Tensor], units: torch.Tensor, stream: int
-) -> dict[str, Callable[[int], None]]:
-    """Bind scattered unit resets over Rust-owned unit fields.
+class UnitResets:
+    """Scattered unit resets over Rust-owned unit fields, on one stream.
 
     Args:
-        cache: The pool's unit fields (``{key,value}.values``,
-            ``{key,value}.initialized`` and, for FP8, ``{key,value}.scale``,
-            each with a ``[columns, num_units]`` leading layout); other
-            entries are ignored.
         units: An int64 ``[num_units]`` column on the pool's device. Rust
             writes the unit ids into ``units[:count]`` before each call.
         stream: The stream handle every reset is enqueued on.
+        names: The name of each of ``fields``: ``{key,value}.values``,
+            ``{key,value}.initialized`` and, for FP8, ``{key,value}.scale``.
+        fields: The pool's unit fields, each with a ``[columns, num_units]``
+            leading layout.
 
-    Returns:
-        ``{"zero", "recycle", "mark_initialized"}``, each taking ``count``:
-        ``zero`` clears values and flags and resets scales to one;
-        ``recycle`` clears flags and resets scales (the reset of a quantized
-        pool of one element type; Rust zeroes mixed-type pools and skips
-        dense pools of one type); ``mark_initialized`` sets both fields'
-        flags. Each is one indexed fill per field, without a host read.
+    Each method takes ``count`` and is one indexed fill per field, without
+    a host read.
     """
-    fields = _fields(cache)
-    for name in ("key.values", "value.values"):
-        if name not in fields:
-            raise ValueError(f"the unit fields lack {name!r}")
-    units = _tensor(units)
-    scope = _stream_scope(int(stream), units.device)
 
-    def fill(count: int, selected: Sequence[str], value) -> None:
-        index = units[: int(count)]
-        with scope():
+    def __init__(
+        self,
+        units: torch.Tensor,
+        stream: int,
+        names: Sequence[str],
+        *fields: torch.Tensor,
+    ) -> None:
+        named = _named(names, fields)
+        for name in ("key.values", "value.values"):
+            if name not in named:
+                raise ValueError(f"the unit fields lack {name!r}")
+        self._fields = named
+        self._units = units
+        self._scope = _stream_scope(int(stream), units.device)
+        self._values = [name for name in named if name.endswith(".values")]
+        self._flags = [name for name in named if name.endswith(".initialized")]
+        self._scales = [name for name in named if name.endswith(".scale")]
+
+    def _fill(self, count: int, selected: Sequence[str], value) -> None:
+        index = self._units[: int(count)]
+        with self._scope():
             for name in selected:
-                fields[name].index_fill_(1, index, value)
+                self._fields[name].index_fill_(1, index, value)
 
-    values = [name for name in fields if name.endswith(".values")]
-    flags = [name for name in fields if name.endswith(".initialized")]
-    scales = [name for name in fields if name.endswith(".scale")]
+    def zero(self, count: int) -> None:
+        """Clear values and flags and reset scales to one."""
+        self._fill(count, self._values + self._flags, 0)
+        self._fill(count, self._scales, 1)
 
-    def zero(count: int) -> None:
-        fill(count, values + flags, 0)
-        fill(count, scales, 1)
+    def recycle(self, count: int) -> None:
+        """Clear flags and reset scales.
 
-    def recycle(count: int) -> None:
-        fill(count, flags, 0)
-        fill(count, scales, 1)
+        The reset of a quantized pool of one element type; Rust zeroes
+        mixed-type pools and skips dense pools of one type.
+        """
+        self._fill(count, self._flags, 0)
+        self._fill(count, self._scales, 1)
 
-    def mark_initialized(count: int) -> None:
-        fill(count, flags, 1)
-
-    return binding(
-        {
-            "zero": zero,
-            "recycle": recycle,
-            "mark_initialized": mark_initialized,
-        }
-    )
+    def mark_initialized(self, count: int) -> None:
+        """Set both fields' flags."""
+        self._fill(count, self._flags, 1)
 
 
-def bind_conversion(
-    plan: CachePlan,
-    num_units: int,
-    cache: Mapping[str, torch.Tensor],
-    scratch: torch.Tensor,
-    elements: int,
-    scales: int,
-    stream: int,
-) -> dict[str, Callable[..., None]]:
-    """Bind the dtype and FP8 conversion of imported pages.
+class PageConversion:
+    """The dtype and FP8 conversion of imported pages, on one stream.
 
     Args:
         plan: The ``cache_plan`` result.
         num_units: The units the fields hold, sentinel included.
-        cache: The pool's unit fields by name; other entries are ignored.
         scratch: uint8 ``[20 * elements + 8 * scales]``: raw keys at bytes
             ``[0, 8E)``, raw values at ``[8E, 16E)``, the FP32 conversion
             scratch at ``[16E, 20E)`` and FP32 source scales at ``[20E, 20E +
@@ -453,35 +432,46 @@ def bind_conversion(
         elements: ``E`` above.
         scales: ``S`` above.
         stream: The stream conversions are enqueued on.
+        names, fields: The pool's unit fields, as :class:`UnitResets` takes
+            them.
 
-    Returns:
-        ``{"convert": convert}``. ``convert(group, source_dtype,
-        compute_dtype, count, offset, source_offset, source_page_tokens,
-        scale_heads, pages, units)`` reads ``[count, layers, heads, dim]``
-        raw keys and values of ``source_dtype`` from the scratch (with FP8,
-        also ``[pages, 2, layers, scale groups]`` scales) and writes the
-        destination page's ``units`` at token ``offset`` with
-        ``copy_converted``.
+    Raises:
+        ValueError: The scratch disagrees with its layout.
     """
-    from uniserve_models.cache.conversion import copy_converted
 
-    elements, scales = int(elements), int(scales)
-    scratch = _tensor(scratch)
-    if scratch.dtype != torch.uint8 or scratch.numel() < (
-        20 * elements + 8 * scales
-    ):
-        raise ValueError("the conversion scratch disagrees with its layout")
-    pool = UnitPool(
-        plan.planes, _fields(cache), plan.configs, num_units=int(num_units)
-    )
-    raw = scratch[: 16 * elements].view(2, 8 * elements)
-    values = scratch[16 * elements : 20 * elements].view(torch.float32)
-    scale_buffer = scratch[20 * elements : 20 * elements + 8 * scales].view(
-        torch.float32
-    )
-    scope = _stream_scope(int(stream), scratch.device)
+    def __init__(
+        self,
+        plan: CachePlan,
+        num_units: int,
+        scratch: torch.Tensor,
+        elements: int,
+        scales: int,
+        stream: int,
+        names: Sequence[str],
+        *fields: torch.Tensor,
+    ) -> None:
+        elements, scales = int(elements), int(scales)
+        if scratch.dtype != torch.uint8 or scratch.numel() < (
+            20 * elements + 8 * scales
+        ):
+            raise ValueError("the conversion scratch disagrees with its layout")
+        self._pool = UnitPool(
+            plan.planes,
+            _named(names, fields),
+            plan.configs,
+            num_units=int(num_units),
+        )
+        self._raw = scratch[: 16 * elements].view(2, 8 * elements)
+        self._values = scratch[16 * elements : 20 * elements].view(
+            torch.float32
+        )
+        self._scales = scratch[20 * elements : 20 * elements + 8 * scales].view(
+            torch.float32
+        )
+        self._scope = _stream_scope(int(stream), scratch.device)
 
     def convert(
+        self,
         group: int,
         source_dtype: str,
         compute_dtype: str,
@@ -493,6 +483,16 @@ def bind_conversion(
         pages: int,
         units: Sequence[int],
     ) -> None:
+        """Write one imported span into the destination page's units.
+
+        Reads ``[count, layers, heads, dim]`` raw keys and values of
+        ``source_dtype`` from the scratch (with FP8, also ``[pages, 2,
+        layers, scale groups]`` scales) and writes the destination page's
+        ``units`` at token ``offset`` with ``copy_converted``.
+        """
+        from uniserve_models.cache.conversion import copy_converted
+
+        pool, raw = self._pool, self._raw
         cache_group = pool.groups[int(group)]
         dtype = getattr(torch, source_dtype)
         layers, heads = len(cache_group.layers), cache_group.num_kv_heads
@@ -508,16 +508,16 @@ def bind_conversion(
             groups = -(-(first + heads) // int(scale_heads)) - first // int(
                 scale_heads
             )
-            source_scales = scale_buffer[
+            source_scales = self._scales[
                 : int(pages) * 2 * layers * groups
             ].view(int(pages), 2, layers, groups)
-        with scope():
+        with self._scope():
             copy_converted(
                 pool,
                 int(group),
                 source,
                 source_scales,
-                values,
+                self._values,
                 (raw[0], raw[1]),
                 tuple(int(unit) for unit in units),
                 int(offset),
@@ -526,8 +526,6 @@ def bind_conversion(
                 int(scale_heads),
                 getattr(torch, compute_dtype),
             )
-
-    return binding({"convert": convert})
 
 
 def pool(
@@ -550,17 +548,9 @@ def pool(
     Raises:
         ValueError: A field disagrees with the plan's layout.
     """
-    tensors = {
-        str(name): field for name, field in zip(names, fields, strict=True)
-    }
     return UnitPool(
-        plan.planes, tensors, plan.configs, num_units=int(num_units)
+        plan.planes,
+        _named(names, fields),
+        plan.configs,
+        num_units=int(num_units),
     )
-
-
-def functions() -> dict[str, Callable]:
-    """Return this module's interface-table entries."""
-    return {
-        "cache.bind_units": bind_units,
-        "cache.bind_conversion": bind_conversion,
-    }

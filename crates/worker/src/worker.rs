@@ -984,8 +984,7 @@ fn allocate_storage(
             plan.info.max_unresolved_calls as usize,
             device,
             preparation.map(CUDAStream::stream).transpose()?,
-            &interface.function("cache.bind_units")?,
-            &interface.function("cache.bind_conversion")?,
+            interface,
         )?),
         _ => None,
     };
