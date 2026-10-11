@@ -30,7 +30,7 @@ use crate::storage::LatentUpdate;
 use crate::{Error, Result};
 
 /// The denoiser serving a batch, with its device and stream.
-pub(super) fn placement(runtime: &ImageRuntime) -> Result<(Option<i32>, Option<Stream>, usize)> {
+pub(crate) fn placement(runtime: &ImageRuntime) -> Result<(Option<i32>, Option<Stream>, usize)> {
     let runner = runtime.diffusion().ok_or_else(|| {
         Error::Unsupported("image trajectories are served by an image denoiser".into())
     })?;
@@ -164,7 +164,7 @@ impl ImageBatch<'_> {
 
     /// Draw each trajectory's seeded initial latent and stage it as its
     /// first committed version.
-    pub(super) fn prepare_latents(&mut self) -> Result<ForwardStats> {
+    pub(crate) fn prepare_latents(&mut self) -> Result<ForwardStats> {
         let mut trajectories = Vec::new();
         for index in self.active() {
             let call = &self.plan.calls[index];
@@ -353,7 +353,7 @@ impl ImageBatch<'_> {
     /// Advance every active trajectory by its assigned interval. Missing
     /// guidance prefixes are evaluated by `text` first, as expert steps on a
     /// rank with `experts`.
-    pub(super) fn denoise(
+    pub(crate) fn denoise(
         &mut self,
         mut text: Option<&mut TextRuntime>,
         experts: Option<&ExpertRuntime>,
