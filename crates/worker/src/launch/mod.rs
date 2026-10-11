@@ -1,4 +1,4 @@
-//! The rank process: arguments, descriptor, signals, endpoint and exit
+//! The rank process: arguments, registration, descriptor, signals and exit
 //! status.
 //!
 //! [`main`] is the body of the worker library's exported `main`. The thread
@@ -11,41 +11,28 @@
 //! | --- | --- |
 //! | argument or descriptor error | 2, after a usage line |
 //! | debug build of the library | 1 |
+//! | the head cannot be reached or refuses the registration | 1 |
 //! | SIGINT before serving | 130 |
 //! | SIGTERM before serving | signal death |
-//! | startup or serving failure | 1, after an aborted close |
+//! | the head's connection closing before serving | 1, at once |
+//! | startup or serving failure, or the head's connection closing while serving | 1, after an aborted close |
 //! | close by the head, or after a fatal response | 0 |
 
 mod arguments;
-mod endpoint;
+mod registration;
 mod signals;
 
 pub use arguments::{Arguments, USAGE};
-pub use endpoint::Endpoint;
+pub use registration::{HeadWatch, register};
 pub use signals::Signals;
 
 use tvm_ffi::Map;
-use uniserve_ipc::LaunchDescriptor;
 
-use crate::config::{DescriptorError, WorkerLaunch, resolve};
+use crate::config::{DescriptorError, resolve};
 use crate::error::WorkerError;
 use crate::ffi::Interpreter;
 use crate::model::interface::Interface;
 use crate::worker::Worker;
-
-/// Read and resolve the launch descriptor named on the command line.
-pub fn configure<S: AsRef<str>>(argv: &[S]) -> Result<WorkerLaunch, DescriptorError> {
-    let arguments = Arguments::parse(argv)?;
-    let text = std::fs::read_to_string(&arguments.descriptor).map_err(|error| {
-        DescriptorError::new(format!(
-            "cannot read launch descriptor {}: {error}",
-            arguments.descriptor.display()
-        ))
-    })?;
-    let descriptor = LaunchDescriptor::from_json(&text)
-        .map_err(|error| DescriptorError::new(format!("invalid launch descriptor: {error}")))?;
-    resolve(descriptor)
-}
 
 /// Run the rank and return its exit status.
 pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> i64 {
@@ -59,12 +46,13 @@ pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> 
             return 1;
         }
     };
-    let launch = match configure(argv) {
-        Ok(launch) => launch,
-        Err(error) => {
-            eprintln!("{USAGE}\nuniserve-worker: error: {error}");
-            return 2;
-        }
+    let usage = |error: DescriptorError| {
+        eprintln!("{USAGE}\nuniserve-worker: error: {error}");
+        2
+    };
+    let arguments = match Arguments::parse(argv) {
+        Ok(arguments) => arguments,
+        Err(error) => return usage(error),
     };
     if cfg!(debug_assertions) {
         tracing::error!(
@@ -73,12 +61,13 @@ pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> 
         );
         return 1;
     }
-    match run(launch, table, &signals) {
+    match run(&arguments, table, &signals) {
         Ok(()) => {
             tracing::info!(target: "uniserve_worker.launch", "worker shut down");
             0
         }
-        Err(error) => {
+        Err(Failure::Descriptor(error)) => usage(error),
+        Err(Failure::Worker(error)) => {
             match error.traceback() {
                 Some(traceback) => tracing::error!(
                     target: "uniserve_worker.launch",
@@ -91,13 +80,26 @@ pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> 
     }
 }
 
+/// Why a rank ended other than by an orderly close.
+enum Failure {
+    /// The head's launch descriptor names a launch this rank cannot run.
+    Descriptor(DescriptorError),
+    Worker(WorkerError),
+}
+
+impl<E: Into<WorkerError>> From<E> for Failure {
+    fn from(error: E) -> Self {
+        Self::Worker(error.into())
+    }
+}
+
 /// Run the rank on a control thread while the calling thread serves its
 /// Python calls.
 fn run(
-    launch: WorkerLaunch,
+    arguments: &Arguments,
     table: Map<tvm_ffi::String, tvm_ffi::Function>,
     signals: &Signals,
-) -> std::result::Result<(), WorkerError> {
+) -> std::result::Result<(), Failure> {
     let interface = Interface::from_table(table)?;
     let interpreter = Interpreter::start()?;
     let (finished, outcome) = crossbeam_channel::bounded(1);
@@ -108,7 +110,7 @@ fn run(
             .spawn_scoped(scope, move || {
                 // The receiver outlives this thread: the interpreter holds
                 // it until this value arrives.
-                let _ = finished.send(serve(launch, interface, signals));
+                let _ = finished.send(serve(arguments, interface, signals));
             })
             .map_err(|error| crate::Error::Transport(format!("control thread: {error}")))?;
 
@@ -118,26 +120,35 @@ fn run(
     })
 }
 
-/// The rank's life on the control thread: bind, register, start, warm up,
-/// serve and close.
+/// The rank's life on the control thread: register with the head, start,
+/// warm up, serve and close.
 fn serve(
-    launch: WorkerLaunch,
+    arguments: &Arguments,
     interface: Interface,
     signals: &Signals,
-) -> std::result::Result<(), WorkerError> {
-    let rank = launch.execution.rank as u32;
-    let mut endpoint = Endpoint::bind(&launch.ipc, rank)?;
-    endpoint.register(&launch.ipc, &launch.worker_id, rank)?;
+) -> std::result::Result<(), Failure> {
+    let (mut channel, descriptor) = register(arguments)?;
+    let launch = resolve(descriptor).map_err(Failure::Descriptor)?;
+    channel.set_bound(launch.ipc.max_payload_bytes);
+
+    // Until the service observes the connection, the head's close ends the
+    // process from the watch's thread.
+    let hangup = channel
+        .hangup()
+        .map_err(|error| crate::Error::Transport(error.to_string()))?;
+    let mut starting = Some(HeadWatch::start(hangup)?);
 
     let mut worker = Worker::start(launch, interface)?;
-    tracing::info!(target: "uniserve_worker.launch", "worker IPC endpoint bound");
     let served = worker.warmup().and_then(|()| {
+        starting.take();
         signals.serving();
-        worker.run(&mut endpoint)
+        worker.run(&mut channel)
     });
+    // An orderly failure of the startup closes the rank below, not the watch.
+    drop(starting);
     let closed = worker.close(served.is_err());
-    // The worker's readers retire before the endpoint is released.
+    // The worker's readers retire before the connection is released.
     drop(worker);
-    drop(endpoint);
-    served.and(closed)
+    drop(channel);
+    Ok(served.and(closed)?)
 }

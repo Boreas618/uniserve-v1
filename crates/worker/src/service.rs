@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use uniserve_ipc::{
-    Batch as BatchPlan, IpcError, RankServer, RequestKind, WorkerInfo, WorkerRequest,
-    WorkerResponse, WorkerResponseError,
+    Batch as BatchPlan, Channel, IpcError, RequestKind, WorkerInfo, WorkerRequest, WorkerResponse,
+    WorkerResponseError,
 };
 
 use crate::{Backend, Batch, BatchResult, Error, Executor, Submission};
@@ -43,12 +43,12 @@ enum PendingResponse {
     },
 }
 
-/// Borrows a worker's executor and endpoint for one synchronous serving run.
+/// Borrows a worker's executor and channel for one synchronous serving run.
 /// All channel waits run on the caller's thread; completion wakes interrupt
 /// them without advancing execution on a callback thread.
 pub struct Service<'a, B: ServiceBackend> {
     executor: &'a mut Executor<B>,
-    endpoint: &'a mut RankServer,
+    channel: &'a mut Channel,
     info: WorkerInfo,
     experts: bool,
     pending: VecDeque<PendingResponse>,
@@ -60,14 +60,14 @@ pub struct Service<'a, B: ServiceBackend> {
 impl<'a, B: ServiceBackend> Service<'a, B> {
     pub fn new(
         executor: &'a mut Executor<B>,
-        endpoint: &'a mut RankServer,
+        channel: &'a mut Channel,
         info: WorkerInfo,
         experts: bool,
     ) -> Self {
-        executor.set_completion_wake(Some(endpoint.completion_wake()));
+        executor.set_completion_wake(Some(channel.wake()));
         Self {
             executor,
-            endpoint,
+            channel,
             info,
             experts,
             pending: VecDeque::new(),
@@ -94,16 +94,17 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
                 if let Some(response) = self.shutdown.take() {
                     self.respond(&response)?;
                 }
+
+                // The rank closes its connection after this, which discards
+                // what is still queued: a fatal error or this acknowledgment
+                // may wait behind a large result the head is still reading.
+                self.channel.flush().map_err(|e| self.channel_error(e))?;
                 return Ok(());
             }
 
             if !self.closing && self.pending.len() < self.info.queue_depth as usize {
-                let frame = self
-                    .endpoint
-                    .try_recv()
-                    .map_err(|e| self.channel_error(e))?;
-                if let Some(frame) = frame {
-                    let request = frame.decode_request().map_err(|e| self.channel_error(e))?;
+                let request = self.channel.try_recv().map_err(|e| self.channel_error(e))?;
+                if let Some(request) = request {
                     self.accept(request)?;
                     continue;
                 }
@@ -134,9 +135,9 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
             } else if self.experts {
                 self.wait(EXPERT_POLL)?;
             } else {
-                let frame = self.endpoint.recv().map_err(|e| self.channel_error(e))?;
-                let request = frame.decode_request().map_err(|e| self.channel_error(e))?;
-                self.accept(request)?;
+                // Nothing is owed or running, so only a request or the head's
+                // close can end this wait.
+                self.wait(Duration::from_secs(60))?;
             }
         }
     }
@@ -240,14 +241,17 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
     }
 
     fn respond(&mut self, response: &WorkerResponse) -> Result<(), B::Error> {
-        self.endpoint
-            .respond(response)
+        self.channel
+            .send(response)
             .map_err(|e| self.channel_error(e))
     }
 
+    /// Block until a request, a completion wake or the timeout. Fails once
+    /// the head's connection has closed: it is the head's liveness, and
+    /// nothing this rank computes can be delivered after it.
     fn wait(&mut self, timeout: Duration) -> Result<(), B::Error> {
-        self.endpoint
-            .wait_incoming(timeout)
+        self.channel
+            .wait(timeout)
             .map_err(|e| self.channel_error(e))
     }
 

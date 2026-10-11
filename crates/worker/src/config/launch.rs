@@ -12,11 +12,9 @@ use uniserve_ipc::{CallKind, ForwardMode, LaunchDescriptor, MediaCall, TransferM
 use super::device::{Device, generation_device};
 use super::{DescriptorError, WorkerConfig};
 
-/// Channel and product-publication settings of the rank's endpoint.
+/// Channel and product-publication settings of the rank.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcConfig {
-    pub registration_address: String,
-    pub channel_transport: String,
     pub acknowledgment_slot: u32,
     pub host_slots: Vec<u32>,
     pub products_cross_hosts: bool,
@@ -258,8 +256,6 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
     Ok(WorkerLaunch {
         worker_id: descriptor.worker_id.clone(),
         ipc: IpcConfig {
-            registration_address: descriptor.registration_address.clone(),
-            channel_transport: descriptor.channel_transport.clone(),
             acknowledgment_slot: descriptor.acknowledgment_slot,
             host_slots: descriptor.host_slots.clone(),
             products_cross_hosts: descriptor.products_cross_hosts,
