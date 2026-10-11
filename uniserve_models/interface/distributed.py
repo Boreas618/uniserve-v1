@@ -30,7 +30,6 @@ def functions() -> dict[str, Callable[..., Any]]:
         "distributed.create_groups": create_groups,
         "distributed.mesh": mesh,
         "distributed.destroy": destroy,
-        "distributed.bind_collectives": bind_collectives,
     }
 
 
@@ -451,24 +450,6 @@ class NativeCollectives:
 
     def close(self) -> None:
         """The worker destroys the communicator."""
-
-
-def bind_collectives(
-    prepared, collectives: Sequence[NativeCollectives]
-) -> None:
-    """Route a binding's collectives to the worker's stream communicators.
-
-    ``collectives`` holds one stream's collectives of each communicator.
-    Every multi-member communicator the binding uses must have one: within
-    an activation, a collective never falls back to another stream.
-
-    Raises:
-        ValueError: A used communicator has no stream collectives.
-    """
-    context = prepared.context
-    if context is None:
-        raise ValueError("collectives bind to a bound component")
-    context.collectives = stream_collectives(context.groups, collectives)
 
 
 def stream_collectives(

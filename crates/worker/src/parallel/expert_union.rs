@@ -11,8 +11,9 @@
 //!   collectively by `uniserve_models.distributed.experts.create_exchange`),
 //!   each with its own stream, and the microbatch threads that rotate eager
 //!   forwards (`microbatches.rs`);
-//! - joins: per microbatch its prepared component, whose expert layers a
-//!   join runs with no tokens, and their captured graphs (`joins.rs`).
+//! - joins: per microbatch the owner of an execution context, whose
+//!   expert layers a join runs with no tokens, and their captured graphs
+//!   (`joins.rs`).
 //!
 //! A runner runs its forwards as expert steps through
 //! [`ExpertUnion::capacity`] and [`ExpertUnion::run`]; between its own
@@ -30,10 +31,9 @@
 //!    peer-mapped storage, then `create_exchange`, collectively;
 //! 4. microbatch threads, each warmed with its thread-local handles.
 //!
-//! Bindings follow: a runner prepares its component per microbatch with the
-//! exchanges and hands the prepared components over for joins
-//! ([`ExpertUnion::bind_joins`]); an expert-only rank prepares its expert
-//! layers itself ([`ExpertUnion::bind_experts`]).
+//! Runners follow: one is constructed per microbatch with its exchange and
+//! handed over for joins ([`ExpertUnion::bind_joins`]); an expert-only rank
+//! constructs its expert layers itself ([`ExpertUnion::bind_experts`]).
 //!
 //! Warmup reaches the same collectives in the same order on every member:
 //! [`WarmupHooks::prepare`] compares plans before any collective step;
@@ -78,8 +78,8 @@ pub(super) struct ExpertFunctions {
     symmetric_bytes: Function,
     create: Function,
     bind_microbatches: Function,
-    /// `join(prepared, capacity)`: one expert step this rank joins with no
-    /// tokens, on the prepared component's stream.
+    /// `join(owner, capacity)`: one expert step this rank joins with no
+    /// tokens, on the stream of the owner's execution context.
     pub(super) join: Function,
     warm_thread: Function,
     close: Function,
@@ -112,8 +112,8 @@ pub(super) struct Microbatch {
     /// streams after this member.
     pub(super) stream: Stream,
     /// The owner of the execution context whose expert layers this
-    /// microbatch's joins run: a runner, a prepared component or an
-    /// expert-only rank's `ExpertLayers`.
+    /// microbatch's joins run: a runner or an expert-only rank's
+    /// `ExpertLayers`.
     pub(super) prepared: Option<Handle>,
     /// This microbatch's captured joins, so an empty microbatch of a
     /// populated step launches them on its own stream.
@@ -534,13 +534,13 @@ impl ExpertUnion {
         Ok(Some(runtime))
     }
 
-    /// Take the prepared component of every microbatch (`prepared`, in
+    /// Take the context owner of every microbatch (`prepared`, in
     /// microbatch order) for its joins, then bind the exchanges' shared
     /// microbatch plan.
     pub(crate) fn bind_joins(&mut self, prepared: &[&Handle]) -> Result<()> {
         if prepared.len() != self.microbatches.len() {
             return Err(Error::Invariant(
-                "every microbatch joins through one prepared component".into(),
+                "every microbatch joins through one execution context".into(),
             ));
         }
         for (microbatch, &prepared) in self.microbatches.iter_mut().zip(prepared) {

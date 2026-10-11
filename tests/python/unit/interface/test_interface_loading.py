@@ -1,7 +1,6 @@
 """Describing, loading and planning the stub model through the interface."""
 
 import pytest
-import torch
 
 from tests.python.fixtures.stub import load_model, read_config
 from uniserve_models import interface
@@ -76,40 +75,6 @@ def test_cache_plan_describes_pages_of_the_requested_size(loaded):
     # One column holds key and value planes of 32 one-element BF16 rows,
     # plus one initialization flag per plane.
     assert plan.unit_bytes() == 2 * (32 * 2 + 1)
-
-
-def test_component_binding_serves_its_declared_workspace(loaded):
-    table, model = loaded
-    prepared, requirements = table["component.prepare"](
-        model,
-        {
-            "component": "model",
-            "path": "",
-            "device": -1,
-            "stream": 0,
-            "size": {"tokens": 16, "rows": 2},
-            "attention": "auto",
-            "vsa": "auto",
-            "matmul": "auto",
-            "moe": "auto",
-            "derive_host_lengths": True,
-            "experts": None,
-            "weights": None,
-            "cache": None,
-        },
-    )
-    tensors = {
-        item["name"]: torch.zeros(
-            item["shape"], dtype=getattr(torch, item["dtype"])
-        )
-        for item in requirements["workspaces"]
-    }
-    functions = table["component.bind"](prepared, {"workspaces": tensors})
-    paths = {record["path"] for record in functions["kernels"]()}
-    assert "backbone.layers.0.attention" in paths
-    assert prepared.context is not None
-    functions["close"](False)
-    assert prepared.context is None
 
 
 def test_a_single_rank_world_binds_local_communicators():

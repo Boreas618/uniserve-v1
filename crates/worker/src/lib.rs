@@ -81,7 +81,7 @@ pub use storage::{
     GroupShape, GroupTable, HostBuffers, KVCache, KVCacheManager, KVPlan, KVPlanes, LatentExport,
     LatentImport, LatentPool, LatentStorage, LatentUpdate, LogprobLayout, OutputBuffer, OutputPool,
     OutputStorage, ProductBuffer, ProductRead, RequestSlots, TablePages, TensorStore, UnitColumn,
-    Workspaces, table_pages,
+    table_pages,
 };
 pub use stream::{CUDAStream, Deferred, EventPool};
 pub use transfer::{
