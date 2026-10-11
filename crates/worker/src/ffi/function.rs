@@ -1,6 +1,6 @@
 //! Python callables and calls made through the interpreter.
 
-use tvm_ffi::{Any, AnyView, Map};
+use tvm_ffi::{Any, AnyView};
 
 use super::interpreter;
 use crate::{Error, Result};
@@ -99,55 +99,5 @@ impl DeferredCall {
     /// Make the call and drop the result.
     pub fn invoke(self) -> Result<()> {
         self.function.call_values(&self.args).map(drop)
-    }
-}
-
-/// A map of functions returned by a Python loading or binding function.
-pub struct Functions {
-    owner: String,
-    functions: Map<tvm_ffi::String, tvm_ffi::Function>,
-}
-
-impl Functions {
-    /// `owner` names the producing function for error messages, for example
-    /// `canvas.bind`.
-    pub fn new(owner: impl Into<String>, value: Any) -> Result<Self> {
-        let owner = owner.into();
-        let functions = Map::try_from(value).map_err(|error| Error::numerical(&owner, &error))?;
-        Ok(Self { owner, functions })
-    }
-
-    /// Wrap a map received as a typed argument.
-    pub fn from_map(
-        owner: impl Into<String>,
-        functions: Map<tvm_ffi::String, tvm_ffi::Function>,
-    ) -> Self {
-        Self {
-            owner: owner.into(),
-            functions,
-        }
-    }
-
-    pub fn owner(&self) -> &str {
-        &self.owner
-    }
-
-    /// A required function. Startup fails naming the missing key.
-    pub fn get(&self, key: &str) -> Result<Function> {
-        self.optional(key)?.ok_or_else(|| {
-            Error::Interface(format!("{} did not provide function `{key}`", self.owner))
-        })
-    }
-
-    pub fn optional(&self, key: &str) -> Result<Option<Function>> {
-        let name = format!("{}.{key}", self.owner);
-        self.functions
-            .get(&tvm_ffi::String::from(key))
-            .map(|function| function.map(|function| Function::new(name.as_str(), function)))
-            .map_err(|error| Error::numerical(&self.owner, &error))
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = String> + '_ {
-        self.functions.keys().map(|key| key.as_str().to_owned())
     }
 }

@@ -11,8 +11,6 @@ pytestmark = pytest.mark.unit
 
 # Entries the worker resolves at startup; a missing one fails the rank.
 STARTUP_ENTRIES = {
-    "cache.bind_units",
-    "cache.bind_conversion",
     "graphs.pool",
     "distributed.initialize",
     "distributed.create_groups",

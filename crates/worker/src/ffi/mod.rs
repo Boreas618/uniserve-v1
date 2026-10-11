@@ -20,7 +20,7 @@ mod record;
 mod values;
 
 pub use dlpack::{Backing, DType, Device, contiguous_strides, export};
-pub use function::{DeferredCall, Function, Functions};
+pub use function::{DeferredCall, Function};
 pub use handle::Handle;
 pub use interpreter::{Interpreter, cooperative};
 pub use record::{Fields, Record, json, to_json};
