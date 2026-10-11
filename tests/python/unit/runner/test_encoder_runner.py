@@ -1,4 +1,4 @@
-"""Encoder bindings write the stub model's encodings into product regions."""
+"""An image model's encoders write their encodings into product regions."""
 
 import base64
 import io
@@ -6,7 +6,6 @@ import io
 import numpy as np
 import pytest
 import torch
-import tvm_ffi
 from PIL import Image
 
 from tests.python.fixtures.stub import load_stub
@@ -16,6 +15,7 @@ from uniserve_models.media.pixels import (
     prepare_tensor_image,
 )
 from uniserve_models.model import VisionInput
+from uniserve_models.runner.encoder import EncoderRunner
 
 pytestmark = pytest.mark.unit
 
@@ -53,11 +53,9 @@ def bound(table, model, component, root, path):
     table["component.bind"](prepared, {"workspaces": {}})
     arena = torch.zeros(ARENA_BYTES, dtype=torch.uint8)
     module = ".".join(part for part in (root, path) if part)
-    info = table["encoder.describe"](model, module, "bfloat16")
-    steps = table["encoder.bind"](
-        prepared, model, path, tvm_ffi.convert({"products": arena})
-    )
-    return info, steps, arena
+    info = EncoderRunner.describe(model, module, "bfloat16")
+    runner = EncoderRunner.bound(prepared, path, model, arena)
+    return info, runner, arena
 
 
 def payload(height, width, seed=0):
@@ -75,7 +73,7 @@ def region(offset, dtype, elements):
 
 def test_vision_features_fill_their_product_regions(loaded):
     table, model = loaded
-    info, steps, arena = bound(
+    info, runner, arena = bound(
         table, model, "vision_encoder", "vision_encoder", ""
     )
     assert info["kind"] == "vision"
@@ -83,12 +81,12 @@ def test_vision_features_fill_their_product_regions(loaded):
     assert (info["max_patches"], info["pixel_dtype"]) == (0, "bfloat16")
 
     images = [
-        table["image.prepare_input"](model, "vit", payload(32, 48, seed), 2, 0)
+        EncoderRunner.prepare_image(model, "vit", payload(32, 48, seed), 2, 0)
         for seed in (1, 2)
     ]
     assert [list(image["grid"]) for image in images] == [[2, 3], [2, 3]]
     out = [region(0, "bfloat16", 4096), region(8192, "bfloat16", 4096)]
-    shapes = steps["encode"]([image["image"] for image in images], out)
+    shapes = runner.encode([image["image"] for image in images], out)
 
     processor = model.image_processor
     for index, (image, shape) in enumerate(zip(images, shapes, strict=True)):
@@ -111,17 +109,17 @@ def test_vision_features_fill_their_product_regions(loaded):
 
 def test_resident_images_encode_like_their_decoded_pixels(loaded):
     table, model = loaded
-    _, steps, arena = bound(table, model, "model", "", "latent_encoder")
+    _, runner, arena = bound(table, model, "model", "", "latent_encoder")
 
     # A generated [3, 32, 32] BF16 image product in [-1, 1].
     pixels = torch.linspace(-1, 1, 3 * 32 * 32).reshape(3, 32, 32)
     image = interface.regions.view(arena, [0, "bfloat16", [3, 32, 32]])
     image.copy_(pixels)
-    prepared = steps["prepare_resident"]([0, "bfloat16", [3, 32, 32]], "vae", 1)
+    prepared = runner.prepare_resident([0, "bfloat16", [3, 32, 32]], "vae", 1)
     assert (prepared["height"], prepared["width"]) == (32, 32)
     assert prepared["grid"] is None
 
-    (shape,) = steps["encode"](
+    (shape,) = runner.encode(
         [prepared["image"]], [region(8192, "bfloat16", 4096)]
     )
     decoded = prepare_tensor_image(
@@ -139,15 +137,15 @@ def test_resident_images_encode_like_their_decoded_pixels(loaded):
 
 def test_products_beyond_their_region_are_refused(loaded):
     table, model = loaded
-    _, steps, _ = bound(table, model, "vision_encoder", "vision_encoder", "")
-    image = table["image.prepare_input"](model, "vit", payload(32, 48), 1, 0)
+    _, runner, _ = bound(table, model, "vision_encoder", "vision_encoder", "")
+    image = EncoderRunner.prepare_image(model, "vit", payload(32, 48), 1, 0)
     with pytest.raises(Exception, match="exceeds its product bound"):
-        steps["encode"]([image["image"]], [region(0, "bfloat16", 8)])
+        runner.encode([image["image"]], [region(0, "bfloat16", 8)])
 
 
 def test_inline_images_are_validated_on_the_host(loaded):
-    table, model = loaded
+    _, model = loaded
     with pytest.raises(Exception, match="not a valid encoded image"):
-        table["image.prepare_input"](model, "vit", "bm90IGFuIGltYWdl", 1, 0)
+        EncoderRunner.prepare_image(model, "vit", "bm90IGFuIGltYWdl", 1, 0)
     with pytest.raises(Exception, match="no input images"):
-        table["image.prepare_input"](model, "vit", payload(16, 16), 0, 0)
+        EncoderRunner.prepare_image(model, "vit", payload(16, 16), 0, 0)

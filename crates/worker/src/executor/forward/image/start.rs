@@ -428,14 +428,9 @@ impl ImageRuntime {
                         .iter()
                         .map(|table| i64::from(table.windowed))
                         .collect();
-                    let table_layout = crate::ffi::Fields::new()
-                        .with("page_tokens", crate::ffi::integer_list(page_tokens))
-                        .with("windowed", crate::ffi::integer_list(windowed))
-                        .map();
                     let runner = ImageDiffusion::bind(
                         interface,
                         binding,
-                        loaded,
                         "",
                         layout,
                         capacity,
@@ -444,7 +439,8 @@ impl ImageRuntime {
                             slot_timesteps: latents.storage.timesteps().clone(),
                             products,
                             slot_tables,
-                            layout: table_layout,
+                            page_tokens,
+                            windowed,
                         },
                         target.stream.clone(),
                     )?;
@@ -465,7 +461,6 @@ impl ImageRuntime {
                     let runner = DecoderRunner::bind(
                         interface,
                         binding,
-                        loaded,
                         "",
                         range,
                         latents,

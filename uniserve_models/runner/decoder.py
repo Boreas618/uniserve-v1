@@ -1,8 +1,9 @@
 """The forwards of the media decoders: :class:`DecoderRunner`.
 
-One runner serves one decoder module on one stream at one size: a video
-decoder at one segment (the native frames and raster a media unit decodes
-to), an audio decoder at one track length. The tensors of a forward are
+One runner serves one decoder module on one stream: a video decoder at one
+segment (the native frames and raster a media unit decodes to), an audio
+decoder at one track length, an image decoder of a bound component at
+every image size (:meth:`DecoderRunner.bound`). The tensors of a forward are
 parameters of :meth:`DecoderRunner.decode`; the parameters depend on the
 decoder's capability class and are documented there. A video decoder's
 forward has shapes fixed by its scalar arguments and takes every changing
@@ -21,12 +22,15 @@ from typing import Any, Protocol, cast
 import torch
 
 from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
+from uniserve_models.interface import calls, regions
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
 from uniserve_models.interface.workspace import execution_context
 from uniserve_models.media import image, video
+from uniserve_models.media.pixels import quantize_image_hwc
 from uniserve_models.model import (
     AudioDecoder,
+    ImageDecoder,
     VideoDecoder,
     VideoPostprocessor,
 )
@@ -96,6 +100,12 @@ class DecoderRunner:
             ``[latent_frames]`` of an audio decoder's track.
     """
 
+    # An image decoder and its caller's tensors (see :meth:`bound`).
+    _image: ImageDecoder
+    _latents: torch.Tensor
+    _staging: torch.Tensor
+    _products: torch.Tensor
+
     def __init__(
         self,
         loaded,
@@ -108,7 +118,7 @@ class DecoderRunner:
         module = loaded.module.get_submodule(str(path))
         self._device = next(module.parameters()).device
         extents = [int(extent) for extent in size]
-        self._decode: Callable[..., None]
+        self._decode: Callable[..., Any]
         if isinstance(module, VideoDecoder):
             frames, width, height = extents
             self._decoder = module
@@ -173,6 +183,55 @@ class DecoderRunner:
             raise SetupError(
                 f"{type(module).__qualname__} is not a video or audio decoder"
             )
+
+    @classmethod
+    def bound(
+        cls,
+        prepared,
+        path: str,
+        latents: torch.Tensor,
+        staging: torch.Tensor,
+        products: torch.Tensor,
+    ) -> DecoderRunner:
+        """A runner of the image decoder at ``path`` of a bound component.
+
+        Args:
+            prepared: The bound component, whose execution context runs
+                every forward on the caller's stream. A decoder placed on
+                a generation tower computes there and returns its results
+                to the caller's tensors.
+            path: The decoder's path within the component (``""`` for its
+                root).
+            latents: The latent pool's step workspace ``[units, width]``,
+                into which the caller gathers each completed trajectory's
+                pages before decoding.
+            staging: uint8 bytes receiving each image's quantized HWC
+                pixels, which the caller copies to the host and encodes.
+            products: The device's uint8 product arena, in which image
+                products are regions.
+        """
+        # FIXME: the component binding prepares the decoder's operators
+        # and declares its workspace before the caller allocates it; image
+        # products are still named by regions of the arena.
+        context = prepared.context
+        if context is None:
+            raise ValueError("a runner requires a bound component")
+        path = str(path)
+        root = prepared.module
+        decoder = root.get_submodule(path) if path else root
+        if not isinstance(decoder, ImageDecoder):
+            raise SetupError(
+                f"{type(decoder).__qualname__} is not an image decoder"
+            )
+        runner = cls.__new__(cls)
+        runner._image = decoder
+        runner._context = context
+        runner._device = context.device
+        runner._latents = latents
+        runner._staging = staging
+        runner._products = products
+        runner._decode = runner._decode_image
+        return runner
 
     # Sizing, answered from configuration.
 
@@ -265,7 +324,7 @@ class DecoderRunner:
 
     # Forward.
 
-    def decode(self, *arguments: Any) -> None:
+    def decode(self, *arguments: Any) -> Any:
         """Decode into the caller's output tensor.
 
         A video decoder takes ``(latent, rows, overlap, out, first, last,
@@ -287,8 +346,77 @@ class DecoderRunner:
         ``total`` of a track of ``samples`` samples. ``latent`` is the
         request's complete audio latent timeline; the units' samples, which
         abut, land in ``out`` (``[span, 2]`` int16) in order.
+
+        An image decoder takes ``(rows, images)``: ``rows`` holds one
+        ``[offset, units, height, width, staging]`` row per image,
+        flattened: its latent rows ``latents[offset:offset + units]``, its
+        size and the staging offset of its pixels. It decodes every image
+        (one numerical call per size), writes image ``i`` to the product
+        region ``images[i]`` when given (the decoded values in the
+        product's dtype), quantizes it into the staging bytes and returns
+        each image's byte count, ``height * width * 3``.
         """
-        self._decode(*arguments)
+        return self._decode(*arguments)
+
+    def quantize(self, region, low: float, high: float, offset: int) -> int:
+        """Quantize a resident image product into the staging bytes.
+
+        ``region`` holds values in ``[low, high]``; its HWC pixels land at
+        ``offset`` of the staging bytes. Returns their byte count.
+        """
+        with calls.scope(self._context):
+            return self._stage(
+                regions.view(self._products, region),
+                float(low),
+                float(high),
+                int(offset),
+            )
+
+    def _stage(
+        self, value: torch.Tensor, low: float, high: float, offset: int
+    ) -> int:
+        """Quantize one image into the staging bytes at ``offset``."""
+        staging = self._staging
+        pixels = quantize_image_hwc(value, value_range=(low, high))
+        count = pixels.numel()
+        if offset < 0 or offset + count > staging.numel():
+            raise ValueError("image pixels exceed the decoder staging")
+        staging[offset : offset + count].copy_(
+            calls.local(pixels.reshape(-1), staging.device)
+        )
+        return count
+
+    def _decode_image(self, rows: Sequence[int], images: Sequence) -> list[int]:
+        decoder, context = self._image, self._context
+        flat = [int(value) for value in rows]
+        described = [
+            tuple(flat[start : start + 5]) for start in range(0, len(flat), 5)
+        ]
+        if len(described) != len(images):
+            raise ValueError("decoder rows and image products must align")
+        low, high = (float(value) for value in decoder.decoder.value_range)
+        with calls.scope(context):
+            # A decoder placed on a generation tower reads its latents there.
+            values = decoder.decode(
+                tuple(
+                    self._latents[offset : offset + units].to(
+                        context.device, non_blocking=True
+                    )
+                    for offset, units, *_ in described
+                ),
+                sizes=tuple(
+                    image.Config(height, width)
+                    for _, _, height, width, _ in described
+                ),
+            )
+            counts = []
+            for value, row, region in zip(
+                values, described, images, strict=True
+            ):
+                if region is not None:
+                    calls.write(regions.view(self._products, region), value)
+                counts.append(self._stage(value, low, high, row[4]))
+            return counts
 
     def _decode_video(
         self,

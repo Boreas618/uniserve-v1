@@ -40,7 +40,7 @@ use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::executor::forward::video::{Parts, decode_range, publish_bound, stream_of};
-use crate::ffi::{DType, Fields, Function, Functions, Handle, Record, Region, integer_list, list};
+use crate::ffi::{DType, Function, Handle, Record, Region, integer_list, list};
 use crate::model::bind::ComponentBinding;
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
@@ -75,13 +75,13 @@ pub struct DecoderRunner {
     owner: String,
     device: Device,
     stream: Option<Stream>,
+    /// The Python half and its methods, each called with it first.
+    runner: Handle,
     decode: Function,
     quantize: Function,
     /// The decoder's pixel range, `(low, high)`.
     range: (f32, f32),
     staging: StorageView,
-    /// Buffers bound to the binding, retained for its lifetime.
-    _buffers: Vec<StorageView>,
 }
 
 impl DecoderRunner {
@@ -95,7 +95,6 @@ impl DecoderRunner {
     pub fn bind(
         interface: &Interface,
         binding: &ComponentBinding,
-        loaded: &Handle,
         path: &str,
         range: (f32, f32),
         latents: StorageView,
@@ -119,34 +118,23 @@ impl DecoderRunner {
             Device::Cpu => Memory::host(staging_bytes.max(1)),
         };
         let staging = StorageView::contiguous(memory, 0, DType::U8, &[staging_bytes as i64])?;
-        let buffers = vec![
-            ("latents", latents),
-            ("staging", staging.clone()),
-            ("products", products),
-        ];
-        let mut tensors = Fields::new();
-        for (name, view) in &buffers {
-            tensors = tensors.with(name, view.to_tensor()?);
-        }
-        let function = interface.function("decoder.bind")?;
-        let functions = Functions::new(
-            function.name(),
-            function.call_values(&[
-                binding.prepared().to_any(),
-                loaded.to_any(),
-                Any::from(tvm_ffi::String::from(path)),
-                tensors.into_any(),
-            ])?,
-        )?;
+        let method = |name: &str| interface.import(&format!("{DECODER}.{name}"));
+        let runner = Handle::new(method("bound")?.call_values(&[
+            binding.prepared().to_any(),
+            Any::from(tvm_ffi::String::from(path)),
+            Any::from(latents.to_tensor()?),
+            Any::from(staging.to_tensor()?),
+            Any::from(products.to_tensor()?),
+        ])?)?;
         Ok(Self {
             owner,
             device,
             stream,
-            decode: functions.get("decode")?,
-            quantize: functions.get("quantize")?,
+            runner,
+            decode: method("decode")?,
+            quantize: method("quantize")?,
             range,
             staging,
-            _buffers: buffers.into_iter().map(|(_, view)| view).collect(),
         })
     }
 
@@ -191,17 +179,17 @@ impl DecoderRunner {
             }
             let mut offsets = Vec::with_capacity(end - first);
             let mut offset = 0;
-            let rows = list(images[first..end].iter().map(|image| {
+            let rows = integer_list(images[first..end].iter().flat_map(|image| {
                 offsets.push(offset);
-                let row = integer_list([
+                let row = [
                     i64::from(image.sample),
                     i64::from(image.units),
                     i64::from(image.height),
                     i64::from(image.width),
                     offset as i64,
-                ]);
+                ];
                 offset += image.pixel_bytes();
-                Any::from(row)
+                row
             }));
             let products = list(images[first..end].iter().map(|image| {
                 image
@@ -209,10 +197,11 @@ impl DecoderRunner {
                     .as_ref()
                     .map_or_else(Any::default, Region::to_any)
             }));
-            let counts = crate::ffi::integers(
-                self.decode
-                    .call_values(&[Any::from(rows), Any::from(products)])?,
-            )
+            let counts = crate::ffi::integers(self.decode.call_values(&[
+                self.runner.to_any(),
+                Any::from(rows),
+                Any::from(products),
+            ])?)
             .map_err(|error| Error::numerical(self.decode.name(), &error))?;
             if counts.len() != end - first {
                 return Err(Error::Interface(format!(
@@ -248,6 +237,7 @@ impl DecoderRunner {
         stage: impl FnOnce(StorageView) -> Result<()>,
     ) -> Result<()> {
         let count: i64 = self.quantize.call_as(&[
+            self.runner.view(),
             (&image.to_any()).into(),
             (&Any::from(f64::from(range.0))).into(),
             (&Any::from(f64::from(range.1))).into(),
