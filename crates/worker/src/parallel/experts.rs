@@ -261,7 +261,8 @@ pub struct Agreement {
     pub released: bool,
 }
 
-/// One expert layer as `experts.layers` describes it.
+/// One expert layer as `uniserve_models.distributed.experts.layers` describes
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExpertLayer {
     pub num_experts: usize,

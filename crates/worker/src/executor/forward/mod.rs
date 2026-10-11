@@ -14,7 +14,6 @@
 //! the rank serving.
 
 pub(crate) mod batch;
-pub(crate) mod experts;
 pub(crate) mod image;
 pub(crate) mod inputs;
 pub(crate) mod launch;

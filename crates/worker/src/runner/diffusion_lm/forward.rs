@@ -38,13 +38,13 @@ use super::{DiffusionLMRunner, Executed, KIND};
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
-use crate::executor::forward::experts::ExpertRuntime;
 use crate::executor::forward::launch::{
     Launched, StreamOrder, error_code, failed_output, lock, read_flag, reports_output, seal,
 };
 use crate::executor::lifecycle::RequestStorage;
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
+use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
 use crate::storage::{KVCache, OutputLease, OutputPlacement, ProductBuffer, TensorStore};
 use crate::stream::EventPool;
@@ -63,8 +63,8 @@ struct Context<'a> {
     /// The text runtime's batch order: these forwards read the prefix
     /// cache its prefills write, possibly on another stream.
     pub(crate) text: Option<&'a StreamOrder>,
-    /// The rank's expert runtime, when forwards are expert steps.
-    pub(crate) experts: Option<&'a ExpertRuntime>,
+    /// The rank's expert union member, when forwards are expert steps.
+    pub(crate) experts: Option<&'a ExpertUnion>,
 }
 
 /// The expert call kind of diffusion LM runner `index`: distinct from the
@@ -76,7 +76,7 @@ fn expert_kind(index: usize) -> i64 {
 /// The coordinator of runner `index`'s expert steps: agreement while
 /// serving, announced or `forced` capacities during warmup.
 pub(super) fn coordinator<'a>(
-    experts: Option<&'a ExpertRuntime>,
+    experts: Option<&'a ExpertUnion>,
     index: usize,
     forced: Option<usize>,
 ) -> impl FnMut(usize) -> Result<Option<usize>> + 'a {
@@ -315,7 +315,7 @@ impl RequestStorage for DiffusionLMRunner {
 /// One batch on the runner.
 struct Batch<'a> {
     runner: &'a mut DiffusionLMRunner,
-    experts: Option<&'a ExpertRuntime>,
+    experts: Option<&'a ExpertUnion>,
     requests: &'a mut RequestPool,
     kv: &'a mut KVCache,
     tensors: &'a TensorStore,

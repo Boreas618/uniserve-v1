@@ -1,33 +1,33 @@
-"""Distributed routed experts: the ``experts.*`` interface entries.
+"""Distributed routed experts: expert exchanges and distributed weights.
 
-The worker owns the expert step protocol: agreement on each step's per-rank
-token capacity over its host group, microbatch threads and their rotation,
-join graphs and close ordering. These functions construct and bind the
-numerical side:
+The rank runtime owns the expert step protocol: agreement on each step's
+per-rank token capacity over its host group, microbatch threads and their
+rotation, join graphs and close ordering. It reaches these functions by
+import path to construct the numerical side:
 
-* ``experts.layers(model, disaggregated)`` describes the expert layers that
+* ``layers(model, disaggregated)`` describes the expert layers that
   exchange tokens, in collective (traversal) order.
-* ``experts.create_exchange(...)`` constructs one microbatch's token
-  transport (``uniserve_models.backends.experts``), collectively over the
-  expert union, bootstrapped with the worker's host functions.
-* ``experts.bind_microbatches(exchanges)`` binds the microbatches' shared
-  plan, when the transport has one.
-* ``experts.symmetric_bytes(...)`` sizes the peer-mapped storage of split
-  MegaMoE, which the worker allocates and maps.
-* ``experts.bind(prepared)`` returns ``{"join": join(capacity)}`` for a
-  bound component: one expert step of ``capacity`` in which this rank joins
-  every expert layer with no tokens of its own.
-* ``experts.warm_thread(device)`` prepares a microbatch thread's
-  thread-local numerical state (cuBLAS handle) before graph capture.
-* ``experts.close_exchange(exchange)`` releases a transport; collective for
-  transports with device communicators.
+* ``create_exchange(...)`` constructs one microbatch's expert exchange
+  (``uniserve_models.backends.experts``), collectively over the expert
+  union, bootstrapped with the caller's host functions.
+* ``bind_microbatches(exchanges)`` binds the microbatches' shared plan,
+  when the exchange has one.
+* ``symmetric_bytes(...)`` sizes the peer-mapped storage of split MegaMoE,
+  which the caller allocates and maps.
+* ``join(prepared, capacity)`` runs one expert step of ``capacity`` in which
+  this rank joins every expert layer of a prepared component with no tokens
+  of its own.
+* ``warm_thread(device)`` prepares a microbatch thread's thread-local
+  numerical state (cuBLAS handle) before graph capture.
+* ``close_exchange(exchange)`` releases an exchange; collective for
+  exchanges with device communicators.
 
 Distributed weight data parallelism (DWDP) exchanges weights instead of
-tokens: ``experts.weight_fields(model)`` places each expert layer's weights
-for its kernels and returns this rank's shards, the worker publishes them
-and maps every field's full extent, ``experts.bind_weights`` installs the
-full views as the layer's parameters, and ``experts.bind_prefetch`` returns
-the object a binding's expert calls prefetch peers' weights through.
+tokens: ``weight_fields(model)`` places each expert layer's weights for its
+kernels and returns this rank's shards, the caller publishes them and maps
+every field's full extent, ``bind_weights`` installs the full views as the
+layer's parameters, and ``bind_prefetch`` returns the object a prepared
+component's expert calls prefetch peers' weights through.
 """
 
 from __future__ import annotations
@@ -44,23 +44,6 @@ from uniserve_models.backends import experts as transports
 from uniserve_models.distributed import Communicator
 from uniserve_models.nn.moe import FusedMoE
 from uniserve_models.quantization import QuantizedTensor
-
-from .errors import binding
-
-
-def functions() -> dict[str, Callable[..., Any]]:
-    return {
-        "experts.layers": layers,
-        "experts.symmetric_bytes": symmetric_bytes,
-        "experts.create_exchange": create_exchange,
-        "experts.bind_microbatches": bind_microbatches,
-        "experts.bind": bind,
-        "experts.warm_thread": warm_thread,
-        "experts.close_exchange": close_exchange,
-        "experts.weight_fields": weight_fields,
-        "experts.bind_weights": bind_weights,
-        "experts.bind_prefetch": bind_prefetch,
-    }
 
 
 def _module(model) -> nn.Module:
@@ -232,27 +215,22 @@ def bind_microbatches(exchanges) -> None:
     exchanges[0].bind_microbatches(exchanges)
 
 
-def bind(prepared) -> dict[str, Callable[..., Any]]:
-    """Join functions of a bound component with expert-parallel layers.
+def join(prepared, capacity: int) -> None:
+    """Join one expert step of ``capacity`` tokens per rank with no tokens.
 
-    ``join(capacity)`` runs one expert step of ``capacity`` tokens per
-    rank on the binding's stream in which this rank sends no tokens: every
-    expert layer exchanges, runs the tokens other ranks route to this
-    rank's experts and returns their results.
+    On the stream of the prepared component ``prepared``, every expert
+    layer exchanges, runs the tokens other ranks route to this rank's
+    experts and returns their results; this rank sends none.
     """
     context = prepared.context
     if context is None:
         raise ValueError("expert joins require a bound component")
-
-    def join(capacity: int) -> None:
-        with (
-            torch.inference_mode(),
-            context.activate(),
-            context.expert_step(int(capacity)),
-        ):
-            pass
-
-    return binding({"join": join})
+    with (
+        torch.inference_mode(),
+        context.activate(),
+        context.expert_step(int(capacity)),
+    ):
+        pass
 
 
 def warm_thread(device: int) -> None:

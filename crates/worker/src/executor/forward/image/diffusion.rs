@@ -21,8 +21,8 @@ use super::ImageRuntime;
 use super::batch::ImageBatch;
 use super::latents::Scratch;
 use crate::cuda_graph::GraphMode;
-use crate::executor::forward::experts::ExpertRuntime;
 use crate::executor::forward::transfer::latents;
+use crate::parallel::ExpertUnion;
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::diffusion::image::{DenoiseRow, IntegrateRow};
@@ -356,7 +356,7 @@ impl ImageBatch<'_> {
     pub(super) fn denoise(
         &mut self,
         mut text: Option<&mut CausalLMRunners>,
-        experts: Option<&ExpertRuntime>,
+        experts: Option<&ExpertUnion>,
     ) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();
