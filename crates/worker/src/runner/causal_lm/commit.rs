@@ -10,10 +10,10 @@
 
 use uniserve_cuda::{CopyBatch, SourceOrder};
 
-use super::super::launch::lock;
-use super::batch::{CallState, TokenBatch};
+use super::batch::{Batch, CallState};
 use super::calls;
 use super::step::{Invoked, Stepped};
+use crate::executor::forward::launch::lock;
 use crate::storage::{LogprobLayout, ProductBuffer, Scalar};
 use crate::{Error, Result};
 
@@ -39,7 +39,7 @@ fn fatal(error: Error) -> Failure {
     }
 }
 
-impl TokenBatch<'_> {
+impl Batch<'_> {
     /// Advance progress, capture outputs, relay products and commit.
     pub(super) fn finish(&mut self, stepped: &Stepped) -> std::result::Result<(), Failure> {
         let commits = self.advance(stepped)?;

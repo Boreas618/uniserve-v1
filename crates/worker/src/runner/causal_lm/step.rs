@@ -15,14 +15,14 @@ use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::StepParts;
-use super::batch::TokenBatch;
+use super::batch::Batch;
 use super::calls::{self, Prepared};
 use super::context::{self, Sources};
 use crate::cuda_graph::GraphMode;
-use crate::runner::diffusion::image::ConditionRow;
-use crate::runner::text::{
+use crate::runner::causal_lm::{
     Embeddings, Executed, FINISH_IDS, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };
+use crate::runner::diffusion::image::ConditionRow;
 use crate::sampling::SamplingMetadata;
 use crate::sampling::plan::{SampleTask, SamplingPlan, logprob_request, logprob_words};
 use crate::storage::LogprobLayout;
@@ -114,9 +114,9 @@ struct Planned {
 }
 
 impl Planned {
-    fn request(&self, decode: bool) -> StepRequest<'_> {
+    fn request(&self, mode: ForwardMode) -> StepRequest<'_> {
         StepRequest {
-            decode,
+            mode,
             rows: &self.rows,
             finish_ids: &self.finish_ids,
             sampling: self.sampling.as_ref().map(|plan| SamplingColumns {
@@ -151,7 +151,7 @@ impl PromptScore {
     }
 }
 
-impl TokenBatch<'_> {
+impl Batch<'_> {
     /// Build the active calls' invocations, one per microbatch, and run
     /// them as one step.
     ///
@@ -289,10 +289,9 @@ impl TokenBatch<'_> {
             // Only latent conditionings, which the image denoiser wrote.
             vec![None; count]
         } else {
-            let decode = self.mode == ForwardMode::Decode;
             let requests: Vec<Option<StepRequest<'_>>> = planned
                 .iter()
-                .map(|planned| planned.as_ref().map(|planned| planned.request(decode)))
+                .map(|planned| planned.as_ref().map(|planned| planned.request(self.mode)))
                 .collect();
             let kv = self
                 .storage
@@ -425,12 +424,12 @@ impl TokenBatch<'_> {
                 *id = i64::from(token);
             }
             let (first, count) = layout[position];
-            // A verification samples every candidate row; the others their
-            // last projected row.
+            // A verification samples its candidate rows, one per token
+            // position; the others the last-position logits of their row.
             let row = if self.mode == ForwardMode::Verify {
                 first
             } else {
-                first + count.saturating_sub(1)
+                position
             };
             if call.code == CallKind::Forward(ForwardMode::Prefill)
                 && prepared.scores
@@ -575,7 +574,7 @@ impl TokenBatch<'_> {
     }
 }
 
-impl TokenBatch<'_> {
+impl Batch<'_> {
     /// Write the K/V of latent images inserted as conditioning, through the
     /// image denoiser on its stream, ordered between this batch's text
     /// work.
