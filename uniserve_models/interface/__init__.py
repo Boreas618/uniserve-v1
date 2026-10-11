@@ -23,7 +23,6 @@ _AREAS = (
     "loading",
     "cache",
     "binding",
-    "canvas",
     "distributed",
     "experts",
     "graphs",
