@@ -49,13 +49,12 @@ use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageBatch;
 use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::transfer::latents;
-use crate::ffi::{DType, Function, Handle, integer_list};
-use crate::model::bind::ComponentBinding;
-use crate::model::interface::Interface;
+use crate::ffi::{DType, Function, Handle, Record, integer_list};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
 use crate::request::diffusion::{BranchSet, GuidancePlan};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
+use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
@@ -187,6 +186,8 @@ struct Methods {
     plan_denoise: Function,
     encode_conditions: Function,
     step: Function,
+    kernels: Function,
+    close: Function,
     /// Whether an attention operator plans each launch on the host.
     plans_attention: bool,
     /// Captures a forward between its begin and end.
@@ -233,24 +234,19 @@ fn bytes<T: Copy>(values: &[T]) -> &[u8] {
 }
 
 impl ImageDiffusion {
-    /// Allocate the runner's columns and bind the denoiser at `path` of
-    /// `binding`. `stream` borrows the binding's stream, on which every
-    /// step and sample update runs.
-    pub fn bind(
-        interface: &Interface,
-        binding: &ComponentBinding,
-        path: &str,
+    /// Allocate the runner's columns and construct the Python half of the
+    /// denoiser `setup` names over the prefix cache `cache`. Every step and
+    /// sample update runs on the setup's stream.
+    pub fn new(
+        setup: &ImageSetup<'_>,
+        cache: &Handle,
         layout: ImageDenoiserLayout,
         capacity: DiffusionCapacity,
         storage: DiffusionStorage,
-        stream: Option<Stream>,
     ) -> Result<Self> {
-        let owner = if path.is_empty() {
-            binding.component.clone()
-        } else {
-            format!("{}.{path}", binding.component)
-        };
-        let device = binding.device;
+        let interface = setup.interface;
+        let owner = setup.owner();
+        let (device, stream) = (setup.device, setup.stream.clone());
         if device.is_cuda() != stream.is_some() {
             return Err(Error::Invariant(
                 "an image denoiser runs on streams exactly on CUDA devices".into(),
@@ -300,9 +296,9 @@ impl ImageDiffusion {
             Ok(Any::from(view.to_tensor()?))
         };
         let method = |name: &str| interface.import(&format!("{RUNNER}.{name}"));
-        let runner = Handle::new(method("bound")?.call_values(&[
-            binding.prepared().to_any(),
-            Any::from(tvm_ffi::String::from(path)),
+        let mut arguments = setup.arguments();
+        arguments.extend([
+            cache.to_any(),
             Any::from(capacity.rows as i64),
             Any::from(capacity.tokens as i64),
             Any::from(capacity.units as i64),
@@ -314,7 +310,8 @@ impl ImageDiffusion {
             slot_table("unit_tables")?,
             slot_table("start_pages")?,
             slot_table("table_shapes")?,
-        ])?)?;
+        ]);
+        let runner = Handle::new(method("image")?.call_values(&arguments)?)?;
         let plans_attention = method("plans_attention")?.call_as::<bool>(&[runner.view()])?;
         let capture = GraphFunctions::from_interface(interface)?;
         Ok(Self {
@@ -328,6 +325,8 @@ impl ImageDiffusion {
                 plan_denoise: method("plan_denoise")?,
                 encode_conditions: method("encode_conditions")?,
                 step: method("step")?,
+                kernels: method("kernels")?,
+                close: method("close")?,
                 plans_attention,
                 capture,
             },
@@ -352,7 +351,7 @@ impl ImageDiffusion {
         self.device
     }
 
-    /// The binding's stream; `None` on the host.
+    /// The runner's stream; `None` on the host.
     pub fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
     }
@@ -757,7 +756,26 @@ impl ImageDiffusion {
 
     /// Release the runner's graphs; the caller drained its streams.
     pub fn close(&mut self, aborted: bool) -> Result<()> {
-        self.graphs.close(aborted)
+        let graphs = self.graphs.close(aborted);
+        let flag = Any::from(aborted);
+        graphs.and(
+            self.methods
+                .close
+                .invoke(&[self.methods.runner.view(), (&flag).into()]),
+        )
+    }
+
+    /// The kernels the denoiser's operators selected.
+    pub fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+        let records: tvm_ffi::Array<Any> = self
+            .methods
+            .kernels
+            .call_as(&[self.methods.runner.view()])?;
+        records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+            .collect()
     }
 }
 

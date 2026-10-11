@@ -54,10 +54,8 @@ use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{DType, Function, Handle, Record, integer_list};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
-use crate::model::bind::ComponentBinding;
-use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
-use crate::runner::{Methods, RunnerSetup, device_buffer};
+use crate::runner::{ImageSetup, Methods, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
     LatentUpdate, Metadata, OutputPlacement, ProductBuffer, RequestSlots, SlotField, ValueRange,
@@ -98,26 +96,15 @@ pub struct DecoderRunner {
 }
 
 impl DecoderRunner {
-    /// Bind the image decoder at `path` of `binding` over the latent pool's
-    /// step workspace `latents` and `staging_bytes` of staging. `stream` borrows the binding's stream.
-    pub fn bind(
-        interface: &Interface,
-        binding: &ComponentBinding,
-        path: &str,
+    /// The runner of an image model's decoder over the latent pool's step
+    /// workspace `latents` and `staging_bytes` of staging.
+    pub fn image(
+        setup: &ImageSetup<'_>,
         range: (f32, f32),
         latents: StorageView,
         staging_bytes: usize,
-        stream: Option<Stream>,
     ) -> Result<Self> {
-        let image = ImageDecoder::bind(
-            interface,
-            binding,
-            path,
-            range,
-            latents,
-            staging_bytes,
-            stream,
-        )?;
+        let image = ImageDecoder::new(setup, range, latents, staging_bytes)?;
         Ok(Self {
             family: Family::Image(Box::new(image)),
         })
@@ -149,7 +136,7 @@ impl DecoderRunner {
         })
     }
 
-    fn image(&self) -> Result<&ImageDecoder> {
+    fn image_decoder(&self) -> Result<&ImageDecoder> {
         match &self.family {
             Family::Image(image) => Ok(image),
             _ => Err(Error::Invariant("the decoder decodes no images".into())),
@@ -189,7 +176,7 @@ impl DecoderRunner {
 
     /// An image decoder's pixel range, `(low, high)`.
     pub fn range(&self) -> Result<(f32, f32)> {
-        Ok(self.image()?.range)
+        Ok(self.image_decoder()?.range)
     }
 
     /// Decode `images`, handing each image's staged pixels (in input
@@ -201,7 +188,7 @@ impl DecoderRunner {
         images: &[DecodeImage],
         stage: impl FnMut(usize, StorageView) -> Result<()>,
     ) -> Result<()> {
-        self.image()?.decode(images, stage)
+        self.image_decoder()?.decode(images, stage)
     }
 
     /// Quantize a resident image product holding values in `range` and
@@ -212,7 +199,7 @@ impl DecoderRunner {
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
     ) -> Result<()> {
-        self.image()?.quantize(image, range, stage)
+        self.image_decoder()?.quantize(image, range, stage)
     }
 
     /// Construct a video decoder's Python runner of every segment, the
@@ -297,17 +284,28 @@ impl DecoderRunner {
     /// The kernels the operators of a video or audio decoder selected.
     pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
         match &self.family {
-            Family::Image(_) => Ok(Vec::new()),
+            Family::Image(image) => {
+                let records: tvm_ffi::Array<Any> = image.kernels.call_as(&[image.runner.view()])?;
+                records
+                    .iter()
+                    .enumerate()
+                    .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+                    .collect()
+            }
             Family::Video(video) => video.kernels(label),
             Family::Audio(audio) => audio.kernels(label),
         }
     }
 
     /// Release the graphs and Python runners of a video or audio decoder;
-    /// an image decoder's component binding owns its resources.
+    /// an image decoder releases the execution context its Python half
+    /// constructed.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         match &mut self.family {
-            Family::Image(_) => Ok(()),
+            Family::Image(image) => {
+                let flag = Any::from(aborted);
+                image.close.invoke(&[image.runner.view(), (&flag).into()])
+            }
             Family::Video(video) => video.close(aborted),
             Family::Audio(audio) => audio.close(aborted),
         }
@@ -323,27 +321,23 @@ struct ImageDecoder {
     runner: Handle,
     decode: Function,
     quantize: Function,
+    kernels: Function,
+    close: Function,
     /// The decoder's pixel range, `(low, high)`.
     range: (f32, f32),
     staging: StorageView,
 }
 
 impl ImageDecoder {
-    fn bind(
-        interface: &Interface,
-        binding: &ComponentBinding,
-        path: &str,
+    fn new(
+        setup: &ImageSetup<'_>,
         range: (f32, f32),
         latents: StorageView,
         staging_bytes: usize,
-        stream: Option<Stream>,
     ) -> Result<Self> {
-        let owner = if path.is_empty() {
-            binding.component.clone()
-        } else {
-            format!("{}.{path}", binding.component)
-        };
-        let device = binding.device;
+        let interface = setup.interface;
+        let owner = setup.owner();
+        let (device, stream) = (setup.device, setup.stream.clone());
         if device.is_cuda() != stream.is_some() {
             return Err(Error::Invariant(
                 "an image decoder runs on a stream exactly on a CUDA device".into(),
@@ -355,12 +349,10 @@ impl ImageDecoder {
         };
         let staging = StorageView::contiguous(memory, 0, DType::U8, &[staging_bytes as i64])?;
         let method = |name: &str| interface.import(&format!("{DECODER}.{name}"));
-        let runner = Handle::new(method("bound")?.call_values(&[
-            binding.prepared().to_any(),
-            Any::from(tvm_ffi::String::from(path)),
-            Any::from(latents.to_tensor()?),
-            Any::from(staging.to_tensor()?),
-        ])?)?;
+        let mut arguments = setup.arguments();
+        arguments.push(Any::from(latents.to_tensor()?));
+        arguments.push(Any::from(staging.to_tensor()?));
+        let runner = Handle::new(method("image")?.call_values(&arguments)?)?;
         Ok(Self {
             owner,
             device,
@@ -368,6 +360,8 @@ impl ImageDecoder {
             runner,
             decode: method("decode")?,
             quantize: method("quantize")?,
+            kernels: method("kernels")?,
+            close: method("close")?,
             range,
             staging,
         })

@@ -155,27 +155,46 @@ class EncoderRunner:
         return runner
 
     @classmethod
-    def bound(cls, prepared, path: str, loaded) -> EncoderRunner:
-        """A runner of the encoder at ``path`` of a bound component.
+    def image(
+        cls,
+        loaded,
+        path: str,
+        stream: int,
+        device: int,
+        scratch,
+        size: Sequence[int],
+    ) -> EncoderRunner:
+        """A runner of an image model's vision or latent encoder.
 
-        ``path`` is relative to the component's root (``""`` for the root
-        itself); the runner computes with the component's execution
-        context. ``loaded`` is the loaded model, whose image policy
-        prepares resident images.
+        Args:
+            loaded: The loaded model, whose image policy prepares resident
+                images.
+            path: The encoder module's path in the model.
+            stream: The CUDA stream handle every forward enqueues on (0 on
+                the host).
+            device: The CUDA ordinal ``stream`` belongs to, -1 for the
+                host. An encoder placed on a generation tower computes
+                there between the stream's steps.
+            scratch: The stream's shared work areas.
+            size: ``[tokens, rows]``, the most one call passes through the
+                encoder's projections; empty for a latent encoder, whose
+                convolutions need none.
         """
-        # FIXME: an image model's encoders are still prepared by the
-        # component binding, which sizes their operators and declares their
-        # workspace before the caller allocates it.
-        context = prepared.context
-        if context is None:
-            raise ValueError("a runner requires a bound component")
-        path = str(path)
-        root = prepared.module
-        module = root.get_submodule(path) if path else root
+        module = _module(loaded, path)
         if not isinstance(module, (PatchEncoder, PatchAutoencoder)):
             raise SetupError(
                 f"{type(module).__qualname__} is not a patch or latent encoder"
             )
+        context = execution_context(
+            module,
+            int(stream),
+            loaded.attention,
+            scratch,
+            device=int(device),
+            derive_host_lengths=True,
+        )
+        values = [int(value) for value in size]
+        context.prepare(TextSize(*values) if values else None)
         runner = cls.__new__(cls)
         runner._loaded = loaded
         runner._bind(module, context)

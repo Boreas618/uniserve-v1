@@ -356,8 +356,8 @@ impl Worker {
                 lanes: &lanes,
                 storage: &storage,
                 latent: plan.latent,
-                components: &mut components,
-                workspaces: &mut workspaces,
+                components: &components,
+                scratches: &mut scratches,
                 graphs: &mut graphs,
                 preparation,
             })
@@ -850,6 +850,15 @@ impl Worker {
             let kernels = binding.kernels().map_err(phase("warmup"))?;
             records
                 .add(&label, &binding.device.to_string(), &kernels)
+                .map_err(phase("warmup"))?;
+        }
+        for (label, device, kernels) in executor
+            .backend()
+            .image_kernels()
+            .map_err(phase("warmup"))?
+        {
+            records
+                .add(&label, &device, &kernels)
                 .map_err(phase("warmup"))?;
         }
         if executor.backend().serves_video() {

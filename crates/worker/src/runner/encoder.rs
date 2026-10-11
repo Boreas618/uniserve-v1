@@ -2,7 +2,7 @@
 //! and a video model's condition latent encoders.
 //!
 //! An [`EncoderRunner`] serves one encoder call of a bound component: the
-//! module at a path within the binding's root (the root itself, or a nested
+//! module at a path of the loaded model (a component's root, or a nested
 //! encoder such as a text encoder's vision tower bound with it). It owns the
 //! encoder's Rust buffers, its graph table and its call policy.
 //!
@@ -81,10 +81,10 @@ use crate::executor::forward::batch::{
 };
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list, list};
-use crate::model::bind::{ComponentBinding, TextSize};
+use crate::model::bind::TextSize;
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
-use crate::runner::{Methods, RunnerSetup};
+use crate::runner::{ImageSetup, Methods, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{Metadata, OutputPlacement, ValueRange};
 use crate::{Error, Result};
@@ -328,10 +328,10 @@ impl EncoderInfo {
         })
     }
 
-    /// The text size the encoder's component binding prepares its
+    /// The text size the encoder's execution context prepares its
     /// operators for: the most rows one numerical call passes through its
     /// projections. A latent encoder's convolutions need none.
-    pub fn binding_size(&self, config: &EncoderConfig) -> Option<TextSize> {
+    pub fn context_size(&self, config: &EncoderConfig) -> Option<TextSize> {
         match self {
             Self::Vision(vision) => Some(match vision.max_patches {
                 Some(max_patches) => {
@@ -569,7 +569,7 @@ pub struct EncoderRunner {
     owner: String,
     info: EncoderInfo,
     device: Device,
-    /// The binding's stream, shared with its lane; `None` on the host.
+    /// The runner's stream, shared with its lane; `None` on the host.
     stream: Option<Stream>,
     methods: EncoderMethods,
     packed: Option<PackedVision>,
@@ -581,8 +581,9 @@ pub struct EncoderRunner {
     capturing: bool,
     /// The component binding a video model's text encoder owns, with its
     /// workspaces; its vision tower computes with the same binding.
-    /// The methods releasing the execution context a text encoder's Python
-    /// half constructed; its vision tower computes with the same context.
+    /// The methods releasing the execution context this runner's Python
+    /// half constructed (an image encoder, or a text encoder whose vision
+    /// tower computes with the same context).
     context: Option<OwnedContext>,
     /// The Python runners of condition latent encoders.
     conditions: Option<Box<Conditions>>,
@@ -598,26 +599,18 @@ fn allocate(device: Device, dtype: DType, shape: &[i64]) -> Result<StorageView> 
 }
 
 impl EncoderRunner {
-    /// Allocate the buffers of the encoder `info` describes and bind them
-    /// to the encoder at `path` of `binding` (relative to the binding's
-    /// root, which was prepared for [`EncoderInfo::binding_size`]).
-    /// `products` is the binding device's product arena (a `uint8` view);
-    /// `stream` borrows the binding's stream.
-    pub fn bind(
-        interface: &Interface,
-        binding: &ComponentBinding,
-        loaded: &Handle,
-        path: &str,
+    /// The runner of an image model's vision or latent encoder: allocate
+    /// the buffers of the encoder `info` describes and construct its Python
+    /// half, whose execution context is prepared for
+    /// [`EncoderInfo::context_size`].
+    pub fn image(
+        setup: &ImageSetup<'_>,
         info: EncoderInfo,
         config: &EncoderConfig,
-        stream: Option<Stream>,
     ) -> Result<Self> {
-        let owner = if path.is_empty() {
-            binding.component.clone()
-        } else {
-            format!("{}.{path}", binding.component)
-        };
-        let device = binding.device;
+        let interface = setup.interface;
+        let owner = setup.owner();
+        let (device, stream) = (setup.device, setup.stream.clone());
         if device.is_cuda() != stream.is_some() {
             return Err(Error::Invariant(
                 "an encoder runs on a stream exactly on a CUDA device".into(),
@@ -660,7 +653,7 @@ impl EncoderRunner {
             EncoderInfo::Latent(_) => {}
             EncoderInfo::Text(_) | EncoderInfo::Condition => {
                 return Err(Error::Invariant(
-                    "only an image model's encoder is constructed over a binding".into(),
+                    "only an image model's vision or latent encoder is constructed here".into(),
                 ));
             }
         }
@@ -669,13 +662,18 @@ impl EncoderRunner {
             stream.synchronize()?;
         }
 
-        let runner = Handle::new(interface.import(&format!("{ENCODER}.bound"))?.call_values(
-            &[
-                binding.prepared().to_any(),
-                Any::from(tvm_ffi::String::from(path)),
-                loaded.to_any(),
-            ],
-        )?)?;
+        let size = info.context_size(config);
+        let mut arguments = setup.arguments();
+        arguments.push(Any::from(integer_list(
+            size.iter()
+                .flat_map(|size| [size.tokens as i64, size.rows as i64]),
+        )));
+        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let runner = Handle::new(method("image")?.call_values(&arguments)?)?;
+        let context = OwnedContext {
+            kernels: method("kernels")?,
+            close: method("close")?,
+        };
         let methods = EncoderMethods::new(interface, runner)?;
         Ok(Self {
             graphs: packed
@@ -691,7 +689,7 @@ impl EncoderRunner {
             text_capacities: Vec::new(),
             config: config.clone(),
             capturing: false,
-            context: None,
+            context: Some(context),
             conditions: None,
         })
     }
@@ -759,7 +757,7 @@ impl EncoderRunner {
             EncoderInfo::Vision(_) => (None, None),
             EncoderInfo::Latent(_) | EncoderInfo::Condition => {
                 return Err(Error::Invariant(
-                    "only a text encoder and its vision tower share a binding".into(),
+                    "only a text encoder and its vision tower share a context".into(),
                 ));
             }
         };
@@ -1270,7 +1268,7 @@ impl EncoderRunner {
     }
 
     /// Release the runner's graphs, then what it owns: the Python runners
-    /// of condition encoders and a text encoder's component binding. The
+    /// of condition encoders and the execution context it owns. The
     /// caller drained its stream. An aborted close keeps everything until
     /// the process exits.
     pub fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1484,7 +1482,7 @@ pub(crate) struct TextSetup<'a> {
 
 impl EncoderRunner {
     /// The runners of a video model's text encoder component: the prompt
-    /// encoder, which owns the component's binding, and, for conditioned
+    /// encoder, which owns the execution context, and, for conditioned
     /// tasks, the vision tower bound with it.
     pub(crate) fn text(setup: TextSetup<'_>) -> Result<(Self, Option<Self>)> {
         let TextSetup {
@@ -1525,8 +1523,8 @@ impl EncoderRunner {
         // for the larger of their workloads: a prompt padded to the largest
         // capacity, and a request's vision blocks.
         let size = [
-            text_info.binding_size(&config),
-            vision_info.and_then(|info| info.binding_size(&config)),
+            text_info.context_size(&config),
+            vision_info.and_then(|info| info.context_size(&config)),
         ]
         .into_iter()
         .flatten()
@@ -1624,7 +1622,7 @@ impl EncoderRunner {
             .encode_audio(samples, lengths, out)
     }
 
-    /// The kernels the operators of a text encoder's binding or of the
+    /// The kernels the operators of the runner's execution context or of the
     /// condition encoders selected.
     pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
         match (&self.context, &self.conditions) {
@@ -2176,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn a_packed_binding_covers_every_slot_of_its_capacity() {
+    fn a_packed_context_covers_every_slot_of_its_capacity() {
         let info = VisionEncoder {
             patch_size: 16,
             downsample: 3,
@@ -2194,7 +2192,7 @@ mod tests {
             ..EncoderConfig::default()
         };
         assert_eq!(
-            EncoderInfo::Vision(info).binding_size(&config),
+            EncoderInfo::Vision(info).context_size(&config),
             Some(TextSize {
                 tokens: 16 * 2520,
                 rows: 32,

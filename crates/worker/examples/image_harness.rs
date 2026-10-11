@@ -16,14 +16,11 @@ use tvm_ffi::{Any, Array, Map, String as FfiString, Tensor};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_worker::config::Device;
 use uniserve_worker::ffi::{Backing, DType, Handle, Record};
-use uniserve_worker::model::bind::{
-    self, Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize,
-};
 use uniserve_worker::model::interface::Interface;
 use uniserve_worker::storage::memory::{Memory, StorageView};
 use uniserve_worker::{
-    DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool, Result,
-    Tower, prepare_input,
+    DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool, ImageSetup,
+    Result, Tower, prepare_input,
 };
 
 /// Bytes of the host product arena; every product of these cases fits.
@@ -35,33 +32,22 @@ fn failure(error: impl std::fmt::Display) -> tvm_ffi::Error {
     tvm_ffi::Error::new(tvm_ffi::RUNTIME_ERROR, &error.to_string(), "")
 }
 
-fn binding(
-    interface: &Interface,
-    loaded: &Handle,
-    component: &str,
-    root: &str,
-    device: Device,
-    stream: Option<&Stream>,
-    size: Option<TextSize>,
-) -> Result<ComponentBinding> {
-    let prepared = bind::prepare(
-        interface,
-        loaded,
-        BindingRequest {
-            component: component.to_owned(),
-            path: root.to_owned(),
-            device,
-            stream: stream.map_or(0, Stream::raw),
-            size,
-            backends: Backends::default(),
-            derive_host_lengths: true,
-            experts: None,
-            weights: None,
-            cache: None,
-        },
-    )?;
-    let mut bound = bind::bind(interface, &mut StreamWorkspaces::default(), vec![prepared])?;
-    Ok(bound.remove(0))
+/// The shared work areas of one stream, as the worker holds them.
+fn scratch(interface: &Interface) -> Result<Handle> {
+    Handle::new(
+        interface
+            .import("uniserve_models.bindings.context.Scratch")?
+            .call_values(&[])?,
+    )
+}
+
+/// The module path `path` below `root`.
+fn module_path(root: &str, path: &str) -> String {
+    [root, path]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn arena(device: Device) -> Result<StorageView> {
@@ -94,7 +80,7 @@ fn view(product: &StorageView, shape: &[i64]) -> Result<Tensor> {
 }
 
 /// Encode inline images (`tower` is `vit` or `vae`) with the encoder at
-/// `path` of the `component` binding rooted at `root`, on `device` (a CUDA
+/// `path` below `root` of the model, named by `component`, on `device` (a CUDA
 /// ordinal, the host when absent), capturing the encoder's graphs first
 /// when `capture` is set. Each entry of `orders` (default: every image in
 /// order) is one batch of image indices. Returns, per batch, each image's
@@ -128,35 +114,24 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             Device::Cpu => None,
         };
         let root = config.string("root")?;
-        let module = [root.as_str(), path.as_str()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(".");
+        let module = module_path(&root, &path);
         let info = EncoderInfo::describe(&interface, &loaded, &module, DType::BF16)?;
         let settings = EncoderConfig {
             max_images: orders.iter().map(Vec::len).max().unwrap_or(1),
             ..EncoderConfig::default()
         };
-        let binding = binding(
-            &interface,
-            &loaded,
-            &config.string("component")?,
-            &root,
+        let component = config.string("component")?;
+        let setup = ImageSetup {
+            interface: &interface,
+            loaded: &loaded,
+            component: &component,
+            path: &module,
             device,
-            stream.as_ref(),
-            info.binding_size(&settings),
-        )?;
+            stream: stream.clone(),
+            scratch: scratch(&interface)?,
+        };
         let products = arena(device)?;
-        let mut runner = EncoderRunner::bind(
-            &interface,
-            &binding,
-            &loaded,
-            &path,
-            info,
-            &settings,
-            stream.clone(),
-        )?;
+        let mut runner = EncoderRunner::image(&setup, info, &settings)?;
         if config.optional::<bool>("capture")?.unwrap_or(false) {
             let Device::Cuda(index) = device else {
                 return Err(uniserve_worker::Error::Invalid(
@@ -249,7 +224,7 @@ fn pool(interface: &Interface, device: i32) -> Result<Arc<GraphPool<Handle>>> {
 
 /// Decode `latents` (`[units, width]` per image, consecutive) of images of
 /// `sizes` (`[height, width]` each) with the image decoder at `path` of the
-/// `component` binding rooted at `root`, through a staging of
+/// `component` below `root` of the model, through a staging of
 /// `staging_bytes`. Returns each image's staged pixels and its product.
 fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ffi::Error> {
     (|| -> Result<Array<Any>> {
@@ -260,15 +235,17 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let latents: Tensor = config.get("latents")?;
         let sizes = config.list("sizes")?;
         let staging_bytes = config.count("staging_bytes")?;
-        let binding = binding(
-            &interface,
-            &loaded,
-            &config.string("component")?,
-            &config.string("root")?,
-            Device::Cpu,
-            None,
-            None,
-        )?;
+        let component = config.string("component")?;
+        let module = module_path(&config.string("root")?, &path);
+        let setup = ImageSetup {
+            interface: &interface,
+            loaded: &loaded,
+            component: &component,
+            path: &module,
+            device: Device::Cpu,
+            stream: None,
+            scratch: scratch(&interface)?,
+        };
         let products = arena(Device::Cpu)?;
         let [units, width] = latents.shape()[..] else {
             return Err(uniserve_worker::Error::Invalid(
@@ -286,15 +263,7 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             );
         }
         let workspace = StorageView::contiguous(memory as Arc<_>, 0, DType::BF16, &[units, width])?;
-        let runner = DecoderRunner::bind(
-            &interface,
-            &binding,
-            &path,
-            (-1.0, 1.0),
-            workspace,
-            staging_bytes,
-            None,
-        )?;
+        let runner = DecoderRunner::image(&setup, (-1.0, 1.0), workspace, staging_bytes)?;
         let mut images = Vec::new();
         let mut sample = 0;
         for (index, size) in sizes.iter().enumerate() {
