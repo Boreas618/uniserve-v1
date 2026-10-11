@@ -49,7 +49,7 @@ use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageBatch;
 use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::transfer::latents;
-use crate::ffi::{DType, Function, Handle, Region, integer_list, list};
+use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::model::bind::ComponentBinding;
 use crate::model::interface::Interface;
 use crate::parallel::ExpertUnion;
@@ -108,10 +108,10 @@ pub struct DenoiseRow {
 
 /// A latent image inserted as conditioning: its K/V is written after the
 /// slot's visible tokens.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ConditionRow {
     /// The latent feature product (`[units, width]`).
-    pub features: Region,
+    pub features: StorageView,
     pub height: u32,
     pub width: u32,
     pub slot: u32,
@@ -167,8 +167,6 @@ pub struct DiffusionStorage {
     pub samples: StorageView,
     /// The latent pool's per-slot timesteps `[slots + 1, 1]` float32.
     pub slot_timesteps: StorageView,
-    /// The denoiser device's product arena (`uint8`).
-    pub products: StorageView,
     /// The KV cache's slot tables (`unit_tables`, `start_pages`,
     /// `table_shapes`), and each numerical block table's page tokens and
     /// whether it is windowed.
@@ -313,7 +311,6 @@ impl ImageDiffusion {
             Any::from(integer_list(storage.windowed.iter().copied())),
             Any::from(storage.samples.to_tensor()?),
             Any::from(storage.slot_timesteps.to_tensor()?),
-            Any::from(storage.products.to_tensor()?),
             slot_table("unit_tables")?,
             slot_table("start_pages")?,
             slot_table("table_shapes")?,
@@ -631,9 +628,11 @@ impl ImageDiffusion {
             self.attention
                 .stage(&attention, tables, None, check, self.stream.as_ref())?;
         let mut arguments = self.arguments(&described, &geometry)?;
-        arguments.push(Any::from(list(
-            rows.iter().map(|row| row.features.to_any()),
-        )));
+        // Each row's features follow the forward's tensors as a tensor of
+        // their own.
+        for row in rows {
+            arguments.push(Any::from(row.features.to_tensor()?));
+        }
         self.methods
             .encode_conditions
             .call_values(&arguments)

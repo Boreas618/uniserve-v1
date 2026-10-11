@@ -51,7 +51,7 @@ use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::batch::image::{Encoding, ImageBatch, allocations, lock};
 use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::ffi::{DType, Function, Handle, Record, Region, integer_list, list};
+use crate::ffi::{DType, Function, Handle, Record, integer_list};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
 use crate::model::bind::ComponentBinding;
@@ -67,7 +67,7 @@ use crate::{Error, Result};
 const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
 
 /// One image to decode.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DecodeImage {
     /// The image's first latent row in the step workspace and its rows.
     pub sample: u32,
@@ -75,7 +75,7 @@ pub struct DecodeImage {
     pub height: u32,
     pub width: u32,
     /// The image product receiving the decoded values, if published.
-    pub product: Option<Region>,
+    pub product: Option<StorageView>,
 }
 
 impl DecodeImage {
@@ -99,19 +99,13 @@ pub struct DecoderRunner {
 
 impl DecoderRunner {
     /// Bind the image decoder at `path` of `binding` over the latent pool's
-    /// step workspace `latents`, the device's product arena and
-    /// `staging_bytes` of staging. `stream` borrows the binding's stream.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the binding's complete resources"
-    )]
+    /// step workspace `latents` and `staging_bytes` of staging. `stream` borrows the binding's stream.
     pub fn bind(
         interface: &Interface,
         binding: &ComponentBinding,
         path: &str,
         range: (f32, f32),
         latents: StorageView,
-        products: StorageView,
         staging_bytes: usize,
         stream: Option<Stream>,
     ) -> Result<Self> {
@@ -121,7 +115,6 @@ impl DecoderRunner {
             path,
             range,
             latents,
-            products,
             staging_bytes,
             stream,
         )?;
@@ -215,7 +208,7 @@ impl DecoderRunner {
     /// hand its staged pixels to `stage`.
     pub fn quantize(
         &self,
-        image: &Region,
+        image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
     ) -> Result<()> {
@@ -336,17 +329,12 @@ struct ImageDecoder {
 }
 
 impl ImageDecoder {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the binding's complete resources"
-    )]
     fn bind(
         interface: &Interface,
         binding: &ComponentBinding,
         path: &str,
         range: (f32, f32),
         latents: StorageView,
-        products: StorageView,
         staging_bytes: usize,
         stream: Option<Stream>,
     ) -> Result<Self> {
@@ -372,7 +360,6 @@ impl ImageDecoder {
             Any::from(tvm_ffi::String::from(path)),
             Any::from(latents.to_tensor()?),
             Any::from(staging.to_tensor()?),
-            Any::from(products.to_tensor()?),
         ])?)?;
         Ok(Self {
             owner,
@@ -431,18 +418,17 @@ impl ImageDecoder {
                 offset += image.pixel_bytes();
                 row
             }));
-            let products = list(images[first..end].iter().map(|image| {
-                image
-                    .product
-                    .as_ref()
-                    .map_or_else(Any::default, Region::to_any)
-            }));
-            let counts = crate::ffi::integers(self.decode.call_values(&[
-                self.runner.to_any(),
-                Any::from(rows),
-                Any::from(products),
-            ])?)
-            .map_err(|error| Error::numerical(self.decode.name(), &error))?;
+            // Each image's product follows the rows: a tensor, or none
+            // for an image that publishes no product.
+            let mut arguments = vec![self.runner.to_any(), Any::from(rows)];
+            for image in &images[first..end] {
+                arguments.push(match &image.product {
+                    Some(product) => Any::from(product.to_tensor()?),
+                    None => Any::default(),
+                });
+            }
+            let counts = crate::ffi::integers(self.decode.call_values(&arguments)?)
+                .map_err(|error| Error::numerical(self.decode.name(), &error))?;
             if counts.len() != end - first {
                 return Err(Error::Interface(format!(
                     "{} returns one byte count per image",
@@ -472,13 +458,13 @@ impl ImageDecoder {
     /// hand its staged pixels to `stage` (see [`Self::decode`]).
     fn quantize(
         &self,
-        image: &Region,
+        image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
     ) -> Result<()> {
         let count: i64 = self.quantize.call_as(&[
             self.runner.view(),
-            (&image.to_any()).into(),
+            (&Any::from(image.to_tensor()?)).into(),
             (&Any::from(f64::from(range.0))).into(),
             (&Any::from(f64::from(range.1))).into(),
             (&Any::from(0_i64)).into(),
@@ -542,7 +528,7 @@ enum Source {
     /// A trajectory gathered at `DecodeImage::sample`.
     Latent(DecodeImage),
     /// A resident image product and its value range.
-    Resident(Region, (f32, f32), u32, u32),
+    Resident(StorageView, (f32, f32), u32, u32),
 }
 
 impl ImageBatch<'_> {
@@ -655,10 +641,9 @@ impl ImageBatch<'_> {
                     ));
                 }
             };
-            let arena = self.parts.arena(target)?;
-            let region = Region::within(arena, read.value());
+            let resident = read.value().clone();
             self.reads.push(read);
-            sources.push(Some(Source::Resident(region?, range, height, width)));
+            sources.push(Some(Source::Resident(resident, range, height, width)));
         }
 
         if !latent_calls.is_empty() {
@@ -719,8 +704,7 @@ impl ImageBatch<'_> {
                     .image_output
                     .as_ref()
                     .and_then(product)
-                    .map(|write| Region::within(self.parts.arena(target)?, &write.view()))
-                    .transpose()?;
+                    .map(|write| write.view());
                 let position = active
                     .iter()
                     .position(|value| value == index)

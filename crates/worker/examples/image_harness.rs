@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tvm_ffi::{Any, Array, Map, String as FfiString, Tensor};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_worker::config::Device;
-use uniserve_worker::ffi::{Backing, DType, Handle, Record, Region};
+use uniserve_worker::ffi::{Backing, DType, Handle, Record};
 use uniserve_worker::model::bind::{
     self, Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize,
 };
@@ -28,7 +28,7 @@ use uniserve_worker::{
 
 /// Bytes of the host product arena; every product of these cases fits.
 const ARENA_BYTES: usize = 1 << 23;
-/// Bytes reserved for each product region.
+/// Bytes reserved for each product.
 const PRODUCT_BYTES: u64 = 1 << 16;
 
 fn failure(error: impl std::fmt::Display) -> tvm_ffi::Error {
@@ -72,21 +72,22 @@ fn arena(device: Device) -> Result<StorageView> {
     StorageView::contiguous(memory, 0, DType::U8, &[ARENA_BYTES as i64])
 }
 
-/// The product region `index` of an arena: `[elements]` of `dtype`.
-fn region(index: usize, dtype: DType) -> Result<Region> {
-    Region::new(
-        index as u64 * PRODUCT_BYTES,
+/// Product `index` of an arena: `[elements]` of `dtype`.
+fn product(arena: &StorageView, index: usize, dtype: DType) -> Result<StorageView> {
+    StorageView::contiguous(
+        Arc::clone(arena.memory()),
+        index * PRODUCT_BYTES as usize,
         dtype,
-        vec![(PRODUCT_BYTES / dtype.bytes() as u64) as i64],
+        &[(PRODUCT_BYTES / dtype.bytes() as u64) as i64],
     )
 }
 
-/// The arena bytes a region's leading `shape` elements hold.
-fn view(arena: &StorageView, region: &Region, shape: &[i64]) -> Result<Tensor> {
+/// The leading `shape` elements of a product.
+fn view(product: &StorageView, shape: &[i64]) -> Result<Tensor> {
     StorageView::contiguous(
-        Arc::clone(arena.memory()),
-        region.offset() as usize,
-        region.dtype(),
+        Arc::clone(product.memory()),
+        (product.address() - product.memory().address()) as usize,
+        product.dtype(),
         shape,
     )?
     .to_tensor()
@@ -154,7 +155,6 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             &path,
             info,
             &settings,
-            products.clone(),
             stream.clone(),
         )?;
         if config.optional::<bool>("capture")?.unwrap_or(false) {
@@ -200,14 +200,14 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let mut results = Vec::new();
         let mut next = 0;
         for order in &orders {
-            let regions = (next..next + order.len())
-                .map(|index| region(index, dtype))
+            let outputs = (next..next + order.len())
+                .map(|index| product(&products, index, dtype))
                 .collect::<Result<Vec<_>>>()?;
             next += order.len();
             let batch: Vec<_> = order.iter().map(|&index| &images[index]).collect();
-            let encoded = runner.encode(&batch, &regions)?;
-            for (shape, region) in encoded.shapes.iter().zip(&regions) {
-                results.push(Any::from(view(&products, region, shape)?));
+            let encoded = runner.encode(&batch, &outputs)?;
+            for (shape, output) in encoded.shapes.iter().zip(&outputs) {
+                results.push(Any::from(view(output, shape)?));
             }
             results.push(Any::from(uniserve_worker::ffi::integer_list([
                 encoded.replays as i64,
@@ -292,7 +292,6 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             &path,
             (-1.0, 1.0),
             workspace,
-            products.clone(),
             staging_bytes,
             None,
         )?;
@@ -308,7 +307,7 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
                 units: rows,
                 height,
                 width,
-                product: Some(region(index, DType::BF16)?),
+                product: Some(product(&products, index, DType::BF16)?),
             });
             sample += rows;
         }
@@ -336,9 +335,8 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let mut results = Vec::new();
         for (image, pixels) in images.iter().zip(staged) {
             results.push(Any::from(pixels.expect("staged image").to_tensor()?));
-            let product = image.product.as_ref().expect("product region");
+            let product = image.product.as_ref().expect("product");
             results.push(Any::from(view(
-                &products,
                 product,
                 &[3, i64::from(image.height), i64::from(image.width)],
             )?));

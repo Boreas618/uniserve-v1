@@ -80,7 +80,7 @@ use crate::executor::forward::batch::{
     Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
 };
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::ffi::{Backing, DType, Function, Handle, Record, Region, integer_list, list};
+use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list, list};
 use crate::model::bind::{ComponentBinding, TextSize};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
@@ -572,9 +572,6 @@ pub struct EncoderRunner {
     /// The binding's stream, shared with its lane; `None` on the host.
     stream: Option<Stream>,
     methods: EncoderMethods,
-    /// The device's product arena, in which an image encoder's products
-    /// are regions.
-    products: Option<StorageView>,
     packed: Option<PackedVision>,
     text: Option<TextBuffers>,
     text_capacities: Vec<usize>,
@@ -606,10 +603,6 @@ impl EncoderRunner {
     /// root, which was prepared for [`EncoderInfo::binding_size`]).
     /// `products` is the binding device's product arena (a `uint8` view);
     /// `stream` borrows the binding's stream.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the binding's complete resources"
-    )]
     pub fn bind(
         interface: &Interface,
         binding: &ComponentBinding,
@@ -617,7 +610,6 @@ impl EncoderRunner {
         path: &str,
         info: EncoderInfo,
         config: &EncoderConfig,
-        products: StorageView,
         stream: Option<Stream>,
     ) -> Result<Self> {
         let owner = if path.is_empty() {
@@ -626,11 +618,6 @@ impl EncoderRunner {
             format!("{}.{path}", binding.component)
         };
         let device = binding.device;
-        if products.dtype() != DType::U8 || products.shape().len() != 1 {
-            return Err(Error::Invariant(
-                "a product arena is bound as one uint8 dimension".into(),
-            ));
-        }
         if device.is_cuda() != stream.is_some() {
             return Err(Error::Invariant(
                 "an encoder runs on a stream exactly on a CUDA device".into(),
@@ -673,7 +660,7 @@ impl EncoderRunner {
             EncoderInfo::Latent(_) => {}
             EncoderInfo::Text(_) | EncoderInfo::Condition => {
                 return Err(Error::Invariant(
-                    "only an image model's encoder is bound with a product arena".into(),
+                    "only an image model's encoder is constructed over a binding".into(),
                 ));
             }
         }
@@ -687,7 +674,6 @@ impl EncoderRunner {
                 binding.prepared().to_any(),
                 Any::from(tvm_ffi::String::from(path)),
                 loaded.to_any(),
-                Any::from(products.to_tensor()?),
             ],
         )?)?;
         let methods = EncoderMethods::new(interface, runner)?;
@@ -700,7 +686,6 @@ impl EncoderRunner {
             device,
             stream,
             methods,
-            products: Some(products),
             packed,
             text: None,
             text_capacities: Vec::new(),
@@ -785,7 +770,6 @@ impl EncoderRunner {
             device,
             stream: Some(stream),
             methods,
-            products: None,
             packed: None,
             text,
             text_capacities,
@@ -807,13 +791,6 @@ impl EncoderRunner {
     /// The runner's stream; `None` on the host.
     pub fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
-    }
-
-    /// The product arena an image encoder's regions name.
-    pub fn products(&self) -> Result<&StorageView> {
-        self.products
-            .as_ref()
-            .ok_or_else(|| Error::Invariant(format!("{} names no products by region", self.owner)))
     }
 
     /// Images one packed numerical call encodes; `None` when unpacked.
@@ -849,7 +826,7 @@ impl EncoderRunner {
     /// `signed_unit` declares pixel values in `[-1, 1]` rather than `[0, 1]`.
     pub fn prepare_resident(
         &self,
-        image: &Region,
+        image: &StorageView,
         tower: Tower,
         signed_unit: bool,
     ) -> Result<PreparedImage> {
@@ -859,7 +836,7 @@ impl EncoderRunner {
         let function = &self.methods.prepare_resident;
         let value = function.call_values(&[
             self.methods.runner.to_any(),
-            image.to_any(),
+            Any::from(image.to_tensor()?),
             Any::from(tvm_ffi::String::from(tower.name())),
             Any::from(signed_unit),
         ])?;
@@ -876,7 +853,7 @@ impl EncoderRunner {
     /// over Python-held pixels of request-chosen shapes, and a latent
     /// encoder's posterior draws from the device's default generator
     /// inside the call instead of reading noise the caller supplies.
-    pub fn encode(&mut self, images: &[&PreparedImage], out: &[Region]) -> Result<Encoded> {
+    pub fn encode(&mut self, images: &[&PreparedImage], out: &[StorageView]) -> Result<Encoded> {
         if images.len() != out.len() {
             return Err(Error::Invariant(
                 "encoder images and products must align".into(),
@@ -909,15 +886,16 @@ impl EncoderRunner {
                     _ => shape_groups(images),
                 };
                 for group in groups {
-                    let shapes = call_shapes(
-                        &self.methods.encode,
-                        &[
-                            self.methods.runner.to_any(),
-                            image_list(group.iter().map(|&index| images[index])),
-                            region_list(group.iter().map(|&index| &out[index])),
-                        ],
-                        group.len(),
-                    )?;
+                    // Each image's product follows the images as a tensor
+                    // of its own.
+                    let mut arguments = vec![
+                        self.methods.runner.to_any(),
+                        image_list(group.iter().map(|&index| images[index])),
+                    ];
+                    for &index in &group {
+                        arguments.push(Any::from(out[index].to_tensor()?));
+                    }
+                    let shapes = call_shapes(&self.methods.encode, &arguments, group.len())?;
                     for (index, shape) in group.into_iter().zip(shapes) {
                         result.shapes[index] = shape;
                     }
@@ -950,12 +928,10 @@ impl EncoderRunner {
     fn encode_packed(
         &mut self,
         images: &[&PreparedImage],
-        out: &[Region],
+        out: &[StorageView],
         result: &mut Encoded,
     ) -> Result<()> {
-        let (EncoderInfo::Vision(vision), Some(packed), Some(products)) =
-            (&self.info, &self.packed, &self.products)
-        else {
+        let (EncoderInfo::Vision(vision), Some(packed)) = (&self.info, &self.packed) else {
             return Err(Error::Invariant("encoder packs no images".into()));
         };
         let vision = *vision;
@@ -965,7 +941,6 @@ impl EncoderRunner {
             packed.grids.clone(),
             packed.features.clone(),
         );
-        let arena = products.address();
         let max_patches = vision.max_patches.unwrap_or_default();
         let slot_tokens = u64::from(vision.slot_tokens().unwrap_or_default());
         let row_bytes = u64::from(vision.output_size) * vision.output_dtype.bytes() as u64;
@@ -1022,22 +997,22 @@ impl EncoderRunner {
             for (index, &[rows, columns]) in chunk.iter().enumerate() {
                 let count =
                     u64::from(rows) * u64::from(columns) / u64::from(vision.downsample).pow(2);
-                let region = &out[offset + index];
+                let target = out[offset + index].address();
                 let source = features.address() + index as u64 * slot_tokens * row_bytes;
                 let bytes = (count * row_bytes) as usize;
                 match &stream {
                     // SAFETY: the rows lie in the slot's features and the
-                    // region in the product arena the caller reserved; the
+                    // target is the product the caller reserved; the
                     // copy follows the encode on the stream.
                     Some(stream) => unsafe {
-                        memcpy_async(arena + region.offset(), source, bytes, stream)?;
+                        memcpy_async(target, source, bytes, stream)?;
                     },
                     // SAFETY: as above, in host memory the encode wrote
                     // before returning.
                     None => unsafe {
                         std::ptr::copy_nonoverlapping(
                             source as *const u8,
-                            (arena + region.offset()) as *mut u8,
+                            target as *mut u8,
                             bytes,
                         );
                     },
@@ -1356,10 +1331,6 @@ fn image_list<'a>(images: impl Iterator<Item = &'a PreparedImage>) -> Any {
     Any::from(list(images.map(|image| image.value.to_any())))
 }
 
-fn region_list<'a>(regions: impl Iterator<Item = &'a Region>) -> Any {
-    Any::from(list(regions.map(Region::to_any)))
-}
-
 /// Call an encode function and read one result shape per input.
 fn call_shapes(function: &Function, args: &[Any], count: usize) -> Result<Vec<Vec<i64>>> {
     let value: tvm_ffi::Array<Any> = tvm_ffi::Array::try_from(function.call_values(args)?)
@@ -1613,7 +1584,6 @@ impl EncoderRunner {
             device: Device::Cuda(video.device),
             stream: Some(video.stream.clone()),
             methods: EncoderMethods::new(interface, Handle::none())?,
-            products: None,
             packed: None,
             text: None,
             text_capacities: Vec::new(),
@@ -2077,9 +2047,9 @@ impl ImageBatch<'_> {
                         }
                     };
                     let runner = &self.parts.encoders.image[route];
-                    let region = Region::within(runner.products()?, read.value());
+                    let resident = read.value().clone();
                     self.reads.push(read);
-                    runner.prepare_resident(&region?, tower, range == ValueRange::SignedUnit)?
+                    runner.prepare_resident(&resident, tower, range == ValueRange::SignedUnit)?
                 }
                 _ => {
                     return Err(Error::Invalid(
@@ -2104,12 +2074,9 @@ impl ImageBatch<'_> {
         )?;
         self.writes.extend(writes.iter().cloned());
         let runner = &mut self.parts.encoders.image[route];
-        let regions = writes
-            .iter()
-            .map(|write| Region::within(runner.products()?, &write.view()))
-            .collect::<Result<Vec<_>>>()?;
+        let products: Vec<StorageView> = writes.iter().map(|write| write.view()).collect();
         let borrowed: Vec<&PreparedImage> = images.iter().collect();
-        let encoded = runner.encode(&borrowed, &regions)?;
+        let encoded = runner.encode(&borrowed, &products)?;
 
         for (((write, image), shape), &index) in
             writes.iter().zip(&images).zip(&encoded.shapes).zip(&active)

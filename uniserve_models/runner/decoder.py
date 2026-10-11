@@ -22,7 +22,7 @@ from typing import Any, Protocol, cast
 import torch
 
 from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
-from uniserve_models.interface import calls, regions
+from uniserve_models.interface import calls
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
 from uniserve_models.media import image, video
@@ -104,7 +104,6 @@ class DecoderRunner:
     _image: ImageDecoder
     _latents: torch.Tensor
     _staging: torch.Tensor
-    _products: torch.Tensor
 
     def __init__(
         self,
@@ -187,7 +186,6 @@ class DecoderRunner:
         path: str,
         latents: torch.Tensor,
         staging: torch.Tensor,
-        products: torch.Tensor,
     ) -> DecoderRunner:
         """A runner of the image decoder at ``path`` of a bound component.
 
@@ -203,12 +201,9 @@ class DecoderRunner:
                 pages before decoding.
             staging: uint8 bytes receiving each image's quantized HWC
                 pixels, which the caller copies to the host and encodes.
-            products: The device's uint8 product arena, in which image
-                products are regions.
         """
         # FIXME: the component binding prepares the decoder's operators
-        # and declares its workspace before the caller allocates it; image
-        # products are still named by regions of the arena.
+        # and declares its workspace before the caller allocates it.
         context = prepared.context
         if context is None:
             raise ValueError("a runner requires a bound component")
@@ -225,7 +220,6 @@ class DecoderRunner:
         runner._device = context.device
         runner._latents = latents
         runner._staging = staging
-        runner._products = products
         runner._decode = runner._decode_image
         return runner
 
@@ -354,26 +348,28 @@ class DecoderRunner:
         request's complete audio latent timeline; the units' samples, which
         abut, land in ``out`` (``[span, 2]`` int16) in order.
 
-        An image decoder takes ``(rows, images)``: ``rows`` holds one
+        An image decoder takes ``(rows, *images)``: ``rows`` holds one
         ``[offset, units, height, width, staging]`` row per image,
         flattened: its latent rows ``latents[offset:offset + units]``, its
         size and the staging offset of its pixels. It decodes every image
         (one numerical call per size), writes image ``i`` to the product
-        region ``images[i]`` when given (the decoded values in the
+        tensor ``images[i]`` unless that is None (the decoded values in the
         product's dtype), quantizes it into the staging bytes and returns
         each image's byte count, ``height * width * 3``.
         """
         return self._decode(*arguments)
 
-    def quantize(self, region, low: float, high: float, offset: int) -> int:
+    def quantize(
+        self, image: torch.Tensor, low: float, high: float, offset: int
+    ) -> int:
         """Quantize a resident image product into the staging bytes.
 
-        ``region`` holds values in ``[low, high]``; its HWC pixels land at
+        ``image`` holds values in ``[low, high]``; its HWC pixels land at
         ``offset`` of the staging bytes. Returns their byte count.
         """
         with calls.scope(self._context):
             return self._stage(
-                regions.view(self._products, region),
+                image,
                 float(low),
                 float(high),
                 int(offset),
@@ -393,7 +389,9 @@ class DecoderRunner:
         )
         return count
 
-    def _decode_image(self, rows: Sequence[int], images: Sequence) -> list[int]:
+    def _decode_image(
+        self, rows: Sequence[int], *images: torch.Tensor | None
+    ) -> list[int]:
         decoder, context = self._image, self._context
         flat = [int(value) for value in rows]
         described = [
@@ -417,11 +415,11 @@ class DecoderRunner:
                 ),
             )
             counts = []
-            for value, row, region in zip(
+            for value, row, product in zip(
                 values, described, images, strict=True
             ):
-                if region is not None:
-                    calls.write(regions.view(self._products, region), value)
+                if product is not None:
+                    calls.write(product, value)
                 counts.append(self._stage(value, low, high, row[4]))
             return counts
 

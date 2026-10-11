@@ -451,21 +451,6 @@ impl TensorStore {
         self.max_feature_bytes
     }
 
-    /// The product arena of `device`: the buffer pool storage that every
-    /// persistent product there occupies, as one `uint8` dimension. A
-    /// binding receives it once and names products by their region of it
-    /// ([`crate::ffi::Region::within`]).
-    pub fn arena(&self, device: Device) -> Result<StorageView> {
-        let pool = lock(&self.buffer_pool);
-        let memory = pool.backing(&device_name(device)).ok_or_else(|| {
-            Error::Invalid("the tensor store holds no product arena on this device".into())
-        })?;
-        StorageView::whole(
-            Arc::clone(memory) as Arc<dyn crate::ffi::Backing>,
-            DType::U8,
-        )
-    }
-
     pub fn capacity(&self) -> usize {
         lock(&self.state).capacity
     }

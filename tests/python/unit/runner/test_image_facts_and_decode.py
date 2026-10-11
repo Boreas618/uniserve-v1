@@ -136,17 +136,12 @@ def test_decoded_images_fill_their_products_and_staging(loaded):
     latents = torch.linspace(-1.2, 1.2, 8 * 768).reshape(8, 768)
     latents = latents.to(torch.bfloat16)
     staging = torch.zeros(4 * 32 * 32 * 3, dtype=torch.uint8)
-    arena = torch.zeros(1 << 16, dtype=torch.uint8)
-    runner = DecoderRunner.bound(
-        prepared, "image_decoder", latents, staging, arena
-    )
+    product = torch.zeros(3, 32, 32, dtype=torch.bfloat16)
+    runner = DecoderRunner.bound(prepared, "image_decoder", latents, staging)
 
     # Two 32x32 images of four 16-pixel patches each; the second publishes
     # its decoded values as a product.
-    counts = runner.decode(
-        [0, 4, 32, 32, 0, 4, 4, 32, 32, 3072],
-        [None, [0, "bfloat16", [3, 32, 32]]],
-    )
+    counts = runner.decode([0, 4, 32, 32, 0, 4, 4, 32, 32, 3072], None, product)
     assert counts == [3072, 3072]
     decoder = model.module.image_decoder
     for index in range(2):
@@ -158,11 +153,8 @@ def test_decoded_images_fill_their_products_and_staging(loaded):
         assert torch.equal(
             staging[3072 * index : 3072 * (index + 1)], expected.reshape(-1)
         )
-    product = interface.regions.view(arena, [0, "bfloat16", [3, 32, 32]])
     assert torch.equal(product, decoded)
 
     # A resident product quantizes like a decoded image.
-    assert (
-        runner.quantize([0, "bfloat16", [3, 32, 32]], -1.0, 1.0, 6144) == 3072
-    )
+    assert runner.quantize(product, -1.0, 1.0, 6144) == 3072
     assert torch.equal(staging[6144:9216], staging[3072:6144])

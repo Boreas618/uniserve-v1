@@ -12,7 +12,7 @@ use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
 use crate::executor::forward::decodes_video;
-use crate::ffi::{DType, Device as StorageDevice, Handle};
+use crate::ffi::Handle;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::Lanes;
@@ -32,8 +32,7 @@ use crate::runner::denoiser::runners::{DenoiserRunners, FlowShape};
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::media::MediaRunner;
-use crate::storage::memory::StorageView;
-use crate::storage::{ImageLatents, LatentPool, LatentStorage, OutputPool, TensorStore};
+use crate::storage::{ImageLatents, LatentPool, LatentStorage, OutputPool};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
@@ -164,8 +163,6 @@ pub(crate) struct ImageOwners {
     pub(crate) decoders: DecoderRunners,
     /// The latent pool of a rank holding an image denoiser.
     pub(crate) latents: Option<ImageLatents>,
-    /// The product arena of each device, which bindings name products in.
-    pub(crate) arenas: HashMap<StorageDevice, StorageView>,
     /// The output leases of image batches.
     pub(crate) outputs: OutputPool,
     /// The lane preparing input images and encoding output images.
@@ -369,15 +366,12 @@ impl ImageOwners {
             .map(|latents| latents.workspace().cloned())
             .transpose()?;
 
-        let mut arenas = HashMap::new();
         let mut encoders = Vec::new();
         let mut encoder_routes = HashMap::new();
         let mut diffusion = None;
         let mut decoder = None;
         let mut units = None;
         for ((target, binding), info) in targets.iter().zip(&bindings).zip(infos) {
-            let products = arena(&startup.storage.tensors, storage_device(target.device))?;
-            arenas.insert(storage_device(target.device), products.clone());
             match target.kind {
                 CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
                     let info = info.ok_or_else(|| {
@@ -390,7 +384,6 @@ impl ImageOwners {
                         "",
                         info,
                         &encoder_config,
-                        products,
                         target.stream.clone(),
                     )?;
                     encoder_routes.insert((target.component.clone(), target.kind), encoders.len());
@@ -434,7 +427,6 @@ impl ImageOwners {
                         DiffusionStorage {
                             samples,
                             slot_timesteps: latents.storage.timesteps().clone(),
-                            products,
                             slot_tables,
                             page_tokens,
                             windowed,
@@ -461,7 +453,6 @@ impl ImageOwners {
                         "",
                         range,
                         latents,
-                        products,
                         staging,
                         target.stream.clone(),
                     )?;
@@ -554,33 +545,10 @@ impl ImageOwners {
             denoisers: DenoiserRunners::image(diffusion, flow, flow_pools, units),
             decoders: DecoderRunners::image(decoder, max_pixel_words),
             latents,
-            arenas,
             outputs,
             host,
         }))
     }
-}
-
-/// Where storage of a component device lives.
-fn storage_device(device: Device) -> StorageDevice {
-    match device {
-        Device::Cuda(index) => StorageDevice::Cuda(index),
-        Device::Cpu => StorageDevice::Cpu,
-    }
-}
-
-/// The product arena of `device` as one `uint8` dimension.
-fn arena(
-    tensors: &TensorStore,
-    device: StorageDevice,
-) -> Result<crate::storage::memory::StorageView> {
-    let view = tensors.arena(device)?;
-    if view.dtype() != DType::U8 {
-        return Err(Error::Invariant(
-            "a product arena is bound as uint8 bytes".into(),
-        ));
-    }
-    Ok(view)
 }
 
 /// Device bytes an image model's runners allocate beside the KV and latent pools:
