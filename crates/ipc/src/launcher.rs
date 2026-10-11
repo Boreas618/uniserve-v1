@@ -1,42 +1,33 @@
-//! The protocol between the head's engine and a host's launcher.
+//! The messages between the head's engine and a host's launcher.
 //!
 //! The engine starts no process on another host. Each host of a deployment
-//! runs one `uniserve-host` launcher, which connects to the head and keeps one
-//! TCP connection for the deployment's lifetime. The connection carries
-//! newline-delimited JSON in both directions:
+//! runs one `uniserve-host` launcher, which connects to the head and keeps
+//! that connection for the deployment's lifetime. The connection carries
+//! frames in both directions:
 //!
-//! - the launcher sends its [`Presentation`] once, then [`Report`]s: a
-//!   [`Reservation`] answering each [`Instruction::Reserve`], and a
-//!   [`RankExit`] for each rank it still supervises that exits, which excludes
-//!   ranks an [`Instruction::Stop`] ended;
+//! - the launcher sends its [`Registration`](crate::Registration) once, then
+//!   [`Report`]s: a [`Reservation`] answering each [`Instruction::Reserve`],
+//!   and a [`RankExit`] for each rank it still supervises that exits, which
+//!   excludes ranks an [`Instruction::Stop`] ended;
 //! - the head sends [`Instruction`]s.
 //!
 //! Each worker group's launches carry a generation, which every
 //! [`RankSpawn`] names and the launcher echoes in that rank's [`RankExit`].
-//! The head ends a group's generation with a stop before it relaunches the
-//! group under the next one, so an exit the launcher reported just before it
-//! read the stop is recognized as the stopped generation's rather than the
+//! The head ends a group's launch with a stop before it relaunches the group
+//! under the next generation, so an exit the launcher reported just before it
+//! read the stop is recognized as the stopped launch's rather than the
 //! relaunch's.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::launch::LaunchDescriptor;
-
-/// What a launcher says when it connects.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Presentation {
-    /// The host identity the launcher owns, as the placement names it.
-    pub host: String,
-}
-
 /// One instruction the head sends a launcher.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Instruction {
-    /// Start one rank from the descriptor the head derived for it, as a
-    /// member of its group's current generation.
+    /// Start one rank, as a member of its group's current generation. The
+    /// rank connects to the head and receives its launch descriptor there.
     Spawn(Box<RankSpawn>),
     /// Bind and hold a collective store socket for one worker group, which
     /// the launcher hands to that group's first rank when it spawns it. The
@@ -60,14 +51,11 @@ pub struct RankSpawn {
     /// The group generation the head is launching; the rank's exit report
     /// carries it back.
     pub generation: u64,
-    /// Ranks in the worker group's process world.
-    pub world_size: u32,
     /// Interpreter that runs the worker module.
     pub python: String,
-    /// The launch descriptor the rank reads, as the head derived it for a
-    /// local spawn. The launcher sets the inherited rendezvous socket's
-    /// number in the first rank's copy, which only it knows.
-    pub descriptor: LaunchDescriptor,
+    /// The head's address as this host reaches it, which the rank connects
+    /// to and registers at.
+    pub head: String,
     /// The variables the head's spawn command for this rank sets, applied
     /// over the environment the launcher inherited. A variable the head's
     /// command removes arrives with an empty value and is set empty rather
@@ -75,12 +63,9 @@ pub struct RankSpawn {
     pub environment: HashMap<String, String>,
 }
 
-/// One message a launcher sends after its presentation.
-///
-/// The two reports are distinguished by their fields: only a reservation
-/// carries a port.
+/// One message a launcher sends after its registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(rename_all = "snake_case")]
 pub enum Report {
     Reservation(Reservation),
     Exit(RankExit),
@@ -93,6 +78,10 @@ pub struct Reservation {
     pub worker_id: String,
     /// Port the launcher bound on its host for the group's collective store.
     pub port: u16,
+    /// The descriptor number the launcher holds the bound socket at. The
+    /// group's first rank inherits the socket at the same number, which the
+    /// head names in that rank's launch descriptor.
+    pub listen_fd: i32,
 }
 
 /// What a launcher says when one of its ranks exits.

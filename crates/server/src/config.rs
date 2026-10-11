@@ -139,7 +139,7 @@ impl Default for EngineSettings {
             data_parallel_size: 1,
             expert_parallel: None,
             worker_process: WorkerProcessArgs {
-                resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
+                max_message_bytes: EngineSettings::DEFAULT_MAX_MESSAGE_BYTES,
                 ..WorkerProcessArgs::default()
             },
         }
@@ -327,10 +327,10 @@ impl EngineSettings {
     /// model exposes a `max_model_len`.
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
 
-    /// Default response-ring slot capacity in bytes for the worker IPC
-    /// transport (64 MiB). `build_state` raises the configured capacity to the
-    /// model's channel payload capacity when that is larger.
-    pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
+    /// Default bound, in bytes, of one message on a rank's channel (64 MiB).
+    /// `build_state` raises the configured bound to the model's channel
+    /// payload capacity when that is larger.
+    pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 << 20;
 
     /// Default condition capacity in denoiser rows: two keyframes on the
     /// largest named canvas, 1008 rows each, so every `fl2va` request fits.
@@ -369,7 +369,7 @@ impl EngineSettings {
         crate::serving::validate_video_capacity(self.max_video_seconds)
             .map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
-            self.worker_process.resp_slot_cap > 0,
+            self.worker_process.max_message_bytes > 0,
             "resp_slot_cap must be greater than 0"
         );
         WorkerConfig::validate_all(&self.workers)?;
@@ -425,9 +425,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_resp_slot_cap_is_rejected() {
+    fn a_zero_message_bound_is_rejected() {
         let mut config = Config::default();
-        config.engine.worker_process.resp_slot_cap = 0;
+        config.engine.worker_process.max_message_bytes = 0;
         assert!(config.validate().is_err());
     }
 

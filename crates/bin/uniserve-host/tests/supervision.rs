@@ -1,15 +1,19 @@
-//! Host supervision through its public command stream and real child processes.
+//! Host supervision through its connection to the head and real child
+//! processes.
 //!
-//! Each test binds a TCP listener that stands in for the head, starts the
-//! built `uniserve-host` binary against it, and exchanges the launcher's
-//! newline-delimited JSON messages: instructions to the launcher, and its
-//! presentation, reservation replies, and rank exit reports back.
+//! Each test binds a listener that stands in for the head, starts the built
+//! `uniserve-host` binary against it, and exchanges the launcher's frames:
+//! its registration, instructions to the launcher, and reservation replies
+//! and rank exit reports back.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report, Reservation};
+use uniserve_ipc::{Channel, Listener, Registration, VERSION};
 
 /// Kills and reaps the launcher process when a test ends, including when it
 /// panics.
@@ -22,122 +26,63 @@ impl Drop for Launcher {
     }
 }
 
-/// Reads one newline-terminated JSON message from the launcher, panicking if
-/// the read fails, including on the socket's read timeout, or if the line is
-/// not JSON, as at end of stream.
-fn receive(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+/// Waits for the launcher's next report, panicking if none arrives within
+/// thirty seconds or the launcher closes the connection.
+fn receive(head: &mut Channel) -> Report {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(report) = head.try_recv().unwrap() {
+            return report;
+        }
+        assert!(Instant::now() < deadline, "the launcher sent no report");
+        head.wait(Duration::from_millis(50)).unwrap();
+    }
 }
 
-/// A complete launch descriptor for a one-component CPU stub rank, as the
-/// head sends it; the stand-in ranks here read at most its rendezvous socket.
-fn descriptor(rank: u32, world_size: u32) -> serde_json::Value {
-    let descriptor = uniserve_ipc::LaunchDescriptor {
-        worker_id: "group".into(),
-        registration_address: "127.0.0.1:1".into(),
-        channel_transport: "tcp".into(),
-        acknowledgment_slot: rank,
-        host_slots: (0..world_size).collect(),
-        products_cross_hosts: false,
-        queue_depth: 2,
-        ipc_payload_cap: 1 << 20,
-        model: String::new(),
-        base_model: None,
-        device: "cpu".into(),
+/// Waits for the launcher's answer to a reservation.
+fn reservation(head: &mut Channel) -> Reservation {
+    match receive(head) {
+        Report::Reservation(reservation) => reservation,
+        other => panic!("expected a reservation, received {other:?}"),
+    }
+}
+
+/// Waits for the launcher's report of a rank's exit.
+fn exit(head: &mut Channel) -> RankExit {
+    match receive(head) {
+        Report::Exit(exit) => exit,
+        other => panic!("expected an exit, received {other:?}"),
+    }
+}
+
+/// The launch of one rank of `worker_id`, run by `python`.
+fn spawn(worker_id: &str, rank: u32, generation: u64, python: &str) -> RankSpawn {
+    RankSpawn {
         rank,
-        local_rank: rank,
-        world_size,
-        components: std::collections::BTreeMap::from([(
-            "model".to_owned(),
-            uniserve_core::ComponentConfig::parallel(
-                (0..world_size as usize).collect(),
-                uniserve_core::ParallelConfig {
-                    tensor_parallel_size: world_size as usize,
-                    ..Default::default()
-                },
-            ),
-        )]),
-        deployment_components: vec!["model".into()],
-        supported_calls: None,
-        transfer_backends: "local".into(),
-        export_backends: "local".into(),
-        rendezvous_address: Some("127.0.0.1:1".into()),
-        rendezvous_listen_fd: None,
-        expert_parallel: None,
-        role: "model".into(),
-        expert_microbatches: 1,
-        distributed_backend: None,
-        mesh: None,
-        lane: Vec::new(),
-        no_model: true,
-        allow_stub: true,
-        load_format: "auto".into(),
-        download_dir: None,
-        load_threads: None,
-        checksum_manifest: None,
-        model_dtype: "bfloat16".into(),
-        quantization_config: serde_json::json!({}),
-        kv_cache_dtype: None,
-        kv_memory_fraction: 0.7,
-        kv_token_capacity: None,
-        attention_backend: "auto".into(),
-        block_size: None,
-        max_batch_calls: 8,
-        max_batch_tokens: 1024,
-        max_request_pool_size: 8,
-        max_model_len: 1024,
-        max_video_seconds: 15.0,
-        max_condition_rows: 0,
-        // The stub rank encodes many small images, so it keeps a larger
-        // encoder cache than a served model's default.
-        encoder_cache_entries: 1024,
-        ffmpeg: "ffmpeg".into(),
-        min_video_seconds: None,
-        graph_policy: "auto".into(),
-        decode_graph_batch_sizes: None,
-        prefill_cuda_graph: true,
-        prefill_outputs: true,
-        prefill_graph_token_sizes: None,
-        flow_cuda_graph: true,
-        flow_graph_batch_sizes: None,
-        flow_graph_shapes: None,
-        video_text_capacities: None,
-        video_canvases: Vec::new(),
-        canvas_sampling: None,
-        flashinfer_workspace_size: 512 << 20,
-        flashinfer_use_tensor_core: None,
-        flashinfer_decode_backend: "fa2".into(),
-        flashinfer_prefill_backend: "auto".into(),
-        flashinfer_decode_split_tile_size: None,
-        flashinfer_prefill_split_tile_size: None,
-        flashinfer_disable_split_kv: false,
-    };
-    serde_json::to_value(descriptor).unwrap()
+        worker_id: worker_id.into(),
+        generation,
+        python: python.into(),
+        head: "127.0.0.1:1".into(),
+        environment: HashMap::new(),
+    }
 }
 
-/// Starts a launcher against a head bound here and reads its presentation.
+/// Starts a launcher against a head bound here and takes its registration.
 ///
-/// Returns the launcher guard, the head's end of the connection for sending
-/// instructions, and a reader over a clone of it for receiving messages. The
-/// read timeout is set on the socket, so the clone shares it.
-fn start_launcher() -> (Launcher, TcpStream, BufReader<TcpStream>) {
+/// Returns the launcher guard and the head's end of the connection.
+fn start_launcher() -> (Launcher, Channel) {
     start_launcher_with(Stdio::null(), Stdio::inherit())
 }
 
 /// `start_launcher` with the launcher's log output sent to `stdout` and
 /// `stderr`.
-fn start_launcher_with(
-    stdout: Stdio,
-    stderr: Stdio,
-) -> (Launcher, TcpStream, BufReader<TcpStream>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+fn start_launcher_with(stdout: Stdio, stderr: Stdio) -> (Launcher, Channel) {
+    let listener = Listener::bind(&["127.0.0.1:0"]).unwrap();
     let launcher = Launcher(
         Command::new(env!("CARGO_BIN_EXE_uniserve-host"))
             .args([
                 "--head",
-                &listener.local_addr().unwrap().to_string(),
+                &listener.addresses()[0],
                 "--host-identity",
                 "host",
             ])
@@ -146,121 +91,139 @@ fn start_launcher_with(
             .spawn()
             .unwrap(),
     );
-    let (stream, _) = listener.accept().unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    assert_eq!(receive(&mut reader)["host"], "host");
-    (launcher, stream, reader)
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut head = loop {
+        if let Some(head) = listener.try_accept().unwrap() {
+            break head;
+        }
+        assert!(Instant::now() < deadline, "the launcher did not connect");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    // The launcher's first frame says which host it owns and what it was
+    // built as.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let registration: Registration = loop {
+        if let Some(registration) = head.try_recv().unwrap() {
+            break registration;
+        }
+        assert!(Instant::now() < deadline, "the launcher did not register");
+        head.wait(Duration::from_millis(50)).unwrap();
+    };
+    assert_eq!(
+        registration,
+        Registration::Launcher {
+            host: "host".into(),
+            version: VERSION.into(),
+        }
+    );
+    (launcher, head)
 }
 
 #[test]
 fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() {
-    let (_launcher, mut stream, mut reader) = start_launcher();
+    let (_launcher, mut head) = start_launcher();
 
-    // A partial instruction must survive the supervisor's child-exit polling.
-    // The pause outlasts the read timeout `supervise` sets on the head
-    // connection, so the partial line spans more than one poll.
-    stream.write_all(b"{\"reserve\":").unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    stream.write_all(b"{\"worker_id\":\"first\"}}\n").unwrap();
-    let first = receive(&mut reader);
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"reserve": {"worker_id": "second"}})
-    )
-    .unwrap();
-    let second = receive(&mut reader);
-    assert_ne!(first["port"], second["port"]);
+    for worker in ["first", "second"] {
+        head.send(&Instruction::Reserve {
+            worker_id: worker.into(),
+        })
+        .unwrap();
+    }
+    let first = reservation(&mut head);
+    let second = reservation(&mut head);
+    assert_eq!(
+        (first.worker_id.as_str(), second.worker_id.as_str()),
+        ("first", "second")
+    );
+    assert_ne!(first.port, second.port);
 
     // /bin/false is a real process with a known exit status; numerical worker
     // initialization is irrelevant to the host's independent exit reporting.
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"spawn": {
-            "rank": 0, "worker_id": "first", "generation": 3, "world_size": 1,
-            "python": "/bin/false", "descriptor": descriptor(0, 1), "environment": {}
-        }})
-    )
+    head.send(&Instruction::Spawn(Box::new(spawn(
+        "first",
+        0,
+        3,
+        "/bin/false",
+    ))))
     .unwrap();
 
     // No further instruction is sent: the report must come from the
     // launcher's own polling of its ranks. It names the generation the
     // rank's spawn carried, which is how the head tells it from an exit of
     // the same rank before its group was relaunched.
-    let exit = receive(&mut reader);
-    assert_eq!(exit["worker_id"], "first");
-    assert_eq!(exit["generation"], 3);
-    assert_eq!(exit["rank"], 0);
-    assert_eq!(exit["status"], "exit status: 1");
+    assert_eq!(
+        exit(&mut head),
+        RankExit {
+            worker_id: "first".into(),
+            generation: 3,
+            rank: 0,
+            status: "exit status: 1".into(),
+        }
+    );
 }
 
 #[test]
 fn the_first_rank_serves_its_store_on_the_reserved_port() {
-    let (_launcher, mut stream, mut reader) = start_launcher();
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"reserve": {"worker_id": "group"}})
-    )
+    let (_launcher, mut head) = start_launcher();
+    head.send(&Instruction::Reserve {
+        worker_id: "group".into(),
+    })
     .unwrap();
-    let port = receive(&mut reader)["port"].as_u64().unwrap() as u16;
+    let reserved = reservation(&mut head);
 
-    // The rank's module accepts one peer on the socket its descriptor names,
-    // which is how a collective store serves on an inherited socket. The
-    // package is regular so it shadows any installed worker package.
+    // The rank's module accepts one peer on the socket it inherits at the
+    // number the reservation reported, which is how a collective store serves
+    // on an inherited socket. The head names that number in the rank's launch
+    // descriptor; this stand-in is given it in its environment. The package
+    // is regular so it shadows any installed worker package.
     let modules = tempfile::tempdir().unwrap();
     let package = modules.path().join("uniserve_models");
     std::fs::create_dir(&package).unwrap();
     std::fs::write(package.join("__init__.py"), "").unwrap();
     std::fs::write(
         package.join("worker.py"),
-        "import json, socket, sys\n\
-         path = sys.argv[sys.argv.index('--launch-descriptor') + 1]\n\
-         descriptor = json.load(open(path))\n\
-         store = socket.socket(fileno=descriptor['rendezvous_listen_fd'])\n\
+        "import os, socket\n\
+         store = socket.socket(fileno=int(os.environ['STORE_FD']))\n\
          peer, _ = store.accept()\n\
          peer.sendall(b'served\\n')\n",
     )
     .unwrap();
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"spawn": {
-            "rank": 0, "worker_id": "group", "generation": 0, "world_size": 2,
-            "python": "python3", "descriptor": descriptor(0, 2),
-            "environment": {"PYTHONPATH": modules.path()}
-        }})
-    )
-    .unwrap();
+    let mut rank = spawn("group", 0, 0, "python3");
+    rank.environment = HashMap::from([
+        (
+            "PYTHONPATH".to_owned(),
+            modules.path().to_str().unwrap().to_owned(),
+        ),
+        ("STORE_FD".to_owned(), reserved.listen_fd.to_string()),
+    ]);
+    head.send(&Instruction::Spawn(Box::new(rank))).unwrap();
 
     // The reserved socket is already listening, so this connection waits in
     // its backlog until the rank starts and accepts it; the generous read
     // timeout covers the interpreter's startup.
-    let peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let peer = TcpStream::connect(("127.0.0.1", reserved.port)).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     let mut served = String::new();
-    BufReader::new(peer).read_line(&mut served).unwrap();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(peer), &mut served).unwrap();
     assert_eq!(served, "served\n");
 
-    let exit = receive(&mut reader);
     assert_eq!(
-        (
-            exit["worker_id"].as_str(),
-            exit["generation"].as_u64(),
-            exit["rank"].as_u64()
-        ),
-        (Some("group"), Some(0), Some(0))
+        exit(&mut head),
+        RankExit {
+            worker_id: "group".into(),
+            generation: 0,
+            rank: 0,
+            status: "exit status: 0".into(),
+        }
     );
-    assert_eq!(exit["status"], "exit status: 0");
     // The launcher kept no copy of the socket it handed over, so the port
     // closes with the rank that served it.
     assert_eq!(
-        TcpStream::connect(("127.0.0.1", port)).unwrap_err().kind(),
+        TcpStream::connect(("127.0.0.1", reserved.port))
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::ConnectionRefused
     );
 }
@@ -275,10 +238,10 @@ struct StandIn {
 
 #[cfg(target_os = "linux")]
 impl StandIn {
-    /// Has the launcher behind `stream` spawn rank 1 of group `group` as a
+    /// Has the launcher behind `head` spawn rank 1 of group `group` as a
     /// shell script that records its PID and then sleeps under that PID, and
     /// waits for it to start.
-    fn spawn(stream: &mut TcpStream, group: &str) -> Self {
+    fn spawn(head: &mut Channel, group: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
 
         // The launcher runs `<python> -m uniserve_models.worker ...`; the
@@ -292,16 +255,12 @@ impl StandIn {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        writeln!(
-            stream,
-            "{}",
-            serde_json::json!({"spawn": {
-                "rank": 1, "worker_id": group, "generation": 0, "world_size": 2,
-                "python": script, "descriptor": descriptor(1, 2),
-                "environment": {"RANK_PID_FILE": pid_file}
-            }})
-        )
-        .unwrap();
+        let mut rank = spawn(group, 1, 0, script.to_str().unwrap());
+        rank.environment = HashMap::from([(
+            "RANK_PID_FILE".to_owned(),
+            pid_file.to_str().unwrap().to_owned(),
+        )]);
+        head.send(&Instruction::Spawn(Box::new(rank))).unwrap();
 
         let mut pid = None;
         assert!(
@@ -357,8 +316,8 @@ fn eventually(mut condition: impl FnMut() -> bool) -> bool {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_killed_launcher_takes_its_ranks_with_it() {
-    let (mut launcher, mut stream, _reader) = start_launcher();
-    let rank = StandIn::spawn(&mut stream, "group");
+    let (mut launcher, mut head) = start_launcher();
+    let rank = StandIn::spawn(&mut head, "group");
     assert!(rank.alive());
 
     // SIGKILL skips every exit path of the launcher's own.
@@ -374,8 +333,8 @@ fn a_killed_launcher_takes_its_ranks_with_it() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_closed_log_pipe_does_not_end_supervision() {
-    let (mut launcher, mut stream, reader) = start_launcher_with(Stdio::piped(), Stdio::piped());
-    let rank = StandIn::spawn(&mut stream, "group");
+    let (mut launcher, mut head) = start_launcher_with(Stdio::piped(), Stdio::piped());
+    let rank = StandIn::spawn(&mut head, "group");
 
     // Closing the read ends, as a dropped SSH session does, makes every
     // later log write fail.
@@ -384,11 +343,9 @@ fn a_closed_log_pipe_does_not_end_supervision() {
 
     // The launcher still follows the head: a stop ends the group's rank, and
     // the head closing the connection ends the launcher cleanly.
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({"stop": {"worker_id": "group"}})
-    )
+    head.send(&Instruction::Stop {
+        worker_id: "group".into(),
+    })
     .unwrap();
     assert!(
         eventually(|| !rank.alive()),
@@ -400,8 +357,7 @@ fn a_closed_log_pipe_does_not_end_supervision() {
         "the launcher ended with its log pipe"
     );
 
-    drop(stream);
-    drop(reader);
+    drop(head);
     let mut status = None;
     assert!(eventually(|| {
         status = launcher.0.try_wait().unwrap();

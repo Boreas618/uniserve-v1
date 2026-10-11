@@ -1,16 +1,19 @@
 //! One rank's process and channel, from spawn to shutdown.
 //!
-//! `PendingRank::spawn_rank` writes the rank's launch descriptor and starts
+//! `PendingRank::spawn_rank` derives the rank's launch descriptor and starts
 //! the rank process here, or hands the launch to the host's launcher
 //! (`launcher::RemoteHost`) when the placement puts the rank on another host.
-//! Once the rank reports its endpoint through `registration::RankRegistry`,
-//! `PendingRank::adopt` binds a `RankChannel` to it and yields a
-//! `RankProcess`, which `WorkerGroup` (in `instance`) drives:
-//! `finish_startup` validates the rank's startup report, `submit_batch` and
+//! The rank connects to the head and registers (`registry::RankRegistry`);
+//! `PendingRank::adopt` answers on that connection with the descriptor and
+//! yields a `RankProcess`, which `WorkerGroup` (in `instance`) drives:
+//! `finish_startup` validates the ranks' startup reports, `submit_batch` and
 //! `poll_batch` exchange batches and results, and `close_ranks` or
 //! `terminate` retires the rank.
 //!
-//! The host exchanges FlatBuffers descriptors and bounded result values while
+//! A rank's connection is its liveness: the head treats a rank whose
+//! connection has closed as dead.
+//!
+//! The host exchanges batch descriptors and bounded result values while
 //! tensors, KV pages, and latent storage remain worker-resident.
 //!
 //! The module also defines the launch settings `WorkerProcessArgs` carries
@@ -27,35 +30,14 @@ use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uniserve_ipc::Channel;
 use uniserve_ipc::{
     Batch, DEFAULT_COMPONENT, ExpertParallelDescriptor, LaunchDescriptor, WorkerInfo,
     WorkerRequest, WorkerResponse,
 };
-use uniserve_ipc::{Frame, Outstanding, RankChannel};
-
-/// How long the head waits for a rank's socket channel to accept.
-///
-/// A rank binds its address before it registers, so this covers accepting an
-/// already-bound connection rather than waiting for the rank to start. A
-/// shared-storage connect does not use it.
-const CHANNEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 use crate::worker::WorkerProcessArgs;
-use crate::worker::death_watch::DeathWatcher;
 
-/// Deadline for `finish_startup` to send the startup info request, retrying
-/// until the rank's end of the channel is connected.
-///
-/// It bounds only the send. The rank answers once its model is built and
-/// warmed up, and that wait has no deadline here (see
-/// `RankProcess::wait_pending_response`).
-const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
-/// Deadline for sending the shutdown request in `request_close`.
-///
-/// The channel was connected at startup, so a missing server connection at
-/// this point means the rank has dropped off, and shutdown fails fast rather
-/// than waiting for the startup deadline.
-const WORKER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time `request_close` spends draining in-flight responses from a
 /// still-alive worker before it sends the shutdown request. A hung (alive but
 /// unresponsive) worker must not be able to block shutdown forever.
@@ -66,15 +48,14 @@ const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// its teardown had not yet released.
 const WORKER_EXIT_GRACE: Duration = Duration::from_secs(30);
 /// Longest wait between checks for the exit of a rank `close_ranks` is
-/// closing. A local process exit raises no wake once the rank's death watcher
-/// has stopped, and a launcher reports a remote exit within its own
-/// 100-millisecond read timeout.
+/// closing. A local process exit raises no wake, and a launcher reports a
+/// remote exit within its own 100-millisecond read timeout.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Interval between progress logs while a rank prepares during startup.
 const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Longest wait between liveness checks (`RankProcess::check_worker`) while
-/// waiting on a rank, which bounds how late a local rank's exit is noticed
-/// without a death watcher.
+/// waiting on a rank, which bounds how late a local rank's exit status is
+/// read once its connection has closed.
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub use uniserve_ipc::LaneConfig;
@@ -172,8 +153,7 @@ impl Default for WorkerProcessArgs {
             peers: Default::default(),
             stub: false,
             queue_depth: 2,
-            req_slot_cap: 1 << 20,
-            resp_slot_cap: 8 << 20,
+            max_message_bytes: 8 << 20,
             kv_token_capacity: None,
             block_size: None,
             max_batch_calls: 128,
@@ -254,38 +234,24 @@ impl WorkerProcessArgs {
         self.ranks.len() as u32
     }
 
-    /// Names the channel mechanism `rank` serves its endpoint over.
-    ///
-    /// A rank on the head's host can offer shared storage; a rank placed
-    /// elsewhere has none to offer and serves a socket.
-    fn channel_transport(&self, rank: u32) -> &'static str {
-        if self.ranks[rank as usize].node == self.host {
-            uniserve_ipc::SHARED_STORAGE_CHANNEL
-        } else {
-            uniserve_ipc::SOCKET_CHANNEL
-        }
-    }
-
     /// Builds the typed launch descriptor the worker process consumes.
     ///
     /// Every tuning value is stated explicitly, so the launching side is the
     /// single source of defaults and the worker never re-derives one. The
-    /// worker deserializes the same [`LaunchDescriptor`] type and refuses an
-    /// unknown or missing key. Only the process identity and the
-    /// descriptor's path travel on argv.
+    /// head answers the rank's registration with it; only the head's address
+    /// and the rank's identity travel on argv.
     ///
     /// `rank` must index `self.ranks`. Fails when a host-relative rank value
     /// does not fit `u32` or the role does not serialize.
     pub(crate) fn launch_descriptor(
         &self,
         rank: u32,
-        registration: &str,
         rendezvous: Option<&str>,
         rendezvous_listen_fd: Option<std::os::fd::RawFd>,
         expert_listen_fd: Option<std::os::fd::RawFd>,
     ) -> anyhow::Result<LaunchDescriptor> {
         let depth = self.queue_depth.max(1);
-        let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
+        let max_payload = self.max_message_bytes.max(1);
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (transfer_backends, export_backends) =
             self.transfer.rank_backends(&self.worker_id, rank);
@@ -313,12 +279,6 @@ impl WorkerProcessArgs {
 
         Ok(LaunchDescriptor {
             worker_id: self.worker_id.clone(),
-            registration_address: registration.to_owned(),
-            // The placement decides the mechanism and the rank names the
-            // endpoint: a rank on the head's host can offer shared storage,
-            // a rank elsewhere cannot, and only the head knows where a rank
-            // was placed.
-            channel_transport: self.channel_transport(rank).to_owned(),
             // A rank cannot name the ranks that read what it publishes: it
             // knows its own component, not which component consumes its
             // products. The head states a product's readers on the call that
@@ -438,46 +398,35 @@ fn serde_name(value: &impl Serialize) -> anyhow::Result<String> {
 ///
 /// Dropping it closes the rank alone through `close_ranks`.
 pub(super) struct RankProcess {
-    client: RankChannel,
+    client: Channel,
     /// The rank's validated startup report; the default value until
     /// `finish_startup` stores it.
     info: WorkerInfo,
     /// The startup cancellation flag shared by the ranks launched together,
-    /// which any of their death watchers sets. `WorkerGroup` detaches it with
-    /// `set_startup_cancel(None)` once the group is ready.
+    /// which the teardown of any of them sets. `WorkerGroup` detaches it
+    /// with `set_startup_cancel(None)` once the group is ready.
     startup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The rank's process, when this engine started it. A rank placed on
     /// another host is started by that host's launcher and its process is
     /// never visible here; its exit surfaces through the channel once the
-    /// connection closes, as `death` in its wake events or as a transport
-    /// error from a receive.
+    /// connection closes, as a transport error from a receive.
     child: Option<Child>,
-    /// Keeps the launch descriptor's directory alive for the rank's
-    /// lifetime; dropping it deletes the file.
-    _launch_descriptor: tempfile::TempDir,
-    /// Most requests outstanding at once. `adopt` also sizes the channel
-    /// with it (see `RankChannel::connect`), and `finish_startup` requires
-    /// the worker to report the same `queue_depth`.
+    /// Most requests outstanding at once on the rank.
     depth: usize,
     rank: u32,
-    world_size: u32,
-    expected_components: std::collections::BTreeMap<String, uniserve_core::ComponentConfig>,
     /// Submitted batches awaiting a response, by message identity.
-    pending: HashMap<u64, PendingRecord>,
+    pending: HashMap<u64, OutstandingKind>,
     /// Routed results and errors, in arrival order, that `poll_batch` has
     /// not returned yet.
     ready: VecDeque<anyhow::Result<WorkerResult>>,
     /// Next message identity to assign. Identities start at 1 and are never
-    /// zero; `route` treats a zero header identity as absent.
+    /// zero, which is the identity a channel gives a response that states
+    /// none.
     next_message_id: u64,
     /// How far the rank's retirement has progressed.
     retirement: Retirement,
-    /// Edge-triggered worker-death watcher: fires the channel's death wake
-    /// and sets the startup cancellation flag when the child exits. `None`
-    /// for a rank started on another host, off Linux, when
-    /// `DeathWatcher::spawn` failed, and once `request_close` or `terminate`
-    /// has stopped it; a local rank's exit is then noticed by `check_worker`.
-    death_watcher: Option<DeathWatcher>,
+    /// Whether the startup report has been asked for and has not arrived.
+    starting: bool,
 }
 
 /// How far a rank's retirement has progressed.
@@ -485,35 +434,32 @@ enum Retirement {
     /// Neither `request_close` nor `terminate` has run.
     Serving,
     /// `request_close` has asked the rank to shut down, and `await_close`
-    /// has not yet waited for it. `acknowledgment` is the shutdown request
-    /// while its answer is outstanding; it is `None` when the rank had
-    /// already exited or the request could not be sent.
-    Closing { acknowledgment: Option<Outstanding> },
+    /// has not yet waited for it. `acknowledgment` is the shutdown request's
+    /// message identity while its answer is outstanding; it is `None` when
+    /// the rank had already exited or the request could not be sent.
+    Closing { acknowledgment: Option<u64> },
     /// The rank was closed or terminated; nothing remains to do.
     Retired,
 }
 
-/// One launched rank between its start and its endpoint report.
+/// One launched rank between its start and its registration.
 ///
-/// The engine cannot bind the rank's channel until the rank names its own
-/// endpoint, so everything the channel needs is retained here meanwhile.
+/// The rank's channel exists once the rank has connected and registered, so
+/// everything the rank is answered with is retained here meanwhile.
 pub(super) struct PendingRank {
     /// Released by adoption; a local rank still held here is killed when
     /// this value drops, as it does when the launch fails.
     child: PendingChild,
     rank: u32,
-    world_size: u32,
-    /// Channel sizing `adopt` passes to `RankChannel::connect`.
+    /// Most requests outstanding at once on the rank.
     depth: usize,
-    /// Largest frame payload in bytes, in either direction.
+    /// Largest encoded message in bytes, which `adopt` sets as the bound of
+    /// what the head sends the rank.
     max_payload: usize,
     /// Moves by adoption alongside the process it cancels.
     startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Retains the launch descriptor until the rank has read it; adoption
-    /// transfers it to the `RankProcess`, which keeps it for the rank's
-    /// lifetime.
-    launch_descriptor: tempfile::TempDir,
-    components: std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
+    /// The launch descriptor `adopt` answers the rank's registration with.
+    descriptor: LaunchDescriptor,
 }
 
 /// The process of a launched rank that has not been adopted yet, when this
@@ -525,23 +471,6 @@ impl PendingChild {
     fn release(mut self) -> Option<Child> {
         self.0.take()
     }
-}
-
-/// One submitted request awaiting its response.
-struct PendingRecord {
-    kind: OutstandingKind,
-    pending: Outstanding,
-}
-
-/// Drops an answered request's channel handle and returns what it was sent for.
-///
-/// On a shared-storage channel, dropping the handle frees one of the
-/// iceoryx2 client's active-request slots, of which it holds at most the
-/// rank's queue depth.
-fn release_consumed_request(record: PendingRecord) -> OutstandingKind {
-    let PendingRecord { kind, pending } = record;
-    drop(pending);
-    kind
 }
 
 /// What an outstanding request was sent for; only batch submissions are
@@ -626,49 +555,38 @@ pub(crate) struct RankSockets {
 }
 
 impl PendingRank {
-    /// Spawns one rank, which reports its endpoint to `registration`.
+    /// Spawns one rank, which connects to the head at `head` and registers.
     ///
-    /// The rank's channel is bound afterwards from that report, so nothing here
-    /// names the endpoint and nothing waits for model readiness. `rendezvous`
-    /// is the group's collective store address, and `sockets.group` the
-    /// socket this rank serves that store on when it is the group's first rank
-    /// and this process spawns it; the rank inherits the socket and this
-    /// process keeps no copy. With `remote`, the launch goes to that host's
-    /// launcher and no process is started here. `startup_abort` is the
-    /// startup cancellation flag shared by the ranks launched together.
-    /// `sockets.experts` is the socket this rank serves its expert-parallel
-    /// world's store on, when it is that world's rank 0.
+    /// Nothing here waits for the rank. `rendezvous` is the group's
+    /// collective store address, and `sockets.group` the socket this rank
+    /// serves that store on when it is the group's first rank and this
+    /// process spawns it; the rank inherits the socket and this process keeps
+    /// no copy. `store_fd` is the descriptor number a first rank on another
+    /// host inherits that socket at, as its launcher reported it. With
+    /// `remote`, the launch goes to that host's launcher and no process is
+    /// started here. `startup_abort` is the startup cancellation flag shared
+    /// by the ranks launched together. `sockets.experts` is the socket this
+    /// rank serves its expert-parallel world's store on, when it is that
+    /// world's rank 0.
     ///
-    /// Fails when the descriptor directory cannot be created, the rank's
-    /// host-relative values or its descriptor cannot be built, the descriptor
-    /// cannot be written, the remote delivery fails, or the process cannot be
-    /// spawned.
+    /// Fails when the rank's host-relative values or its descriptor cannot
+    /// be built, the remote delivery fails, or the process cannot be spawned.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_rank(
         args: &WorkerProcessArgs,
         rank: u32,
         rendezvous: Option<&str>,
         sockets: RankSockets,
+        store_fd: Option<std::os::fd::RawFd>,
         remote: Option<&mut super::launcher::RemoteHost<'_>>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        registration: &str,
+        head: &str,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
-        let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
+        let max_payload = args.max_message_bytes.max(1);
         let world_size = args.world_size();
 
-        let descriptor_directory = tempfile::Builder::new()
-            .prefix("uniserve-worker-launch")
-            .tempdir()
-            .context("creating the worker launch descriptor directory")?;
-        let descriptor_path = descriptor_directory.path().join("launch.json");
-
-        let mut cmd = uniserve_ipc::launch::rank_command(
-            &args.python,
-            &args.worker_id,
-            rank,
-            world_size,
-            &descriptor_path,
-        );
+        let mut cmd = uniserve_ipc::launch::rank_command(&args.python, head, &args.worker_id, rank);
 
         // Torch and the numerical libraries read the host-relative pair; the
         // global pair names the rank's place in the whole process world.
@@ -692,71 +610,43 @@ impl PendingRank {
         // process's copy when it is dropped, after the spawn below.
         let rendezvous_listen_fd = sockets
             .group
-            .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener));
+            .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener))
+            .or(store_fd);
         let expert_listen_fd = sockets
             .experts
             .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener));
 
-        // One typed descriptor carries every launch value. argv keeps the
-        // process identity and the descriptor's location so a running worker
-        // remains identifiable from the process table.
-        let descriptor = args.launch_descriptor(
-            rank,
-            registration,
-            rendezvous,
-            rendezvous_listen_fd,
-            expert_listen_fd,
-        )?;
-        std::fs::write(&descriptor_path, descriptor.to_json()?)
-            .context("writing the worker launch descriptor")?;
+        // One typed descriptor carries every launch value. The head keeps it
+        // and answers the rank's registration with it.
+        let descriptor =
+            args.launch_descriptor(rank, rendezvous, rendezvous_listen_fd, expert_listen_fd)?;
 
         // A rank placed on another host is started by that host's launcher,
-        // which needs the same descriptor and environment this process would
+        // which needs the same command and environment this process would
         // have used. The head derives both once, here, for either path.
-        if let Some(remote) = remote {
-            remote.deliver(
-                rank,
-                world_size,
-                &args.python,
-                &args.worker_id,
-                &descriptor,
-                &cmd,
-            )?;
-            return Ok(Self {
-                child: PendingChild(None),
-                rank,
-                world_size,
-                depth,
-                max_payload,
-                startup_abort,
-                launch_descriptor: descriptor_directory,
-                components: args.components.clone(),
-            });
-        }
-        let child = cmd.spawn().context("spawning the rank process")?;
+        let child = match remote {
+            Some(remote) => {
+                remote.deliver(rank, &args.python, &args.worker_id, head, &cmd)?;
+                None
+            }
+            None => Some(cmd.spawn().context("spawning the rank process")?),
+        };
 
         Ok(Self {
-            child: PendingChild(Some(child)),
+            child: PendingChild(child),
             rank,
-            world_size,
             depth,
             max_payload,
             startup_abort,
-            launch_descriptor: descriptor_directory,
-            components: args.components.clone(),
+            descriptor,
         })
     }
 
-    /// Returns the rank this process was launched as.
-    pub(crate) fn rank(&self) -> u32 {
-        self.rank
-    }
-
-    /// Fails by name when the rank exited before reporting its endpoint.
+    /// Fails by name when the rank exited before registering.
     ///
-    /// `RankRegistry::collect` calls this, through the `alive` callback
-    /// `adopt_ranks` passes it, while no report is waiting. Reaps the process
-    /// when it has exited.
+    /// `RankRegistry::collect` calls this, through the `alive` callback `adopt_ranks`
+    /// passes it, while the launch is incomplete. Reaps the process when it
+    /// has exited.
     pub(crate) fn check_alive(&mut self) -> anyhow::Result<()> {
         // A rank started by another host's launcher has no process here. Its
         // exit before registration reaches the head as a report from the
@@ -767,82 +657,55 @@ impl PendingRank {
         match child.try_wait() {
             Ok(None) => Ok(()),
             Ok(Some(status)) => Err(anyhow::anyhow!(
-                "rank {} exited with {status} before reporting its endpoint",
+                "rank {} exited with {status} before registering",
                 self.rank
             )),
             Err(error) => Err(error).context("checking a launched rank"),
         }
     }
 
-    /// Binds this rank's channel to the endpoint and mechanism the rank reported.
+    /// Answers the rank's registration on `channel` with its launch
+    /// descriptor and takes the connection as the rank's channel.
     ///
     /// The returned `RankProcess` owns the rank's process, when this engine
-    /// spawned it, and a death watcher for it when one can be started. Its
-    /// `info` stays the default until `RankProcess::finish_startup` runs.
-    pub(crate) fn adopt(self, transport: &str, endpoint: &str) -> anyhow::Result<RankProcess> {
-        let rank = self.rank;
-        // The process stays owned here until the channel exists, so a failed
-        // connection terminates the rank instead of orphaning it.
-        let client = RankChannel::connect(
-            transport,
-            endpoint,
-            self.max_payload,
-            self.depth,
-            CHANNEL_CONNECT_TIMEOUT,
-        )
-        .with_context(|| format!("connecting to the channel rank {rank} reported"))?;
-        // The mechanism and endpoint are the rank's choice, so the head records
-        // what it bound.
-        tracing::info!(
-            rank,
-            transport,
-            endpoint,
-            "bound rank channel from its registration"
-        );
-
+    /// spawned it. Its `info` stays the default until `finish_startup` runs.
+    pub(crate) fn adopt(self, mut channel: Channel) -> anyhow::Result<RankProcess> {
         let PendingRank {
             child,
             rank,
-            world_size,
             depth,
-            max_payload: _,
+            max_payload,
             startup_abort,
-            launch_descriptor,
-            components,
+            descriptor,
         } = self;
-        let child = child.release();
-        // A watcher observes a process identifier, so only a rank this engine
-        // started has one. A rank elsewhere falls to the bounded liveness
-        // probe, which reads its channel rather than its process.
-        let death_watcher = child.as_ref().and_then(|child| {
-            DeathWatcher::spawn(
-                child.id(),
-                client.death_wake(),
-                std::sync::Arc::clone(&startup_abort),
-            )
-        });
+
+        // The process stays owned by `child` until the answer is sent, so a
+        // failed send terminates the rank instead of orphaning it.
+        channel
+            .send(&descriptor)
+            .with_context(|| format!("sending rank {rank} its launch descriptor"))?;
+        channel.set_bound(max_payload);
+        tracing::info!(rank, "a rank registered and received its launch descriptor");
+
         Ok(RankProcess {
-            client,
+            client: channel,
             info: WorkerInfo::default(),
             startup_cancel: Some(startup_abort),
-            child,
-            _launch_descriptor: launch_descriptor,
+            child: child.release(),
             depth,
             rank,
-            world_size,
-            expected_components: components,
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_message_id: 1,
             retirement: Retirement::Serving,
-            death_watcher,
+            starting: false,
         })
     }
 }
 
 impl Drop for PendingChild {
-    /// A rank that never reported an endpoint has no channel to close through,
-    /// so a failed launch terminates its process here rather than leaking it.
+    /// A rank that never registered has no channel to close through, so a
+    /// failed launch terminates its process here rather than leaking it.
     fn drop(&mut self) {
         if let Some(child) = self.0.as_mut() {
             let _ = child.kill();
@@ -852,25 +715,38 @@ impl Drop for PendingChild {
 }
 
 impl RankProcess {
-    /// Waits for the rank's startup report and checks it against the launch.
+    /// Asks the rank for its startup report.
     ///
-    /// The rank answers the info request only once its model is built and
-    /// warmed up, so once the request is sent this blocks for the rank's
-    /// whole preparation, bounded by the rank's liveness and the startup
-    /// cancellation flag rather than a deadline. The report must be valid,
-    /// match the launched queue depth, rank, world size, and components, and
-    /// state the resolved model dtype and attention backend. On success it
-    /// becomes `info`; on failure `info` is unchanged.
-    pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
+    /// The rank answers only once its model is built and warmed up;
+    /// `poll_startup` takes the answer.
+    fn request_startup(&mut self) -> anyhow::Result<()> {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
         request.set_call_id(Some(message_id));
-        let pending =
-            self.send_request_with_timeout(&request, "Worker startup", WORKER_CONNECT_TIMEOUT)?;
-        let response = self
-            .wait_pending_response(&pending, "Worker startup")?
-            .decode_response()?;
+        self.client.send(&request)?;
+        self.starting = true;
+        Ok(())
+    }
 
+    /// Takes the rank's startup report if it has arrived, as `info`. Returns
+    /// whether the rank's startup is complete.
+    ///
+    /// Fails when the rank reports that its startup failed, and when its
+    /// connection has closed, which is how a rank that died while starting
+    /// is noticed.
+    fn poll_startup(&mut self) -> anyhow::Result<bool> {
+        let response = self
+            .client
+            .try_recv::<WorkerResponse>()
+            .with_context(|| format!("rank {} was lost during startup", self.rank))?;
+        // A rank that is ready stays under watch until its peers are: the
+        // receive above is what notices its connection closing.
+        if !self.starting {
+            return Ok(true);
+        }
+        let Some(response) = response else {
+            return Ok(false);
+        };
         let info = match response {
             WorkerResponse::Info { info, .. } => info,
             WorkerResponse::Error { error, .. } => {
@@ -885,40 +761,11 @@ impl RankProcess {
             other => bail!("unexpected startup response: {:?}", other.kind()),
         };
 
-        info.validate()
-            .context("worker reported invalid worker info during startup")?;
-        let host_depth = self.depth as u32;
-        anyhow::ensure!(
-            info.queue_depth == host_depth,
-            "worker queue_depth {} does not match launched depth {}",
-            info.queue_depth,
-            host_depth
-        );
-        anyhow::ensure!(
-            info.endpoint.rank == self.rank && info.world_size == self.world_size,
-            "worker process rank/world_size ({}/{}) does not match launched topology ({}/{})",
-            info.endpoint.rank,
-            info.world_size,
-            self.rank,
-            self.world_size
-        );
-        anyhow::ensure!(
-            info.components
-                .iter()
-                .map(|entry| (entry.name.clone(), entry.config.clone()))
-                .collect::<std::collections::BTreeMap<_, _>>()
-                == self.expected_components,
-            "worker resolved component configuration disagrees with configuration"
-        );
-        anyhow::ensure!(
-            !info.model_dtype.is_empty() && !info.attention_backend.is_empty(),
-            "worker omitted resolved numerical settings"
-        );
-
         self.check_worker("Worker startup")?;
         self.info = info;
+        self.starting = false;
         tracing::info!(?self.info, "worker ready");
-        Ok(())
+        Ok(true)
     }
 
     /// Allocates the next worker message identifier.
@@ -952,9 +799,6 @@ impl RankProcess {
     /// Sends no shutdown request and discards outstanding and routed results.
     pub(crate) fn terminate(&mut self) {
         self.retirement = Retirement::Retired;
-        // The watcher stops before the kill, so the intended exit raises no
-        // death wake and no startup cancellation.
-        self.death_watcher.take();
         // A rank this engine started is killed and reaped here. A rank
         // elsewhere has no process here: `WorkerGroup` recovery stops it
         // through `LauncherRegistry::stop_worker`, and a launcher terminates
@@ -988,132 +832,40 @@ impl RankProcess {
         Ok(())
     }
 
-    /// Sends a request, waiting at most `WORKER_SEND_TIMEOUT` for a
-    /// connected server.
-    fn send_request_checked(
-        &mut self,
-        req: &WorkerRequest,
-        context: &str,
-    ) -> anyhow::Result<Outstanding> {
-        self.send_request_with_timeout(req, context, WORKER_SEND_TIMEOUT)
-    }
-
-    /// Waits for an IPC server connection and submits a request before the deadline.
+    /// Drains ready responses and routes them into `ready`, and returns how
+    /// many were routed.
     ///
-    /// Retries while a socket send queue is full or a shared-storage request
-    /// reached no connected server, checking liveness between attempts. Wakes
-    /// consumed by the wait between attempts are not reported to the caller.
-    fn send_request_with_timeout(
-        &mut self,
-        req: &WorkerRequest,
-        context: &str,
-        timeout: Duration,
-    ) -> anyhow::Result<Outstanding> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let pending = match self.client.send_request_attempt(req) {
-                Ok(pending) => Some(pending),
-                Err(uniserve_ipc::IpcError::WouldBlock) => None,
-                Err(error) => return Err(error.into()),
-            };
-            // An unconnected shared-storage request reaches no one; it drops at
-            // the end of this iteration, which frees its request slot.
-            if let Some(pending) = pending
-                && self.client.is_connected(&pending)
-            {
-                return Ok(pending);
-            }
-            self.check_worker(context)?;
-            if Instant::now() >= deadline {
-                bail!("worker IPC service had no connected server during {context}");
-            }
-            self.client.wait_wake(Duration::from_millis(20))?;
-        }
-    }
-
-    /// Waits for one startup response while checking child liveness and reporting progress.
-    fn wait_pending_response(
-        &mut self,
-        pending: &Outstanding,
-        context: &str,
-    ) -> anyhow::Result<Frame> {
-        let started = Instant::now();
-        let mut last_log = started;
-        let mut last_worker_check = started;
-        // Loading checkpoints and preparing numerical shapes have no
-        // model-independent completion deadline, so this wait has none; any
-        // launch deadline belongs to the caller of the launch. Rank death and
-        // cancellation remain observable throughout preparation.
-        loop {
-            if let Some(frame) = self.client.try_recv_response(pending)? {
-                return Ok(frame);
-            }
-            if last_worker_check.elapsed() >= WORKER_CHECK_INTERVAL {
-                self.check_worker(context)?;
-                last_worker_check = Instant::now();
-            }
-            if last_log.elapsed() >= STARTUP_LOG_INTERVAL {
-                tracing::info!(
-                    elapsed_secs = started.elapsed().as_secs(),
-                    "worker still busy during {context}"
-                );
-                last_log = Instant::now();
-            }
-            let until_check = WORKER_CHECK_INTERVAL.saturating_sub(last_worker_check.elapsed());
-            let until_log = STARTUP_LOG_INTERVAL.saturating_sub(last_log.elapsed());
-            self.client.wait_wake(until_check.min(until_log))?;
-        }
-    }
-
-    /// Drains ready IPC responses and routes them into `ready`.
-    ///
-    /// Returns how many responses were routed and the wakes drained before
-    /// the scan. A transport, execution, or routing error stops the scan and
-    /// is returned; responses routed before it stay in `ready`.
-    fn drain_ready(&mut self) -> anyhow::Result<(usize, uniserve_ipc::WakeEvents)> {
-        let wakes = self.client.drain_wakes()?;
-        let ids = self.pending.keys().copied().collect::<Vec<_>>();
+    /// A transport, execution, or routing error stops the scan and is
+    /// returned; responses routed before it stay in `ready`. The channel
+    /// reports its close, which is the rank's death, as an error only after
+    /// every response that arrived whole has been routed.
+    fn drain_ready(&mut self) -> anyhow::Result<usize> {
         let mut drained = 0usize;
-        for message_id in ids {
-            let Some(record) = self.pending.get(&message_id) else {
-                continue;
-            };
-            let Some(frame) = self.client.try_recv_response(&record.pending)? else {
-                continue;
-            };
-            let record = self.pending.remove(&message_id).ok_or_else(|| {
-                anyhow::anyhow!("pending record {message_id} disappeared while routing response")
+        while let Some(response) = self.client.try_recv::<WorkerResponse>()? {
+            // A response answers the request whose identity it states.
+            let message_id = response
+                .message_id()
+                .context("worker response states no message identity")?;
+            let kind = self.pending.remove(&message_id).with_context(|| {
+                format!("worker response {message_id} answers no outstanding request")
             })?;
-            // Consuming the response ends this IPC request. On a
-            // shared-storage channel, release its iceoryx2 active-request slot
-            // before routing the result.
-            let kind = release_consumed_request(record);
-            self.route(message_id, kind, frame)?;
+            self.route(kind, response)?;
             drained += 1;
         }
-        Ok((drained, wakes))
+        Ok(drained)
     }
 
-    /// Decodes one batch response and appends its result to `ready`.
+    /// Routes one batch response and appends its result to `ready`.
     ///
     /// The result is received, which claims any media it published
-    /// (`WorkerResult::receive`), before the correlation checks run, so a
-    /// rejected response still releases that storage. Returns an error and
-    /// appends nothing when the frame does not decode, either stated message
-    /// identity differs from `message_id`, the worker answered with an
+    /// (`WorkerResult::receive`). Returns an error and appends nothing when
+    /// the worker answered with an
     /// execution error (as a `WorkerExecError`) or an unexpected response
     /// kind, a product locator names an endpoint other than this rank's
     /// reported one, or the result's batch identity differs from the
     /// submitted batch.
-    fn route(
-        &mut self,
-        message_id: u64,
-        kind: OutstandingKind,
-        frame: Frame,
-    ) -> anyhow::Result<()> {
+    fn route(&mut self, kind: OutstandingKind, response: WorkerResponse) -> anyhow::Result<()> {
         let OutstandingKind::Batch { batch_id } = kind;
-        let response = frame.decode_response()?;
-        let echoed = response.message_id();
         let report = match response {
             WorkerResponse::Result { result, .. } => Ok(WorkerResult::receive(result)),
             WorkerResponse::Error { error, .. } => Err(WorkerExecError {
@@ -1131,19 +883,6 @@ impl RankProcess {
                 other.kind()
             )),
         };
-        // A zero header identity means the response carries none
-        // (`header_for_response`); an identity that is stated must match.
-        if frame.header.message_id != 0 && frame.header.message_id != message_id {
-            bail!(
-                "worker response call id mismatch: expected {message_id}, got {}",
-                frame.header.message_id
-            );
-        }
-        if let Some(echoed) = echoed
-            && echoed != message_id
-        {
-            bail!("worker response echoed call id {echoed}, expected {message_id}");
-        }
         let report = report?;
 
         // A product must name this rank's reported endpoint, which identifies
@@ -1166,13 +905,10 @@ impl RankProcess {
         Ok(())
     }
 
-    /// Returns the descriptors that signal this rank's progress.
-    ///
-    /// A shared-storage channel multiplexes every wake onto one listener; a
-    /// socket channel carries only results and raises the engine's own wakes
-    /// on a second descriptor.
+    /// Returns the descriptors that signal this rank's progress: its
+    /// connection, whose close is also the rank's death.
     pub(crate) fn progress_fds(&self) -> Vec<libc::pollfd> {
-        self.client.progress_fds()
+        self.client.poll_fds().to_vec()
     }
 }
 
@@ -1185,15 +921,11 @@ impl RankProcess {
     /// Submits one physical run and records its outstanding message identity.
     ///
     /// Hands the batch back as `WouldBlock` when `depth` requests are already
-    /// outstanding or a socket send queue is full; the batch is not recorded
-    /// as pending then.
+    /// outstanding; the batch is not recorded as pending then.
     /// Fails when draining earlier responses or the send fails.
     pub(super) fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
         // Answered requests free their slots before the depth check.
         self.drain_ready().map_err(BatchSubmitError::Failed)?;
-        // Without this check, a shared-storage send beyond the client's
-        // request limit would fail as a transport error rather than
-        // `WouldBlock`.
         if self.pending.len() >= self.depth {
             return Err(BatchSubmitError::WouldBlock(Box::new(batch)));
         }
@@ -1201,23 +933,11 @@ impl RankProcess {
         let message_id = self.alloc_call_id();
         let mut req = WorkerRequest::submit(batch);
         req.set_call_id(Some(message_id));
-        let pending = match self.client.send_request_attempt(&req) {
-            Ok(pending) => pending,
-            Err(uniserve_ipc::IpcError::WouldBlock) => {
-                return Err(BatchSubmitError::WouldBlock(match req {
-                    WorkerRequest::Submit { batch, .. } => batch,
-                    _ => unreachable!(),
-                }));
-            }
-            Err(error) => return Err(BatchSubmitError::Failed(error.into())),
-        };
-        self.pending.insert(
-            message_id,
-            PendingRecord {
-                kind: OutstandingKind::Batch { batch_id },
-                pending,
-            },
-        );
+        self.client
+            .send(&req)
+            .map_err(|error| BatchSubmitError::Failed(error.into()))?;
+        self.pending
+            .insert(message_id, OutstandingKind::Batch { batch_id });
         Ok(())
     }
 
@@ -1227,33 +947,29 @@ impl RankProcess {
     /// `Ok(None)` when the timeout passes with nothing ready. An entry is a
     /// result or the error that draining or routing a response produced.
     /// Results already received are returned before a rank exit, startup
-    /// cancellation, a channel death wake, or a failed wait fails the call.
+    /// cancellation, the rank's connection closing, or a failed wait fails
+    /// the call.
     pub(super) fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(result) = self.ready.pop_front() {
                 return result.map(Some);
             }
-            let (_, wakes) = match self.drain_ready() {
-                Ok(progress) => progress,
-                Err(error) => {
-                    // Complete replies remain ahead of a trailing transport or
-                    // decoding error in the same drain.
-                    self.ready.push_back(Err(error));
-                    continue;
-                }
-            };
+            if let Err(error) = self.drain_ready() {
+                // Complete replies remain ahead of a trailing transport or
+                // decoding error in the same drain.
+                self.ready.push_back(Err(error));
+                continue;
+            }
             if !self.ready.is_empty() {
                 continue;
             }
             self.check_worker("executor poll")?;
-            anyhow::ensure!(!wakes.death, "worker rank channel disconnected");
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
             }
-            self.client
-                .wait_wake(remaining.min(WORKER_CHECK_INTERVAL))?;
+            self.client.wait(remaining.min(WORKER_CHECK_INTERVAL))?;
         }
     }
 
@@ -1280,9 +996,6 @@ impl RankProcess {
             return;
         }
 
-        // Stop the death watcher before the intended teardown, so the exit
-        // does not fire a spurious death wake during shutdown.
-        let _ = self.death_watcher.take();
         let mut acknowledgment = None;
         // A rank started elsewhere is never observed to have exited here, so
         // shutdown drains its channel as it would a live local rank.
@@ -1300,12 +1013,12 @@ impl RankProcess {
                     break;
                 }
                 match self.drain_ready() {
-                    Ok((0, _)) => {
+                    Ok(0) => {
                         if self.check_worker("shutdown drain").is_err() {
                             break;
                         }
                         let remaining = drain_deadline.saturating_duration_since(Instant::now());
-                        let _ = self.client.wait_wake(remaining.min(WORKER_CHECK_INTERVAL));
+                        let _ = self.client.wait(remaining.min(WORKER_CHECK_INTERVAL));
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -1317,7 +1030,7 @@ impl RankProcess {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
                 req.set_call_id(Some(message_id));
-                acknowledgment = self.send_request_checked(&req, "shutdown").ok();
+                acknowledgment = self.client.send(&req).ok().map(|()| message_id);
             }
         }
         self.retirement = Retirement::Closing { acknowledgment };
@@ -1342,11 +1055,14 @@ impl RankProcess {
 
         loop {
             // A failed receive means the rank's end of the channel is gone,
-            // which answers the request as finally as a response does.
-            if let Some(pending) = acknowledgment.as_ref()
-                && !matches!(self.client.try_recv_response(pending), Ok(None))
-            {
-                acknowledgment = None;
+            // which answers the request as finally as a response does. A
+            // response to anything else is a result nobody waits for any more.
+            while let Some(message_id) = acknowledgment {
+                match self.client.try_recv::<WorkerResponse>() {
+                    Ok(Some(response)) if response.message_id() != Some(message_id) => {}
+                    Ok(None) => break,
+                    Ok(Some(_)) | Err(_) => acknowledgment = None,
+                }
             }
             let retired = match self.child.as_mut() {
                 Some(child) => !matches!(child.try_wait(), Ok(None)),
@@ -1360,11 +1076,12 @@ impl RankProcess {
             if remaining.is_zero() {
                 break;
             }
-            // A response raises a wake; a process exit does not, so the wait
-            // is also bounded by the exit poll interval. A channel that cannot
-            // wait any more still gets the interval, so the loop never spins.
+            // A response ends the wait; a process exit does not, so the wait
+            // is also bounded by the exit poll interval. A closed channel
+            // fails the wait at once and still gets the interval, so the
+            // loop never spins.
             let interval = remaining.min(EXIT_POLL_INTERVAL);
-            if self.client.wait_wake(interval).is_err() {
+            if self.client.wait(interval).is_err() {
                 std::thread::sleep(interval);
             }
         }
@@ -1377,6 +1094,55 @@ impl RankProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// Waits until every rank in `ranks` has reported that it is ready, and
+/// checks each report against its launch.
+///
+/// A rank answers only once its model is built and warmed up, and ranks that
+/// initialize together wait for one another, so the ranks are asked first
+/// and then awaited together: the wait has no deadline, and ends by any
+/// rank's failure. A rank that dies while starting closes its connection,
+/// which fails the startup of all of them by that rank's name instead of
+/// leaving its peers waiting for it.
+pub(super) fn finish_startup(ranks: &mut [&mut RankProcess]) -> anyhow::Result<()> {
+    for rank in ranks.iter_mut() {
+        rank.request_startup()?;
+    }
+
+    let started = Instant::now();
+    let mut last_log = started;
+    let mut last_worker_check = started;
+    loop {
+        // Every rank is polled and parked on, including those already
+        // ready, so that the close of any connection ends the wait.
+        let mut ready = true;
+        let mut descriptors = Vec::new();
+        for rank in ranks.iter_mut() {
+            ready &= rank.poll_startup()?;
+            descriptors.extend(rank.progress_fds());
+        }
+        if ready {
+            return Ok(());
+        }
+
+        if last_worker_check.elapsed() >= WORKER_CHECK_INTERVAL {
+            for rank in ranks.iter_mut() {
+                rank.check_worker("Worker startup")?;
+            }
+            last_worker_check = Instant::now();
+        }
+        if last_log.elapsed() >= STARTUP_LOG_INTERVAL {
+            tracing::info!(
+                elapsed_secs = started.elapsed().as_secs(),
+                "workers still busy during startup"
+            );
+            last_log = Instant::now();
+        }
+        let until_check = WORKER_CHECK_INTERVAL.saturating_sub(last_worker_check.elapsed());
+        let until_log = STARTUP_LOG_INTERVAL.saturating_sub(last_log.elapsed());
+        crate::worker::park_descriptors(&descriptors, until_check.min(until_log))?;
     }
 }
 
@@ -1484,9 +1250,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
-    /// A rank receives the operator's local base checkpoint under the key
-    /// the worker reads, and no key when the operator named none, so the
-    /// worker then reads the base from the Hugging Face cache.
+    /// A rank receives the operator's local base checkpoint, and none when
+    /// the operator named none, so the worker then reads the base from the
+    /// Hugging Face cache.
     #[test]
     fn the_launch_descriptor_carries_a_named_base_checkpoint() {
         let mut args = WorkerProcessArgs {
@@ -1494,18 +1260,32 @@ mod tests {
             ..WorkerProcessArgs::default()
         };
         let descriptor = args
-            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
+            .launch_descriptor(0, None, None, None)
             .expect("descriptor");
         assert_eq!(descriptor.base_model, None);
-        let encoded: serde_json::Value =
-            serde_json::from_slice(&descriptor.to_json().expect("encoded")).expect("json");
-        assert!(encoded.get("base_model").is_none());
 
         args.base_model = Some("/models/MiniMax-H3".into());
         let descriptor = args
-            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
+            .launch_descriptor(0, None, None, None)
             .expect("descriptor");
         assert_eq!(descriptor.base_model.as_deref(), Some("/models/MiniMax-H3"));
+    }
+
+    /// The head answers a rank's registration with its launch descriptor as
+    /// one frame, so every field must survive the frame's encoding, with and
+    /// without the values that are optional.
+    #[test]
+    fn the_launch_descriptor_round_trips_through_a_frame() {
+        let mut args = WorkerProcessArgs::default();
+        for base_model in [None, Some("/models/MiniMax-H3".into())] {
+            args.base_model = base_model;
+            let descriptor = args
+                .launch_descriptor(0, Some("127.0.0.1:29500"), Some(7), None)
+                .expect("descriptor");
+            let frame = uniserve_ipc::Frame::encode(&descriptor).expect("a frame");
+            let received: uniserve_ipc::LaunchDescriptor = frame.decode().expect("a descriptor");
+            assert_eq!(received, descriptor);
+        }
     }
 
     /// `--lane` accepts only the fields the worker applies, so a misspelled
@@ -1522,7 +1302,7 @@ mod tests {
             ..WorkerProcessArgs::default()
         };
         let descriptor = args
-            .launch_descriptor(0, "127.0.0.1:1", None, None, None)
+            .launch_descriptor(0, None, None, None)
             .expect("descriptor");
         assert_eq!(
             serde_json::to_value(&descriptor.lane[0].call_kinds).expect("kinds"),

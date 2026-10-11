@@ -186,7 +186,7 @@ pub struct ComponentInfo {
     /// Component name; `WorkerInfo::validate` requires it to be non-empty and
     /// unique within one worker.
     pub name: String,
-    #[serde(flatten)]
+    /// Rank membership and parallel layout of the component.
     pub config: uniserve_core::ComponentConfig,
     /// Named tensor results declared by the loaded computation. Their order
     /// defines product output indices independently of Worker grouping.
@@ -207,7 +207,6 @@ pub struct OutputInfo {
     /// The axes holding a video request's raster, for a result laid out at
     /// the request's canvas. Their extents in `shape_bound` are the largest
     /// height and width the worker admits; a request binds them to its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raster_axes: Option<RasterAxes>,
 }
 
@@ -328,15 +327,12 @@ pub struct VideoDenoiserInfo {
     /// The only canvases the deployment serves: those it prepares, in the
     /// order it names them. Empty declares every canvas of the model's
     /// canvas rule.
-    #[serde(default)]
     pub canvases: Vec<uniserve_core::Canvas>,
     /// The checkpoint's packed sequence capacity in rows, when it has one.
-    #[serde(default)]
     pub max_sequence_rows: Option<u32>,
     /// How the denoiser packs condition rows: in whole tiles for a
     /// multi-region denoiser, or densely, one row per condition token, when
     /// absent.
-    #[serde(default)]
     pub condition_tiles: Option<ConditionTiles>,
 }
 
@@ -393,12 +389,10 @@ pub struct WorkerInfo {
     /// Loaded model identity.
     pub model_name: String,
     /// Model-declared finite terminal-media computation, when supported.
-    #[serde(default)]
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
     /// Effective number of diffusion predictions advertised by the loaded model.
     pub num_inference_steps: u32,
     /// What the deployment's video denoiser serves, when the model has one.
-    #[serde(default)]
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
@@ -411,24 +405,18 @@ pub struct WorkerInfo {
     /// A fabric handle is importable from another host inside the fabric
     /// domain; a descriptor handle reaches only the host that created it, so
     /// this is what decides whether a transfer edge may cross hosts.
-    #[serde(default)]
     pub fabric_handles: bool,
     /// Number of physical members in this Worker.
     pub world_size: u32,
     /// Resolved compute dtype, compared per rank on restart.
-    #[serde(default)]
     pub model_dtype: String,
     /// Resolved attention selection, compared per rank on restart.
-    #[serde(default)]
     pub attention_backend: String,
     /// Numerical weight storage formats present on this rank.
-    #[serde(default)]
     pub weight_formats: Vec<String>,
     /// Resolved activation quantization formats on this physical rank.
-    #[serde(default)]
     pub activation_formats: Vec<String>,
     /// Finalized component membership and logical degrees.
-    #[serde(default)]
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
@@ -443,14 +431,12 @@ pub struct WorkerInfo {
     /// prefill graphs hold. A prefill run no captured graph holds fails, so
     /// the scheduler never forms one. Zero leaves prefill runs bounded by
     /// `max_batch_calls` alone, as when they run eagerly.
-    #[serde(default)]
     pub max_prefill_calls: u32,
     /// Maximum calls in one decode run: the rows the rank's largest captured
     /// decode graph holds, fewer when its KV pool cannot hold a page of
     /// every cache group for more rows. A decode run no captured graph
     /// holds fails, so the scheduler never forms one. Zero leaves decode
     /// runs bounded by `max_batch_calls` alone, as when they run eagerly.
-    #[serde(default)]
     pub max_decode_calls: u32,
     /// Number of resident request slots.
     pub request_slots: u32,
@@ -471,7 +457,6 @@ pub struct WorkerInfo {
     pub max_unresolved_calls: u32,
     /// Concurrent host-lane tasks this rank's bounded host executor admits.
     /// The scheduler treats zero as one.
-    #[serde(default)]
     pub host_lane_capacity: u32,
 }
 
