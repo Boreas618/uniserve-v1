@@ -148,10 +148,10 @@ impl CausalLMRunners {
     /// microbatches run in rotation, empty ones joining, and the lane stream
     /// waits on every microbatch stream. Microbatches launch their graphs
     /// only once the union joins by launching its own
-    /// ([`crate::executor::forward::experts::ExpertRuntime::replays`]).
+    /// ([`crate::parallel::ExpertUnion::replays`]).
     pub(crate) fn invoke(
         &mut self,
-        experts: Option<&crate::executor::forward::experts::ExpertRuntime>,
+        experts: Option<&crate::parallel::ExpertUnion>,
         group: usize,
         requests: &[Option<StepRequest<'_>>],
         context: &mut StepParts<'_>,
@@ -219,7 +219,7 @@ impl CausalLMRunners {
                 Some(staged) => {
                     let launch = self.runners[runner].launch(staged, Some(capacity), replay)?;
                     modes.push(Some(launch.mode));
-                    calls.push(Some(crate::executor::forward::experts::MicrobatchForward {
+                    calls.push(Some(crate::parallel::MicrobatchForward {
                         call: launch.call,
                         yields: launch.yields,
                     }));
@@ -295,7 +295,7 @@ impl CausalLMRunners {
     /// microbatches join.
     pub(crate) fn prefill_cache(
         &mut self,
-        experts: Option<&crate::executor::forward::experts::ExpertRuntime>,
+        experts: Option<&crate::parallel::ExpertUnion>,
         component: &str,
         prefixes: &[(u32, &[u32])],
         tables: &BlockTables,

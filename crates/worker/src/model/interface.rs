@@ -4,7 +4,7 @@
 //! functions. [`Interface`] resolves the entries startup needs into typed
 //! fields once, failing startup with the name of any missing entry, and
 //! keeps every entry so capability runtimes can resolve their own
-//! (`canvas.bind`, ...) by name.
+//! (`component.bind`, ...) by name.
 
 use std::collections::BTreeMap;
 
@@ -35,10 +35,6 @@ pub struct Interface {
     pub mesh: Function,
     /// Destroy the process world's groups in reverse creation order.
     pub destroy: Function,
-    /// Caching-allocator statistics of one device.
-    pub memory_stats: Function,
-    /// Return cached allocator blocks to the device.
-    pub release_cached: Function,
     /// A counter that changes whenever a kernel provider choice changes.
     pub kernel_choices: Function,
     /// Start a profiler window.
@@ -78,8 +74,6 @@ impl Interface {
             create_groups: require("distributed.create_groups")?,
             mesh: require("distributed.mesh")?,
             destroy: require("distributed.destroy")?,
-            memory_stats: require("memory.stats")?,
-            release_cached: require("memory.release_cached")?,
             kernel_choices: require("kernels.choices")?,
             profiler_start: require("profiling.start")?,
             profiler_stop: require("profiling.stop")?,

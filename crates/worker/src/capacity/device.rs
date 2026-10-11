@@ -17,9 +17,11 @@ use crate::{Error, Result};
 /// Per-process device storage measurements.
 pub struct DeviceBudget {
     nvml: Nvml,
-    /// `memory.release_cached`: synchronize the device and empty PyTorch's
-    /// cache before a measurement.
-    release_cached: Function,
+    /// `torch.cuda.synchronize(device)` and `torch.cuda.empty_cache()`,
+    /// called before a measurement so blocks freed by completed work are
+    /// returned to the device and process memory excludes reusable cache.
+    synchronize: Function,
+    empty_cache: Function,
 }
 
 /// A device's storage grant and its free bytes, at one measurement.
@@ -36,10 +38,11 @@ pub struct Budget {
 }
 
 impl DeviceBudget {
-    pub fn new(release_cached: Function) -> Result<Self> {
+    pub fn new(synchronize: Function, empty_cache: Function) -> Result<Self> {
         Ok(Self {
             nvml: Nvml::init()?,
-            release_cached,
+            synchronize,
+            empty_cache,
         })
     }
 
@@ -49,8 +52,9 @@ impl DeviceBudget {
     /// Fails when NVML attributes no usage on the device to this process, as
     /// inside a PID namespace NVML does not report.
     pub fn process_bytes(&self, device: i32) -> Result<u64> {
-        self.release_cached
+        self.synchronize
             .invoke(&[(&tvm_ffi::Any::from(i64::from(device))).into()])?;
+        self.empty_cache.invoke(&[])?;
         self.nvml
             .process_memory(DeviceId(device))
             .map_err(|error| match error {

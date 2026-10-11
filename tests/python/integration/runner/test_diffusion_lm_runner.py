@@ -1,20 +1,21 @@
-"""Canvas readouts and steps through the numerical interface's binding.
+"""Readouts and denoising steps through ``DiffusionLMRunner``.
 
-The worker reaches token canvases only through ``canvas.describe`` and the
-functions ``canvas.bind`` returns over buffers it owns. These tests play the
-worker's part on the CPU over the two-layer DiffusionGemma fixture: they
-prefill a prompt into a K/V unit pool, allocate the bound buffers with
-torch, write the canvas tokens, positions and attention metadata, call the
-binding, and compare its outputs with the public ``TokenDenoiser`` and the
-block-diffusion sampler driven directly over the same cache:
+A caller reaches a diffusion LM's forwards through the runner's methods
+over tensors it owns. These tests play that caller on the CPU over the
+two-layer DiffusionGemma fixture: they prefill a prompt into a prefix cache
+unit pool, allocate the forward's tensors with torch, write the tokens,
+positions and attention metadata, call the runner, and compare its outputs
+with the public ``DiffusionLM`` and the block-diffusion sampler driven
+directly over the same cache:
 
 - a readout returns every candidate's log-probability under the full
-  vocabulary at its slot, in row, slot and candidate order, for canvas rows
-  of different lengths read in one call;
-- a canvas step returns each row's outcome and argmax canvas and commits the
-  stepped state to its request slot, leaving the padding slot zero and the
-  slot of a row whose block an earlier step stopped untouched; a row of a
-  stopped block reports the skipped outcome.
+  vocabulary at its slot, in row, slot and candidate order, for blocks of
+  different lengths read in one forward;
+- a denoising step returns each row's outcome and argmax tokens and commits
+  the stepped state to its request slot, leaving the padding slot zero and
+  the slot of a row whose block an earlier step stopped untouched; a row of
+  a stopped block reports the skipped outcome;
+- a captured forward replays its eager results.
 """
 
 from __future__ import annotations
@@ -33,10 +34,10 @@ from uniserve_models import catalog as models
 from uniserve_models.bindings.context import ExecutionContext
 from uniserve_models.cache.units import UnitPool
 from uniserve_models.diffusion import canvas as sampler
-from uniserve_models.interface import binding, canvas, graphs
+from uniserve_models.interface import binding, graphs
 from uniserve_models.interface.loading import Loaded
 from uniserve_models.loading import weights
-from uniserve_models.model import CanvasInput, TextInput, TextSize
+from uniserve_models.model import DiffusionLMInput, TextInput, TextSize
 from uniserve_models.nn.attention import (
     AttentionBatch,
     BlockTable,
@@ -44,20 +45,16 @@ from uniserve_models.nn.attention import (
     SegmentedInput,
     SequenceLengths,
 )
+from uniserve_models.runner import diffusion_lm
 
 pytestmark = pytest.mark.integration
 
 PAGE, PAGES = 4, 12
 CANVAS = 16
 PROMPT = 12
-SAMPLING = {
-    "max_steps": 4,
-    "entropy_bound": 0.5,
-    "t_min": 0.4,
-    "t_max": 0.8,
-    "confidence_threshold": 0.2,
-    "stability_threshold": 1,
-}
+# The served sampling: steps, entropy bound, minimum and maximum
+# temperature, confidence and stability thresholds.
+SAMPLING = (4, 0.5, 0.4, 0.8, 0.2, 1)
 # The constants of ``SAMPLING`` with the fixture's end of sequence 1 and 6
 # and padding 0.
 CONSTANTS = sampler.CanvasSampling(
@@ -73,7 +70,9 @@ CONSTANTS = sampler.CanvasSampling(
 SLOTS = 3
 ROWS = 4
 TOKENS = 64
-# The expert step capacity of calls on these models, which have no
+# The resident banks, in the runner's parameter order.
+BANKS = ("canvas", "history", "self_conditioning", "live")
+# The expert step capacity of forwards on these models, which have no
 # expert-parallel layer.
 NO_EXPERT_STEP = 0
 
@@ -95,7 +94,7 @@ class _Setup:
 
 
 class _Session:
-    """The public model, a unit pool holding one prompt, and the binding.
+    """The public model, a unit pool holding one prompt, and the runner.
 
     Table ``t`` of the pool gives the prompt the units
     ``1 + t * pages ...``; unit zero is the padding sentinel.
@@ -144,10 +143,7 @@ class _Session:
         loaded = Loaded(
             module=self.model, description=None, attention=setup.attention
         )
-        self.facts = canvas.describe(
-            loaded,
-            {"path": "denoiser", "exchange": False, "attention_ranks": 0},
-        )
+        self.facts = diffusion_lm.describe(loaded, "denoiser", False, 0)
         prepared, requirements = binding.prepare(
             loaded,
             {
@@ -173,21 +169,100 @@ class _Session:
         }
         binding.bind(prepared, {"workspaces": workspaces})
         self.buffers = self._buffers(sampling)
-        options = {
-            "tables": [
-                {
-                    "page_tokens": self.pool.groups[table.group].page_tokens,
-                    "windowed": self.pool.groups[table.group].window
-                    is not None,
-                }
-                for table in self.pool.tables
-            ],
-            "device": torch.device(setup.device).index or 0 if cuda else -1,
-            "step_rows": 2,
-        }
+        groups = [self.pool.groups[table.group] for table in self.pool.tables]
+        page_tokens = [group.page_tokens for group in groups]
+        windowed = [group.window is not None for group in groups]
         if sampling:
-            options["sampling"] = SAMPLING
-        self.functions = canvas.bind(prepared, self.buffers, options)
+            self.runner = diffusion_lm.DiffusionLMRunner(
+                prepared,
+                page_tokens,
+                windowed,
+                2,
+                *SAMPLING,
+                *(self.buffers[f"bank.{name}"] for name in BANKS),
+            )
+        else:
+            self.runner = diffusion_lm.DiffusionLMRunner(
+                prepared, page_tokens, windowed, 0
+            )
+
+    def attention(self) -> list[torch.Tensor]:
+        """The attention metadata tensors, in parameter order."""
+        return [
+            self.buffers[f"attention.{name}"]
+            for name in (
+                "query_lengths",
+                "query_offsets",
+                "prefix_lengths",
+                "prefix_offsets",
+                "block_tables",
+                "start_pages",
+            )
+        ]
+
+    def attend_state(self) -> list[torch.Tensor]:
+        return [
+            self.buffers[f"attend_state.{index}"]
+            for index in range(len(self.facts["attend_widths"]))
+        ]
+
+    def attend_arguments(
+        self, rows, tokens, visible, queries, prefixes, widths, starts
+    ) -> list:
+        """The arguments of ``attend`` over the session's tensors."""
+        return [
+            rows,
+            tokens,
+            visible,
+            widths,
+            queries,
+            prefixes,
+            starts,
+            NO_EXPERT_STEP,
+            self.buffers["input_ids"],
+            self.buffers["positions"],
+            *self.attention(),
+            *self.attend_state(),
+        ]
+
+    def readout_arguments(self, slots: int, candidates: int) -> list:
+        """The arguments of ``readout`` over the session's tensors."""
+        return [
+            slots,
+            candidates,
+            NO_EXPERT_STEP,
+            self.buffers["slot_rows"],
+            self.buffers["candidate_index"],
+            self.buffers["candidate_logprobs"],
+            *self.attend_state(),
+        ]
+
+    def denoise_arguments(
+        self, rows, first, queries, prefixes, widths, starts
+    ) -> list:
+        """The arguments of ``denoise`` over the session's tensors."""
+        return [
+            rows,
+            first,
+            widths,
+            queries,
+            prefixes,
+            starts,
+            NO_EXPERT_STEP,
+            self.buffers["step.columns"],
+            self.buffers["positions"],
+            *self.attention(),
+            *(
+                self.buffers[f"step.{name}"]
+                for name in (
+                    "canvas",
+                    "history",
+                    "self_conditioning",
+                    "results",
+                    "continued",
+                )
+            ),
+        ]
 
     def _units(self, table: int) -> list[int]:
         pages = self.setup.pages
@@ -225,7 +300,7 @@ class _Session:
             )
 
     def _buffers(self, sampling: bool) -> dict[str, torch.Tensor]:
-        """Allocate every bound buffer, as the worker does."""
+        """Allocate the tensors of the forwards, as the worker does."""
         tables, tokens, rows = len(self.pool.tables), TOKENS, 2 * ROWS
         setup = self.setup
         hidden, dtype = self.facts["hidden_size"], setup.dtype
@@ -243,8 +318,7 @@ class _Session:
                 (tables, rows, setup.pages), **ints
             ),
             "attention.start_pages": torch.zeros((tables, rows), **ints),
-            "slot_tokens": torch.zeros(tokens, **long),
-            "tail_rows": torch.zeros(64, **long),
+            "slot_rows": torch.zeros(tokens, **long),
             "candidate_index": torch.zeros(256, **long),
             "candidate_logprobs": torch.zeros(
                 256, dtype=torch.float32, device=device
@@ -255,7 +329,7 @@ class _Session:
                 (tokens, width), dtype=dtype, device=device
             )
         if sampling:
-            depth = SAMPLING["stability_threshold"]
+            depth = SAMPLING[5]
             buffers |= {
                 "step.columns": torch.zeros((4, ROWS), **long),
                 "step.canvas": torch.zeros((ROWS, canvas), **long),
@@ -275,15 +349,6 @@ class _Session:
                 "bank.live": torch.zeros(
                     SLOTS + 1, dtype=torch.uint8, device=device
                 ),
-            }
-            workspace = sampler.CanvasWorkspace.empty(
-                2, canvas, setup.vocab, hidden, dtype=dtype, device=device
-            )
-            buffers |= {
-                "workspace.weights": workspace.weights,
-                "workspace.normalizer": workspace.normalizer,
-                "workspace.product": workspace.product,
-                "workspace.scratch": workspace.scratch,
             }
         return buffers
 
@@ -368,7 +433,7 @@ class _Session:
         )
         with self.context.activate(), torch.no_grad():
             return self.model.denoiser(
-                CanvasInput(torch.cat(canvases), positions, batch, soft)
+                DiffusionLMInput(torch.cat(canvases), positions, batch, soft)
             )
 
 
@@ -376,7 +441,7 @@ def test_a_readout_reads_every_candidate_of_rows_of_different_lengths(
     tmp_path,
 ):
     session = _Session(tmp_path, sampling=False)
-    assert session.facts["canvas_length"] == CANVAS
+    assert session.facts["sequence_length"] == CANVAS
     assert session.facts["vocab_size"] == VOCAB
     assert session.facts["eos_token_ids"] == [1, 6]
     assert session.facts["generates"] and session.facts["local_tail"]
@@ -411,22 +476,21 @@ def test_a_readout_reads_every_candidate_of_rows_of_different_lengths(
         for candidate in candidates:
             index.append(number * VOCAB + candidate)
             expected.append(normalized[token, candidate])
-    session.buffers["slot_tokens"][: len(packed)] = torch.tensor(packed)
+    session.buffers["slot_rows"][: len(packed)] = torch.tensor(packed)
     session.buffers["candidate_index"][: len(index)] = torch.tensor(index)
 
-    functions = session.functions
-    functions["readout_attend"](
-        2,
-        count,
-        CANVAS,
-        [row.numel() for row in canvases],
-        [PROMPT, PROMPT],
-        widths,
-        starts,
-        NO_EXPERT_STEP,
+    session.runner.attend(
+        *session.attend_arguments(
+            2,
+            count,
+            CANVAS,
+            [row.numel() for row in canvases],
+            [PROMPT, PROMPT],
+            widths,
+            starts,
+        )
     )
-    tail = functions["readout_finish"](len(packed), NO_EXPERT_STEP)
-    functions["readout_candidates"](tail, 0, len(index))
+    session.runner.readout(*session.readout_arguments(len(packed), len(index)))
 
     torch.testing.assert_close(
         session.buffers["candidate_logprobs"][: len(index)],
@@ -476,9 +540,9 @@ def _reference_step(session, state: sampler.CanvasState, first: bool):
     return decision
 
 
-def test_canvas_steps_follow_the_sampler_and_commit_their_slots(tmp_path):
+def test_denoising_steps_follow_the_sampler_and_commit_their_slots(tmp_path):
     session = _Session(tmp_path, sampling=True)
-    functions, buffers = session.functions, session.buffers
+    buffers = session.buffers
     slots, seeds = [2, 3], [11, 12]
 
     def run(steps: list[int], live: int) -> None:
@@ -494,14 +558,15 @@ def test_canvas_steps_follow_the_sampler_and_commit_their_slots(tmp_path):
             + [torch.zeros(CANVAS, dtype=torch.int64)]
         )
         widths, starts = session.write_attention([CANVAS] * rows)
-        functions["step"](
-            rows,
-            all(step == 0 for step in steps),
-            [CANVAS] * rows,
-            [PROMPT] * rows,
-            widths,
-            starts,
-            NO_EXPERT_STEP,
+        session.runner.denoise(
+            *session.denoise_arguments(
+                rows,
+                all(step == 0 for step in steps),
+                [CANVAS] * rows,
+                [PROMPT] * rows,
+                widths,
+                starts,
+            )
         )
 
     for step in range(2):
@@ -553,7 +618,7 @@ def test_canvas_steps_follow_the_sampler_and_commit_their_slots(tmp_path):
         for name in ("canvas", "history", "self_conditioning")
     }
     run([2], 1)
-    assert buffers["step.results"][0, 0] == canvas.STEP_SKIPPED
+    assert buffers["step.results"][0, 0] == diffusion_lm.STEP_SKIPPED
     for name, value in before.items():
         assert torch.equal(buffers[f"bank.{name}"], value)
 
@@ -584,8 +649,18 @@ GPU = _Setup(
 )
 
 
+def _capture(session, pool, method, *arguments) -> graphs.Graph:
+    """Capture one call of a runner method that already ran eagerly."""
+    torch.cuda.synchronize()
+    recording = graphs.begin_capture(pool, session.stream.cuda_stream, 0)
+    method(*arguments)
+    graph, _ = graphs.end_capture(recording)
+    torch.cuda.synchronize()
+    return graph
+
+
 def _synchronized(function, *arguments):
-    """Call a binding function on its stream and wait for it."""
+    """Call a runner method on its stream and wait for it."""
     torch.cuda.synchronize()
     result = function(*arguments)
     torch.cuda.synchronize()
@@ -596,20 +671,21 @@ def _synchronized(function, *arguments):
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() != (10, 0),
-    reason="the canvas kernels and native attention require an SM100 GPU",
+    reason="the sampler kernels and native attention require an SM100 GPU",
 )
 def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
-    """Graph replays of readouts and steps equal the eager functions.
+    """Captured readouts and denoising steps equal their eager forwards.
 
-    The readout graph holds two canvases of 32 and 20 tokens padded to a
-    bucket of two 32-token canvases (a 12-token and an empty padding
-    sequence that read no prefix); its tail holds 64 slot rows. Its
-    candidates agree with the eager pass within the rounding the different
-    shapes allow. A captured step replays the eager step bit for bit, the
-    committed bank rows included, for a first step and the step after it.
+    The ``attend`` graph holds two blocks of 32 and 20 tokens padded to a
+    bucket of two 32-token blocks (a 12-token and an empty padding sequence
+    that read no prefix); the ``readout`` graph holds 64 slot rows and 256
+    candidates. Its candidates agree with the eager forward within the
+    rounding the different shapes allow. A captured ``denoise`` replays the
+    eager step bit for bit, the committed bank rows included, for a first
+    step and the step after it.
     """
     session = _Session(tmp_path, sampling=True, setup=GPU)
-    functions, buffers = session.functions, session.buffers
+    runner, buffers = session.runner, session.buffers
     setup, vocab = GPU, GPU.vocab
     pool = graphs.pool(0)[0]
     generator = torch.Generator().manual_seed(4)
@@ -622,7 +698,7 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
     ).cuda()
     slots = [3, 31, 32, 50]
     candidates = [(5, 7), (4095,), (0, 1, 2), (9,)]
-    buffers["slot_tokens"][: len(slots)] = torch.tensor(slots).cuda()
+    buffers["slot_rows"][: len(slots)] = torch.tensor(slots).cuda()
     flat = [
         number * vocab + token
         for number, options in enumerate(candidates)
@@ -634,46 +710,34 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
 
     widths, starts = session.write_attention(lengths)
     _synchronized(
-        functions["readout_attend"],
-        2,
-        tokens.numel(),
-        32,
-        queries,
-        prefixes,
-        widths,
-        starts,
-        NO_EXPERT_STEP,
+        runner.attend,
+        *session.attend_arguments(
+            2, tokens.numel(), 32, queries, prefixes, widths, starts
+        ),
     )
-    tail = _synchronized(
-        functions["readout_finish"], len(slots), NO_EXPERT_STEP
-    )
-    _synchronized(functions["readout_candidates"], tail, 0, count)
+    _synchronized(runner.readout, *session.readout_arguments(len(slots), count))
     eager = buffers["candidate_logprobs"][:count].clone()
 
-    # The bucket of two 32-token canvases: four sequences, 64 tokens.
+    # The bucket of two 32-token blocks: four sequences, 64 tokens.
     padding = (12, 0)
     buffers["input_ids"][tokens.numel() : 64] = 0
     buffers["positions"][tokens.numel() : 64] = 0
     widths, starts = session.write_attention(lengths, padding)
-    padded = [*queries, *padding], [*prefixes, 0, 0]
-    attend, *_ = _synchronized(
-        functions["capture"],
-        "readout_attend",
-        [4, 64, 32, *padded, widths, starts],
-        pool,
-        NO_EXPERT_STEP,
+    arguments = session.attend_arguments(
+        4, 64, 32, [*queries, *padding], [*prefixes, 0, 0], widths, starts
     )
+    _synchronized(runner.attend, *arguments)
+    attend = _capture(session, pool, runner.attend, *arguments)
     buffers["candidate_logprobs"].zero_()
-    buffers["tail_rows"].zero_()
-    buffers["tail_rows"][: len(slots)] = torch.tensor(slots).cuda()
-    tail, *_ = _synchronized(
-        functions["capture"], "readout_tail", [64], pool, NO_EXPERT_STEP
-    )
+    buffers["slot_rows"][len(slots) : 64] = 0
+    arguments = session.readout_arguments(64, 256)
+    _synchronized(runner.readout, *arguments)
+    readout = _capture(session, pool, runner.readout, *arguments)
+    buffers["candidate_logprobs"].zero_()
     buffers["attend_state.0"].zero_()
     buffers["attend_state.1"].zero_()
-    _synchronized(functions["replay"], attend, *padded, starts)
-    _synchronized(functions["replay"], tail, None, None, None)
-    _synchronized(functions["readout_candidates"], tail, 0, count)
+    _synchronized(attend.replay)
+    _synchronized(readout.replay)
     torch.testing.assert_close(
         buffers["candidate_logprobs"][:count], eager, rtol=2e-2, atol=2e-2
     )
@@ -685,7 +749,7 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
     ).cuda()
     widths, starts = session.write_attention([canvas] * 2)
     metadata = ([canvas] * 2, [setup.prompt] * 2, widths, starts)
-    names = ("canvas", "history", "self_conditioning", "live")
+    names = BANKS
     for step in (0, 1):
         columns = buffers["step.columns"]
         columns.zero_()
@@ -699,29 +763,20 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
                 buffers[f"bank.{name}"].copy_(before[name])
             _gather(session, rows, 2)
 
+        arguments = session.denoise_arguments(2, step == 0, *metadata)
         restore()
-        _synchronized(
-            functions["step"], 2, step == 0, *metadata, NO_EXPERT_STEP
-        )
+        _synchronized(runner.denoise, *arguments)
         expected = {name: buffers[f"bank.{name}"].clone() for name in names}
         results = buffers["step.results"][:2].clone()
 
         restore()
-        graph, *_ = _synchronized(
-            functions["capture"],
-            "step",
-            [2, step == 0, *metadata],
-            pool,
-            NO_EXPERT_STEP,
-        )
+        graph = _capture(session, pool, runner.denoise, *arguments)
         restore()
         buffers["step.results"].zero_()
-        _synchronized(
-            functions["replay"], graph, metadata[0], metadata[1], starts
-        )
+        _synchronized(graph.replay)
         assert torch.equal(buffers["step.results"][:2], results)
         for name in names:
             assert torch.equal(buffers[f"bank.{name}"], expected[name]), name
-        functions["release"](graph)
-    functions["release"](attend)
-    functions["release"](tail)
+        graph.release()
+    attend.release()
+    readout.release()

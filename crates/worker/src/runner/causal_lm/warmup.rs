@@ -25,7 +25,7 @@ use super::{CausalLMRunners, StepParts};
 use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
-use crate::executor::forward::experts::ExpertRuntime;
+use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, RowSource, StepRequest, TokenRow};
 use crate::storage::KVCache;
@@ -146,7 +146,7 @@ fn capture(
     runtime: &mut CausalLMRunners,
     kv: &mut KVCache,
     row_tokens: usize,
-    experts: Option<&ExpertRuntime>,
+    experts: Option<&ExpertUnion>,
 ) -> Result<()> {
     let shapes = kv.plan().group_shapes()?;
     let pages: Vec<(usize, usize)> = shapes
@@ -277,7 +277,7 @@ fn capture(
 /// other microbatches join. `capacity` forces the expert step capacity.
 fn step(
     runtime: &mut CausalLMRunners,
-    experts: Option<&ExpertRuntime>,
+    experts: Option<&ExpertUnion>,
     (group, peer): (usize, usize),
     kv: &mut KVCache,
     rows: &[TokenRow],

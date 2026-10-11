@@ -46,15 +46,9 @@ use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
-use crate::executor::forward::canvas::warmup::CanvasWarmup;
-use crate::executor::forward::canvas::{
-    CanvasRuntime, Startup as CanvasStartup, reserved_bytes as canvas_bytes,
-};
-use crate::executor::forward::experts::warmup::ExpertWarmup;
-use crate::executor::forward::experts::{ExpertRuntime, ExpertStart, WeightRuntime};
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
-use crate::ffi::{DType, Handle, Record};
+use crate::ffi::{DType, Handle};
 use crate::lane::Lanes;
 use crate::launch::Endpoint;
 use crate::model::bind::{PeerGroup, StreamWorkspaces};
@@ -65,6 +59,7 @@ use crate::model::{
     ComponentMesh, Description, ExpertPartition, LoadedModel, ModelFacts, sequence_kind,
 };
 use crate::parallel::world::{World, startup_timeout};
+use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
@@ -77,6 +72,7 @@ use crate::runner::decoder::warmup::DecoderWarmup;
 use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::denoiser::warmup::DenoiserWarmup;
 use crate::runner::denoiser::{VideoModel, placed_denoiser};
+use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
 use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::start::{
     ImageOwners, Startup as ImageStartup, reserved_bytes as image_reserved_bytes, start_video,
@@ -244,7 +240,7 @@ impl Worker {
         let node = host_name().map_err(phase("host"))?;
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.
-        let mut experts = ExpertRuntime::start(ExpertStart {
+        let mut experts = ExpertUnion::start(ExpertStart {
             interface: &interface,
             launch: &launch,
             world: &world,
@@ -254,11 +250,19 @@ impl Worker {
             node: &node,
         })
         .map_err(phase("experts"))?;
-        let weights = WeightRuntime::start(&interface, &launch, &world, &model, &lanes, &node)
+        let weights = DwdpManager::start(&interface, &launch, &world, &model, &lanes, &node)
             .map_err(phase("experts"))?;
         let budget = match device {
             Device::Cuda(_) => Some(
-                DeviceBudget::new(interface.release_cached.clone()).map_err(phase("capacity"))?,
+                DeviceBudget::new(
+                    interface
+                        .import("torch.cuda.synchronize")
+                        .map_err(phase("capacity"))?,
+                    interface
+                        .import("torch.cuda.empty_cache")
+                        .map_err(phase("capacity"))?,
+                )
+                .map_err(phase("capacity"))?,
             ),
             Device::Cpu => None,
         };
@@ -319,7 +323,6 @@ impl Worker {
             .map_or(0, |union| union.rank - launch.execution.rank);
         let peers = PeerGroup {
             group: &world.host,
-            node: &node,
             collectives: launch
                 .components
                 .keys()
@@ -363,11 +366,10 @@ impl Worker {
                 workspaces: &mut workspaces,
                 graphs: &mut graphs,
                 preparation,
-                peers: Some(&peers),
             })
             .map_err(phase("bind"))?
         };
-        let canvas = CanvasRuntime::start(CanvasStartup {
+        let diffusion_lm = DiffusionLMRunner::start(diffusion_lm::Startup {
             interface: &interface,
             config: &config,
             request_slots: info.request_slots as usize,
@@ -383,7 +385,7 @@ impl Worker {
             preparation,
             peers: Some(&peers),
             expert_runtime: experts.as_mut(),
-            weights: weights.as_ref().map(WeightRuntime::prefetch),
+            weights: weights.as_ref(),
         })
         .map_err(phase("bind"))?;
         if let Some(experts) = experts.as_mut() {
@@ -445,9 +447,9 @@ impl Worker {
         if let Some(image) = image {
             backend.set_image(image);
         }
-        let canvas_warmup = canvas.is_some();
-        if let Some(canvas) = canvas {
-            backend.set_canvas(canvas);
+        let diffusion_lm_warmup = !diffusion_lm.is_empty();
+        if diffusion_lm_warmup {
+            backend.set_diffusion_lm(diffusion_lm);
         }
         if let Some(weights) = weights {
             backend.set_weights(weights);
@@ -510,8 +512,8 @@ impl Worker {
                     .max(1),
             }));
         }
-        if canvas_warmup {
-            hooks.push(Box::new(CanvasWarmup));
+        if diffusion_lm_warmup {
+            hooks.push(Box::new(DiffusionLMWarmup));
         }
         if expert_warmup {
             // After the text captures, whose eager warmups were announced
@@ -775,28 +777,21 @@ impl Worker {
         Ok(())
     }
 
-    /// Allocator segments of `device`.
+    /// Bytes the caching allocator holds in each of its pools on `device`.
     fn segments(&self, device: i32) -> Result<Vec<Segment>> {
-        let stats = Record::new(
-            "memory.stats",
-            self.interface
-                .memory_stats
-                .call_values(&[Any::from(i64::from(device))])?,
-        )?;
-        stats
-            .list("segments")?
-            .into_iter()
-            .map(|segment| {
-                let values = crate::ffi::integers(segment)
-                    .map_err(|error| Error::numerical("memory.stats", &error))?;
-                let [first, second, bytes] = values[..] else {
-                    return Err(Error::Interface(
-                        "memory.stats segments are [pool, pool, bytes]".into(),
-                    ));
-                };
-                Ok((device, (first as u64, second as u64), bytes as u64))
-            })
-            .collect()
+        let function = "uniserve_models.interface.graphs.pool_bytes";
+        let pools = self
+            .interface
+            .import(function)?
+            .call_values(&[Any::from(i64::from(device))])?;
+        let pools =
+            crate::ffi::integers(pools).map_err(|error| Error::numerical(function, &error))?;
+        Ok(pools
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&[first, second, bytes]| (device, (first as u64, second as u64), bytes as u64))
+            .collect())
     }
 
     fn require_codecs(&self) -> std::result::Result<(), WorkerError> {
@@ -832,15 +827,13 @@ impl Worker {
             self.graphs.check(&residency).map_err(phase("warmup"))?;
             for &device in &cuda_devices {
                 let process = budget.process_bytes(device).map_err(phase("warmup"))?;
-                let stats = Record::new(
-                    "memory.stats",
-                    self.interface
-                        .memory_stats
-                        .call_values(&[Any::from(i64::from(device))])
-                        .map_err(phase("warmup"))?,
-                )
-                .map_err(phase("warmup"))?;
-                let reserved = stats.count("reserved").map_err(phase("warmup"))?;
+                let reserved: i64 = self
+                    .interface
+                    .import("torch.cuda.memory_reserved")
+                    .and_then(|reserved| {
+                        reserved.call_as(&[(&Any::from(i64::from(device))).into()])
+                    })
+                    .map_err(phase("warmup"))?;
                 let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
                 tracing::info!(
                     target: crate::profiling::kernels::TARGET,
@@ -881,13 +874,12 @@ impl Worker {
                     .map_err(phase("warmup"))?;
             }
         }
-        if let Some(canvas) = executor.backend_mut().canvas_mut() {
-            for (label, kernels) in canvas.kernels().map_err(phase("warmup"))? {
-                records
-                    .add(&label, &self.config.device.to_string(), &kernels)
-                    .map_err(phase("warmup"))?;
-            }
-            canvas.seal();
+        for runner in executor.backend_mut().diffusion_lm_mut() {
+            let (label, kernels) = runner.kernels().map_err(phase("warmup"))?;
+            records
+                .add(&label, &self.config.device.to_string(), &kernels)
+                .map_err(phase("warmup"))?;
+            runner.seal();
         }
         records.log("startup", self.config.rank, &self.config.device.to_string());
         if let Some(text) = executor.backend_mut().text_mut() {
@@ -1076,12 +1068,12 @@ fn host_name() -> Result<String> {
     }
 }
 
-/// Graph pools for an expert runtime's captured joins, one per microbatch,
+/// Graph pools for an expert union member's captured joins, one per microbatch,
 /// when no text runner shares its pools on the microbatch streams.
 fn reserve_join_pools(
     interface: &Interface,
     config: &WorkerConfig,
-    experts: &mut ExpertRuntime,
+    experts: &mut ExpertUnion,
     graphs: &mut GraphStorage<String, Handle>,
 ) -> Result<()> {
     if config.graph_policy == "off" || experts.has_pools() {
@@ -1329,10 +1321,10 @@ fn plan(
                 ),
             );
         }
-        // The canvas runners' buffers and the resident canvas banks.
+        // The diffusion LM runners' buffers, banks and sampler workspaces.
         layout.reserve(
             config.device,
-            canvas_bytes(
+            diffusion_lm::reserved_bytes(
                 interface,
                 model,
                 components,
@@ -1340,7 +1332,6 @@ fn plan(
                 config,
                 layout.info().request_slots as usize,
                 &cache,
-                unit_columns,
             )?,
         );
         let columns = KVCache::import_workers(import_capacity) + unit_columns;

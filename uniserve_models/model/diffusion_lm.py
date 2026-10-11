@@ -23,7 +23,7 @@ from .transformer import TransformerDecoder
 
 
 @dataclass(frozen=True, slots=True)
-class CanvasInput:
+class DiffusionLMInput:
     """Borrowed tensors for one denoising pass over packed token canvases.
 
     ``input_ids`` and ``positions`` cover every canvas row back to back
@@ -123,7 +123,7 @@ class SelfConditioning(nn.Module):
         return self.post_norm(embeddings + signal)
 
 
-class TokenDenoiser(nn.Module):
+class DiffusionLM(nn.Module):
     """One denoising pass of a discrete token canvas over a read-only prefix.
 
     The denoiser shares the causal model's backbone and vocabulary head.
@@ -159,12 +159,12 @@ class TokenDenoiser(nn.Module):
     def cache_config(self):
         return self.backbone.cache_config
 
-    def forward(self, inputs: CanvasInput) -> torch.Tensor:
+    def forward(self, inputs: DiffusionLMInput) -> torch.Tensor:
         return self.backbone(
             self._embeddings(inputs), inputs.positions, inputs.attention
         )
 
-    def attend(self, inputs: CanvasInput) -> tuple[torch.Tensor, ...]:
+    def attend(self, inputs: DiffusionLMInput) -> tuple[torch.Tensor, ...]:
         """Evaluate every canvas token up to the final layer's attention.
 
         Returns the backbone's per-token state of every canvas token on the
@@ -185,7 +185,7 @@ class TokenDenoiser(nn.Module):
         """
         return self.backbone.finish(state, rows)
 
-    def _embeddings(self, inputs: CanvasInput) -> torch.Tensor | None:
+    def _embeddings(self, inputs: DiffusionLMInput) -> torch.Tensor | None:
         """Self-conditioned canvas embeddings, on the first stage."""
         if self.backbone._pipeline.rank != 0:
             return None
