@@ -40,8 +40,8 @@
 
 mod buffers;
 mod calls;
+mod facts;
 mod forward;
-mod methods;
 mod shapes;
 mod start;
 
@@ -51,6 +51,8 @@ use std::sync::Arc;
 use uniserve_core::CanvasSampling;
 use uniserve_cuda::Stream;
 
+use super::input_buffers::InputBuffers;
+use super::methods::{Argument, Methods};
 use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
@@ -61,9 +63,9 @@ use crate::storage::{GroupShape, GroupTable, KVCache, OutputPool, TablePages, ta
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 
-use buffers::{AttentionMetadata, Banks, Buffers, ColumnWrites};
+use buffers::{AttentionMetadata, Banks, ColumnWrites, DenoiseViews, Dimensions};
 use calls::{DenoiseRow, ReadoutPass, Sequence};
-use methods::{Argument, Facts, Method, Methods};
+use facts::Facts;
 use shapes::{SLOT_BUCKETS, ShapeKey, Shapes};
 
 pub(crate) use forward::execute;
@@ -77,6 +79,19 @@ type Coordinate<'a> = &'a mut dyn FnMut(usize) -> Result<Option<usize>>;
 /// buffers.
 const CANDIDATES: usize = 1 << 16;
 
+/// The import path of the runner's Python half.
+const RUNNER: &str = "uniserve_models.runner.diffusion_lm.DiffusionLMRunner";
+
+/// The methods of the Python half the rank calls.
+const METHODS: [&str; 6] = [
+    "attend",
+    "readout",
+    "denoise",
+    "plan_attention",
+    "plans_attention",
+    "kernels",
+];
+
 /// The runner of one diffusion language model component on the rank.
 pub(crate) struct DiffusionLMRunner {
     /// The runner's place among the rank's diffusion LM runners, which
@@ -88,7 +103,9 @@ pub(crate) struct DiffusionLMRunner {
     component: String,
     methods: Methods,
     facts: Facts,
-    buffers: Buffers,
+    buffers: InputBuffers<Dimensions>,
+    /// The state rows of a denoising step, on a generating rank.
+    state: Option<DenoiseViews>,
     /// The resident banks of a generating rank.
     banks: Option<Banks>,
     /// The block-diffusion sampling a generating rank serves.
@@ -151,7 +168,23 @@ impl DiffusionLMRunner {
 
     /// The runner's owner name and kernel records.
     pub(crate) fn kernels(&self) -> Result<(String, Vec<Record>)> {
-        Ok((self.owner.clone(), self.methods.kernels()?))
+        let records = self.methods.call("kernels", Vec::new())?.invoke()?;
+        let records = tvm_ffi::Array::<tvm_ffi::Any>::try_from(records)
+            .map_err(|_| Error::Interface(format!("{RUNNER}.kernels returns a list")))?
+            .iter()
+            .enumerate()
+            .map(|(index, record)| Record::new(format!("{RUNNER}.kernels[{index}]"), record))
+            .collect::<Result<_>>()?;
+        Ok((self.owner.clone(), records))
+    }
+
+    /// Call the method `name` on the Python thread: an eager forward, or
+    /// the forward a capture in progress records.
+    fn call(&self, name: &str, arguments: &[Argument]) -> Result<()> {
+        self.methods
+            .call(name, arguments.to_vec())?
+            .invoke()
+            .map(drop)
     }
 
     /// Refuse further captures; serving may only launch.
@@ -177,7 +210,7 @@ impl DiffusionLMRunner {
     }
 
     fn tensor(&self, name: &str) -> Result<Argument> {
-        Ok(Argument::Tensor(self.buffers.view(name)?))
+        Ok(Argument::Tensor(self.buffers.column(name)?.clone()))
     }
 
     /// The attention metadata tensors of a method call, in parameter order.
@@ -211,7 +244,7 @@ impl DiffusionLMRunner {
         &mut self,
         key: ShapeKey,
         capacity: Option<usize>,
-        method: Method,
+        method: &'static str,
         arguments: &[Argument],
         plan: Option<&[Argument]>,
     ) -> Result<GraphMode> {
@@ -220,14 +253,14 @@ impl DiffusionLMRunner {
             self.stream.clone(),
             self.buffers.device(),
         ) else {
-            self.methods.call(method, arguments)?;
+            self.call(method, arguments)?;
             self.graphs.record(GraphMode::Eager);
             return Ok(GraphMode::Eager);
         };
         let mode = match self.graphs.lookup(&key, capacity)? {
             Lookup::Replay(graph) => {
                 if let (true, Some(plan)) = (self.plans_attention, plan) {
-                    self.methods.plan_attention(plan)?;
+                    self.call("plan_attention", plan)?;
                 }
                 graph.launch(&stream)?;
                 GraphMode::Replay
@@ -236,13 +269,11 @@ impl DiffusionLMRunner {
                 // The eager call produces this forward's results, plans its
                 // attention and warms the capture, which records the same
                 // call without executing it.
-                self.methods.call(method, arguments)?;
+                self.call(method, arguments)?;
                 let captured = self
                     .methods
                     .graphs
-                    .capture(&pool, stream.raw(), device, || {
-                        self.methods.call(method, arguments)
-                    });
+                    .capture(&pool, stream.raw(), device, || self.call(method, arguments));
 
                 // The breaks the forward reached (weight prefetches) belong
                 // to this capture, whether or not it succeeded.
@@ -272,7 +303,7 @@ impl DiffusionLMRunner {
         coordinate: Coordinate<'_>,
         mut sink: impl FnMut(Range<usize>, &StorageView) -> Result<()>,
     ) -> Result<Executed> {
-        let layout = self.buffers.layout().clone();
+        let layout = self.buffers.dimensions.clone();
         let tokens = pass.tokens.len();
         if pass.rows.is_empty() || pass.rows.iter().map(|row| row.query).sum::<usize>() != tokens {
             return Err(Error::Invalid(
@@ -326,7 +357,7 @@ impl DiffusionLMRunner {
             )));
         }
         let mut writes = ColumnWrites::new();
-        let ids = self.buffers.view("input_ids")?;
+        let ids = self.buffers.column("input_ids")?.clone();
         writes.write(&ids, 0, &pass.tokens)?;
         writes.zero(&ids, tokens, padded_tokens - tokens)?;
         buffers::write_positions(&self.buffers, &mut writes, &pass.rows, padded_tokens)?;
@@ -364,11 +395,11 @@ impl DiffusionLMRunner {
         arguments.push(self.tensor("positions")?);
         arguments.extend(attention);
         arguments.extend(state.iter().cloned());
-        let mode = self.run(key, capacity, Method::Attend, &arguments, Some(&plan))?;
+        let mode = self.run(key, capacity, "attend", &arguments, Some(&plan))?;
 
-        let slot_rows = self.buffers.view("slot_rows")?;
-        let index = self.buffers.view("candidate_index")?;
-        let values = self.buffers.view("candidate_logprobs")?;
+        let slot_rows = self.buffers.column("slot_rows")?.clone();
+        let index = self.buffers.column("candidate_index")?.clone();
+        let values = self.buffers.column("candidate_logprobs")?.clone();
         let readout =
             |slots: usize, candidates: usize, index: &StorageView, values: &StorageView| {
                 let mut arguments: Vec<Argument> = vec![
@@ -416,9 +447,9 @@ impl DiffusionLMRunner {
                     let arguments = readout(bucket, CANDIDATES, &index, &values);
                     if self.facts.last_stage() {
                         let key = ShapeKey::Readout { slots: bucket };
-                        self.run(key, None, Method::Readout, &arguments, None)?;
+                        self.run(key, None, "readout", &arguments, None)?;
                     } else {
-                        self.methods.call(Method::Readout, &arguments)?;
+                        self.call("readout", &arguments)?;
                     }
                     sink(window..end, &values.prefix((end - window) as i64)?)?;
                 }
@@ -452,10 +483,7 @@ impl DiffusionLMRunner {
             writes.write(&slot_rows, 0, &pass.slots)?;
             writes.write(index, 0, &flat(0..total, 0))?;
             self.submit(writes)?;
-            self.methods.call(
-                Method::Readout,
-                &readout(pass.slots.len(), total, index, values),
-            )?;
+            self.call("readout", &readout(pass.slots.len(), total, index, values))?;
             sink(0..total, &values.prefix(total as i64)?)?;
             if let (Some(_), Some(stream)) = (&larger, &self.stream) {
                 // The forward's own storage is freed once its copies ran.
@@ -478,7 +506,7 @@ impl DiffusionLMRunner {
         pages: &[TablePages],
         coordinate: Coordinate<'_>,
     ) -> Result<Executed> {
-        let (Some(banks), Some(state)) = (&self.banks, self.buffers.denoise()) else {
+        let (Some(banks), Some(state)) = (&self.banks, &self.state) else {
             return Err(Error::Invalid(
                 "this worker keeps no generating blocks".into(),
             ));
@@ -499,7 +527,7 @@ impl DiffusionLMRunner {
         }
 
         let mut writes = ColumnWrites::new();
-        let columns = self.buffers.view("denoise.columns")?;
+        let columns = self.buffers.column("denoise.columns")?.clone();
         let fields: [Vec<i64>; 4] = [
             rows.iter().map(|row| i64::from(row.slot)).collect(),
             // Seeds are u64 carried bit for bit in int64 columns.
@@ -564,7 +592,7 @@ impl DiffusionLMRunner {
             rows: padded,
             first,
         };
-        let mode = self.run(key, capacity, Method::Denoise, &arguments, Some(&plan))?;
+        let mode = self.run(key, capacity, "denoise", &arguments, Some(&plan))?;
         Ok(Executed {
             mode,
             tokens: live * length,
@@ -604,7 +632,9 @@ impl DiffusionLMRunner {
         if let Some(stream) = &self.stream {
             stream.synchronize()?;
         }
-        self.plans_attention = self.methods.plans_attention()?;
+        let plans = self.methods.call("plans_attention", Vec::new())?.invoke()?;
+        self.plans_attention = bool::try_from(plans)
+            .map_err(|_| Error::Interface(format!("{RUNNER}.plans_attention returns a flag")))?;
 
         let mut counts = [0; 3];
         for (key, _) in self.graphs.keys() {
@@ -727,8 +757,8 @@ impl DiffusionLMRunner {
 
     /// Capture the `readout` graph of `slots` slot rows.
     fn warm_readout(&mut self, slots: usize) -> Result<()> {
-        let slot_rows = self.buffers.view("slot_rows")?;
-        let index = self.buffers.view("candidate_index")?;
+        let slot_rows = self.buffers.column("slot_rows")?.clone();
+        let index = self.buffers.column("candidate_index")?.clone();
         let mut writes = ColumnWrites::new();
         writes.write(&slot_rows, 0, &(0..slots as i64).collect::<Vec<_>>())?;
         writes.zero(&index, 0, CANDIDATES)?;
@@ -744,8 +774,7 @@ impl DiffusionLMRunner {
         ];
         arguments.extend(self.attend_state()?);
         let key = ShapeKey::Readout { slots };
-        self.run(key, None, Method::Readout, &arguments, None)
-            .map(drop)
+        self.run(key, None, "readout", &arguments, None).map(drop)
     }
 
     /// Pages of `count` rows of `length` tokens reading a one-token prefix
