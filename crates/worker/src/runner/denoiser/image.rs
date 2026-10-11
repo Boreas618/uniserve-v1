@@ -49,9 +49,10 @@ use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageBatch;
 use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::transfer::latents;
-use crate::ffi::{DType, Function, Handle, Record, integer_list};
+use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
+use crate::profiling::kernels::KernelRecord;
 use crate::request::diffusion::{BranchSet, GuidancePlan};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::ImageSetup;
@@ -766,7 +767,7 @@ impl ImageDiffusion {
     }
 
     /// The kernels the denoiser's operators selected.
-    pub fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+    pub fn kernels(&self, label: &str) -> Result<Vec<KernelRecord>> {
         let records: tvm_ffi::Array<Any> = self
             .methods
             .kernels
@@ -774,7 +775,7 @@ impl ImageDiffusion {
         records
             .iter()
             .enumerate()
-            .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+            .map(|(index, record)| KernelRecord::new(format!("{label}.kernels[{index}]"), record))
             .collect()
     }
 }

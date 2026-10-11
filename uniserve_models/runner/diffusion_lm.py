@@ -57,7 +57,7 @@ from uniserve_models.nn.attention import (
     SequenceLengths,
 )
 from uniserve_models.nn.moe import FusedMoE
-from uniserve_models.runner.context import execution_context
+from uniserve_models.runner.context import execution_context, kernel_records
 
 __all__ = [
     "STEP_CONTINUED",
@@ -421,14 +421,18 @@ class DiffusionLMRunner:
         """
         return self._context.plans_attention()
 
-    def kernels(self) -> list[dict[str, Any]]:
+    def kernels(self) -> list[str]:
         """Kernel records of the model's layers and of the sampler.
 
         The selected kernel of every operator of the execution context,
         then, on CUDA, one ``product`` record per chunk shape the sampler's
         self-conditioning product has run: its positions, vocabulary and
-        hidden sizes and the cuBLASLt algorithm it uses.
+        hidden sizes and the cuBLASLt algorithm it uses. Each record is the
+        text of one JSON object.
         """
+        return kernel_records(self._kernels())
+
+    def _kernels(self) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = list(self._context.kernels())
         workspace, table = self._workspace, self._table
         if (

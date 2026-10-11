@@ -23,11 +23,12 @@ use super::forward::{self, launch::Launched};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
-use crate::ffi::{Function, Record};
+use crate::ffi::Function;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::JobQueues;
 use crate::model::registry::Components;
+use crate::profiling::kernels::KernelRecord;
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
@@ -407,7 +408,7 @@ impl WorkerBackend {
 
     /// The kernels each image runner's operators selected, as `(name,
     /// device, kernels)` in construction order.
-    pub(crate) fn image_kernels(&self) -> Result<Vec<(String, String, Vec<Record>)>> {
+    pub(crate) fn image_kernels(&self) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
         image_kernels(
             &self.image_order,
             &self.encoders,
@@ -777,35 +778,32 @@ impl WorkerBackend {
             return;
         }
         watch.last = choices;
-        let mut current = KernelRecords::default();
-        if let Some(text) = &self.text {
-            let added = text.kernels().and_then(|listed| {
-                listed
-                    .iter()
-                    .try_for_each(|(label, device, records)| current.add(label, device, records))
-            });
-            if let Err(error) = added {
-                tracing::warn!(target: "uniserve_worker.profiling", "kernel report failed: {error}");
-                return;
-            }
-        }
-        let added = image_kernels(
+        let mut current = watch.records.empty();
+        let text = match &self.text {
+            Some(text) => text.kernels(),
+            None => Ok(Vec::new()),
+        };
+        let image = image_kernels(
             &self.image_order,
             &self.encoders,
             &self.denoisers,
             &self.decoders,
-        )
-        .and_then(|listed| {
-            listed
-                .iter()
-                .try_for_each(|(label, device, records)| current.add(label, device, records))
+        );
+        let listed = text.and_then(|mut listed| {
+            listed.extend(image?);
+            Ok(listed)
         });
-        if let Err(error) = added {
+        let logged = listed.and_then(|listed| {
+            for (label, device, records) in &listed {
+                current.add(label, device, records);
+            }
+            if watch.records.merge(current) {
+                watch.records.log("serving", watch.rank, &watch.device)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = logged {
             tracing::warn!(target: "uniserve_worker.profiling", "kernel report failed: {error}");
-            return;
-        }
-        if watch.records.merge(current) {
-            watch.records.log("serving", watch.rank, &watch.device);
         }
     }
 
@@ -961,7 +959,7 @@ fn image_kernels(
     encoders: &EncoderRunners,
     denoisers: &DenoiserRunners,
     decoders: &DecoderRunners,
-) -> Result<Vec<(String, String, Vec<Record>)>> {
+) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
     let mut listed = Vec::new();
     for (runner, name) in order {
         let (device, kernels) = match runner {

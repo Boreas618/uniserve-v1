@@ -22,8 +22,9 @@ use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{Call, CallKind};
 
-use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list};
+use crate::ffi::{Backing, DType, Function, Handle, integer_list};
 use crate::model::interface::Interface;
+use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
 
@@ -284,7 +285,7 @@ impl Methods {
         &self,
         label: &str,
         runners: impl IntoIterator<Item = &'a Handle>,
-    ) -> Result<Vec<Record>> {
+    ) -> Result<Vec<KernelRecord>> {
         let mut values: Vec<Any> = Vec::new();
         for runner in runners {
             let records: tvm_ffi::Array<Any> = self.kernels.call_as(&[runner.view()])?;
@@ -293,7 +294,7 @@ impl Methods {
         values
             .into_iter()
             .enumerate()
-            .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+            .map(|(index, record)| KernelRecord::new(format!("{label}.kernels[{index}]"), record))
             .collect()
     }
 
