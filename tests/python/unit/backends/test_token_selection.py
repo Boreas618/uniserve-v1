@@ -15,7 +15,6 @@ from uniserve_models.sampling.select import (
     TOKEN_CONTINUATION_BIT,
     TOP_P,
     TYPICAL_P,
-    Task,
     select_categorical,
 )
 from uniserve_models.sampling.state import (
@@ -27,6 +26,39 @@ from uniserve_models.sampling.state import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def _select(logits, params, **controls):
+    """Select one task over ``logits`` rows with neutral host controls."""
+    rows = int(logits.shape[0])
+    neutral = {
+        "row_counts": [rows],
+        "drafts": [],
+        "terminal_prefixes": [0],
+        "top_ks": [0] * rows,
+        "top_p_rows": [],
+        "min_p_rows": [],
+        "typical_p_rows": [],
+        "allowed_rows": [],
+        "allowed": [],
+        "suppressed": [],
+        "penalty_rows": [],
+        "penalty_counts": None,
+        "bias": [],
+        "bias_values": [],
+        "logprob_tasks": [],
+        "logprob_requests": [],
+        "force_finish": [0],
+        "finish_ids": [-1],
+        "transition_ids": [-1],
+    }
+    return select_categorical(
+        logits,
+        torch.zeros(rows),
+        params,
+        torch.ones(1, dtype=torch.bool),
+        **{**neutral, **controls},
+    )
 
 
 def _params(rows: int, temperature: float = 0.0) -> torch.Tensor:
@@ -65,13 +97,11 @@ def test_penalties_shape_the_seen_tokens_before_selection(
     counts = torch.zeros(len(logits), dtype=torch.int32)
     counts[0] = count
 
-    selection = select_categorical(
-        [Task(row=0, rows=1, slot=1, penalties=True)],
+    selection = _select(
         torch.tensor([logits]),
-        torch.zeros(1),
         params,
-        torch.ones(1, dtype=torch.bool),
-        [counts],
+        penalty_rows=[0],
+        penalty_counts=counts.unsqueeze(0),
     )
 
     assert selection.tokens.tolist() == [selected]
@@ -88,22 +118,12 @@ def _verify(
     logits = torch.full((3, 5), -1.0)
     for row, token in enumerate((3, 1, 4)):
         logits[row, token] = 2.0
-    task = Task(
-        row=0,
-        rows=3,
-        slot=1,
-        drafts=drafts,
-        finish_ids=finish_ids,
-        terminal_prefix=terminal_prefix,
-        allowed=(None, None, None),
-    )
-    return select_categorical(
-        [task],
+    return _select(
         logits,
-        torch.zeros(3),
         _params(3),
-        torch.ones(1, dtype=torch.bool),
-        [None, None, None],
+        drafts=list(drafts),
+        terminal_prefixes=[terminal_prefix or 0],
+        finish_ids=list(finish_ids) or [-1],
     )
 
 
