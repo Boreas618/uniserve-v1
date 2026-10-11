@@ -1,15 +1,20 @@
 //! [`Facts`]: what the rank sizes a diffusion LM runner's buffers and graphs
-//! from before the runner exists (`uniserve_models.runner.diffusion_lm`).
+//! from before the runner exists.
+//!
+//! Each fact is a function of `uniserve_models.runner.diffusion_lm` over the
+//! loaded model and the diffusion LM's module path, returning a scalar or a
+//! flat list: the model's own read-only method of the same name. The module
+//! itself does not cross: a callable object would cross as a function.
 
 use tvm_ffi::Any;
 
-use crate::ffi::{DType, Handle, Record};
+use crate::ffi::{DType, Handle};
 use crate::model::interface::Interface;
 use crate::{Error, Result};
 
 const MODULE: &str = "uniserve_models.runner.diffusion_lm";
 
-/// What a diffusion LM's rank computes (`describe`).
+/// What a diffusion LM's rank computes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Facts {
     /// Tokens of one generated block (`C`).
@@ -20,8 +25,6 @@ pub(crate) struct Facts {
     pub(crate) hidden_size: usize,
     /// The self-conditioning embedding dtype.
     pub(crate) dtype: DType,
-    pub(crate) eos_token_ids: Vec<u32>,
-    pub(crate) pad_token_id: u32,
     /// Per-token widths of the final stage's attend state; empty elsewhere.
     pub(crate) attend_widths: Vec<usize>,
     pub(crate) attend_dtype: DType,
@@ -35,56 +38,69 @@ pub(crate) struct Facts {
     pub(crate) pipeline_size: usize,
 }
 
-fn dtype(record: &Record, key: &str) -> Result<DType> {
-    let name = record.string(key)?;
-    DType::from_name(&name)
-        .ok_or_else(|| Error::Interface(format!("{MODULE}.describe reports the {key} {name:?}")))
-}
-
 fn text(value: &str) -> Any {
     Any::from(tvm_ffi::String::from(value))
 }
 
+/// The error of a library function that returned another type than its
+/// docstring states.
+fn mismatch(function: &str) -> impl Fn(tvm_ffi::Error) -> Error + '_ {
+    move |error| Error::numerical(function, &error)
+}
+
 impl Facts {
-    /// Describe the diffusion LM at `path` of the loaded model. `exchange`
-    /// says routed experts use an expert exchange, and `attention_ranks`
-    /// counts the attention ranks of a disaggregated expert union (zero
-    /// when every rank holds its experts).
-    pub(crate) fn describe(
+    /// Read the facts of the diffusion LM at `path` of the loaded model.
+    /// `exchange` says routed experts use an expert exchange, and
+    /// `attention_ranks` counts the attention ranks of a disaggregated
+    /// expert union (zero when every rank holds its experts).
+    pub(crate) fn read(
         interface: &Interface,
         loaded: &Handle,
         path: &str,
         exchange: bool,
         attention_ranks: usize,
     ) -> Result<Self> {
-        let function = format!("{MODULE}.describe");
-        let record = Record::new(
-            function.as_str(),
-            interface.import(&function)?.call_values(&[
-                loaded.to_any(),
-                text(path),
-                Any::from(exchange),
-                Any::from(attention_ranks as i64),
-            ])?,
+        let call = |name: &str, more: &[Any]| -> Result<Any> {
+            let mut arguments = vec![loaded.to_any(), text(path)];
+            arguments.extend_from_slice(more);
+            interface
+                .import(&format!("{MODULE}.{name}"))?
+                .call_values(&arguments)
+        };
+        let count = |name: &str| -> Result<usize> {
+            let value = i64::try_from(call(name, &[])?).map_err(mismatch(name))?;
+            Ok(value as usize)
+        };
+        let dtype = |name: &str| -> Result<DType> {
+            let value = tvm_ffi::String::try_from(call(name, &[])?).map_err(mismatch(name))?;
+            DType::from_name(value.as_str()).ok_or_else(|| {
+                Error::Unsupported(format!("{MODULE}.{name} names {:?}", value.as_str()))
+            })
+        };
+        let counts = |name: &str| -> Result<Vec<usize>> {
+            let values = crate::ffi::integers(call(name, &[])?).map_err(mismatch(name))?;
+            Ok(values.into_iter().map(|value| value as usize).collect())
+        };
+        let flag = |name: &str, more: &[Any]| -> Result<bool> {
+            bool::try_from(call(name, more)?).map_err(mismatch(name))
+        };
+
+        let stage = counts("stage")?;
+        let exchanges = flag(
+            "exchanges_readout",
+            &[Any::from(exchange), Any::from(attention_ranks as i64)],
         )?;
-        let tokens = |values: Vec<i64>| values.into_iter().map(|value| value as u32).collect();
         Ok(Self {
-            sequence_length: record.count("sequence_length")?,
-            vocab_size: record.count("vocab_size")?,
-            hidden_size: record.count("hidden_size")?,
-            dtype: dtype(&record, "dtype")?,
-            eos_token_ids: tokens(record.shape("eos_token_ids")?),
-            pad_token_id: record.count("pad_token_id")? as u32,
-            attend_widths: record
-                .shape("attend_widths")?
-                .into_iter()
-                .map(|width| width as usize)
-                .collect(),
-            attend_dtype: dtype(&record, "attend_dtype")?,
-            generates: record.flag("generates")?,
-            local_tail: record.flag("local_tail")?,
-            pipeline_rank: record.count("pipeline_rank")?,
-            pipeline_size: record.count("pipeline_size")?,
+            sequence_length: count("sequence_length")?,
+            vocab_size: count("vocab_size")?,
+            hidden_size: count("hidden_size")?,
+            dtype: dtype("embedding_dtype")?,
+            attend_widths: counts("attend_widths")?,
+            attend_dtype: dtype("compute_dtype")?,
+            generates: flag("generates", &[])?,
+            local_tail: !exchanges,
+            pipeline_rank: stage[0],
+            pipeline_size: stage[1],
         })
     }
 
