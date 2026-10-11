@@ -25,10 +25,10 @@ use uniserve_ipc::{Call, ForwardBatch};
 use crate::executor::PendingOutput;
 use crate::executor::forward::image::ImageRuntime;
 use crate::ffi::{Device, Region};
-use crate::model::image::ROPE_ADVANCE;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};
-use crate::runner::diffusion::image::ConditionRow;
+use crate::runner::denoiser::image::ConditionRow;
+use crate::runner::denoiser::image_model::ROPE_ADVANCE;
 use crate::runner::vision::{BlockPositions, PositionLayout};
 use crate::storage::memory::StorageView;
 use crate::storage::{BlockTables, Metadata, ProductRead, TensorStore};
@@ -466,7 +466,7 @@ pub(super) fn visual(
     ))
 }
 
-fn diffusion_device(diffusion: &crate::runner::diffusion::image::ImageDiffusion) -> Device {
+fn diffusion_device(diffusion: &crate::runner::denoiser::image::ImageDiffusion) -> Device {
     match diffusion.device() {
         crate::config::Device::Cuda(index) => Device::Cuda(index),
         crate::config::Device::Cpu => Device::Cpu,
