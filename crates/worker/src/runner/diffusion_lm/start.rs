@@ -407,7 +407,9 @@ impl DiffusionLMRunner {
                 // The functions of each communicator's collectives on the
                 // stream, by communicator name.
                 match &collectives {
-                    Some(collectives) => Argument::Handle(Handle::new(collectives.tables())?),
+                    Some(collectives) => {
+                        Argument::Handle(Handle::new(collectives.natives(interface)?)?)
+                    }
                     None => Argument::None,
                 },
                 bounds.tokens.into(),
