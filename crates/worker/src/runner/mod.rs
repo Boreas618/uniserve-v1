@@ -8,11 +8,8 @@ pub(crate) mod decoder;
 pub(crate) mod denoiser;
 pub(crate) mod diffusion;
 pub(crate) mod encoder;
-mod graph_shapes;
 pub(crate) mod media;
 pub(crate) mod vision;
-
-pub use graph_shapes::{PrefillShape, TextShapes, prefill_shapes, prefill_units};
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;

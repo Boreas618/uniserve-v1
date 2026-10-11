@@ -50,7 +50,7 @@ pub struct WorkerBackend {
     /// The rank's storage owners (events, products, transports, KV cache).
     rank_storage: Option<RankStorage>,
     /// The text runtime, on ranks holding a causal language model.
-    text: Option<forward::token::TextRuntime>,
+    text: Option<crate::runner::causal_lm::CausalLMRunners>,
     /// The image runtime, on ranks holding encoders, image denoisers or
     /// image decoders of a model that is not a video model.
     image: Option<forward::image::ImageRuntime>,
@@ -81,7 +81,7 @@ pub(crate) struct Parts<'a> {
     pub rank: usize,
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut RankStorage>,
-    pub text: Option<&'a mut forward::token::TextRuntime>,
+    pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
     pub image: Option<&'a mut forward::image::ImageRuntime>,
     pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
     pub experts: Option<&'a forward::experts::ExpertRuntime>,
@@ -93,7 +93,7 @@ pub(crate) struct Parts<'a> {
 /// runtimes' owners.
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
-    text: &'a mut Option<forward::token::TextRuntime>,
+    text: &'a mut Option<crate::runner::causal_lm::CausalLMRunners>,
     image: &'a mut Option<forward::image::ImageRuntime>,
     canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
     transfer: &'a mut Option<forward::transfer::TransferRuntime>,
@@ -322,11 +322,11 @@ impl WorkerBackend {
     }
 
     /// Install the text runtime.
-    pub(crate) fn set_text(&mut self, text: forward::token::TextRuntime) {
+    pub(crate) fn set_text(&mut self, text: crate::runner::causal_lm::CausalLMRunners) {
         self.text = Some(text);
     }
 
-    pub(crate) fn text_mut(&mut self) -> Option<&mut forward::token::TextRuntime> {
+    pub(crate) fn text_mut(&mut self) -> Option<&mut crate::runner::causal_lm::CausalLMRunners> {
         self.text.as_mut()
     }
 

@@ -1,11 +1,11 @@
 //! A token batch's reservation and retirement.
 //!
-//! [`TokenBatch::open`] binds every call's pending output, resolves
+//! [`Batch::open`] binds every call's pending output, resolves
 //! host-gated predicates and leases the batch's output storage.
-//! [`TokenBatch::reserve`] installs the active calls' block tables, resets
+//! [`Batch::reserve`] installs the active calls' block tables, resets
 //! newly assigned units, retains the KV extents the batch reads and writes
 //! until its device work retires, binds its scalar products and leases its
-//! relayed predicates. [`TokenBatch::discard`] retires all of it after a
+//! relayed predicates. [`Batch::discard`] retires all of it after a
 //! failure before the commit point.
 
 use std::collections::{HashMap, HashSet};
@@ -15,11 +15,11 @@ use std::time::Instant;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{Batch as BatchPlan, CallStatus, DType, ForwardMode, RequestKey, TensorRef};
 
-use super::super::launch::{lock, read_flag, reports_output, seal};
 use super::calls::{self, Prepared};
-use super::{COMPLETION_FIELDS, TextRuntime};
+use super::{COMPLETION_FIELDS, CausalLMRunners};
 use crate::executor::PendingOutput;
 use crate::executor::forward::image::ImageRuntime;
+use crate::executor::forward::launch::{lock, read_flag, reports_output, seal};
 use crate::ffi::Device;
 use crate::request::RequestPool;
 use crate::sampling::SamplingMetadata;
@@ -48,8 +48,8 @@ pub(super) struct CallState {
 }
 
 /// A token batch's borrowed owners and the resources it reserved.
-pub(super) struct TokenBatch<'a> {
-    pub(super) runtime: &'a mut TextRuntime,
+pub(super) struct Batch<'a> {
+    pub(super) runtime: &'a mut CausalLMRunners,
     /// The image runtime, for prompts placing image features.
     pub(super) image: Option<&'a mut ImageRuntime>,
     pub(super) storage: &'a mut RankStorage,
@@ -58,7 +58,7 @@ pub(super) struct TokenBatch<'a> {
     /// The runner group serving the batch.
     pub(super) group: usize,
     /// The rank's expert runtime, when its forwards are expert steps.
-    pub(super) experts: Option<&'a super::super::experts::ExpertRuntime>,
+    pub(super) experts: Option<&'a crate::executor::forward::experts::ExpertRuntime>,
     /// The group's lane stream.
     pub(super) stream: Option<Stream>,
     pub(super) device: Option<i32>,
@@ -74,15 +74,15 @@ pub(super) struct TokenBatch<'a> {
     pub(super) started: Instant,
 }
 
-impl<'a> TokenBatch<'a> {
+impl<'a> Batch<'a> {
     /// Bind the batch's outputs and lease its output storage.
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(super) fn open(
-        runtime: &'a mut TextRuntime,
+        runtime: &'a mut CausalLMRunners,
         image: Option<&'a mut ImageRuntime>,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
-        experts: Option<&'a super::super::experts::ExpertRuntime>,
+        experts: Option<&'a crate::executor::forward::experts::ExpertRuntime>,
         info: &uniserve_ipc::WorkerInfo,
         rank: usize,
         plan: &'a BatchPlan,

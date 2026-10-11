@@ -1,33 +1,26 @@
-//! The text runtime: prefill, decode and speculative-verify batches of causal
-//! language models.
+//! The causal LM runners of a rank and the batches they serve: prefill,
+//! decode and speculative-verify calls of causal language models.
 //!
-//! A token batch runs in four stages on the executor thread:
+//! A token batch runs in four stages on its lane's thread:
 //!
-//! 1. **Reservation** ([`batch`]): bind every call's pending output and the
+//! 1. **Reservation** ([`super::batch`]): bind every call's pending output and the
 //!    batch's output lease; install its block tables, reset newly assigned
 //!    units and retain the KV extents it reads and writes until its device
 //!    work retires; bind its scalar products (token relays, transition and
 //!    completion flags); lease its predicates. A call whose host predicate
 //!    is false is skipped (`Predicated`) and only publishes false flags.
-//! 2. **Step** ([`step`]): one input row per active call, the sampling tasks
+//! 2. **Step** ([`super::step`]): one input row per active call, the sampling tasks
 //!    and prompt scoring, and one forward on the call kind's runner.
-//! 3. **Capture and commit** ([`commit`]): advance each call's progress, copy
+//! 3. **Capture and commit** ([`super::commit`]): advance each call's progress, copy
 //!    completion and logprob words to the output lease, relay sampled tokens
 //!    and transitions into their products, then commit products, slot state
 //!    and pending calls together. A failure before the commit point retires
 //!    everything the batch reserved and reports every call as failed; a
 //!    failure after it is fatal.
-//! 4. **Materialization** ([`super::launch::materialize`]): once the
+//! 4. **Materialization** ([`crate::executor::forward::launch::materialize`]):
+//!    once the
 //!    lease's device fences complete, decode each call's result and accept
 //!    its progress.
-
-mod batch;
-mod calls;
-mod commit;
-mod context;
-pub(crate) mod start;
-mod step;
-pub(crate) mod warmup;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,11 +31,11 @@ use uniserve_ipc::{
     Batch as BatchPlan, BufferId, CallKind, ForwardMode, ForwardStats, RequestKey, Wake,
 };
 
-use super::super::backend::{Parts, WorkerBackend, WorkerBatch};
-use super::launch::{Launched, StreamOrder, error_code, failed_output};
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
+use crate::executor::backend::{Parts, WorkerBackend, WorkerBatch};
+use crate::executor::forward::launch::{Launched, StreamOrder, error_code, failed_output};
 use crate::executor::lifecycle::RequestStorage;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
@@ -59,39 +52,39 @@ pub(crate) struct StepParts<'a> {
     pub(crate) cache: &'a mut KVCacheManager<Arc<Retirement>>,
 }
 
-use batch::TokenBatch;
-use commit::Failure;
-use step::Stepped;
+use super::batch::Batch;
+use super::commit::Failure;
+use super::step::Stepped;
 
 /// Fields of a call's completion section: valid, active, token, accepted.
-const COMPLETION_FIELDS: usize = 4;
+pub(super) const COMPLETION_FIELDS: usize = 4;
 
-/// The text runtime of a rank: one runner per lane binding, or per expert
-/// microbatch of it, the slot continuation state they share, and their
-/// output storage.
-pub(crate) struct TextRuntime {
-    runners: Vec<CausalLMRunner>,
+/// The causal LM runners of a rank: one runner per lane binding, or per
+/// expert microbatch of it, the slot continuation state they share, and
+/// their output storage.
+pub(crate) struct CausalLMRunners {
+    pub(super) runners: Vec<CausalLMRunner>,
     /// Each lane binding's runners, one per expert microbatch; the first
     /// runs on the lane's stream, the others on its forks.
-    groups: Vec<Vec<usize>>,
+    pub(super) groups: Vec<Vec<usize>>,
     /// The NCCL communicators of the runners' bindings, destroyed after
     /// their graphs.
-    collectives: Vec<crate::parallel::StreamCollectives>,
+    pub(super) collectives: Vec<crate::parallel::StreamCollectives>,
     /// The unit reset column of each runner's stream.
-    columns: Vec<UnitColumn>,
+    pub(super) columns: Vec<UnitColumn>,
     /// The group serving each component's call kind.
-    routes: HashMap<(String, CallKind), usize>,
-    state: DecodeState,
-    outputs: OutputPool,
+    pub(super) routes: HashMap<(String, CallKind), usize>,
+    pub(super) state: DecodeState,
+    pub(super) outputs: OutputPool,
     /// Global vocabulary of sampling.
-    vocab: usize,
+    pub(super) vocab: usize,
     /// Orders slot state across runner streams: recorded after each text
     /// batch's last write, waited on by the next batch on another stream.
-    order: StreamOrder,
+    pub(super) order: StreamOrder,
 }
 
-impl TextRuntime {
-    fn route(&self, component: &str, kind: CallKind) -> Option<usize> {
+impl CausalLMRunners {
+    pub(super) fn route(&self, component: &str, kind: CallKind) -> Option<usize> {
         self.routes.get(&(component.to_owned(), kind)).copied()
     }
 
@@ -102,7 +95,7 @@ impl TextRuntime {
         }
     }
 
-    /// The order of this runtime's batches across streams; other runtimes
+    /// The order of these runners' batches across streams; other runtimes
     /// reading what text batches write (their KV) wait on it.
     pub(crate) fn order(&self) -> &StreamOrder {
         &self.order
@@ -155,10 +148,10 @@ impl TextRuntime {
     /// microbatches run in rotation, empty ones joining, and the lane stream
     /// waits on every microbatch stream. Microbatches launch their graphs
     /// only once the union joins by launching its own
-    /// ([`super::experts::ExpertRuntime::replays`]).
+    /// ([`crate::executor::forward::experts::ExpertRuntime::replays`]).
     pub(crate) fn invoke(
         &mut self,
-        experts: Option<&super::experts::ExpertRuntime>,
+        experts: Option<&crate::executor::forward::experts::ExpertRuntime>,
         group: usize,
         requests: &[Option<StepRequest<'_>>],
         context: &mut StepParts<'_>,
@@ -226,7 +219,7 @@ impl TextRuntime {
                 Some(staged) => {
                     let launch = self.runners[runner].launch(staged, Some(capacity), replay)?;
                     modes.push(Some(launch.mode));
-                    calls.push(Some(super::experts::MicrobatchForward {
+                    calls.push(Some(crate::executor::forward::experts::MicrobatchForward {
                         call: launch.call,
                         yields: launch.yields,
                     }));
@@ -253,7 +246,7 @@ impl TextRuntime {
         Ok(executed)
     }
 
-    /// The order of this runtime's batches, for other runtimes that also
+    /// The order of these runners' batches, for other runtimes that also
     /// write what text batches read (guidance prefixes, latent images'
     /// K/V).
     pub(crate) fn order_mut(&mut self) -> &mut StreamOrder {
@@ -302,7 +295,7 @@ impl TextRuntime {
     /// microbatches join.
     pub(crate) fn prefill_cache(
         &mut self,
-        experts: Option<&super::experts::ExpertRuntime>,
+        experts: Option<&crate::executor::forward::experts::ExpertRuntime>,
         component: &str,
         prefixes: &[(u32, &[u32])],
         tables: &BlockTables,
@@ -333,7 +326,7 @@ impl TextRuntime {
 
         // The lane's runner evaluates every prefix.
         let mut requests: Vec<Option<StepRequest<'_>>> = vec![Some(StepRequest {
-            decode: false,
+            mode: ForwardMode::Prefill,
             rows: &rows,
             finish_ids: &[],
             sampling: None,
@@ -376,7 +369,7 @@ impl TextRuntime {
     }
 }
 
-impl RequestStorage for TextRuntime {
+impl RequestStorage for CausalLMRunners {
     fn admit_slots(&mut self, slots: &[usize]) -> Result<()> {
         // Reset on the first runner's stream; other streams order after it
         // before their next batch.
@@ -430,7 +423,7 @@ pub(crate) fn execute(
             batch.launch(launched);
             return Ok(());
         }
-        Ok(None) => return Err(super::unsupported(kind, "text")),
+        Ok(None) => return Err(crate::executor::forward::unsupported(kind, "text")),
         Err(failure) => failure,
     };
     let mut error = WorkerError::classify(failure.error, Some("token batch"));
@@ -471,7 +464,7 @@ fn run(parts: Parts<'_>, plan: &BatchPlan) -> std::result::Result<Option<Launche
     let (Some(runtime), Some(storage)) = (parts.text, parts.storage) else {
         return Ok(None);
     };
-    let mut batch = TokenBatch::open(
+    let mut batch = Batch::open(
         runtime,
         parts.image,
         storage,
@@ -519,7 +512,7 @@ fn run(parts: Parts<'_>, plan: &BatchPlan) -> std::result::Result<Option<Launche
     }
 }
 
-impl TokenBatch<'_> {
+impl Batch<'_> {
     /// Commit a batch whose calls were all skipped: only their false flags
     /// were published.
     fn finish_skipped(&mut self) -> std::result::Result<(), Failure> {
@@ -537,7 +530,7 @@ impl TokenBatch<'_> {
     }
 }
 
-fn statistics(batch: &TokenBatch<'_>, stepped: Option<&Stepped>) -> ForwardStats {
+fn statistics(batch: &Batch<'_>, stepped: Option<&Stepped>) -> ForwardStats {
     let mut stats = ForwardStats::default();
     let elapsed = batch.started.elapsed().as_micros() as u64;
     stats.component_us.insert("text_execute".into(), elapsed);
