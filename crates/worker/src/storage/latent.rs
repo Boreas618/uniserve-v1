@@ -1,5 +1,7 @@
 //! Paged diffusion trajectories and the physical lifetime of their two banks.
 
+pub(crate) mod image;
+
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

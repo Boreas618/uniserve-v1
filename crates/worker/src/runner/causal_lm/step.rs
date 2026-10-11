@@ -23,7 +23,7 @@ use crate::runner::causal_lm::{
     Embeddings, Executed, FINISH_IDS, PromptChunks, SamplingColumns, StepRequest, TokenRow,
     logit_layout,
 };
-use crate::runner::diffusion::image::ConditionRow;
+use crate::runner::denoiser::image::ConditionRow;
 use crate::sampling::SamplingMetadata;
 use crate::sampling::plan::{SampleTask, SamplingPlan, logprob_request, logprob_words};
 use crate::storage::LogprobLayout;
@@ -199,7 +199,7 @@ impl Batch<'_> {
                 let scores = call.writes_context() && admitted.prompt_logprobs_requested();
                 let sources = Sources {
                     tensors: &self.storage.tensors,
-                    image: self.image.as_deref(),
+                    image: self.image.as_ref(),
                     tables,
                     device: self.device,
                     stream: self.stream.as_ref(),
@@ -577,7 +577,7 @@ impl Batch<'_> {
     /// image denoiser on its stream, ordered between this batch's text
     /// work.
     fn condition_latents(&mut self, rows: &[ConditionRow]) -> Result<()> {
-        let image = self.image.as_deref_mut().ok_or_else(|| {
+        let image = self.image.as_mut().ok_or_else(|| {
             Error::Unsupported("latent conditioning requires the image runtime".into())
         })?;
         let diffusion = image.diffusion_mut().ok_or_else(|| {

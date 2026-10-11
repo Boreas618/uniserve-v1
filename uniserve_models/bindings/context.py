@@ -7,8 +7,9 @@ every numerical call site, and installs those bindings into the
 
 Workspace backing comes from a provider:
 
-* :class:`StandaloneWorkspace` (the default) allocates with ``torch.empty``,
-  for direct library use.
+* :class:`Workspace` (the default) allocates with ``torch.empty``; memory
+  torch cannot allocate, the peer-mapped storage of a symmetric field, comes
+  from the allocation function it is constructed with.
 * :class:`DeclaredWorkspace` records every request without allocating. The
   worker uses it to learn a binding's requirements, allocates them itself and
   hands them back as tensors.
@@ -306,12 +307,34 @@ def _split(requirement) -> tuple[dict, dict]:
     return local, symmetric
 
 
-class StandaloneWorkspace:
-    """Allocate workspace with the caching allocator, for library calls."""
+class Workspace:
+    """The workspace of an execution context, in torch memory.
 
-    def __init__(self, scratch: Scratch | None = None) -> None:
+    Shared scratch is grown and kept by a :class:`Scratch`; persistent
+    fields are tensors of their own. A symmetric field, which every member
+    of a group maps, is memory torch cannot allocate and comes from
+    ``allocate``.
+
+    Args:
+        scratch: The shared :class:`Scratch` contexts serialized on one
+            stream borrow; ``None`` creates one this workspace owns.
+        allocate: ``allocate(ranks, dtype, shape)`` returns
+            ``[local, peer_0, ...]``: this rank's tensor of one symmetric
+            field and every member's peer-mapped view of it, in member
+            order. ``ranks`` are the members' process ranks and ``dtype``
+            the element type's name (``"float32"``). The call is collective:
+            every member makes it at the same point. ``None`` maps the field
+            over the torch process group of its communicator.
+    """
+
+    def __init__(
+        self,
+        scratch: Scratch | None = None,
+        allocate: Callable[..., Any] | None = None,
+    ) -> None:
         self._owns_scratch = scratch is None
         self._scratch = Scratch() if scratch is None else scratch
+        self._allocate = allocate
         self._allocations: list[TensorBuffers] = []
         # Peer-mapped allocations, retained until release.
         self._symmetric: list[Any] = []
@@ -333,20 +356,30 @@ class StandaloneWorkspace:
         local, symmetric = _split(requirement)
         tensors = dict(self.allocate(local, requirement.group.device))
         peers = {}
-        if symmetric:
-            # Library use maps peers over the torch process group; the
-            # worker binds its own peer-mapped storage instead.
-            from uniserve_models.distributed.symmetric import (
-                allocate_symmetric_storage,
-            )
+        for name, config in symmetric.items():
+            if self._allocate is None:
+                from uniserve_models.distributed.symmetric import (
+                    allocate_symmetric_storage,
+                )
 
-            for name, config in symmetric.items():
                 shared = allocate_symmetric_storage(
                     requirement.group, config.shape, config.dtype
                 )
                 self._symmetric.append(shared)
                 tensors[name] = shared.local
                 peers[name] = tuple(shared.peers)
+            else:
+                views = [
+                    torch.from_dlpack(view)
+                    for view in self._allocate(
+                        list(requirement.group.ranks),
+                        str(config.dtype).removeprefix("torch."),
+                        list(config.shape),
+                    )
+                ]
+                self._symmetric.append(views)
+                tensors[name] = views[0]
+                peers[name] = tuple(views[1:])
         return tensors, peers
 
     def release(self) -> None:
@@ -842,12 +875,12 @@ class ExecutionContext:
         moe: Routed-expert backend name.
         groups: Communicators the bound modules use; defaults to every
             communicator in the module tree.
-        scratch: A shared :class:`Scratch` (standalone workspace only).
+        scratch: A shared :class:`Scratch` (default workspace only).
         derive_host_lengths: Plans may read missing host lengths from the
             device.
         experts: The expert exchange routed experts communicate through.
         weights: Expert weight prefetch.
-        workspace: Workspace provider; defaults to a standalone provider.
+        workspace: Workspace provider; defaults to a :class:`Workspace`.
         collectives: Stream-bound collective bindings selected during an
             activation (the parallel runtime supplies them for its streams);
             ``None`` uses the process groups directly.
@@ -911,9 +944,7 @@ class ExecutionContext:
         }
         self.derive_host_lengths = derive_host_lengths
         self.collectives = collectives
-        self.workspace = (
-            StandaloneWorkspace(scratch) if workspace is None else workspace
-        )
+        self.workspace = Workspace(scratch) if workspace is None else workspace
         self.constants: Mapping[str, torch.Tensor] = _empty()
         self.workspace_views: Mapping[str, torch.Tensor] = _empty()
         self.graph_streams: set[torch.cuda.Stream] = set()

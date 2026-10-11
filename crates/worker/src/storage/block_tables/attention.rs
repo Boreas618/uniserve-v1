@@ -196,7 +196,7 @@ mod tests {
         ];
 
         // Token 8 reaches page 1; token 12 reaches page 2. The latter row
-        // extends beyond the stored prefix, as a read-only canvas may do.
+        // extends beyond the stored prefix, as a read-only block may do.
         let pages = table_pages(&tables, &[8, 12], &[1, 16])?;
         let values: Vec<Vec<Vec<u32>>> = pages
             .iter()

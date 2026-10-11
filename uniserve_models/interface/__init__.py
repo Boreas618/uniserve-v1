@@ -23,20 +23,11 @@ _AREAS = (
     "loading",
     "cache",
     "binding",
-    "canvas",
     "distributed",
-    "experts",
     "graphs",
-    "image",
-    "encoder",
-    "decoder",
-    "denoiser",
-    "memory",
     "kernels",
     "profiling",
     "runtime",
-    "video",
-    "media",
 )
 
 

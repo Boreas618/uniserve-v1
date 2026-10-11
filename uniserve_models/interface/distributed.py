@@ -347,8 +347,22 @@ def bind_collectives(prepared, tables: Mapping[str, Any]) -> None:
     context = prepared.context
     if context is None:
         raise ValueError("collectives bind to a bound component")
+    context.collectives = stream_collectives(context.groups, tables)
+
+
+def stream_collectives(groups, tables: Mapping[str, Any]) -> dict:
+    """The stream collectives of ``groups``, for an execution context.
+
+    ``tables`` maps a communicator name (mesh axes joined by ``.``) to the
+    collective functions of that communicator on one stream. Every
+    multi-member communicator of ``groups`` must have one: within an
+    activation, a collective never falls back to another stream.
+
+    Raises:
+        ValueError: A communicator has no table.
+    """
     bound = {}
-    for group in context.groups:
+    for group in groups:
         if group.size == 1:
             continue
         table = tables.get(group.name)
@@ -357,4 +371,4 @@ def bind_collectives(prepared, tables: Mapping[str, Any]) -> None:
                 f"communicator {group.name!r} has no stream collectives"
             )
         bound[group._require().group_name] = NativeCollectives(table)
-    context.collectives = bound
+    return bound

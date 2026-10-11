@@ -1,4 +1,4 @@
-"""Execution-context workspace: standalone, declared and bound backing."""
+"""Execution-context workspace: torch, declared and bound backing."""
 
 import pytest
 import torch
@@ -8,6 +8,7 @@ from uniserve_models.bindings.context import (
     DeclaredWorkspace,
     ExecutionContext,
     TensorBuffers,
+    Workspace,
 )
 from uniserve_models.tensors import BufferConfig
 
@@ -175,3 +176,42 @@ def test_attention_storage_declares_symmetric_fields_with_their_members():
         supplied["0000/output.peer0"].data_ptr(),
         supplied["0000/output.peer1"].data_ptr(),
     ]
+
+
+def test_a_symmetric_field_comes_from_the_allocation_function():
+    """The workspace asks its allocation function for peer-mapped storage.
+
+    The function receives the members' process ranks, the element type's
+    name and the shape, and its tensors back the field: the first locally,
+    the others as every member's view in member order. Other fields are
+    ordinary tensors.
+    """
+    from uniserve_models.distributed import Communicator
+    from uniserve_models.nn.attention.storage import StorageRequirement
+
+    requirement = StorageRequirement(
+        Communicator((3, 5), 0, "ulysses"),
+        {
+            "output": BufferConfig((2, 4), torch.float32),
+            "sync_input": BufferConfig((1,), torch.int32),
+        },
+        ("output",),
+        (),
+    )
+    requests = []
+    mapped = [torch.zeros((2, 4)), torch.zeros((2, 4)), torch.ones((2, 4))]
+
+    def allocate(ranks, dtype, shape):
+        requests.append((ranks, dtype, shape))
+        return mapped
+
+    tensors, peers = Workspace(allocate=allocate).storage(requirement)
+
+    assert requests == [([3, 5], "float32", [2, 4])]
+    assert tensors["output"].data_ptr() == mapped[0].data_ptr()
+    assert [peer.data_ptr() for peer in peers["output"]] == [
+        mapped[1].data_ptr(),
+        mapped[2].data_ptr(),
+    ]
+    assert tensors["sync_input"].shape == (1,)
+    assert "sync_input" not in peers

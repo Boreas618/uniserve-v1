@@ -18,19 +18,32 @@ use uniserve_ipc::{
     RequestKind, WorkerInfo, WorkerResponseError,
 };
 
+use super::forward::batch::image::ImageParts;
 use super::forward::{self, launch::Launched};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
-use crate::ffi::Function;
+use crate::ffi::{Function, Record};
+use crate::host::HostLane;
+use crate::host::image::ImageTask;
 use crate::lane::JobQueues;
 use crate::model::registry::Components;
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
+use crate::request::diffusion::Trajectories;
+use crate::request::video::VideoRequests;
+use crate::runner::decoder::runners::DecoderRunners;
+use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
+use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::encoder::inputs::Inputs;
+use crate::runner::encoder::runners::EncoderRunners;
+use crate::runner::media::MediaRunner;
+use crate::runner::start::{ImageOwners, ImageRunner};
 use crate::service::ServiceBackend;
+use crate::storage::ImageLatents;
 use crate::worker::RankStorage;
-use crate::{Error, Result};
+use crate::{Error, OutputPool, Result};
 
 /// Serving-time kernel reporting: a cheap counter tells when any provider
 /// choice changed, and only then are the bindings' records gathered.
@@ -51,20 +64,37 @@ pub struct WorkerBackend {
     rank_storage: Option<RankStorage>,
     /// The text runtime, on ranks holding a causal language model.
     text: Option<crate::runner::causal_lm::CausalLMRunners>,
-    /// The image runtime, on ranks holding encoders, image denoisers or
-    /// image decoders of a model that is not a video model.
-    image: Option<forward::image::ImageRuntime>,
-    /// The canvas runtime, on ranks holding a token denoiser.
-    canvas: Option<forward::canvas::CanvasRuntime>,
+    /// An image model's facts and host policy, on ranks holding encoders,
+    /// image denoisers or image decoders of a model that is not a video
+    /// model.
+    image: Option<(ImageModel, ImagePolicy)>,
+    /// The latent pool of a rank holding an image denoiser.
+    latents: Option<ImageLatents>,
+    /// The open image trajectory of each request slot.
+    trajectories: Trajectories,
+    /// The lane preparing input images and encoding output images.
+    image_host: Option<HostLane<ImageTask>>,
+    /// An image model's runners with their names, in construction order.
+    image_order: Vec<(ImageRunner, String)>,
+    /// The runner of each diffusion LM component placed on the rank.
+    diffusion_lm: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
     /// The expert-parallel runtime, on ranks of an expert union.
-    experts: Option<forward::experts::ExpertRuntime>,
+    experts: Option<crate::parallel::ExpertUnion>,
     /// Distributed expert weights, on ranks that prefetch them.
-    weights: Option<forward::experts::WeightRuntime>,
+    weights: Option<crate::parallel::DwdpManager>,
     /// The transfer runtime: tensor transfers, KV exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<forward::transfer::TransferRuntime>,
-    /// The video runtime, on ranks of a video model.
-    video: Option<forward::video::VideoRuntime>,
+    /// The admitted video requests, on ranks of a video model.
+    video: Option<VideoRequests>,
+    /// The rank's encoder, denoiser and decoder runners.
+    encoders: EncoderRunners,
+    denoisers: DenoiserRunners,
+    decoders: DecoderRunners,
+    /// The host media of a rank holding host components.
+    media: Option<MediaRunner>,
+    /// The output leases of media batches.
+    media_outputs: Option<OutputPool>,
     /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
@@ -82,22 +112,31 @@ pub(crate) struct Parts<'a> {
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
-    pub image: Option<&'a mut forward::image::ImageRuntime>,
-    pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
-    pub experts: Option<&'a forward::experts::ExpertRuntime>,
+    pub image: Option<ImageParts<'a>>,
+    pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
+    pub experts: Option<&'a crate::parallel::ExpertUnion>,
     pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
 }
 
-/// Every request storage owner, in lifecycle order: rank storage, then the
-/// text, image, canvas, transfer and video runtimes, then the other
-/// runtimes' owners.
+/// Every request storage owner, in lifecycle order: rank storage, the text
+/// runners, an image model's trajectories, output leases and latent pool,
+/// the diffusion LM runners, the transfer runtime, a video model's requests, denoiser
+/// runners and output leases, then the other runtimes' owners.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per owner the backend holds"
+)]
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<crate::runner::causal_lm::CausalLMRunners>,
-    image: &'a mut Option<forward::image::ImageRuntime>,
-    canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
+    image: bool,
+    trajectories: &'a mut Trajectories,
+    latents: &'a mut Option<ImageLatents>,
+    diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
     transfer: &'a mut Option<forward::transfer::TransferRuntime>,
-    video: &'a mut Option<forward::video::VideoRuntime>,
+    video: &'a mut Option<VideoRequests>,
+    denoisers: &'a mut DenoiserRunners,
+    media_outputs: &'a mut Option<OutputPool>,
     others: &'a mut [Box<dyn RequestStorage>],
 ) -> Vec<&'a mut dyn RequestStorage> {
     let mut owners: Vec<&'a mut dyn RequestStorage> = Vec::new();
@@ -107,17 +146,28 @@ fn owners<'a>(
     if let Some(text) = text {
         owners.push(text);
     }
-    if let Some(image) = image {
-        owners.push(image);
+    let mut media_outputs = media_outputs.as_mut();
+    if image {
+        owners.push(trajectories);
+        if let Some(outputs) = media_outputs.take() {
+            owners.push(outputs);
+        }
+        if let Some(latents) = latents {
+            owners.push(latents);
+        }
     }
-    if let Some(canvas) = canvas {
-        owners.push(canvas);
+    for runner in diffusion_lm {
+        owners.push(runner);
     }
     if let Some(transfer) = transfer {
         owners.push(transfer);
     }
     if let Some(video) = video {
         owners.push(video);
+        owners.push(denoisers);
+        if let Some(outputs) = media_outputs.take() {
+            owners.push(outputs);
+        }
     }
     owners.extend(
         others
@@ -136,10 +186,10 @@ pub struct WorkerBatch {
     /// A capability runtime's launched work awaiting materialization.
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
-    image_inputs: Option<forward::image::Inputs>,
+    image_inputs: Option<Inputs>,
     /// Products and KV transfers imported from other calls.
     inputs: forward::inputs::Inputs,
-    /// A video runtime batch's calls and completion.
+    /// A media batch's calls and completion.
     media: Option<forward::batch::MediaBatch>,
     output: Option<BatchResult>,
 }
@@ -199,15 +249,15 @@ impl WorkerBatch {
         self.running = Some(running);
     }
 
-    pub(crate) fn image_inputs(&self) -> Option<&forward::image::Inputs> {
+    pub(crate) fn image_inputs(&self) -> Option<&Inputs> {
         self.image_inputs.as_ref()
     }
 
-    pub(crate) fn set_image_inputs(&mut self, inputs: forward::image::Inputs) {
+    pub(crate) fn set_image_inputs(&mut self, inputs: Inputs) {
         self.image_inputs = Some(inputs);
     }
 
-    pub(crate) fn take_image_inputs(&mut self) -> Option<forward::image::Inputs> {
+    pub(crate) fn take_image_inputs(&mut self) -> Option<Inputs> {
         self.image_inputs.take()
     }
 
@@ -242,11 +292,20 @@ impl WorkerBackend {
             rank_storage: None,
             text: None,
             image: None,
-            canvas: None,
+            latents: None,
+            trajectories: Trajectories::default(),
+            image_host: None,
+            image_order: Vec::new(),
+            diffusion_lm: Vec::new(),
             experts: None,
             weights: None,
             transfer: None,
             video: None,
+            encoders: EncoderRunners::default(),
+            denoisers: DenoiserRunners::default(),
+            decoders: DecoderRunners::default(),
+            media: None,
+            media_outputs: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -330,39 +389,116 @@ impl WorkerBackend {
         self.text.as_mut()
     }
 
-    /// Install the image runtime.
-    pub(crate) fn set_image(&mut self, image: forward::image::ImageRuntime) {
-        self.image = Some(image);
+    /// Install what serves an image model on this rank.
+    pub(crate) fn set_image(&mut self, owners: ImageOwners) {
+        self.image = Some((owners.model, owners.policy));
+        self.encoders = owners.encoders;
+        self.denoisers = owners.denoisers;
+        self.decoders = owners.decoders;
+        self.latents = owners.latents;
+        self.media_outputs = Some(owners.outputs);
+        self.image_host = Some(owners.host);
+        self.image_order = owners.order;
     }
 
-    pub(crate) fn image_mut(&mut self) -> Option<&mut forward::image::ImageRuntime> {
-        self.image.as_mut()
+    /// The kernels each image runner's operators selected, as `(name,
+    /// device, kernels)` in construction order.
+    pub(crate) fn image_kernels(&self) -> Result<Vec<(String, String, Vec<Record>)>> {
+        image_kernels(
+            &self.image_order,
+            &self.encoders,
+            &self.denoisers,
+            &self.decoders,
+        )
     }
 
-    /// Install the canvas runtime.
-    pub(crate) fn set_canvas(&mut self, canvas: forward::canvas::CanvasRuntime) {
-        self.canvas = Some(canvas);
+    /// Release what serves an image model: its runners, the host lane and
+    /// the output storage, after the lanes drained.
+    fn close_image(&mut self, aborted: bool) -> Result<()> {
+        let Some(image) = self.image.take() else {
+            return Ok(());
+        };
+        // Each runner releases its graphs and then the execution context
+        // its Python half constructed, newest first.
+        let mut result = Ok(());
+        for (runner, _) in std::mem::take(&mut self.image_order).into_iter().rev() {
+            let closed = match runner {
+                ImageRunner::Encoder(index) => self
+                    .encoders
+                    .image
+                    .get_mut(index)
+                    .map_or(Ok(()), |runner| runner.close(aborted)),
+                ImageRunner::Denoiser => self
+                    .denoisers
+                    .image
+                    .as_mut()
+                    .map_or(Ok(()), |(_, runner)| runner.close(aborted)),
+                ImageRunner::Decoder => self
+                    .decoders
+                    .image
+                    .as_mut()
+                    .map_or(Ok(()), |(_, runner)| runner.close(aborted)),
+            };
+            result = result.and(closed);
+        }
+        if let Some(host) = self.image_host.take() {
+            if aborted {
+                host.abort();
+            } else if let Some(error) = host.close().into_iter().next() {
+                result = result.and(Err(error));
+            }
+        }
+        if let Some(mut outputs) = self.media_outputs.take() {
+            outputs.begin_close();
+            if !aborted {
+                outputs.finish_close();
+            }
+        }
+        // The owners end here, as the model's facts do.
+        drop(image);
+        self.release_media();
+        result
     }
 
-    pub(crate) fn canvas_mut(&mut self) -> Option<&mut forward::canvas::CanvasRuntime> {
-        self.canvas.as_mut()
+    /// Drop the rank's media runners and the storage their forwards use.
+    fn release_media(&mut self) {
+        self.encoders = EncoderRunners::default();
+        self.denoisers = DenoiserRunners::default();
+        self.decoders = DecoderRunners::default();
+        self.latents = None;
+        self.trajectories = Trajectories::default();
+        self.media = None;
+    }
+
+    /// Install the diffusion LM runners.
+    pub(crate) fn set_diffusion_lm(
+        &mut self,
+        runners: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
+    ) {
+        self.diffusion_lm = runners;
+    }
+
+    pub(crate) fn diffusion_lm_mut(
+        &mut self,
+    ) -> &mut [crate::runner::diffusion_lm::DiffusionLMRunner] {
+        &mut self.diffusion_lm
     }
 
     /// Install the expert-parallel runtime.
-    pub(crate) fn set_experts(&mut self, experts: forward::experts::ExpertRuntime) {
+    pub(crate) fn set_experts(&mut self, experts: crate::parallel::ExpertUnion) {
         self.experts = Some(experts);
     }
 
     /// Install the distributed expert weights.
-    pub(crate) fn set_weights(&mut self, weights: forward::experts::WeightRuntime) {
+    pub(crate) fn set_weights(&mut self, weights: crate::parallel::DwdpManager) {
         self.weights = Some(weights);
     }
 
-    pub(crate) fn experts(&self) -> Option<&forward::experts::ExpertRuntime> {
+    pub(crate) fn experts(&self) -> Option<&crate::parallel::ExpertUnion> {
         self.experts.as_ref()
     }
 
-    pub(crate) fn experts_mut(&mut self) -> Option<&mut forward::experts::ExpertRuntime> {
+    pub(crate) fn experts_mut(&mut self) -> Option<&mut crate::parallel::ExpertUnion> {
         self.experts.as_mut()
     }
 
@@ -417,8 +553,21 @@ impl WorkerBackend {
             requests: &mut self.requests,
             storage: self.rank_storage.as_mut(),
             text: self.text.as_mut(),
-            image: self.image.as_mut(),
-            canvas: self.canvas.as_mut(),
+            image: match (&self.image, &mut self.media_outputs, &self.image_host) {
+                (Some((model, policy)), Some(outputs), Some(host)) => Some(ImageParts {
+                    model,
+                    policy,
+                    encoders: &mut self.encoders,
+                    denoisers: &mut self.denoisers,
+                    decoders: &mut self.decoders,
+                    latents: self.latents.as_mut(),
+                    trajectories: &mut self.trajectories,
+                    outputs,
+                    host,
+                }),
+                _ => None,
+            },
+            diffusion_lm: &mut self.diffusion_lm,
             experts: self.experts.as_ref(),
             transfer: self.transfer.as_mut(),
         }
@@ -437,33 +586,61 @@ impl WorkerBackend {
         self.kernels = Some(watch);
     }
 
-    /// Whether the rank serves a video model: its encoders and denoisers
-    /// run in the video runtime.
+    /// Whether the rank serves a video model: its calls run as media
+    /// batches on the rank's video runners.
     pub fn serves_video(&self) -> bool {
         self.video.is_some()
     }
 
-    /// Install the video runtime of a video model's rank.
-    pub(crate) fn set_video(&mut self, video: forward::video::VideoRuntime) {
+    /// Install what serves a video model on this rank: its request
+    /// records, its runners, its host media and its output leases.
+    pub(crate) fn set_video(
+        &mut self,
+        video: VideoRequests,
+        encoders: EncoderRunners,
+        denoisers: DenoiserRunners,
+        decoders: DecoderRunners,
+        media: Option<MediaRunner>,
+        outputs: OutputPool,
+    ) {
         self.video = Some(video);
+        self.encoders = encoders;
+        self.denoisers = denoisers;
+        self.decoders = decoders;
+        self.media = media;
+        self.media_outputs = Some(outputs);
     }
 
-    pub(crate) fn video_mut(&mut self) -> Option<&mut forward::video::VideoRuntime> {
-        self.video.as_mut()
+    pub(crate) fn encoders(&self) -> &EncoderRunners {
+        &self.encoders
+    }
+
+    pub(crate) fn denoisers(&self) -> &DenoiserRunners {
+        &self.denoisers
+    }
+
+    pub(crate) fn decoders(&self) -> &DecoderRunners {
+        &self.decoders
     }
 
     /// The parts a video batch executes with.
-    pub(crate) fn media_parts(&mut self) -> Result<forward::video::Parts<'_>> {
-        Ok(forward::video::Parts {
+    pub(crate) fn media_parts(&mut self) -> Result<forward::batch::Parts<'_>> {
+        let unserved =
+            || Error::Unsupported("video calls are served on a video model's rank".into());
+        Ok(forward::batch::Parts {
             requests: &mut self.requests,
             storage: self
                 .rank_storage
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("the rank has no storage owners".into()))?,
-            video: self.video.as_mut().ok_or_else(|| {
-                Error::Unsupported("video calls are served by the video runtime".into())
-            })?,
             info: &self.info,
+            rank: self.rank,
+            video: self.video.as_mut().ok_or_else(unserved)?,
+            encoders: &mut self.encoders,
+            denoisers: &mut self.denoisers,
+            decoders: &mut self.decoders,
+            media: self.media.as_ref(),
+            outputs: self.media_outputs.as_mut().ok_or_else(unserved)?,
         })
     }
 
@@ -487,10 +664,14 @@ impl WorkerBackend {
             for owner in owners(
                 &mut self.rank_storage,
                 &mut self.text,
-                &mut self.image,
-                &mut self.canvas,
+                self.image.is_some(),
+                &mut self.trajectories,
+                &mut self.latents,
+                &mut self.diffusion_lm,
                 &mut self.transfer,
                 &mut self.video,
+                &mut self.denoisers,
+                &mut self.media_outputs,
                 &mut self.storage,
             ) {
                 owner.admit_slots(&admitted)?;
@@ -499,7 +680,7 @@ impl WorkerBackend {
         started?;
         if let Some(video) = &mut self.video {
             for request in installed {
-                video.admit(request)?;
+                video.admit(request, &mut self.denoisers)?;
             }
         }
 
@@ -603,6 +784,21 @@ impl WorkerBackend {
                 return;
             }
         }
+        let added = image_kernels(
+            &self.image_order,
+            &self.encoders,
+            &self.denoisers,
+            &self.decoders,
+        )
+        .and_then(|listed| {
+            listed
+                .iter()
+                .try_for_each(|(label, device, records)| current.add(label, device, records))
+        });
+        if let Err(error) = added {
+            tracing::warn!(target: "uniserve_worker.profiling", "kernel report failed: {error}");
+            return;
+        }
         if watch.records.merge(current) {
             watch.records.log("serving", watch.rank, &watch.device);
         }
@@ -617,42 +813,53 @@ impl WorkerBackend {
         if let Some(text) = &self.text {
             text.set_wake(wake.clone());
         }
-        if let Some(image) = &self.image {
-            image.set_wake(wake.clone());
+        if let Some(host) = &self.image_host {
+            host.set_wake(wake.clone());
         }
         if let Some(transfer) = &self.transfer {
             transfer.set_wake(wake.clone());
         }
-        if let Some(video) = &self.video {
-            video.set_wake(wake.clone());
+        if let Some(media) = &self.media {
+            media.lane.set_wake(wake.clone());
         }
         for owner in &self.storage {
             owner.set_wake(wake.clone());
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, the video,
-    /// transfer, canvas, image and text runtimes, then rank storage), after
+    /// Close every storage owner, newest first (other runtimes, a video
+    /// model's owners, the transfer runtime, the diffusion LM runners, the
+    /// image and text owners, then rank storage), after
     /// the executor drained; returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
         }
-        // The video runtime closes before the rank storage its products
-        // live in.
+        // A video model's owners close before the rank storage their
+        // products live in: the host lane, the request records, then the
+        // runners and the output leases.
         if let Some(mut video) = self.video.take() {
+            if let Some(media) = &self.media {
+                result = result.and(media.close(aborted));
+            }
             result = result.and(video.close(aborted));
+            result = result.and(self.encoders.close_text(aborted));
+            result = result.and(self.denoisers.close(aborted));
+            result = result.and(self.decoders.close(aborted));
+            result = result.and(self.encoders.close_latent(aborted));
+            if let Some(mut outputs) = self.media_outputs.take() {
+                result = result.and(outputs.close(aborted));
+            }
+            self.release_media();
         }
         if let Some(mut transfer) = self.transfer.take() {
             result = result.and(transfer.close(aborted));
         }
-        if let Some(mut canvas) = self.canvas.take() {
-            result = result.and(canvas.close(aborted));
+        for mut runner in std::mem::take(&mut self.diffusion_lm) {
+            result = result.and(runner.close(aborted));
         }
-        if let Some(mut image) = self.image.take() {
-            result = result.and(image.close(aborted));
-        }
+        result = result.and(self.close_image(aborted));
         if let Some(mut text) = self.text.take() {
             result = result.and(text.close(aborted));
         }
@@ -662,23 +869,20 @@ impl WorkerBackend {
         result
     }
 
-    /// Close the canvas, image and text runtimes (graphs, then steps)
+    /// Close the diffusion LM, image and text runtimes (graphs, then steps)
     /// before the bindings they run close; attempts every one before
     /// returning the first failure.
     pub fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
-        let canvas = self
-            .canvas
-            .take()
-            .map_or(Ok(()), |mut canvas| canvas.close(aborted));
-        let image = self
-            .image
-            .take()
-            .map_or(Ok(()), |mut image| image.close(aborted));
+        let mut diffusion_lm = Ok(());
+        for mut runner in std::mem::take(&mut self.diffusion_lm) {
+            diffusion_lm = diffusion_lm.and(runner.close(aborted));
+        }
+        let image = self.close_image(aborted);
         let text = self
             .text
             .take()
             .map_or(Ok(()), |mut text| text.close(aborted));
-        canvas.and(image).and(text)
+        diffusion_lm.and(image).and(text)
     }
 
     /// Release the outputs of the predecessors this batch's calls follow.
@@ -745,6 +949,35 @@ impl WorkerBackend {
     }
 }
 
+/// The kernels of an image model's runners, in the order `order` names
+/// them: each runner's name, its device and what its operators selected.
+fn image_kernels(
+    order: &[(ImageRunner, String)],
+    encoders: &EncoderRunners,
+    denoisers: &DenoiserRunners,
+    decoders: &DecoderRunners,
+) -> Result<Vec<(String, String, Vec<Record>)>> {
+    let mut listed = Vec::new();
+    for (runner, name) in order {
+        let (device, kernels) = match runner {
+            ImageRunner::Encoder(index) => match encoders.image.get(*index) {
+                Some(runner) => (runner.device().to_string(), runner.kernels(name)?),
+                None => continue,
+            },
+            ImageRunner::Denoiser => match &denoisers.image {
+                Some((_, runner)) => (runner.device().to_string(), runner.kernels(name)?),
+                None => continue,
+            },
+            ImageRunner::Decoder => match &decoders.image {
+                Some((_, runner)) => (runner.device().to_string(), runner.kernels(name)?),
+                None => continue,
+            },
+        };
+        listed.push((name.clone(), device, kernels));
+    }
+    Ok(listed)
+}
+
 /// A binding's kernel-table label: component, root path and call kinds.
 pub fn binding_label(binding: &crate::model::bind::ComponentBinding) -> String {
     if binding.path.is_empty() {
@@ -781,10 +1014,14 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
-            &mut self.image,
-            &mut self.canvas,
+            self.image.is_some(),
+            &mut self.trajectories,
+            &mut self.latents,
+            &mut self.diffusion_lm,
             &mut self.transfer,
             &mut self.video,
+            &mut self.denoisers,
+            &mut self.media_outputs,
             &mut self.storage,
         );
         batch.retirement.admit(&mut owners)?;
@@ -820,7 +1057,7 @@ impl Backend for WorkerBackend {
         // launches once they are ready (the lane notifies `submission`).
         // Other batches' inputs are prepared when their runtime executes.
         if self.image.is_some() && !self.serves_video() {
-            return forward::image::prepare_inputs(self, batch, submission);
+            return crate::runner::encoder::inputs::prepare_inputs(self, batch, submission);
         }
         Ok(true)
     }
@@ -862,10 +1099,14 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
-            &mut self.image,
-            &mut self.canvas,
+            self.image.is_some(),
+            &mut self.trajectories,
+            &mut self.latents,
+            &mut self.diffusion_lm,
             &mut self.transfer,
             &mut self.video,
+            &mut self.denoisers,
+            &mut self.media_outputs,
             &mut self.storage,
         );
         batch.retirement.begin(&self.requests, &mut owners)?;
@@ -898,10 +1139,14 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
-            &mut self.image,
-            &mut self.canvas,
+            self.image.is_some(),
+            &mut self.trajectories,
+            &mut self.latents,
+            &mut self.diffusion_lm,
             &mut self.transfer,
             &mut self.video,
+            &mut self.denoisers,
+            &mut self.media_outputs,
             &mut self.storage,
         );
         let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
@@ -944,10 +1189,14 @@ impl Backend for WorkerBackend {
         for owner in owners(
             &mut self.rank_storage,
             &mut self.text,
-            &mut self.image,
-            &mut self.canvas,
+            self.image.is_some(),
+            &mut self.trajectories,
+            &mut self.latents,
+            &mut self.diffusion_lm,
             &mut self.transfer,
             &mut self.video,
+            &mut self.denoisers,
+            &mut self.media_outputs,
             &mut self.storage,
         ) {
             owner.reap()?;
@@ -1023,7 +1272,7 @@ impl ServiceBackend for WorkerBackend {
     fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
         // A join launches on the lane the union's forwards run on.
         self.jobs.run(CallKind::Forward(ForwardMode::Decode), || {
-            forward::experts::join_step(self, leaving)
+            crate::parallel::join_step(self, leaving)
         })
     }
 }
