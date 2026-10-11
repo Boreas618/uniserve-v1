@@ -32,12 +32,35 @@ impl KernelRecords {
     /// Add one binding's records under `label` (component, root path and
     /// sorted call kinds).
     pub fn add(&mut self, label: &str, device: &str, records: &[Record]) -> Result<()> {
+        let records = records
+            .iter()
+            .map(Record::to_json)
+            .collect::<Result<Vec<_>>>()?;
+        self.insert(label, device, records)
+    }
+
+    /// Add a runner's kernel listings under `label`: each the JSON array of
+    /// records its Python half's `kernels` method returned.
+    pub fn add_listings(&mut self, label: &str, device: &str, listings: &[String]) -> Result<()> {
+        for listing in listings {
+            let records: Vec<Map<String, Value>> = serde_json::from_str(listing)
+                .map_err(|error| Error::Interface(format!("kernel listing of {label}: {error}")))?;
+            self.insert(label, device, records)?;
+        }
+        Ok(())
+    }
+
+    fn insert(
+        &mut self,
+        label: &str,
+        device: &str,
+        records: Vec<Map<String, Value>>,
+    ) -> Result<()> {
         let (_, paths) = self
             .runners
             .entry(label.to_owned())
             .or_insert_with(|| (device.to_owned(), IndexMap::new()));
-        for record in records {
-            let mut record = record.to_json()?;
+        for mut record in records {
             let path = record
                 .remove("path")
                 .and_then(|path| path.as_str().map(str::to_owned))

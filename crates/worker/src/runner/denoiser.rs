@@ -45,11 +45,12 @@ use crate::executor::forward::batch::{MediaBatch, Trajectories};
 use crate::executor::forward::batch::{Parts, latent_params, product_name, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, export};
 use crate::executor::forward::transfer::latents::Pool;
-use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list, integers};
+use crate::ffi::{Backing, DType, Function, Handle, integer_list, integers};
 use crate::model::components::{Capability, Declarations};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::request::video::{VideoLayout, VideoSize};
+use crate::runner::methods::kernel_listing;
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::storage::{RequestSlots, SlotField};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
@@ -1297,24 +1298,14 @@ impl DenoiserRunner {
     }
 
     /// The kernels the denoiser's and the conditioner's operators selected.
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
-        let mut values: Vec<Any> = Vec::new();
-        let mut collect = |function: &Function, runner: &Handle| -> Result<()> {
-            let records: tvm_ffi::Array<Any> = function.call_as(&[runner.view()])?;
-            values.extend(records.iter());
-            Ok(())
-        };
-        collect(&self.methods.kernels, &self.methods.runner)?;
+    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
+        let mut listings = vec![kernel_listing(&self.methods.kernels, &self.methods.runner)?];
         if let Some(conditioner) = &self.conditioner {
             for runner in conditioner.runners.values() {
-                collect(&conditioner.kernels, runner)?;
+                listings.push(kernel_listing(&conditioner.kernels, runner)?);
             }
         }
-        values
-            .into_iter()
-            .enumerate()
-            .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
-            .collect()
+        Ok(listings)
     }
 
     /// Release graphs and the Python half. An aborted close keeps

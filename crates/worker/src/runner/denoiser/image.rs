@@ -49,7 +49,7 @@ use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageBatch;
 use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::transfer::latents;
-use crate::ffi::{DType, Function, Handle, Record, integer_list};
+use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
 use crate::request::diffusion::{BranchSet, GuidancePlan};
@@ -58,6 +58,7 @@ use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
+use crate::runner::methods::kernel_listing;
 use crate::storage::LatentUpdate;
 use crate::storage::Scratch;
 use crate::storage::memory::{Memory, StorageView};
@@ -766,16 +767,11 @@ impl ImageDiffusion {
     }
 
     /// The kernels the denoiser's operators selected.
-    pub fn kernels(&self, label: &str) -> Result<Vec<Record>> {
-        let records: tvm_ffi::Array<Any> = self
-            .methods
-            .kernels
-            .call_as(&[self.methods.runner.view()])?;
-        records
-            .iter()
-            .enumerate()
-            .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
-            .collect()
+    pub fn kernels(&self) -> Result<Vec<String>> {
+        Ok(vec![kernel_listing(
+            &self.methods.kernels,
+            &self.methods.runner,
+        )?])
     }
 }
 
