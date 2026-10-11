@@ -53,6 +53,7 @@ pub use request::diffusion::{
     Prefix, PrefixFill, Trajectories,
 };
 pub use request::{Request, RequestPool, RequestProgress};
+pub use runner::ImageSetup;
 pub use runner::attention::{
     AttentionCapacity, AttentionColumns, AttentionGeometry, ROW_SECTIONS, pack_rows,
 };

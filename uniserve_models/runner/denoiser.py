@@ -97,6 +97,7 @@ from uniserve_models.model import (
     LatentInput,
     PatchEncoder,
     TextEncoder,
+    TextSize,
     VideoDecoder,
     VideoDenoiser,
     VideoEncoder,
@@ -486,10 +487,14 @@ class DenoiserRunner:
         self._denoise: Callable[..., None] = self._video_denoise
 
     @classmethod
-    def bound(
+    def image(
         cls,
-        prepared,
+        loaded,
         path: str,
+        stream: int,
+        device: int,
+        scratch,
+        cache,
         rows: int,
         tokens: int,
         units: int,
@@ -502,15 +507,22 @@ class DenoiserRunner:
         start_pages: torch.Tensor,
         table_shapes: torch.Tensor,
     ) -> DenoiserRunner:
-        """A runner of the image denoiser at ``path`` of a bound component.
+        """A runner of an image model's denoiser.
 
         Args:
-            prepared: The bound component, whose execution context holds
-                the operators and the prefix cache.
-            path: The denoiser's path within the component (``""`` for its
-                root).
+            loaded: The loaded model.
+            path: The denoiser module's path in the model.
+            stream: The CUDA stream handle every forward enqueues on (0 on
+                the host).
+            device: The CUDA ordinal ``stream`` belongs to, -1 for the
+                host. Modules placed on a generation tower compute there
+                between the stream's steps.
+            scratch: The stream's shared work areas.
+            cache: The prefix cache view object the denoiser's attention
+                reads.
             rows: The most rows one forward evaluates.
-            tokens: The most tokens (framed latent sequences) of a forward.
+            tokens: The most tokens (framed latent sequences) of a forward;
+                with ``rows``, the size the operators are prepared for.
             units: The most latent rows one forward predicts.
             width: The most pages one row selects from a block table.
             page_tokens: Tokens per page of each numerical block table.
@@ -528,20 +540,22 @@ class DenoiserRunner:
             table_shapes: ``[tables, 3]`` int32 ``(group, page tokens,
                 window or -1)``.
         """
-        # FIXME: the component binding prepares the denoiser's operators and
-        # declares its workspace before the caller allocates it. The runner
-        # takes its own execution context once that binding is replaced by
-        # the caller's allocation function.
-        context = prepared.context
-        if context is None:
-            raise ValueError("a runner requires a bound component")
         path = str(path)
-        root = prepared.module
-        network = root.get_submodule(path) if path else root
+        network = loaded.module.get_submodule(path) if path else loaded.module
         if not isinstance(network, ImageDenoiser):
             raise SetupError(
                 f"{type(network).__qualname__} is not an image denoiser"
             )
+        # The denoiser receives exact host lengths with each forward.
+        context = execution_context(
+            network,
+            int(stream),
+            loaded.attention,
+            scratch,
+            device=int(device),
+            cache=cache,
+        )
+        context.prepare(TextSize(int(tokens), int(rows)))
         runner = cls.__new__(cls)
         runner._network = network
         runner._context = context
@@ -563,19 +577,19 @@ class DenoiserRunner:
         # derives from the slot tables. Captured graphs address them, so
         # they live as long as the runner.
         rows, tokens, tables = int(rows), int(tokens), len(runner._page_tokens)
-        device = runner._device
+        target = runner._device
         latent_width = network.patch_size**2 * network.latent_channels
         with torch.inference_mode(), torch.cuda.stream(context.stream):
 
             def zeros(*shape: int) -> torch.Tensor:
-                return torch.zeros(shape, dtype=torch.int32, device=device)
+                return torch.zeros(shape, dtype=torch.int32, device=target)
 
             runner._predictions = torch.zeros(
                 (int(units), latent_width),
                 dtype=network.prediction_dtype,
-                device=device,
+                device=target,
             )
-            runner._step = torch.zeros(1, dtype=torch.int64, device=device)
+            runner._step = torch.zeros(1, dtype=torch.int64, device=target)
             runner._block_tables = zeros(tables, rows, int(width))
             runner._start_pages = zeros(tables, rows)
             runner._cache_lengths = zeros(rows)
@@ -583,7 +597,7 @@ class DenoiserRunner:
             runner._query_offsets = zeros(rows + 1)
             runner._prefix_offsets = zeros(rows + 1)
             runner._write_indices = torch.full(
-                (tables, tokens), -1, dtype=torch.int64, device=device
+                (tables, tokens), -1, dtype=torch.int64, device=target
             )
         runner._draw_noise = runner._image_draw_noise
         runner._prepare_latents = runner._image_prepare_latents

@@ -1,5 +1,5 @@
 //! Startup of a rank's media runners: the runners of a video model's
-//! placed components, and the bindings and runners of an image model's
+//! placed components, and the runners of an image model's
 //! encoders, denoiser and decoder.
 
 use std::collections::HashMap;
@@ -17,10 +17,10 @@ use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
-use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
 use crate::model::components::Capability;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
+use crate::runner::ImageSetup;
 use crate::runner::causal_lm::model_dtype;
 use crate::runner::causal_lm::start::TextBounds;
 use crate::runner::component::VideoSetup;
@@ -32,6 +32,7 @@ use crate::runner::denoiser::runners::{DenoiserRunners, FlowShape};
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::media::MediaRunner;
+use crate::runner::scratch::Scratches;
 use crate::storage::{ImageLatents, LatentPool, LatentStorage, OutputPool};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
@@ -102,8 +103,9 @@ pub(crate) struct Startup<'a> {
     pub(crate) lanes: &'a Lanes,
     pub(crate) storage: &'a RankStorage,
     pub(crate) latent: Option<LatentPlan>,
-    pub(crate) components: &'a mut Components,
-    pub(crate) workspaces: &'a mut StreamWorkspaces,
+    pub(crate) components: &'a Components,
+    /// The shared work areas of the rank's streams.
+    pub(crate) scratches: &'a mut Scratches,
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
@@ -154,6 +156,15 @@ fn max_image_pixels(layout: Option<&ImageDenoiserLayout>) -> usize {
     })
 }
 
+/// One of an image model's runners on a rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageRunner {
+    /// The encoder at this index of the rank's image encoders.
+    Encoder(usize),
+    Denoiser,
+    Decoder,
+}
+
 /// What serves an image model on this rank, as startup built it.
 pub(crate) struct ImageOwners {
     pub(crate) model: ImageModel,
@@ -163,6 +174,9 @@ pub(crate) struct ImageOwners {
     pub(crate) decoders: DecoderRunners,
     /// The latent pool of a rank holding an image denoiser.
     pub(crate) latents: Option<ImageLatents>,
+    /// The runners with their names, in the order startup constructed
+    /// them: the order their kernels are listed in; they close in reverse.
+    pub(crate) order: Vec<(ImageRunner, String)>,
     /// The output leases of image batches.
     pub(crate) outputs: OutputPool,
     /// The lane preparing input images and encoding output images.
@@ -281,53 +295,6 @@ impl ImageOwners {
             }
         };
 
-        // Prepare every binding before binding any, so shared workspaces
-        // hold the largest of them.
-        let mut prepared = Vec::with_capacity(targets.len());
-        let mut infos = Vec::with_capacity(targets.len());
-        for target in &targets {
-            let (size, info, cache) = match target.kind {
-                CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-                    let info = EncoderInfo::describe(interface, loaded, &target.path, dtype)?;
-                    (info.binding_size(&encoder_config), Some(info), None)
-                }
-                CallKind::Media(MediaCall::Denoising) => {
-                    let capacity = capacity.as_ref().ok_or_else(|| {
-                        Error::Invariant("an image denoiser lost its capacity".into())
-                    })?;
-                    (
-                        Some(TextSize {
-                            tokens: capacity.tokens,
-                            rows: capacity.rows,
-                        }),
-                        None,
-                        pool.clone(),
-                    )
-                }
-                _ => (None, None, None),
-            };
-            infos.push(info);
-            prepared.push(bind::prepare(
-                interface,
-                loaded,
-                BindingRequest {
-                    component: target.component.clone(),
-                    path: target.path.clone(),
-                    device: target.device,
-                    stream: target.stream.as_ref().map_or(0, Stream::raw),
-                    size,
-                    backends: Backends::default(),
-                    // The denoiser receives exact host lengths; encoders and
-                    // decoders derive their own.
-                    derive_host_lengths: cache.is_none(),
-                    experts: None,
-                    weights: None,
-                    cache,
-                },
-            )?);
-        }
-        let bindings = bind::bind(interface, startup.workspaces, prepared)?;
-
         // The latent pool lives on the denoiser's device.
         let denoiser_device = targets
             .iter()
@@ -371,32 +338,49 @@ impl ImageOwners {
         let mut diffusion = None;
         let mut decoder = None;
         let mut units = None;
-        for ((target, binding), info) in targets.iter().zip(&bindings).zip(infos) {
+        // Every runner's Python half constructs its execution context over
+        // the shared work areas of its stream, in this order.
+        let mut order = Vec::new();
+        for target in &targets {
+            let scratch = startup.scratches.get(
+                interface,
+                target.stream.as_ref().map_or(0, Stream::raw),
+                target.device.cuda_index(),
+            )?;
+            let setup = ImageSetup {
+                interface,
+                loaded,
+                component: &target.component,
+                path: &target.path,
+                device: target.device,
+                stream: target.stream.clone(),
+                scratch,
+            };
             match target.kind {
                 CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-                    let info = info.ok_or_else(|| {
-                        Error::Invariant("an encoder binding lost its description".into())
-                    })?;
-                    let runner = EncoderRunner::bind(
-                        interface,
-                        binding,
-                        loaded,
-                        "",
-                        info,
-                        &encoder_config,
-                        target.stream.clone(),
-                    )?;
+                    let info = EncoderInfo::describe(interface, loaded, &target.path, dtype)?;
+                    let runner = EncoderRunner::image(&setup, info, &encoder_config)?;
+                    order.push((ImageRunner::Encoder(encoders.len()), setup.owner()));
                     encoder_routes.insert((target.component.clone(), target.kind), encoders.len());
                     encoders.push(runner);
                 }
                 CallKind::Media(MediaCall::Denoising) => {
-                    let (Some(layout), Some(capacity), Some(bounds), Some(kv), Some(latents)) = (
+                    let (
+                        Some(layout),
+                        Some(capacity),
+                        Some(bounds),
+                        Some(kv),
+                        Some(latents),
+                        Some(pool),
+                    ) = (
                         layout,
                         capacity.clone(),
                         bounds.as_ref(),
                         kv,
                         latents.as_ref(),
-                    ) else {
+                        pool.as_ref(),
+                    )
+                    else {
                         return Err(Error::Invariant(
                             "an image denoiser lost its storage".into(),
                         ));
@@ -418,10 +402,9 @@ impl ImageOwners {
                         .iter()
                         .map(|table| i64::from(table.windowed))
                         .collect();
-                    let runner = ImageDiffusion::bind(
-                        interface,
-                        binding,
-                        "",
+                    let runner = ImageDiffusion::new(
+                        &setup,
+                        pool,
                         layout,
                         capacity,
                         DiffusionStorage {
@@ -431,8 +414,8 @@ impl ImageOwners {
                             page_tokens,
                             windowed,
                         },
-                        target.stream.clone(),
                     )?;
+                    order.push((ImageRunner::Denoiser, setup.owner()));
                     units = Some(kv.bind_units(
                         &interface.function("cache.bind_units")?,
                         target.stream.as_ref(),
@@ -447,21 +430,13 @@ impl ImageOwners {
                         Error::Unsupported("image decoding requires an image denoiser".into())
                     })?;
                     let staging = max_image_pixels(layout.as_ref()) * 3 * max_calls;
-                    let runner = DecoderRunner::bind(
-                        interface,
-                        binding,
-                        "",
-                        range,
-                        latents,
-                        staging,
-                        target.stream.clone(),
-                    )?;
+                    let runner = DecoderRunner::image(&setup, range, latents, staging)?;
+                    order.push((ImageRunner::Decoder, setup.owner()));
                     decoder = Some((target.component.clone(), runner));
                 }
                 _ => {}
             }
         }
-        startup.components.add_bindings(bindings);
 
         // The configured denoising steps capture at warmup into one pool
         // per device the denoiser's modules run on: its own and a
@@ -545,6 +520,7 @@ impl ImageOwners {
             denoisers: DenoiserRunners::image(diffusion, flow, flow_pools, units),
             decoders: DecoderRunners::image(decoder, max_pixel_words),
             latents,
+            order,
             outputs,
             host,
         }))

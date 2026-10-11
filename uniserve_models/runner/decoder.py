@@ -180,40 +180,48 @@ class DecoderRunner:
             )
 
     @classmethod
-    def bound(
+    def image(
         cls,
-        prepared,
+        loaded,
         path: str,
+        stream: int,
+        device: int,
+        scratch,
         latents: torch.Tensor,
         staging: torch.Tensor,
     ) -> DecoderRunner:
-        """A runner of the image decoder at ``path`` of a bound component.
+        """A runner of an image model's decoder.
 
         Args:
-            prepared: The bound component, whose execution context runs
-                every forward on the caller's stream. A decoder placed on
-                a generation tower computes there and returns its results
-                to the caller's tensors.
-            path: The decoder's path within the component (``""`` for its
-                root).
+            loaded: The loaded model.
+            path: The decoder module's path in the model.
+            stream: The CUDA stream handle every forward enqueues on (0 on
+                the host).
+            device: The CUDA ordinal ``stream`` belongs to, -1 for the
+                host. A decoder placed on a generation tower computes
+                there and returns its results to the caller's tensors.
+            scratch: The stream's shared work areas.
             latents: The latent pool's step workspace ``[units, width]``,
                 into which the caller gathers each completed trajectory's
                 pages before decoding.
             staging: uint8 bytes receiving each image's quantized HWC
                 pixels, which the caller copies to the host and encodes.
         """
-        # FIXME: the component binding prepares the decoder's operators
-        # and declares its workspace before the caller allocates it.
-        context = prepared.context
-        if context is None:
-            raise ValueError("a runner requires a bound component")
         path = str(path)
-        root = prepared.module
-        decoder = root.get_submodule(path) if path else root
+        decoder = loaded.module.get_submodule(path) if path else loaded.module
         if not isinstance(decoder, ImageDecoder):
             raise SetupError(
                 f"{type(decoder).__qualname__} is not an image decoder"
             )
+        context = execution_context(
+            decoder,
+            int(stream),
+            loaded.attention,
+            scratch,
+            device=int(device),
+            derive_host_lengths=True,
+        )
+        context.prepare(None)
         runner = cls.__new__(cls)
         runner._image = decoder
         runner._context = context

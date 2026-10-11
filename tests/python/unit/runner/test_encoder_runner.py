@@ -10,6 +10,7 @@ from PIL import Image
 
 from tests.python.fixtures.stub import load_stub
 from uniserve_models import interface
+from uniserve_models.bindings.context import Scratch
 from uniserve_models.media.pixels import (
     prepare_host_image,
     prepare_tensor_image,
@@ -26,30 +27,9 @@ def loaded():
     return table, load_stub()
 
 
-def bound(table, model, component, root, path):
-    """Bind ``path`` within the ``root`` binding of ``component`` on CPU."""
-    prepared, requirements = table["component.prepare"](
-        model,
-        {
-            "component": component,
-            "path": root,
-            "device": -1,
-            "stream": 0,
-            "size": None,
-            "attention": "auto",
-            "vsa": "auto",
-            "matmul": "auto",
-            "moe": "auto",
-            "derive_host_lengths": True,
-            "experts": None,
-            "weights": None,
-            "cache": None,
-        },
-    )
-    assert not requirements["workspaces"]
-    table["component.bind"](prepared, {"workspaces": {}})
-    module = ".".join(part for part in (root, path) if part)
-    runner = EncoderRunner.bound(prepared, path, model)
+def constructed(model, module):
+    """A runner of the encoder at ``module`` of the stub, on the host."""
+    runner = EncoderRunner.image(model, module, 0, -1, Scratch(), [])
     return (model, module), runner
 
 
@@ -69,7 +49,7 @@ def product(elements):
 
 def test_vision_features_fill_their_products(loaded):
     table, model = loaded
-    info, runner = bound(table, model, "vision_encoder", "vision_encoder", "")
+    info, runner = constructed(model, "vision_encoder")
     assert EncoderRunner.kind(*info) == "vision"
     assert EncoderRunner.patch_size(*info) == 16
     assert EncoderRunner.downsample(*info) == 1
@@ -103,7 +83,7 @@ def test_vision_features_fill_their_products(loaded):
 
 def test_resident_images_encode_like_their_decoded_pixels(loaded):
     table, model = loaded
-    _, runner = bound(table, model, "model", "", "latent_encoder")
+    _, runner = constructed(model, "latent_encoder")
 
     # A generated [3, 32, 32] BF16 image product in [-1, 1].
     pixels = torch.linspace(-1, 1, 3 * 32 * 32).reshape(3, 32, 32)
@@ -129,7 +109,7 @@ def test_resident_images_encode_like_their_decoded_pixels(loaded):
 
 def test_encodings_larger_than_their_product_are_refused(loaded):
     table, model = loaded
-    _, runner = bound(table, model, "vision_encoder", "vision_encoder", "")
+    _, runner = constructed(model, "vision_encoder")
     image = EncoderRunner.prepare_image(model, "vit", payload(32, 48), 1, 0)
     with pytest.raises(Exception, match="exceeds its product bound"):
         runner.encode([image["image"]], product(8))

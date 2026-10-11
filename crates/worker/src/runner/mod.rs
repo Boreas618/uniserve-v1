@@ -191,6 +191,50 @@ pub(crate) struct RunnerSetup<'a> {
     pub(crate) scratch: Handle,
 }
 
+/// What an image runner's Python half is constructed from: the module at
+/// `path` of the loaded model, the stream its forwards enqueue on and that
+/// stream's shared work areas. The half constructs its own execution
+/// context and releases it when the runner closes.
+pub struct ImageSetup<'a> {
+    pub interface: &'a Interface,
+    pub loaded: &'a Handle,
+    /// The component the module belongs to.
+    pub component: &'a str,
+    /// The module's path in the model.
+    pub path: &'a str,
+    /// The device `stream` belongs to. A module placed on a generation
+    /// tower computes there between the stream's steps.
+    pub device: crate::config::Device,
+    /// The stream every forward enqueues on; `None` on the host.
+    pub stream: Option<Stream>,
+    /// The stream's shared work areas, a Python `Scratch`.
+    pub scratch: Handle,
+}
+
+impl ImageSetup<'_> {
+    /// The runner's name: its component, with the module path below it.
+    pub fn owner(&self) -> String {
+        if self.path.is_empty() {
+            self.component.to_owned()
+        } else {
+            format!("{}.{}", self.component, self.path)
+        }
+    }
+
+    /// The leading constructor arguments of every image runner: the loaded
+    /// model, the module path, the stream handle (0 on the host), the
+    /// device ordinal (-1 for the host) and the scratch.
+    pub fn arguments(&self) -> Vec<Any> {
+        vec![
+            self.loaded.to_any(),
+            Any::from(tvm_ffi::String::from(self.path)),
+            Any::from(self.stream.as_ref().map_or(0, Stream::raw) as i64),
+            Any::from(self.device.cuda_index().map_or(-1, i64::from)),
+            self.scratch.to_any(),
+        ]
+    }
+}
+
 /// The Python runners of one module: their constructor's fixed arguments
 /// and their methods, each called with a runner first.
 pub(crate) struct Methods {

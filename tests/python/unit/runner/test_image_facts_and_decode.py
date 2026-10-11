@@ -9,6 +9,7 @@ from transformers import PreTrainedTokenizerFast
 
 from tests.python.fixtures.stub import load_stub
 from uniserve_models import interface
+from uniserve_models.bindings.context import Scratch
 from uniserve_models.media import image
 from uniserve_models.media.pixels import quantize_image_hwc
 from uniserve_models.processing import FlowPrompt, resolve_prefix
@@ -114,30 +115,13 @@ def test_unframed_models_reuse_their_context_and_refuse_overrides(loaded):
 
 def test_decoded_images_fill_their_products_and_staging(loaded):
     table, model = loaded
-    prepared, _ = table["component.prepare"](
-        model,
-        {
-            "component": "model",
-            "path": "",
-            "device": -1,
-            "stream": 0,
-            "size": None,
-            "attention": "auto",
-            "vsa": "auto",
-            "matmul": "auto",
-            "moe": "auto",
-            "derive_host_lengths": True,
-            "experts": None,
-            "weights": None,
-            "cache": None,
-        },
-    )
-    table["component.bind"](prepared, {"workspaces": {}})
     latents = torch.linspace(-1.2, 1.2, 8 * 768).reshape(8, 768)
     latents = latents.to(torch.bfloat16)
     staging = torch.zeros(4 * 32 * 32 * 3, dtype=torch.uint8)
     product = torch.zeros(3, 32, 32, dtype=torch.bfloat16)
-    runner = DecoderRunner.bound(prepared, "image_decoder", latents, staging)
+    runner = DecoderRunner.image(
+        model, "image_decoder", 0, -1, Scratch(), latents, staging
+    )
 
     # Two 32x32 images of four 16-pixel patches each; the second publishes
     # its decoded values as a product.

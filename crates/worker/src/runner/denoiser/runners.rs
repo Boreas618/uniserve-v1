@@ -148,14 +148,6 @@ impl DenoiserRunners {
         }
     }
 
-    /// Release the image denoiser.
-    pub(crate) fn close_image(&mut self, aborted: bool) -> Result<()> {
-        match &mut self.image {
-            Some((_, runner)) => runner.close(aborted),
-            None => Ok(()),
-        }
-    }
-
     /// Hold `layout` for the request admitted in `slot` and return its id,
     /// releasing the layout of the request the slot held before. `None` on
     /// a rank without a video denoiser.
