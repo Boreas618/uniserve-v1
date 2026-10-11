@@ -102,16 +102,12 @@ class Graph:
 
         Each is the ``cudaGraphExec_t`` of one ``torch.cuda.CUDAGraph``
         (its ``raw_cuda_graph_exec``), valid until :meth:`release`.
-        Launching them in order on one stream runs a graph without breaks.
-        Unlike :meth:`replay`, a launch does not advance the registered
-        generators, so it suits steps that draw no random numbers.
+        Launching the executable of a one-segment graph on a stream runs
+        the graph. Unlike :meth:`replay`, a launch does not advance the
+        registered generators, so it suits steps that draw no random
+        numbers.
         """
         return [graph.raw_cuda_graph_exec() for graph in self._graphs]
-
-    @property
-    def num_breaks(self) -> int:
-        """The eager calls :meth:`replay` makes between segments."""
-        return len(self._steps) - len(self._graphs)
 
     def release(self) -> None:
         """Drop the graph executables and the captured output.
@@ -369,17 +365,12 @@ def capture(
 def export(graph: Graph, owner: Any = None) -> list[Any]:
     """Return a captured graph to the worker.
 
-    The worker receives ``[graph, executables, breaks]``: the graph as an
-    opaque handle it passes back to the binding, the raw executable of each
-    segment in submission order, and the number of graph breaks between
-    them. ``owner`` crosses in place of the graph for a binding that wraps
-    it in an object of its own.
+    The worker receives ``[graph, executables]``: the graph as an opaque
+    handle it passes back to the binding, and the raw executable of each
+    segment in submission order. ``owner`` crosses in place of the graph
+    for a binding that wraps it in an object of its own.
     """
-    return [
-        graph if owner is None else owner,
-        graph.raw_cuda_graph_execs(),
-        graph.num_breaks,
-    ]
+    return [graph if owner is None else owner, graph.raw_cuda_graph_execs()]
 
 
 def begin_capture(pool, stream: int, device: int) -> Capture:

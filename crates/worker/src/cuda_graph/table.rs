@@ -173,7 +173,6 @@ mod tests {
         CUDAGraph::captured(Any::from(list([
             Any::from(value),
             Any::from(integer_list([0x1000 + value])),
-            Any::from(0_i64),
         ])))
         .unwrap()
     }
