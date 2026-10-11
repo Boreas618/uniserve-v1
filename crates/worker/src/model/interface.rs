@@ -4,7 +4,7 @@
 //! functions. [`Interface`] resolves the entries startup needs into typed
 //! fields once, failing startup with the name of any missing entry, and
 //! keeps every entry so capability runtimes can resolve their own
-//! (`text.bind`, `canvas.bind`, ...) by name.
+//! (`canvas.bind`, ...) by name.
 
 use std::collections::BTreeMap;
 
@@ -95,6 +95,19 @@ impl Interface {
                 "the numerical interface table has no `{name}` entry"
             ))
         })
+    }
+
+    /// The Python callable at a dotted import path, for example
+    /// `uniserve_models.runner.causal_lm.CausalLMRunner.decode`: a function,
+    /// a class (called to construct it) or a method (called with the object
+    /// first).
+    pub fn import(&self, path: &str) -> Result<Function> {
+        let imported = self
+            .function("runtime.import")?
+            .call(&[(&tvm_ffi::Any::from(tvm_ffi::String::from(path))).into()])?;
+        let function = tvm_ffi::Function::try_from(imported)
+            .map_err(|_| Error::Interface(format!("`{path}` is not callable")))?;
+        Ok(Function::new(path, function))
     }
 
     pub fn optional(&self, name: &str) -> Option<Function> {

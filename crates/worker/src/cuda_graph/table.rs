@@ -165,7 +165,7 @@ mod tests {
             sink.lock().unwrap().push(value);
             Ok(Any::from(()))
         });
-        (Function::new("text.release", function), released)
+        (Function::new("graphs.release", function), released)
     }
 
     /// A one-segment capture result whose Python graph is `value`.

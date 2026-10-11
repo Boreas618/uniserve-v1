@@ -120,7 +120,8 @@ unsafe impl Send for ExpertRuntime {}
 
 /// One microbatch's forward in an expert step.
 pub(crate) struct MicrobatchForward {
-    pub(crate) call: DeferredCall,
+    /// The forward: a graph launch or a runner method call.
+    pub(crate) call: MicrobatchCall<()>,
     /// Whether the forward passes the host turn at its expert dispatch
     /// points: an eager forward does and stays suspended in Python
     /// meanwhile; a captured forward submits its whole step at once.
@@ -293,7 +294,7 @@ impl ExpertRuntime {
         }
         let Some(lanes) = &self.lanes else {
             return match forwards.into_iter().next().flatten() {
-                Some(forward) => forward.call.invoke(),
+                Some(forward) => (forward.call)(),
                 None => self.peer_join(0, capacity)?(),
             };
         };
@@ -301,10 +302,8 @@ impl ExpertRuntime {
             .into_iter()
             .enumerate()
             .map(|(peer, forward)| match forward {
-                Some(forward) if forward.yields => {
-                    Ok(turn(Box::new(move || forward.call.invoke())))
-                }
-                Some(forward) => Ok(Box::new(move || forward.call.invoke()) as MicrobatchCall<()>),
+                Some(forward) if forward.yields => Ok(turn(forward.call)),
+                Some(forward) => Ok(forward.call),
                 None => self.peer_join(peer, capacity),
             })
             .collect::<Result<Vec<_>>>()?;

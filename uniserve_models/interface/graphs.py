@@ -13,10 +13,13 @@ binding's fixed buffers, so running it needs no copies. A binding's
 
 The interface entry ``graphs.pool`` creates the allocator pools Rust
 assigns to graph owners. ``graphs.begin_capture`` and ``graphs.end_capture``
-let Rust capture work it submits itself between them, possibly from several
-host threads on streams forked from the capturing one (expert joins of all
-microbatches); ``graphs.release`` releases such a graph. Importing this
-module does not initialize CUDA.
+let Rust capture the work between them: runner methods it calls, or work it
+submits itself, possibly from several host threads on streams forked from
+the capturing one (expert joins of all microbatches). Where such a forward
+reaches work a graph cannot record, :func:`break_graph` ends the segment and
+begins the next, and Rust performs the work between the two at every
+launch. ``graphs.release`` releases such a graph. Importing this module does
+not initialize CUDA.
 """
 
 from __future__ import annotations
@@ -32,7 +35,18 @@ from typing import Any
 
 import torch
 
-__all__ = ["Capture", "Graph", "capture", "export", "functions", "pool"]
+__all__ = [
+    "Capture",
+    "Graph",
+    "break_graph",
+    "capture",
+    "export",
+    "functions",
+    "pool",
+]
+
+# The capture begun by ``begin_capture`` and not yet ended.
+_capturing: Capture | None = None
 
 
 def functions() -> dict[str, Callable[..., Any]]:
@@ -176,6 +190,11 @@ class _Segments:
     def submit(self, call: Callable[[], object]) -> None:
         self.end()
         self.steps.append(call)
+        self.begin()
+
+    def break_graph(self) -> None:
+        """End the current segment and begin the next in the same pool."""
+        self.end()
         self.begin()
 
     def reset(self) -> None:
@@ -375,17 +394,37 @@ def export(graph: Graph, owner: Any = None) -> list[Any]:
 
 def begin_capture(pool, stream: int, device: int) -> Capture:
     """Begin capturing work Rust submits on ``stream`` into ``pool``."""
+    global _capturing
     computation = torch.cuda.ExternalStream(
         int(stream), device=torch.device("cuda", int(device))
     )
     recording = Capture(computation, pool)
     recording.begin()
+    _capturing = recording
     return recording
 
 
 def end_capture(recording: Capture) -> list[Any]:
     """End a capture begun by :func:`begin_capture` and export its graph."""
+    global _capturing
+    _capturing = None
     return export(recording.end())
+
+
+def break_graph() -> None:
+    """End the capturing graph's segment and begin its next.
+
+    Called where the forward captured between :func:`begin_capture` and
+    :func:`end_capture` reaches work a graph cannot record. The caller
+    performs that work between the two segments at every launch; nothing is
+    recorded for it here.
+
+    Raises:
+        RuntimeError: No capture is in progress.
+    """
+    if _capturing is None:
+        raise RuntimeError("break_graph is called while a graph is captured")
+    _capturing.segments.break_graph()
 
 
 def release(graph: Graph) -> None:
