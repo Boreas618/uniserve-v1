@@ -25,15 +25,9 @@ _AREAS = (
     "binding",
     "distributed",
     "graphs",
-    "image",
-    "encoder",
-    "decoder",
-    "denoiser",
     "kernels",
     "profiling",
     "runtime",
-    "video",
-    "media",
 )
 
 

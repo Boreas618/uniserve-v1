@@ -15,11 +15,14 @@
 //! stream: the banks and the shared step workspace are then used by one
 //! batch at a time on the device.
 
+use std::collections::HashSet;
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
-use uniserve_ipc::LatentParams;
 
-use super::super::launch::StreamOrder;
-pub(crate) use super::super::transfer::latents::Pool;
+use uniserve_ipc::{BufferId, LatentParams, RequestKey};
+
+use crate::executor::forward::launch::StreamOrder;
+use crate::executor::forward::transfer::latents::Pool;
+use crate::executor::lifecycle::RequestStorage;
 use crate::storage::LatentStorage;
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
@@ -175,5 +178,60 @@ impl ImageLatents {
         stream: Option<&Stream>,
     ) -> Result<()> {
         self.storage.fill_timestep(slot, value, stream).map(drop)
+    }
+}
+
+impl RequestStorage for ImageLatents {
+    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_buffers(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
+        self.pool
+            .release_exports(&buffers.iter().copied().collect::<Vec<_>>());
+        Ok(())
+    }
+
+    fn release_requests(
+        &mut self,
+        requests: &HashSet<RequestKey>,
+        retained: &HashSet<BufferId>,
+    ) -> Result<()> {
+        let mut result = Ok(());
+        // Finished requests' published versions retire once their
+        // readers did, except retained ones.
+        let exports: Vec<BufferId> = self
+            .pool
+            .exports()
+            .map(|source| source.buffer)
+            .filter(|buffer| requests.contains(&buffer.owner) && !retained.contains(buffer))
+            .collect();
+        self.pool.release_exports(&exports);
+        for transfer in self.pool.cancel_imports(requests) {
+            result = result.and(transfer.read().cancel());
+        }
+        result
+    }
+
+    fn retirement_ready(
+        &mut self,
+        _buffers: &HashSet<BufferId>,
+        requests: &HashSet<RequestKey>,
+        _retained: &HashSet<BufferId>,
+    ) -> Result<bool> {
+        Ok(self.pool.retirement_ready(requests))
+    }
+
+    fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
+        let slots: Vec<i64> = slots.iter().map(|&slot| slot as i64).collect();
+        for transfer in self.pool.release_slots(&slots)? {
+            transfer.read().cancel()?;
+        }
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Result<()> {
+        self.pool.reap();
+        Ok(())
     }
 }

@@ -1,8 +1,7 @@
-"""Image facts, guidance prefixes and image decoding through the interface."""
+"""Image facts, guidance prefixes and image decoding through the runners."""
 
 import pytest
 import torch
-import tvm_ffi
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
@@ -10,10 +9,12 @@ from transformers import PreTrainedTokenizerFast
 
 from tests.python.fixtures.stub import load_stub
 from uniserve_models import interface
-from uniserve_models.interface.image import resolve_prefix
 from uniserve_models.media import image
 from uniserve_models.media.pixels import quantize_image_hwc
-from uniserve_models.processing import FlowPrompt
+from uniserve_models.processing import FlowPrompt, resolve_prefix
+from uniserve_models.runner.decoder import DecoderRunner
+from uniserve_models.runner.denoiser import DenoiserRunner
+from uniserve_models.runner.encoder import EncoderRunner
 
 pytestmark = pytest.mark.unit
 
@@ -25,36 +26,30 @@ def loaded():
 
 
 def test_the_stub_reports_its_image_facts(loaded):
-    table, model = loaded
-    facts = table["image.describe"](model)
-    processor = facts["processor"]
-    assert (processor["vit"], processor["vae"]) == (True, True)
-    assert processor["patch_tower"] is True
-    assert processor["pixel_dtype"] == "bfloat16"
-    assert dict(processor["injection"]) == {
-        "layout": "direct",
-        "positions": "temporal_spatial",
-        "start_token": None,
-        "end_token": 1007,
-    }
-    assert dict(facts["denoiser"]) == {
-        "patch_size": 16,
-        "latent_channels": 3,
-        "downsample": 16,
-        "framing_tokens": 2,
-        "image_unconditional": "start",
-        "max_sequence_tokens": 1024,
-        "prediction_dtype": "bfloat16",
-    }
+    _, model = loaded
+    assert EncoderRunner.processes_images(model)
+    assert EncoderRunner.image_towers(model) == ["vit", "vae"]
+    assert EncoderRunner.packs_patches(model) is True
+    assert EncoderRunner.pixel_dtype(model) == "bfloat16"
+    assert EncoderRunner.feature_injection(model) == [
+        "direct",
+        "temporal_spatial",
+    ]
+    # The stub places an end token only.
+    assert EncoderRunner.injection_tokens(model) == [-1, 1007]
+    # Patch size, latent channels, downsample, framing and longest sequence.
+    assert DenoiserRunner.image_layout(model) == [16, 3, 16, 2, 1024]
+    assert DenoiserRunner.image_unconditional(model) == "start"
+    assert DenoiserRunner.prediction_dtype(model) == "bfloat16"
     # The stub decodes RGB patches in [-1, 1].
-    assert list(facts["decoder_range"]) == [-1.0, 1.0]
+    assert DecoderRunner.value_range(model) == [-1.0, 1.0]
 
 
 def test_patch_grids_follow_the_shared_pixel_budget(loaded):
-    table, model = loaded
-    assert list(table["image.patch_grid"](model, 48, 64, 1)) == [3, 4]
+    _, model = loaded
+    assert EncoderRunner.patch_grid(model, 48, 64, 1) == [3, 4]
     with pytest.raises(Exception, match="aspect"):
-        table["image.patch_grid"](model, 16, 16 * 400, 1)
+        EncoderRunner.patch_grid(model, 16, 16 * 400, 1)
 
 
 def _tokenizer():
@@ -109,19 +104,12 @@ def test_prefixes_frame_their_source_text(source, positive, negative, expected):
 
 
 def test_unframed_models_reuse_their_context_and_refuse_overrides(loaded):
-    table, model = loaded
-    assert list(
-        table["image.guidance_prefix"](model, "conditioning", "", "")
-    ) == [
-        [],
-        True,
-    ]
-    assert list(table["image.guidance_prefix"](model, "start", "", "")) == [
-        [],
-        False,
-    ]
+    _, model = loaded
+    # ``[reuses, *tokens]``: no tokens either way.
+    assert DenoiserRunner.guidance_prefix(model, "conditioning", "", "") == [1]
+    assert DenoiserRunner.guidance_prefix(model, "start", "", "") == [0]
     with pytest.raises(Exception, match="prompt override"):
-        table["image.guidance_prefix"](model, "conditioning", "positive", "")
+        DenoiserRunner.guidance_prefix(model, "conditioning", "positive", "")
 
 
 def test_decoded_images_fill_their_products_and_staging(loaded):
@@ -149,22 +137,17 @@ def test_decoded_images_fill_their_products_and_staging(loaded):
     latents = latents.to(torch.bfloat16)
     staging = torch.zeros(4 * 32 * 32 * 3, dtype=torch.uint8)
     arena = torch.zeros(1 << 16, dtype=torch.uint8)
-    steps = table["decoder.bind"](
-        prepared,
-        model,
-        "image_decoder",
-        tvm_ffi.convert(
-            {"latents": latents, "staging": staging, "products": arena}
-        ),
+    runner = DecoderRunner.bound(
+        prepared, "image_decoder", latents, staging, arena
     )
 
     # Two 32x32 images of four 16-pixel patches each; the second publishes
     # its decoded values as a product.
-    counts = steps["decode"](
-        [[0, 4, 32, 32, 0], [4, 4, 32, 32, 3072]],
+    counts = runner.decode(
+        [0, 4, 32, 32, 0, 4, 4, 32, 32, 3072],
         [None, [0, "bfloat16", [3, 32, 32]]],
     )
-    assert list(counts) == [3072, 3072]
+    assert counts == [3072, 3072]
     decoder = model.module.image_decoder
     for index in range(2):
         (decoded,) = decoder.decode(
@@ -180,6 +163,6 @@ def test_decoded_images_fill_their_products_and_staging(loaded):
 
     # A resident product quantizes like a decoded image.
     assert (
-        steps["quantize"]([0, "bfloat16", [3, 32, 32]], -1.0, 1.0, 6144) == 3072
+        runner.quantize([0, "bfloat16", [3, 32, 32]], -1.0, 1.0, 6144) == 3072
     )
     assert torch.equal(staging[6144:9216], staging[3072:6144])

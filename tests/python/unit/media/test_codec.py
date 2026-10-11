@@ -12,6 +12,7 @@ import io
 
 import numpy as np
 import pytest
+import torch
 
 from uniserve_models.media import codec
 
@@ -111,3 +112,16 @@ def test_malformed_units_are_refused():
         codec.Container.open(
             track, frame_rate=FRAME_RATE, audio_rate=AUDIO_RATE
         )
+
+
+def test_a_callers_tensor_encodes_like_its_array():
+    # The serving worker passes views of its own storage positionally.
+    unit = _unit(5, 90)
+    assert codec.encode_video_unit(
+        torch.from_numpy(unit), FRAME_RATE
+    ) == codec.encode_video_unit(unit, frame_rate=FRAME_RATE)
+
+    pcm = np.arange(4096, dtype=np.int16).reshape(2048, 2)
+    assert codec.encode_audio_track(
+        torch.from_numpy(pcm), 2048, AUDIO_RATE
+    ) == codec.encode_audio_track(pcm, samples=2048, rate=AUDIO_RATE)

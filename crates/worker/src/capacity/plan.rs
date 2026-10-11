@@ -185,7 +185,7 @@ pub struct Report {
     pub activation_formats: Vec<String>,
 }
 
-/// Media-timeline facts of a video model, from the video runtime.
+/// Media-timeline facts of a video model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaFacts {
     pub num_steps: u32,

@@ -172,7 +172,8 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         } else {
             Tower::Vae
         };
-        let function = interface.function("image.prepare_input")?;
+        let function =
+            interface.import("uniserve_models.runner.encoder.EncoderRunner.prepare_image")?;
         let images = payloads
             .iter()
             .map(|payload| {
@@ -190,6 +191,11 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             EncoderInfo::Vision(vision) => vision.output_dtype,
             EncoderInfo::Latent(latent) => latent.output_dtype,
             EncoderInfo::Text(text) => text.output_dtype,
+            EncoderInfo::Condition => {
+                return Err(uniserve_worker::Error::Invalid(
+                    "the harness encodes images".into(),
+                ));
+            }
         };
         let mut results = Vec::new();
         let mut next = 0;
@@ -283,7 +289,6 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let runner = DecoderRunner::bind(
             &interface,
             &binding,
-            &loaded,
             &path,
             (-1.0, 1.0),
             workspace,
