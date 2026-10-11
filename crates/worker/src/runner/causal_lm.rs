@@ -1,7 +1,7 @@
 //! Text forwards of a causal language model on one lane binding.
 //!
-//! A [`TextRunner`] owns one binding's input and output tensors
-//! ([`TextBuffers`]), its graph shapes and captured graphs, and the Python
+//! A [`CausalLMRunner`] owns one binding's input and output tensors
+//! ([`InputBuffers`]), its graph shapes and captured graphs, and the Python
 //! runner ([`Methods`]). Per forward it:
 //!
 //! 1. resolves the rows' attention pages against the installed block tables
@@ -9,32 +9,57 @@
 //! 2. selects an eager run, a resident graph or, before the rank is sealed,
 //!    a graph to capture;
 //! 3. writes the forward's inputs on the lane stream in one batched copy;
-//! 4. launches the graph, or calls the runner method.
+//! 4. launches the graph, or calls the runner's forward method;
+//! 5. calls the runner's eager selection for rows that sample, verify
+//!    drafts or score their prompt.
 //!
 //! A decode forward evaluates one token per row from the slot state: its
 //! inputs are each row's slot, forced-finish flag and finish tokens, and a
 //! row whose token comes from the host has it written to its slot first.
-//! Its graph gathers, runs the model and selects greedily, so a launch runs
-//! no Python; rows that sample then run the runner's `sample`. A decode
-//! bucket pads with rows of slot 0. A prefill forward packs its rows' host
-//! columns; its buckets add one sequence holding every padding token, then
-//! empty sequences. Padding rows never write K/V (their write addresses are
-//! -1).
+//! Its graph gathers, runs the model and selects greedily, so a greedy
+//! decode runs no Python. A decode bucket pads with rows of slot 0.
+//!
+//! A prefill forward evaluates rows of host tokens (prompt chunks and
+//! verification rows): its inputs are the rows' packed columns, tokens and
+//! positions. Its graph gathers, runs the model and, unless the forward
+//! only writes the prefix cache, keeps the hidden states and projects each
+//! row's last position. A prefill bucket adds one sequence holding every
+//! padding token, then empty sequences.
+//!
+//! Padding rows never write K/V (their write addresses are -1).
+//!
+//! A rank's runners and the request state they share are
+//! [`CausalLMRunners`] ([`runners`]): a batch of token calls reserves its
+//! storage ([`batch`]), turns its calls into rows, sampling tasks and prompt
+//! scoring ([`calls`], [`context`], [`step`]), runs one forward per expert
+//! microbatch and commits its outputs ([`commit`]). [`start`] builds the
+//! runners and [`warmup`] captures their graphs.
 
-pub(crate) mod buffers;
+mod batch;
+mod calls;
+mod commit;
+mod context;
+pub(crate) mod input_buffers;
 pub(crate) mod methods;
 pub(crate) mod rows;
+mod runners;
+pub(crate) mod start;
+mod step;
+pub(crate) mod warmup;
 
-pub(crate) use buffers::{Dimensions, FINISH_IDS, TextBuffers};
+pub(crate) use input_buffers::{Dimensions, FINISH_IDS, InputBuffers};
 pub(crate) use methods::{Construction, Methods};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
+pub(crate) use runners::{CausalLMRunners, execute};
 
 use std::sync::Arc;
 
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_ipc::ForwardMode;
 
-use super::{TextShapes, TokenSelection};
+use super::TokenSelection;
 use crate::cuda_graph::{CUDAGraph, GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
+use crate::cuda_graph::{ShapeKey, TextShapes};
 use crate::ffi::{DType, Handle};
 use crate::parallel::MicrobatchCall;
 use crate::request::decode_state::DecodeState;
@@ -42,8 +67,9 @@ use crate::storage::memory::StorageView;
 use crate::storage::{AttentionRow, BlockTables, KVCacheManager};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
+use runners::{COMPLETION_FIELDS, StepParts};
 
-use buffers::ROW_SECTIONS;
+use input_buffers::ROW_SECTIONS;
 use methods::{Argument, MethodCall};
 
 /// The commit mode of a row that only sets its slot's cache length
@@ -55,23 +81,6 @@ pub(crate) const COMMIT_CACHE: i64 = 3;
 pub(crate) struct TableShape {
     pub(crate) page_tokens: u32,
     pub(crate) windowed: bool,
-}
-
-/// What identifies a captured text graph besides the runner's fixed table
-/// widths and tensors: the method and its scalar arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum TextGraphKey {
-    /// `decode` of a row bucket.
-    Decode { rows: usize },
-    /// The model forward of a prefill bucket, with hidden outputs or
-    /// writing only the prefix cache.
-    Prefill {
-        rows: usize,
-        tokens: usize,
-        outputs: bool,
-    },
-    /// `commit` of a row bucket.
-    Commit { rows: usize },
 }
 
 /// The sampling inputs of one invocation (see `crate::sampling::plan`).
@@ -98,7 +107,8 @@ pub(crate) struct Embeddings {
 
 /// One invocation request.
 pub(crate) struct StepRequest<'a> {
-    pub(crate) decode: bool,
+    /// What the rows are: a prefill, a decode or a verification.
+    pub(crate) mode: ForwardMode,
     pub(crate) rows: &'a [TokenRow],
     /// Each decode row's finish tokens, padded with -1; a row beyond the
     /// slice has none. A decode forward without `sampling` selects with
@@ -132,7 +142,7 @@ pub(crate) struct Executed {
 /// variant.
 enum Choice {
     Eager,
-    Graph(TextGraphKey),
+    Graph(ShapeKey),
 }
 
 /// A planned forward whose inputs are written on the runner's stream,
@@ -169,7 +179,7 @@ pub(crate) struct Launch {
 
 /// One planned forward: its shapes and host columns.
 struct Plan {
-    decode: bool,
+    mode: ForwardMode,
     live: usize,
     rows: usize,
     live_tokens: usize,
@@ -182,9 +192,11 @@ struct Plan {
     /// Rotary position axes the rows carry: 1, or 3 when a row places
     /// positions explicitly.
     axes: usize,
+    /// Candidate rows the eager selection projects at `logit_rows`: every
+    /// position of a verification, or of a prefill that scores its prompt.
     logit_count: usize,
-    all_last: bool,
-    cache_only: bool,
+    /// A prefill keeps hidden states and last-position logits.
+    outputs: bool,
     choice: Choice,
     /// Host column words of the row gather (absent for decode).
     row_columns: Vec<i64>,
@@ -204,7 +216,7 @@ struct Plan {
 }
 
 /// One lane binding of a causal language model.
-pub(crate) struct TextRunner {
+pub(crate) struct CausalLMRunner {
     device: Option<i32>,
     stream: Option<Stream>,
     methods: Methods,
@@ -213,12 +225,12 @@ pub(crate) struct TextRunner {
     /// Where the distributed expert weights note the copies a captured
     /// forward performs between its segments.
     breaks: Option<GraphBreaks>,
-    buffers: TextBuffers,
+    buffers: InputBuffers,
     tables: Vec<TableShape>,
     /// Configured per-table widths every graph addresses.
     widths: Vec<i64>,
     shapes: TextShapes,
-    graphs: GraphTable<TextGraphKey>,
+    graphs: GraphTable<ShapeKey>,
     pool: Option<Handle>,
 }
 
@@ -231,7 +243,7 @@ pub(crate) struct RunnerParts {
     pub(crate) methods: Methods,
     pub(crate) plans_attention: bool,
     pub(crate) breaks: Option<GraphBreaks>,
-    pub(crate) buffers: TextBuffers,
+    pub(crate) buffers: InputBuffers,
     pub(crate) tables: Vec<TableShape>,
     pub(crate) widths: Vec<i64>,
     pub(crate) shapes: TextShapes,
@@ -239,7 +251,7 @@ pub(crate) struct RunnerParts {
     pub(crate) pool: Option<Handle>,
 }
 
-impl TextRunner {
+impl CausalLMRunner {
     pub(crate) fn new(parts: RunnerParts) -> Self {
         let graphs = GraphTable::new(
             format!("text runner of {}", parts.component),
@@ -322,108 +334,94 @@ impl TextRunner {
             .collect()
     }
 
-    /// An optional column as a method argument.
-    fn optional(&self, name: &str) -> Argument {
-        self.buffers
-            .column(name)
-            .map_or(Argument::None, Argument::from)
-    }
-
-    /// The runner's `decode` of `plan` at `capacity`.
-    fn decode(&self, plan: &Plan, capacity: Option<usize>) -> Result<MethodCall> {
-        let mut arguments = vec![
-            plan.rows.into(),
-            plan.widths.as_slice().into(),
-            plan.prefixes.as_slice().into(),
-            plan.starts.as_slice().into(),
-            capacity.unwrap_or(0).into(),
-        ];
-        arguments.extend(self.tensors(&[
-            "request_pool_indices",
-            "decode_force_finish",
-            "finish_ids",
-            "logits",
-            "completion",
-            "continuation",
-            "tagged",
-            "points",
-            "transition",
-        ])?);
-        Ok(self.methods.call(&self.methods.decode, arguments))
-    }
-
-    /// The runner's `plan_decode` of `plan`.
-    fn plan_decode(&self, plan: &Plan) -> Result<MethodCall> {
-        let mut arguments = vec![
-            plan.rows.into(),
-            plan.widths.as_slice().into(),
-            plan.prefixes.as_slice().into(),
-            plan.starts.as_slice().into(),
-        ];
-        arguments.extend(self.tensors(&["request_pool_indices"])?);
-        Ok(self.methods.call(&self.methods.plan_decode, arguments))
-    }
-
-    /// The runner's `sample` of a decode's `rows` candidate rows.
-    fn sample(&self, rows: usize, words: &[i64]) -> Result<MethodCall> {
-        let mut arguments = vec![rows.into(), words.into()];
-        arguments.extend(self.tensors(&[
-            "logits",
-            "draws",
-            "params",
-            "tasks",
-            "completion",
-            "continuation",
-            "tagged",
-            "points",
-            "transition",
-            "logprobs",
-        ])?);
-        Ok(self.methods.call(&self.methods.sample, arguments))
-    }
-
-    /// The runner's `prefill` of a staged forward, replaying `graph` for
-    /// its model forward when given.
-    fn prefill(
-        &self,
-        staged: &Staged,
-        graph: Option<&CUDAGraph>,
-        capacity: Option<usize>,
-    ) -> Result<MethodCall> {
+    /// The runner's forward method of a staged forward at `capacity`:
+    /// `decode`, or `prefill` for prefill and verification rows.
+    fn forward(&self, staged: &Staged, capacity: Option<usize>) -> Result<MethodCall> {
         let plan = &staged.plan;
+        let capacity = capacity.unwrap_or(0);
+        if plan.mode == ForwardMode::Decode {
+            let mut arguments = vec![
+                plan.rows.into(),
+                plan.widths.as_slice().into(),
+                plan.prefixes.as_slice().into(),
+                plan.starts.as_slice().into(),
+                capacity.into(),
+            ];
+            arguments.extend(self.tensors(&[
+                "request_pool_indices",
+                "decode_force_finish",
+                "finish_ids",
+                "logits",
+                "completion",
+                "continuation",
+                "tagged",
+                "points",
+                "transition",
+            ])?);
+            return Ok(self.methods.call(&self.methods.decode, arguments));
+        }
+
         let mut arguments = vec![
-            graph.map_or(Argument::None, |graph| {
-                Argument::Handle(graph.handle().clone())
-            }),
             plan.rows.into(),
-            plan.live.into(),
             plan.tokens.into(),
             plan.widths.as_slice().into(),
             plan.queries.as_slice().into(),
             plan.prefixes.as_slice().into(),
             plan.starts.as_slice().into(),
             plan.causal.as_slice().into(),
-            plan.logit_count.into(),
-            plan.all_last.into(),
-            plan.cache_only.into(),
-            staged.sampling.as_slice().into(),
-            staged.prompt.as_slice().into(),
             plan.axes.into(),
-            staged.embedded.into(),
-            capacity.unwrap_or(0).into(),
+            plan.outputs.into(),
+            capacity.into(),
         ];
         arguments.extend(self.tensors(&[
             "row_columns",
             "input_ids",
             "positions",
             "causal_values",
-            "logit_rows",
         ])?);
-        arguments.extend(
-            ["input_embeddings", "embedding_mask", "hidden"].map(|name| self.optional(name)),
-        );
-        arguments.extend(self.tensors(&[
-            "logits",
+        if staged.embedded {
+            arguments.extend(self.tensors(&["input_embeddings", "embedding_mask"])?);
+        } else {
+            arguments.extend([Argument::None, Argument::None]);
+        }
+        arguments.extend(self.tensors(&["hidden", "logits"])?);
+        Ok(self.methods.call(&self.methods.prefill, arguments))
+    }
+
+    /// The runner's method planning the attention launches of `plan`'s
+    /// forward on the host: `plan_decode` or `plan_prefill`.
+    fn plan_attention(&self, plan: &Plan) -> Result<MethodCall> {
+        if plan.mode == ForwardMode::Decode {
+            let mut arguments = vec![
+                plan.rows.into(),
+                plan.widths.as_slice().into(),
+                plan.prefixes.as_slice().into(),
+                plan.starts.as_slice().into(),
+            ];
+            arguments.extend(self.tensors(&["request_pool_indices"])?);
+            return Ok(self.methods.call(&self.methods.plan_decode, arguments));
+        }
+
+        let mut arguments = vec![
+            plan.rows.into(),
+            plan.tokens.into(),
+            plan.widths.as_slice().into(),
+            plan.queries.as_slice().into(),
+            plan.prefixes.as_slice().into(),
+            plan.starts.as_slice().into(),
+            plan.causal.as_slice().into(),
+        ];
+        arguments.extend(self.tensors(&["row_columns", "causal_values"])?);
+        Ok(self.methods.call(&self.methods.plan_prefill, arguments))
+    }
+
+    /// The eager methods that follow a staged forward: `sample` for rows
+    /// that sample from the logits the forward projected (`verify` for a
+    /// verification, which projects every candidate position), and
+    /// `prompt_logprobs` for scored prompt chunks.
+    fn selection(&self, staged: &Staged) -> Result<Vec<MethodCall>> {
+        let plan = &staged.plan;
+        let outputs = [
             "draws",
             "params",
             "tasks",
@@ -433,14 +431,40 @@ impl TextRunner {
             "points",
             "transition",
             "logprobs",
-            "prompt_tail",
-        ])?);
-        Ok(self.methods.call(&self.methods.prefill, arguments))
+        ];
+        let mut calls = Vec::new();
+        if !staged.sampling.is_empty() {
+            let words = staged.sampling.as_slice();
+            if plan.mode == ForwardMode::Verify {
+                let mut arguments = vec![plan.logit_count.into(), words.into()];
+                arguments.extend(self.tensors(&["hidden", "logit_rows"])?);
+                arguments.extend(self.tensors(&outputs)?);
+                calls.push(self.methods.call(&self.methods.verify, arguments));
+            } else {
+                let mut arguments = vec![plan.live.into(), words.into()];
+                arguments.extend(self.tensors(&["logits"])?);
+                arguments.extend(self.tensors(&outputs)?);
+                calls.push(self.methods.call(&self.methods.sample, arguments));
+            }
+        }
+        if !staged.prompt.is_empty() {
+            let mut arguments = vec![plan.logit_count.into(), staged.prompt.as_slice().into()];
+            arguments.extend(self.tensors(&[
+                "hidden",
+                "logit_rows",
+                "input_ids",
+                "logprobs",
+                "prompt_tail",
+            ])?);
+            calls.push(self.methods.call(&self.methods.prompt_logprobs, arguments));
+        }
+        Ok(calls)
     }
 
     /// The numerical work of a staged forward at `capacity`: the launch of
     /// its resident graph, or the eager method (also the warmup of a
-    /// capture [`Self::finish`] then records). Without `launch`, a resident
+    /// capture [`Self::finish`] then records), followed by the eager
+    /// selection of rows that sample or score. Without `launch`, a resident
     /// graph's shapes run eagerly instead.
     pub(crate) fn launch(
         &self,
@@ -458,23 +482,12 @@ impl TextRunner {
                 Lookup::Capture => (GraphMode::Capture, None),
             },
         };
-        let plan = &staged.plan;
-        if !plan.decode {
-            let call = self.prefill(staged, graph.as_ref(), capacity)?;
-            return Ok(Launch {
-                mode,
-                call: Box::new(move || call.invoke().map(drop)),
-                yields: mode != GraphMode::Replay,
-            });
-        }
-
-        // Rows that sample select from the logits the forward wrote.
-        let sample = if staged.sampling.is_empty() {
-            None
-        } else {
-            Some(self.sample(plan.live, &staged.sampling)?)
+        let selection = self.selection(staged)?;
+        let select = move || {
+            selection
+                .into_iter()
+                .try_for_each(|call| call.invoke().map(drop))
         };
-        let sample = move || sample.map_or(Ok(()), |call| call.invoke().map(drop));
         match graph {
             Some(graph) => {
                 let stream = self
@@ -483,7 +496,7 @@ impl TextRunner {
                     .ok_or(Error::State("a graph is launched on a CUDA stream"))?;
                 let planned = self
                     .plans_attention
-                    .then(|| self.plan_decode(plan))
+                    .then(|| self.plan_attention(&staged.plan))
                     .transpose()?;
                 Ok(Launch {
                     mode,
@@ -492,18 +505,18 @@ impl TextRunner {
                             call.invoke()?;
                         }
                         graph.launch(&stream)?;
-                        sample()
+                        select()
                     }),
                     yields: false,
                 })
             }
             None => {
-                let call = self.decode(plan, capacity)?;
+                let call = self.forward(staged, capacity)?;
                 Ok(Launch {
                     mode,
                     call: Box::new(move || {
                         call.invoke()?;
-                        sample()
+                        select()
                     }),
                     yields: true,
                 })
@@ -547,38 +560,9 @@ impl TextRunner {
         if mode == GraphMode::Capture
             && let Choice::Graph(key) = &plan.choice
         {
-            let graph = match key {
-                TextGraphKey::Prefill { outputs, .. } => {
-                    let pool = self
-                        .pool
-                        .as_ref()
-                        .ok_or(Error::State("graph capture requires a graph pool"))?;
-                    let mut arguments = vec![
-                        plan.rows.into(),
-                        plan.tokens.into(),
-                        plan.widths.as_slice().into(),
-                        plan.queries.as_slice().into(),
-                        plan.prefixes.as_slice().into(),
-                        plan.starts.as_slice().into(),
-                        plan.causal.as_slice().into(),
-                        (plan.cache_only && !outputs).into(),
-                        Argument::Handle(pool.clone()),
-                        capacity.unwrap_or(0).into(),
-                    ];
-                    arguments.extend(self.tensors(&["input_ids", "positions", "causal_values"])?);
-                    arguments.push(self.optional("hidden"));
-                    CUDAGraph::captured(
-                        self.methods
-                            .call(&self.methods.capture_prefill, arguments)
-                            .invoke()?,
-                    )?
-                }
-                _ => {
-                    // The plans a capture reads are built outside it.
-                    self.plan_decode(plan)?.invoke()?;
-                    self.capture(self.decode(plan, capacity)?)?
-                }
-            };
+            // The plans a capture reads are built outside it.
+            self.plan_attention(plan)?.invoke()?;
+            let graph = self.capture(self.forward(&staged, capacity)?)?;
             self.graphs.insert(key.clone(), capacity, graph)?;
         }
         self.graphs.record(mode);
@@ -592,6 +576,7 @@ impl TextRunner {
     /// Resolve pages, the graph choice and the host columns of `request`.
     fn plan(&self, request: &StepRequest<'_>, context: &mut StepContext<'_>) -> Result<Plan> {
         let rows = request.rows;
+        let decode = request.mode == ForwardMode::Decode;
         let dimensions = self.buffers.dimensions;
         let live = rows.len();
         if live == 0 || live > dimensions.rows {
@@ -610,7 +595,7 @@ impl TextRunner {
                 dimensions.tokens
             )));
         }
-        if request.decode && rows.iter().any(|row| row.query != 1) {
+        if decode && rows.iter().any(|row| row.query != 1) {
             return Err(Error::Invalid(
                 "decode rows evaluate exactly one token".into(),
             ));
@@ -667,16 +652,16 @@ impl TextRunner {
             if let Some((bucket_rows, bucket_tokens, decode, outputs)) = self.shapes.select(
                 &queries,
                 live_tokens,
-                request.decode,
+                decode,
                 Some(true),
                 false,
                 last_logits,
                 cache_only,
             )? {
                 choice = Choice::Graph(if decode {
-                    TextGraphKey::Decode { rows: bucket_rows }
+                    ShapeKey::Decode { rows: bucket_rows }
                 } else {
-                    TextGraphKey::Prefill {
+                    ShapeKey::Prefill {
                         rows: bucket_rows,
                         tokens: bucket_tokens,
                         outputs,
@@ -705,7 +690,7 @@ impl TextRunner {
                     )));
                 }
                 configured
-            } else if request.decode {
+            } else if decode {
                 live_width.next_power_of_two().min(dimensions.width)
             } else {
                 live_width
@@ -726,7 +711,7 @@ impl TextRunner {
         let mut prefixes: Vec<i64> = rows.iter().map(|row| i64::from(row.prefix)).collect();
         let mut slots: Vec<i64> = rows.iter().map(|row| i64::from(row.slot)).collect();
         if padded_rows > live {
-            if request.decode {
+            if decode {
                 queries.resize(padded_rows, 1);
             } else {
                 queries.push((padded_tokens - live_tokens) as i64);
@@ -763,7 +748,7 @@ impl TextRunner {
         // position comes from the host has it written to its slot.
         let mut finish_ids = Vec::new();
         let mut slot_words = Vec::new();
-        if request.decode {
+        if decode {
             finish_ids = vec![-1_i64; padded_rows * FINISH_IDS];
             for (row, ids) in request.finish_ids.iter().enumerate() {
                 finish_ids[row * FINISH_IDS..][..FINISH_IDS].copy_from_slice(ids);
@@ -792,7 +777,7 @@ impl TextRunner {
         let mut token_ids = Vec::new();
         let mut positions = Vec::new();
         let mut relays = Vec::new();
-        if !request.decode {
+        if !decode {
             let stride = dimensions.rows + 1;
             row_columns = vec![0_i64; (ROW_SECTIONS + pages.len()) * stride + padded_tokens];
             let mut query_offset = 0;
@@ -862,12 +847,11 @@ impl TextRunner {
             }
         }
 
-        // Candidate logits positions of a non-decode invocation.
-        let layout = logit_layout(rows);
-        let logit_count: usize = layout.iter().map(|&(_, count)| count).sum();
+        // The token positions the eager selection projects into candidate
+        // rows: every position of a verification row, and of a prefill row
+        // that scores its prompt.
         let mut logit_rows = Vec::new();
-        let all_last = last_logits;
-        if !request.decode && !all_last && logit_count > 0 {
+        if request.mode == ForwardMode::Verify || !request.prompt.is_empty() {
             let mut offset = 0;
             for row in rows {
                 let stop = offset + row.query as usize;
@@ -876,8 +860,16 @@ impl TextRunner {
             }
         }
 
+        // A forward that only writes the cache keeps no outputs, unless the
+        // graph serving it computes them.
+        let outputs = !cache_only
+            || matches!(
+                choice,
+                Choice::Graph(ShapeKey::Prefill { outputs: true, .. })
+            );
+
         Ok(Plan {
-            decode: request.decode,
+            mode: request.mode,
             live,
             rows: padded_rows,
             live_tokens,
@@ -888,9 +880,8 @@ impl TextRunner {
             starts,
             causal,
             axes,
-            logit_count: if request.decode { live } else { logit_count },
-            all_last,
-            cache_only,
+            logit_count: logit_rows.len(),
+            outputs,
             choice,
             row_columns,
             token_ids,
@@ -919,7 +910,7 @@ impl TextRunner {
             entries.push((destination, source.as_ptr() as u64, source.len()));
         };
         let mut causal_values = Vec::new();
-        if plan.decode {
+        if plan.mode == ForwardMode::Decode {
             push(column("request_pool_indices")?, bytes(&plan.slots));
             push(column("decode_force_finish")?, &plan.force);
             push(column("finish_ids")?, bytes(&plan.finish_ids));
@@ -1059,12 +1050,12 @@ impl TextRunner {
             .pool
             .as_ref()
             .and_then(|_| bucket(self.shapes.decode(), rows.len()))
-            .map(|rows| TextGraphKey::Commit { rows });
+            .map(|rows| ShapeKey::Commit { rows });
 
         // A bucket pads with rows that store the padding slot's zero cache
         // length again.
         let count = match &key {
-            Some(TextGraphKey::Commit { rows }) => *rows,
+            Some(ShapeKey::Commit { rows }) => *rows,
             _ => rows.len(),
         };
         let padding = [0, COMMIT_CACHE, -1, 0, 0, 0, 0, 0];

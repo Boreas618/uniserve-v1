@@ -22,9 +22,9 @@ use super::batch::ImageBatch;
 use super::latents::Scratch;
 use crate::cuda_graph::GraphMode;
 use crate::executor::forward::experts::ExpertRuntime;
-use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::transfer::latents;
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
+use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::diffusion::image::{DenoiseRow, IntegrateRow};
 use crate::storage::LatentUpdate;
 use crate::{Error, Result};
@@ -355,7 +355,7 @@ impl ImageBatch<'_> {
     /// rank with `experts`.
     pub(super) fn denoise(
         &mut self,
-        mut text: Option<&mut TextRuntime>,
+        mut text: Option<&mut CausalLMRunners>,
         experts: Option<&ExpertRuntime>,
     ) -> Result<ForwardStats> {
         let plan = self.plan;
