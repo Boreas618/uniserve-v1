@@ -138,7 +138,8 @@ impl Staged {
 pub(crate) struct Launch {
     pub(crate) mode: GraphMode,
     /// The step: an eager forward (a capture's warmup included) or a graph
-    /// replay. Runs on the caller's thread or a microbatch thread.
+    /// replay. Submitted from the lane's execution thread, or from a
+    /// microbatch thread in its turn of an expert step.
     pub(crate) call: DeferredCall,
 }
 

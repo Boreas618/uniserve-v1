@@ -19,6 +19,7 @@ use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::{DType, Handle};
+use crate::lane::Lanes;
 use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
@@ -31,7 +32,6 @@ use crate::runner::text::{
 };
 use crate::runner::{PrefillShape, TextShapes, prefill_shapes};
 use crate::storage::{KVCache, KVPlan, OutputPool};
-use crate::worker::Lanes;
 use crate::{Error, Result};
 
 use super::super::experts::ExpertRuntime;
@@ -226,7 +226,7 @@ fn streams(
         let served: Vec<CallKind> = kinds
             .iter()
             .copied()
-            .filter(|kind| lane.config.call_kinds.contains(kind))
+            .filter(|kind| lane.serves(*kind))
             .collect();
         if !served.is_empty() {
             let stream = lane.stream.stream()?.clone();

@@ -21,10 +21,8 @@
 //! in dependency order: execution, bindings, streams, requests, the process
 //! world, then deferred device memory.
 
-mod lanes;
 mod storage;
 
-pub use lanes::{Lane, Lanes};
 pub use storage::RankStorage;
 
 use std::collections::BTreeMap;
@@ -66,6 +64,7 @@ use crate::executor::forward::transfer::TransferRuntime;
 use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
+use crate::lane::Lanes;
 use crate::launch::Endpoint;
 use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
@@ -420,6 +419,7 @@ impl Worker {
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
         backend.set_rank_storage(storage);
+        backend.set_job_queues(lanes.job_queues());
         let text_warmup = text.is_some();
         let video_warmup = video_runtime.is_some();
         if let Some(runtime) = video_runtime {

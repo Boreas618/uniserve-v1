@@ -23,6 +23,7 @@ use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::Handle;
+use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
 use crate::model::canvas::{CanvasFacts, CanvasModel, StepOptions, TableLayout, scratch_bytes};
@@ -34,7 +35,6 @@ use crate::runner::canvas::{
 };
 use crate::storage::canvas::{BankLayout, CanvasBanks, CanvasBuffers, CanvasLayout, StepLayout};
 use crate::storage::{GroupShape, KVCache, KVPlan, OutputPool};
-use crate::worker::Lanes;
 use crate::{Error, Result};
 
 use super::super::experts::ExpertRuntime;
@@ -196,7 +196,7 @@ fn streams(lanes: &Lanes, device: Device) -> Result<Vec<Option<Stream>>> {
     };
     let mut result = Vec::new();
     for lane in lanes.lanes() {
-        if lane.config.call_kinds.contains(&CANVAS_KIND) {
+        if lane.serves(CANVAS_KIND) {
             result.push(Some(lane.stream.stream()?.clone()));
         }
     }

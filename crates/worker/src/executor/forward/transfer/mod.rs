@@ -42,8 +42,8 @@ use super::launch::Launched;
 use crate::error::WorkerError;
 use crate::executor::lifecycle::RequestStorage;
 use crate::ffi::Device;
+use crate::lane::Lanes;
 use crate::storage::OutputPool;
-use crate::worker::Lanes;
 use crate::{Error, Result};
 
 use batch::{Failure, TransferBatch};

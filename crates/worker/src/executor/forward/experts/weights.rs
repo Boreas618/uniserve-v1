@@ -20,11 +20,11 @@ use uniserve_cuda::{DeviceId, Stream};
 
 use crate::config::{Device, WorkerLaunch};
 use crate::ffi::{Fields, Handle, Record};
+use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::interface::Interface;
 use crate::parallel::world::World;
 use crate::parallel::{ExpertWeights, ShardField};
-use crate::worker::Lanes;
 use crate::{Error, Result};
 
 /// The rank's distributed expert weights and their binding-side object.
