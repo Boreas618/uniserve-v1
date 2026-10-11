@@ -28,6 +28,7 @@
 //! same collective calls in the same order.
 
 mod pool;
+mod shape_key;
 mod table;
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -39,6 +40,7 @@ use crate::ffi::Handle;
 use crate::{Error, Result};
 
 pub use pool::{GraphPool, GraphPools, GraphStorage, graph_storage_budget_bytes, reserve_pools};
+pub(crate) use shape_key::{PrefillShape, ShapeKey, TextShapes, prefill_shapes};
 pub use table::{Capacity, GraphCounts, GraphTable, Lookup};
 
 /// How one numerical invocation ran.

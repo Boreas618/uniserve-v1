@@ -1,4 +1,4 @@
-//! The Python half of the text runner:
+//! The Python half of [`super::CausalLMRunner`]:
 //! `uniserve_models.runner.causal_lm.CausalLMRunner`.
 //!
 //! [`Methods`] holds the Python runner and its methods, reached by import
@@ -100,8 +100,10 @@ pub(crate) struct Methods {
     pub(crate) decode: Function,
     pub(crate) plan_decode: Function,
     pub(crate) prefill: Function,
-    pub(crate) capture_prefill: Function,
+    pub(crate) plan_prefill: Function,
     pub(crate) sample: Function,
+    pub(crate) verify: Function,
+    pub(crate) prompt_logprobs: Function,
     pub(crate) commit: Function,
     /// Captures the methods called between its begin and end.
     pub(crate) graphs: GraphFunctions,
@@ -154,8 +156,10 @@ impl Methods {
             decode: method("decode")?,
             plan_decode: method("plan_decode")?,
             prefill: method("prefill")?,
-            capture_prefill: method("capture_prefill")?,
+            plan_prefill: method("plan_prefill")?,
             sample: method("sample")?,
+            verify: method("verify")?,
+            prompt_logprobs: method("prompt_logprobs")?,
             commit: method("commit")?,
             graphs: GraphFunctions::from_interface(interface)?,
         })
@@ -202,7 +206,7 @@ impl Methods {
     }
 
     /// Whether an attention operator plans each launch on the host, so a
-    /// captured decode is launched after `plan_decode`.
+    /// captured forward is launched after `plan_decode` or `plan_prefill`.
     pub(crate) fn plans_attention(&self, interface: &Interface) -> Result<bool> {
         bool::try_from(self.fact(interface, "plans_attention")?)
             .map_err(|_| Error::Interface(format!("{RUNNER}.plans_attention returns a flag")))
