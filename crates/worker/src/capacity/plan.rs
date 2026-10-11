@@ -7,7 +7,7 @@
 //! and the KV unit count are agreed over the group's [`HostGroup`] with a
 //! minimum reduction.
 //!
-//! Token workers (text, canvas, image) place a KV pool beside fixed storage:
+//! Token workers (text, diffusion LM, image) place a KV pool beside fixed storage:
 //! the buffer pool, the tensor store's products, the latent pool and the
 //! storage each capability runtime reserves (input buffers, block tables,
 //! decode state, importer scratch). Automatic KV sizing gives the pool the

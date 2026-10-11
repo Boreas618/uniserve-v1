@@ -36,7 +36,7 @@ from uniserve_models.diffusion.tokens import self_conditioning_embedding
 from uniserve_models.distributed import Communicator
 from uniserve_models.loading import weights
 from uniserve_models.model import (
-    CanvasInput,
+    DiffusionLMInput,
     EmbeddingReplacement,
     TextInput,
     TextSize,
@@ -166,7 +166,9 @@ def _canvas(model, context, canvas, prefix, soft=None):
     batch = _segmented(context.cache, count=count, prefix=prefix)
     context.bind_attention(batch)
     hidden = model.denoiser(
-        CanvasInput(canvas, torch.arange(prefix, prefix + count), batch, soft)
+        DiffusionLMInput(
+            canvas, torch.arange(prefix, prefix + count), batch, soft
+        )
     )
     return model.denoiser.compute_logits(
         hidden, token_indices=torch.arange(count)
@@ -624,7 +626,7 @@ def _canvas_stage(model, context, canvas, prefix):
     batch = _segmented(context.cache, count=count, prefix=prefix)
     context.bind_attention(batch)
     hidden = model.denoiser(
-        CanvasInput(canvas, torch.arange(prefix, prefix + count), batch)
+        DiffusionLMInput(canvas, torch.arange(prefix, prefix + count), batch)
     )
     return model.denoiser.compute_logits(
         hidden, token_indices=torch.arange(count)
@@ -810,7 +812,7 @@ def _native_pass(root, device, attention, tokens, calls, images, canvases):
             )
             context.bind_attention(batch)
             hidden = model.denoiser(
-                CanvasInput(
+                DiffusionLMInput(
                     canvas.to(device),
                     torch.arange(prefix, prefix + count, device=device),
                     batch,

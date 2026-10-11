@@ -1,6 +1,6 @@
 //! The components this rank holds and their bindings, by capability.
 //!
-//! Capability runtimes (text, canvas, image, video, media, experts) look up
+//! Capability runtimes (text, diffusion LM, image, video, media, experts) look up
 //! the components serving a call kind or runner family here, create their
 //! bindings through [`crate::model::bind`] and register them, so startup
 //! closes every binding in one place and kernel reports cover all of them.

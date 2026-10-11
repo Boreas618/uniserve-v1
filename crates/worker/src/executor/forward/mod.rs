@@ -1,7 +1,8 @@
 //! Numerical execution of a batch's calls, by capability runtime.
 //!
 //! Every batch carries calls of one kind on one component. [`execute`]
-//! routes it to the runtime that serves the kind: text (`token`), canvas,
+//! routes it to the runtime that serves the kind: text (`token`), the
+//! diffusion LM runner (`crate::runner::diffusion_lm`),
 //! image, video, host media (`media`), transfers (`transfer`); expert-only
 //! ranks participate in expert steps through `experts`. These modules are
 //! the integration seam of the capability runtimes: each owns its runners,
@@ -13,7 +14,6 @@
 //! the rank serving.
 
 pub(crate) mod batch;
-pub(crate) mod canvas;
 pub(crate) mod experts;
 pub(crate) mod image;
 pub(crate) mod inputs;
@@ -116,7 +116,9 @@ pub(crate) fn execute(
         Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
             token::execute(backend, batch, kind)
         }
-        Forward(ForwardMode::TokenDenoising) => canvas::execute(backend, batch, kind),
+        Forward(ForwardMode::TokenDenoising) => {
+            crate::runner::diffusion_lm::execute(backend, batch, kind)
+        }
         Transfer(_) => transfer::execute(backend, batch, kind),
         Media(MediaReading | VideoEncoding | AudioEncoding | Muxing) => {
             let (plan, borrowed, state) = batch.media_parts();
