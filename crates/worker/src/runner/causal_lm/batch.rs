@@ -18,7 +18,7 @@ use uniserve_ipc::{Batch as BatchPlan, CallStatus, DType, ForwardMode, RequestKe
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, CausalLMRunners};
 use crate::executor::PendingOutput;
-use crate::executor::forward::image::ImageRuntime;
+use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::launch::{lock, read_flag, reports_output, seal};
 use crate::ffi::Device;
 use crate::request::RequestPool;
@@ -51,14 +51,14 @@ pub(super) struct CallState {
 pub(super) struct Batch<'a> {
     pub(super) runtime: &'a mut CausalLMRunners,
     /// The image runtime, for prompts placing image features.
-    pub(super) image: Option<&'a mut ImageRuntime>,
+    pub(super) image: Option<ImageParts<'a>>,
     pub(super) storage: &'a mut RankStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
     /// The runner group serving the batch.
     pub(super) group: usize,
     /// The rank's expert runtime, when its forwards are expert steps.
-    pub(super) experts: Option<&'a crate::executor::forward::experts::ExpertRuntime>,
+    pub(super) experts: Option<&'a crate::parallel::ExpertUnion>,
     /// The group's lane stream.
     pub(super) stream: Option<Stream>,
     pub(super) device: Option<i32>,
@@ -79,10 +79,10 @@ impl<'a> Batch<'a> {
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(super) fn open(
         runtime: &'a mut CausalLMRunners,
-        image: Option<&'a mut ImageRuntime>,
+        image: Option<ImageParts<'a>>,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
-        experts: Option<&'a crate::executor::forward::experts::ExpertRuntime>,
+        experts: Option<&'a crate::parallel::ExpertUnion>,
         info: &uniserve_ipc::WorkerInfo,
         rank: usize,
         plan: &'a BatchPlan,

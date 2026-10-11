@@ -28,13 +28,13 @@ use crate::model::registry::Components;
 use crate::model::{LoadedModel, ModelFacts};
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::{
-    CausalLMRunner, Construction, Dimensions, InputBuffers, Methods, RunnerParts, TableShape,
-    model_dtype,
+    CausalLMRunner, Construction, Dimensions, RunnerParts, TableShape, methods, model_dtype,
 };
+use crate::runner::input_buffers::InputBuffers;
 use crate::storage::{KVCache, KVPlan, OutputPool};
 use crate::{Error, Result};
 
-use crate::executor::forward::experts::{ExpertRuntime, WeightRuntime};
+use crate::parallel::{DwdpManager, ExpertUnion};
 
 /// The text call kinds a runner may serve.
 pub(crate) const TEXT_KINDS: [CallKind; 3] = [
@@ -265,11 +265,11 @@ pub(crate) struct Startup<'a> {
     pub(crate) preparation: Option<&'a Stream>,
     /// The expert runtime, when forwards are expert steps: each lane binding
     /// gets one runner per microbatch, bound to its transport and stream.
-    pub(crate) experts: Option<&'a mut ExpertRuntime>,
+    pub(crate) experts: Option<&'a mut ExpertUnion>,
     /// The worker's ranks, across which symmetric workspaces are mapped.
     pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
     /// The distributed expert weights, with DWDP.
-    pub(crate) weights: Option<&'a WeightRuntime>,
+    pub(crate) weights: Option<&'a DwdpManager>,
 }
 
 impl CausalLMRunners {
@@ -321,9 +321,7 @@ impl CausalLMRunners {
                 experts.parallel().max_tokens()
             )));
         }
-        let vocab = startup.facts.vocab_size.ok_or_else(|| {
-            Error::Interface("a causal language model reports no vocabulary".into())
-        })?;
+        let vocab = methods::vocab_size(startup.interface, startup.model.handle())?;
         let dtype = model_dtype(&config.model_dtype)?;
 
         // The attention layers' view of the pool, bound once.
@@ -413,12 +411,7 @@ impl CausalLMRunners {
                 groups.len()
             )));
         }
-        let bindings = bind::bind(
-            startup.interface,
-            startup.workspaces,
-            prepared,
-            startup.peers,
-        )?;
+        let bindings = bind::bind(startup.interface, startup.workspaces, prepared)?;
         let mut collectives = Vec::new();
         if let Some(peers) = startup.peers {
             for ((_, _, stream, _), binding) in targets.iter().zip(&bindings) {
@@ -460,7 +453,7 @@ impl CausalLMRunners {
                     .map(|(_, view)| view)
                     .ok_or_else(|| Error::Invariant(format!("block tables have no {name}")))
             };
-            let methods = Methods::construct(
+            let methods = methods::construct(
                 startup.interface,
                 &Construction {
                     prepared: binding.prepared(),
@@ -486,9 +479,9 @@ impl CausalLMRunners {
             )?;
 
             // The runner's vocabulary shard sizes its logits columns.
-            let shard = methods.vocab(startup.interface)?;
-            let hidden = methods.hidden_size(startup.interface)?;
-            let plans_attention = methods.plans_attention(startup.interface)?;
+            let shard = methods::vocab(&methods)?;
+            let hidden = methods::hidden_size(startup.interface, startup.model.handle())?;
+            let plans_attention = methods::plans_attention(&methods)?;
             if shard.size != vocab {
                 return Err(Error::Interface(format!(
                     "the text runner's vocabulary ({}) differs from the model's ({vocab})",
@@ -585,22 +578,25 @@ impl CausalLMRunners {
 
 /// Device bytes the causal LM runners allocate beside the KV pool.
 pub(crate) fn reserved_bytes(
+    interface: &Interface,
+    model: &LoadedModel,
     config: &WorkerConfig,
     request_slots: usize,
     cache: &KVPlan,
     facts: &ModelFacts,
     streams: usize,
 ) -> Result<u64> {
-    let Some(vocab) = facts.vocab_size else {
+    // A rank without a causal language model reports no vocabulary.
+    let vocab = methods::vocab_size(interface, model.handle())?;
+    if vocab == 0 {
         return Ok(0);
-    };
+    }
+    let hidden = methods::hidden_size(interface, model.handle())?;
     let cuda = config.device.is_cuda();
     let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
     let dtype = model_dtype(&config.model_dtype)?;
-    let mut dimensions = bounds.dimensions(vocab, vocab, facts.hidden_size.unwrap_or(0), dtype);
+    let mut dimensions = bounds.dimensions(vocab, vocab, hidden, dtype);
     dimensions.embeddings = facts.image_processor;
-    Ok(
-        dimensions.bytes() * streams.max(1) as u64
-            + DecodeState::bytes(request_slots, vocab, dtype),
-    )
+    Ok(InputBuffers::bytes(&dimensions) * streams.max(1) as u64
+        + DecodeState::bytes(request_slots, vocab, dtype))
 }

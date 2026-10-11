@@ -25,13 +25,13 @@ from uniserve_models.model import (
     CausalLM,
     ComponentEntry,
     Denoiser,
+    DiffusionLM,
     Encoder,
     EntryPoint,
     ImageDecoder,
     ImageDenoiser,
     PatchEncoder,
     TextEncoder,
-    TokenDenoiser,
     VideoDecoder,
     VideoDenoiser,
     VideoEncoder,
@@ -49,7 +49,7 @@ from .errors import SetupError
 # Capability tags the worker understands, with the class each one names.
 CAPABILITIES: tuple[tuple[str, type], ...] = (
     ("causal_lm", CausalLM),
-    ("token_denoiser", TokenDenoiser),
+    ("diffusion_lm", DiffusionLM),
     ("denoiser", Denoiser),
     ("image_denoiser", ImageDenoiser),
     ("video_denoiser", VideoDenoiser),

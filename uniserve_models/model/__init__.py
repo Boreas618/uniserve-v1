@@ -13,6 +13,12 @@ from .denoiser import (
     VideoDenoiser,
     VideoSize,
 )
+from .diffusion_lm import (
+    CanvasTokens,
+    DiffusionLM,
+    DiffusionLMInput,
+    SelfConditioning,
+)
 from .encoder import Encoder, PatchEncoder, TextConditioner, TextEncoder
 from .inputs import (
     DEFAULT_COMPONENT,
@@ -27,12 +33,6 @@ from .inputs import (
 )
 from .logits import Logits, VocabShard
 from .text import CausalLM
-from .token_denoiser import (
-    CanvasInput,
-    CanvasTokens,
-    SelfConditioning,
-    TokenDenoiser,
-)
 from .transformer import PhasedLayer, TransformerDecoder, TransformerEncoder
 from .video import (
     AudioDecoder,
@@ -55,10 +55,10 @@ __all__ = [
     "Logits",
     "VocabShard",
     "CausalLM",
-    "CanvasInput",
+    "DiffusionLMInput",
     "CanvasTokens",
     "SelfConditioning",
-    "TokenDenoiser",
+    "DiffusionLM",
     "PhasedLayer",
     "TransformerDecoder",
     "TransformerEncoder",

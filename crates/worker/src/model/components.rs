@@ -24,7 +24,7 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Capability {
     CausalLm,
-    TokenDenoiser,
+    DiffusionLm,
     Denoiser,
     ImageDenoiser,
     VideoDenoiser,
@@ -43,7 +43,7 @@ pub enum Capability {
 impl Capability {
     pub const ALL: [Self; 15] = [
         Self::CausalLm,
-        Self::TokenDenoiser,
+        Self::DiffusionLm,
         Self::Denoiser,
         Self::ImageDenoiser,
         Self::VideoDenoiser,
@@ -62,7 +62,7 @@ impl Capability {
     pub const fn tag(self) -> &'static str {
         match self {
             Self::CausalLm => "causal_lm",
-            Self::TokenDenoiser => "token_denoiser",
+            Self::DiffusionLm => "diffusion_lm",
             Self::Denoiser => "denoiser",
             Self::ImageDenoiser => "image_denoiser",
             Self::VideoDenoiser => "video_denoiser",
@@ -99,7 +99,7 @@ pub enum Stage {
 pub enum RunnerKind {
     Text,
     Diffusion,
-    Canvas,
+    DiffusionLM,
     Decoder,
     Encoder,
 }
@@ -147,7 +147,7 @@ impl CallDecl {
                         Forward(ForwardMode::Decode),
                         Forward(ForwardMode::Verify),
                     ]);
-                } else if self.is(Capability::TokenDenoiser) {
+                } else if self.is(Capability::DiffusionLm) {
                     kinds.insert(Forward(ForwardMode::TokenDenoising));
                 } else if self.is(Capability::Denoiser) {
                     kinds.extend([Media(LatentPreparation), Media(Denoising)]);
@@ -194,7 +194,7 @@ impl CallDecl {
     fn auxiliary(&self) -> bool {
         (self.is(Capability::CausalLm)
             && matches!(self.method.as_str(), "embed_input_ids" | "compute_logits"))
-            || (self.is(Capability::TokenDenoiser) && self.method == "compute_logits")
+            || (self.is(Capability::DiffusionLm) && self.method == "compute_logits")
     }
 
     /// The runner family that serves this call's module, if any.
@@ -203,8 +203,8 @@ impl CallDecl {
             Some(RunnerKind::Text)
         } else if self.is(Capability::Denoiser) {
             Some(RunnerKind::Diffusion)
-        } else if self.is(Capability::TokenDenoiser) {
-            Some(RunnerKind::Canvas)
+        } else if self.is(Capability::DiffusionLm) {
+            Some(RunnerKind::DiffusionLM)
         } else if [
             Capability::AudioDecoder,
             Capability::ImageDecoder,
