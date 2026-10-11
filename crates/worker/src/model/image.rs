@@ -22,6 +22,9 @@ use crate::request::diffusion::{BranchSource, Prefix};
 use crate::runner::vision::{FeatureInjection, FeatureLayout, PositionLayout};
 use crate::{Error, Result};
 
+const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
+const DENOISER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
+
 /// Language positions a generated image spans in its conversation: its
 /// closing framing token sits this far past the opening one, and the
 /// request's logical position advances by it after the image.
@@ -158,7 +161,8 @@ fn token(record: &Record, key: &str) -> Result<Option<u32>> {
 impl ImageModel {
     /// Describe a loaded model's image facts.
     pub fn describe(interface: &Interface, loaded: &Handle) -> Result<Self> {
-        let function = interface.function("image.describe")?;
+        // FIXME: the image facts still cross as one record.
+        let function = interface.import(&format!("{DENOISER}.describe"))?;
         Self::from_record(&Record::new(
             function.name(),
             function.call_values(&[loaded.to_any()])?,
@@ -271,9 +275,9 @@ impl ImagePolicy {
     pub fn new(interface: &Interface, loaded: Handle) -> Result<Self> {
         Ok(Self {
             loaded,
-            prepare_input: interface.function("image.prepare_input")?,
-            patch_grid: interface.function("image.patch_grid")?,
-            guidance_prefix: interface.function("image.guidance_prefix")?,
+            prepare_input: interface.import(&format!("{ENCODER}.prepare_image"))?,
+            patch_grid: interface.import(&format!("{ENCODER}.patch_grid"))?,
+            guidance_prefix: interface.import(&format!("{DENOISER}.guidance_prefix"))?,
         })
     }
 
@@ -281,7 +285,7 @@ impl ImagePolicy {
         &self.loaded
     }
 
-    /// The `image.prepare_input` function (called from host lanes).
+    /// `EncoderRunner.prepare_image` (called from host lanes).
     pub fn prepare_input(&self) -> &Function {
         &self.prepare_input
     }
@@ -326,37 +330,32 @@ impl ImagePolicy {
                 reuses_conditioning: false,
             });
         }
-        let value: tvm_ffi::Array<Any> = self.guidance_prefix.call_as(&[
-            (&self.loaded.to_any()).into(),
-            (&Any::from(tvm_ffi::String::from(source.name()))).into(),
-            (&Any::from(tvm_ffi::String::from(image_prompt))).into(),
-            (&Any::from(tvm_ffi::String::from(negative_prompt))).into(),
+        // `[reuses, *tokens]`.
+        let value = self.guidance_prefix.call_values(&[
+            self.loaded.to_any(),
+            Any::from(tvm_ffi::String::from(source.name())),
+            Any::from(tvm_ffi::String::from(image_prompt)),
+            Any::from(tvm_ffi::String::from(negative_prompt)),
         ])?;
-        let item = |index: usize| {
-            value
-                .get(index)
-                .map_err(|error| Error::numerical(self.guidance_prefix.name(), &error))
-        };
-        if value.len() != 2 {
-            return Err(Error::Interface(format!(
-                "{} returns [tokens, reuses_conditioning]",
+        let values = integers(value)
+            .map_err(|error| Error::numerical(self.guidance_prefix.name(), &error))?;
+        let (reuses, tokens) = values.split_first().ok_or_else(|| {
+            Error::Interface(format!(
+                "{} returns [reuses, *tokens]",
                 self.guidance_prefix.name()
-            )));
-        }
-        let tokens = integers(item(0)?)
-            .map_err(|error| Error::numerical(self.guidance_prefix.name(), &error))?
-            .into_iter()
-            .map(|token| {
+            ))
+        })?;
+        let tokens = tokens
+            .iter()
+            .map(|&token| {
                 u32::try_from(token).map_err(|_| {
                     Error::Interface("guidance prefix token is outside the token range".into())
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let reuses = bool::try_from(item(1)?)
-            .map_err(|error| Error::numerical(self.guidance_prefix.name(), &error))?;
         Ok(Prefix {
             tokens: Arc::from(tokens),
-            reuses_conditioning: reuses,
+            reuses_conditioning: *reuses != 0,
         })
     }
 }

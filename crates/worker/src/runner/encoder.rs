@@ -64,15 +64,13 @@ use uniserve_ipc::Batch as BatchPlan;
 
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
-use crate::cuda_graph::{CUDAGraph, GraphMode, GraphTable, Lookup};
+use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::executor::forward::video::{
     Parts, bind_rows, decode_range, publish, publish_bound, row_width, stream_of,
 };
-use crate::ffi::{
-    Backing, DType, Fields, Function, Functions, Handle, Record, Region, integer_list, list,
-};
+use crate::ffi::{Backing, DType, Function, Handle, Record, Region, integer_list, list};
 use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
@@ -249,7 +247,8 @@ impl EncoderInfo {
         path: &str,
         dtype: DType,
     ) -> Result<Self> {
-        let function = interface.function("encoder.describe")?;
+        // FIXME: an encoder's facts still cross as one record.
+        let function = interface.import(&format!("{ENCODER}.describe"))?;
         let record = Record::new(
             function.name(),
             function.call_values(&[
@@ -498,31 +497,37 @@ impl Encoded {
 /// leading rows).
 struct PackedVision {
     capacity: usize,
+    pixels: StorageView,
     grids: StorageView,
+    features: StorageView,
 }
 
-/// The binding functions of one encoder kind.
-enum Steps {
-    Vision {
-        encode: Function,
-        prepare_resident: Function,
-        warm: Function,
-        packed: Option<(Function, Function)>,
-    },
-    Latent {
-        encode: Function,
-        prepare_resident: Function,
-        warm: Function,
-    },
-    /// The Python half of a text encoder or of the vision tower bound
-    /// with it: the runner and its methods, each called with it first.
-    Runner {
-        runner: Handle,
-        encode: Function,
-        position_ids: Function,
-        /// Captures a forward between its begin and end.
-        capture: GraphFunctions,
-    },
+/// The Python half (`uniserve_models.runner.encoder.EncoderRunner`) and its
+/// methods, each called with the runner first.
+struct EncoderMethods {
+    runner: Handle,
+    encode: Function,
+    position_ids: Function,
+    prepare_resident: Function,
+    warm: Function,
+    pack_images: Function,
+    /// Captures a forward between its begin and end.
+    capture: GraphFunctions,
+}
+
+impl EncoderMethods {
+    fn new(interface: &Interface, runner: Handle) -> Result<Self> {
+        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        Ok(Self {
+            runner,
+            encode: method("encode")?,
+            position_ids: method("position_ids")?,
+            prepare_resident: method("prepare_resident")?,
+            warm: method("warm")?,
+            pack_images: method("pack_images")?,
+            capture: GraphFunctions::from_interface(interface)?,
+        })
+    }
 }
 
 /// The buffers of a text encoder's forward.
@@ -545,21 +550,17 @@ pub struct EncoderRunner {
     device: Device,
     /// The binding's stream, shared with its lane; `None` on the host.
     stream: Option<Stream>,
-    steps: Steps,
-    /// The device's product arena, as an image encoder's binding received
-    /// it.
+    methods: EncoderMethods,
+    /// The device's product arena, in which an image encoder's products
+    /// are regions.
     products: Option<StorageView>,
     packed: Option<PackedVision>,
     text: Option<TextBuffers>,
     text_capacities: Vec<usize>,
     config: EncoderConfig,
     graphs: Option<GraphTable<EncoderGraph>>,
-    /// Releases a captured graph the storage check refused.
-    release: Option<Function>,
     /// Capture is enabled: graph pools were supplied at startup.
     capturing: bool,
-    /// Buffers bound to the Python binding, retained for its lifetime.
-    _buffers: Vec<StorageView>,
 }
 
 fn allocate(device: Device, dtype: DType, shape: &[i64]) -> Result<StorageView> {
@@ -608,7 +609,6 @@ impl EncoderRunner {
             ));
         }
 
-        let mut buffers = vec![("products", products.clone())];
         let mut packed = None;
         match info {
             EncoderInfo::Vision(vision) => {
@@ -627,30 +627,25 @@ impl EncoderRunner {
                     // Rows past an image keep earlier values, which only
                     // padding reads; they start finite.
                     pixels.zero(stream.as_ref())?;
-                    let grids = allocate(device, DType::I64, &[2 * capacity, 2])?;
-                    let features = allocate(
-                        device,
-                        vision.output_dtype,
-                        &[
-                            capacity * i64::from(slot_tokens),
-                            i64::from(vision.output_size),
-                        ],
-                    )?;
-                    buffers.extend([
-                        ("pixels", pixels),
-                        ("grids", grids.clone()),
-                        ("features", features),
-                    ]);
                     packed = Some(PackedVision {
                         capacity: capacity as usize,
-                        grids,
+                        pixels,
+                        grids: allocate(device, DType::I64, &[2 * capacity, 2])?,
+                        features: allocate(
+                            device,
+                            vision.output_dtype,
+                            &[
+                                capacity * i64::from(slot_tokens),
+                                i64::from(vision.output_size),
+                            ],
+                        )?,
                     });
                 }
             }
             EncoderInfo::Latent(_) => {}
             EncoderInfo::Text(_) => {
                 return Err(Error::Invariant(
-                    "a text encoder computes through its Python runner".into(),
+                    "a text encoder is constructed without a product arena".into(),
                 ));
             }
         }
@@ -659,76 +654,30 @@ impl EncoderRunner {
             stream.synchronize()?;
         }
 
-        let mut tensors = Fields::new();
-        for (name, view) in &buffers {
-            tensors = tensors.with(name, view.to_tensor()?);
-        }
-        let function = interface.function("encoder.bind")?;
-        let functions = Functions::new(
-            function.name(),
-            function.call_values(&[
+        let runner = Handle::new(interface.import(&format!("{ENCODER}.bound"))?.call_values(
+            &[
                 binding.prepared().to_any(),
-                loaded.to_any(),
                 Any::from(tvm_ffi::String::from(path)),
-                tensors.into_any(),
-            ])?,
-        )?;
-        let (steps, release) = match info {
-            EncoderInfo::Vision(_) => {
-                let packed_steps = packed
-                    .as_ref()
-                    .map(|_| -> Result<_> {
-                        Ok((
-                            functions.get("encode_packed")?,
-                            functions.get("capture_packed")?,
-                        ))
-                    })
-                    .transpose()?;
-                let release = packed
-                    .as_ref()
-                    .map(|_| functions.get("release"))
-                    .transpose()?;
-                (
-                    Steps::Vision {
-                        encode: functions.get("encode")?,
-                        prepare_resident: functions.get("prepare_resident")?,
-                        warm: functions.get("warm")?,
-                        packed: packed_steps,
-                    },
-                    release,
-                )
-            }
-            EncoderInfo::Latent(_) => (
-                Steps::Latent {
-                    encode: functions.get("encode")?,
-                    prepare_resident: functions.get("prepare_resident")?,
-                    warm: functions.get("warm")?,
-                },
-                None,
-            ),
-            EncoderInfo::Text(_) => {
-                return Err(Error::Invariant(
-                    "a text encoder computes through its Python runner".into(),
-                ));
-            }
-        };
+                loaded.to_any(),
+                Any::from(products.to_tensor()?),
+            ],
+        )?)?;
+        let methods = EncoderMethods::new(interface, runner)?;
         Ok(Self {
-            graphs: release
-                .clone()
-                .map(|release| GraphTable::new(owner.clone(), release)),
-            release,
+            graphs: packed
+                .as_ref()
+                .map(|_| GraphTable::new(owner.clone(), methods.capture.release.clone())),
             owner,
             info,
             device,
             stream,
-            steps,
+            methods,
             products: Some(products),
             packed,
             text: None,
             text_capacities: Vec::new(),
             config: config.clone(),
             capturing: false,
-            _buffers: buffers.into_iter().map(|(_, view)| view).collect(),
         })
     }
 
@@ -745,22 +694,19 @@ impl EncoderRunner {
         config: &EncoderConfig,
         stream: Stream,
     ) -> Result<Self> {
-        const RUNNER: &str = "uniserve_models.runner.encoder.EncoderRunner";
         let owner = if path.is_empty() {
             binding.component.clone()
         } else {
             format!("{}.{path}", binding.component)
         };
         let device = binding.device;
-        let runner = Handle::new(
-            interface
-                .import(&format!("{RUNNER}.bound"))?
-                .call_values(&[
-                    binding.prepared().to_any(),
-                    Any::from(tvm_ffi::String::from(path)),
-                ])?,
-        )?;
-        let capture = GraphFunctions::from_interface(interface)?;
+        let runner = Handle::new(interface.import(&format!("{ENCODER}.bound"))?.call_values(
+            &[
+                binding.prepared().to_any(),
+                Any::from(tvm_ffi::String::from(path)),
+            ],
+        )?)?;
+        let methods = EncoderMethods::new(interface, runner)?;
 
         let mut text_capacities = config.text_capacities.clone();
         text_capacities.sort_unstable();
@@ -773,8 +719,8 @@ impl EncoderRunner {
                     .unwrap_or(config.max_text_tokens)
                     .max(1) as i64;
                 let final_stage = interface
-                    .import(&format!("{RUNNER}.final_stage"))?
-                    .call_as::<bool>(&[runner.view()])?;
+                    .import(&format!("{ENCODER}.final_stage"))?
+                    .call_as::<bool>(&[methods.runner.view()])?;
                 let buffers = TextBuffers {
                     tokens: allocate(device, DType::I64, &[capacity])?,
                     features: allocate(
@@ -790,36 +736,32 @@ impl EncoderRunner {
                 };
                 (
                     Some(buffers),
-                    Some(GraphTable::new(owner.clone(), capture.release.clone())),
+                    Some(GraphTable::new(
+                        owner.clone(),
+                        methods.capture.release.clone(),
+                    )),
                 )
             }
             EncoderInfo::Vision(_) => (None, None),
             EncoderInfo::Latent(_) => {
                 return Err(Error::Invariant(
-                    "a latent encoder computes through its binding".into(),
+                    "a latent encoder is constructed with a product arena".into(),
                 ));
             }
         };
         Ok(Self {
             graphs,
-            release: Some(capture.release.clone()),
             owner,
             info,
             device,
             stream: Some(stream),
-            steps: Steps::Runner {
-                runner,
-                encode: interface.import(&format!("{RUNNER}.encode"))?,
-                position_ids: interface.import(&format!("{RUNNER}.position_ids"))?,
-                capture,
-            },
+            methods,
             products: None,
             packed: None,
             text,
             text_capacities,
             config: config.clone(),
             capturing: false,
-            _buffers: Vec::new(),
         })
     }
 
@@ -861,11 +803,13 @@ impl EncoderRunner {
     /// encoder (packed vision encoders warm by capturing). A latent encoder
     /// sampling its posterior draws from the device's default generator.
     pub fn warm(&self, side: u32) -> Result<()> {
-        match &self.steps {
-            Steps::Vision { warm, packed, .. } if packed.is_none() => {
-                warm.invoke(&[(&Any::from(i64::from(side))).into()])
+        match (&self.info, &self.packed) {
+            (EncoderInfo::Vision(_), None) | (EncoderInfo::Latent(_), _) => {
+                self.methods.warm.invoke(&[
+                    self.methods.runner.view(),
+                    (&Any::from(i64::from(side))).into(),
+                ])
             }
-            Steps::Latent { warm, .. } => warm.invoke(&[(&Any::from(i64::from(side))).into()]),
             _ => Ok(()),
         }
     }
@@ -878,18 +822,12 @@ impl EncoderRunner {
         tower: Tower,
         signed_unit: bool,
     ) -> Result<PreparedImage> {
-        let function = match &self.steps {
-            Steps::Vision {
-                prepare_resident, ..
-            }
-            | Steps::Latent {
-                prepare_resident, ..
-            } => prepare_resident,
-            Steps::Runner { .. } => {
-                return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
-            }
-        };
+        if matches!(self.info, EncoderInfo::Text(_)) {
+            return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
+        }
+        let function = &self.methods.prepare_resident;
         let value = function.call_values(&[
+            self.methods.runner.to_any(),
             image.to_any(),
             Any::from(tvm_ffi::String::from(tower.name())),
             Any::from(signed_unit),
@@ -915,12 +853,9 @@ impl EncoderRunner {
         if images.is_empty() {
             return Ok(result);
         }
-        match &self.steps {
-            Steps::Vision {
-                packed: Some(_), ..
-            } => self.encode_packed(images, out, &mut result)?,
-            Steps::Vision { encode, .. } | Steps::Latent { encode, .. } => {
-                let encode = encode.clone();
+        match (&self.info, &self.packed) {
+            (EncoderInfo::Vision(_), Some(_)) => self.encode_packed(images, out, &mut result)?,
+            (EncoderInfo::Vision(_) | EncoderInfo::Latent(_), _) => {
                 let groups = match self.info {
                     EncoderInfo::Vision(vision) => {
                         // Each call stays within the rows its projections
@@ -939,8 +874,9 @@ impl EncoderRunner {
                 };
                 for group in groups {
                     let shapes = call_shapes(
-                        &encode,
+                        &self.methods.encode,
                         &[
+                            self.methods.runner.to_any(),
                             image_list(group.iter().map(|&index| images[index])),
                             region_list(group.iter().map(|&index| &out[index])),
                         ],
@@ -952,11 +888,27 @@ impl EncoderRunner {
                     result.record(GraphMode::Eager);
                 }
             }
-            Steps::Runner { .. } => {
+            (EncoderInfo::Text(_), _) => {
                 return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
             }
         }
         Ok(result)
+    }
+
+    /// The arguments of the Python half's `encode` of `slots` packed slots.
+    fn packed_arguments(&self, slots: usize) -> Result<Vec<Any>> {
+        let (EncoderInfo::Vision(vision), Some(packed)) = (&self.info, &self.packed) else {
+            return Err(Error::Invariant("encoder packs no images".into()));
+        };
+        let slots = slots as i64;
+        let patches = i64::from(vision.max_patches.unwrap_or_default());
+        let tokens = i64::from(vision.slot_tokens().unwrap_or_default());
+        Ok(vec![
+            self.methods.runner.to_any(),
+            Any::from(packed.pixels.prefix(slots * patches)?.to_tensor()?),
+            Any::from(packed.grids.prefix(2 * slots)?.to_tensor()?),
+            Any::from(packed.features.prefix(slots * tokens)?.to_tensor()?),
+        ])
     }
 
     fn encode_packed(
@@ -965,20 +917,22 @@ impl EncoderRunner {
         out: &[Region],
         result: &mut Encoded,
     ) -> Result<()> {
-        let (
-            EncoderInfo::Vision(vision),
-            Some(packed),
-            Steps::Vision {
-                packed: Some((encode, _)),
-                ..
-            },
-        ) = (&self.info, &self.packed, &self.steps)
+        let (EncoderInfo::Vision(vision), Some(packed), Some(products)) =
+            (&self.info, &self.packed, &self.products)
         else {
             return Err(Error::Invariant("encoder packs no images".into()));
         };
-        let (vision, encode) = (*vision, encode.clone());
-        let (capacity, grids) = (packed.capacity, packed.grids.clone());
+        let vision = *vision;
+        let (capacity, pixels, grids, features) = (
+            packed.capacity,
+            packed.pixels.clone(),
+            packed.grids.clone(),
+            packed.features.clone(),
+        );
+        let arena = products.address();
         let max_patches = vision.max_patches.unwrap_or_default();
+        let slot_tokens = u64::from(vision.slot_tokens().unwrap_or_default());
+        let row_bytes = u64::from(vision.output_size) * vision.output_dtype.bytes() as u64;
         let shapes = images
             .iter()
             .map(|image| {
@@ -999,19 +953,60 @@ impl EncoderRunner {
             grids
                 .prefix(2 * slots as i64)?
                 .upload(grid_bytes(&layout).as_slice(), self.stream.as_ref())?;
-            let (graph, mode) = self.packed_graph(EncoderGraph::Packed { slots })?;
-            let shapes = call_shapes(
-                &encode,
-                &[
-                    image_list(images[offset..offset + slots].iter().copied()),
-                    Any::from(slots as i64),
-                    graph.map_or_else(Any::default, |graph| graph.to_any()),
-                    region_list(out[offset..offset + slots].iter()),
-                ],
-                slots,
-            )?;
-            for (index, shape) in shapes.into_iter().enumerate() {
-                result.shapes[offset + index] = shape;
+
+            // FIXME: prepared images are Python-held, so their patch rows
+            // reach the slots through one call on the Python thread.
+            let mut pack = vec![self.methods.runner.to_any(), Any::from(pixels.to_tensor()?)];
+            pack.extend(
+                images[offset..offset + slots]
+                    .iter()
+                    .map(|image| image.value.to_any()),
+            );
+            self.methods.pack_images.call_values(&pack)?;
+
+            let arguments = self.packed_arguments(slots)?;
+            let stream = self.stream.clone();
+            let mode = match (self.graph(EncoderGraph::Packed { slots })?, &stream) {
+                (Some(graph), Some(stream)) => {
+                    graph.launch(stream)?;
+                    GraphMode::Replay
+                }
+                _ => {
+                    self.methods.encode.call_values(&arguments)?;
+                    GraphMode::Eager
+                }
+            };
+            if let Some(table) = &mut self.graphs {
+                table.record(mode);
+            }
+
+            // Slot `i` holds image `i`'s features in its leading rows; the
+            // features and the product share their dtype, so the rows are
+            // copied as they are.
+            for (index, &[rows, columns]) in chunk.iter().enumerate() {
+                let count =
+                    u64::from(rows) * u64::from(columns) / u64::from(vision.downsample).pow(2);
+                let region = &out[offset + index];
+                let source = features.address() + index as u64 * slot_tokens * row_bytes;
+                let bytes = (count * row_bytes) as usize;
+                match &stream {
+                    // SAFETY: the rows lie in the slot's features and the
+                    // region in the product arena the caller reserved; the
+                    // copy follows the encode on the stream.
+                    Some(stream) => unsafe {
+                        memcpy_async(arena + region.offset(), source, bytes, stream)?;
+                    },
+                    // SAFETY: as above, in host memory the encode wrote
+                    // before returning.
+                    None => unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            source as *const u8,
+                            (arena + region.offset()) as *mut u8,
+                            bytes,
+                        );
+                    },
+                }
+                result.shapes[offset + index] = vec![count as i64, i64::from(vision.output_size)];
             }
             result.record(mode);
             offset += slots;
@@ -1033,16 +1028,14 @@ impl EncoderRunner {
         grids: &[[u32; 3]],
         out: &StorageView,
     ) -> Result<()> {
-        let (Steps::Runner { runner, encode, .. }, EncoderInfo::Vision(_)) =
-            (&self.steps, &self.info)
-        else {
+        if !matches!(self.info, EncoderInfo::Vision(_)) {
             return Err(Error::Invalid(format!(
                 "{} encodes no vision blocks",
                 self.owner
             )));
-        };
-        encode.call_values(&[
-            runner.to_any(),
+        }
+        self.methods.encode.call_values(&[
+            self.methods.runner.to_any(),
             Any::from(rows.to_tensor()?),
             Any::from(out.to_tensor()?),
             Any::from(integer_list(
@@ -1055,11 +1048,11 @@ impl EncoderRunner {
     /// The arguments of the Python half's `encode` of a prompt padded to
     /// `capacity`, without vision tokens.
     fn text_arguments(&self, capacity: usize) -> Result<Vec<Any>> {
-        let (Steps::Runner { runner, .. }, Some(text)) = (&self.steps, &self.text) else {
+        let Some(text) = &self.text else {
             return Err(Error::Invalid(format!("{} encodes no text", self.owner)));
         };
         Ok(vec![
-            runner.to_any(),
+            self.methods.runner.to_any(),
             Any::from(text.tokens.prefix(capacity as i64)?.to_tensor()?),
             Any::from(text.features.prefix(capacity as i64)?.to_tensor()?),
         ])
@@ -1076,16 +1069,8 @@ impl EncoderRunner {
         out: &StorageView,
         vision: Option<PromptVision<'_>>,
     ) -> Result<GraphMode> {
-        let (
-            Steps::Runner {
-                encode,
-                position_ids,
-                ..
-            },
-            Some(text),
-            Some(stream),
-        ) = (&self.steps, &self.text, &self.stream)
-        else {
+        let (encode, position_ids) = (&self.methods.encode, &self.methods.position_ids);
+        let (Some(text), Some(stream)) = (&self.text, &self.stream) else {
             return Err(Error::Invalid(format!("{} encodes no text", self.owner)));
         };
         let (encode, position_ids, stream) = (encode.clone(), position_ids.clone(), stream.clone());
@@ -1182,27 +1167,12 @@ impl EncoderRunner {
         })
     }
 
-    /// The resident graph handle of a packed vision encode of `key`, which
-    /// its binding replays, or eager execution when capture is disabled.
-    /// After seal a missing graph is an error.
-    fn packed_graph(&mut self, key: EncoderGraph) -> Result<(Option<Handle>, GraphMode)> {
-        let found = self.graph(key)?.map(|graph| graph.handle().clone());
-        let mode = if found.is_some() {
-            GraphMode::Replay
-        } else {
-            GraphMode::Eager
-        };
-        if let Some(table) = &mut self.graphs {
-            table.record(mode);
-        }
-        Ok((found, mode))
-    }
-
-    /// Warm and, with `pool`, capture every graph this encoder replays:
+    /// Warm and, with `pool`, capture every graph this encoder launches:
     /// packed slot counts `capacity..=1` and text capacities, largest
     /// first. `check` runs after each capture (the graph storage budget);
-    /// a failed check releases that graph. Without a pool the same calls
-    /// run eagerly once, so lazy initialization precedes serving.
+    /// a failed check releases that graph. Without a pool the same
+    /// forwards run once on the Python thread, so lazy initialization
+    /// precedes serving.
     pub fn capture(
         &mut self,
         pool: Option<&Arc<GraphPool<Handle>>>,
@@ -1215,17 +1185,10 @@ impl EncoderRunner {
                 "an encoder captures into a pool of its device".into(),
             ));
         }
-        let pool_value = pool.map_or_else(Any::default, |pool| pool.value.to_any());
-        let mut captured = Vec::new();
-        match (&self.info, &self.packed, &self.steps) {
-            (
-                EncoderInfo::Vision(vision),
-                Some(packed),
-                Steps::Vision {
-                    packed: Some((_, capture)),
-                    ..
-                },
-            ) => {
+        // The forwards to capture, largest first, each with its arguments.
+        let mut forwards = Vec::new();
+        match (&self.info, &self.packed, &self.text) {
+            (EncoderInfo::Vision(vision), Some(packed), _) => {
                 for slots in (1..=packed.capacity).rev() {
                     let layout = packed_grids(
                         &[],
@@ -1233,87 +1196,59 @@ impl EncoderRunner {
                         vision.max_patches.unwrap_or_default(),
                         vision.downsample,
                     )?;
-                    packed
-                        .grids
-                        .prefix(2 * slots as i64)?
-                        .upload(grid_bytes(&layout).as_slice(), self.stream.as_ref())?;
-                    let graph =
-                        capture.call_values(&[Any::from(slots as i64), pool_value.clone()])?;
-                    captured.push((EncoderGraph::Packed { slots }, graph));
+                    forwards.push((
+                        EncoderGraph::Packed { slots },
+                        Some(grid_bytes(&layout)),
+                        self.packed_arguments(slots)?,
+                    ));
                 }
             }
-            (
-                EncoderInfo::Text(_),
-                _,
-                Steps::Runner {
-                    encode, capture, ..
-                },
-            ) => {
-                let (encode, capture) = (encode.clone(), capture.clone());
-                let (Some(text), Some(stream), Device::Cuda(device)) =
-                    (&self.text, self.stream.clone(), self.device)
-                else {
-                    return Err(Error::Invariant(
-                        "a text encoder captures on its CUDA stream".into(),
+            (EncoderInfo::Text(_), _, Some(text)) => {
+                text.tokens.zero(self.stream.as_ref())?;
+                for &capacity in self.text_capacities.iter().rev() {
+                    forwards.push((
+                        EncoderGraph::Text { capacity },
+                        None,
+                        self.text_arguments(capacity)?,
                     ));
-                };
-                text.tokens.zero(Some(&stream))?;
-                for &capacity in self.text_capacities.clone().iter().rev() {
-                    // An eager forward first, so kernels compile outside the
-                    // capture.
-                    let arguments = self.text_arguments(capacity)?;
-                    encode.call_values(&arguments)?;
-                    let Some(pool) = pool else {
-                        continue;
-                    };
-                    let graph = capture.capture(&pool.value, stream.raw(), device, || {
-                        encode.call_values(&arguments).map(drop)
-                    })?;
-                    if let Err(error) = check() {
-                        if let Err(cleanup) = capture.release.invoke(&[graph.handle().view()]) {
-                            tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
-                        }
-                        return Err(error);
-                    }
-                    self.graphs
-                        .as_mut()
-                        .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
-                        .insert(EncoderGraph::Text { capacity }, None, graph)?;
                 }
             }
             _ => {}
         }
-        for (key, graph) in captured {
-            self.keep(key, graph, check)?;
+        for (key, grids, arguments) in forwards {
+            if let (EncoderGraph::Packed { slots }, Some(grids), Some(packed)) =
+                (key, &grids, &self.packed)
+            {
+                packed
+                    .grids
+                    .prefix(2 * slots as i64)?
+                    .upload(grids, self.stream.as_ref())?;
+            }
+            // An eager forward first, so kernels compile outside the
+            // capture.
+            self.methods.encode.call_values(&arguments)?;
+            let (Some(pool), Some(stream), Device::Cuda(device)) =
+                (pool, &self.stream, self.device)
+            else {
+                continue;
+            };
+            let capture = &self.methods.capture;
+            let graph = capture.capture(&pool.value, stream.raw(), device, || {
+                self.methods.encode.call_values(&arguments).map(drop)
+            })?;
+            if let Err(error) = check() {
+                if let Err(cleanup) = capture.release.invoke(&[graph.handle().view()]) {
+                    tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
+                }
+                return Err(error);
+            }
+            self.graphs
+                .as_mut()
+                .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
+                .insert(key, None, graph)?;
         }
         self.capturing = pool.is_some();
         Ok(())
-    }
-
-    /// Record one captured graph after the storage check; a warm call
-    /// without a pool returns no graph.
-    fn keep(
-        &mut self,
-        key: EncoderGraph,
-        graph: Any,
-        check: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
-        if crate::ffi::is_none(&graph) {
-            return Ok(());
-        }
-        let graph = CUDAGraph::captured(graph)?;
-        if let Err(error) = check() {
-            if let Some(release) = &self.release
-                && let Err(cleanup) = release.invoke(&[graph.handle().view()])
-            {
-                tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
-            }
-            return Err(error);
-        }
-        self.graphs
-            .as_mut()
-            .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
-            .insert(key, None, graph)
     }
 
     /// Refuse further captures: serving replays what startup captured.
@@ -1994,6 +1929,7 @@ pub(crate) fn encode_conditions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi::Fields;
 
     #[test]
     fn packed_grids_describe_images_and_slot_padding() -> Result<()> {
