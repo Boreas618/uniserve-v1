@@ -21,7 +21,7 @@ mod registration;
 mod signals;
 
 pub use arguments::{Arguments, USAGE};
-pub use registration::{ExitOnClose, register};
+pub use registration::{HeadWatch, register};
 pub use signals::Signals;
 
 use tvm_ffi::Map;
@@ -95,15 +95,14 @@ fn run(
     signals: &Signals,
 ) -> std::result::Result<(), WorkerError> {
     let interface = Interface::from_table(table)?;
-    // Size the channel for the batches and results the descriptor allows.
-    channel.set_capacity(launch.ipc.max_payload_bytes, launch.ipc.queue_depth);
+    channel.set_bound(launch.ipc.max_payload_bytes);
 
     // Until the service observes the connection, the head's close ends the
     // process from the watch's thread.
     let hangup = channel
         .hangup()
         .map_err(|error| crate::Error::Transport(error.to_string()))?;
-    let mut starting = Some(ExitOnClose::watch(hangup)?);
+    let mut starting = Some(HeadWatch::start(hangup)?);
 
     let mut worker = Worker::start(launch, interface)?;
     let served = worker.warmup().and_then(|()| {

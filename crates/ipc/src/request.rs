@@ -110,17 +110,6 @@ impl WorkerRequest {
     }
 }
 
-impl Message for WorkerRequest {
-    /// Validates the submitted batch; the other requests carry nothing to
-    /// check.
-    fn validate(&self) -> ValidationResult<()> {
-        match self.batch() {
-            Some(batch) => batch.validate(),
-            None => Ok(()),
-        }
-    }
-}
-
 /// Kind discriminator carried by each worker response frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -261,25 +250,6 @@ impl WorkerResponse {
         Self::Error {
             message_id: None,
             error,
-        }
-    }
-}
-
-impl Message for WorkerResponse {
-    /// Validates the worker info or batch output a response carries, and
-    /// requires a failure to state its message.
-    fn validate(&self) -> ValidationResult<()> {
-        match self {
-            Self::Info { info, .. } => info.validate(),
-            Self::Result { result, .. } => result.validate(),
-            Self::Ok { .. } => Ok(()),
-            Self::Error { error, .. } => {
-                ensure_valid!(
-                    !error.message.is_empty(),
-                    "an error response states no message"
-                );
-                Ok(())
-            }
         }
     }
 }

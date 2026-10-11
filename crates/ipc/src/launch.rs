@@ -23,22 +23,14 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use uniserve_core::{Canvas, CanvasSampling, ComponentConfig};
 
-use crate::frame::Message;
-use crate::{LaneConfig, ValidationResult};
+use crate::LaneConfig;
 
 /// The command that starts one rank with the interpreter `python`.
 ///
 /// argv carries the address of the head the rank connects to and the rank's
-/// identity: its worker group, its rank, and the generation of the launch
-/// that starts it, which its registration states. The caller adds the
-/// environment and any inherited sockets.
-pub fn rank_command(
-    python: impl AsRef<OsStr>,
-    head: &str,
-    worker_id: &str,
-    rank: u32,
-    generation: u64,
-) -> Command {
+/// identity, its worker group and its rank, which its registration states.
+/// The caller adds the environment and any inherited sockets.
+pub fn rank_command(python: impl AsRef<OsStr>, head: &str, worker_id: &str, rank: u32) -> Command {
     let mut command = Command::new(python);
     command
         .arg("-m")
@@ -48,9 +40,7 @@ pub fn rank_command(
         .arg("--worker-id")
         .arg(worker_id)
         .arg("--rank")
-        .arg(rank.to_string())
-        .arg("--generation")
-        .arg(generation.to_string());
+        .arg(rank.to_string());
     command
 }
 
@@ -102,7 +92,8 @@ pub struct LaunchDescriptor {
     pub products_cross_hosts: bool,
     /// Most requests outstanding on the rank's channel at once.
     pub queue_depth: usize,
-    /// Largest frame payload in bytes, in either direction.
+    /// Largest encoded message in bytes, in either direction. The rank sizes
+    /// the storage it stages a batch's inputs in from it.
     pub ipc_payload_cap: usize,
 
     /// Checkpoint path or repository; empty for the stub model.
@@ -225,12 +216,4 @@ pub struct ExpertParallelDescriptor {
     pub listen_fd: Option<i32>,
     /// `alltoall`, `megamoe`, `dwdp` or `deepep`.
     pub exchange: String,
-}
-
-impl Message for LaunchDescriptor {
-    /// The descriptor carries raw launch values; the rank that receives it
-    /// resolves and checks them, so nothing is refused here.
-    fn validate(&self) -> ValidationResult<()> {
-        Ok(())
-    }
 }

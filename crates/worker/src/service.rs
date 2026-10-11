@@ -16,12 +16,6 @@ const EXPERT_POLL: Duration = Duration::from_micros(200);
 // joining an empty expert step. The engine needs time to consume the result
 // and schedule its next batch even when it still has admitted requests.
 const OWN_STEP_WAIT: Duration = Duration::from_millis(8);
-// Longest one wait for the head to take bytes while the send queue is full.
-// The wait ends as soon as the socket accepts some, and is then repeated.
-const SEND_WAIT: Duration = Duration::from_secs(1);
-// Longest the rank waits for the head to take its last responses before it
-// closes the connection.
-const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Numerical values and resource observations needed by the rank service.
 /// Request correlation, admission, polling and shutdown remain in Service.
@@ -104,9 +98,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
                 // The rank closes its connection after this, which discards
                 // what is still queued: a fatal error or this acknowledgment
                 // may wait behind a large result the head is still reading.
-                self.channel
-                    .flush(CLOSE_FLUSH_TIMEOUT)
-                    .map_err(|e| self.channel_error(e))?;
+                self.channel.flush().map_err(|e| self.channel_error(e))?;
                 return Ok(());
             }
 
@@ -248,25 +240,15 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
         })
     }
 
-    /// Send one response, waiting while the send queue is full.
-    ///
-    /// A head that reads more slowly than this rank answers fills the queue.
-    /// The rank then waits for the socket to accept bytes, which is the
-    /// backpressure a full queue stands for, instead of failing.
     fn respond(&mut self, response: &WorkerResponse) -> Result<(), B::Error> {
-        loop {
-            match self.channel.send(response) {
-                Ok(()) => return Ok(()),
-                Err(IpcError::WouldBlock) => self.wait(SEND_WAIT)?,
-                Err(error) => return Err(self.channel_error(error)),
-            }
-        }
+        self.channel
+            .send(response)
+            .map_err(|e| self.channel_error(e))
     }
 
-    /// Block until a request, a completion wake, room in the send queue or
-    /// the timeout. Fails once the head's connection has closed: it is the
-    /// head's liveness, and nothing this rank computes can be delivered
-    /// after it.
+    /// Block until a request, a completion wake or the timeout. Fails once
+    /// the head's connection has closed: it is the head's liveness, and
+    /// nothing this rank computes can be delivered after it.
     fn wait(&mut self, timeout: Duration) -> Result<(), B::Error> {
         self.channel
             .wait(timeout)

@@ -3,7 +3,7 @@
 //! `PendingRank::spawn_rank` derives the rank's launch descriptor and starts
 //! the rank process here, or hands the launch to the host's launcher
 //! (`launcher::RemoteHost`) when the placement puts the rank on another host.
-//! The rank connects to the head and registers (`head::Head`);
+//! The rank connects to the head and registers (`registry::RankRegistry`);
 //! `PendingRank::adopt` answers on that connection with the descriptor and
 //! yields a `RankProcess`, which `WorkerGroup` (in `instance`) drives:
 //! `finish_startup` validates the ranks' startup reports, `submit_batch` and
@@ -38,19 +38,6 @@ use uniserve_ipc::{
 
 use crate::worker::WorkerProcessArgs;
 
-/// Deadline for `finish_startup` to send the startup info request, retrying
-/// until the rank's end of the channel is connected.
-///
-/// It bounds only the send. The rank answers once its model is built and
-/// warmed up, and that wait has no deadline here (see
-/// `RankProcess::wait_pending_response`).
-const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
-/// Deadline for sending the shutdown request in `request_close`.
-///
-/// The channel was connected at startup, so a missing server connection at
-/// this point means the rank has dropped off, and shutdown fails fast rather
-/// than waiting for the startup deadline.
-const WORKER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time `request_close` spends draining in-flight responses from a
 /// still-alive worker before it sends the shutdown request. A hung (alive but
 /// unresponsive) worker must not be able to block shutdown forever.
@@ -424,13 +411,9 @@ pub(super) struct RankProcess {
     /// never visible here; its exit surfaces through the channel once the
     /// connection closes, as a transport error from a receive.
     child: Option<Child>,
-    /// Most requests outstanding at once. `adopt` also sizes the channel
-    /// with it (see `Channel::set_capacity`), and `finish_startup` requires
-    /// the worker to report the same `queue_depth`.
+    /// Most requests outstanding at once on the rank.
     depth: usize,
     rank: u32,
-    world_size: u32,
-    expected_components: std::collections::BTreeMap<String, uniserve_core::ComponentConfig>,
     /// Submitted batches awaiting a response, by message identity.
     pending: HashMap<u64, OutstandingKind>,
     /// Routed results and errors, in arrival order, that `poll_batch` has
@@ -442,8 +425,8 @@ pub(super) struct RankProcess {
     next_message_id: u64,
     /// How far the rank's retirement has progressed.
     retirement: Retirement,
-    /// The identity of the startup request while its answer is outstanding.
-    startup: Option<u64>,
+    /// Whether the startup report has been asked for and has not arrived.
+    starting: bool,
 }
 
 /// How far a rank's retirement has progressed.
@@ -468,16 +451,15 @@ pub(super) struct PendingRank {
     /// this value drops, as it does when the launch fails.
     child: PendingChild,
     rank: u32,
-    world_size: u32,
-    /// Channel sizing `adopt` passes to `Channel::set_capacity`.
+    /// Most requests outstanding at once on the rank.
     depth: usize,
-    /// Largest frame payload in bytes, in either direction.
+    /// Largest encoded message in bytes, which `adopt` sets as the bound of
+    /// what the head sends the rank.
     max_payload: usize,
     /// Moves by adoption alongside the process it cancels.
     startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The launch descriptor `adopt` answers the rank's registration with.
     descriptor: LaunchDescriptor,
-    components: std::collections::BTreeMap<String, crate::executor::ComponentConfig>,
 }
 
 /// The process of a launched rank that has not been adopted yet, when this
@@ -573,8 +555,7 @@ pub(crate) struct RankSockets {
 }
 
 impl PendingRank {
-    /// Spawns one rank, which connects to the head at `head` and registers
-    /// as a member of launch `generation`.
+    /// Spawns one rank, which connects to the head at `head` and registers.
     ///
     /// Nothing here waits for the rank. `rendezvous` is the group's
     /// collective store address, and `sockets.group` the socket this rank
@@ -600,19 +581,12 @@ impl PendingRank {
         remote: Option<&mut super::launcher::RemoteHost<'_>>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         head: &str,
-        generation: u64,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
         let max_payload = args.max_message_bytes.max(1);
         let world_size = args.world_size();
 
-        let mut cmd = uniserve_ipc::launch::rank_command(
-            &args.python,
-            head,
-            &args.worker_id,
-            rank,
-            generation,
-        );
+        let mut cmd = uniserve_ipc::launch::rank_command(&args.python, head, &args.worker_id, rank);
 
         // Torch and the numerical libraries read the host-relative pair; the
         // global pair names the rank's place in the whole process world.
@@ -652,7 +626,7 @@ impl PendingRank {
         // have used. The head derives both once, here, for either path.
         let child = match remote {
             Some(remote) => {
-                remote.deliver(rank, &args.python, &args.worker_id, generation, head, &cmd)?;
+                remote.deliver(rank, &args.python, &args.worker_id, head, &cmd)?;
                 None
             }
             None => Some(cmd.spawn().context("spawning the rank process")?),
@@ -661,18 +635,16 @@ impl PendingRank {
         Ok(Self {
             child: PendingChild(child),
             rank,
-            world_size,
             depth,
             max_payload,
             startup_abort,
             descriptor,
-            components: args.components.clone(),
         })
     }
 
     /// Fails by name when the rank exited before registering.
     ///
-    /// `Head::collect` calls this, through the `alive` callback `adopt_ranks`
+    /// `RankRegistry::collect` calls this, through the `alive` callback `adopt_ranks`
     /// passes it, while the launch is incomplete. Reaps the process when it
     /// has exited.
     pub(crate) fn check_alive(&mut self) -> anyhow::Result<()> {
@@ -701,12 +673,10 @@ impl PendingRank {
         let PendingRank {
             child,
             rank,
-            world_size,
             depth,
             max_payload,
             startup_abort,
             descriptor,
-            components,
         } = self;
 
         // The process stays owned by `child` until the answer is sent, so a
@@ -714,7 +684,7 @@ impl PendingRank {
         channel
             .send(&descriptor)
             .with_context(|| format!("sending rank {rank} its launch descriptor"))?;
-        channel.set_capacity(max_payload, depth);
+        channel.set_bound(max_payload);
         tracing::info!(rank, "a rank registered and received its launch descriptor");
 
         Ok(RankProcess {
@@ -724,13 +694,11 @@ impl PendingRank {
             child: child.release(),
             depth,
             rank,
-            world_size,
-            expected_components: components,
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_message_id: 1,
             retirement: Retirement::Serving,
-            startup: None,
+            starting: false,
         })
     }
 }
@@ -755,44 +723,30 @@ impl RankProcess {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
         request.set_call_id(Some(message_id));
-        self.send_request_with_timeout(&request, "Worker startup", WORKER_CONNECT_TIMEOUT)?;
-        self.startup = Some(message_id);
+        self.client.send(&request)?;
+        self.starting = true;
         Ok(())
     }
 
-    /// Takes the rank's startup report if it has arrived and checks it
-    /// against the launch. Returns whether the rank's startup is complete.
+    /// Takes the rank's startup report if it has arrived, as `info`. Returns
+    /// whether the rank's startup is complete.
     ///
-    /// The report must be valid, match the launched queue depth, rank, world
-    /// size, and components, and state the resolved model dtype and attention
-    /// backend. On success it becomes `info`; on failure `info` is
-    /// unchanged. Fails when the rank's connection has closed, which is how a
-    /// rank that died while starting is noticed.
+    /// Fails when the rank reports that its startup failed, and when its
+    /// connection has closed, which is how a rank that died while starting
+    /// is noticed.
     fn poll_startup(&mut self) -> anyhow::Result<bool> {
         let response = self
             .client
             .try_recv::<WorkerResponse>()
             .with_context(|| format!("rank {} was lost during startup", self.rank))?;
-        let Some(message_id) = self.startup else {
-            // A rank that is ready stays under watch until its peers are.
-            // Nothing is outstanding on it, so its connection is silent.
-            anyhow::ensure!(
-                response.is_none(),
-                "rank {} answered a request nobody sent during startup",
-                self.rank
-            );
+        // A rank that is ready stays under watch until its peers are: the
+        // receive above is what notices its connection closing.
+        if !self.starting {
             return Ok(true);
-        };
+        }
         let Some(response) = response else {
             return Ok(false);
         };
-
-        // Nothing else is outstanding during startup.
-        anyhow::ensure!(
-            response.message_id() == Some(message_id),
-            "worker answered startup under message identity {:?}, expected {message_id}",
-            response.message_id()
-        );
         let info = match response {
             WorkerResponse::Info { info, .. } => info,
             WorkerResponse::Error { error, .. } => {
@@ -807,39 +761,9 @@ impl RankProcess {
             other => bail!("unexpected startup response: {:?}", other.kind()),
         };
 
-        info.validate()
-            .context("worker reported invalid worker info during startup")?;
-        let host_depth = self.depth as u32;
-        anyhow::ensure!(
-            info.queue_depth == host_depth,
-            "worker queue_depth {} does not match launched depth {}",
-            info.queue_depth,
-            host_depth
-        );
-        anyhow::ensure!(
-            info.endpoint.rank == self.rank && info.world_size == self.world_size,
-            "worker process rank/world_size ({}/{}) does not match launched topology ({}/{})",
-            info.endpoint.rank,
-            info.world_size,
-            self.rank,
-            self.world_size
-        );
-        anyhow::ensure!(
-            info.components
-                .iter()
-                .map(|entry| (entry.name.clone(), entry.config.clone()))
-                .collect::<std::collections::BTreeMap<_, _>>()
-                == self.expected_components,
-            "worker resolved component configuration disagrees with configuration"
-        );
-        anyhow::ensure!(
-            !info.model_dtype.is_empty() && !info.attention_backend.is_empty(),
-            "worker omitted resolved numerical settings"
-        );
-
         self.check_worker("Worker startup")?;
         self.info = info;
-        self.startup = None;
+        self.starting = false;
         tracing::info!(?self.info, "worker ready");
         Ok(true)
     }
@@ -908,46 +832,14 @@ impl RankProcess {
         Ok(())
     }
 
-    /// Sends a request, waiting at most `WORKER_SEND_TIMEOUT` for room in
-    /// the send queue.
-    fn send_request_checked(&mut self, req: &WorkerRequest, context: &str) -> anyhow::Result<()> {
-        self.send_request_with_timeout(req, context, WORKER_SEND_TIMEOUT)
-    }
-
-    /// Submits a request before the deadline.
+    /// Drains ready responses and routes them into `ready`, and returns how
+    /// many were routed.
     ///
-    /// Retries while the send queue is full, checking liveness between
-    /// attempts. Wakes consumed by the wait between attempts are not reported
-    /// to the caller.
-    fn send_request_with_timeout(
-        &mut self,
-        req: &WorkerRequest,
-        context: &str,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.client.send(req) {
-                Ok(()) => return Ok(()),
-                Err(uniserve_ipc::IpcError::WouldBlock) => {}
-                Err(error) => return Err(error.into()),
-            }
-            self.check_worker(context)?;
-            if Instant::now() >= deadline {
-                bail!("worker channel accepted no request during {context}");
-            }
-            self.client.wait(Duration::from_millis(20))?;
-        }
-    }
-
-    /// Drains ready responses and routes them into `ready`.
-    ///
-    /// Returns how many responses were routed, and whether the rank's
-    /// connection has closed, which is its death. A transport, execution, or
-    /// routing error stops the scan and is returned; responses routed before
-    /// it stay in `ready`. The channel reports its close as an error only
-    /// after every response that arrived whole has been routed.
-    fn drain_ready(&mut self) -> anyhow::Result<(usize, bool)> {
+    /// A transport, execution, or routing error stops the scan and is
+    /// returned; responses routed before it stay in `ready`. The channel
+    /// reports its close, which is the rank's death, as an error only after
+    /// every response that arrived whole has been routed.
+    fn drain_ready(&mut self) -> anyhow::Result<usize> {
         let mut drained = 0usize;
         while let Some(response) = self.client.try_recv::<WorkerResponse>()? {
             // A response answers the request whose identity it states.
@@ -960,7 +852,7 @@ impl RankProcess {
             self.route(kind, response)?;
             drained += 1;
         }
-        Ok((drained, self.client.is_closed()))
+        Ok(drained)
     }
 
     /// Routes one batch response and appends its result to `ready`.
@@ -1029,8 +921,7 @@ impl RankProcess {
     /// Submits one physical run and records its outstanding message identity.
     ///
     /// Hands the batch back as `WouldBlock` when `depth` requests are already
-    /// outstanding or the send queue is full; the batch is not recorded as
-    /// pending then.
+    /// outstanding; the batch is not recorded as pending then.
     /// Fails when draining earlier responses or the send fails.
     pub(super) fn submit_batch(&mut self, batch: Batch) -> Result<(), BatchSubmitError> {
         // Answered requests free their slots before the depth check.
@@ -1042,16 +933,9 @@ impl RankProcess {
         let message_id = self.alloc_call_id();
         let mut req = WorkerRequest::submit(batch);
         req.set_call_id(Some(message_id));
-        match self.client.send(&req) {
-            Ok(()) => {}
-            Err(uniserve_ipc::IpcError::WouldBlock) => {
-                return Err(BatchSubmitError::WouldBlock(match req {
-                    WorkerRequest::Submit { batch, .. } => batch,
-                    _ => unreachable!(),
-                }));
-            }
-            Err(error) => return Err(BatchSubmitError::Failed(error.into())),
-        };
+        self.client
+            .send(&req)
+            .map_err(|error| BatchSubmitError::Failed(error.into()))?;
         self.pending
             .insert(message_id, OutstandingKind::Batch { batch_id });
         Ok(())
@@ -1071,20 +955,16 @@ impl RankProcess {
             if let Some(result) = self.ready.pop_front() {
                 return result.map(Some);
             }
-            let (_, death) = match self.drain_ready() {
-                Ok(progress) => progress,
-                Err(error) => {
-                    // Complete replies remain ahead of a trailing transport or
-                    // decoding error in the same drain.
-                    self.ready.push_back(Err(error));
-                    continue;
-                }
-            };
+            if let Err(error) = self.drain_ready() {
+                // Complete replies remain ahead of a trailing transport or
+                // decoding error in the same drain.
+                self.ready.push_back(Err(error));
+                continue;
+            }
             if !self.ready.is_empty() {
                 continue;
             }
             self.check_worker("executor poll")?;
-            anyhow::ensure!(!death, "worker rank channel disconnected");
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
@@ -1133,7 +1013,7 @@ impl RankProcess {
                     break;
                 }
                 match self.drain_ready() {
-                    Ok((0, _)) => {
+                    Ok(0) => {
                         if self.check_worker("shutdown drain").is_err() {
                             break;
                         }
@@ -1150,10 +1030,7 @@ impl RankProcess {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
                 req.set_call_id(Some(message_id));
-                acknowledgment = self
-                    .send_request_checked(&req, "shutdown")
-                    .ok()
-                    .map(|()| message_id);
+                acknowledgment = self.client.send(&req).ok().map(|()| message_id);
             }
         }
         self.retirement = Retirement::Closing { acknowledgment };
@@ -1405,7 +1282,7 @@ mod tests {
             let descriptor = args
                 .launch_descriptor(0, Some("127.0.0.1:29500"), Some(7), None)
                 .expect("descriptor");
-            let frame = uniserve_ipc::Frame::encode(&descriptor, 1 << 20).expect("a frame");
+            let frame = uniserve_ipc::Frame::encode(&descriptor).expect("a frame");
             let received: uniserve_ipc::LaunchDescriptor = frame.decode().expect("a descriptor");
             assert_eq!(received, descriptor);
         }

@@ -93,7 +93,7 @@ pub mod registration;
 
 pub use channel::{Channel, Listener, Wake};
 pub use error::{IpcError, IpcResult};
-pub use frame::{Frame, Message};
+pub use frame::Frame;
 pub use launch::{ExpertParallelDescriptor, LaunchDescriptor};
 pub use registration::{Registration, VERSION};
 
