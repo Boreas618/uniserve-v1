@@ -6,13 +6,11 @@
 use std::collections::HashMap;
 
 use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report, Reservation};
-use uniserve_ipc::{Frame, Message, Registration, VERSION};
+use uniserve_ipc::{Frame, Registration, VERSION};
 
 /// Returns `message` as a receiver decodes it from the frame a sender made.
-fn round_trip<M: Message>(message: &M) -> M {
-    let bound = 1 << 20;
-    let sent = Frame::encode(message, bound).unwrap().into_bytes();
-    Frame::from_bytes(sent, bound).unwrap().decode().unwrap()
+fn round_trip<M: serde::Serialize + serde::de::DeserializeOwned>(message: &M) -> M {
+    Frame::encode(message).unwrap().decode().unwrap()
 }
 
 #[test]
@@ -61,7 +59,6 @@ fn a_rank_and_a_launcher_register_with_the_same_first_frame() {
     let rank = Registration::Rank {
         worker_id: "model".into(),
         rank: 5,
-        generation: 2,
         version: VERSION.into(),
     };
     let launcher = Registration::Launcher {
@@ -72,11 +69,4 @@ fn a_rank_and_a_launcher_register_with_the_same_first_frame() {
         assert_eq!(round_trip(&registration), registration);
         assert_eq!(registration.version(), VERSION);
     }
-
-    // A registration that names nobody is refused before it is sent.
-    let nameless = Registration::Launcher {
-        host: String::new(),
-        version: VERSION.into(),
-    };
-    assert!(Frame::encode(&nameless, 1 << 20).is_err());
 }

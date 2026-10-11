@@ -28,23 +28,16 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
 use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report, Reservation};
 use uniserve_ipc::{Channel, IpcError, Registration, VERSION};
 
-/// Bounds connecting to the head and sending it one report.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Bounds how long a rank's exit waits to be reported: exit reporting must
 /// not depend on another instruction arriving.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Frames queued for a head that reads slowly; a launcher reports the exits
-/// of many ranks at once when a group fails.
-const REPORT_DEPTH: usize = 256;
 
 /// Spawns and supervises the ranks an instance places on this host.
 #[derive(Parser, Debug)]
@@ -84,9 +77,8 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    let mut head = Channel::connect(&args.head, HEAD_TIMEOUT)
+    let mut head = Channel::connect(&args.head)
         .with_context(|| format!("connecting to the head at {}", args.head))?;
-    head.set_capacity(uniserve_ipc::channel::INITIAL_BOUND, REPORT_DEPTH);
     head.send(&Registration::Launcher {
         host: args.host_identity.clone(),
         version: VERSION.to_owned(),
@@ -157,7 +149,8 @@ fn supervise(
                     listen_fd: listener.as_raw_fd(),
                 });
                 rendezvous.insert(worker_id, listener);
-                report(head, &reservation)?;
+                head.send(&reservation)
+                    .context("reporting a reservation to the head")?;
             }
             Instruction::Spawn(spawn) => {
                 // The group's first rank serves its store on the reserved
@@ -199,22 +192,6 @@ fn supervise(
     }
 }
 
-/// Sends the head one report, waiting while the send queue is full.
-fn report(head: &mut Channel, report: &Report) -> anyhow::Result<()> {
-    let deadline = Instant::now() + HEAD_TIMEOUT;
-    loop {
-        match head.send(report) {
-            Ok(()) => return Ok(()),
-            Err(IpcError::WouldBlock) => {}
-            Err(error) => return Err(error).context("reporting to the head"),
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        anyhow::ensure!(!remaining.is_zero(), "the head accepts no report");
-        head.wait(remaining)
-            .context("waiting to report to the head")?;
-    }
-}
-
 /// Starts one rank, which connects to the head and receives its launch
 /// descriptor there.
 ///
@@ -232,7 +209,6 @@ fn start_rank(
         &spawn.head,
         &spawn.worker_id,
         spawn.rank,
-        spawn.generation,
     );
     for (name, value) in &spawn.environment {
         command.env(name, value);
@@ -305,7 +281,8 @@ fn report_exits(head: &mut Channel, ranks: &mut HashMap<RankKey, Rank>) -> anyho
             rank,
             status: status.clone(),
         });
-        report(head, &exit)?;
+        head.send(&exit)
+            .context("reporting a rank exit to the head")?;
         tracing::warn!(worker = %worker_id, generation, rank, status = %status, "a rank exited");
     }
     Ok(())

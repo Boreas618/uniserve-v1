@@ -7,20 +7,9 @@ use std::time::{Duration, Instant};
 use uniserve_ipc::{Listener, Registration, VERSION};
 use uniserve_worker::launch::{Arguments, register};
 
-/// The command line of rank 3 of worker `text`, launch 2, for a head at
-/// `head`.
+/// The command line of rank 3 of worker `text`, for a head at `head`.
 fn arguments(head: &str) -> Arguments {
-    Arguments::parse(&[
-        "--head",
-        head,
-        "--worker-id",
-        "text",
-        "--rank",
-        "3",
-        "--generation",
-        "2",
-    ])
-    .unwrap()
+    Arguments::parse(&["--head", head, "--worker-id", "text", "--rank", "3"]).unwrap()
 }
 
 /// A rank waits for its launch descriptor for as long as the head keeps the
@@ -34,11 +23,14 @@ fn the_wait_for_the_descriptor_ends_when_the_head_closes() {
     let held = Duration::from_millis(500);
 
     let head = std::thread::spawn(move || {
-        let mut channel = listener
-            .accept(Duration::from_secs(30))
-            .unwrap()
-            .expect("the rank connects");
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut channel = loop {
+            if let Some(channel) = listener.try_accept().unwrap() {
+                break channel;
+            }
+            assert!(Instant::now() < deadline, "the rank did not connect");
+            std::thread::sleep(Duration::from_millis(5));
+        };
         let registration = loop {
             if let Some(registration) = channel.try_recv::<Registration>().unwrap() {
                 break registration;
@@ -65,7 +57,6 @@ fn the_wait_for_the_descriptor_ends_when_the_head_closes() {
         Registration::Rank {
             worker_id: "text".into(),
             rank: 3,
-            generation: 2,
             version: VERSION.into(),
         }
     );

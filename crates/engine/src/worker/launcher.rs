@@ -14,31 +14,22 @@
 //!
 //! The messages are `uniserve_ipc::launcher`'s, which the `uniserve-host`
 //! binary shares, carried as frames on the connection the launcher registered
-//! on (`head::Head`). A `Stop` ends a group's launch before the group is
-//! relaunched under the next generation. A launcher may report an exit of a
-//! stopped rank before it reads the `Stop`, and the head may read that report
-//! only after the relaunch, so an exit is attributed to a group only when it
-//! names the generation of the group's running launch.
+//! on (`registry::RankRegistry`). A `Stop` ends a group's generation before
+//! the group is relaunched under the next one. A launcher may report an exit
+//! of a stopped rank before it reads the `Stop`, and the head may read that
+//! report only after the relaunch, so an exit is attributed to a group only
+//! when it names the group's current generation.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use uniserve_ipc::Channel;
 use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report};
-use uniserve_ipc::{Channel, IpcError};
 
-/// Longest a launcher may take to accept an instruction or to answer a
-/// reservation.
-const LAUNCHER_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Longest the head waits, when it stops, for a launcher to take the
-/// instructions still queued for it.
-const TERMINATE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Frames queued for a launcher that reads slowly; a group's launch sends
-/// one instruction per rank without waiting for the launcher in between.
-const INSTRUCTION_DEPTH: usize = 256;
+/// Longest a launcher may take to answer a reservation.
+const RESERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The registry of one deployment, shared by every group that places a rank
 /// on another host.
@@ -58,34 +49,16 @@ struct Launcher {
     channel: Channel,
 }
 
-impl Launcher {
-    /// Sends one instruction, waiting while the send queue is full.
-    fn send(&mut self, instruction: &Instruction) -> anyhow::Result<()> {
-        let deadline = Instant::now() + LAUNCHER_TIMEOUT;
-        loop {
-            match self.channel.send(instruction) {
-                Ok(()) => return Ok(()),
-                Err(IpcError::WouldBlock) => {}
-                Err(error) => return Err(error.into()),
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            anyhow::ensure!(!remaining.is_zero(), "the launcher accepts no instruction");
-            self.channel.wait(remaining)?;
-        }
-    }
-}
-
 /// Rank exits read from the launchers and not yet taken, and the generation
-/// of each worker group's running launch.
+/// each worker group is launched under.
 ///
 /// A launcher reports every group's ranks on one connection, and each group
 /// takes its own. Only exits of a group's current generation are kept, so a
 /// report of a rank a stop ended is never attributed to its relaunch.
 #[derive(Default)]
 struct ExitReports {
-    /// The generation of each group's running launch. A group absent here
-    /// has no launch whose exits are of interest: none has been sent to a
-    /// launcher, or a stop has ended the last one.
+    /// Each group's current generation; a group absent here has never been
+    /// stopped and is in generation zero.
     generations: HashMap<String, u64>,
     /// Exits of each group's current generation, with the host that
     /// reported each, by worker group.
@@ -93,16 +66,15 @@ struct ExitReports {
 }
 
 impl ExitReports {
-    /// Records the generation of the launch of `worker_id` being sent to
-    /// the launchers.
-    fn begin_generation(&mut self, worker_id: &str, generation: u64) {
-        self.generations.insert(worker_id.to_owned(), generation);
+    /// Returns the generation `worker_id`'s launches currently carry.
+    fn generation(&self, worker_id: &str) -> u64 {
+        self.generations.get(worker_id).copied().unwrap_or(0)
     }
 
     /// Keeps one exit a launcher on `host` reported for its group, or
     /// discards it when it names a generation a stop has ended.
     fn file(&mut self, host: &str, exit: RankExit) {
-        if self.generations.get(&exit.worker_id) != Some(&exit.generation) {
+        if exit.generation != self.generation(&exit.worker_id) {
             tracing::debug!(
                 host,
                 worker = %exit.worker_id,
@@ -126,7 +98,7 @@ impl ExitReports {
     /// Ends `worker_id`'s current generation: its kept exits are discarded,
     /// as is every exit of that generation read later.
     fn end_generation(&mut self, worker_id: &str) {
-        self.generations.remove(worker_id);
+        *self.generations.entry(worker_id.to_owned()).or_default() += 1;
         self.reported.remove(worker_id);
     }
 }
@@ -147,7 +119,7 @@ impl LauncherRegistry {
     /// other host any of the placements names. A deployment placing every
     /// rank on this host needs no registry.
     pub(crate) fn for_hosts(
-        head: &super::head::SharedHead,
+        registry: &super::registry::Registry,
         host: &str,
         placements: impl IntoIterator<Item = impl AsRef<[crate::WorkerRank]>>,
         timeout: Duration,
@@ -169,17 +141,17 @@ impl LauncherRegistry {
             return Ok(None);
         }
 
-        let mut registry = Self {
+        let mut launchers = Self {
             hosts: HashMap::new(),
             exits: ExitReports::default(),
         };
         tracing::info!(
-            address = super::head::lock(head)?.tcp_address(),
+            address = super::registry::lock(registry)?.tcp_address(),
             hosts = ?remote_hosts,
             "awaiting a launcher for each host this instance does not run on"
         );
-        registry.await_hosts(head, &remote_hosts, timeout)?;
-        Ok(Some(Arc::new(Mutex::new(registry))))
+        launchers.await_hosts(registry, &remote_hosts, timeout)?;
+        Ok(Some(Arc::new(Mutex::new(launchers))))
     }
 
     /// Returns a host address of this machine that a launcher reached it at.
@@ -203,23 +175,22 @@ impl LauncherRegistry {
             .ip())
     }
 
-    /// Waits until every named host has registered a launcher with `head`.
+    /// Waits until every named host has registered a launcher.
     ///
     /// A host that never registers fails the launch by name rather than
     /// leaving the instance waiting for ranks that were never started. A
     /// launcher of another build than the head's fails the wait by name.
     pub(crate) fn await_hosts(
         &mut self,
-        head: &super::head::SharedHead,
+        registry: &super::registry::Registry,
         hosts: &[String],
         timeout: Duration,
     ) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            let mut head = super::head::lock(head)?;
-            for (host, mut channel) in head.take_launchers(hosts)? {
+            let mut head = super::registry::lock(registry)?;
+            for (host, channel) in head.take_launchers()? {
                 tracing::info!(host = %host, "a launcher presented its host");
-                channel.set_capacity(uniserve_ipc::channel::INITIAL_BOUND, INSTRUCTION_DEPTH);
                 self.hosts.insert(host, Launcher { channel });
             }
             let Some(missing) = hosts.iter().find(|host| !self.hosts.contains_key(*host)) else {
@@ -245,7 +216,7 @@ impl LauncherRegistry {
         &mut self,
         host: &str,
         worker_id: &str,
-    ) -> anyhow::Result<super::head::Rendezvous> {
+    ) -> anyhow::Result<super::rendezvous::Rendezvous> {
         let launcher = self
             .hosts
             .get_mut(host)
@@ -255,13 +226,13 @@ impl LauncherRegistry {
             .peer_addr()?
             .context("a launcher reached the head over a Unix socket")?
             .ip();
-        launcher.send(&Instruction::Reserve {
+        launcher.channel.send(&Instruction::Reserve {
             worker_id: worker_id.to_owned(),
         })?;
 
         // The launcher may report rank exits before it answers; those are
         // kept for their groups and the wait continues until the reply.
-        let deadline = Instant::now() + LAUNCHER_TIMEOUT;
+        let deadline = Instant::now() + RESERVATION_TIMEOUT;
         loop {
             match launcher.channel.try_recv::<Report>() {
                 Ok(Some(Report::Reservation(reservation))) => {
@@ -269,7 +240,7 @@ impl LauncherRegistry {
                         reservation.worker_id == worker_id && reservation.port > 0,
                         "invalid rendezvous reservation"
                     );
-                    return Ok(super::head::Rendezvous {
+                    return Ok(super::rendezvous::Rendezvous {
                         address: std::net::SocketAddr::new(address, reservation.port).to_string(),
                         listener: None,
                         listen_fd: Some(reservation.listen_fd),
@@ -291,16 +262,22 @@ impl LauncherRegistry {
         }
     }
 
-    /// Sends one rank's launch to the launcher that owns its host, and takes
-    /// the launch's generation as the one whose exits belong to its group.
-    pub(crate) fn spawn_remote(&mut self, host: &str, spawn: RankSpawn) -> anyhow::Result<()> {
-        self.exits
-            .begin_generation(&spawn.worker_id, spawn.generation);
+    /// Sends one rank's launch to the launcher that owns its host. `launch`
+    /// states the rank's spawn for the generation `worker_id`'s launches
+    /// currently carry, which only the registry knows.
+    pub(crate) fn spawn_remote(
+        &mut self,
+        host: &str,
+        worker_id: &str,
+        launch: impl FnOnce(u64) -> RankSpawn,
+    ) -> anyhow::Result<()> {
+        let spawn = launch(self.exits.generation(worker_id));
         let launcher = self
             .hosts
             .get_mut(host)
             .with_context(|| format!("no launcher presented host {host}"))?;
         launcher
+            .channel
             .send(&Instruction::Spawn(Box::new(spawn)))
             .with_context(|| format!("sending a launch to host {host}"))
     }
@@ -326,7 +303,7 @@ impl LauncherRegistry {
     /// Stops one worker group's ranks on every launcher, ahead of relaunching
     /// the group; the launchers stay connected for the other groups.
     ///
-    /// The group's launch ends first, even if a stop cannot be sent: its
+    /// The group's generation ends first, even if a stop cannot be sent: its
     /// exits already collected are discarded, and so is any exit of the
     /// stopped ranks read later, including one a launcher wrote before it
     /// read the stop. The launcher drops the stopped ranks from its
@@ -339,6 +316,7 @@ impl LauncherRegistry {
         };
         for (host, launcher) in self.hosts.iter_mut() {
             launcher
+                .channel
                 .send(&stop)
                 .with_context(|| format!("sending a worker stop to host {host}"))?;
         }
@@ -354,13 +332,7 @@ impl Drop for LauncherRegistry {
     /// close does the work either way.
     fn drop(&mut self) {
         for (host, launcher) in self.hosts.iter_mut() {
-            // Dropping the channel discards what is still queued, so the
-            // instruction is written out first, within a short bound.
-            let sent = launcher
-                .channel
-                .send(&Instruction::Terminate)
-                .and_then(|()| launcher.channel.flush(TERMINATE_FLUSH_TIMEOUT));
-            if sent.is_err() {
+            if launcher.channel.send(&Instruction::Terminate).is_err() {
                 tracing::debug!(host = %host, "a launcher was already gone at shutdown");
             }
         }
@@ -378,14 +350,13 @@ pub(crate) struct RemoteHost<'a> {
 }
 
 impl RemoteHost<'_> {
-    /// Sends one rank's launch to this host's launcher: a member of launch
-    /// `generation` of its group, which connects to the head at `head`.
+    /// Sends one rank's launch to this host's launcher. The rank connects to
+    /// the head at `head`.
     pub(crate) fn deliver(
         &mut self,
         rank: u32,
         python: &std::path::Path,
         worker_id: &str,
-        generation: u64,
         head: &str,
         command: &std::process::Command,
     ) -> anyhow::Result<()> {
@@ -408,32 +379,29 @@ impl RemoteHost<'_> {
             .registry
             .lock()
             .map_err(|_| anyhow::anyhow!("the launcher registry is poisoned"))?;
-        registry.spawn_remote(
-            self.host,
-            RankSpawn {
-                rank,
-                worker_id: worker_id.to_owned(),
-                generation,
-                python: python.to_owned(),
-                head: head.to_owned(),
-                environment,
-            },
-        )
+        registry.spawn_remote(self.host, worker_id, |generation| RankSpawn {
+            rank,
+            worker_id: worker_id.to_owned(),
+            generation,
+            python: python.to_owned(),
+            head: head.to_owned(),
+            environment,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{LauncherRegistry, RankSpawn};
-    use crate::worker::head::{Head, SharedHead, lock};
+    use crate::worker::registry::{RankRegistry, Registry, lock};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
     use uniserve_ipc::launcher::{Instruction, RankExit, Report};
-    use uniserve_ipc::{Channel, Message, Registration, VERSION};
+    use uniserve_ipc::{Channel, Registration, VERSION};
 
     /// Binds a head and connects a launcher of host `b` to its TCP port.
-    fn head_and_launcher() -> (SharedHead, Channel) {
-        let head = Head::bind(true).expect("the head binds");
+    fn head_and_launcher() -> (Registry, Channel) {
+        let head = RankRegistry::bind(true).expect("the head binds");
         let port = lock(&head)
             .expect("the head locks")
             .tcp_address()
@@ -441,8 +409,8 @@ mod tests {
             .expect("a port")
             .1
             .to_owned();
-        let mut launcher = Channel::connect(&format!("127.0.0.1:{port}"), Duration::from_secs(5))
-            .expect("the launcher connects");
+        let mut launcher =
+            Channel::connect(&format!("127.0.0.1:{port}")).expect("the launcher connects");
         launcher
             .send(&Registration::Launcher {
                 host: "b".into(),
@@ -453,7 +421,7 @@ mod tests {
     }
 
     /// A registry in which host `b` has presented.
-    fn registry(head: &SharedHead) -> LauncherRegistry {
+    fn registry(head: &Registry) -> LauncherRegistry {
         LauncherRegistry::for_hosts(
             head,
             "a",
@@ -470,7 +438,7 @@ mod tests {
     }
 
     /// Waits for the launcher's next message from the head.
-    fn receive<M: Message>(launcher: &mut Channel) -> M {
+    fn receive<M: serde::de::DeserializeOwned>(launcher: &mut Channel) -> M {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(message) = launcher.try_recv().expect("the head is connected") {
@@ -483,16 +451,18 @@ mod tests {
         }
     }
 
-    /// One rank's launch on host `b`, as the head sends it.
-    fn spawn(worker_id: &str, rank: u32, generation: u64) -> RankSpawn {
-        RankSpawn {
-            rank,
-            worker_id: worker_id.to_owned(),
-            generation,
-            python: "python3".to_owned(),
-            head: "127.0.0.1:1".to_owned(),
-            environment: HashMap::new(),
-        }
+    /// Launches one rank of `worker_id` on host `b`.
+    fn spawn(registry: &mut LauncherRegistry, worker_id: &str, rank: u32) {
+        registry
+            .spawn_remote("b", worker_id, |generation| RankSpawn {
+                rank,
+                worker_id: worker_id.to_owned(),
+                generation,
+                python: "python3".to_owned(),
+                head: "127.0.0.1:1".to_owned(),
+                environment: HashMap::new(),
+            })
+            .expect("the rank is launched");
     }
 
     /// An exit of the rank `spawn` launched.
@@ -528,9 +498,7 @@ mod tests {
 
         // Both ranks are launched, and then both exit.
         for (worker, rank) in [("model", 5), ("host", 1)] {
-            registry
-                .spawn_remote("b", spawn(worker, rank, 1))
-                .expect("the rank is launched");
+            spawn(&mut registry, worker, rank);
         }
         for status in ["exit status: 1", "exit status: 2"] {
             let Instruction::Spawn(launched) = receive(&mut launcher) else {
@@ -565,7 +533,7 @@ mod tests {
         );
     }
 
-    /// A stop ends a group's launch: an exit its launcher reported for a
+    /// A stop ends a group's generation: an exit its launcher reported for a
     /// stopped rank before reading the stop, and which the head has not read
     /// when it relaunches the group, is not attributed to the relaunch,
     /// while an exit of a relaunched rank is.
@@ -575,9 +543,7 @@ mod tests {
         let mut registry = registry(&head);
 
         // The failed rank's exit is written before the stop is read.
-        registry
-            .spawn_remote("b", spawn("model", 5, 1))
-            .expect("the rank is launched");
+        spawn(&mut registry, "model", 5);
         let Instruction::Spawn(failed) = receive(&mut launcher) else {
             panic!("the head launches a rank");
         };
@@ -586,9 +552,7 @@ mod tests {
             .expect("the launcher reports the failed rank");
 
         registry.stop_worker("model").expect("the stop is sent");
-        registry
-            .spawn_remote("b", spawn("model", 5, 2))
-            .expect("the rank is relaunched");
+        spawn(&mut registry, "model", 5);
         assert_eq!(
             receive::<Instruction>(&mut launcher),
             Instruction::Stop {

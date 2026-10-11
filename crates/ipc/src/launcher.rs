@@ -22,9 +22,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ValidationResult;
-use crate::frame::Message;
-
 /// One instruction the head sends a launcher.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,26 +63,12 @@ pub struct RankSpawn {
     pub environment: HashMap<String, String>,
 }
 
-impl Message for Instruction {
-    /// An instruction carries values the launcher acts on as given.
-    fn validate(&self) -> ValidationResult<()> {
-        Ok(())
-    }
-}
-
 /// One message a launcher sends after its registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Report {
     Reservation(Reservation),
     Exit(RankExit),
-}
-
-impl Message for Report {
-    /// A report states what the launcher observed; the head attributes it.
-    fn validate(&self) -> ValidationResult<()> {
-        Ok(())
-    }
 }
 
 /// A launcher's answer to [`Instruction::Reserve`].
