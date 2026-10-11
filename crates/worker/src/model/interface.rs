@@ -15,12 +15,6 @@ use crate::{Error, Result};
 
 /// Startup and lifecycle entries of the interface table.
 pub struct Interface {
-    /// Read the checkpoint configuration and describe the meta skeleton.
-    pub describe: Function,
-    /// Narrow the checkpoint to this rank's modules and weight choices.
-    pub resolve: Function,
-    /// Materialize this rank's modules on their meshes.
-    pub load: Function,
     /// Model-derived quantities for capacity, reporting and warmup.
     pub facts: Function,
     /// Declare a component call set's workspace requirements.
@@ -64,9 +58,6 @@ impl Interface {
             })
         };
         Ok(Self {
-            describe: require("model.describe")?,
-            resolve: require("model.resolve")?,
-            load: require("model.load")?,
             facts: require("model.facts")?,
             prepare: require("component.prepare")?,
             bind: require("component.bind")?,
