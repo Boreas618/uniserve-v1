@@ -40,7 +40,7 @@ use crate::executor::lifecycle::RequestStorage;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{
-    CausalLMRunner, Executed, RowSource, Staged, StepContext, StepRequest, TokenRow,
+    CausalLMRunner, Executed, PromptChunks, RowSource, Staged, StepContext, StepRequest, TokenRow,
 };
 use crate::storage::{BlockTables, KVCacheManager, OutputPool, UnitColumn};
 use crate::transfer::Retirement;
@@ -325,12 +325,13 @@ impl CausalLMRunners {
         self.order.wait(stream.as_ref())?;
 
         // The lane's runner evaluates every prefix.
+        let prompt = PromptChunks::default();
         let mut requests: Vec<Option<StepRequest<'_>>> = vec![Some(StepRequest {
             mode: ForwardMode::Prefill,
             rows: &rows,
             finish_ids: &[],
             sampling: None,
-            prompt: &[],
+            prompt: &prompt,
             embeddings: &[],
         })];
         requests.resize_with(self.groups[group].len(), || None);

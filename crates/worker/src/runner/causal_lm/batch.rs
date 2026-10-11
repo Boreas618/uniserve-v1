@@ -57,7 +57,7 @@ pub(super) struct Batch<'a> {
     pub(super) plan: &'a BatchPlan,
     /// The runner group serving the batch.
     pub(super) group: usize,
-    /// The rank's expert runtime, when its forwards are expert steps.
+    /// The rank's expert union, when its forwards are expert steps.
     pub(super) experts: Option<&'a crate::parallel::ExpertUnion>,
     /// The group's lane stream.
     pub(super) stream: Option<Stream>,

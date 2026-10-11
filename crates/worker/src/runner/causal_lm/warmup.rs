@@ -27,7 +27,7 @@ use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
-use crate::runner::causal_lm::{COMMIT_CACHE, RowSource, StepRequest, TokenRow};
+use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
 use crate::storage::KVCache;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
@@ -285,6 +285,7 @@ fn step(
     capacity: Option<usize>,
 ) -> Result<()> {
     let (tables, cache) = kv.split();
+    let prompt = PromptChunks::default();
     let request = StepRequest {
         mode: if decode {
             ForwardMode::Decode
@@ -294,7 +295,7 @@ fn step(
         rows,
         finish_ids: &[],
         sampling: None,
-        prompt: &[],
+        prompt: &prompt,
         embeddings: &[],
     };
     let mut requests: Vec<Option<StepRequest<'_>>> =

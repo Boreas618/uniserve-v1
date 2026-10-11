@@ -1,6 +1,6 @@
 """Batched token selection, speculative acceptance and terminal decisions.
 
-Tasks are sampled calls; each owns one or more candidate logits rows (a
+A task is one sampled call; it owns one or more candidate logits rows (a
 verification task owns one row per draft token plus its bonus row). The
 selectors take the tasks of one homogeneous group:
 
@@ -17,6 +17,14 @@ Every selector then resolves predicates, finish and transition decisions as
 device tensors. With a ``broadcast``, tensor-parallel ranks replace their
 selection with the source rank's before those decisions, so every rank
 commits identical state.
+
+Per-row values (temperature, cutoffs, penalty strengths, draws) are tensor
+columns. What a caller knows on the host arrives as flat integer lists:
+which rows take a shaping stage, and token sets as scatter indices
+``row * vocab + token`` into the group's ``[rows, vocab]`` logits, with
+out-of-vocabulary and repeated tokens already removed. Per-task token sets
+(finish and transition tokens) are row-major ``[tasks, width]`` matrices
+padded with -1.
 """
 
 from __future__ import annotations
@@ -39,54 +47,6 @@ TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 TEMPERATURE, TOP_P, MIN_P, TYPICAL_P = 0, 1, 2, 3
 REPETITION, FREQUENCY, PRESENCE = 4, 5, 6
 PARAMETER_COLUMNS = 8
-
-
-@dataclass(frozen=True, slots=True)
-class Task:
-    """One sampled call's host controls.
-
-    Attributes:
-        row: First candidate row in the step's logits.
-        rows: Candidate rows: drafts plus the bonus row.
-        slot: Request slot (penalty counts row).
-        force_finish: Grammar state forcing termination.
-        return_transition: The call publishes a transition decision.
-        tagged: The call is gated by its request's continuation flag.
-        penalties: Repetition, frequency or presence penalties apply.
-        top_k: Top-k width, zero when disabled.
-        top_p: A nucleus cutoff below one applies.
-        min_p: A minimum-probability cutoff applies.
-        typical_p: A typical-probability cutoff below one applies.
-        finish_ids: Terminal tokens, sorted and deduplicated.
-        transition_ids: Tokens that select a transition.
-        suppress: Tokens masked from selection.
-        logit_bias: ``(token, bias)`` additive offsets.
-        logprobs: What the call reports, or ``None``.
-        drafts: Draft tokens a verification compares row by row.
-        terminal_prefix: One-based length of the draft prefix ending at the
-            first terminal draft token, or ``None``.
-        allowed: Per candidate row, the only selectable tokens, or ``None``.
-    """
-
-    row: int
-    rows: int
-    slot: int
-    force_finish: bool = False
-    return_transition: bool = False
-    tagged: bool = False
-    penalties: bool = False
-    top_k: int = 0
-    top_p: bool = False
-    min_p: bool = False
-    typical_p: bool = False
-    finish_ids: tuple[int, ...] = ()
-    transition_ids: tuple[int, ...] = ()
-    suppress: tuple[int, ...] = ()
-    logit_bias: tuple[tuple[int, float], ...] = ()
-    logprobs: LogprobRequest | None = None
-    drafts: tuple[int, ...] = ()
-    terminal_prefix: int | None = None
-    allowed: tuple[tuple[int, ...] | None, ...] = (None,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,48 +85,42 @@ class Selection:
 Broadcast = Callable[[torch.Tensor], object] | None
 
 
-def _member(
-    tokens: torch.Tensor, sets: Sequence[tuple[int, ...]]
-) -> torch.Tensor:
-    """Whether each task's token is in its own token set."""
-    first = sets[0]
-    if all(values == first for values in sets[1:]):
-        # One shared set: a vectorized comparison per member.
-        matched = torch.zeros_like(tokens, dtype=torch.bool)
-        for token in first:
-            matched |= tokens == token
-        return matched
-    # Mixed sets: a padded matrix with -1 as the non-token sentinel.
-    width = max(1, *(len(values) for values in sets))
-    padded = torch.tensor(
-        [(*values, *((-1,) * (width - len(values)))) for values in sets],
-        dtype=tokens.dtype,
-        device=tokens.device,
-    )
-    return tokens.unsqueeze(1).eq(padded).any(dim=1)
+def _index(values: Sequence[int], device: torch.device) -> torch.Tensor:
+    return torch.tensor(list(values), dtype=torch.long, device=device)
+
+
+def _member(tokens: torch.Tensor, ids: Sequence[int]) -> torch.Tensor:
+    """Whether each task's token is in its row of ``ids``."""
+    sets = torch.tensor(
+        list(ids), dtype=tokens.dtype, device=tokens.device
+    ).view(int(tokens.numel()), -1)
+    return tokens.unsqueeze(1).eq(sets).any(dim=1)
 
 
 def decisions(
-    tasks: Sequence[Task],
     tokens: torch.Tensor,
     valid: torch.Tensor,
     active: torch.Tensor,
+    force_finish: Sequence[int],
+    finish_ids: Sequence[int],
+    transition_ids: Sequence[int],
     terminal: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Finish, continuation, tagged token and transition per task.
 
     A task finishes when it is valid and active and either forced to
-    finish, its token is in its finish set, or it accepted a terminal draft
-    prefix. It continues when valid, active and not finished. A transition
-    requires a valid, active selection in the task's transition set.
+    finish (``force_finish``, one flag per task), its token is in its row
+    of ``finish_ids``, or it accepted a terminal draft prefix. It continues
+    when valid, active and not finished. A transition requires a valid,
+    active selection in the task's row of ``transition_ids``; a task
+    without a transition output has an empty row. Both matrices are
+    row-major ``[tasks, width]`` with at least one column, padded with -1.
     """
     eligible = valid & active
     forced = torch.tensor(
-        [task.force_finish for task in tasks],
-        dtype=torch.bool,
-        device=tokens.device,
-    )
-    finish = forced | _member(tokens, [task.finish_ids for task in tasks])
+        list(force_finish), dtype=torch.long, device=tokens.device
+    ).bool()
+    finish = forced | _member(tokens, finish_ids)
     if terminal is not None:
         finish = finish | terminal
     finish = finish & eligible
@@ -174,16 +128,7 @@ def decisions(
     tagged = tokens.to(torch.int64) | torch.where(
         continuation, TOKEN_CONTINUATION_BIT, 0
     )
-    participates = torch.tensor(
-        [task.return_transition for task in tasks],
-        dtype=torch.bool,
-        device=tokens.device,
-    )
-    transition = (
-        _member(tokens, [task.transition_ids for task in tasks])
-        & participates
-        & eligible
-    )
+    transition = _member(tokens, transition_ids) & eligible
     return finish, continuation, tagged, transition
 
 
@@ -197,32 +142,32 @@ def _valid(work: torch.Tensor) -> torch.Tensor:
 
 
 def select_greedy(
-    tasks: Sequence[Task],
     logits: torch.Tensor,
     active: torch.Tensor,
     *,
-    suppress: bool,
+    suppressed: Sequence[int],
+    force_finish: Sequence[int],
+    finish_ids: Sequence[int],
+    transition_ids: Sequence[int],
     broadcast: Broadcast = None,
 ) -> Selection:
     """Argmax of each task's single ``[tasks, vocab]`` logits row.
 
-    With ``suppress``, each task's suppressed ids are masked on a float32
-    copy before the argmax.
+    ``suppressed`` scatter indices are masked on a float32 copy before the
+    argmax.
     """
     work = logits
-    if suppress:
+    if len(suppressed):
         work = logits.to(dtype=torch.float32, copy=True)
-        vocab = int(work.shape[1])
-        for row, task in enumerate(tasks):
-            for token in dict.fromkeys(task.suppress):
-                if 0 <= token < vocab:
-                    work[row, token].fill_(float("-inf"))
+        work.reshape(-1).index_fill_(
+            0, _index(suppressed, work.device), float("-inf")
+        )
     tokens = torch.argmax(work, dim=-1)
     valid = _valid(work)
     if broadcast is not None:
         broadcast(tokens)
     finish, continuation, tagged, transition = decisions(
-        tasks, tokens, valid, active
+        tokens, valid, active, force_finish, finish_ids, transition_ids
     )
     zeros = torch.zeros_like(tokens)
     return Selection(
@@ -239,19 +184,26 @@ def select_greedy(
 
 
 def select_top_k(
-    tasks: Sequence[Task],
     logits: torch.Tensor,
     draws: torch.Tensor,
     params: torch.Tensor,
     active: torch.Tensor,
     top_k: int,
     *,
+    min_p_rows: Sequence[int],
+    logprob_tasks: Sequence[int],
+    logprob_requests: Sequence[LogprobRequest],
+    force_finish: Sequence[int],
+    finish_ids: Sequence[int],
+    transition_ids: Sequence[int],
     broadcast: Broadcast = None,
 ) -> Selection:
     """Sample a group sharing one top-k width with the compiled kernel.
 
-    Logprobs, when any task requests them, are scored from the general
-    shaping path while the kernel's tokens are kept.
+    Logprobs, when a task requests them (``logprob_tasks``, with one of
+    ``logprob_requests`` each), are scored from the general shaping path
+    while the kernel's tokens are kept; ``min_p_rows`` names the rows with a
+    minimum-probability cutoff for that path.
     """
     tokens, valid = sample_top_k(
         logits, draws, params[:, [TEMPERATURE, TOP_P, MIN_P]], int(top_k)
@@ -259,18 +211,24 @@ def select_top_k(
     if broadcast is not None:
         broadcast(tokens)
     finish, continuation, tagged, transition = decisions(
-        tasks, tokens, valid, active
+        tokens, valid, active, force_finish, finish_ids, transition_ids
     )
     packed = None
-    if any(task.logprobs is not None for task in tasks):
+    if len(logprob_tasks):
         # Observations do not select another numerical sampler: even draws
         # at a floating-point CDF boundary keep the kernel's chosen token.
-        work, _ = shape_logits(logits, params, _rows(tasks), None)
+        work, _ = shape_logits(
+            logits,
+            params,
+            top_ks=[int(top_k)] * int(logits.shape[0]),
+            min_p_rows=min_p_rows,
+        )
         packed = _logprobs(
             work,
-            torch.arange(len(tasks), device=tokens.device),
+            torch.arange(int(tokens.numel()), device=tokens.device),
             tokens,
-            tasks,
+            logprob_tasks,
+            logprob_requests,
         )
     zeros = torch.zeros_like(tokens)
     return Selection(
@@ -287,51 +245,60 @@ def select_top_k(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _Row:
-    """Shaping controls of one candidate row."""
-
-    task: Task
-    allowed: tuple[int, ...] | None
-
-
-def _rows(tasks: Sequence[Task]) -> list[_Row]:
-    return [_Row(task, allowed) for task in tasks for allowed in task.allowed]
-
-
 def _logprobs(
     work: torch.Tensor,
     rows: torch.Tensor,
     tokens: torch.Tensor,
-    tasks: Sequence[Task],
+    logprob_tasks: Sequence[int],
+    logprob_requests: Sequence[LogprobRequest],
 ) -> torch.Tensor:
-    requesting = [
-        index for index, task in enumerate(tasks) if task.logprobs is not None
-    ]
-    selected = torch.tensor(requesting, dtype=torch.long, device=work.device)
+    selected = _index(logprob_tasks, work.device)
     return logprob_details(
         work,
         rows.index_select(0, selected),
         tokens.index_select(0, selected),
-        [task.logprobs for task in tasks if task.logprobs is not None],
+        logprob_requests,
     )
 
 
 def select_categorical(
-    tasks: Sequence[Task],
     logits: torch.Tensor,
     draws: torch.Tensor,
     params: torch.Tensor,
     active: torch.Tensor,
-    penalty_counts: Sequence[torch.Tensor | None],
     *,
+    row_counts: Sequence[int],
+    drafts: Sequence[int],
+    terminal_prefixes: Sequence[int],
+    top_ks: Sequence[int],
+    top_p_rows: Sequence[int],
+    min_p_rows: Sequence[int],
+    typical_p_rows: Sequence[int],
+    allowed_rows: Sequence[int],
+    allowed: Sequence[int],
+    suppressed: Sequence[int],
+    penalty_rows: Sequence[int],
+    penalty_counts: torch.Tensor | None,
+    bias: Sequence[int],
+    bias_values: Sequence[float],
+    logprob_tasks: Sequence[int],
+    logprob_requests: Sequence[LogprobRequest],
+    force_finish: Sequence[int],
+    finish_ids: Sequence[int],
+    transition_ids: Sequence[int],
     broadcast: Broadcast = None,
 ) -> Selection:
     """Sample tasks through the general shaping path.
 
-    ``logits`` holds every task's candidate rows back to back, ``draws`` and
-    ``params`` one entry per candidate row and ``penalty_counts`` each
-    row's token counts (``None`` without penalties).
+    ``logits`` holds every task's candidate rows back to back
+    (``row_counts`` rows per task), ``draws`` and ``params`` one entry per
+    candidate row. ``drafts`` concatenates the tasks' draft tokens, one
+    fewer than each task's rows, and ``terminal_prefixes`` holds per task
+    the one-based length of its draft prefix ending at the first terminal
+    draft token, or zero. The shaping arguments are those of
+    :func:`shape_logits`, the decision arguments those of
+    :func:`decisions`, and ``logprob_tasks`` names the tasks reporting one
+    of ``logprob_requests`` each.
 
     Speculative tasks accept the longest prefix where row ``i``'s selection
     equals draft ``i``. Without a terminal prefix, the output row is the
@@ -341,9 +308,20 @@ def select_categorical(
     selection, so the emitted-token count adds no extra token.
     """
     device = logits.device
-    rows = _rows(tasks)
     work, valid = shape_logits(
-        logits.float(), params, rows, list(penalty_counts)
+        logits.float(),
+        params,
+        top_ks=top_ks,
+        top_p_rows=top_p_rows,
+        min_p_rows=min_p_rows,
+        typical_p_rows=typical_p_rows,
+        allowed_rows=allowed_rows,
+        allowed=allowed,
+        suppressed=suppressed,
+        penalty_rows=penalty_rows,
+        penalty_counts=penalty_counts,
+        bias=bias,
+        bias_values=bias_values,
     )
 
     # Temperature-zero rows use deterministic argmax; the others invert the
@@ -355,31 +333,36 @@ def select_categorical(
         params[:, TEMPERATURE] > 0.0, sampled, torch.argmax(work, dim=-1)
     )
 
-    offsets = []
-    offset = 0
-    for task in tasks:
+    counts = [int(count) for count in row_counts]
+    offsets, drafted = [], []
+    offset = taken = 0
+    for count in counts:
         offsets.append(offset)
-        offset += task.rows
+        drafted.append(
+            tuple(int(token) for token in drafts[taken : taken + count - 1])
+        )
+        offset += count
+        taken += count - 1
     accepted_counts, point_counts, terminals = [], [], []
     output_rows, terminal_tokens = [], []
-    for task, first in zip(tasks, offsets, strict=True):
-        if task.drafts:
-            draft = torch.tensor(
-                task.drafts, dtype=row_tokens.dtype, device=device
-            )
-            matches = row_tokens[first : first + len(task.drafts)] == draft
+    for first, tokens_, prefix in zip(
+        offsets, drafted, terminal_prefixes, strict=True
+    ):
+        if tokens_:
+            draft = torch.tensor(tokens_, dtype=row_tokens.dtype, device=device)
+            matches = row_tokens[first : first + len(tokens_)] == draft
             raw = torch.cumprod(matches.to(torch.long), dim=0).sum()
         else:
             draft = torch.empty((0,), dtype=row_tokens.dtype, device=device)
             raw = torch.zeros((), dtype=torch.long, device=device)
-        if task.terminal_prefix is None:
+        prefix = int(prefix)
+        if not prefix:
             accepted = raw
             terminal = torch.zeros((), dtype=torch.bool, device=device)
             terminal_token = torch.zeros(
                 (), dtype=row_tokens.dtype, device=device
             )
         else:
-            prefix = int(task.terminal_prefix)
             accepted = raw.clamp_max(prefix)
             terminal = raw >= prefix
             terminal_token = draft[prefix - 1]
@@ -420,24 +403,34 @@ def select_categorical(
     # legal candidate under its sampling constraints.
     task_valid = torch.stack(
         tuple(
-            valid[first : first + task.rows][
-                torch.arange(task.rows, device=device) < points[index]
+            valid[first : first + count][
+                torch.arange(count, device=device) < points[index]
             ].all()
-            for index, (task, first) in enumerate(
-                zip(tasks, offsets, strict=True)
+            for index, (count, first) in enumerate(
+                zip(counts, offsets, strict=True)
             )
         )
     )
     finish, continuation, tagged, transition = decisions(
-        tasks, tokens, task_valid, active, terminal
+        tokens,
+        task_valid,
+        active,
+        force_finish,
+        finish_ids,
+        transition_ids,
+        terminal,
     )
 
     # A terminal selection emits the finish draft token, which the
     # verification row before the output row scored.
     packed = None
-    if any(task.logprobs is not None for task in tasks):
+    if len(logprob_tasks):
         packed = _logprobs(
-            work, output - terminal.to(dtype=torch.long), tokens, tasks
+            work,
+            output - terminal.to(dtype=torch.long),
+            tokens,
+            logprob_tasks,
+            logprob_requests,
         )
     return Selection(
         tokens,
@@ -456,17 +449,41 @@ def select_categorical(
 def shape_logits(
     work: torch.Tensor,
     params: torch.Tensor,
-    rows: Sequence[_Row],
-    penalty_counts: Sequence[torch.Tensor | None] | None,
+    *,
+    top_ks: Sequence[int],
+    top_p_rows: Sequence[int] = (),
+    min_p_rows: Sequence[int] = (),
+    typical_p_rows: Sequence[int] = (),
+    allowed_rows: Sequence[int] = (),
+    allowed: Sequence[int] = (),
+    suppressed: Sequence[int] = (),
+    penalty_rows: Sequence[int] = (),
+    penalty_counts: torch.Tensor | None = None,
+    bias: Sequence[int] = (),
+    bias_values: Sequence[float] = (),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the canonical shaping and truncation order to logits rows.
 
     Stages run in this order on a float32 copy: allowed-token restriction,
     suppression, penalties, logit bias, temperature, top-k with nested
     top-p, full-vocabulary top-p, min-p and typical-p. Float values come
-    from the ``params`` columns; the host controls decide which rows take
-    each stage. Out-of-vocabulary ids in the allowed, suppressed and bias
-    sets are ignored.
+    from the ``params`` columns; the lists decide which rows take each
+    stage.
+
+    Args:
+        work: ``[rows, vocab]`` logits.
+        params: ``[rows, PARAMETER_COLUMNS]`` float parameters.
+        top_ks: Per row, its top-k width, or zero without one.
+        top_p_rows: Rows with a nucleus cutoff below one and no top-k width.
+        min_p_rows: Rows with a minimum-probability cutoff.
+        typical_p_rows: Rows with a typical-probability cutoff below one.
+        allowed_rows: Rows restricted to the tokens ``allowed`` (scatter
+            indices) names for them.
+        suppressed: Scatter indices of tokens masked from selection.
+        penalty_rows: Rows with repetition, frequency or presence penalties;
+            ``penalty_counts`` holds their ``[len(penalty_rows), vocab]``
+            token counts.
+        bias: Scatter indices of the additive offsets ``bias_values``.
 
     Returns:
         ``(work, valid)``: the shaped ``[rows, vocab]`` float32 logits with
@@ -474,59 +491,27 @@ def shape_logits(
         distribution.
     """
     work = work.to(dtype=torch.float32, copy=True)
-    count, vocab = (int(value) for value in work.shape)
     device = work.device
-    if len(rows) != count or int(params.shape[0]) != count:
-        raise ValueError("sampling controls do not align with logits rows")
 
     # Allowed-token restriction masks every other vocabulary entry.
-    allowed_rows: list[int] = []
-    allowed_flat: list[int] = []
-    for index, row in enumerate(rows):
-        if row.allowed is None:
-            continue
-        allowed_rows.append(index)
-        allowed_flat.extend(
-            index * vocab + token
-            for token in dict.fromkeys(row.allowed)
-            if 0 <= token < vocab
-        )
-    if allowed_rows:
+    if len(allowed_rows):
         mask = torch.ones_like(work, dtype=torch.bool)
-        restricted = torch.tensor(allowed_rows, dtype=torch.long, device=device)
-        mask.index_fill_(0, restricted, False)
-        mask.reshape(-1)[
-            torch.tensor(allowed_flat, dtype=torch.long, device=device)
-        ] = True
+        mask.index_fill_(0, _index(allowed_rows, device), False)
+        mask.reshape(-1)[_index(allowed, device)] = True
         work.masked_fill_(~mask, float("-inf"))
 
     # Suppressed tokens are masked regardless of any other shaping.
-    suppressed = tuple(
-        index * vocab + token
-        for index, row in enumerate(rows)
-        for token in dict.fromkeys(row.task.suppress)
-        if 0 <= token < vocab
-    )
-    if suppressed:
+    if len(suppressed):
         work.reshape(-1).index_fill_(
-            0,
-            torch.tensor(suppressed, dtype=torch.long, device=device),
-            float("-inf"),
+            0, _index(suppressed, device), float("-inf")
         )
 
     # Penalties apply to tokens with a positive count: repetition is
     # multiplicative and sign-aware, frequency scales with the count and
     # presence is flat. Masked (-inf) entries are preserved.
-    penalized = [
-        index
-        for index, value in enumerate(penalty_counts or ())
-        if value is not None
-    ]
-    if penalized:
-        selected = torch.tensor(penalized, dtype=torch.long, device=device)
-        counts = torch.stack(
-            [value for value in penalty_counts or () if value is not None]
-        ).to(dtype=work.dtype)
+    if len(penalty_rows) and penalty_counts is not None:
+        selected = _index(penalty_rows, device)
+        counts = penalty_counts.to(dtype=work.dtype)
         values = params.index_select(0, selected)
         repetition = values[:, REPETITION].unsqueeze(1)
         frequency = values[:, FREQUENCY].unsqueeze(1)
@@ -541,17 +526,10 @@ def shape_logits(
         work.index_copy_(0, selected, torch.where(apply, adjusted, current))
 
     # Logit bias adds per-token offsets on top of the penalized logits.
-    bias_indexes: list[int] = []
-    bias_values: list[float] = []
-    for index, row in enumerate(rows):
-        for token, bias in row.task.logit_bias:
-            if 0 <= token < vocab:
-                bias_indexes.append(index * vocab + token)
-                bias_values.append(float(bias))
-    if bias_indexes:
+    if len(bias):
         work.reshape(-1).index_put_(
-            (torch.tensor(bias_indexes, dtype=torch.long, device=device),),
-            torch.tensor(bias_values, dtype=work.dtype, device=device),
+            (_index(bias, device),),
+            torch.tensor(list(bias_values), dtype=work.dtype, device=device),
             accumulate=True,
         )
 
@@ -568,11 +546,11 @@ def shape_logits(
     # sharing a width are truncated in one gather/sort pass. The candidates
     # are shared with ``sample_top_k``, so both paths keep the same tokens.
     widths: dict[int, list[int]] = defaultdict(list)
-    for index, row in enumerate(rows):
-        if 0 < row.task.top_k < vocab:
-            widths[row.task.top_k].append(index)
+    for index, top_k in enumerate(top_ks):
+        if int(top_k) > 0:
+            widths[int(top_k)].append(index)
     for top_k, members in widths.items():
-        selected = torch.tensor(members, dtype=torch.long, device=device)
+        selected = _index(members, device)
         subset = work.index_select(0, selected)
         top_p = params.index_select(0, selected)[:, TOP_P]
         ordered, tokens = top_k_candidates(subset, top_k, top_p)
@@ -582,13 +560,8 @@ def shape_logits(
 
     # Full-vocabulary top-p for rows without a top-k restriction. The token
     # that first crosses top_p is kept: each drop decision shifts right.
-    nucleus = [
-        index
-        for index, row in enumerate(rows)
-        if row.task.top_p and not 0 < row.task.top_k < vocab
-    ]
-    if nucleus:
-        selected = torch.tensor(nucleus, dtype=torch.long, device=device)
+    if len(top_p_rows):
+        selected = _index(top_p_rows, device)
         subset = work.index_select(0, selected)
         ordered, tokens = torch.sort(subset, dim=-1, descending=True)
         top_p = params.index_select(0, selected)[:, TOP_P]
@@ -596,7 +569,9 @@ def shape_logits(
         over = cumulative > top_p.unsqueeze(1)
         drop = torch.cat(
             (
-                torch.zeros((len(nucleus), 1), dtype=torch.bool, device=device),
+                torch.zeros(
+                    (len(top_p_rows), 1), dtype=torch.bool, device=device
+                ),
                 over[:, :-1],
             ),
             dim=1,
@@ -608,9 +583,8 @@ def shape_logits(
 
     # Min-p drops tokens below a fraction of the row maximum, compared in log
     # space so the shaped logits are used directly.
-    floor = [index for index, row in enumerate(rows) if row.task.min_p]
-    if floor:
-        selected = torch.tensor(floor, dtype=torch.long, device=device)
+    if len(min_p_rows):
+        selected = _index(min_p_rows, device)
         subset = work.index_select(0, selected)
         min_p = params.index_select(0, selected)[:, MIN_P]
         threshold = subset.max(dim=-1).values + torch.log(min_p)
@@ -619,9 +593,8 @@ def shape_logits(
 
     # Typical-p keeps the tokens whose surprise is closest to the row entropy,
     # covering the requested probability mass.
-    typical = [index for index, row in enumerate(rows) if row.task.typical_p]
-    if typical:
-        selected = torch.tensor(typical, dtype=torch.long, device=device)
+    if len(typical_p_rows):
+        selected = _index(typical_p_rows, device)
         subset = work.index_select(0, selected)
         typical_p = params.index_select(0, selected)[:, TYPICAL_P]
         probs = torch.softmax(subset, dim=-1)
@@ -633,7 +606,9 @@ def shape_logits(
         over = cumulative >= typical_p.unsqueeze(1)
         drop = torch.cat(
             (
-                torch.zeros((len(typical), 1), dtype=torch.bool, device=device),
+                torch.zeros(
+                    (len(typical_p_rows), 1), dtype=torch.bool, device=device
+                ),
                 over[:, :-1],
             ),
             dim=1,
@@ -651,7 +626,6 @@ __all__ = [
     "TOKEN_CONTINUATION_BIT",
     "TOKEN_VALUE_MASK",
     "Selection",
-    "Task",
     "decisions",
     "select_categorical",
     "select_greedy",
