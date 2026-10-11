@@ -226,7 +226,10 @@ impl TextRuntime {
                 Some(staged) => {
                     let launch = self.runners[runner].launch(staged, Some(capacity), replay)?;
                     modes.push(Some(launch.mode));
-                    calls.push(Some(launch.call));
+                    calls.push(Some(super::experts::MicrobatchForward {
+                        call: launch.call,
+                        yields: launch.mode != GraphMode::Replay,
+                    }));
                 }
                 None => {
                     modes.push(None);

@@ -26,6 +26,7 @@ use uniserve_cuda::{DeviceId, Stream};
 use super::{ExpertFunctions, ExpertRuntime, Peer};
 use crate::config::{Device, WorkerLaunch};
 use crate::ffi::{Backing, Fields, Function, Functions, Handle, Record, integer_list};
+use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
 use crate::model::interface::Interface;
@@ -34,7 +35,6 @@ use crate::parallel::joins::GraphFunctions;
 use crate::parallel::world::World;
 use crate::parallel::{ExpertParallel, ExpertTransport, MicrobatchLanes, yield_microbatch};
 use crate::transfer::PeerStorage;
-use crate::worker::Lanes;
 use crate::{Error, Result};
 
 /// What constructing the expert runtime borrows from the rank.
@@ -245,8 +245,11 @@ impl ExpertRuntime {
         if microbatches > 1 {
             let lanes = MicrobatchLanes::new(microbatches)?;
             let warm = functions.warm_thread.clone();
+            // Thread-local numerical state belongs to the thread an eager
+            // forward runs on, so each microbatch thread makes this call
+            // itself.
             lanes.each(Arc::new(move |_| {
-                warm.invoke(&[(&Any::from(i64::from(device))).into()])
+                crate::ffi::cooperative(|| warm.invoke(&[(&Any::from(i64::from(device))).into()]))
             }))?;
             runtime.lanes = Some(lanes);
         }

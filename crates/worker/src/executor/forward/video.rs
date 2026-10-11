@@ -1602,7 +1602,7 @@ pub(crate) struct RuntimeSetup<'a> {
     pub(crate) info: &'a WorkerInfo,
     pub(crate) config: &'a crate::config::WorkerConfig,
     pub(crate) components: &'a crate::model::registry::Components,
-    pub(crate) lanes: &'a mut crate::worker::Lanes,
+    pub(crate) lanes: &'a mut crate::lane::Lanes,
     pub(crate) graphs: &'a mut crate::cuda_graph::GraphStorage<String, Handle>,
     /// The attention backend the model loaded with.
     pub(crate) attention: String,
@@ -1618,7 +1618,7 @@ const TEXT_GRAPHS: usize = 1002;
 
 /// A stream forked for one component's calls and its workspace allocator.
 fn component_stream(
-    lanes: &mut crate::worker::Lanes,
+    lanes: &mut crate::lane::Lanes,
     kind: MediaCall,
     device: Device,
 ) -> Result<(Stream, tvm_ffi::Function)> {
