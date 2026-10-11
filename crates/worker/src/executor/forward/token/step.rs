@@ -114,9 +114,9 @@ struct Planned {
 }
 
 impl Planned {
-    fn request(&self, decode: bool) -> StepRequest<'_> {
+    fn request(&self, mode: ForwardMode) -> StepRequest<'_> {
         StepRequest {
-            decode,
+            mode,
             rows: &self.rows,
             finish_ids: &self.finish_ids,
             sampling: self.sampling.as_ref().map(|plan| SamplingColumns {
@@ -289,10 +289,9 @@ impl TokenBatch<'_> {
             // Only latent conditionings, which the image denoiser wrote.
             vec![None; count]
         } else {
-            let decode = self.mode == ForwardMode::Decode;
             let requests: Vec<Option<StepRequest<'_>>> = planned
                 .iter()
-                .map(|planned| planned.as_ref().map(|planned| planned.request(decode)))
+                .map(|planned| planned.as_ref().map(|planned| planned.request(self.mode)))
                 .collect();
             let kv = self
                 .storage
@@ -425,12 +424,12 @@ impl TokenBatch<'_> {
                 *id = i64::from(token);
             }
             let (first, count) = layout[position];
-            // A verification samples every candidate row; the others their
-            // last projected row.
+            // A verification samples its candidate rows, one per token
+            // position; the others the last-position logits of their row.
             let row = if self.mode == ForwardMode::Verify {
                 first
             } else {
-                first + count.saturating_sub(1)
+                position
             };
             if call.code == CallKind::Forward(ForwardMode::Prefill)
                 && prepared.scores

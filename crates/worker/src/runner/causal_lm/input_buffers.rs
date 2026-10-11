@@ -65,8 +65,6 @@ pub(crate) struct Dimensions {
     /// Global vocabulary of sampling and prompt scoring.
     pub(crate) vocab: usize,
     pub(crate) hidden: usize,
-    /// Allocate the prefill graph output.
-    pub(crate) hidden_output: bool,
     /// Allocate precomputed embeddings replacing token embeddings (vision
     /// features of multimodal prompts).
     pub(crate) embeddings: bool,
@@ -108,10 +106,8 @@ impl Dimensions {
             ("points", DType::I64, vec![rows]),
             ("logprobs", DType::I64, vec![self.logprob_words() as i64]),
             ("prompt_tail", self.dtype, vec![rows, self.vocab as i64]),
+            ("hidden", self.dtype, vec![tokens, self.hidden as i64]),
         ];
-        if self.hidden_output {
-            columns.push(("hidden", self.dtype, vec![tokens, self.hidden as i64]));
-        }
         if self.embeddings {
             columns.push((
                 "input_embeddings",

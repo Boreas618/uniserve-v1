@@ -173,7 +173,6 @@ impl TextBounds {
             local_vocab,
             vocab,
             hidden,
-            hidden_output: self.prefill.iter().any(|shape| shape.outputs),
             embeddings: false,
             dtype,
         }
