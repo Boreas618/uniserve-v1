@@ -333,7 +333,7 @@ impl TextRuntime {
 
         // The lane's runner evaluates every prefix.
         let mut requests: Vec<Option<StepRequest<'_>>> = vec![Some(StepRequest {
-            decode: false,
+            mode: ForwardMode::Prefill,
             rows: &rows,
             finish_ids: &[],
             sampling: None,
