@@ -17,7 +17,6 @@
 //! capability ([`registry`]) follow.
 
 pub mod bind;
-pub mod canvas;
 pub mod components;
 pub mod image;
 pub mod interface;
