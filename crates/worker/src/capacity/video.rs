@@ -17,9 +17,9 @@ use uniserve_ipc::{DType, DimBound, MediaCall, OutputInfo, ShapeBound};
 use super::plan::{LatentPlan, MediaFacts, product_bytes};
 use crate::config::WorkerConfig;
 use crate::host::mux::encoded_unit_bytes;
-use crate::model::video::VideoModel;
 use crate::request::video::MediaPlan;
-use crate::runner::diffusion::video::{SamplePages, StateEnvelope};
+use crate::runner::denoiser::VideoModel;
+use crate::runner::denoiser::{SamplePages, StateEnvelope};
 use crate::{Error, Result};
 
 /// What a rank's video components need beside its products.

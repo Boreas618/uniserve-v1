@@ -18,7 +18,6 @@ pub(crate) mod experts;
 pub(crate) mod image;
 pub(crate) mod inputs;
 pub(crate) mod launch;
-pub(crate) mod media;
 pub(crate) mod placement;
 pub(crate) mod products;
 pub(crate) mod token;
@@ -121,7 +120,7 @@ pub(crate) fn execute(
         Media(MediaReading | VideoEncoding | AudioEncoding | Muxing) => {
             let (plan, borrowed, state) = batch.media_parts();
             let mut parts = backend.media_parts()?;
-            media::execute(&mut parts, plan, borrowed, state)
+            crate::runner::media::execute(&mut parts, plan, borrowed, state)
         }
         Media(ImageDecoding) => image::execute(backend, batch, kind),
         Media(VideoDecoding | AudioDecoding) => {

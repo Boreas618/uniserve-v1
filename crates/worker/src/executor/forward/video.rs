@@ -1,26 +1,24 @@
-//! The video runtime: video requests, their denoising, decoding and
-//! condition encoding on device ranks, and their media work on host ranks.
+//! The video runtime: a rank's video requests and the order of their work.
 //!
-//! [`VideoRuntime`] owns a rank's video components: the text encoder with
-//! its vision tower, the denoiser runner with its latent pool and layouts,
-//! the video and audio decoders, the condition latent encoders and the host
-//! media (condition reading, codecs
-//! and MP4 assembly). It admits each video request the rank serves when the
-//! engine starts it, keeps the request's numerical size and layout while it
-//! lives, and executes the request's media calls: device calls here, host
-//! calls in [`super::media`]. Every batch runs through a
-//! [`MediaBatch`](super::batch::MediaBatch): its inputs are imported before
-//! it executes, its outputs are written and exported on the call's stream,
-//! and its result is delivered once its device work and host tasks
-//! completed.
+//! [`VideoRuntime`] holds the runners of the video components placed on a
+//! rank: the text encoder with its vision tower, the denoiser with its
+//! latent pool and layouts, the video and audio decoders, the condition
+//! latent encoders (`crate::runner::{encoder, denoiser, decoder}`) and the
+//! host media (`crate::runner::media`). It admits each video request the
+//! rank serves when the engine starts it, keeps the request's numerical
+//! size and layout while it lives, hands each media call of a batch to its
+//! runner's forward, and warms and captures the runners at startup. Every
+//! batch runs through a [`MediaBatch`](super::batch::MediaBatch): its inputs
+//! are imported before it executes, its outputs are written and exported on
+//! the call's stream, and its result is delivered once its device work and
+//! host tasks completed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use tvm_ffi::Any;
 use uniserve_core::{Canvas, ComponentConfig, VideoCondition};
-use uniserve_cuda::{Stream, memset_d8};
+use uniserve_cuda::Stream;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, CallKind, MediaCall, NewRequest,
     RequestKey, TensorRef, WorkerInfo,
@@ -31,20 +29,19 @@ use crate::error::WorkerError;
 use crate::executor::forward::placement::{
     OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export, skipped,
 };
-use crate::ffi::Region;
-use crate::ffi::{DType, Device, Function, Handle, list};
-use crate::host::mux::{MuxConfig, MuxFunctions, MuxSession};
-use crate::host::reader::ConditionReader;
-use crate::host::task::MediaTask;
-use crate::host::{HostLane, HostTask};
-use crate::model::video::VideoModel;
+use crate::ffi::{DType, Device, Handle, Record};
+use crate::host::mux::{MuxConfig, MuxSession};
+
 use crate::request::RequestPool;
 use crate::request::video::{Admission, MediaPlan, VideoSize, condition_shapes, vision_spans};
-use crate::runner::diffusion::video::VideoDenoiser;
-use crate::runner::encoder::{EncoderConfig, PromptVision};
-use crate::runner::video::{
-    AudioDecoding, LatentEncoding, Segment, TextEncoding, TextSetup, VideoDecoding,
+use crate::runner::RunnerSetup;
+use crate::runner::decoder::{
+    AudioDecoding, DecodeCapacity, Segment, TrackUnits, UnitShape, VideoDecoding,
 };
+use crate::runner::denoiser::{Conditioning, DenoiserRunner, VideoModel};
+use crate::runner::encoder::EncoderConfig;
+use crate::runner::encoder::{LatentEncoding, TextEncoding, TextSetup};
+use crate::runner::media::MediaRunner;
 use crate::worker::RankStorage;
 use crate::{Error, OutputPool, Result};
 
@@ -103,8 +100,8 @@ pub(crate) struct VideoRequest {
     pub(crate) units: Arc<[u32]>,
     /// Samples of the generated audio track.
     pub(crate) audio_samples: u64,
-    /// The host task drawing the request's noise.
-    pub(crate) preparation: Option<Arc<HostTask<MediaTask>>>,
+    /// The seed of the request's noise.
+    pub(crate) seed: u64,
     /// The request's MP4 on the muxer rank.
     pub(crate) mux: Option<Arc<MuxSession>>,
 }
@@ -114,17 +111,6 @@ impl VideoRequest {
     pub(crate) fn longest(&self) -> u32 {
         self.units.iter().copied().max().unwrap_or(0)
     }
-}
-
-/// The host media components of a rank.
-pub(crate) struct HostMedia {
-    pub(crate) reader: Option<Arc<ConditionReader>>,
-    pub(crate) encode_video: Function,
-    pub(crate) encode_audio: Function,
-    pub(crate) mux: MuxFunctions,
-    pub(crate) lane: HostLane<MediaTask>,
-    /// Host component placements, by name.
-    pub(crate) components: BTreeMap<String, ComponentConfig>,
 }
 
 /// A rank's video runtime.
@@ -137,13 +123,17 @@ pub(crate) struct VideoRuntime {
     pub(crate) text: Option<Component<TextEncoding>>,
     /// The text encoder's graph pool, when graphs are captured.
     pub(crate) text_pool: Option<Arc<crate::cuda_graph::GraphPool<Handle>>>,
-    pub(crate) denoiser: Option<Component<VideoDenoiser>>,
+    pub(crate) denoiser: Option<Component<DenoiserRunner>>,
     pub(crate) decoder: Option<Component<VideoDecoding>>,
+    /// The unit shapes startup warmed, which it then captures: each with
+    /// its window's latent rows and its video's longest unit.
+    decoder_shapes: Vec<(UnitShape, u64, u32)>,
+    /// The track units startup warmed, which it then captures, each with
+    /// its track's latent rows.
+    audio_units: Vec<(TrackUnits, u64)>,
     pub(crate) audio: Option<Component<AudioDecoding>>,
     pub(crate) latent: Option<Component<LatentEncoding>>,
-    pub(crate) host: Option<HostMedia>,
-    /// Draws requests' noise beside device work.
-    pub(crate) noise: Option<HostLane<MediaTask>>,
+    pub(crate) host: Option<MediaRunner>,
     pub(crate) outputs: OutputPool,
     /// Product names of every component's outputs, by output index.
     pub(crate) products: HashMap<String, Vec<String>>,
@@ -202,7 +192,7 @@ impl VideoRuntime {
     }
 
     /// Admit a started video request: resolve its size and, on a denoising
-    /// rank, its layout, and start drawing its noise.
+    /// rank, its layout.
     pub(crate) fn admit(&mut self, admission: &NewRequest) -> Result<()> {
         let (Some(media), Some(video)) = (&admission.diffusion, &admission.video) else {
             return Ok(());
@@ -255,42 +245,13 @@ impl VideoRuntime {
             layout: None,
             audio_samples: self.model.track_samples(media.num_frames)?,
             units,
-            preparation: None,
+            seed: media.seed,
             mux: None,
         };
         if let Some(denoiser) = &mut self.denoiser {
             let admitted = self.plan.admit(&self.model, size)?;
             let id = denoiser.runner.acquire(&self.model, admitted.layout)?;
             request.layout = Some(id);
-            let lane = self
-                .noise
-                .as_ref()
-                .ok_or_else(|| Error::Invariant("a denoising rank has no noise lane".into()))?;
-            let task = lane.reserve()?;
-            let arguments = [
-                Any::from(slot as i64),
-                Any::from(id as i64),
-                admitted.size.descriptor(),
-                admitted.size.conditions_descriptor(),
-                admitted.size.spans_descriptor(),
-                // The seed's bits; the binding reads them as unsigned.
-                Any::from(media.seed as i64),
-            ]
-            .into_iter()
-            .map(Handle::new)
-            .collect::<Result<Vec<_>>>()?;
-            let configured = task
-                .configure(MediaTask::Prepare {
-                    function: denoiser.runner.preparation(),
-                    arguments,
-                })
-                .and_then(|()| task.submit());
-            if let Err(error) = configured {
-                let _ = task.cancel(true);
-                denoiser.runner.release(id)?;
-                return Err(error);
-            }
-            request.preparation = Some(task);
             request.admission = Some(admitted);
         }
         if let Some(previous) = self.requests.insert(slot, request) {
@@ -300,13 +261,6 @@ impl VideoRuntime {
     }
 
     fn retire(&mut self, request: VideoRequest) -> Result<()> {
-        if let Some(task) = &request.preparation
-            && !task.completion.done()
-        {
-            // A drawing task still writes the slot's sources: wait for it.
-            let _ = task.cancel(false);
-            let _ = task.completion.wait(None);
-        }
         if let (Some(denoiser), Some(id)) = (&mut self.denoiser, request.layout) {
             denoiser.runner.release(id)?;
         }
@@ -462,25 +416,27 @@ pub(crate) fn execute(
         }
         match call.code {
             CallKind::Media(MediaCall::TextEncoding) => {
-                encode_text(parts, plan, batch, index, slot, &placement)?
+                crate::runner::encoder::encode_text(parts, plan, batch, index, slot, &placement)?
             }
             CallKind::Media(MediaCall::VisionEncoding) => {
-                encode_vision(parts, plan, batch, index, slot, &placement)?
+                crate::runner::encoder::encode_vision(parts, plan, batch, index, slot, &placement)?
             }
             CallKind::Media(MediaCall::LatentPreparation) => {
-                prepare(parts, plan, batch, index, slot)?
+                crate::runner::denoiser::prepare(parts, plan, batch, index, slot)?
             }
             CallKind::Media(MediaCall::Denoising) => {
-                denoise(parts, plan, batch, index, slot, &placement)?
+                crate::runner::denoiser::denoise(parts, plan, batch, index, slot, &placement)?
             }
             CallKind::Media(MediaCall::VideoDecoding) => {
-                decode_video(parts, plan, batch, index, slot, &placement)?
+                crate::runner::decoder::decode_video(parts, plan, batch, index, slot, &placement)?
             }
             CallKind::Media(MediaCall::AudioDecoding) => {
-                decode_audio(parts, plan, batch, index, slot, &placement)?
+                crate::runner::decoder::decode_audio(parts, plan, batch, index, slot, &placement)?
             }
             CallKind::Media(MediaCall::LatentEncoding) => {
-                encode_conditions(parts, plan, batch, index, slot, &placement)?
+                crate::runner::encoder::encode_conditions(
+                    parts, plan, batch, index, slot, &placement,
+                )?
             }
             kind => {
                 return Err(Error::Unsupported(format!(
@@ -501,14 +457,20 @@ pub(crate) fn execute(
     Ok(())
 }
 
-fn latent_params<'a>(plan: &'a BatchPlan, call: &Call) -> Result<&'a uniserve_ipc::LatentParams> {
+pub(crate) fn latent_params<'a>(
+    plan: &'a BatchPlan,
+    call: &Call,
+) -> Result<&'a uniserve_ipc::LatentParams> {
     plan.latent_params
         .iter()
         .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
         .ok_or_else(|| Error::Invalid("a video trajectory call has no latent pages".into()))
 }
 
-fn decode_range<'a>(plan: &'a BatchPlan, call: &Call) -> Result<&'a uniserve_ipc::DecodeRange> {
+pub(crate) fn decode_range<'a>(
+    plan: &'a BatchPlan,
+    call: &Call,
+) -> Result<&'a uniserve_ipc::DecodeRange> {
     plan.decode_ranges
         .iter()
         .find(|range| range.request_key == call.request_key && range.call_id == call.call_id)
@@ -516,7 +478,7 @@ fn decode_range<'a>(plan: &'a BatchPlan, call: &Call) -> Result<&'a uniserve_ipc
 }
 
 /// The batch's stream.
-fn stream_of(batch: &MediaBatch) -> Result<Stream> {
+pub(crate) fn stream_of(batch: &MediaBatch) -> Result<Stream> {
     batch
         .stream
         .clone()
@@ -524,7 +486,7 @@ fn stream_of(batch: &MediaBatch) -> Result<Stream> {
 }
 
 /// The most elements a product holds along one dimension.
-fn extent(dim: &uniserve_ipc::DimBound) -> u64 {
+pub(crate) fn extent(dim: &uniserve_ipc::DimBound) -> u64 {
     match dim {
         uniserve_ipc::DimBound::Static(extent) | uniserve_ipc::DimBound::Device { max: extent } => {
             u64::from(*extent)
@@ -533,7 +495,7 @@ fn extent(dim: &uniserve_ipc::DimBound) -> u64 {
 }
 
 /// Rows' width of a two-dimensional product.
-fn row_width(output: &TensorRef) -> Result<u64> {
+pub(crate) fn row_width(output: &TensorRef) -> Result<u64> {
     output
         .shape_bound
         .dims
@@ -542,27 +504,9 @@ fn row_width(output: &TensorRef) -> Result<u64> {
         .ok_or_else(|| Error::Invalid("the product is not rows".into()))
 }
 
-/// The patch grids of a request's vision blocks, images and videos apart,
-/// each in request order as the text encoder places them.
-fn vision_grids(conditions: &[VideoCondition]) -> (Vec<[u32; 3]>, Vec<[u32; 3]>) {
-    let mut images = Vec::new();
-    let mut videos = Vec::new();
-    for condition in conditions {
-        let Some(vision) = &condition.vision else {
-            continue;
-        };
-        let grid = [vision.grid.t, vision.grid.h, vision.grid.w];
-        match condition.media {
-            uniserve_core::ConditionMedia::Video { .. } => videos.push(grid),
-            _ => images.push(grid),
-        }
-    }
-    (images, videos)
-}
-
 /// Bind a call's single output as rows of `shape` on every rank that
 /// computes it.
-fn bind_rows(
+pub(crate) fn bind_rows(
     parts: &Parts<'_>,
     batch: &mut MediaBatch,
     index: usize,
@@ -590,7 +534,7 @@ fn bind_rows(
 
 /// Publish a call's output, written at `shape` from its leading elements,
 /// and export it to its readers.
-fn publish(
+pub(crate) fn publish(
     parts: &Parts<'_>,
     batch: &mut MediaBatch,
     call: &Call,
@@ -621,7 +565,7 @@ fn publish(
 /// other ranks hold the rest, the whole product when the round assigns
 /// this rank all of it. Publishing the view itself is right in both cases;
 /// the store tracks a share that covers the product as a whole product.
-fn publish_bound(
+pub(crate) fn publish_bound(
     parts: &Parts<'_>,
     batch: &mut MediaBatch,
     call: &Call,
@@ -647,837 +591,6 @@ fn publish_bound(
     Ok(())
 }
 
-/// Encode a request's prompt into its `conditioning` rows, splicing the
-/// vision features of its condition media in at their placeholders when the
-/// call reads them. Every rank of the text encoder computes the features
-/// and publishes its copy.
-fn encode_text(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
-    slot: usize,
-    placement: &Placement<'_>,
-) -> Result<()> {
-    let call = &plan.calls[index];
-    if call.outputs.len() != 1 || call.inputs.len() > 1 {
-        return Err(Error::Invalid(
-            "text encoding reads at most one vision product and writes its conditioning".into(),
-        ));
-    }
-    let (tokens, conditions) = {
-        let request = parts.video.request(slot, call.request_key)?;
-        (Arc::clone(&request.tokens), Arc::clone(&request.conditions))
-    };
-    if tokens.is_empty() {
-        return Err(Error::Invalid(
-            "text conditioning requires admitted prompt tokens".into(),
-        ));
-    }
-    let width = row_width(&call.outputs[0])?;
-    let stream = stream_of(batch)?;
-    let visual = call
-        .inputs
-        .first()
-        .map(|input| {
-            batch.inputs.read(
-                parts.owners().store,
-                input,
-                call.call_id,
-                batch.device,
-                Some(&stream),
-            )
-        })
-        .transpose()?;
-    let write = bind_rows(
-        parts,
-        batch,
-        index,
-        &call.outputs[0],
-        vec![tokens.len() as u64, width],
-        placement,
-    )?;
-
-    let text = &mut parts
-        .video
-        .text
-        .as_mut()
-        .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?
-        .runner;
-    let arena = text.text.products().clone();
-    let out = Region::within(&arena, &write.view())?;
-    let (image_grids, video_grids) = vision_grids(&conditions);
-    let rows = visual
-        .as_ref()
-        .map(|read| Region::within(&arena, read.value()))
-        .transpose()?;
-    let vision = rows.as_ref().map(|rows| PromptVision {
-        image_grids: &image_grids,
-        video_grids: &video_grids,
-        rows,
-    });
-    let (shape, _) = text.text.encode_text(&tokens, &out, vision)?;
-    if shape.as_deref() != Some(&[tokens.len() as i64, width as i64][..]) {
-        return Err(Error::Invalid(
-            "prompt features disagree with the request's prompt and the conditioning width".into(),
-        ));
-    }
-    publish(
-        parts,
-        batch,
-        call,
-        index,
-        &write,
-        &[tokens.len() as u64, width],
-    )
-}
-
-/// Encode the vision blocks of a request's condition media into one
-/// `vision_features` row per vision placeholder, in request order.
-fn encode_vision(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
-    slot: usize,
-    placement: &Placement<'_>,
-) -> Result<()> {
-    let call = &plan.calls[index];
-    if call.inputs.len() != 1 || call.outputs.len() != 1 {
-        return Err(Error::Invalid(
-            "vision encoding requires one input and one output".into(),
-        ));
-    }
-    let conditions = Arc::clone(&parts.video.request(slot, call.request_key)?.conditions);
-    let blocks: Vec<([u32; 3], u64)> = conditions
-        .iter()
-        .filter_map(|condition| condition.vision.as_ref())
-        .map(|vision| {
-            (
-                [vision.grid.t, vision.grid.h, vision.grid.w],
-                u64::from(vision.tokens),
-            )
-        })
-        .collect();
-    if blocks.is_empty() {
-        return Err(Error::Invalid(
-            "vision encoding requires a vision block".into(),
-        ));
-    }
-    let width = row_width(&call.outputs[0])?;
-    let tokens: u64 = blocks.iter().map(|block| block.1).sum();
-    let stream = stream_of(batch)?;
-    let patches = batch.inputs.read(
-        parts.owners().store,
-        &call.inputs[0],
-        call.call_id,
-        batch.device,
-        Some(&stream),
-    )?;
-    let write = bind_rows(
-        parts,
-        batch,
-        index,
-        &call.outputs[0],
-        vec![tokens, width],
-        placement,
-    )?;
-
-    let text = &mut parts
-        .video
-        .text
-        .as_mut()
-        .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?
-        .runner;
-    let vision = text
-        .vision
-        .as_mut()
-        .ok_or_else(|| Error::Invalid("this rank's text encoder reads no vision".into()))?;
-    let arena = vision.products().clone();
-    let rows = Region::within(&arena, patches.value())?;
-    let product = Region::within(&arena, &write.view())?;
-    // Each block's features are consecutive rows of the product.
-    let row_bytes = width * product.dtype().bytes() as u64;
-    let mut start = 0;
-    let mut out = Vec::with_capacity(blocks.len());
-    for &(_, count) in &blocks {
-        out.push(Region::new(
-            product.offset() + start * row_bytes,
-            product.dtype(),
-            vec![count as i64, width as i64],
-        )?);
-        start += count;
-    }
-    let grids: Vec<[u32; 3]> = blocks.iter().map(|block| block.0).collect();
-    let encoded = vision.encode_patches(&rows, &grids, &out)?;
-    let planned: Vec<Vec<i64>> = blocks
-        .iter()
-        .map(|block| vec![block.1 as i64, width as i64])
-        .collect();
-    if encoded.shapes != planned {
-        return Err(Error::Invalid(
-            "vision features disagree with the request's placeholders".into(),
-        ));
-    }
-    publish(parts, batch, call, index, &write, &[tokens, width])
-}
-
-/// Initialize a request's trajectory: its prepared sources, its refined
-/// prompt and its encoded conditions.
-fn prepare(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
-    slot: usize,
-) -> Result<()> {
-    let call = &plan.calls[index];
-    let params = latent_params(plan, call)?;
-    let (id, preparation, conditioned, size) = {
-        let request = parts.video.request(slot, call.request_key)?;
-        let id = request
-            .layout
-            .ok_or_else(|| Error::Invariant("a denoising request has no layout".into()))?;
-        (
-            id,
-            request.preparation.clone(),
-            !request.conditions.is_empty(),
-            request
-                .admission
-                .as_ref()
-                .map(|admission| admission.size.clone()),
-        )
-    };
-    if call.inputs.is_empty() || (call.inputs.len() > 1) != conditioned {
-        return Err(Error::Invalid(
-            "video preparation reads its conditioning and its conditions".into(),
-        ));
-    }
-    if let Some(task) = preparation {
-        match task.completion.wait(None) {
-            Some(crate::Outcome::Success(_)) => {}
-            Some(crate::Outcome::Failed(error)) => {
-                return Err(Error::Invalid(format!(
-                    "video request preparation failed: {error}"
-                )));
-            }
-            _ => {
-                return Err(Error::Invalid(
-                    "video request preparation was cancelled".into(),
-                ));
-            }
-        }
-    }
-    let store = parts.owners().store;
-    let stream = stream_of(batch)?;
-    let device = batch.device;
-    let features =
-        batch
-            .inputs
-            .read(store, &call.inputs[0], call.call_id, device, Some(&stream))?;
-    let conditions: Vec<Arc<crate::ProductRead>> = call.inputs[1..]
-        .iter()
-        .map(|input| {
-            batch
-                .inputs
-                .read(store, input, call.call_id, device, Some(&stream))
-        })
-        .collect::<Result<_>>()?;
-    let denoiser = parts
-        .video
-        .denoiser
-        .as_mut()
-        .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-    let update = denoiser.runner.initialize(id, slot, call, params)?;
-    let value = features.value();
-    let count = size.as_ref().map_or(0, |size| u64::from(size.tokens));
-    if value.shape().first().copied() != Some(count as i64) {
-        return Err(Error::Invalid(
-            "prompt features disagree with the request's prompt".into(),
-        ));
-    }
-    denoiser.runner.condition(id, slot, value, count)?;
-    if conditioned {
-        let size =
-            size.ok_or_else(|| Error::Invariant("a conditioned request has no size".into()))?;
-        let request = parts.video.request(slot, call.request_key)?;
-        let latents = condition_latents(&request.conditions, &conditions)?;
-        let arguments = [
-            size.descriptor(),
-            size.conditions_descriptor(),
-            size.spans_descriptor(),
-        ];
-        let denoiser = parts
-            .video
-            .denoiser
-            .as_ref()
-            .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-        denoiser
-            .runner
-            .encode_conditions(id, slot, &arguments, latents)?;
-    }
-    batch.calls[index].latent = Some(update);
-    Ok(())
-}
-
-/// Rows of one condition read: `(read, first row, rows)`.
-type RowSpan = (usize, u64, u64);
-
-/// Locate every condition latent in latent preparation's condition reads.
-///
-/// `conditions` are each condition's `(visual rows, audio rows)` in request
-/// order. The reads are the visual rounds' rows in round order (`rounds`
-/// holds each round's row count), then, when any condition carries audio,
-/// one read of every track's rows (`tracks`). The visual rounds hold the
-/// conditions' visual rows back to back, and a round ends wherever its
-/// units do, so a condition's rows may continue into the next round.
-///
-/// Returns the latents in request order, a condition's visual rows before
-/// its audio rows, each as the spans that hold its rows in row order.
-fn condition_spans(
-    conditions: &[(u64, u64)],
-    rounds: &[u64],
-    tracks: Option<u64>,
-) -> Result<Vec<Vec<RowSpan>>> {
-    let mismatch =
-        || Error::Invalid("condition latents disagree with the request's planned rows".into());
-    let visual: u64 = conditions.iter().map(|rows| rows.0).sum();
-    let audio: u64 = conditions.iter().map(|rows| rows.1).sum();
-    if rounds.iter().sum::<u64>() != visual || tracks.unwrap_or(0) != audio {
-        return Err(mismatch());
-    }
-    // The audio read follows the visual rounds.
-    let track_read = rounds.len();
-    let mut result = Vec::new();
-    let (mut round, mut row, mut audio_row) = (0usize, 0u64, 0u64);
-    for &(visual_rows, audio_rows) in conditions {
-        if visual_rows > 0 {
-            let mut spans = Vec::new();
-            let mut needed = visual_rows;
-            while needed > 0 {
-                let available = *rounds.get(round).ok_or_else(mismatch)? - row;
-                let taken = available.min(needed);
-                if taken > 0 {
-                    spans.push((round, row, taken));
-                }
-                needed -= taken;
-                row += taken;
-                if taken == available {
-                    round += 1;
-                    row = 0;
-                }
-            }
-            result.push(spans);
-        }
-        if audio_rows > 0 {
-            result.push(vec![(track_read, audio_row, audio_rows)]);
-            audio_row += audio_rows;
-        }
-    }
-    Ok(result)
-}
-
-/// The condition latents of latent preparation's condition `reads`, each a
-/// list of row tensors that together hold its rows (see
-/// [`condition_spans`]).
-fn condition_latents(
-    conditions: &[VideoCondition],
-    reads: &[Arc<crate::ProductRead>],
-) -> Result<Vec<Any>> {
-    let audio = conditions.iter().any(|condition| condition.audio_rows > 0);
-    let (rounds, tracks) = match (audio, reads.split_last()) {
-        (true, Some((tracks, rounds))) => (rounds, Some(tracks)),
-        (true, None) => {
-            return Err(Error::Invalid(
-                "condition latents lack their audio rows".into(),
-            ));
-        }
-        (false, _) => (reads, None),
-    };
-    let rows = |read: &Arc<crate::ProductRead>| {
-        read.value().shape().first().copied().unwrap_or(0).max(0) as u64
-    };
-    let planned: Vec<(u64, u64)> = conditions
-        .iter()
-        .map(|condition| (condition.video_rows(), u64::from(condition.audio_rows)))
-        .collect();
-    let round_rows: Vec<u64> = rounds.iter().map(rows).collect();
-    condition_spans(&planned, &round_rows, tracks.map(rows))?
-        .into_iter()
-        .map(|spans| {
-            let parts = spans
-                .into_iter()
-                .map(|(read, first, count)| {
-                    let rows = reads[read].value().narrow(0, first as i64, count as i64)?;
-                    Ok(Any::from(rows.to_tensor()?))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Any::from(list(parts)))
-        })
-        .collect()
-}
-
-/// Advance a request's trajectory by one step; the final step publishes the
-/// rank's rows of each modality's latents.
-fn denoise(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
-    slot: usize,
-    placement: &Placement<'_>,
-) -> Result<()> {
-    let call = &plan.calls[index];
-    let params = latent_params(plan, call)?;
-    let id = parts
-        .video
-        .request(slot, call.request_key)?
-        .layout
-        .ok_or_else(|| Error::Invariant("a denoising request has no layout".into()))?;
-    let num_steps = parts.video.model.facts.num_steps;
-    let names: Vec<String> = call
-        .outputs
-        .iter()
-        .map(|output| parts.video.product_name(call, output).map(str::to_owned))
-        .collect::<Result<_>>()?;
-    let denoiser = parts
-        .video
-        .denoiser
-        .as_mut()
-        .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-    let (update, _) = denoiser.runner.denoise(id, slot, call, params)?;
-    batch.calls[index].latent = Some(update);
-    if call.outputs.is_empty() {
-        return Ok(());
-    }
-    if params.start_step + params.step_count != num_steps {
-        return Err(Error::Invalid(
-            "final latent products require completed denoising".into(),
-        ));
-    }
-    let samples = denoiser.runner.final_samples(id)?;
-    let rows = denoiser.runner.sample_rows(id)?;
-    let modalities = parts.video.model.facts.modalities.clone();
-    let owners = parts.owners();
-    let stream = stream_of(batch)?;
-    for (output, name) in call.outputs.iter().zip(&names) {
-        let modality = modalities
-            .iter()
-            .position(|modality| format!("{modality}_latents") == *name)
-            .ok_or_else(|| Error::Invalid(format!("the denoiser publishes no {name}")))?;
-        let (Some(sample), sample_rows) = (&samples[modality], rows[modality]) else {
-            // This rank holds none of the modality's rows.
-            continue;
-        };
-        let shape = vec![sample_rows.rows, sample_rows.width];
-        let region = Some(vec![
-            sample_rows.local.0..sample_rows.local.1,
-            0..sample_rows.width,
-        ]);
-        let bound = bind_outputs(
-            owners.store,
-            &[OutputShape {
-                product: output.clone(),
-                shape,
-                region,
-            }],
-            batch.device,
-            placement,
-        )?;
-        let write = bound
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Invariant("a latent product was not bound".into()))?;
-        batch.calls[index].writes.push(write.clone());
-        owners.store.write(&write, sample, Some(&stream), None)?;
-        let (exported, locations) =
-            export(owners, call, output, &write, false, None, Some(&stream))?;
-        batch.calls[index].publish(write.id(), locations, exported)?;
-    }
-    Ok(())
-}
-
-/// Decode and reconstruct this rank's media unit of a video round into its
-/// row of the round's product.
-fn decode_video(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
-    slot: usize,
-    placement: &Placement<'_>,
-) -> Result<()> {
-    let call = &plan.calls[index];
-    let range = decode_range(plan, call)?;
-    let (frames, canvas, longest, total) = {
-        let request = parts.video.request(slot, call.request_key)?;
-        (
-            request.frames,
-            request.canvas,
-            request.longest(),
-            request.units.len() as u32,
-        )
-    };
-    if call.inputs.len() != 1 || call.outputs.len() != 1 {
-        return Err(Error::Invalid(
-            "media reconstruction requires one tensor input and output".into(),
-        ));
-    }
-    if range.max_units == 0 || range.cursor + range.max_units > total {
-        return Err(Error::Invalid(
-            "media decoder assignment exceeds its media unit range".into(),
-        ));
-    }
-    let rank = parts.video.rank;
-    let decoder = parts
-        .video
-        .decoder
-        .as_ref()
-        .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?;
-    let run = decoder.units(rank, range.cursor, range.max_units)?;
-    if run.is_empty() {
-        // This rank holds no unit of the round and joins no exchange.
-        return Ok(());
-    }
-    if run.len() != 1 {
-        return Err(Error::Unsupported(
-            "video decoding reconstructs one media unit per rank and round".into(),
-        ));
-    }
-    let unit = run.start;
-    let segment: Segment = parts.video.model.segment(frames, canvas, unit)?;
-    let owners = parts.owners();
-    let stream = stream_of(batch)?;
-    let latent = batch.inputs.read(
-        owners.store,
-        &call.inputs[0],
-        call.call_id,
-        batch.device,
-        Some(&stream),
-    )?;
-    let row = u64::from(unit - range.cursor);
-    let shape = vec![
-        u64::from(range.max_units),
-        u64::from(longest),
-        u64::from(canvas.height),
-        u64::from(canvas.width),
-        3,
-    ];
-    let mut region: Vec<Range<u64>> = shape.iter().map(|&extent| 0..extent).collect();
-    region[0] = row..row + 1;
-    let write = bind_outputs(
-        owners.store,
-        &[OutputShape {
-            product: call.outputs[0].clone(),
-            shape,
-            region: Some(region),
-        }],
-        batch.device,
-        placement,
-    )?
-    .into_iter()
-    .next()
-    .ok_or_else(|| Error::Invariant("a decoded unit row was not bound".into()))?;
-    batch.calls[index].writes.push(write.clone());
-    let view = write.view();
-    let out = view.select(0, 0)?;
-    let decoder = &mut parts
-        .video
-        .decoder
-        .as_mut()
-        .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?
-        .runner;
-    let (written, _) = decoder.decode(
-        slot,
-        latent.value(),
-        frames,
-        canvas,
-        segment,
-        unit,
-        range.max_units,
-        &out,
-    )?;
-    let frame_bytes = u64::from(canvas.height) * u64::from(canvas.width) * 3;
-    let padding = u64::from(longest.saturating_sub(written)) * frame_bytes;
-    if padding > 0 {
-        // A short unit's row keeps zero frames after its own for its reader.
-        // SAFETY: the padding lies inside the unit's bound product row,
-        // written on the decoder's stream after the reconstruction.
-        unsafe {
-            memset_d8(
-                out.address() + u64::from(written) * frame_bytes,
-                0,
-                padding as usize,
-                &stream,
-            )?;
-        }
-    }
-    publish_bound(parts, batch, call, index, &write, true)
-}
-
-/// Decode this rank's audio units into its span of the track.
-fn decode_audio(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
-    slot: usize,
-    placement: &Placement<'_>,
-) -> Result<()> {
-    let call = &plan.calls[index];
-    let range = decode_range(plan, call)?;
-    let samples = parts.video.request(slot, call.request_key)?.audio_samples;
-    if call.inputs.len() != 1 || call.outputs.len() != 1 {
-        return Err(Error::Invalid(
-            "media reconstruction requires one tensor input and output".into(),
-        ));
-    }
-    let rank = parts.video.rank;
-    let audio = parts
-        .video
-        .audio
-        .as_ref()
-        .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?;
-    let total = if audio.config.distribution.is_some() {
-        (audio.config.ranks.len() * audio.config.units_per_rank.max(1)) as u32
-    } else {
-        1
-    };
-    let units = range.max_units.min(total).max(1);
-    let run = audio.units(rank, 0, units)?;
-    if run.is_empty() {
-        return Ok(());
-    }
-    let spans = parts.video.model.audio_units(samples, units)?;
-    let first = spans[run.start as usize].start;
-    let last = spans[run.end as usize - 1].end;
-    let owners = parts.owners();
-    let stream = stream_of(batch)?;
-    let latent = batch.inputs.read(
-        owners.store,
-        &call.inputs[0],
-        call.call_id,
-        batch.device,
-        Some(&stream),
-    )?;
-    let write = bind_outputs(
-        owners.store,
-        &[OutputShape {
-            product: call.outputs[0].clone(),
-            shape: vec![samples, 2],
-            region: Some(vec![first..last, 0..2]),
-        }],
-        batch.device,
-        placement,
-    )?
-    .into_iter()
-    .next()
-    .ok_or_else(|| Error::Invariant("an audio span was not bound".into()))?;
-    batch.calls[index].writes.push(write.clone());
-    let audio = &parts
-        .video
-        .audio
-        .as_ref()
-        .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?
-        .runner;
-    let written = audio.decode(
-        latent.value(),
-        samples,
-        run.start,
-        run.len() as u32,
-        units,
-        &write.view(),
-    )?;
-    if written != last - first {
-        return Err(Error::Invalid(
-            "audio units disagree with their sample span".into(),
-        ));
-    }
-    publish_bound(parts, batch, call, index, &write, true)
-}
-
-/// Encode a request's conditions into denoiser rows: a round of visual
-/// units, this rank's of them, or every audio track.
-fn encode_conditions(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
-    slot: usize,
-    placement: &Placement<'_>,
-) -> Result<()> {
-    let call = &plan.calls[index];
-    if call.inputs.len() != 1 || call.outputs.len() != 1 {
-        return Err(Error::Invalid(
-            "condition encoding requires one input and one output".into(),
-        ));
-    }
-    let name = parts.video.product_name(call, &call.outputs[0])?.to_owned();
-    let conditions = Arc::clone(&parts.video.request(slot, call.request_key)?.conditions);
-    if conditions.is_empty() {
-        return Err(Error::Invalid(
-            "condition encoding requires admitted conditions".into(),
-        ));
-    }
-    let rank = parts.video.rank;
-    let latent = parts
-        .video
-        .latent
-        .as_ref()
-        .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
-    let owners = parts.owners();
-    let stream = stream_of(batch)?;
-    let width = row_width(&call.outputs[0])?;
-    match name.as_str() {
-        "condition_video_latents" => {
-            let range = decode_range(plan, call)?;
-            // Every visual unit as (condition, unit, rows), in encoding order.
-            let all: Vec<(usize, u32, u64)> = conditions
-                .iter()
-                .enumerate()
-                .flat_map(|(index, condition)| {
-                    condition
-                        .latent_units
-                        .iter()
-                        .enumerate()
-                        .map(move |(unit, &rows)| (index, unit as u32, u64::from(rows)))
-                })
-                .collect();
-            let (cursor, count) = (range.cursor as usize, range.max_units as usize);
-            if count == 0 || cursor + count > all.len() {
-                return Err(Error::Invalid(
-                    "condition encoding exceeds the admitted units".into(),
-                ));
-            }
-            let round = &all[cursor..cursor + count];
-            let run = latent.units(rank, 0, count as u32)?;
-            if run.is_empty() {
-                return Err(Error::Invalid(
-                    "condition encoding assigns this rank no unit".into(),
-                ));
-            }
-            let rows: u64 = round.iter().map(|unit| unit.2).sum();
-            let first: u64 = round[..run.start as usize].iter().map(|unit| unit.2).sum();
-            let last: u64 = round[..run.end as usize].iter().map(|unit| unit.2).sum();
-            let pixels = batch.inputs.read(
-                owners.store,
-                &call.inputs[0],
-                call.call_id,
-                batch.device,
-                Some(&stream),
-            )?;
-            let mut offsets = Vec::new();
-            let mut cursor_pixels = 0u64;
-            for condition in conditions.iter() {
-                offsets.push(cursor_pixels);
-                cursor_pixels += condition.pixel_bytes() / 3;
-            }
-            let units: Vec<[i64; 5]> = round[run.start as usize..run.end as usize]
-                .iter()
-                .map(|&(condition, unit, _)| {
-                    let (frames, canvas) = conditions[condition].media.pixels().unwrap_or((
-                        0,
-                        Canvas {
-                            width: 0,
-                            height: 0,
-                        },
-                    ));
-                    [
-                        offsets[condition] as i64,
-                        i64::from(frames),
-                        i64::from(canvas.width),
-                        i64::from(canvas.height),
-                        i64::from(unit),
-                    ]
-                })
-                .collect();
-            let write = bind_outputs(
-                owners.store,
-                &[OutputShape {
-                    product: call.outputs[0].clone(),
-                    shape: vec![rows, width],
-                    region: Some(vec![first..last, 0..width]),
-                }],
-                batch.device,
-                placement,
-            )?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
-            batch.calls[index].writes.push(write.clone());
-            let encoded = latent
-                .runner
-                .encode_video(pixels.value(), &units, &write.view())?;
-            let planned: Vec<i64> = round[run.start as usize..run.end as usize]
-                .iter()
-                .map(|unit| unit.2 as i64)
-                .collect();
-            if encoded != planned {
-                return Err(Error::Invalid(
-                    "encoded condition units disagree with their planned rows".into(),
-                ));
-            }
-            publish_bound(parts, batch, call, index, &write, false)?;
-        }
-        "condition_audio_latents" => {
-            // The audio call is one unit, the component's first rank's.
-            let run = latent.units(rank, 0, 1)?;
-            if run.is_empty() {
-                return Ok(());
-            }
-            let lengths: Vec<u64> = conditions
-                .iter()
-                .filter_map(|condition| condition.media.audio().map(|track| track.samples))
-                .collect();
-            let rows: u64 = conditions
-                .iter()
-                .map(|condition| u64::from(condition.audio_rows))
-                .sum();
-            let samples = batch.inputs.read(
-                owners.store,
-                &call.inputs[0],
-                call.call_id,
-                batch.device,
-                Some(&stream),
-            )?;
-            let write = bind_outputs(
-                owners.store,
-                &[OutputShape {
-                    product: call.outputs[0].clone(),
-                    shape: vec![rows, width],
-                    region: None,
-                }],
-                batch.device,
-                placement,
-            )?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
-            batch.calls[index].writes.push(write.clone());
-            let encoded = latent
-                .runner
-                .encode_audio(samples.value(), &lengths, &write.view())?;
-            let planned: Vec<i64> = conditions
-                .iter()
-                .filter(|condition| condition.audio_rows > 0)
-                .map(|condition| i64::from(condition.audio_rows))
-                .collect();
-            if encoded != planned {
-                return Err(Error::Invalid(
-                    "encoded audio tracks disagree with their planned rows".into(),
-                ));
-            }
-            publish_bound(parts, batch, call, index, &write, false)?;
-        }
-        other => {
-            return Err(Error::Invalid(format!(
-                "latent encoding does not produce {other}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 impl crate::executor::lifecycle::RequestStorage for VideoRuntime {
     fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
         // A request's state is created when its admission is installed.
@@ -1499,17 +612,10 @@ impl crate::executor::lifecycle::RequestStorage for VideoRuntime {
     fn retirement_ready(
         &mut self,
         _buffers: &HashSet<BufferId>,
-        requests: &HashSet<RequestKey>,
+        _requests: &HashSet<RequestKey>,
         _retained: &HashSet<BufferId>,
     ) -> Result<bool> {
-        // A drawing task writes its slot's sources until it finishes.
-        Ok(self.requests.values().all(|request| {
-            !requests.contains(&request.key)
-                || request
-                    .preparation
-                    .as_ref()
-                    .is_none_or(|task| task.completion.done())
-        }))
+        Ok(true)
     }
 
     fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
@@ -1536,9 +642,6 @@ impl crate::executor::lifecycle::RequestStorage for VideoRuntime {
     }
 
     fn set_wake(&self, wake: Option<uniserve_ipc::Wake>) {
-        if let Some(lane) = &self.noise {
-            lane.set_wake(wake.clone());
-        }
         if let Some(host) = &self.host {
             host.lane.set_wake(wake);
         }
@@ -1546,11 +649,7 @@ impl crate::executor::lifecycle::RequestStorage for VideoRuntime {
 
     fn close(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
-        for lane in self
-            .noise
-            .iter()
-            .chain(self.host.as_ref().map(|host| &host.lane))
-        {
+        if let Some(lane) = self.host.as_ref().map(|host| &host.lane) {
             if aborted {
                 lane.abort();
             } else {
@@ -1583,16 +682,6 @@ impl crate::executor::lifecycle::RequestStorage for VideoRuntime {
     }
 }
 
-impl super::batch::Trajectories for VideoDenoiser {
-    fn validate(&self, updates: &[crate::LatentUpdate]) -> Result<()> {
-        VideoDenoiser::validate(self, updates)
-    }
-
-    fn apply(&mut self, updates: &[crate::LatentUpdate]) {
-        VideoDenoiser::apply(self, updates);
-    }
-}
-
 /// What the video runtime is built from at startup.
 pub(crate) struct RuntimeSetup<'a> {
     pub(crate) interface: &'a crate::model::interface::Interface,
@@ -1606,15 +695,13 @@ pub(crate) struct RuntimeSetup<'a> {
     pub(crate) graphs: &'a mut crate::cuda_graph::GraphStorage<String, Handle>,
     /// The attention backend the model loaded with.
     pub(crate) attention: String,
-    /// The product arena of the rank's device, which encoder bindings name
-    /// products in.
-    pub(crate) products: Option<crate::storage::memory::StorageView>,
 }
 
 /// Graph storage keys of the video runtime's owners.
 const DENOISER_GRAPHS: usize = 1000;
 const DECODER_GRAPHS: usize = 1001;
 const TEXT_GRAPHS: usize = 1002;
+const AUDIO_GRAPHS: usize = 1003;
 
 /// A stream forked for one component's calls and its workspace allocator.
 fn component_stream(
@@ -1649,7 +736,6 @@ impl VideoRuntime {
             lanes,
             graphs,
             attention,
-            products: arena,
         } = setup;
         let crate::capacity::video::VideoCapacity {
             media: plan,
@@ -1758,9 +844,6 @@ impl VideoRuntime {
                     .find(|call| call.is(crate::model::components::Capability::TextEncoder))
                     .map(|call| call.path.clone())
                     .unwrap_or_default();
-                let products = arena.clone().ok_or_else(|| {
-                    Error::Invariant("a text encoding rank has no product arena".into())
-                })?;
                 let (stream, _) = component_stream(lanes, MediaCall::TextEncoding, device)?;
                 text_pool = pool(graphs, TEXT_GRAPHS, &placed.name, device, None)?;
                 let runner = TextEncoding::new(TextSetup {
@@ -1784,7 +867,6 @@ impl VideoRuntime {
                             .collect(),
                         max_text_tokens: plan.max_text_tokens as usize,
                     },
-                    products,
                     vision: has(crate::model::components::Capability::PatchEncoder),
                 })?;
                 text = Some(Component {
@@ -1800,28 +882,31 @@ impl VideoRuntime {
                     .ok_or_else(|| Error::Invariant("a denoising rank has no slot state".into()))?;
                 let (stream, allocate) = component_stream(lanes, MediaCall::Denoising, device)?;
                 let graph_pool = pool(graphs, DENOISER_GRAPHS, &placed.name, device, None)?;
-                let conditioner = placed.calls.iter().any(|call| {
+                let conditioner = placed.calls.iter().find(|call| {
                     call.method == "encode"
                         && call.is(crate::model::components::Capability::Encoder)
                 });
                 let conditioning = match (conditioner, conditioning) {
-                    (true, Some((width, dtype))) => {
-                        Some((plan.text_capacities.clone(), width, dtype))
-                    }
-                    (true, None) => {
+                    (Some(call), Some((width, dtype))) => Some(Conditioning {
+                        path: call.path.clone(),
+                        capacities: plan.text_capacities.clone(),
+                        width,
+                        dtype,
+                    }),
+                    (Some(_), None) => {
                         return Err(Error::Unsupported(
                             "the text conditioner has no text encoder features".into(),
                         ));
                     }
-                    (false, _) => None,
+                    (None, _) => None,
                 };
                 let Device::Cuda(index) = device else {
                     return Err(Error::Unsupported(
                         "the video denoiser computes on CUDA".into(),
                     ));
                 };
-                let runner = VideoDenoiser::new(crate::runner::diffusion::video::DenoiserSetup {
-                    bind: &interface.function("video.bind_denoiser")?,
+                let runner = DenoiserRunner::new(crate::runner::denoiser::DenoiserSetup {
+                    interface,
                     loaded,
                     component: &placed.name,
                     stream,
@@ -1844,31 +929,64 @@ impl VideoRuntime {
                     runner,
                 });
             }
+            // The module path of the placed call of a capability.
+            let path = |capability: crate::model::components::Capability| -> Result<&str> {
+                placed
+                    .calls
+                    .iter()
+                    .find(|call| call.is(capability))
+                    .map(|call| call.path.as_str())
+                    .ok_or_else(|| {
+                        Error::Invariant(format!(
+                            "component {} calls no {}",
+                            placed.name,
+                            capability.tag()
+                        ))
+                    })
+            };
             if has(crate::model::components::Capability::VideoDecoder) {
                 let (stream, allocate) = component_stream(lanes, MediaCall::VideoDecoding, device)?;
                 let graph_pool = pool(graphs, DECODER_GRAPHS, &placed.name, device, None)?;
-                let mut window = (0, DType::F32);
-                for segment in segments(&model, &plan)? {
-                    let size = model.window(segment)?;
-                    window = (window.0.max(size.0), size.1);
-                }
-                let mut overlap = (0, DType::F16);
+                let mut capacity = DecodeCapacity {
+                    latent: [0, 0],
+                    frames: [0, 0, 0],
+                    overlap: (0, DType::F16),
+                };
+                let longest = model
+                    .unit_frames(plan.max_frames())?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
                 for &canvas in &plan.canvases {
                     let size = model.overlap(canvas)?;
-                    overlap = (overlap.0.max(size.0), size.1);
+                    capacity.overlap = (capacity.overlap.0.max(size.0), size.1);
+                    let layout = model.layout_size(&VideoSize::plain(
+                        plan.max_frames(),
+                        canvas,
+                        plan.max_text_tokens,
+                    ))?;
+                    let latent = model.latent_shape("video", &layout)?;
+                    let [rows, width] = latent[..] else {
+                        return Err(Error::Interface("a video latent is [rows, width]".into()));
+                    };
+                    capacity.latent = [capacity.latent[0].max(rows), width];
+                    capacity.frames = [
+                        u64::from(longest),
+                        capacity.frames[1].max(u64::from(canvas.height)),
+                        capacity.frames[2].max(u64::from(canvas.width)),
+                    ];
                 }
                 let runner = VideoDecoding::new(
-                    crate::runner::video::BindingSetup {
-                        bind: &interface.function("video.bind_decoder")?,
+                    RunnerSetup {
+                        interface,
                         loaded,
-                        component: &placed.name,
+                        path: path(crate::model::components::Capability::VideoDecoder)?,
                         stream,
                         device: device_index(device)?,
                         attention: attention.clone(),
                         allocate,
                     },
-                    window,
-                    overlap,
+                    capacity,
                     slots,
                     graph_pool,
                 )?;
@@ -1881,15 +999,31 @@ impl VideoRuntime {
             }
             if has(crate::model::components::Capability::AudioDecoder) {
                 let (stream, allocate) = component_stream(lanes, MediaCall::AudioDecoding, device)?;
-                let runner = AudioDecoding::new(crate::runner::video::BindingSetup {
-                    bind: &interface.function("video.bind_audio_decoder")?,
-                    loaded,
-                    component: &placed.name,
-                    stream,
-                    device: device_index(device)?,
-                    attention: attention.clone(),
-                    allocate,
-                })?;
+                let graph_pool = pool(graphs, AUDIO_GRAPHS, &placed.name, device, None)?;
+                // A track's latent does not depend on the canvas.
+                let layout = model.layout_size(&VideoSize::plain(
+                    plan.max_frames(),
+                    plan.canvases[0],
+                    plan.max_text_tokens,
+                ))?;
+                let latent = model.latent_shape("audio", &layout)?;
+                let [rows, width] = latent[..] else {
+                    return Err(Error::Interface("an audio latent is [rows, width]".into()));
+                };
+                let runner = AudioDecoding::new(
+                    RunnerSetup {
+                        interface,
+                        loaded,
+                        path: path(crate::model::components::Capability::AudioDecoder)?,
+                        stream,
+                        device: device_index(device)?,
+                        attention: attention.clone(),
+                        allocate,
+                    },
+                    [rows, width],
+                    model.track_samples(plan.max_frames())?,
+                    graph_pool,
+                )?;
                 audio = Some(Component {
                     name: placed.name.clone(),
                     config: placed.config.clone(),
@@ -1900,15 +1034,21 @@ impl VideoRuntime {
             if has(crate::model::components::Capability::VideoEncoder) {
                 let (stream, allocate) =
                     component_stream(lanes, MediaCall::LatentEncoding, device)?;
-                let runner = LatentEncoding::new(crate::runner::video::BindingSetup {
-                    bind: &interface.function("video.bind_latent_encoder")?,
-                    loaded,
-                    component: &placed.name,
-                    stream,
-                    device: device_index(device)?,
-                    attention: attention.clone(),
-                    allocate,
-                })?;
+                let setup = |capability| -> Result<RunnerSetup<'_>> {
+                    Ok(RunnerSetup {
+                        interface,
+                        loaded,
+                        path: path(capability)?,
+                        stream: stream.clone(),
+                        device: device_index(device)?,
+                        attention: attention.clone(),
+                        allocate: allocate.clone(),
+                    })
+                };
+                let runner = LatentEncoding::new(
+                    setup(crate::model::components::Capability::VideoEncoder)?,
+                    setup(crate::model::components::Capability::AudioEncoder)?,
+                )?;
                 latent = Some(Component {
                     name: placed.name.clone(),
                     config: placed.config.clone(),
@@ -1920,34 +1060,16 @@ impl VideoRuntime {
         let host = if host_components.is_empty() {
             None
         } else {
-            let reader = if host_components.contains_key("media_reader") {
-                let functions = crate::host::reader::ReaderFunctions::new(interface, loaded)?;
-                Some(Arc::new(ConditionReader::new(
-                    functions,
-                    config.ffmpeg.clone(),
-                    model.facts.frame_rate,
-                )))
-            } else {
-                None
-            };
             let capacity =
                 (info.queue_depth as usize * info.max_batch_calls.max(1) as usize).max(1);
-            Some(HostMedia {
-                reader,
-                encode_video: interface.function("media.encode_video_unit")?,
-                encode_audio: interface.function("media.encode_audio_track")?,
-                mux: MuxFunctions::new(interface)?,
-                lane: HostLane::new(capacity, 1, "uniserve-media")?,
-                components: host_components,
-            })
-        };
-        let noise = match &denoiser {
-            Some(_) => Some(HostLane::new(
-                config.max_request_pool_size.max(1),
-                1,
-                "uniserve-noise",
-            )?),
-            None => None,
+            Some(MediaRunner::new(
+                interface,
+                loaded,
+                host_components,
+                config.ffmpeg.clone(),
+                model.facts.frame_rate,
+                capacity,
+            )?)
         };
         let device = match config.device {
             crate::config::Device::Cuda(index) => Some(index),
@@ -1964,45 +1086,37 @@ impl VideoRuntime {
             text_pool,
             denoiser,
             decoder,
+            decoder_shapes: Vec::new(),
+            audio_units: Vec::new(),
             audio,
             latent,
             host,
-            noise,
             outputs: OutputPool::new(device, leases, words),
             products,
             output_ranks,
         })
     }
 
-    /// The bindings whose kernels the rank reports.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<crate::ffi::Record>)>> {
-        let mut functions = Vec::new();
-        if let Some(denoiser) = &self.denoiser {
-            functions.push((denoiser.name.clone(), denoiser.runner.kernels().clone()));
-        }
-        if let Some(decoder) = &self.decoder {
-            functions.push((decoder.name.clone(), decoder.runner.kernels().clone()));
-        }
-        if let Some(audio) = &self.audio {
-            functions.push((audio.name.clone(), audio.runner.kernels().clone()));
-        }
-        if let Some(latent) = &self.latent {
-            functions.push((latent.name.clone(), latent.runner.kernels().clone()));
-        }
+    /// The kernels each component's operators selected.
+    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<Record>)>> {
         let mut kernels = Vec::new();
         if let Some(text) = &self.text {
             kernels.push((text.name.clone(), text.runner.kernels()?));
         }
-        for (label, function) in functions {
-            let value: tvm_ffi::Array<Any> = function.call_as(&[])?;
-            let records = value
-                .iter()
-                .enumerate()
-                .map(|(index, record)| {
-                    crate::ffi::Record::new(format!("{label}.kernels[{index}]"), record)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            kernels.push((label, records));
+        if let Some(denoiser) = &self.denoiser {
+            kernels.push((
+                denoiser.name.clone(),
+                denoiser.runner.kernels(&denoiser.name)?,
+            ));
+        }
+        if let Some(decoder) = &self.decoder {
+            kernels.push((decoder.name.clone(), decoder.runner.kernels(&decoder.name)?));
+        }
+        if let Some(audio) = &self.audio {
+            kernels.push((audio.name.clone(), audio.runner.kernels(&audio.name)?));
+        }
+        if let Some(latent) = &self.latent {
+            kernels.push((latent.name.clone(), latent.runner.kernels(&latent.name)?));
         }
         Ok(kernels)
     }
@@ -2027,11 +1141,9 @@ impl VideoRuntime {
                     ids.push(id);
                 }
             }
-            runner.prepare_conditioner()?;
             // A placeholder request in slot one warms every layout before
             // any capture: kernels, plans and scratch are created by a
             // layout's first step.
-            let prepare = runner.preparation();
             for &id in &ids {
                 let key = runner.key(id)?;
                 let size = VideoSize::plain(
@@ -2039,38 +1151,45 @@ impl VideoRuntime {
                     key.canvas,
                     key.text_rows.min(plan.max_text_tokens),
                 );
-                prepare.call_values(&[
-                    Any::from(1_i64),
-                    Any::from(id as i64),
-                    size.descriptor(),
-                    size.conditions_descriptor(),
-                    size.spans_descriptor(),
-                    Any::from(0_i64),
-                ])?;
+                runner.prepare_latents(id, 1, &size, 0)?;
                 runner.warm(id, 1)?;
             }
             runner.warm_conditioner(false)?;
         }
         if let Some(decoder) = &mut self.decoder {
-            let segments = segments(model, plan)?;
-            decoder.runner.prepare(&segments, &plan.canvases)?;
-            decoder.runner.warm(&segments)?;
+            decoder.runner.prepare(&segments(model, plan)?)?;
             let width = (decoder.config.ranks.len() * decoder.config.units_per_rank.max(1)) as u32;
+            // One round of each shape warms the ring and is captured: a
+            // round's shape is its canvas, whether it holds the video's
+            // first and last units, and how many members hold a unit. Every
+            // member derives the same rounds in the same order.
+            let mut warmed = HashSet::new();
             for &canvas in &plan.canvases {
                 for &frames in plan.frame_counts.iter().rev() {
-                    let total = model.unit_frames(frames)?.len() as u32;
+                    let units = model.unit_frames(frames)?;
+                    let total = units.len() as u32;
+                    let longest = units.iter().copied().max().unwrap_or(0);
                     let mut cursor = 0;
                     while cursor < total {
                         let count = width.min(total - cursor);
+                        let round = (canvas, cursor == 0, cursor + count == total, count);
                         let run = decoder.units(self.rank, cursor, count)?;
-                        if !run.is_empty() {
-                            decoder.runner.warm_unit(frames, canvas, run.start, count)?;
+                        if warmed.insert(round) && !run.is_empty() {
+                            let unit = run.start;
+                            let shape = UnitShape {
+                                segment: model.segment(frames, canvas, unit)?,
+                                first: unit == 0,
+                                last: unit + 1 == total,
+                                count,
+                            };
+                            let rows = model.window_rows(frames, canvas, unit)?;
+                            decoder.runner.warm(shape, rows, longest)?;
+                            self.decoder_shapes.push((shape, rows, longest));
                         }
                         cursor += count;
                     }
                 }
             }
-            decoder.runner.stream().synchronize()?;
         }
         if let Some(audio) = &mut self.audio {
             let total = if audio.config.distribution.is_some() {
@@ -2087,21 +1206,29 @@ impl VideoRuntime {
                 let samples = model.track_samples(frames)?;
                 let layout =
                     model.layout_size(&VideoSize::plain(frames, canvas, plan.max_text_tokens))?;
-                let shape = model.latent_shape("audio", &layout)?;
+                let rows = model.latent_shape("audio", &layout)?[0];
                 let run = audio.units(self.rank, 0, total)?;
                 if !run.is_empty() {
-                    audio
-                        .runner
-                        .warm(samples, run.start, run.len() as u32, total, &shape)?;
+                    let spans = model.audio_units(samples, total)?;
+                    let units = TrackUnits {
+                        samples,
+                        latent_frames: model.audio_latent_frames(samples)?,
+                        first: run.start,
+                        count: run.len() as u32,
+                        total,
+                        span: spans[run.end as usize - 1].end - spans[run.start as usize].start,
+                    };
+                    audio.runner.warm(units, rows)?;
+                    self.audio_units.push((units, rows));
                 }
             }
-            audio.runner.stream().synchronize()?;
         }
         Ok(())
     }
 
-    /// Capture the denoiser's startup layouts and conditioner capacities and
-    /// the decoder's segments, then refuse further captures.
+    /// Capture the text encoder's prompt capacities and the denoiser's
+    /// startup layouts and conditioner capacities, then refuse further
+    /// captures.
     pub(crate) fn capture_startup(&mut self) -> Result<()> {
         if let Some(text) = &mut self.text {
             // Prompt capacities are warmed and captured largest first, the
@@ -2121,9 +1248,18 @@ impl VideoRuntime {
             runner.seal();
         }
         if let Some(decoder) = &mut self.decoder {
-            let segments = segments(&self.model, &self.plan)?;
-            decoder.runner.capture(&segments)?;
+            for (shape, rows, longest) in std::mem::take(&mut self.decoder_shapes) {
+                decoder.runner.capture(shape, rows, longest)?;
+            }
+            decoder.runner.stream().synchronize()?;
             decoder.runner.seal();
+        }
+        if let Some(audio) = &mut self.audio {
+            for (units, rows) in std::mem::take(&mut self.audio_units) {
+                audio.runner.capture(units, rows)?;
+            }
+            audio.runner.stream().synchronize()?;
+            audio.runner.seal();
         }
         Ok(())
     }
@@ -2198,36 +1334,6 @@ mod tests {
             distribution: distribution.then_some(ComponentDistribution::TemporalUnits),
             units_per_rank,
         }
-    }
-
-    #[test]
-    fn condition_latents_follow_their_rows_across_encoding_rounds() {
-        // A keyframe of 4 rows, a reference video of 10 rows with 3 audio
-        // rows and a voice of 2 audio rows; the encoder published the
-        // visual rows in rounds of 6, 5 and 3 rows.
-        let conditions = [(4, 0), (10, 3), (0, 2)];
-        let latents = condition_spans(&conditions, &[6, 5, 3], Some(5)).unwrap();
-        assert_eq!(
-            latents,
-            vec![
-                vec![(0, 0, 4)],
-                // The video continues through the second round into the third.
-                vec![(0, 4, 2), (1, 0, 5), (2, 0, 3)],
-                // The audio read follows the three visual rounds.
-                vec![(3, 0, 3)],
-                vec![(3, 3, 2)],
-            ]
-        );
-
-        // Reads that hold other rows than the request planned are refused.
-        assert!(condition_spans(&conditions, &[6, 5], Some(5)).is_err());
-        assert!(condition_spans(&conditions, &[6, 5, 3], Some(4)).is_err());
-        assert!(condition_spans(&conditions, &[6, 5, 3], None).is_err());
-        // Without audio, every read is a visual round.
-        assert_eq!(
-            condition_spans(&[(4, 0)], &[4], None).unwrap(),
-            vec![vec![(0, 0, 4)]]
-        );
     }
 
     #[test]

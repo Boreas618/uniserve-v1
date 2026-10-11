@@ -97,7 +97,7 @@ impl ImageBatch<'_> {
                         }
                     };
                     let runner = &self.runtime.encoders[route];
-                    let region = Region::within(runner.products(), read.value());
+                    let region = Region::within(runner.products()?, read.value());
                     self.reads.push(read);
                     runner.prepare_resident(&region?, tower, range == ValueRange::SignedUnit)?
                 }
@@ -126,7 +126,7 @@ impl ImageBatch<'_> {
         let runner = &mut self.runtime.encoders[route];
         let regions = writes
             .iter()
-            .map(|write| Region::within(runner.products(), &write.view()))
+            .map(|write| Region::within(runner.products()?, &write.view()))
             .collect::<Result<Vec<_>>>()?;
         let borrowed: Vec<&PreparedImage> = images.iter().collect();
         let encoded = runner.encode(&borrowed, &regions)?;
