@@ -286,31 +286,46 @@ pub struct PeerGroup<'a> {
 }
 
 impl PeerGroup<'_> {
-    /// Bind `binding`'s collectives to NCCL communicators on its stream
-    /// (`owner`), collectively over each group's members, and route the
-    /// binding's numerical collectives to them (`distributed.bind_collectives`).
-    /// `None` when the binding's component communicates over no group, and
-    /// for a host binding: it has no stream, and its collectives run on the
-    /// component's host process groups.
+    /// Bind the collectives of `component` on `device` to NCCL
+    /// communicators on its stream (`owner`), collectively over each
+    /// group's members. `None` when the component communicates over no
+    /// group, and on the host: a host component has no stream, and its
+    /// collectives run on the component's host process groups.
+    pub fn stream_collectives(
+        &self,
+        component: &str,
+        device: Device,
+        owner: Option<&crate::stream::CUDAStream>,
+    ) -> Result<Option<crate::parallel::StreamCollectives>> {
+        let Some(groups) = self
+            .collectives
+            .get(component)
+            .filter(|groups| !groups.is_empty())
+        else {
+            return Ok(None);
+        };
+        if device == Device::Cpu {
+            return Ok(None);
+        }
+        let owner = owner
+            .ok_or_else(|| Error::Unsupported("stream collectives require a CUDA stream".into()))?;
+        crate::parallel::StreamCollectives::bind(owner, self.group, groups).map(Some)
+    }
+
+    /// Bind `binding`'s collectives ([`Self::stream_collectives`]) and
+    /// route the binding's numerical collectives to them
+    /// (`distributed.bind_collectives`).
     pub fn bind_collectives(
         &self,
         interface: &Interface,
         binding: &ComponentBinding,
         owner: Option<&crate::stream::CUDAStream>,
     ) -> Result<Option<crate::parallel::StreamCollectives>> {
-        let Some(groups) = self
-            .collectives
-            .get(&binding.component)
-            .filter(|groups| !groups.is_empty())
+        let Some(collectives) =
+            self.stream_collectives(&binding.component, binding.device, owner)?
         else {
             return Ok(None);
         };
-        if binding.device == Device::Cpu {
-            return Ok(None);
-        }
-        let owner = owner
-            .ok_or_else(|| Error::Unsupported("stream collectives require a CUDA stream".into()))?;
-        let collectives = crate::parallel::StreamCollectives::bind(owner, self.group, groups)?;
         interface
             .function("distributed.bind_collectives")?
             .call_values(&[binding.prepared().to_any(), collectives.tables()])?;

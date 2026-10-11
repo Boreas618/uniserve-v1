@@ -14,9 +14,10 @@ import path to construct the numerical side:
   when the exchange has one.
 * ``symmetric_bytes(...)`` sizes the peer-mapped storage of split MegaMoE,
   which the caller allocates and maps.
-* ``join(prepared, capacity)`` runs one expert step of ``capacity`` in which
-  this rank joins every expert layer of a prepared component with no tokens
-  of its own.
+* ``join(owner, capacity)`` runs one expert step of ``capacity`` in which
+  this rank joins every expert layer of the owner's execution context with
+  no tokens of its own; :class:`ExpertLayers` is the owner on an expert-only
+  rank.
 * ``warm_thread(device)`` prepares a microbatch thread's thread-local
   numerical state (cuBLAS handle) before graph capture.
 * ``close_exchange(exchange)`` releases an exchange; collective for
@@ -215,16 +216,52 @@ def bind_microbatches(exchanges) -> None:
     exchanges[0].bind_microbatches(exchanges)
 
 
-def join(prepared, capacity: int) -> None:
+class ExpertLayers:
+    """The routed expert layers of an expert-only rank on one stream.
+
+    The rank holds no forward of its own: its layers run only the tokens
+    other ranks route to them, through :func:`join`.
+
+    Args:
+        loaded: The loaded model, the rank's routed expert layers.
+        stream: The CUDA stream handle of one microbatch.
+        scratch: The stream's shared work areas.
+        exchange: The microbatch's expert exchange.
+        max_tokens: The most tokens a rank sends per expert step.
+    """
+
+    def __init__(
+        self, loaded, stream: int, scratch, exchange, max_tokens: int
+    ) -> None:
+        from uniserve_models.model import TextSize
+        from uniserve_models.runner.context import execution_context
+
+        self.context = execution_context(
+            loaded.module,
+            int(stream),
+            loaded.attention,
+            scratch,
+            experts=exchange,
+        )
+        self.context.prepare(TextSize(int(max_tokens), 1))
+
+    def close(self) -> None:
+        """Release the layers' operators after every join graph retired."""
+        self.context.close()
+
+
+def join(owner, capacity: int) -> None:
     """Join one expert step of ``capacity`` tokens per rank with no tokens.
 
-    On the stream of the prepared component ``prepared``, every expert
-    layer exchanges, runs the tokens other ranks route to this rank's
-    experts and returns their results; this rank sends none.
+    ``owner`` holds the execution context of a module with expert-parallel
+    layers as ``context``: a runner, a prepared component or the
+    :class:`ExpertLayers` of an expert-only rank. On the context's stream,
+    every expert layer exchanges, runs the tokens other ranks route to this
+    rank's experts and returns their results; this rank sends none.
     """
-    context = prepared.context
+    context = owner.context
     if context is None:
-        raise ValueError("expert joins require a bound component")
+        raise ValueError("expert joins require a prepared execution context")
     with (
         torch.inference_mode(),
         context.activate(),
