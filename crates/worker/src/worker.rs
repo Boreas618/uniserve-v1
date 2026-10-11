@@ -834,12 +834,10 @@ impl Worker {
             .executor
             .as_mut()
             .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
-        let mut records = KernelRecords::default();
+        let mut records = KernelRecords::new(&self.interface).map_err(phase("warmup"))?;
         if let Some(text) = executor.backend().text() {
             for (label, device, kernels) in text.kernels().map_err(phase("warmup"))? {
-                records
-                    .add(&label, &device, &kernels)
-                    .map_err(phase("warmup"))?;
+                records.add(&label, &device, &kernels);
             }
         }
         for (label, device, kernels) in executor
@@ -847,9 +845,7 @@ impl Worker {
             .image_kernels()
             .map_err(phase("warmup"))?
         {
-            records
-                .add(&label, &device, &kernels)
-                .map_err(phase("warmup"))?;
+            records.add(&label, &device, &kernels);
         }
         if executor.backend().serves_video() {
             let backend = executor.backend();
@@ -863,19 +859,17 @@ impl Worker {
                     .map_err(phase("warmup"))?,
             );
             for (label, kernels) in video {
-                records
-                    .add(&label, &self.config.device.to_string(), &kernels)
-                    .map_err(phase("warmup"))?;
+                records.add(&label, &self.config.device.to_string(), &kernels);
             }
         }
         for runner in executor.backend_mut().diffusion_lm_mut() {
             let (label, kernels) = runner.kernels().map_err(phase("warmup"))?;
-            records
-                .add(&label, &self.config.device.to_string(), &kernels)
-                .map_err(phase("warmup"))?;
+            records.add(&label, &self.config.device.to_string(), &kernels);
             runner.seal();
         }
-        records.log("startup", self.config.rank, &self.config.device.to_string());
+        records
+            .log("startup", self.config.rank, &self.config.device.to_string())
+            .map_err(phase("warmup"))?;
         if let Some(text) = executor.backend_mut().text_mut() {
             text.seal();
         }

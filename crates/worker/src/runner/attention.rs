@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use uniserve_cuda::Stream;
 
-use crate::ffi::{Backing, DType, Fields};
+use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable, TablePages};
 use crate::{Error, Result};
@@ -135,15 +135,6 @@ impl AttentionColumns {
             .find(|(column, _)| *column == name)
             .map(|(_, view)| view)
             .ok_or_else(|| Error::Invariant(format!("attention columns have no {name}")))
-    }
-
-    /// The columns keyed as a binding receives them.
-    pub fn tensors(&self, fields: Fields) -> Result<Fields> {
-        let mut fields = fields;
-        for (name, view) in &self.columns {
-            fields = fields.with(name, view.to_tensor()?);
-        }
-        Ok(fields)
     }
 
     /// Select `rows`' pages, pack the host columns and copy them to the

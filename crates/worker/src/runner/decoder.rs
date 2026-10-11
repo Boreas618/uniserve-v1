@@ -51,10 +51,11 @@ use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::batch::image::{Encoding, ImageBatch, allocations, lock};
 use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::ffi::{DType, Function, Handle, Record, integer_list};
+use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
 use crate::parallel::joins::GraphFunctions;
+use crate::profiling::kernels::KernelRecord;
 use crate::runner::{ImageSetup, Methods, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
@@ -282,14 +283,16 @@ impl DecoderRunner {
     }
 
     /// The kernels the operators of a video or audio decoder selected.
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<KernelRecord>> {
         match &self.family {
             Family::Image(image) => {
                 let records: tvm_ffi::Array<Any> = image.kernels.call_as(&[image.runner.view()])?;
                 records
                     .iter()
                     .enumerate()
-                    .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+                    .map(|(index, record)| {
+                        KernelRecord::new(format!("{label}.kernels[{index}]"), record)
+                    })
                     .collect()
             }
             Family::Video(video) => video.kernels(label),
@@ -1117,7 +1120,7 @@ impl VideoDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<KernelRecord>> {
         self.methods
             .kernels(label, self.runners.iter().map(|(_, runner)| runner))
     }
@@ -1308,7 +1311,7 @@ impl AudioDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<KernelRecord>> {
         self.methods.kernels(label, self.runners.values())
     }
 

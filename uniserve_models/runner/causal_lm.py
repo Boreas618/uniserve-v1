@@ -64,7 +64,7 @@ from uniserve_models.nn.attention.gather import (
     gather_request_decode_inputs,
     gather_request_rows,
 )
-from uniserve_models.runner.context import execution_context
+from uniserve_models.runner.context import execution_context, kernel_records
 from uniserve_models.sampling.greedy import greedy
 from uniserve_models.sampling.logprobs import (
     LogprobRequest,
@@ -342,9 +342,9 @@ class CausalLMRunner:
         """
         return self._context.plans_attention()
 
-    def kernels(self) -> list[dict[str, Any]]:
-        """The selected kernel of every operator of the execution context."""
-        return list(self._context.kernels())
+    def kernels(self) -> list[str]:
+        """The kernels the runner's operators selected, as JSON objects."""
+        return kernel_records(self._context.kernels())
 
     def close(self) -> None:
         """Release the execution context after the stream drained."""

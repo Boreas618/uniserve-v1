@@ -57,9 +57,10 @@ use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::ffi::Function;
-use crate::ffi::{Backing, DType, Handle, Record};
+use crate::ffi::{Backing, DType, Handle};
 use crate::model::interface::Interface;
 use crate::parallel::ExpertUnion;
+use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{GroupShape, GroupTable, KVCache, OutputPool, TablePages, table_pages};
 use crate::warmup::WarmupHooks;
@@ -187,7 +188,7 @@ impl DiffusionLMRunner {
     }
 
     /// The runner's owner name and kernel records.
-    pub(crate) fn kernels(&self) -> Result<(String, Vec<Record>)> {
+    pub(crate) fn kernels(&self) -> Result<(String, Vec<KernelRecord>)> {
         let records = self
             .methods
             .call(&self.functions.kernels, Vec::new())
@@ -196,7 +197,7 @@ impl DiffusionLMRunner {
             .map_err(|_| Error::Interface(format!("{RUNNER}.kernels returns a list")))?
             .iter()
             .enumerate()
-            .map(|(index, record)| Record::new(format!("{RUNNER}.kernels[{index}]"), record))
+            .map(|(index, record)| KernelRecord::new(format!("{RUNNER}.kernels[{index}]"), record))
             .collect::<Result<_>>()?;
         Ok((self.owner.clone(), records))
     }

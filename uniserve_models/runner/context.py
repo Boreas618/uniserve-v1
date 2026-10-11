@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import json
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -71,3 +72,14 @@ def execution_context(
         scratch=scratch,
         collectives=bound,
     )
+
+
+def kernel_records(records: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Kernel records as a runner reports them to the rank.
+
+    Each record describes one prepared operator: its layer ``path``, its
+    ``op``, the ``provider`` serving it and fields particular to the
+    operator. The rank only groups and logs them, so each crosses as the
+    text of one JSON object.
+    """
+    return [json.dumps(record) for record in records]

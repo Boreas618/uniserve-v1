@@ -37,7 +37,7 @@ from uniserve_models.model import (
 )
 from uniserve_models.nn.vae import PatchAutoencoder
 from uniserve_models.processing import PatchTransform
-from uniserve_models.runner.context import execution_context
+from uniserve_models.runner.context import execution_context, kernel_records
 
 __all__ = ["EncoderRunner"]
 
@@ -783,9 +783,9 @@ class EncoderRunner:
     ) -> None:
         features.copy_(self._module.encode_packed(pixels, grids))
 
-    def kernels(self) -> list[dict]:
-        """The kernels the runner's operators selected."""
-        return list(self._context.kernels())
+    def kernels(self) -> list[str]:
+        """The kernels the runner's operators selected, as JSON objects."""
+        return kernel_records(self._context.kernels())
 
     def close(self, aborted: bool) -> None:
         """Release the runner's operators and workspace.

@@ -37,7 +37,7 @@ use crate::executor::BatchResult;
 use crate::executor::backend::{Parts, WorkerBackend, WorkerBatch};
 use crate::executor::forward::launch::{Launched, StreamOrder, error_code, failed_output};
 use crate::executor::lifecycle::RequestStorage;
-use crate::ffi::Record;
+use crate::profiling::kernels::KernelRecord;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{
@@ -359,7 +359,7 @@ impl CausalLMRunners {
 
     /// Each runner's kernel-table label, device name and the kernels its
     /// operators selected, after numerical warmup.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, String, Vec<Record>)>> {
+    pub(crate) fn kernels(&self) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
         self.runners
             .iter()
             .zip(&self.labels)
@@ -372,7 +372,9 @@ impl CausalLMRunners {
                     .map_err(|error| Error::numerical("kernels", &error))?
                     .iter()
                     .enumerate()
-                    .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+                    .map(|(index, record)| {
+                        KernelRecord::new(format!("{label}.kernels[{index}]"), record)
+                    })
                     .collect::<Result<_>>()?;
                 Ok((label.clone(), device.clone(), records))
             })

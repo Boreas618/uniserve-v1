@@ -83,6 +83,7 @@ use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list, list};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
+use crate::profiling::kernels::KernelRecord;
 use crate::runner::{ImageSetup, Methods, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{Metadata, OutputPlacement, ValueRange};
@@ -1452,7 +1453,7 @@ impl Conditions {
         Ok(())
     }
 
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<KernelRecord>> {
         let mut records = self.video.kernels(label, self.video_runners.values())?;
         records.extend(self.audio.kernels(label, self.audio_runners.values())?);
         Ok(records)
@@ -1630,7 +1631,7 @@ impl EncoderRunner {
 
     /// The kernels the operators of the runner's execution context or of the
     /// condition encoders selected.
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<KernelRecord>> {
         match (&self.context, &self.conditions) {
             (Some(context), _) => {
                 let records: tvm_ffi::Array<Any> =
@@ -1638,7 +1639,9 @@ impl EncoderRunner {
                 records
                     .iter()
                     .enumerate()
-                    .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+                    .map(|(index, record)| {
+                        KernelRecord::new(format!("{label}.kernels[{index}]"), record)
+                    })
                     .collect()
             }
             (_, Some(conditions)) => conditions.kernels(label),
