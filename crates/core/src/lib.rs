@@ -327,9 +327,8 @@ pub struct KvCacheDtypeParseError(String);
 /// tensors — so they can cross the worker boundary without carrying device
 /// state.
 ///
-/// The worker receives these fields through the worker IPC codec's flatbuffer
-/// `SamplingParams` table and stages them for the Python samplers in
-/// `uniserve_models.sampling`. All consumers share this FP32 representation
+/// The worker receives these fields in a request's admission message and
+/// stages them for the Python samplers in `uniserve_models.sampling`. All consumers share this FP32 representation
 /// and its numerical validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
@@ -346,62 +345,37 @@ pub struct SamplingParams {
     /// Optional deterministic random seed.
     pub seed: Option<u64>,
     /// Minimum-probability cutoff relative to the top token.
-    #[serde(default)]
     pub min_p: f32,
     /// Multiplicative repetition penalty (1.0 == no-op).
-    #[serde(default = "default_repetition_penalty")]
     pub repetition_penalty: f32,
     /// Additive frequency penalty over the running output (0.0 == no-op).
-    #[serde(default)]
     pub frequency_penalty: f32,
     /// Additive presence penalty over the running output (0.0 == no-op).
-    #[serde(default)]
     pub presence_penalty: f32,
     /// Per-token logit bias, `(token_id, bias)` pairs (empty == no-op).
-    #[serde(default)]
     pub logit_bias: Vec<(u32, f32)>,
     /// Floor on generated tokens before EOS/stop may fire.
-    #[serde(default)]
     pub min_tokens: usize,
     /// Whether to return the sampled token's log probability.
-    #[serde(default)]
     pub return_logprobs: bool,
     /// How many highest-probability alternatives to return per generated step.
-    #[serde(default)]
     pub n_logprobs: u32,
     /// Whether to score prompt positions during prefill.
-    #[serde(default)]
     pub return_prompt_logprobs: bool,
     /// How many highest-probability alternatives to return per scored prompt position.
-    #[serde(default)]
     pub n_prompt_logprobs: u32,
     /// Token IDs whose log probabilities are returned at every scored position.
-    #[serde(default)]
     pub logprob_token_ids: Vec<u32>,
     /// Bad-word token sequences: generation may not complete any of these.
     /// Enforced host-side by masking the completing token.
-    #[serde(default)]
     pub bad_words_ids: Vec<Vec<u32>>,
     /// If set, only these token ids may be sampled (whitelist mask).
-    #[serde(default)]
     pub allowed_token_ids: Option<Vec<u32>>,
     /// Typical-sampling mass cutoff over the locally-typical set (1.0 == no-op).
-    #[serde(default = "default_typical_p")]
     pub typical_p: f32,
     /// Forced-decoding schedule: point `i` of a call's span is forced to
     /// `forced_token_ids[i]` when present, overriding stochastic selection.
-    #[serde(default)]
     pub forced_token_ids: Vec<u32>,
-}
-
-/// Returns the neutral multiplicative repetition penalty.
-fn default_repetition_penalty() -> f32 {
-    1.0
-}
-
-/// Returns the typical-sampling cutoff that retains the full distribution.
-fn default_typical_p() -> f32 {
-    1.0
 }
 
 /// Validation failure returned by [`SamplingParams::validate`].
@@ -608,7 +582,6 @@ pub struct ImageParams {
     /// Inclusive normalized step interval where guidance is active.
     pub cfg_interval: (f32, f32),
     /// Shift applied to the diffusion timestep schedule.
-    #[serde(default = "default_timestep_shift")]
     pub timestep_shift: f32,
     /// Output height in pixels.
     pub height: u32,
@@ -621,10 +594,8 @@ pub struct ImageParams {
     /// Maximum images this request may generate.
     pub max_images: u16,
     /// Optional per-image prompt overrides.
-    #[serde(default)]
     pub image_prompts: Vec<String>,
     /// Whether completed image bytes remain available to the caller.
-    #[serde(default = "default_retain_images")]
     pub retain_images: bool,
 }
 
@@ -650,16 +621,6 @@ impl ImageParams {
 /// Returns whether two guidance scales are equal within relative tolerance.
 fn scale_approx(left: f32, right: f32) -> bool {
     (left - right).abs() <= 1.0e-6_f32 * left.abs().max(right.abs()).max(1.0)
-}
-
-/// Returns the neutral diffusion timestep shift.
-fn default_timestep_shift() -> f32 {
-    1.0
-}
-
-/// Returns the default policy that retains materialized image bytes.
-fn default_retain_images() -> bool {
-    true
 }
 
 /// Validation failure returned by [`ImageParams::validate`].
@@ -921,7 +882,6 @@ pub struct CfgParams {
     /// Minimum renormalization factor.
     pub renorm_min: f32,
     /// Inclusive normalized denoising interval where guidance is active.
-    #[serde(default)]
     pub interval: (f32, f32),
 }
 
@@ -969,7 +929,6 @@ impl KvGroupKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCacheGroup {
     /// History retention policy of the group.
-    #[serde(default)]
     pub kind: KvGroupKind,
     /// Tokens stored per logical page; a power of two.
     pub page_tokens: u32,

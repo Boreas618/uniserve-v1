@@ -1,10 +1,11 @@
 //! Worker request and response envelopes.
 //!
-//! One [`WorkerRequest`] or [`WorkerResponse`] travels as the payload of one
-//! transport frame. Each envelope's optional `message_id` is the
-//! request-response correlation identity that the transport copies into
-//! `Header::message_id` (`None` becomes zero); it is unrelated to the planned
-//! calls' [`CallId`] values inside a batch.
+//! One [`WorkerRequest`] or [`WorkerResponse`] is the message of one
+//! [`Frame`](crate::Frame). Each envelope's optional `message_id` is the
+//! request-response correlation identity: a rank answers a request under the
+//! identity it carried, and a transport that matches a response to its request
+//! reads the identity from the decoded envelope, taking `None` as zero. It is
+//! unrelated to the planned calls' [`CallId`] values inside a batch.
 
 use super::*;
 
@@ -21,13 +22,7 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
-    /// Request kinds accepted by the worker endpoint.
-    ///
-    /// The codec resolves wire discriminants against this list, so a kind
-    /// missing here cannot be decoded.
-    pub const ALL: [Self; 3] = [Self::Info, Self::Submit, Self::Close];
-
-    /// Returns the stable wire name for this request kind.
+    /// Returns the stable name of this request kind.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Info => "info",
@@ -39,7 +34,7 @@ impl RequestKind {
 
 /// Host-to-worker request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum WorkerRequest {
     /// Queries worker identity and capabilities.
     Info {
@@ -160,7 +155,7 @@ pub struct WorkerResponseError {
 
 /// Worker-to-host response envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum WorkerResponse {
     /// Returns worker identity and capabilities.
     Info {

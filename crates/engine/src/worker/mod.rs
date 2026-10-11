@@ -6,18 +6,17 @@
 //! their agreeing results into `WorkerResult`s, and replaces the whole group
 //! when a rank is lost. `WorkerExecutor` (in `executor`) submits explicitly
 //! targeted work to the groups of a deployment. `process` owns one rank's
-//! process and IPC channel, `registration` the addresses ranks rendezvous and
-//! report their endpoints at, `launcher` the per-host launchers that start
-//! ranks placed on other hosts, and `death_watch` the Linux watcher that fires a
-//! rank channel's death wake when a rank process this engine spawned exits.
+//! process and channel, `registry` the listener ranks and launchers connect
+//! to and register at, `rendezvous` the address a group's ranks meet at, and
+//! `launcher` the per-host launchers that start ranks placed on other hosts.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-mod death_watch;
 mod executor;
 mod instance;
 mod launcher;
 mod process;
-mod registration;
+mod registry;
+mod rendezvous;
 
 pub use executor::WorkerExecutor;
 pub use instance::{CallReaders, WorkerGroup};
@@ -80,10 +79,9 @@ pub struct WorkerProcessArgs {
     pub stub: bool,
     /// Maximum number of physical runs concurrently in flight per rank.
     pub queue_depth: usize,
-    /// Request IPC slot capacity in bytes.
-    pub req_slot_cap: usize,
-    /// Response IPC slot capacity in bytes.
-    pub resp_slot_cap: usize,
+    /// Largest encoded message, in bytes, a rank's channel carries in either
+    /// direction: the bound of one frame.
+    pub max_message_bytes: usize,
     /// Optional KV cache capacity expressed in tokens.
     pub kv_token_capacity: Option<u64>,
     /// Tokens per KV page of the cache group with the widest token rows;

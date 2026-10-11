@@ -32,7 +32,7 @@ use tvm_ffi::Any;
 use uniserve_core::ComponentConfig;
 
 use uniserve_cuda::{DeviceId, HandleType, PrimaryContext};
-use uniserve_ipc::{CallKind, ComponentInfo, ForwardMode, WorkerEndpoint, WorkerInfo};
+use uniserve_ipc::{CallKind, Channel, ComponentInfo, ForwardMode, WorkerEndpoint, WorkerInfo};
 
 use crate::capacity::checks;
 use crate::capacity::device::{DeviceBudget, total_bytes};
@@ -65,7 +65,6 @@ use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
 use crate::lane::Lanes;
-use crate::launch::Endpoint;
 use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
 use crate::model::image::ImageModel;
@@ -647,7 +646,7 @@ impl Worker {
 
     /// Serve the channel until the engine closes the rank or a fatal
     /// response ends admission.
-    pub fn run(&mut self, endpoint: &mut Endpoint) -> std::result::Result<(), WorkerError> {
+    pub fn run(&mut self, channel: &mut Channel) -> std::result::Result<(), WorkerError> {
         self.warmup()?;
         let info = self.info.clone();
         let executor = self
@@ -656,10 +655,8 @@ impl Worker {
             .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
         // Ranks of an expert union join every step outside their own.
         let experts = executor.backend().experts().is_some();
-        executor
-            .backend()
-            .set_storage_wake(Some(endpoint.completion_wake()));
-        let served = Service::new(executor, endpoint.server(), info, experts).run();
+        executor.backend().set_storage_wake(Some(channel.wake()));
+        let served = Service::new(executor, channel, info, experts).run();
         executor.backend().set_storage_wake(None);
         served
     }

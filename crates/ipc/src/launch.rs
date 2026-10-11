@@ -1,25 +1,23 @@
 //! The launch descriptor a rank process is started with.
 //!
-//! The engine (or a host's `uniserve-host` launcher for a rank placed on
-//! another host) writes one [`LaunchDescriptor`] as JSON next to the rank and
-//! passes its path on argv. The rank's runtime deserializes it with the same
-//! type, so the engine, the launcher and the worker always agree on the field
-//! set: an unknown key is refused rather than ignored. The descriptor carries
-//! raw launch values; the worker validates and resolves them once, before any
-//! model work, and reports a violation as a usage error.
+//! A rank is started with the head's address and its own identity, and the
+//! head answers the rank's registration with one [`LaunchDescriptor`], which
+//! carries every other launch value. The rank's runtime validates and
+//! resolves the raw values once, before any model work, and reports a
+//! violation as a usage error.
 //!
 //! Every tuning value is stated explicitly: the launching side is the single
 //! source of defaults and the worker never re-derives one.
 //!
-//! Both launching sides start a rank with [`rank_command`] and hand it the
-//! sockets it serves with [`inherit_listener`].
+//! Both launching sides, the head and a host's `uniserve-host` launcher, start
+//! a rank with [`rank_command`] and hand it the sockets it serves with
+//! [`inherit_listener`].
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -29,30 +27,20 @@ use crate::LaneConfig;
 
 /// The command that starts one rank with the interpreter `python`.
 ///
-/// argv carries the rank's identity and its descriptor's location, so a
-/// running rank remains identifiable from the process table; every other
-/// launch value is in the descriptor file at `descriptor`. The caller adds
-/// the environment and any inherited sockets, and writes the descriptor
-/// before it spawns the command.
-pub fn rank_command(
-    python: impl AsRef<OsStr>,
-    worker_id: &str,
-    rank: u32,
-    world_size: u32,
-    descriptor: &Path,
-) -> Command {
+/// argv carries the address of the head the rank connects to and the rank's
+/// identity, its worker group and its rank, which its registration states.
+/// The caller adds the environment and any inherited sockets.
+pub fn rank_command(python: impl AsRef<OsStr>, head: &str, worker_id: &str, rank: u32) -> Command {
     let mut command = Command::new(python);
     command
         .arg("-m")
         .arg("uniserve_models.worker")
+        .arg("--head")
+        .arg(head)
         .arg("--worker-id")
         .arg(worker_id)
         .arg("--rank")
-        .arg(rank.to_string())
-        .arg("--world-size")
-        .arg(world_size.to_string())
-        .arg("--launch-descriptor")
-        .arg(descriptor);
+        .arg(rank.to_string());
     command
 }
 
@@ -96,11 +84,6 @@ pub fn inherit_listener(command: &mut Command, listener: TcpListener) -> RawFd {
 pub struct LaunchDescriptor {
     /// Logical worker this rank belongs to.
     pub worker_id: String,
-    /// `host:port` the rank reports its channel endpoint to.
-    pub registration_address: String,
-    /// Channel mechanism the rank serves its endpoint over
-    /// (`SHARED_STORAGE_CHANNEL` or `SOCKET_CHANNEL`).
-    pub channel_transport: String,
     /// This rank's word in every published product's acknowledgment array.
     pub acknowledgment_slot: u32,
     /// Acknowledgment slots of the ranks on this rank's host.
@@ -109,13 +92,13 @@ pub struct LaunchDescriptor {
     pub products_cross_hosts: bool,
     /// Most requests outstanding on the rank's channel at once.
     pub queue_depth: usize,
-    /// Largest frame payload in bytes, in either direction.
+    /// Largest encoded message in bytes, in either direction. The rank sizes
+    /// the storage it stages a batch's inputs in from it.
     pub ipc_payload_cap: usize,
 
     /// Checkpoint path or repository; empty for the stub model.
     pub model: String,
     /// Base checkpoint an adapter checkpoint extends.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_model: Option<String>,
     /// Torch device name of the rank's primary device (`cpu`, `cuda`, `cuda:N`).
     pub device: String,
@@ -233,16 +216,4 @@ pub struct ExpertParallelDescriptor {
     pub listen_fd: Option<i32>,
     /// `alltoall`, `megamoe`, `dwdp` or `deepep`.
     pub exchange: String,
-}
-
-impl LaunchDescriptor {
-    /// Parses a descriptor, refusing unknown and missing keys.
-    pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(text)
-    }
-
-    /// Serializes the descriptor as pretty-printed JSON.
-    pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec_pretty(self)
-    }
 }
