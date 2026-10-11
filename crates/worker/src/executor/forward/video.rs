@@ -35,9 +35,7 @@ use crate::host::mux::{MuxConfig, MuxSession};
 use crate::request::RequestPool;
 use crate::request::video::{Admission, MediaPlan, VideoSize, condition_shapes, vision_spans};
 use crate::runner::RunnerSetup;
-use crate::runner::decoder::{
-    AudioDecoding, DecodeCapacity, Segment, TrackUnits, UnitShape, VideoDecoding,
-};
+use crate::runner::decoder::{DecodeCapacity, DecoderRunner, Segment, TrackUnits, UnitShape};
 use crate::runner::denoiser::{Conditioning, DenoiserRunner, VideoModel};
 use crate::runner::encoder::EncoderConfig;
 use crate::runner::encoder::{LatentEncoding, TextEncoding, TextSetup};
@@ -124,14 +122,14 @@ pub(crate) struct VideoRuntime {
     /// The text encoder's graph pool, when graphs are captured.
     pub(crate) text_pool: Option<Arc<crate::cuda_graph::GraphPool<Handle>>>,
     pub(crate) denoiser: Option<Component<DenoiserRunner>>,
-    pub(crate) decoder: Option<Component<VideoDecoding>>,
+    pub(crate) decoder: Option<Component<DecoderRunner>>,
     /// The unit shapes startup warmed, which it then captures: each with
     /// its window's latent rows and its video's longest unit.
     decoder_shapes: Vec<(UnitShape, u64, u32)>,
     /// The track units startup warmed, which it then captures, each with
     /// its track's latent rows.
     audio_units: Vec<(TrackUnits, u64)>,
-    pub(crate) audio: Option<Component<AudioDecoding>>,
+    pub(crate) audio: Option<Component<DecoderRunner>>,
     pub(crate) latent: Option<Component<LatentEncoding>>,
     pub(crate) host: Option<MediaRunner>,
     pub(crate) outputs: OutputPool,
@@ -332,14 +330,14 @@ impl VideoRuntime {
                     .decoder
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?;
-                Ok((decoder.device, Some(decoder.runner.stream().clone())))
+                Ok((decoder.device, decoder.runner.stream().cloned()))
             }
             MediaCall::AudioDecoding => {
                 let audio = self
                     .audio
                     .as_ref()
                     .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?;
-                Ok((audio.device, Some(audio.runner.stream().clone())))
+                Ok((audio.device, audio.runner.stream().cloned()))
             }
             MediaCall::LatentEncoding => {
                 let latent = self
@@ -976,7 +974,7 @@ impl VideoRuntime {
                         capacity.frames[2].max(u64::from(canvas.width)),
                     ];
                 }
-                let runner = VideoDecoding::new(
+                let runner = DecoderRunner::video(
                     RunnerSetup {
                         interface,
                         loaded,
@@ -1010,7 +1008,7 @@ impl VideoRuntime {
                 let [rows, width] = latent[..] else {
                     return Err(Error::Interface("an audio latent is [rows, width]".into()));
                 };
-                let runner = AudioDecoding::new(
+                let runner = DecoderRunner::audio(
                     RunnerSetup {
                         interface,
                         loaded,
@@ -1157,7 +1155,7 @@ impl VideoRuntime {
             runner.warm_conditioner(false)?;
         }
         if let Some(decoder) = &mut self.decoder {
-            decoder.runner.prepare(&segments(model, plan)?)?;
+            decoder.runner.prepare_segments(&segments(model, plan)?)?;
             let width = (decoder.config.ranks.len() * decoder.config.units_per_rank.max(1)) as u32;
             // One round of each shape warms the ring and is captured: a
             // round's shape is its canvas, whether it holds the video's
@@ -1183,7 +1181,7 @@ impl VideoRuntime {
                                 count,
                             };
                             let rows = model.window_rows(frames, canvas, unit)?;
-                            decoder.runner.warm(shape, rows, longest)?;
+                            decoder.runner.warm_unit(shape, rows, longest)?;
                             self.decoder_shapes.push((shape, rows, longest));
                         }
                         cursor += count;
@@ -1200,7 +1198,9 @@ impl VideoRuntime {
             let canvas = plan.canvases[0];
             for &frames in plan.frame_counts.iter().rev() {
                 let samples = model.track_samples(frames)?;
-                audio.runner.prepare(model.audio_latent_frames(samples)?)?;
+                audio
+                    .runner
+                    .prepare_track(model.audio_latent_frames(samples)?)?;
             }
             for &frames in plan.frame_counts.iter().rev() {
                 let samples = model.track_samples(frames)?;
@@ -1218,7 +1218,7 @@ impl VideoRuntime {
                         total,
                         span: spans[run.end as usize - 1].end - spans[run.start as usize].start,
                     };
-                    audio.runner.warm(units, rows)?;
+                    audio.runner.warm_track(units, rows)?;
                     self.audio_units.push((units, rows));
                 }
             }
@@ -1249,16 +1249,20 @@ impl VideoRuntime {
         }
         if let Some(decoder) = &mut self.decoder {
             for (shape, rows, longest) in std::mem::take(&mut self.decoder_shapes) {
-                decoder.runner.capture(shape, rows, longest)?;
+                decoder.runner.capture_unit(shape, rows, longest)?;
             }
-            decoder.runner.stream().synchronize()?;
+            if let Some(stream) = decoder.runner.stream() {
+                stream.synchronize()?;
+            }
             decoder.runner.seal();
         }
         if let Some(audio) = &mut self.audio {
             for (units, rows) in std::mem::take(&mut self.audio_units) {
-                audio.runner.capture(units, rows)?;
+                audio.runner.capture_track(units, rows)?;
             }
-            audio.runner.stream().synchronize()?;
+            if let Some(stream) = audio.runner.stream() {
+                stream.synchronize()?;
+            }
             audio.runner.seal();
         }
         Ok(())
