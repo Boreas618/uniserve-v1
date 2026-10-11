@@ -54,8 +54,6 @@ pub struct RankSpawn {
     /// The group generation the head is launching; the rank's exit report
     /// carries it back.
     pub generation: u64,
-    /// Ranks in the worker group's process world.
-    pub world_size: u32,
     /// Interpreter that runs the worker module.
     pub python: String,
     /// The head's address as this host reaches it, which the rank connects

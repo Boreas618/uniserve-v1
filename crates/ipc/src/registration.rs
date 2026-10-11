@@ -17,7 +17,9 @@ use crate::{ValidationError, ValidationResult};
 ///
 /// The message types are the only definition of the protocol, so the two
 /// ends of a connection must be the same build. The head refuses a
-/// registration that states another version.
+/// registration that states another version. The version is the package's,
+/// so two builds of one version are not told apart; a difference between
+/// them then surfaces as a decode error.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The first frame a rank or a launcher sends: who it is and what it was

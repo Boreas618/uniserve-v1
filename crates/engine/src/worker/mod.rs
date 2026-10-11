@@ -78,10 +78,9 @@ pub struct WorkerProcessArgs {
     pub stub: bool,
     /// Maximum number of physical runs concurrently in flight per rank.
     pub queue_depth: usize,
-    /// Request IPC slot capacity in bytes.
-    pub req_slot_cap: usize,
-    /// Response IPC slot capacity in bytes.
-    pub resp_slot_cap: usize,
+    /// Largest encoded message, in bytes, a rank's channel carries in either
+    /// direction: the bound of one frame.
+    pub max_message_bytes: usize,
     /// Optional KV cache capacity expressed in tokens.
     pub kv_token_capacity: Option<u64>,
     /// Tokens per KV page of the cache group with the widest token rows;

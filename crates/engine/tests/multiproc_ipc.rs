@@ -11,8 +11,8 @@
 //! device token relays). The interpreter comes from
 //! `UNISERVE_WORKER_PYTHON` or the repository's `.venv/bin/python`. Several
 //! tests replace that interpreter with a small wrapper script that records a
-//! rank's process id, exits a chosen rank, rewrites a relaunched rank's
-//! descriptor, reports a registration with an unsupported channel transport,
+//! rank's process id, exits a chosen rank, starts a relaunched rank as a
+//! stand-in that reports changed worker info, registers under another build,
 //! or holds a rank's exit until its peers have closed.
 //!
 //! Faults are injected at the OS boundary: `/proc/thread-self/children` and
@@ -640,7 +640,7 @@ fn a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow::
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     args.python = wrapper.clone();
     let startup = WorkerGroup::spawn(args);
     remove_file(wrapper)?;
@@ -687,7 +687,7 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-        let mut args = rank_group_args(1 << 20, 8 << 20);
+        let mut args = rank_group_args(8 << 20);
         args.python = wrapper;
         let mut worker = WorkerGroup::spawn(args)?;
 
@@ -742,7 +742,7 @@ fn closing_a_group_lets_every_rank_finish_a_collective_teardown() -> anyhow::Res
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     args.python = wrapper;
     let mut worker = WorkerGroup::spawn(args)?;
 
@@ -903,7 +903,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     // any result is read, so each successor starts from its predecessor's
     // device product rather than from a host observation.
     let transfer = uniserve_engine::TransferConfig::default();
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     args.queue_depth = 4;
     let mut executor = WorkerExecutor::try_new(
         vec![(WorkerId("worker".into()), WorkerGroup::spawn(args)?)],
@@ -1139,7 +1139,7 @@ fn launch_refuses_a_rank_of_another_build() -> anyhow::Result<()> {
     // The stand-in registers as the rank it was started as, under a build
     // the head is not, and then waits for the head to close. The frames are
     // encoded here, one per rank of the group's first launch.
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     let frames = (0..args.ranks.len())
         .map(|rank| {
             let registration = uniserve_ipc::Registration::Rank {
@@ -1210,7 +1210,7 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
         2,
         WorkerConfig::single_component("model", WORLD_SIZE),
     )];
-    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    config.worker_process = rank_group_args(128 << 10);
     config.worker_process.python = wrapper.clone();
     let engine = EngineCore::new(config)?;
 
@@ -1287,7 +1287,7 @@ fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<(
         2,
         WorkerConfig::single_component("model", WORLD_SIZE),
     )];
-    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    config.worker_process = rank_group_args(128 << 10);
     let engine = {
         let _launch_guard = CHILD_LAUNCH_ENV_LOCK
             .lock()
@@ -1324,7 +1324,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         2,
         WorkerConfig::single_component("model", WORLD_SIZE),
     )];
-    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    config.worker_process = rank_group_args(128 << 10);
     let engine = {
         let _launch_guard = CHILD_LAUNCH_ENV_LOCK
             .lock()
@@ -1480,29 +1480,16 @@ impl Drop for PausedProcess {
 
 /// Spawns the default two-rank stub group from `rank_group_args`.
 fn spawn_rank_group() -> anyhow::Result<WorkerGroup> {
-    spawn_rank_group_with_capacities(1 << 20, 8 << 20)
-}
-
-fn spawn_rank_group_with_capacities(
-    request_slot_capacity: usize,
-    response_slot_capacity: usize,
-) -> anyhow::Result<WorkerGroup> {
-    WorkerGroup::spawn(rank_group_args(
-        request_slot_capacity,
-        response_slot_capacity,
-    ))
+    WorkerGroup::spawn(rank_group_args(8 << 20))
 }
 
 /// Launch arguments for a two-rank stub group on the local host's CPU.
 ///
 /// Both ranks hold the single `model` component, with `QUEUE_DEPTH` batches
-/// in flight and the given channel slot capacities in bytes. Tests adjust the
+/// in flight and the given bound on one channel message in bytes. Tests adjust the
 /// returned value (for example components, interpreter or transfer edges)
 /// before spawning.
-fn rank_group_args(
-    request_slot_capacity: usize,
-    response_slot_capacity: usize,
-) -> WorkerProcessArgs {
+fn rank_group_args(max_message_bytes: usize) -> WorkerProcessArgs {
     let worker = worker_python();
     let config = WorkerProcessArgs {
         stub: true,
@@ -1525,8 +1512,7 @@ fn rank_group_args(
         .ranks,
         components: WorkerConfig::single_component("model", WORLD_SIZE),
         queue_depth: QUEUE_DEPTH,
-        req_slot_cap: request_slot_capacity,
-        resp_slot_cap: response_slot_capacity,
+        max_message_bytes,
         kv_token_capacity: Some(4096),
         block_size: Some(16),
         max_batch_calls: 256,
@@ -1667,7 +1653,7 @@ fn text_admission(
 
 #[test]
 fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<()> {
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     // The language backbone and the patch encoder hold a rank each, which is
     // the arrangement a model with several components is served in.
     args.components = split_components();
@@ -1766,7 +1752,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
         uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?,
         uniserve_engine::TransferConfig::default(),
     ] {
-        let mut args = rank_group_args(1 << 20, 8 << 20);
+        let mut args = rank_group_args(8 << 20);
         args.components = split_components();
         let transfer = transfer.with_worker_defaults(&[WorkerConfig {
             role: uniserve_engine::WorkerRole::Model,
@@ -1868,7 +1854,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
     use uniserve_engine::{WorkerExecutor, WorkerId};
 
     let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?;
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     args.queue_depth = 3;
     args.transfer = transfer.clone();
     args.components = split_components();
@@ -2511,7 +2497,7 @@ fn a_kv_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
 /// the same external input into a device product through a tensor transfer.
 #[test]
 fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result<()> {
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     // `publisher` is the worker id `SlowShmExport` names as the source of its
     // segment.
     args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=shm")?;
@@ -3284,7 +3270,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-        let mut args = rank_group_args(1 << 20, 8 << 20);
+        let mut args = rank_group_args(8 << 20);
         args.python = wrapper;
         let mut worker = WorkerGroup::spawn(args)?;
         let admission = text_admission(81, 1, 1)?;
@@ -3498,7 +3484,7 @@ fn media_rank() -> anyhow::Result<()> {
 /// as a completed batch, and the group keeps serving.
 #[test]
 fn a_failed_external_input_fails_the_calls_reading_it() -> anyhow::Result<()> {
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=shm")?;
     let mut executor = WorkerGroup::spawn(args)?;
 
@@ -3577,7 +3563,7 @@ fn split_components() -> std::collections::BTreeMap<String, uniserve_core::Compo
 /// Launch arguments for a one-rank stub instance `worker_id` that holds
 /// every stub component, with `queue_depth` batches in flight.
 fn single_rank_args(worker_id: &str, queue_depth: usize) -> WorkerProcessArgs {
-    let mut args = rank_group_args(1 << 20, 8 << 20);
+    let mut args = rank_group_args(8 << 20);
     let components = std::collections::BTreeMap::from([
         (
             "model".into(),

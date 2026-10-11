@@ -12,7 +12,7 @@ use uniserve_ipc::{CallKind, ForwardMode, LaunchDescriptor, MediaCall, TransferM
 use super::device::{Device, generation_device};
 use super::{DescriptorError, WorkerConfig};
 
-/// Channel and product-publication settings of the rank's endpoint.
+/// Channel and product-publication settings of the rank.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcConfig {
     pub acknowledgment_slot: u32,
