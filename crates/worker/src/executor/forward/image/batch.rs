@@ -35,25 +35,25 @@ use crate::worker::RankStorage;
 use crate::{Error, Result};
 
 /// One call's state through its batch.
-pub(super) struct CallState {
-    pub(super) output: PendingOutput,
-    pub(super) slot: usize,
+pub(crate) struct CallState {
+    pub(crate) output: PendingOutput,
+    pub(crate) slot: usize,
     /// False when the call's host predicate skipped it.
-    pub(super) active: bool,
-    pub(super) completion_write: Option<ProductBuffer>,
+    pub(crate) active: bool,
+    pub(crate) completion_write: Option<ProductBuffer>,
 }
 
 /// A decoded image's encoding, run once its pixels reached the host.
-pub(super) struct Encoding {
+pub(crate) struct Encoding {
     /// The call's index in the batch.
-    pub(super) call: usize,
-    pub(super) task: Arc<HostTask<ImageTask>>,
+    pub(crate) call: usize,
+    pub(crate) task: Arc<HostTask<ImageTask>>,
 }
 
 /// A failure, and whether it happened past the commit point.
-pub(super) struct Failure {
-    pub(super) error: Error,
-    pub(super) committed: bool,
+pub(crate) struct Failure {
+    pub(crate) error: Error,
+    pub(crate) committed: bool,
 }
 
 impl From<Error> for Failure {
@@ -65,17 +65,17 @@ impl From<Error> for Failure {
     }
 }
 
-pub(super) fn fatal(error: Error) -> Failure {
+pub(crate) fn fatal(error: Error) -> Failure {
     Failure {
         error,
         committed: true,
     }
 }
 
-pub(super) use super::super::launch::lock;
+pub(crate) use super::super::launch::lock;
 
 /// A batch's persistent buffer allocations by buffer.
-pub(super) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocation> {
+pub(crate) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocation> {
     plan.buffer_allocations
         .iter()
         .map(|allocation| (allocation.buffer, *allocation))
@@ -83,37 +83,37 @@ pub(super) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocatio
 }
 
 /// An image batch's borrowed owners and the resources it reserved.
-pub(super) struct ImageBatch<'a> {
-    pub(super) runtime: &'a mut ImageRuntime,
-    pub(super) storage: &'a mut RankStorage,
-    pub(super) requests: &'a mut RequestPool,
-    pub(super) plan: &'a BatchPlan,
+pub(crate) struct ImageBatch<'a> {
+    pub(crate) runtime: &'a mut ImageRuntime,
+    pub(crate) storage: &'a mut RankStorage,
+    pub(crate) requests: &'a mut RequestPool,
+    pub(crate) plan: &'a BatchPlan,
     /// The device and stream the batch's computation runs on.
-    pub(super) device: Option<i32>,
-    pub(super) stream: Option<Stream>,
+    pub(crate) device: Option<i32>,
+    pub(crate) stream: Option<Stream>,
     /// This rank reports the component's host results.
-    pub(super) reports: bool,
-    pub(super) calls: Vec<CallState>,
-    pub(super) buffer: OutputLease,
-    pub(super) writes: Vec<ProductBuffer>,
-    pub(super) reads: Vec<Arc<ProductRead>>,
+    pub(crate) reports: bool,
+    pub(crate) calls: Vec<CallState>,
+    pub(crate) buffer: OutputLease,
+    pub(crate) writes: Vec<ProductBuffer>,
+    pub(crate) reads: Vec<Arc<ProductRead>>,
     /// Trajectory commits and releases by call index, applied at the
     /// commit point.
-    pub(super) updates: Vec<(usize, LatentUpdate)>,
+    pub(crate) updates: Vec<(usize, LatentUpdate)>,
     /// Image encodings to run once the batch's pixels reached the host.
-    pub(super) encodings: Vec<Encoding>,
+    pub(crate) encodings: Vec<Encoding>,
     /// Product exports (encoder features, trajectory versions),
     /// registered once the batch commits.
-    pub(super) publications: Publications,
+    pub(crate) publications: Publications,
     /// Trajectory versions exported from the latent pool, released from it
     /// if the batch fails before committing.
-    pub(super) latent_exports: Vec<BufferId>,
+    pub(crate) latent_exports: Vec<BufferId>,
     /// Signals the physical end of the batch's KV accesses.
-    pub(super) retirement: Arc<Retirement>,
+    pub(crate) retirement: Arc<Retirement>,
     /// The batch uses the latent pool on its stream (see
     /// `ImageLatents::enter`).
-    pub(super) latents_entered: bool,
-    pub(super) started: Instant,
+    pub(crate) latents_entered: bool,
+    pub(crate) started: Instant,
 }
 
 impl<'a> ImageBatch<'a> {
@@ -121,7 +121,7 @@ impl<'a> ImageBatch<'a> {
     /// and lease its output storage on `stream`. `words` are the payload
     /// words the batch reads back beside one completion word per call.
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
-    pub(super) fn open(
+    pub(crate) fn open(
         runtime: &'a mut ImageRuntime,
         storage: &'a mut RankStorage,
         requests: &'a mut RequestPool,
@@ -205,19 +205,19 @@ impl<'a> ImageBatch<'a> {
     }
 
     /// The batch's product device.
-    pub(super) fn target(&self) -> Device {
+    pub(crate) fn target(&self) -> Device {
         self.device.map_or(Device::Cpu, Device::Cuda)
     }
 
     /// Indices of the calls that execute.
-    pub(super) fn active(&self) -> Vec<usize> {
+    pub(crate) fn active(&self) -> Vec<usize> {
         (0..self.calls.len())
             .filter(|&index| self.calls[index].active)
             .collect()
     }
 
     /// Bind every call's completion flag; skipped calls publish false now.
-    pub(super) fn bind_flags(&mut self) -> Result<()> {
+    pub(crate) fn bind_flags(&mut self) -> Result<()> {
         let target = self.target();
         let slots: HashMap<RequestKey, usize> = self
             .plan
@@ -267,7 +267,7 @@ impl<'a> ImageBatch<'a> {
     }
 
     /// Validate every owner's update, then commit them together.
-    pub(super) fn commit(&mut self) -> std::result::Result<(), Failure> {
+    pub(crate) fn commit(&mut self) -> std::result::Result<(), Failure> {
         let stream = self.stream.as_ref();
         let reads = std::mem::take(&mut self.reads);
         self.storage.tensors.complete_reads(&reads, stream, &[])?;
@@ -336,7 +336,7 @@ impl<'a> ImageBatch<'a> {
 
     /// Seal the lease on the batch's stream and retire its KV accesses and
     /// output storage once the fences complete; wake the service then.
-    pub(super) fn seal(&self) -> Result<()> {
+    pub(crate) fn seal(&self) -> Result<()> {
         seal_lease(
             &self.storage.events,
             &self.buffer,
@@ -355,7 +355,7 @@ impl<'a> ImageBatch<'a> {
 
     /// Retire every reservation after a failure before the commit point;
     /// storage returns once the fences recorded here complete.
-    pub(super) fn discard(&mut self) -> Result<()> {
+    pub(crate) fn discard(&mut self) -> Result<()> {
         let left = self.leave_latents();
         let revoked = self.publications.revoke();
         let exported = std::mem::take(&mut self.latent_exports);

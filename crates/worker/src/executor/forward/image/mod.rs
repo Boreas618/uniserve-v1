@@ -21,11 +21,9 @@
 //! the text runtime's prefill (`token`), through the encoder products and
 //! the image denoiser this runtime owns.
 
-mod batch;
-mod decode;
+pub(crate) mod batch;
 mod diffusion;
-mod encode;
-mod host;
+pub(crate) mod host;
 mod latents;
 pub(crate) mod start;
 pub(crate) mod warmup;
@@ -68,13 +66,13 @@ pub(crate) struct ImageRuntime {
     facts: ImageModel,
     policy: ImagePolicy,
     /// Encoders by (component, call kind).
-    encoders: Vec<EncoderRunner>,
+    pub(crate) encoders: Vec<EncoderRunner>,
     encoder_routes: HashMap<(String, CallKind), usize>,
     /// The image denoiser of a component serving latent preparation and
     /// denoising.
     diffusion: Option<(String, ImageDiffusion)>,
     /// The image decoder of a component serving image decoding.
-    decoder: Option<(String, DecoderRunner)>,
+    pub(crate) decoder: Option<(String, DecoderRunner)>,
     latents: Option<ImageLatents>,
     trajectories: Trajectories,
     /// The product arena of each device, which bindings name products in.
@@ -90,9 +88,9 @@ pub(crate) struct ImageRuntime {
     flow: Vec<start::FlowShape>,
     flow_pools: Vec<Arc<GraphPool<Handle>>>,
     /// Output words of a decoding batch's pixels at most.
-    max_pixel_words: usize,
+    pub(crate) max_pixel_words: usize,
     outputs: OutputPool,
-    host: HostLane<ImageTask>,
+    pub(crate) host: HostLane<ImageTask>,
 }
 
 impl ImageRuntime {
@@ -112,7 +110,7 @@ impl ImageRuntime {
         self.diffusion.as_mut().map(|(_, runner)| runner)
     }
 
-    fn latents(&self) -> Result<&ImageLatents> {
+    pub(crate) fn latents(&self) -> Result<&ImageLatents> {
         self.latents
             .as_ref()
             .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))
@@ -142,7 +140,7 @@ impl ImageRuntime {
     }
 
     /// The encoder serving `kind` calls of `component`.
-    fn encoder_route(&self, component: &str, kind: CallKind) -> Result<usize> {
+    pub(crate) fn encoder_route(&self, component: &str, kind: CallKind) -> Result<usize> {
         self.encoder_routes
             .get(&(component.to_owned(), kind))
             .copied()
@@ -565,12 +563,14 @@ fn run(
     };
     let (device, stream, words) = match kind {
         CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-            encode::placement(runtime, plan)?
+            crate::runner::encoder::image_placement(runtime, plan)?
         }
         CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
             diffusion::placement(runtime)?
         }
-        CallKind::Media(MediaCall::ImageDecoding) => decode::placement(runtime, plan)?,
+        CallKind::Media(MediaCall::ImageDecoding) => {
+            crate::runner::decoder::image_placement(runtime, plan)?
+        }
         _ => {
             return Err(Error::Unsupported(format!(
                 "{} is served by another runtime",
