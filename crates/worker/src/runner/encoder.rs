@@ -1731,7 +1731,8 @@ pub(crate) fn encode_text(
         video_grids: &video_grids,
         rows: read.value(),
     });
-    text.encode_text(&tokens, &write.view(), vision)?;
+    let mode = text.encode_text(&tokens, &write.view(), vision)?;
+    batch.record(mode);
     publish(
         parts,
         batch,

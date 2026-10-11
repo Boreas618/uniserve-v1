@@ -1392,7 +1392,8 @@ pub(crate) fn prepare(
             "prompt features disagree with the request's prompt".into(),
         ));
     }
-    denoiser.runner.condition(id, slot, value, count)?;
+    let mode = denoiser.runner.condition(id, slot, value, count)?;
+    batch.record(mode);
     if conditioned {
         let request = parts.video.request(slot, call.request_key)?;
         let latents = condition_latents(&request.conditions, &conditions)?;
@@ -1532,7 +1533,8 @@ pub(crate) fn denoise(
         .video
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-    let (update, _) = denoiser.runner.denoise(id, slot, call, params)?;
+    let (update, mode) = denoiser.runner.denoise(id, slot, call, params)?;
+    batch.record(mode);
     batch.calls[index].latent = Some(update);
     if call.outputs.is_empty() {
         return Ok(());

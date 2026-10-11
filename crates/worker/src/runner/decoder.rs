@@ -1413,7 +1413,7 @@ pub(crate) fn decode_video(
         .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?
         .runner;
     let written = units[unit as usize];
-    decoder.decode_unit(
+    let mode = decoder.decode_unit(
         slot,
         latent.value(),
         frames,
@@ -1428,6 +1428,7 @@ pub(crate) fn decode_video(
         written,
         &out,
     )?;
+    batch.record(mode);
     let frame_bytes = u64::from(canvas.height) * u64::from(canvas.width) * 3;
     let padding = u64::from(longest.saturating_sub(written)) * frame_bytes;
     if padding > 0 {
@@ -1512,7 +1513,7 @@ pub(crate) fn decode_audio(
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?
         .runner;
-    audio.decode_track(
+    let mode = audio.decode_track(
         latent.value(),
         TrackUnits {
             samples,
@@ -1524,5 +1525,6 @@ pub(crate) fn decode_audio(
         },
         &write.view(),
     )?;
+    batch.record(mode);
     publish_bound(parts, batch, call, index, &write, true)
 }
