@@ -479,9 +479,10 @@ impl CausalLMRunners {
             )?;
 
             // The runner's vocabulary shard sizes its logits columns.
-            let shard = methods::vocab(&methods)?;
+            let functions = methods::Functions::resolve(startup.interface, &methods)?;
+            let shard = methods::vocab(startup.interface, &methods)?;
             let hidden = methods::hidden_size(startup.interface, startup.model.handle())?;
-            let plans_attention = methods::plans_attention(&methods)?;
+            let plans_attention = methods::plans_attention(startup.interface, &methods)?;
             if shard.size != vocab {
                 return Err(Error::Interface(format!(
                     "the text runner's vocabulary ({}) differs from the model's ({vocab})",
@@ -534,6 +535,7 @@ impl CausalLMRunners {
                 device: ordinal,
                 stream,
                 methods,
+                functions,
                 plans_attention,
                 breaks: startup.weights.map(|weights| weights.breaks().clone()),
                 buffers,
