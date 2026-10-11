@@ -110,7 +110,7 @@ pub struct Functions {
 
 impl Functions {
     /// `owner` names the producing function for error messages, for example
-    /// `text.bind`.
+    /// `canvas.bind`.
     pub fn new(owner: impl Into<String>, value: Any) -> Result<Self> {
         let owner = owner.into();
         let functions = Map::try_from(value).map_err(|error| Error::numerical(&owner, &error))?;

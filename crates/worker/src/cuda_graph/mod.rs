@@ -6,11 +6,13 @@
 //! bound step under `torch.cuda.CUDAGraph` in the pool Rust passes and
 //! returns the graph with the raw executable of each of its segments. Rust
 //! launches those executables itself on the forward's stream
-//! ([`CUDAGraph::launch`]) and keeps the Python graph only to release it.
+//! ([`CUDAGraph::launch`]), performing the graph breaks it noted during the
+//! capture between them, and keeps the Python graph only to release it.
 //!
 //! The pieces are independent of any runner:
 //!
 //! - [`CUDAGraph`]: one captured forward;
+//! - [`GraphBreaks`]: the graph breaks noted while a forward is captured;
 //! - [`bucket`]: the smallest configured size that holds a live count;
 //! - [`capture_order`]: shapes largest footprint first, so later captures
 //!   reuse the pool blocks and workspaces of earlier ones;
@@ -28,7 +30,7 @@
 mod pool;
 mod table;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tvm_ffi::Any;
 use uniserve_cuda::{GraphExec, Stream};
@@ -57,16 +59,46 @@ impl GraphMode {
     }
 }
 
+/// Work a graph cannot record, performed between two of its segments at
+/// every launch.
+pub(crate) type GraphBreak = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+/// The graph breaks noted while a forward is captured.
+///
+/// A capture ends a segment and begins the next where its forward reaches
+/// work a graph cannot record; the owner of that work notes it here, and
+/// whoever captures the forward takes the notes for its graph
+/// ([`CUDAGraph::with_breaks`]).
+#[derive(Clone, Default)]
+pub(crate) struct GraphBreaks(Arc<Mutex<Vec<GraphBreak>>>);
+
+impl GraphBreaks {
+    /// Note the break between the segment that just ended and the next.
+    pub(crate) fn note(&self, work: GraphBreak) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(work);
+    }
+
+    /// The breaks noted since the last call, in capture order.
+    pub(crate) fn take(&self) -> Vec<GraphBreak> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
 /// One captured forward.
 ///
 /// A graph is an ordered list of segments, each one CUDA graph executable,
 /// with a graph break between two segments: work a graph cannot record. The
-/// Python graph owns the executables, the memory their nodes address and
-/// the breaks it recorded.
+/// Python graph owns the executables and the memory their nodes address.
 #[derive(Clone)]
 pub struct CUDAGraph {
     /// One executable per segment, in launch order.
     segments: Arc<[GraphExec]>,
+    /// The work between segments `i` and `i + 1`, for a graph whose breaks
+    /// Rust noted at capture.
+    breaks: Arc<[GraphBreak]>,
     /// The Python graph, passed back to release it and to a binding that
     /// replays the graph itself.
     graph: Handle,
@@ -91,8 +123,16 @@ impl CUDAGraph {
             .collect();
         Ok(Self {
             segments,
+            breaks: Arc::new([]),
             graph: Handle::new(field(0)?)?,
         })
+    }
+
+    /// The graph with the breaks noted during its capture, one between
+    /// every two segments.
+    pub(crate) fn with_breaks(mut self, breaks: Vec<GraphBreak>) -> Self {
+        self.breaks = breaks.into();
+        self
     }
 
     /// The Python graph.
@@ -106,15 +146,15 @@ impl CUDAGraph {
     }
 
     /// Submit one execution of the forward to `stream` without waiting for
-    /// it. The inputs the graph reads were written on `stream` before, and
-    /// its outputs are read on `stream` after.
-    ///
-    /// FIXME: graph breaks are not performed between the segments. A graph
-    /// of several segments (a text forward with a weight prefetch) is
-    /// replayed by its binding, which makes the breaks' Python calls.
+    /// it: every segment in order, and after each segment the break that
+    /// follows it. The inputs the graph reads were written on `stream`
+    /// before, and its outputs are read on `stream` after.
     pub fn launch(&self, stream: &Stream) -> Result<()> {
-        for segment in self.segments.iter() {
+        for (index, segment) in self.segments.iter().enumerate() {
             segment.launch(stream)?;
+            if let Some(work) = self.breaks.get(index) {
+                work()?;
+            }
         }
         Ok(())
     }
