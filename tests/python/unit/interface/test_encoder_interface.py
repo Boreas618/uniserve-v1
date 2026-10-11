@@ -26,7 +26,7 @@ ARENA_BYTES = 1 << 16
 @pytest.fixture(scope="module")
 def loaded():
     table = interface.table()
-    return table, load_stub(table)
+    return table, load_stub()
 
 
 def bound(table, model, component, root, path):

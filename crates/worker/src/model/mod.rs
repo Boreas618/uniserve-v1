@@ -30,6 +30,9 @@ use uniserve_ipc::{DType, DimBound, OutputInfo, RasterAxes, ShapeBound};
 
 use crate::config::{Device, WorkerLaunch};
 use crate::ffi::{Fields, Handle, Record, integer_list, list, strings};
+
+/// The library module that reads and loads a rank's model.
+const LOADING: &str = "uniserve_models.interface.loading";
 use crate::{Error, Result};
 use components::Declarations;
 use interface::Interface;
@@ -47,68 +50,63 @@ pub struct Description {
 }
 
 impl Description {
-    /// Describe the model and validate the placement against it.
+    /// Read the model's configuration and validate the placement against
+    /// it (`read_config`).
     pub fn describe(interface: &Interface, launch: &WorkerLaunch) -> Result<Self> {
         let execution = &launch.execution;
         let model = launch.model.as_ref();
-        let components = serde_json::to_value(&launch.components).map_err(|error| {
+        let components = serde_json::to_string(&launch.components).map_err(|error| {
             Error::Invalid(format!("encoding the component placement: {error}"))
         })?;
-        let request = Fields::new()
-            .with("stub", launch.stub)
-            .optional_text("path", model.map(|model| model.path.as_str()))
-            .optional_text(
-                "base_model",
-                model.and_then(|model| model.base_model.as_deref()),
-            )
-            .with(
-                "io",
-                Fields::new()
-                    .text("format", &launch.load.format)
-                    .text("mode", &launch.load.mode)
-                    .optional_text("download_dir", launch.load.download_dir.as_deref())
-                    .optional("num_threads", launch.load.num_threads.map(i64::from))
-                    .optional_text(
-                        "checksum_manifest",
-                        launch.load.checksum_manifest.as_deref(),
-                    )
-                    .map(),
-            )
-            .text("device", &execution.device.to_string())
-            .optional_text(
-                "generation_device",
-                execution
-                    .generation_device
-                    .map(|device| device.to_string())
-                    .as_deref(),
-            )
-            .with("components", crate::ffi::json(&components)?)
-            .with("rank", execution.rank as i64)
-            .text("role", &execution.role)
-            .with(
-                "expert_split",
+        let text = |value: &str| Any::from(tvm_ffi::String::from(value));
+        let optional = |value: Option<&str>| value.map(text).unwrap_or_default();
+        let generation = execution.generation_device.map(|device| device.to_string());
+        let result: tvm_ffi::Array<Any> = interface
+            .import(&format!("{LOADING}.read_config"))?
+            .call_values(&[
+                Any::from(launch.stub),
+                optional(model.map(|model| model.path.as_str())),
+                optional(model.and_then(|model| model.base_model.as_deref())),
+                text(&launch.load.format),
+                text(&launch.load.mode),
+                optional(launch.load.download_dir.as_deref()),
                 launch
-                    .expert_parallel
-                    .as_ref()
-                    .is_some_and(|union| union.disaggregated()),
-            )
-            .into_any();
-        let result: tvm_ffi::Array<Any> = interface.describe.call_as(&[(&request).into()])?;
+                    .load
+                    .num_threads
+                    .map(|threads| Any::from(i64::from(threads)))
+                    .unwrap_or_default(),
+                optional(launch.load.checksum_manifest.as_deref()),
+                text(&execution.device.to_string()),
+                optional(generation.as_deref()),
+                text(&components),
+                Any::from(execution.rank as i64),
+                text(&execution.role),
+                Any::from(
+                    launch
+                        .expert_parallel
+                        .as_ref()
+                        .is_some_and(|union| union.disaggregated()),
+                ),
+            ])
+            .and_then(|result| {
+                tvm_ffi::Array::<Any>::try_from(result)
+                    .map_err(|error| Error::numerical("read_config", &error))
+            })?;
         if result.len() != 2 {
             return Err(Error::Interface(
-                "model.describe returns [description, info]".into(),
+                "read_config returns [description, info]".into(),
             ));
         }
         let handle = Handle::new(
             result
                 .get(0)
-                .map_err(|error| Error::numerical("model.describe", &error))?,
+                .map_err(|error| Error::numerical("read_config", &error))?,
         )?;
         let info = Record::new(
-            "model.describe",
+            "read_config",
             result
                 .get(1)
-                .map_err(|error| Error::numerical("model.describe", &error))?,
+                .map_err(|error| Error::numerical("read_config", &error))?,
         )?;
         let declarations = Declarations::from_record(&info)?;
         declarations.validate(&launch.components)?;
@@ -119,47 +117,6 @@ impl Description {
             expert_paths: info.strings("expert_paths")?,
             video_decoder: info.flag("video_decoder")?,
         })
-    }
-
-    /// Narrow the checkpoint to this rank's resident modules. Dedicated
-    /// expert ranks hold only the routed experts; attention ranks of a
-    /// disaggregated union exclude them.
-    pub fn resolve(&self, interface: &Interface, launch: &WorkerLaunch) -> Result<Handle> {
-        let dedicated = launch.execution.role == "experts";
-        let split = launch
-            .expert_parallel
-            .as_ref()
-            .is_some_and(|union| union.disaggregated());
-        let modules: Vec<String> = if dedicated {
-            self.expert_paths.clone()
-        } else {
-            self.declarations
-                .resident(launch.execution.rank, &launch.components)
-                .into_iter()
-                .collect()
-        };
-        let excluded: &[String] = if split && !dedicated {
-            &self.expert_paths
-        } else {
-            &[]
-        };
-        let request = Fields::new()
-            .with("modules", strings(&modules))
-            .with("exclude_modules", strings(excluded))
-            .text(
-                "quantization",
-                launch
-                    .model
-                    .as_ref()
-                    .map_or("{}", |model| model.quantization.as_str()),
-            )
-            .text("model_dtype", &launch.execution.model_dtype)
-            .into_any();
-        Handle::new(
-            interface
-                .resolve
-                .call(&[self.handle.view(), (&request).into()])?,
-        )
     }
 }
 
@@ -191,75 +148,93 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    /// Materialize this rank's modules.
+    /// Materialize this rank's modules (`load_model`). The checkpoint is
+    /// narrowed to the rank's resident modules: dedicated expert ranks hold
+    /// only the routed experts, and attention ranks of a disaggregated
+    /// union exclude them.
     pub fn load(
         interface: &Interface,
         description: Description,
-        resolved: Handle,
         launch: &WorkerLaunch,
         meshes: Vec<ComponentMesh>,
         experts: Option<ExpertPartition>,
         host_only: bool,
     ) -> Result<Self> {
+        let execution = &launch.execution;
+        let dedicated = execution.role == "experts";
+        let split = launch
+            .expert_parallel
+            .as_ref()
+            .is_some_and(|union| union.disaggregated());
+        let modules: Vec<String> = if dedicated {
+            description.expert_paths.clone()
+        } else {
+            description
+                .declarations
+                .resident(execution.rank, &launch.components)
+                .into_iter()
+                .collect()
+        };
+        let excluded: &[String] = if split && !dedicated {
+            &description.expert_paths
+        } else {
+            &[]
+        };
+
+        let text = |value: &str| Any::from(tvm_ffi::String::from(value));
+        let optional = |value: Option<i64>| value.map(Any::from).unwrap_or_default();
+        let generation = execution.generation_device.map(|device| device.to_string());
         let attention = &launch.attention;
-        let meshes = list(meshes.into_iter().map(|mesh| {
-            Fields::new()
-                .text("component", &mesh.component)
-                .with("paths", strings(&mesh.paths))
-                .with("mesh", mesh.mesh.to_any())
-                .optional("units", mesh.units.map(|units| units.to_any()))
-                .text("sequence", mesh.sequence)
-                .into_any()
-        }));
-        let experts = experts.map(|experts| {
-            Fields::new()
-                .with("world", experts.world.to_any())
-                .with("attention_ranks", experts.attention_ranks as i64)
-                .with("dedicated", experts.dedicated)
-                .into_any()
-        });
-        let request = Fields::new()
-            .text("device", &launch.execution.device.to_string())
-            .optional_text(
-                "generation_device",
-                launch
-                    .execution
-                    .generation_device
-                    .map(|device| device.to_string())
-                    .as_deref(),
-            )
-            .text("role", &launch.execution.role)
-            .with("host_only", host_only)
-            .with("meshes", meshes)
-            .optional("experts", experts)
-            .text(
-                "attention_backend",
-                launch
-                    .execution
-                    .attention_backend
-                    .as_deref()
-                    .unwrap_or("auto"),
-            )
-            .with(
-                "attention",
-                Fields::new()
-                    .with("workspace_size", attention.workspace_size as i64)
-                    .text("decode_backend", &attention.decode_backend)
-                    .text("prefill_backend", &attention.prefill_backend)
-                    .with("disable_split_kv", attention.disable_split_kv)
-                    .optional(
-                        "decode_split_tile_size",
-                        attention.decode_split_tile_size.map(i64::from),
-                    )
-                    .optional(
-                        "prefill_split_tile_size",
-                        attention.prefill_split_tile_size.map(i64::from),
-                    )
-                    .optional("use_tensor_core", attention.use_tensor_core)
-                    .map(),
-            )
-            .into_any();
-        let handle = Handle::new(interface.load.call(&[resolved.view(), (&request).into()])?)?;
+        // Each component's paths cross back to back, with their counts.
+        let path_counts: Vec<i64> = meshes.iter().map(|mesh| mesh.paths.len() as i64).collect();
+        let paths: Vec<&String> = meshes.iter().flat_map(|mesh| &mesh.paths).collect();
+        let (world, attention_ranks, expert_dedicated) = match &experts {
+            Some(experts) => (
+                experts.world.to_any(),
+                experts.attention_ranks as i64,
+                experts.dedicated,
+            ),
+            None => (Any::default(), 0, false),
+        };
+        let handle = Handle::new(
+            interface
+                .import(&format!("{LOADING}.load_model"))?
+                .call_values(&[
+                    description.handle.to_any(),
+                    Any::from(strings(&modules)),
+                    Any::from(strings(excluded)),
+                    text(
+                        launch
+                            .model
+                            .as_ref()
+                            .map_or("{}", |model| model.quantization.as_str()),
+                    ),
+                    text(&execution.model_dtype),
+                    text(&execution.device.to_string()),
+                    generation.as_deref().map(text).unwrap_or_default(),
+                    text(&execution.role),
+                    Any::from(host_only),
+                    Any::from(strings(meshes.iter().map(|mesh| &mesh.component))),
+                    Any::from(integer_list(path_counts)),
+                    Any::from(strings(paths)),
+                    Any::from(list(meshes.iter().map(|mesh| mesh.mesh.to_any()))),
+                    Any::from(list(meshes.iter().map(|mesh| {
+                        mesh.units.as_ref().map(Handle::to_any).unwrap_or_default()
+                    }))),
+                    Any::from(strings(meshes.iter().map(|mesh| mesh.sequence))),
+                    world,
+                    Any::from(attention_ranks),
+                    Any::from(expert_dedicated),
+                    text(execution.attention_backend.as_deref().unwrap_or("auto")),
+                    Any::from(attention.workspace_size as i64),
+                    text(&attention.decode_backend),
+                    text(&attention.prefill_backend),
+                    Any::from(attention.disable_split_kv),
+                    optional(attention.decode_split_tile_size.map(i64::from)),
+                    optional(attention.prefill_split_tile_size.map(i64::from)),
+                    attention.use_tensor_core.map(Any::from).unwrap_or_default(),
+                ])?,
+        )?;
         Ok(Self {
             handle,
             model_name: description.model_name,
