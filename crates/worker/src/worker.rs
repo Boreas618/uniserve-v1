@@ -1168,8 +1168,13 @@ fn plan(
         config.block_size,
         |size| {
             if text {
-                let plan = model.cache_plan(interface, size, kv_dtype.as_deref())?;
-                model.reads_pages(interface, &model.attention_backend, &plan)
+                KVPlan::reads_pages(
+                    interface,
+                    model.handle(),
+                    &model.attention_backend,
+                    size,
+                    kv_dtype.as_deref(),
+                )
             } else {
                 Ok(true)
             }
@@ -1302,8 +1307,7 @@ fn plan(
             .any(|call| call.is(Capability::CausalLm))
     });
     let cache = if text && !dedicated && holds_text {
-        let cache =
-            KVPlan::decode(model.cache_plan(interface, block_size, kv_dtype.as_deref())?)?;
+        let cache = KVPlan::plan(interface, model.handle(), block_size, kv_dtype.as_deref())?;
         let total = match device {
             Device::Cuda(index) => total_bytes(index)?,
             Device::Cpu => 0,

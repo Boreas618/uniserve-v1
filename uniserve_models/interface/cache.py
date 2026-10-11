@@ -3,9 +3,11 @@
 The Rust worker owns the K/V unit pool: it allocates the planes, flags and
 scales, assigns units, and copies imported pages. These functions supply
 what only the numerical library knows: the pool's layout for a loaded model
-(``cache_plan``), whether an attention backend reads a page shape
-(``reads_pages``), the scattered unit resets (``bind_units``) and the
-dtype/FP8 conversion of imported pages (``bind_conversion``).
+(``cache_plan``, a :class:`CachePlan` the worker reads column by column and
+passes back unchanged), whether an attention backend reads a page shape
+(``reads_pages``), the attention layers' view of the pool (``pool``), the
+scattered unit resets (``bind_units``) and the dtype/FP8 conversion of
+imported pages (``bind_conversion``).
 
 Binding functions run once, at bind time, over Rust-owned tensors and a
 Rust-owned stream; the returned per-call functions take only integers.
@@ -15,12 +17,14 @@ Importing this module does not initialize CUDA.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
+from uniserve_models.cache import mha
 from uniserve_models.cache.units import Planes, UnitPool, plan_units
 from uniserve_models.quantization import Quantizer
 
@@ -30,6 +34,7 @@ if TYPE_CHECKING:
     from uniserve_models.model import CausalLM
 
 __all__ = [
+    "CachePlan",
     "bind_conversion",
     "bind_units",
     "cache_plan",
@@ -131,7 +136,114 @@ def _group_layers(model: CausalLM, planes: Planes) -> list[list[int]]:
     return result
 
 
-def cache_plan(loaded, block_size: int, kv_dtype: str) -> dict:
+@dataclass(frozen=True)
+class CachePlan:
+    """A rank's K/V unit pool for one page size, read column by column.
+
+    ``columns``, ``plane_bytes``, ``quantized``, ``unit_bytes`` and
+    ``dtype`` describe the pool. Every other method returns one value per
+    cache group, in table order, except ``layers`` and ``layer_ids``, which
+    concatenate the groups' resident layers (``layer_counts`` of them per
+    group, in column order).
+    """
+
+    planes: Planes
+    # Each resident cache layer's layout.
+    configs: Mapping[str, mha.Config]
+    # The published stored element type.
+    stored: torch.dtype
+    # Each group's resident layers as global cache-layer ids.
+    ids: tuple[tuple[int, ...], ...]
+    # Where each group's resident layers lie in the group's transfer layer
+    # axis (every stage's layers of the group in ascending global order):
+    # the offset of their consecutive run and the axis length.
+    axes: tuple[tuple[int, int], ...]
+
+    def _layouts(self) -> list[mha.Config]:
+        """Each group's layer layout; a group's layers share one."""
+        return [self.configs[group.layers[0]] for group in self.planes.groups]
+
+    def columns(self) -> int:
+        """Columns per unit."""
+        return int(self.planes.columns)
+
+    def plane_bytes(self) -> int:
+        """Bytes of one ``(column, field)`` plane of one unit."""
+        return int(self.planes.plane_bytes)
+
+    def quantized(self) -> bool:
+        """Whether the planes hold FP8 values with per-plane scales."""
+        return bool(self.planes.quantized)
+
+    def unit_bytes(self) -> int:
+        """Bytes one unit occupies: its planes, flags and FP8 scales."""
+        return int(self.planes.unit_bytes)
+
+    def dtype(self) -> str:
+        """The published stored element type's name."""
+        return _dtype_name(self.stored)
+
+    def windows(self) -> list[int]:
+        """Each group's history window in tokens; -1 for full attention."""
+        return [
+            -1 if group.window is None else int(group.window)
+            for group in self.planes.groups
+        ]
+
+    def page_tokens(self) -> list[int]:
+        """Tokens of each group's logical page."""
+        return [int(group.page_tokens) for group in self.planes.groups]
+
+    def units_per_page(self) -> list[int]:
+        """Units each group's logical page occupies."""
+        return [int(group.units_per_page) for group in self.planes.groups]
+
+    def layer_counts(self) -> list[int]:
+        """Resident layers of each group."""
+        return [len(group.layers) for group in self.planes.groups]
+
+    def layers(self) -> list[str]:
+        """Every group's resident layer names, concatenated."""
+        return [name for group in self.planes.groups for name in group.layers]
+
+    def layer_ids(self) -> list[int]:
+        """Every group's resident global cache-layer ids, concatenated."""
+        return [layer for ids in self.ids for layer in ids]
+
+    def axis_offsets(self) -> list[int]:
+        """Where each group's resident run starts in its transfer axis."""
+        return [offset for offset, _ in self.axes]
+
+    def axis_sizes(self) -> list[int]:
+        """Layers of each group's transfer axis across pipeline stages."""
+        return [size for _, size in self.axes]
+
+    def num_kv_heads(self) -> list[int]:
+        """K/V heads each group stores per layer on this rank."""
+        return [len(layout.head_indices) for layout in self._layouts()]
+
+    def total_kv_heads(self) -> list[int]:
+        """Logical K/V heads of each group's layers."""
+        return [int(layout.num_kv_heads) for layout in self._layouts()]
+
+    def kv_head_offsets(self) -> list[int]:
+        """The first logical K/V head each group stores on this rank."""
+        return [int(layout.head_indices[0]) for layout in self._layouts()]
+
+    def head_dims(self) -> list[int]:
+        """Each group's head width."""
+        return [int(group.head_dim) for group in self.planes.groups]
+
+    def dtypes(self) -> list[str]:
+        """The stored element type of each group's planes."""
+        return [_dtype_name(group.dtype) for group in self.planes.groups]
+
+    def compute_dtypes(self) -> list[str]:
+        """The compute element type of each group's layers."""
+        return [_dtype_name(layout.compute_dtype) for layout in self._layouts()]
+
+
+def cache_plan(loaded, block_size: int, kv_dtype: str) -> CachePlan:
     """Describe the rank's K/V unit pool for ``block_size``-token pages.
 
     ``block_size`` is the page size of the group with the widest token rows;
@@ -139,51 +251,35 @@ def cache_plan(loaded, block_size: int, kv_dtype: str) -> dict:
     ``kv_dtype`` is ``""`` for each layer's compute dtype, a dense dtype
     name, or ``"float8_e4m3fn"`` for FP8 storage.
 
-    Returns:
-        ``{"columns", "plane_bytes", "quantized", "unit_bytes", "dtype",
-        "groups"}``: ``dtype`` is the published stored dtype and each group
-        is ``{"window"`` (-1 for full attention), ``"page_tokens",
-        "units_per_page", "layers"`` (resident names in column order),
-        ``"layer_ids"`` (their global cache-layer ids), ``"axis_layers"``
-        (every global id of the group across stages, ascending),
-        ``"num_kv_heads"`` (local), ``"total_kv_heads", "kv_head_offset",
-        "head_dim", "dtype"`` (stored element dtype), ``"compute_dtype"}``.
-
     Raises:
         ValueError: As ``plan_units``; when the model has no resident cache
-            layer; or when a group's local heads are not consecutive.
+            layer; when a group's local heads are not consecutive; or when
+            a group's resident layers are not one consecutive run of its
+            transfer axis.
     """
     model = _causal_lm(loaded)
     planes = _plan(model, block_size, kv_dtype)
     names = model.backbone.cache_names
     layouts = model.cache_config.layers
-    axes = _group_layers(model, planes)
 
-    groups = []
-    for group, axis in zip(planes.groups, axes, strict=True):
-        layout = layouts[group.layers[0]]
-        heads = layout.head_indices
+    ids, axes = [], []
+    for group, axis in zip(
+        planes.groups, _group_layers(model, planes), strict=True
+    ):
+        heads = layouts[group.layers[0]].head_indices
         if heads != tuple(range(heads[0], heads[0] + len(heads))):
             raise ValueError(
                 "the worker K/V protocol requires consecutive logical cache "
                 "heads"
             )
-        groups.append(
-            {
-                "window": -1 if group.window is None else int(group.window),
-                "page_tokens": int(group.page_tokens),
-                "units_per_page": int(group.units_per_page),
-                "layers": list(group.layers),
-                "layer_ids": [names.index(name) for name in group.layers],
-                "axis_layers": list(axis),
-                "num_kv_heads": len(heads),
-                "total_kv_heads": int(layout.num_kv_heads),
-                "kv_head_offset": int(heads[0]),
-                "head_dim": int(group.head_dim),
-                "dtype": _dtype_name(group.dtype),
-                "compute_dtype": _dtype_name(layout.compute_dtype),
-            }
-        )
+        resident = tuple(names.index(name) for name in group.layers)
+        offset = axis.index(resident[0])
+        if tuple(axis[offset : offset + len(resident)]) != resident:
+            raise ValueError(
+                "cache group layers must be one consecutive transfer run"
+            )
+        ids.append(resident)
+        axes.append((offset, len(axis)))
 
     # The published dtype names the stored element type: FP8 for encoded
     # storage, otherwise the configured or compute dtype.
@@ -195,17 +291,13 @@ def cache_plan(loaded, block_size: int, kv_dtype: str) -> dict:
         if dtype is not None
         else layouts[planes.groups[0].layers[0]].compute_dtype
     )
-    return {
-        "columns": int(planes.columns),
-        "plane_bytes": int(planes.plane_bytes),
-        "quantized": bool(planes.quantized),
-        "unit_bytes": int(planes.unit_bytes),
-        "dtype": _dtype_name(stored),
-        "groups": groups,
+    configs = {
+        name: layouts[name] for group in planes.groups for name in group.layers
     }
+    return CachePlan(planes, configs, stored, tuple(ids), tuple(axes))
 
 
-def reads_pages(loaded, backend: str, plan: Mapping) -> bool:
+def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
     """Report whether ``backend`` reads every resident layer's pages.
 
     ``plan`` is a ``cache_plan`` result. Each resident cache layer is read
@@ -231,14 +323,11 @@ def reads_pages(loaded, backend: str, plan: Mapping) -> bool:
         )
     device = next(model.parameters()).device
     provider = resolve(backend, device=device)
-    quantized = bool(plan["quantized"])
-    for group in plan["groups"]:
+    for group in plan.planes.groups:
         pages = CachePages(
-            int(group["page_tokens"]),
-            getattr(torch, str(group["dtype"])),
-            quantized,
+            int(group.page_tokens), group.dtype, plan.planes.quantized
         )
-        for name in group["layers"]:
+        for name in group.layers:
             reader = readers[name]
             if not provider.reads_pages(
                 num_heads=reader.local_heads,
@@ -342,7 +431,8 @@ def bind_units(
 
 
 def bind_conversion(
-    plan: Mapping,
+    plan: CachePlan,
+    num_units: int,
     cache: Mapping[str, torch.Tensor],
     scratch: torch.Tensor,
     elements: int,
@@ -352,8 +442,9 @@ def bind_conversion(
     """Bind the dtype and FP8 conversion of imported pages.
 
     Args:
-        plan: The ``cache_plan`` result plus ``"num_units"``.
-        cache: The pool's unit fields, as ``UnitPool.from_plan`` takes them.
+        plan: The ``cache_plan`` result.
+        num_units: The units the fields hold, sentinel included.
+        cache: The pool's unit fields by name; other entries are ignored.
         scratch: uint8 ``[20 * elements + 8 * scales]``: raw keys at bytes
             ``[0, 8E)``, raw values at ``[8E, 16E)``, the FP32 conversion
             scratch at ``[16E, 20E)`` and FP32 source scales at ``[20E, 20E +
@@ -380,7 +471,9 @@ def bind_conversion(
         20 * elements + 8 * scales
     ):
         raise ValueError("the conversion scratch disagrees with its layout")
-    pool = UnitPool.from_plan(plan, _fields(cache))
+    pool = UnitPool(
+        plan.planes, _fields(cache), plan.configs, num_units=int(num_units)
+    )
     raw = scratch[: 16 * elements].view(2, 8 * elements)
     values = scratch[16 * elements : 20 * elements].view(torch.float32)
     scale_buffer = scratch[20 * elements : 20 * elements + 8 * scales].view(
@@ -437,27 +530,37 @@ def bind_conversion(
     return binding({"convert": convert})
 
 
-def pool(layout: Mapping, views: Mapping[str, torch.Tensor]) -> UnitPool:
+def pool(
+    plan: CachePlan, num_units: int, names: Sequence[str], *fields: torch.Tensor
+) -> UnitPool:
     """Bind the attention layers' view of the Rust-owned K/V unit pool.
 
     Args:
-        layout: The ``cache_plan`` result plus ``"num_units"``.
-        views: The pool's unit fields; other entries (block tables) are
-            ignored.
+        plan: The ``cache_plan`` result.
+        num_units: The units the fields hold, sentinel included.
+        names: The name of each of ``fields``: ``{key,value}.values``,
+            ``{key,value}.initialized`` and, for FP8, ``{key,value}.scale``.
+        fields: The pool's unit fields, each with a ``[columns, num_units]``
+            leading layout.
 
     Returns:
-        The pool object an execution context binds its attention layers to
-        (``component.prepare``'s ``cache``), an opaque handle to the worker.
+        The pool object an execution context binds its attention layers
+        to, an opaque handle to the worker.
+
+    Raises:
+        ValueError: A field disagrees with the plan's layout.
     """
-    return UnitPool.from_plan(layout, _fields(views))
+    tensors = {
+        str(name): field for name, field in zip(names, fields, strict=True)
+    }
+    return UnitPool(
+        plan.planes, tensors, plan.configs, num_units=int(num_units)
+    )
 
 
 def functions() -> dict[str, Callable]:
     """Return this module's interface-table entries."""
     return {
-        "model.cache_plan": cache_plan,
-        "model.reads_pages": reads_pages,
         "cache.bind_units": bind_units,
         "cache.bind_conversion": bind_conversion,
-        "cache.pool": pool,
     }

@@ -281,19 +281,7 @@ impl DiffusionLMRunner {
         let interface = startup.interface;
 
         // The attention layers' view of the pool.
-        let views = kv
-            .views()?
-            .into_iter()
-            .try_fold(
-                crate::ffi::Fields::new(),
-                |fields, (name, view)| -> Result<_> { Ok(fields.with(&name, view.to_tensor()?)) },
-            )?
-            .into_any();
-        let cache = Handle::new(
-            interface
-                .function("cache.pool")?
-                .call_values(&[tvm_ffi::Any::from(kv.layout()?), views])?,
-        )?;
+        let cache = kv.pool(interface)?;
 
         let mut experts = startup.expert_runtime;
         if let Some(experts) = experts.as_ref()

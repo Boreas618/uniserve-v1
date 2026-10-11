@@ -1,6 +1,6 @@
 //! A TVM-FFI test harness that drives the native KV owners with the real
 //! numerical interface: Python loads this library with
-//! `tvm_ffi.load_module`, passes `uniserve_models.interface.cache` functions
+//! `tvm_ffi.load_module`, passes the interface table and its cache plans
 //! and inspects the Rust-owned storage through the returned DLPack tensors
 //! (`tests/python/integration/storage`).
 //!
@@ -19,7 +19,8 @@ use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};
 use uniserve_core::{CallId, RequestId, UnitId};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
-use uniserve_worker::ffi::{Function, Record};
+use uniserve_worker::ffi::{Function, Handle, Record};
+use uniserve_worker::model::interface::Interface;
 use uniserve_worker::storage::{KVCache, KVPlan, tensor_map};
 use uniserve_worker::transfer::{Capacity, TransportKind, TransportOptions, Transports, notify};
 use uniserve_worker::{EventPool, Result};
@@ -104,8 +105,12 @@ fn kv_transfer(
 
 fn run(config: Any) -> Result<Map<FfiString, Any>> {
     let config = Record::new("kv_transfer", config)?;
-    let source_plan = Arc::new(KVPlan::decode(config.value("source_plan")?)?);
-    let destination_plan = Arc::new(KVPlan::decode(config.value("destination_plan")?)?);
+    let interface = Interface::from_table(config.get("interface")?)?;
+    let plan = |key: &str| -> Result<Arc<KVPlan>> {
+        KVPlan::read(&interface, Handle::new(config.value(key)?)?).map(Arc::new)
+    };
+    let source_plan = plan("source_plan")?;
+    let destination_plan = plan("destination_plan")?;
     let num_units = config.count("num_units")? as u32;
     let tokens = config.count("tokens")? as u32;
     let devices = [
@@ -113,9 +118,8 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         config.count("destination_device")? as i32,
     ];
     let kind = TransportKind::parse(&config.string("transport")?)?;
-    let bind_units: Function = Function::new("cache.bind_units", config.get("bind_units")?);
-    let bind_conversion: Function =
-        Function::new("cache.bind_conversion", config.get("bind_conversion")?);
+    let bind_units = interface.function("cache.bind_units")?;
+    let bind_conversion = interface.function("cache.bind_conversion")?;
     let fill: Function = Function::new("fill", config.get("fill")?);
     let source_units = units(config.value("source_units")?)?;
     let destination_units = units(config.value("destination_units")?)?;
@@ -155,8 +159,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     )?;
     streams[0].synchronize()?;
     let source_views = tensor_map(&source.views()?)?;
-    let source_layout = source.layout()?;
-    fill.invoke(&[AnyView::from(&source_views), AnyView::from(&source_layout)])?;
+    fill.invoke(&[AnyView::from(&source_views)])?;
 
     let capacity = Arc::new(Capacity::new(1 << 28, 16, notify)?);
     let transports = Arc::new(Transports::new(
@@ -233,15 +236,9 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     transports.close()?;
 
     let destination_views = tensor_map(&destination.views()?)?;
-    let destination_layout = destination.layout()?;
     let result: Map<FfiString, Any> = [
         (FfiString::from("source"), Any::from(source_views)),
-        (FfiString::from("source_layout"), Any::from(source_layout)),
         (FfiString::from("destination"), Any::from(destination_views)),
-        (
-            FfiString::from("destination_layout"),
-            Any::from(destination_layout),
-        ),
         (
             FfiString::from("exported_extent"),
             Any::from(verified_tokens),

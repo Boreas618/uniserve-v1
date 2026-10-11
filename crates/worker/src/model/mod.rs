@@ -254,38 +254,6 @@ impl LoadedModel {
             .call_values(&[self.handle.to_any()])?;
         texts(value).map_err(|error| Error::numerical(function, &error))
     }
-
-    /// The KV layout for `block_size`-token pages of the widest rows, as
-    /// `model.cache_plan` returns it. `kv_dtype` is `None` for the compute
-    /// dtype.
-    pub fn cache_plan(
-        &self,
-        interface: &Interface,
-        block_size: usize,
-        kv_dtype: Option<&str>,
-    ) -> Result<Any> {
-        let value = interface.function("model.cache_plan")?.call_values(&[
-            self.handle.to_any(),
-            Any::from(block_size as i64),
-            Any::from(tvm_ffi::String::from(kv_dtype.unwrap_or(""))),
-        ])?;
-        if crate::ffi::is_none(&value) {
-            return Err(Error::Interface(
-                "model.cache_plan describes no cache for a causal LM".into(),
-            ));
-        }
-        Ok(value)
-    }
-
-    /// Whether the attention `backend` reads every resident layer's pages
-    /// of a `cache_plan` layout.
-    pub fn reads_pages(&self, interface: &Interface, backend: &str, plan: &Any) -> Result<bool> {
-        interface.function("model.reads_pages")?.call_as(&[
-            self.handle.view(),
-            (&Any::from(tvm_ffi::String::from(backend))).into(),
-            plan.into(),
-        ])
-    }
 }
 
 /// The sequence-parallel kind name of a placement.

@@ -446,39 +446,8 @@ def test_mha_binding_borrows_buffers_and_validates_physical_layout():
         config.bind(backing, block_size=4, dtype=None, quantizer=quantizer)
 
 
-def _plan(pool, config, num_units):
-    """Describe ``pool`` as the worker's cache plan does."""
-    groups = []
-    for group in pool.groups:
-        layout = config.layers[group.layers[0]]
-        groups.append(
-            {
-                "window": -1 if group.window is None else group.window,
-                "page_tokens": group.page_tokens,
-                "units_per_page": group.units_per_page,
-                "layers": list(group.layers),
-                "num_kv_heads": len(layout.head_indices),
-                "total_kv_heads": layout.num_kv_heads,
-                "kv_head_offset": layout.head_indices[0],
-                "head_dim": group.head_dim,
-                "dtype": str(group.dtype).removeprefix("torch."),
-                "compute_dtype": str(layout.compute_dtype).removeprefix(
-                    "torch."
-                ),
-            }
-        )
-    return {
-        "columns": pool.planes.columns,
-        "plane_bytes": pool.planes.plane_bytes,
-        "quantized": pool.planes.quantized,
-        "unit_bytes": pool.planes.unit_bytes,
-        "groups": groups,
-        "num_units": num_units,
-    }
-
-
 @pytest.mark.parametrize("quantized", (False, True))
-def test_plan_binding_reads_external_fields_as_allocated_pools_do(quantized):
+def test_a_pool_over_external_fields_reads_as_an_allocated_pool(quantized):
     config = _hybrid_config()
     quantization = (
         {name: Quantizer("fp8", axis=0) for name in config.layers}
@@ -492,7 +461,6 @@ def test_plan_binding_reads_external_fields_as_allocated_pools_do(quantized):
         device="cpu",
         quantization=quantization,
     )
-    plan = _plan(owned, config, 6)
     # The owner's fields: scales are [columns, units], and extra entries such
     # as block tables are not unit fields.
     fields = {
@@ -502,7 +470,7 @@ def test_plan_binding_reads_external_fields_as_allocated_pools_do(quantized):
         for name, spec in owned.planes.buffers(6).items()
     }
     fields["unit_tables"] = torch.zeros(6, 2, 3, dtype=torch.int32)
-    bound = UnitPool.from_plan(plan, fields)
+    bound = UnitPool(owned.planes, fields, config.layers, num_units=6)
 
     assert bound.tables == owned.tables
     values = torch.arange(8 * 2 * 8, dtype=torch.float32).reshape(8, 2, 8)
@@ -524,13 +492,9 @@ def test_plan_binding_reads_external_fields_as_allocated_pools_do(quantized):
             == owned.scales_of("key")[1, 2].item()
         )
 
-    plan["unit_bytes"] += 1
-    with pytest.raises(ValueError, match="unit bytes"):
-        UnitPool.from_plan(plan, fields)
     del fields["key.values"]
-    plan["unit_bytes"] -= 1
     with pytest.raises(ValueError, match="key.values"):
-        UnitPool.from_plan(plan, fields)
+        UnitPool(owned.planes, fields, config.layers, num_units=6)
 
 
 @pytest.mark.parametrize(
