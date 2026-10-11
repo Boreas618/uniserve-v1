@@ -26,8 +26,8 @@ use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::model::{LoadedModel, ModelFacts};
 use crate::request::decode_state::DecodeState;
-use crate::runner::text::{
-    Construction, Dimensions, Methods, RunnerParts, TableShape, TextBuffers, TextRunner,
+use crate::runner::causal_lm::{
+    CausalLMRunner, Construction, Dimensions, InputBuffers, Methods, RunnerParts, TableShape,
     model_dtype,
 };
 use crate::runner::{PrefillShape, TextShapes, prefill_shapes};
@@ -500,7 +500,7 @@ impl TextRuntime {
             // Prompts of a model with an image processor place vision
             // features in place of token embeddings.
             dimensions.embeddings = startup.facts.image_processor;
-            let buffers = TextBuffers::allocate(dimensions, ordinal, startup.preparation)?;
+            let buffers = InputBuffers::allocate(dimensions, ordinal, startup.preparation)?;
 
             let pool = match (
                 ordinal,
@@ -537,7 +537,7 @@ impl TextRuntime {
                     }
                 }
             }
-            runners.push(TextRunner::new(RunnerParts {
+            runners.push(CausalLMRunner::new(RunnerParts {
                 component,
                 device: ordinal,
                 stream,

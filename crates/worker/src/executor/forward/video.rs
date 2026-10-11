@@ -1771,7 +1771,7 @@ impl VideoRuntime {
                     device: device_index(device)?,
                     stream,
                     attention: attention.clone(),
-                    dtype: crate::runner::text::model_dtype(&config.model_dtype)?,
+                    dtype: crate::runner::causal_lm::model_dtype(&config.model_dtype)?,
                     config: EncoderConfig {
                         // The text encoder derives its vision blocks'
                         // bound from the row budget.

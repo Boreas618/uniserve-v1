@@ -46,8 +46,8 @@ use crate::executor::BatchResult;
 use crate::executor::lifecycle::RequestStorage;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
-use crate::runner::text::{
-    Executed, RowSource, Staged, StepContext, StepRequest, TextRunner, TokenRow,
+use crate::runner::causal_lm::{
+    CausalLMRunner, Executed, RowSource, Staged, StepContext, StepRequest, TokenRow,
 };
 use crate::storage::{BlockTables, KVCacheManager, OutputPool, UnitColumn};
 use crate::transfer::Retirement;
@@ -70,7 +70,7 @@ const COMPLETION_FIELDS: usize = 4;
 /// microbatch of it, the slot continuation state they share, and their
 /// output storage.
 pub(crate) struct TextRuntime {
-    runners: Vec<TextRunner>,
+    runners: Vec<CausalLMRunner>,
     /// Each lane binding's runners, one per expert microbatch; the first
     /// runs on the lane's stream, the others on its forks.
     groups: Vec<Vec<usize>>,
@@ -171,7 +171,7 @@ impl TextRuntime {
             ));
         }
         let state = &self.state;
-        let mut step = |runner: &TextRunner, request: &StepRequest<'_>| {
+        let mut step = |runner: &CausalLMRunner, request: &StepRequest<'_>| {
             runner.stage(
                 request,
                 &mut StepContext {
@@ -380,7 +380,7 @@ impl RequestStorage for TextRuntime {
     fn admit_slots(&mut self, slots: &[usize]) -> Result<()> {
         // Reset on the first runner's stream; other streams order after it
         // before their next batch.
-        let stream = self.runners.first().and_then(TextRunner::stream);
+        let stream = self.runners.first().and_then(CausalLMRunner::stream);
         self.order.wait(stream)?;
         self.state.reset(slots, stream)?;
         self.order.record(stream)
@@ -525,7 +525,7 @@ impl TokenBatch<'_> {
     fn finish_skipped(&mut self) -> std::result::Result<(), Failure> {
         let empty = Stepped {
             invocations: Vec::new(),
-            executed: crate::runner::text::Executed {
+            executed: crate::runner::causal_lm::Executed {
                 mode: GraphMode::Eager,
                 live_tokens: 0,
                 padded_tokens: 0,

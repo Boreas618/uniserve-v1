@@ -27,7 +27,7 @@ use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::runner::TokenSelection;
-use crate::runner::text::{COMMIT_CACHE, RowSource, StepRequest, TokenRow};
+use crate::runner::causal_lm::{COMMIT_CACHE, RowSource, StepRequest, TokenRow};
 use crate::storage::KVCache;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};

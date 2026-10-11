@@ -1,7 +1,7 @@
 //! Text forwards of a causal language model on one lane binding.
 //!
-//! A [`TextRunner`] owns one binding's input and output tensors
-//! ([`TextBuffers`]), its graph shapes and captured graphs, and the Python
+//! A [`CausalLMRunner`] owns one binding's input and output tensors
+//! ([`InputBuffers`]), its graph shapes and captured graphs, and the Python
 //! runner ([`Methods`]). Per forward it:
 //!
 //! 1. resolves the rows' attention pages against the installed block tables
@@ -21,11 +21,11 @@
 //! empty sequences. Padding rows never write K/V (their write addresses are
 //! -1).
 
-pub(crate) mod buffers;
+pub(crate) mod input_buffers;
 pub(crate) mod methods;
 pub(crate) mod rows;
 
-pub(crate) use buffers::{Dimensions, FINISH_IDS, TextBuffers};
+pub(crate) use input_buffers::{Dimensions, FINISH_IDS, InputBuffers};
 pub(crate) use methods::{Construction, Methods};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
 
@@ -43,7 +43,7 @@ use crate::storage::{AttentionRow, BlockTables, KVCacheManager};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
 
-use buffers::ROW_SECTIONS;
+use input_buffers::ROW_SECTIONS;
 use methods::{Argument, MethodCall};
 
 /// The commit mode of a row that only sets its slot's cache length
@@ -60,7 +60,7 @@ pub(crate) struct TableShape {
 /// What identifies a captured text graph besides the runner's fixed table
 /// widths and tensors: the method and its scalar arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum TextGraphKey {
+pub(crate) enum ShapeKey {
     /// `decode` of a row bucket.
     Decode { rows: usize },
     /// The model forward of a prefill bucket, with hidden outputs or
@@ -132,7 +132,7 @@ pub(crate) struct Executed {
 /// variant.
 enum Choice {
     Eager,
-    Graph(TextGraphKey),
+    Graph(ShapeKey),
 }
 
 /// A planned forward whose inputs are written on the runner's stream,
@@ -204,7 +204,7 @@ struct Plan {
 }
 
 /// One lane binding of a causal language model.
-pub(crate) struct TextRunner {
+pub(crate) struct CausalLMRunner {
     device: Option<i32>,
     stream: Option<Stream>,
     methods: Methods,
@@ -213,12 +213,12 @@ pub(crate) struct TextRunner {
     /// Where the distributed expert weights note the copies a captured
     /// forward performs between its segments.
     breaks: Option<GraphBreaks>,
-    buffers: TextBuffers,
+    buffers: InputBuffers,
     tables: Vec<TableShape>,
     /// Configured per-table widths every graph addresses.
     widths: Vec<i64>,
     shapes: TextShapes,
-    graphs: GraphTable<TextGraphKey>,
+    graphs: GraphTable<ShapeKey>,
     pool: Option<Handle>,
 }
 
@@ -231,7 +231,7 @@ pub(crate) struct RunnerParts {
     pub(crate) methods: Methods,
     pub(crate) plans_attention: bool,
     pub(crate) breaks: Option<GraphBreaks>,
-    pub(crate) buffers: TextBuffers,
+    pub(crate) buffers: InputBuffers,
     pub(crate) tables: Vec<TableShape>,
     pub(crate) widths: Vec<i64>,
     pub(crate) shapes: TextShapes,
@@ -239,7 +239,7 @@ pub(crate) struct RunnerParts {
     pub(crate) pool: Option<Handle>,
 }
 
-impl TextRunner {
+impl CausalLMRunner {
     pub(crate) fn new(parts: RunnerParts) -> Self {
         let graphs = GraphTable::new(
             format!("text runner of {}", parts.component),
@@ -548,7 +548,7 @@ impl TextRunner {
             && let Choice::Graph(key) = &plan.choice
         {
             let graph = match key {
-                TextGraphKey::Prefill { outputs, .. } => {
+                ShapeKey::Prefill { outputs, .. } => {
                     let pool = self
                         .pool
                         .as_ref()
@@ -674,9 +674,9 @@ impl TextRunner {
                 cache_only,
             )? {
                 choice = Choice::Graph(if decode {
-                    TextGraphKey::Decode { rows: bucket_rows }
+                    ShapeKey::Decode { rows: bucket_rows }
                 } else {
-                    TextGraphKey::Prefill {
+                    ShapeKey::Prefill {
                         rows: bucket_rows,
                         tokens: bucket_tokens,
                         outputs,
@@ -1059,12 +1059,12 @@ impl TextRunner {
             .pool
             .as_ref()
             .and_then(|_| bucket(self.shapes.decode(), rows.len()))
-            .map(|rows| TextGraphKey::Commit { rows });
+            .map(|rows| ShapeKey::Commit { rows });
 
         // A bucket pads with rows that store the padding slot's zero cache
         // length again.
         let count = match &key {
-            Some(TextGraphKey::Commit { rows }) => *rows,
+            Some(ShapeKey::Commit { rows }) => *rows,
             _ => rows.len(),
         };
         let padding = [0, COMMIT_CACHE, -1, 0, 0, 0, 0, 0];

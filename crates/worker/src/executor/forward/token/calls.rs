@@ -11,7 +11,7 @@ use uniserve_ipc::{Call, CallKind, DType, ForwardMode};
 use super::context::Media;
 use crate::executor::PendingOutput;
 use crate::runner::TokenSelection;
-use crate::runner::text::{COMMIT_CACHE as CACHE, FINISH_IDS, RowSource, TokenRow};
+use crate::runner::causal_lm::{COMMIT_CACHE as CACHE, FINISH_IDS, RowSource, TokenRow};
 use crate::sampling::SamplingMetadata;
 use crate::storage::BlockTables;
 use crate::{Error, Result};

@@ -137,12 +137,12 @@ fn column_bytes(dtype: DType, shape: &[i64]) -> usize {
 }
 
 /// A binding's columns in one allocation.
-pub(crate) struct TextBuffers {
+pub(crate) struct InputBuffers {
     pub(crate) dimensions: Dimensions,
     columns: Vec<(&'static str, StorageView)>,
 }
 
-impl TextBuffers {
+impl InputBuffers {
     /// Allocate the columns on `device` (host memory when `None`) and zero
     /// them on `stream`.
     pub(crate) fn allocate(
