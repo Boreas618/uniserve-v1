@@ -28,10 +28,12 @@ fn failed(phase: &'static str) -> impl Fn(Error) -> WorkerError {
 impl WarmupHooks for ExpertWarmup {
     fn prepare(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         let text = backend.text_mut().map(|text| text.capture_plan());
-        let diffusion_lm = backend
+        let diffusion_lm: Vec<_> = backend
             .diffusion_lm_mut()
-            .map(|runner| runner.capture_plan());
-        let calls = (text.is_some() || diffusion_lm.is_some())
+            .iter()
+            .map(|runner| runner.capture_plan())
+            .collect();
+        let calls = (text.is_some() || !diffusion_lm.is_empty())
             .then(|| serde_json::json!({"text": text, "diffusion_lm": diffusion_lm}));
         let Some(experts) = backend.experts() else {
             return Ok(());

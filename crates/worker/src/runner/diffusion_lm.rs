@@ -77,8 +77,11 @@ type Coordinate<'a> = &'a mut dyn FnMut(usize) -> Result<Option<usize>>;
 /// buffers.
 const CANDIDATES: usize = 1 << 16;
 
-/// The runner of the rank's diffusion language model.
+/// The runner of one diffusion language model component on the rank.
 pub(crate) struct DiffusionLMRunner {
+    /// The runner's place among the rank's diffusion LM runners, which
+    /// tells their expert steps apart.
+    index: usize,
     /// Names the runner in errors, graph tables and kernel records.
     owner: String,
     /// The component whose calls the runner serves.
@@ -139,16 +142,16 @@ impl DiffusionLMRunner {
     /// The warmup and capture plan every source of an expert union must
     /// share: the runner's row and length buckets and whether it denoises.
     pub(crate) fn capture_plan(&self) -> serde_json::Value {
-        serde_json::json!([{
+        serde_json::json!({
             "rows": self.shapes.rows(),
             "lengths": self.shapes.lengths(),
             "steps": self.sampling.is_some(),
-        }])
+        })
     }
 
-    /// The runner's kernel records, by owner.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<Record>)>> {
-        Ok(vec![(self.owner.clone(), self.methods.kernels()?)])
+    /// The runner's owner name and kernel records.
+    pub(crate) fn kernels(&self) -> Result<(String, Vec<Record>)> {
+        Ok((self.owner.clone(), self.methods.kernels()?))
     }
 
     /// Refuse further captures; serving may only launch.
@@ -660,7 +663,7 @@ impl DiffusionLMRunner {
                 self.denoise(
                     &synthetic_steps(count, true),
                     &pages,
-                    &mut forward::coordinator(experts, None),
+                    &mut forward::coordinator(experts, self.index, None),
                 )?;
             }
             return Ok(());
@@ -698,7 +701,7 @@ impl DiffusionLMRunner {
                 for capacity in variants(extent) {
                     self.readout(
                         &pass,
-                        &mut forward::coordinator(experts, capacity),
+                        &mut forward::coordinator(experts, self.index, capacity),
                         |_, _| Ok(()),
                     )?;
                 }
@@ -713,7 +716,7 @@ impl DiffusionLMRunner {
                         self.denoise(
                             &synthetic_steps(count, first),
                             &pages,
-                            &mut forward::coordinator(experts, capacity),
+                            &mut forward::coordinator(experts, self.index, capacity),
                         )?;
                     }
                 }
@@ -800,15 +803,19 @@ pub(crate) struct DiffusionLMWarmup;
 impl WarmupHooks for DiffusionLMWarmup {
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         let parts = backend.parts();
-        let (Some(runner), Some(storage)) = (parts.diffusion_lm, parts.storage) else {
+        let Some(storage) = parts.storage else {
             return Ok(());
         };
-        let kv = storage
-            .kv
-            .as_mut()
-            .ok_or(Error::State("diffusion LM warmup requires a KV cache"))?;
-        runner.warm(kv, parts.experts).map_err(|error| {
-            WorkerError::classify(error, Some("diffusion LM graph capture")).with_phase("warmup")
-        })
+        for runner in parts.diffusion_lm {
+            let kv = storage
+                .kv
+                .as_mut()
+                .ok_or(Error::State("diffusion LM warmup requires a KV cache"))?;
+            runner.warm(kv, parts.experts).map_err(|error| {
+                WorkerError::classify(error, Some("diffusion LM graph capture"))
+                    .with_phase("warmup")
+            })?;
+        }
+        Ok(())
     }
 }

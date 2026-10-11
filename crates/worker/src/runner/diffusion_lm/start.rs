@@ -5,7 +5,8 @@
 //! configuration, the prefix cache plan and the model's facts, once for
 //! capacity planning (bytes to reserve beside the prefix cache pool) and
 //! again for allocation, so both agree. [`DiffusionLMRunner::start`] then
-//! prepares the model's component on the lane's stream (operators over Rust
+//! creates one runner per diffusion LM component placed on the rank: it
+//! prepares the component on the lane's stream (operators over Rust
 //! workspaces and the prefix cache pool), allocates the runner's buffers,
 //! banks and graph pool, and constructs the Python runner over the banks.
 
@@ -224,74 +225,53 @@ pub(crate) struct Startup<'a> {
     pub(crate) weights: Option<&'a WeightRuntime>,
 }
 
-/// The diffusion LM component placed on this rank: name, module path and
-/// device.
-fn component(components: &Components) -> Option<(String, String, Device)> {
+/// The diffusion LM components placed on this rank: name, module path and
+/// device of each.
+fn placed(components: &Components) -> Result<Vec<(String, String, Device)>> {
     components
         .for_runner(RunnerKind::DiffusionLM)
         .filter(|placed| !placed.host() && placed.kinds.contains(&KIND))
-        .find_map(|placed| {
-            let path = placed
+        .map(|placed| {
+            let forward = placed
                 .calls
                 .iter()
                 .find(|call| {
                     call.runner() == Some(RunnerKind::DiffusionLM) && call.method == "forward"
-                })?
-                .path
-                .clone();
-            Some((placed.name.clone(), path, placed.device))
+                })
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "diffusion LM component {} declares no forward",
+                        placed.name
+                    ))
+                })?;
+            Ok((placed.name.clone(), forward.path.clone(), placed.device))
         })
+        .collect()
+}
+
+/// One component between its preparation and its runner.
+struct Planned {
+    component: String,
+    cuda: Option<i32>,
+    facts: Facts,
+    bounds: Bounds,
+    sampling: Option<CanvasSampling>,
+    banks: Option<BankLayout>,
+    stream: Option<Stream>,
 }
 
 impl DiffusionLMRunner {
-    /// Create the runner of the diffusion LM on this rank, or `None` on a
-    /// rank without one.
-    pub(crate) fn start(startup: Startup<'_>) -> Result<Option<Self>> {
-        let Some((component, path, device)) = component(startup.components) else {
-            return Ok(None);
-        };
+    /// Create one runner per diffusion LM component placed on this rank.
+    pub(crate) fn start(startup: Startup<'_>) -> Result<Vec<Self>> {
+        let placed = placed(startup.components)?;
+        if placed.is_empty() {
+            return Ok(Vec::new());
+        }
         let kv = startup
             .kv
             .ok_or_else(|| Error::Invalid("a diffusion LM reads a prefix cache".into()))?;
         let config = startup.config;
         let interface = startup.interface;
-        let cuda = device.cuda_index();
-        let facts = Facts::describe(
-            interface,
-            startup.model.handle(),
-            &path,
-            startup.experts.0,
-            startup.experts.1,
-        )?;
-        let bounds = Bounds::new(
-            config,
-            startup.request_slots,
-            kv.plan(),
-            Some(kv.planes().num_units()),
-            &facts,
-            cuda.is_some(),
-        )?;
-
-        // The served sampling generates the model's blocks.
-        let sampling = match (&config.canvas_sampling, bounds.denoise) {
-            (Some(sampling), Some(_)) => {
-                if sampling.canvas_length as usize != facts.sequence_length {
-                    return Err(Error::Invalid(format!(
-                        "the served canvas length {} is not the model's canvas length {}",
-                        sampling.canvas_length, facts.sequence_length
-                    )));
-                }
-                Some(*sampling)
-            }
-            _ => None,
-        };
-        let bank_layout = sampling
-            .as_ref()
-            .and_then(|sampling| bounds.banks(&facts, startup.request_slots, sampling));
-        let banks = bank_layout
-            .map(|layout| Banks::allocate(layout, cuda, startup.preparation))
-            .transpose()?;
-        let layout = bounds.layout(&facts, bank_layout);
 
         // The attention layers' view of the pool.
         let views = kv
@@ -309,149 +289,217 @@ impl DiffusionLMRunner {
         )?;
 
         let mut experts = startup.expert_runtime;
-        let stream = stream(startup.lanes, device)?;
-        if let Some(experts) = experts.as_ref() {
-            if experts.microbatches() > 1 {
-                return Err(Error::Unsupported(
-                    "diffusion LMs run expert steps without microbatches".into(),
-                ));
-            }
-            if stream.as_ref().map(Stream::raw) != Some(experts.stream(0).raw()) {
+        if let Some(experts) = experts.as_ref()
+            && experts.microbatches() > 1
+        {
+            return Err(Error::Unsupported(
+                "diffusion LMs run expert steps without microbatches".into(),
+            ));
+        }
+
+        // Prepare every component before binding any, so shared workspaces
+        // hold the largest of them.
+        let mut planned = Vec::new();
+        let mut prepared = Vec::new();
+        for (component, path, device) in placed {
+            let cuda = device.cuda_index();
+            let facts = Facts::describe(
+                interface,
+                startup.model.handle(),
+                &path,
+                startup.experts.0,
+                startup.experts.1,
+            )?;
+            let bounds = Bounds::new(
+                config,
+                startup.request_slots,
+                kv.plan(),
+                Some(kv.planes().num_units()),
+                &facts,
+                cuda.is_some(),
+            )?;
+
+            // The served sampling generates the model's blocks.
+            let sampling = match (&config.canvas_sampling, bounds.denoise) {
+                (Some(sampling), Some(_)) => {
+                    if sampling.canvas_length as usize != facts.sequence_length {
+                        return Err(Error::Invalid(format!(
+                            "the served canvas length {} is not the model's canvas length {}",
+                            sampling.canvas_length, facts.sequence_length
+                        )));
+                    }
+                    Some(*sampling)
+                }
+                _ => None,
+            };
+            let banks = sampling
+                .as_ref()
+                .and_then(|sampling| bounds.banks(&facts, startup.request_slots, sampling));
+
+            let stream = stream(startup.lanes, device)?;
+            if let Some(experts) = experts.as_ref()
+                && stream.as_ref().map(Stream::raw) != Some(experts.stream(0).raw())
+            {
                 return Err(Error::Unsupported(
                     "expert parallelism runs every forward on one execution lane".into(),
                 ));
             }
+            prepared.push(bind::prepare(
+                interface,
+                startup.model.handle(),
+                BindingRequest {
+                    component: component.clone(),
+                    path,
+                    device,
+                    stream: stream.as_ref().map_or(0, Stream::raw),
+                    size: Some(TextSize {
+                        tokens: bounds.tokens,
+                        rows: bounds.rows,
+                    }),
+                    // The loaded model resolved its attention backend.
+                    backends: Backends::default(),
+                    derive_host_lengths: false,
+                    experts: experts.as_ref().map(|experts| experts.transport(0).clone()),
+                    weights: startup.weights.map(|weights| weights.prefetch().clone()),
+                    cache: Some(cache.clone()),
+                },
+            )?);
+            planned.push(Planned {
+                component,
+                cuda,
+                facts,
+                bounds,
+                sampling,
+                banks,
+                stream,
+            });
         }
-        let prepared = bind::prepare(
-            interface,
-            startup.model.handle(),
-            BindingRequest {
-                component: component.clone(),
-                path,
-                device,
-                stream: stream.as_ref().map_or(0, Stream::raw),
-                size: Some(TextSize {
-                    tokens: bounds.tokens,
-                    rows: bounds.rows,
-                }),
-                // The loaded model resolved its attention backend.
-                backends: Backends::default(),
-                derive_host_lengths: false,
-                experts: experts.as_ref().map(|experts| experts.transport(0).clone()),
-                weights: startup.weights.map(|weights| weights.prefetch().clone()),
-                cache: Some(cache),
-            },
-        )?;
-        let bindings = bind::bind(interface, startup.workspaces, vec![prepared], startup.peers)?;
-        let binding = bindings
-            .first()
-            .ok_or_else(|| Error::Invariant("a prepared component is bound".into()))?;
-        let mut collectives = Vec::new();
-        if let Some(peers) = startup.peers {
-            let owner = stream
-                .as_ref()
-                .and_then(|stream| startup.lanes.owner(stream.raw()));
-            collectives.extend(peers.bind_collectives(interface, binding, owner)?);
-        }
-        // Idle ranks join expert steps through the model's expert layers; a
-        // text binding may already provide them.
-        if let Some(experts) = experts.as_deref_mut()
-            && !experts.has_joins()
-        {
-            experts.bind_joins(&[binding.prepared()])?;
-        }
+        let bindings = bind::bind(interface, startup.workspaces, prepared, startup.peers)?;
 
-        let buffers = Buffers::allocate(layout, cuda, startup.preparation)?;
-        let chunk_rows = bounds.denoise.map_or(0, |(_, chunk_rows)| chunk_rows);
-        let mut arguments = vec![
-            Argument::Handle(binding.prepared().clone()),
-            bounds.page_tokens.as_slice().into(),
-            bounds.windowed.as_slice().into(),
-            chunk_rows.into(),
-        ];
-        if let (Some(sampling), Some(banks)) = (&sampling, &banks) {
-            arguments.extend([
-                Argument::Integer(i64::from(sampling.max_steps)),
-                Argument::Float(f64::from(sampling.entropy_bound)),
-                Argument::Float(f64::from(sampling.t_min)),
-                Argument::Float(f64::from(sampling.t_max)),
-                Argument::Float(f64::from(sampling.confidence_threshold)),
-                Argument::Integer(i64::from(sampling.stability_threshold)),
-            ]);
-            for (_, view) in banks.views() {
-                arguments.push(view.into());
+        let mut runners = Vec::new();
+        for (index, (plan, binding)) in planned.into_iter().zip(&bindings).enumerate() {
+            let Planned {
+                component,
+                cuda,
+                facts,
+                bounds,
+                sampling,
+                banks,
+                stream,
+            } = plan;
+            let mut collectives = Vec::new();
+            if let Some(peers) = startup.peers {
+                let owner = stream
+                    .as_ref()
+                    .and_then(|stream| startup.lanes.owner(stream.raw()));
+                collectives.extend(peers.bind_collectives(interface, binding, owner)?);
             }
-        }
-        let methods = Methods::construct(interface, &arguments)?;
+            // Idle ranks join expert steps through the model's expert
+            // layers; a text binding may already provide them.
+            if let Some(experts) = experts.as_deref_mut()
+                && !experts.has_joins()
+            {
+                experts.bind_joins(&[binding.prepared()])?;
+            }
 
-        let owner = format!("diffusion_lm:{component}");
-        let pool = match (cuda, bounds.graphs) {
-            (Some(ordinal), true) => {
-                let key = buffers.view("input_ids")?.address() as usize;
-                reserve_pools(
-                    startup.graphs,
-                    &interface.function("graphs.pool")?,
-                    key,
-                    owner.clone(),
-                    &[ordinal],
-                    None,
-                )?
-                .first()
-                .map(|pool| pool.value.clone())
+            let layout = bounds.layout(&facts, banks);
+            let banks = banks
+                .map(|layout| Banks::allocate(layout, cuda, startup.preparation))
+                .transpose()?;
+            let buffers = Buffers::allocate(layout, cuda, startup.preparation)?;
+            let chunk_rows = bounds.denoise.map_or(0, |(_, chunk_rows)| chunk_rows);
+            let mut arguments = vec![
+                Argument::Handle(binding.prepared().clone()),
+                bounds.page_tokens.as_slice().into(),
+                bounds.windowed.as_slice().into(),
+                chunk_rows.into(),
+            ];
+            if let (Some(sampling), Some(banks)) = (&sampling, &banks) {
+                arguments.extend([
+                    Argument::Integer(i64::from(sampling.max_steps)),
+                    Argument::Float(f64::from(sampling.entropy_bound)),
+                    Argument::Float(f64::from(sampling.t_min)),
+                    Argument::Float(f64::from(sampling.t_max)),
+                    Argument::Float(f64::from(sampling.confidence_threshold)),
+                    Argument::Integer(i64::from(sampling.stability_threshold)),
+                ]);
+                for (_, view) in banks.views() {
+                    arguments.push(view.into());
+                }
             }
-            _ => None,
-        };
-        if let Some(experts) = experts
-            && !experts.has_pools()
-            && let Some(pool) = &pool
-        {
-            experts.set_pools(vec![pool.clone()]);
+            let methods = Methods::construct(interface, &arguments)?;
+
+            let owner = format!("diffusion_lm:{component}");
+            let pool = match (cuda, bounds.graphs) {
+                (Some(ordinal), true) => {
+                    let key = buffers.view("input_ids")?.address() as usize;
+                    reserve_pools(
+                        startup.graphs,
+                        &interface.function("graphs.pool")?,
+                        key,
+                        owner.clone(),
+                        &[ordinal],
+                        None,
+                    )?
+                    .first()
+                    .map(|pool| pool.value.clone())
+                }
+                _ => None,
+            };
+            if let Some(experts) = experts.as_deref_mut()
+                && !experts.has_pools()
+                && let Some(pool) = &pool
+            {
+                experts.set_pools(vec![pool.clone()]);
+            }
+            let shapes = Shapes::new(
+                facts.sequence_length,
+                bounds.capacity,
+                sampling.map(|_| startup.request_slots),
+            )?;
+
+            // One lease per batch in flight. A lease holds every step's
+            // outcome and tokens, or the candidate values of readouts, whose
+            // four bytes each the batch's result message bounds.
+            let max_calls = config.max_batch_calls.max(1);
+            let words = (max_calls * (1 + facts.sequence_length))
+                .max(startup.max_payload_bytes.div_ceil(4));
+            let outputs = OutputPool::new(cuda, startup.queue_depth.max(1) + 1, words);
+            runners.push(Self {
+                index,
+                graphs: GraphTable::new(owner.clone(), methods.graphs.release.clone()),
+                breaks: startup.weights.map(|weights| weights.breaks().clone()),
+                segments: 0,
+                owner,
+                component,
+                methods,
+                facts,
+                buffers,
+                banks,
+                sampling,
+                chunk_rows,
+                shapes,
+                graph_widths: bounds.widths,
+                groups: bounds.groups,
+                pool,
+                stream,
+                plans_attention: true,
+                collectives,
+                outputs,
+            });
         }
-        let shapes = Shapes::new(
-            facts.sequence_length,
-            bounds.capacity,
-            sampling.map(|_| startup.request_slots),
-        )?;
         startup.components.add_bindings(bindings);
-
-        // One lease per batch in flight. A lease holds every step's outcome
-        // and tokens, or the candidate values of readouts, whose four bytes
-        // each the batch's result message bounds.
-        let max_calls = config.max_batch_calls.max(1);
-        let words =
-            (max_calls * (1 + facts.sequence_length)).max(startup.max_payload_bytes.div_ceil(4));
-        let outputs = OutputPool::new(cuda, startup.queue_depth.max(1) + 1, words);
         if let Some(stream) = startup.preparation {
             stream.synchronize()?;
         }
-        Ok(Some(Self {
-            graphs: GraphTable::new(owner.clone(), methods.graphs.release.clone()),
-            breaks: startup.weights.map(|weights| weights.breaks().clone()),
-            segments: 0,
-            owner,
-            component,
-            methods,
-            facts,
-            buffers,
-            banks,
-            sampling,
-            chunk_rows,
-            shapes,
-            graph_widths: bounds.widths,
-            groups: bounds.groups,
-            pool,
-            stream,
-            plans_attention: true,
-            collectives,
-            outputs,
-        }))
+        Ok(runners)
     }
 }
 
-/// Device bytes the runner takes beside the prefix cache pool for the
-/// diffusion LM of `components`: its buffers, a generating rank's banks and
-/// the sampler workspace its Python half allocates. `experts` is as in
-/// [`Startup`].
+/// Device bytes the runners take beside the prefix cache pool for the
+/// diffusion LM components of `components`: each one's buffers, a
+/// generating rank's banks and the sampler workspace its Python half
+/// allocates. `experts` is as in [`Startup`].
 pub(crate) fn reserved_bytes(
     interface: &Interface,
     model: &LoadedModel,
@@ -461,20 +509,23 @@ pub(crate) fn reserved_bytes(
     request_slots: usize,
     cache: &KVPlan,
 ) -> Result<u64> {
-    let Some((_, path, _)) = component(components) else {
-        return Ok(0);
-    };
-    let facts = Facts::describe(interface, model.handle(), &path, experts.0, experts.1)?;
     let cuda = config.device.cuda_index().is_some();
-    let bounds = Bounds::new(config, request_slots, cache, None, &facts, cuda)?;
-    let banks = config
-        .canvas_sampling
-        .as_ref()
-        .and_then(|sampling| bounds.banks(&facts, request_slots, sampling));
-    let workspace = match (bounds.denoise, banks) {
-        (Some((_, chunk_rows)), Some(_)) => facts.workspace_bytes(interface, chunk_rows, cuda)?,
-        _ => 0,
-    };
-    let resident = banks.map(|banks| banks.bytes()).transpose()?.unwrap_or(0);
-    Ok(bounds.layout(&facts, banks).bytes() + resident + workspace)
+    let mut bytes = 0;
+    for (_, path, _) in placed(components)? {
+        let facts = Facts::describe(interface, model.handle(), &path, experts.0, experts.1)?;
+        let bounds = Bounds::new(config, request_slots, cache, None, &facts, cuda)?;
+        let banks = config
+            .canvas_sampling
+            .as_ref()
+            .and_then(|sampling| bounds.banks(&facts, request_slots, sampling));
+        let workspace = match (bounds.denoise, banks) {
+            (Some((_, chunk_rows)), Some(_)) => {
+                facts.workspace_bytes(interface, chunk_rows, cuda)?
+            }
+            _ => 0,
+        };
+        let resident = banks.map(|banks| banks.bytes()).transpose()?.unwrap_or(0);
+        bytes += bounds.layout(&facts, banks).bytes() + resident + workspace;
+    }
+    Ok(bytes)
 }
