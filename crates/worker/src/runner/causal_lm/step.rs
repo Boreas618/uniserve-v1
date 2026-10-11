@@ -20,7 +20,8 @@ use super::calls::{self, Prepared};
 use super::context::{self, Sources};
 use crate::cuda_graph::GraphMode;
 use crate::runner::causal_lm::{
-    Embeddings, Executed, FINISH_IDS, SamplingColumns, StepRequest, TokenRow, logit_layout,
+    Embeddings, Executed, FINISH_IDS, PromptChunks, SamplingColumns, StepRequest, TokenRow,
+    logit_layout,
 };
 use crate::runner::denoiser::image::ConditionRow;
 use crate::sampling::SamplingMetadata;
@@ -109,7 +110,7 @@ struct Planned {
     /// selections are final; empty otherwise.
     finish_ids: Vec<[i64; FINISH_IDS]>,
     sampling: Option<SamplingPlan>,
-    prompt: Vec<i64>,
+    prompt: PromptChunks,
     tasks: usize,
 }
 
@@ -120,7 +121,7 @@ impl Planned {
             rows: &self.rows,
             finish_ids: &self.finish_ids,
             sampling: self.sampling.as_ref().map(|plan| SamplingColumns {
-                words: &plan.words,
+                groups: &plan.groups,
                 draws: &plan.draws,
                 params: &plan.params,
                 slots: &plan.slots,
@@ -133,21 +134,18 @@ impl Planned {
 }
 
 impl PromptScore {
-    /// The chunk's record in the step's prompt descriptor: `[row, count,
-    /// token, continued, slot, words, tail, top, requested, ids...]`.
-    fn record(&self, words: &mut Vec<i64>, top: usize, ids: &[u32]) {
-        words.extend([
-            self.span.0 as i64,
-            self.span.1 as i64,
-            self.token as i64,
-            self.continued,
-            self.slot as i64,
-            self.words as i64,
-            self.tail as i64,
-            top as i64,
-            ids.len() as i64,
-        ]);
-        words.extend(ids.iter().map(|&id| i64::from(id)));
+    /// Add the chunk, which reports its `top` tokens and `ids`, to the
+    /// forward's prompt chunks.
+    fn record(&self, chunks: &mut PromptChunks, top: usize, ids: &[u32]) {
+        chunks.rows.push(self.span.0 as i64);
+        chunks.row_counts.push(self.span.1 as i64);
+        chunks.tokens.push(self.token as i64);
+        chunks.continued.push(self.continued);
+        chunks.slots.push(self.slot as i64);
+        chunks.offsets.push(self.words as i64);
+        chunks.tails.push(self.tail as i64);
+        chunks.tops.push(top as i64);
+        chunks.ids.push(ids.to_vec());
     }
 }
 
@@ -516,7 +514,7 @@ impl Batch<'_> {
             .as_ref()
             .and_then(SamplingPlan::logprob_end)
             .unwrap_or(0);
-        let mut prompt_words = Vec::new();
+        let mut prompt_chunks = PromptChunks::default();
         for (tail, &(index, span, token, continued)) in prompts.iter().enumerate() {
             let (admitted, _) = params[index]
                 .as_ref()
@@ -546,7 +544,7 @@ impl Batch<'_> {
                     max_requested: ids.len(),
                 }),
             };
-            score.record(&mut prompt_words, top, &ids);
+            score.record(&mut prompt_chunks, top, &ids);
             cursor += score.size;
             self.calls[index].prompt.push(score);
         }
@@ -568,7 +566,7 @@ impl Batch<'_> {
             embeddings,
             finish_ids,
             sampling,
-            prompt: prompt_words,
+            prompt: prompt_chunks,
             tasks: task_count,
         })
     }
