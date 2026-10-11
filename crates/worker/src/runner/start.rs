@@ -112,7 +112,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
 }
 
-/// One call the runtime binds.
+/// One call startup binds.
 struct Target {
     component: String,
     path: String,

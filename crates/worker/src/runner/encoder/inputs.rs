@@ -79,7 +79,7 @@ pub(crate) fn prepare_inputs(
         _ => return Ok(true),
     };
     let parts = backend.parts();
-    let Some(runtime) = parts.image else {
+    let Some(image) = parts.image else {
         return Ok(true);
     };
     let mut tasks = Vec::new();
@@ -90,13 +90,13 @@ pub(crate) fn prepare_inputs(
             };
             let request = parts.requests.get(call.request_key.request_id.0)?;
             let input_images = request.admission().input_images;
-            let route = runtime.encoders.route(&call.component, call.code)?;
-            let pin = runtime.encoders.image[route].device().is_cuda();
-            let task = runtime.host.reserve()?;
+            let route = image.encoders.route(&call.component, call.code)?;
+            let pin = image.encoders.image[route].device().is_cuda();
+            let task = image.host.reserve()?;
             tasks.push((index, Arc::clone(&task)));
             task.configure(ImageTask::new(ImageWork::Prepare {
-                function: runtime.policy.prepare_input().clone(),
-                loaded: runtime.policy.loaded().clone(),
+                function: image.policy.prepare_input().clone(),
+                loaded: image.policy.loaded().clone(),
                 tower,
                 payload: Arc::clone(payload),
                 input_images,
