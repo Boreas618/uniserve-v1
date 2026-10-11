@@ -326,20 +326,7 @@ impl CausalLMRunners {
         let dtype = model_dtype(&config.model_dtype)?;
 
         // The attention layers' view of the pool, bound once.
-        let views = crate::ffi::Fields::new();
-        let views = kv
-            .views()?
-            .into_iter()
-            .try_fold(views, |fields, (name, view)| -> Result<_> {
-                Ok(fields.with(&name, view.to_tensor()?))
-            })?
-            .into_any();
-        let pool = Handle::new(
-            startup
-                .interface
-                .function("cache.pool")?
-                .call_values(&[tvm_ffi::Any::from(kv.layout()?), views])?,
-        )?;
+        let pool = kv.pool(startup.interface)?;
 
         let state = DecodeState::allocate(
             startup.request_slots,

@@ -563,8 +563,6 @@ pub fn slot_requirements(
 mod tests {
     use uniserve_ipc::{DimBound, ShapeBound};
 
-    use crate::ffi::Fields;
-
     use super::*;
 
     fn group() -> HostGroup {
@@ -593,34 +591,35 @@ mod tests {
         }
     }
 
-    /// A two-layer, one-column bfloat16 pool with 64-token pages, as
-    /// `model.cache_plan` describes it.
+    /// A two-layer, one-column bfloat16 pool with 64-token pages.
     fn cache() -> KVPlan {
-        let ints = |values: &[i64]| crate::ffi::integer_list(values.iter().copied());
-        let group = Fields::new()
-            .with("window", -1i64)
-            .with("page_tokens", 64i64)
-            .with("units_per_page", 2i64)
-            .with("layers", crate::ffi::strings(["layers.0", "layers.1"]))
-            .with("layer_ids", ints(&[0, 1]))
-            .with("axis_layers", ints(&[0, 1]))
-            .with("num_kv_heads", 4i64)
-            .with("total_kv_heads", 8i64)
-            .with("kv_head_offset", 4i64)
-            .with("head_dim", 128i64)
-            .text("dtype", "bfloat16")
-            .text("compute_dtype", "bfloat16")
-            .into_any();
         let plane_bytes = 64 * 4 * 128 * 2;
-        let plan = Fields::new()
-            .with("columns", 1i64)
-            .with("plane_bytes", plane_bytes)
-            .with("quantized", false)
-            .with("unit_bytes", 2 * (plane_bytes + 1))
-            .text("dtype", "bfloat16")
-            .with("groups", crate::ffi::list([group]))
-            .into_any();
-        KVPlan::decode(plan).unwrap()
+        KVPlan {
+            columns: 1,
+            plane_bytes,
+            quantized: false,
+            // Key and value planes, each with one initialization flag.
+            unit_bytes: 2 * (plane_bytes + 1),
+            dtype: uniserve_core::KvCacheDtype::BFloat16,
+            groups: vec![crate::storage::KVGroupPlan {
+                window: None,
+                page_tokens: 64,
+                units_per_page: 2,
+                layers: vec!["layers.0".into(), "layers.1".into()],
+                layer_ids: vec![0, 1],
+                axis: crate::storage::GroupAxis {
+                    offset: 0,
+                    total: 2,
+                },
+                num_kv_heads: 4,
+                total_kv_heads: 8,
+                kv_head_offset: 4,
+                head_dim: 128,
+                dtype: crate::ffi::DType::BF16,
+                compute_dtype: crate::ffi::DType::BF16,
+            }],
+            handle: crate::ffi::Handle::none(),
+        }
     }
 
     #[test]

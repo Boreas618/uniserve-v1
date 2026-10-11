@@ -5,7 +5,7 @@ import torch
 
 from tests.python.fixtures.stub import load_model, read_config
 from uniserve_models import interface
-from uniserve_models.interface import loading
+from uniserve_models.interface import cache, loading
 from uniserve_models.interface.errors import UnsupportedSetup
 from uniserve_models.runner import causal_lm
 
@@ -65,18 +65,17 @@ def test_a_loaded_model_reports_its_backend_sizes_and_formats(loaded):
 
 
 def test_cache_plan_describes_pages_of_the_requested_size(loaded):
-    table, model = loaded
-    plan = table["model.cache_plan"](model, 32, "")
-    assert table["model.reads_pages"](model, "torch", plan) is True
-    assert plan["dtype"] == "bfloat16"
-    (group,) = plan["groups"]
-    assert group["page_tokens"] == 32
-    assert group["layers"] == ["backbone.layers.0.attention"]
-    assert group["layer_ids"] == [0]
-    assert group["window"] == -1
+    _, model = loaded
+    plan = cache.cache_plan(model, 32, "")
+    assert cache.reads_pages(model, "torch", plan) is True
+    assert plan.dtype() == "bfloat16"
+    assert plan.page_tokens() == [32]
+    assert plan.layers() == ["backbone.layers.0.attention"]
+    assert plan.layer_ids() == [0]
+    assert plan.windows() == [-1]
     # One column holds key and value planes of 32 one-element BF16 rows,
     # plus one initialization flag per plane.
-    assert plan["unit_bytes"] == 2 * (32 * 2 + 1)
+    assert plan.unit_bytes() == 2 * (32 * 2 + 1)
 
 
 def test_component_binding_serves_its_declared_workspace(loaded):

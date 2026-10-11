@@ -633,49 +633,40 @@ fn fp8_plan() -> uniserve_worker::KVPlan {
 
 /// A one-group plan storing `dtype`: two layers in two columns, 8-token
 /// pages of two heads of `head_dim` elements.
-fn kv_plan(dtype: &str, head_dim: i64) -> uniserve_worker::KVPlan {
+fn kv_plan(dtype: &str, head_dim: u32) -> uniserve_worker::KVPlan {
+    use uniserve_worker::ffi::{DType, Handle};
+    use uniserve_worker::storage::{GroupAxis, KVGroupPlan};
+
     let quantized = dtype == "float8_e4m3fn";
     let element_bytes = if quantized { 1 } else { 2 };
-    let plane_bytes = 8 * 2 * head_dim * element_bytes;
+    let plane_bytes = u64::from(8 * 2 * head_dim * element_bytes);
     // Each plane carries one initialized flag, and an FP8 plane one f32 scale.
     let metadata_bytes = if quantized { 5 } else { 1 };
-    let unit_bytes = 2 * 2 * (plane_bytes + metadata_bytes);
-
-    use tvm_ffi::{Any, Array, Map, String as FfiString};
-    let entry = |key: &str, value: Any| (FfiString::from(key), value);
-    let names: Array<Any> = ["a", "b"]
-        .iter()
-        .map(|name| Any::from(FfiString::from(*name)))
-        .collect();
-    let ids = || -> Array<Any> { [0_i64, 1].iter().map(|&id| Any::from(id)).collect() };
-    let group: Map<FfiString, Any> = [
-        entry("window", Any::from(-1_i64)),
-        entry("page_tokens", Any::from(8_i64)),
-        entry("units_per_page", Any::from(1_i64)),
-        entry("layers", Any::from(names)),
-        entry("layer_ids", Any::from(ids())),
-        entry("axis_layers", Any::from(ids())),
-        entry("num_kv_heads", Any::from(2_i64)),
-        entry("total_kv_heads", Any::from(2_i64)),
-        entry("kv_head_offset", Any::from(0_i64)),
-        entry("head_dim", Any::from(head_dim)),
-        entry("dtype", Any::from(FfiString::from(dtype))),
-        entry("compute_dtype", Any::from(FfiString::from("bfloat16"))),
-    ]
-    .into_iter()
-    .collect();
-    let groups: Array<Any> = [Any::from(group)].into_iter().collect();
-    let plan: Map<FfiString, Any> = [
-        entry("columns", Any::from(2_i64)),
-        entry("plane_bytes", Any::from(plane_bytes)),
-        entry("quantized", Any::from(quantized)),
-        entry("unit_bytes", Any::from(unit_bytes)),
-        entry("dtype", Any::from(FfiString::from(dtype))),
-        entry("groups", Any::from(groups)),
-    ]
-    .into_iter()
-    .collect();
-    uniserve_worker::KVPlan::decode(Any::from(plan)).unwrap()
+    uniserve_worker::KVPlan {
+        columns: 2,
+        plane_bytes,
+        quantized,
+        unit_bytes: 2 * 2 * (plane_bytes + metadata_bytes),
+        dtype: dtype.parse().unwrap(),
+        groups: vec![KVGroupPlan {
+            window: None,
+            page_tokens: 8,
+            units_per_page: 1,
+            layers: vec!["a".into(), "b".into()],
+            layer_ids: vec![0, 1],
+            axis: GroupAxis {
+                offset: 0,
+                total: 2,
+            },
+            num_kv_heads: 2,
+            total_kv_heads: 2,
+            kv_head_offset: 0,
+            head_dim,
+            dtype: DType::from_name(dtype).unwrap(),
+            compute_dtype: DType::BF16,
+        }],
+        handle: Handle::none(),
+    }
 }
 
 #[test]

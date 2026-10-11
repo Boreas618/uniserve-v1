@@ -66,7 +66,8 @@ impl ImportWorkspace {
         };
         let units = UnitColumn::bind(planes, bind_units, stream.as_deref())?;
 
-        let layout = planes.plan().layout(planes.num_units())?;
+        let plan = &planes.plan().handle;
+        let num_units = i64::from(planes.num_units());
         let cache = tensor_map(&planes.views()?)?;
         let scratch_view = StorageView::contiguous(
             Arc::clone(&scratch) as Arc<dyn Backing>,
@@ -80,7 +81,8 @@ impl ImportWorkspace {
         let functions = Functions::new(
             bind_conversion.name(),
             bind_conversion.call(&[
-                AnyView::from(&layout),
+                plan.view(),
+                AnyView::from(&num_units),
                 AnyView::from(&cache),
                 AnyView::from(&tensor),
                 AnyView::from(&elements_arg),
