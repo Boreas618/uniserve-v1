@@ -63,6 +63,8 @@ use crate::cuda_graph::{ShapeKey, TextShapes};
 use crate::ffi::{DType, Handle};
 use crate::parallel::MicrobatchCall;
 use crate::request::decode_state::DecodeState;
+use crate::sampling::SamplingPath;
+use crate::sampling::plan::{SamplingGroup, padded};
 use crate::storage::memory::StorageView;
 use crate::storage::{AttentionRow, BlockTables, KVCacheManager};
 use crate::transfer::Retirement;
@@ -83,10 +85,33 @@ pub(crate) struct TableShape {
     pub(crate) windowed: bool,
 }
 
-/// The sampling inputs of one invocation (see `crate::sampling::plan`).
+/// The prompt chunks a prefill forward scores: the lists of the runner's
+/// `prompt_logprobs`, one entry per chunk.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PromptChunks {
+    /// The chunk's first candidate row and its candidate rows; a chunk of
+    /// none only retains the logits of its row.
+    pub(crate) rows: Vec<i64>,
+    pub(crate) row_counts: Vec<i64>,
+    /// Its first token in the forward.
+    pub(crate) tokens: Vec<i64>,
+    /// What predicts its first token: nothing (0), the slot's retained
+    /// logits (1), or candidate row `continued - 2`.
+    pub(crate) continued: Vec<i64>,
+    pub(crate) slots: Vec<i64>,
+    /// Where its words start in the logprob tensor.
+    pub(crate) offsets: Vec<i64>,
+    /// The row of the tail tensor its last logits go to.
+    pub(crate) tails: Vec<i64>,
+    /// Its top count and the explicit token ids it reports.
+    pub(crate) tops: Vec<i64>,
+    pub(crate) ids: Vec<Vec<u32>>,
+}
+
+/// The sampling inputs of one forward (see `crate::sampling::plan`).
 pub(crate) struct SamplingColumns<'a> {
-    /// The host descriptor passed to the step.
-    pub(crate) words: &'a [i64],
+    /// The tasks of each sampler.
+    pub(crate) groups: &'a [SamplingGroup],
     /// One draw per candidate row.
     pub(crate) draws: &'a [f32],
     /// Eight parameters per candidate row.
@@ -117,8 +142,8 @@ pub(crate) struct StepRequest<'a> {
     /// The tasks the runner's `sample` selects; absent when no row samples
     /// or a decode forward's greedy selections are final.
     pub(crate) sampling: Option<SamplingColumns<'a>>,
-    /// The prompt scoring descriptor; empty when no row scores its prompt.
-    pub(crate) prompt: &'a [i64],
+    /// The prompt chunks the forward scores.
+    pub(crate) prompt: &'a PromptChunks,
     /// Vision features placed over some of the rows' tokens.
     pub(crate) embeddings: &'a [Embeddings],
 }
@@ -149,9 +174,9 @@ enum Choice {
 /// awaiting its expert step capacity.
 pub(crate) struct Staged {
     plan: Plan,
-    /// The sampling descriptor; empty when no row samples.
-    sampling: Vec<i64>,
-    prompt: Vec<i64>,
+    /// The tasks of each sampler; empty when no row samples.
+    sampling: Vec<SamplingGroup>,
+    prompt: PromptChunks,
     /// Vision features replace some of the tokens' embeddings.
     embedded: bool,
 }
@@ -180,7 +205,6 @@ pub(crate) struct Launch {
 /// One planned forward: its shapes and host columns.
 struct Plan {
     mode: ForwardMode,
-    live: usize,
     rows: usize,
     live_tokens: usize,
     tokens: usize,
@@ -320,8 +344,8 @@ impl CausalLMRunner {
             sampling: request
                 .sampling
                 .as_ref()
-                .map_or_else(Vec::new, |sampling| sampling.words.to_vec()),
-            prompt: request.prompt.to_vec(),
+                .map_or_else(Vec::new, |sampling| sampling.groups.to_vec()),
+            prompt: request.prompt.clone(),
             embedded: !request.embeddings.is_empty(),
         })
     }
@@ -415,40 +439,122 @@ impl CausalLMRunner {
         Ok(self.methods.call(&self.methods.plan_prefill, arguments))
     }
 
-    /// The eager methods that follow a staged forward: `sample` for rows
-    /// that sample from the logits the forward projected (`verify` for a
-    /// verification, which projects every candidate position), and
-    /// `prompt_logprobs` for scored prompt chunks.
+    /// The eager methods that follow a staged forward: one sampling method
+    /// per group of tasks sharing a sampler (`verify` for a verification,
+    /// which projects every candidate position), and `prompt_logprobs` for
+    /// scored prompt chunks.
     fn selection(&self, staged: &Staged) -> Result<Vec<MethodCall>> {
         let plan = &staged.plan;
         let outputs = [
-            "draws",
-            "params",
             "tasks",
             "completion",
             "continuation",
             "tagged",
             "points",
             "transition",
-            "logprobs",
         ];
         let mut calls = Vec::new();
-        if !staged.sampling.is_empty() {
-            let words = staged.sampling.as_slice();
-            if plan.mode == ForwardMode::Verify {
-                let mut arguments = vec![plan.logit_count.into(), words.into()];
-                arguments.extend(self.tensors(&["hidden", "logit_rows"])?);
+        for group in &staged.sampling {
+            // What decides finish and transition, and what a group that
+            // reports logprobs or shapes its logits takes.
+            let decisions = [
+                group.force_finish.as_slice(),
+                &group.finish_ids,
+                &group.transition_ids,
+            ];
+            let logprobs = [
+                group.logprob_tasks.as_slice(),
+                &group.logprob_counts,
+                &group.logprob_ids,
+            ];
+            let shaping = |drafts: bool| {
+                let mut arguments = lists(&[
+                    &group.top_ks,
+                    &group.top_p_rows,
+                    &group.min_p_rows,
+                    &group.typical_p_rows,
+                    &group.allowed_rows,
+                    &group.allowed,
+                    &group.suppressed,
+                    &group.penalty_rows,
+                    &group.penalty_slots,
+                ]);
+                if drafts {
+                    arguments.push(group.penalty_drafts.as_slice().into());
+                }
+                arguments.push(group.bias.as_slice().into());
+                arguments.push(Argument::Floats(group.bias_values.clone()));
+                arguments.extend(lists(&logprobs));
+                arguments.push(group.logprob_offset.into());
+                arguments.extend(lists(&decisions));
+                arguments
+            };
+
+            let mut arguments: Vec<Argument>;
+            let method = if plan.mode == ForwardMode::Verify {
+                arguments = vec![plan.logit_count.into(), group.first.into()];
+                arguments.extend(lists(&[
+                    &group.rows,
+                    &group.row_counts,
+                    &group.drafts,
+                    &group.terminal_prefixes,
+                ]));
+                arguments.push(group.parameters.into());
+                arguments.extend(shaping(true));
+                arguments.extend(self.tensors(&["hidden", "logit_rows", "draws", "params"])?);
                 arguments.extend(self.tensors(&outputs)?);
-                calls.push(self.methods.call(&self.methods.verify, arguments));
+                arguments.extend(self.tensors(&["logprobs"])?);
+                &self.methods.verify
             } else {
-                let mut arguments = vec![plan.live.into(), words.into()];
-                arguments.extend(self.tensors(&["logits"])?);
-                arguments.extend(self.tensors(&outputs)?);
-                calls.push(self.methods.call(&self.methods.sample, arguments));
-            }
+                arguments = vec![group.first.into(), group.rows.as_slice().into()];
+                match group.path {
+                    SamplingPath::Greedy { .. } => {
+                        arguments.push(group.suppressed.as_slice().into());
+                        arguments.extend(lists(&decisions));
+                        arguments.extend(self.tensors(&["logits"])?);
+                        arguments.extend(self.tensors(&outputs)?);
+                        &self.methods.sample_greedy
+                    }
+                    SamplingPath::TopK(width) => {
+                        arguments.push((width as usize).into());
+                        arguments.push(group.parameters.into());
+                        arguments.push(group.min_p_rows.as_slice().into());
+                        arguments.extend(lists(&logprobs));
+                        arguments.push(group.logprob_offset.into());
+                        arguments.extend(lists(&decisions));
+                        arguments.extend(self.tensors(&["logits", "draws", "params"])?);
+                        arguments.extend(self.tensors(&outputs)?);
+                        arguments.extend(self.tensors(&["logprobs"])?);
+                        &self.methods.sample_top_k
+                    }
+                    SamplingPath::Categorical => {
+                        arguments.push(group.parameters.into());
+                        arguments.extend(shaping(false));
+                        arguments.extend(self.tensors(&["logits", "draws", "params"])?);
+                        arguments.extend(self.tensors(&outputs)?);
+                        arguments.extend(self.tensors(&["logprobs"])?);
+                        &self.methods.sample
+                    }
+                }
+            };
+            calls.push(self.methods.call(method, arguments));
         }
-        if !staged.prompt.is_empty() {
-            let mut arguments = vec![plan.logit_count.into(), staged.prompt.as_slice().into()];
+
+        let prompt = &staged.prompt;
+        if !prompt.rows.is_empty() {
+            let ids: Vec<&[u32]> = prompt.ids.iter().map(Vec::as_slice).collect();
+            let mut arguments = vec![plan.logit_count.into()];
+            arguments.extend(lists(&[
+                &prompt.rows,
+                &prompt.row_counts,
+                &prompt.tokens,
+                &prompt.continued,
+                &prompt.slots,
+                &prompt.offsets,
+                &prompt.tails,
+                &prompt.tops,
+                &padded(&ids),
+            ]));
             arguments.extend(self.tensors(&[
                 "hidden",
                 "logit_rows",
@@ -851,7 +957,7 @@ impl CausalLMRunner {
         // rows: every position of a verification row, and of a prefill row
         // that scores its prompt.
         let mut logit_rows = Vec::new();
-        if request.mode == ForwardMode::Verify || !request.prompt.is_empty() {
+        if request.mode == ForwardMode::Verify || !request.prompt.rows.is_empty() {
             let mut offset = 0;
             for row in rows {
                 let stop = offset + row.query as usize;
@@ -870,7 +976,6 @@ impl CausalLMRunner {
 
         Ok(Plan {
             mode: request.mode,
-            live,
             rows: padded_rows,
             live_tokens,
             tokens: padded_tokens,
@@ -1123,6 +1228,11 @@ impl CausalLMRunner {
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         self.graphs.close(aborted)
     }
+}
+
+/// Integer lists as method arguments, in order.
+fn lists(values: &[&[i64]]) -> Vec<Argument> {
+    values.iter().map(|&list| Argument::from(list)).collect()
 }
 
 fn bytes(values: &[i64]) -> &[u8] {
