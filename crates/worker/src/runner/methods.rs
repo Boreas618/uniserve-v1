@@ -20,6 +20,7 @@ pub(crate) enum Argument {
     Integer(i64),
     Float(f64),
     Integers(Vec<i64>),
+    Text(String),
     Tensor(StorageView),
     Handle(Handle),
     None,
@@ -69,6 +70,7 @@ impl MethodCall {
                     Argument::Float(value) => Any::from(value),
                     Argument::Integers(values) => Any::from(Shape::from(values.as_slice())),
                     Argument::Tensor(view) => Any::from(view.to_tensor()?),
+                    Argument::Text(text) => Any::from(tvm_ffi::String::from(text.as_str())),
                     Argument::Handle(handle) => handle.to_any(),
                     Argument::None => Any::default(),
                 })
@@ -115,6 +117,11 @@ impl Methods {
                 .collect::<Result<_>>()?,
             graphs: GraphFunctions::from_interface(interface)?,
         })
+    }
+
+    /// The Python runner.
+    pub(crate) fn runner(&self) -> &Handle {
+        &self.runner
     }
 
     /// A call of the method `name` on the runner with `arguments`.

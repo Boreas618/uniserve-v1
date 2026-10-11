@@ -22,7 +22,7 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(scope="module")
 def loaded():
     table = interface.table()
-    return table, load_stub(table)
+    return table, load_stub()
 
 
 def test_the_stub_reports_its_image_facts(loaded):
