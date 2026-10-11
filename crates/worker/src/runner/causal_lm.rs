@@ -27,22 +27,39 @@
 //! padding token, then empty sequences.
 //!
 //! Padding rows never write K/V (their write addresses are -1).
+//!
+//! A rank's runners and the request state they share are
+//! [`CausalLMRunners`] ([`runners`]): a batch of token calls reserves its
+//! storage ([`batch`]), turns its calls into rows, sampling tasks and prompt
+//! scoring ([`calls`], [`context`], [`step`]), runs one forward per expert
+//! microbatch and commits its outputs ([`commit`]). [`start`] builds the
+//! runners and [`warmup`] captures their graphs.
 
+mod batch;
+mod calls;
+mod commit;
+mod context;
 pub(crate) mod input_buffers;
 pub(crate) mod methods;
 pub(crate) mod rows;
+mod runners;
+pub(crate) mod start;
+mod step;
+pub(crate) mod warmup;
 
 pub(crate) use input_buffers::{Dimensions, FINISH_IDS, InputBuffers};
 pub(crate) use methods::{Construction, Methods};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
+pub(crate) use runners::{CausalLMRunners, execute};
 
 use std::sync::Arc;
 
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 use uniserve_ipc::ForwardMode;
 
-use super::{TextShapes, TokenSelection};
+use super::TokenSelection;
 use crate::cuda_graph::{CUDAGraph, GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
+use crate::cuda_graph::{ShapeKey, TextShapes};
 use crate::ffi::{DType, Handle};
 use crate::parallel::MicrobatchCall;
 use crate::request::decode_state::DecodeState;
@@ -50,6 +67,7 @@ use crate::storage::memory::StorageView;
 use crate::storage::{AttentionRow, BlockTables, KVCacheManager};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
+use runners::{COMPLETION_FIELDS, StepParts};
 
 use input_buffers::ROW_SECTIONS;
 use methods::{Argument, MethodCall};
@@ -63,23 +81,6 @@ pub(crate) const COMMIT_CACHE: i64 = 3;
 pub(crate) struct TableShape {
     pub(crate) page_tokens: u32,
     pub(crate) windowed: bool,
-}
-
-/// What identifies a captured text graph besides the runner's fixed table
-/// widths and tensors: the method and its scalar arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum ShapeKey {
-    /// `decode` of a row bucket.
-    Decode { rows: usize },
-    /// `prefill` of a row and token bucket, with outputs or writing only
-    /// the prefix cache.
-    Prefill {
-        rows: usize,
-        tokens: usize,
-        outputs: bool,
-    },
-    /// `commit` of a row bucket.
-    Commit { rows: usize },
 }
 
 /// The sampling inputs of one invocation (see `crate::sampling::plan`).

@@ -69,10 +69,7 @@ pub use runner::encoder::{
 pub use runner::vision::{
     BlockPositions, FeatureInjection, FeatureLayout, PositionLayout, VisionBlock,
 };
-pub use runner::{
-    ModelBatch, ModelRunners, PrefillShape, TextShapes, TokenSelection, prefill_shapes,
-    prefill_units,
-};
+pub use runner::{ModelBatch, ModelRunners, TokenSelection};
 pub use sampling::{
     SamplingMetadata, SamplingPath, TOKEN_CONTINUATION_BIT, TOKEN_VALUE_MASK, finish_token_ids,
 };
