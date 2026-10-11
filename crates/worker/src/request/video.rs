@@ -13,8 +13,10 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, ConditionRole, VideoCondition};
+use uniserve_ipc::RequestKey;
 
 use crate::ffi::integer_list;
+use crate::host::mux::MuxSession;
 use crate::runner::denoiser::VideoModel;
 use crate::{Error, Result};
 
@@ -453,6 +455,35 @@ impl MediaPlan {
 /// The request-order conditions of an admission, as the denoiser sizes them.
 pub(crate) fn condition_shapes(conditions: &[VideoCondition]) -> Arc<[ConditionShape]> {
     conditions.iter().map(ConditionShape::of).collect()
+}
+
+/// One admitted video request on this rank.
+pub(crate) struct VideoRequest {
+    pub(crate) key: RequestKey,
+    pub(crate) frames: u32,
+    pub(crate) canvas: Canvas,
+    /// The prompt's token ids.
+    pub(crate) tokens: Arc<[i64]>,
+    pub(crate) conditions: Arc<[VideoCondition]>,
+    /// The request's layout on a denoising rank.
+    pub(crate) admission: Option<Admission>,
+    /// The denoiser's prepared layout id of `admission`.
+    pub(crate) layout: Option<usize>,
+    /// Frames of each media unit.
+    pub(crate) units: Arc<[u32]>,
+    /// Samples of the generated audio track.
+    pub(crate) audio_samples: u64,
+    /// The seed of the request's noise.
+    pub(crate) seed: u64,
+    /// The request's MP4 on the muxer rank.
+    pub(crate) mux: Option<Arc<MuxSession>>,
+}
+
+impl VideoRequest {
+    /// The longest media unit's frames.
+    pub(crate) fn longest(&self) -> u32 {
+        self.units.iter().copied().max().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

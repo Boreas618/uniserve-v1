@@ -33,7 +33,7 @@ use crate::ffi::{DType, Device, Handle, Record};
 use crate::host::mux::{MuxConfig, MuxSession};
 
 use crate::request::RequestPool;
-use crate::request::video::{Admission, MediaPlan, VideoSize, condition_shapes, vision_spans};
+use crate::request::video::{MediaPlan, VideoRequest, VideoSize, condition_shapes, vision_spans};
 use crate::runner::RunnerSetup;
 use crate::runner::decoder::{DecodeCapacity, DecoderRunner, Segment, TrackUnits, UnitShape};
 use crate::runner::denoiser::{Conditioning, DenoiserRunner, VideoModel};
@@ -80,35 +80,6 @@ pub(crate) fn units(
     let first = (position * per_rank).min(count);
     let last = (position * per_rank + per_rank).min(count);
     Ok(cursor + first..cursor + last)
-}
-
-/// One admitted video request on this rank.
-pub(crate) struct VideoRequest {
-    pub(crate) key: RequestKey,
-    pub(crate) frames: u32,
-    pub(crate) canvas: Canvas,
-    /// The prompt's token ids.
-    pub(crate) tokens: Arc<[i64]>,
-    pub(crate) conditions: Arc<[VideoCondition]>,
-    /// The request's layout on a denoising rank.
-    pub(crate) admission: Option<Admission>,
-    /// The denoiser's prepared layout id of `admission`.
-    pub(crate) layout: Option<usize>,
-    /// Frames of each media unit.
-    pub(crate) units: Arc<[u32]>,
-    /// Samples of the generated audio track.
-    pub(crate) audio_samples: u64,
-    /// The seed of the request's noise.
-    pub(crate) seed: u64,
-    /// The request's MP4 on the muxer rank.
-    pub(crate) mux: Option<Arc<MuxSession>>,
-}
-
-impl VideoRequest {
-    /// The longest media unit's frames.
-    pub(crate) fn longest(&self) -> u32 {
-        self.units.iter().copied().max().unwrap_or(0)
-    }
 }
 
 /// A rank's video runtime.
