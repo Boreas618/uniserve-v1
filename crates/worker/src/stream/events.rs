@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
 use uniserve_ipc::Wake;
 
+use super::Issue;
 use crate::{Error, Result};
 
 type PoolKey = (i32, bool, bool);
@@ -129,16 +130,16 @@ impl EventPool {
     }
 
     /// Records this lease once on `stream`.
-    pub fn record(&self, event: &Arc<Event>, stream: &Stream) -> Result<()> {
+    pub fn record(&self, event: &Arc<Event>, stream: impl Issue) -> Result<()> {
         let mut state = self.lock();
         require_open(&state)?;
-        let device = stream.device().0;
+        let (device, raw) = producer(&stream)?;
         let active = require(&mut state, event, device)?;
         if active.stream.is_some() {
             return Err(invariant("device event was recorded more than once"));
         }
-        event.record(stream)?;
-        active.stream = Some(stream.raw());
+        stream.record(event)?;
+        active.stream = Some(raw);
         Ok(())
     }
 
@@ -154,8 +155,8 @@ impl EventPool {
 
     /// Acquire, record on `stream` and retain one reference: the fence of
     /// work just submitted to `stream`.
-    pub fn fence(&self, stream: &Stream, interprocess: bool) -> Result<Arc<Event>> {
-        let device = stream.device().0;
+    pub fn fence(&self, stream: impl Issue, interprocess: bool) -> Result<Arc<Event>> {
+        let (device, _) = producer(&stream)?;
         let event = self.acquire(device, false, interprocess)?;
         self.record(&event, stream)?;
         self.retain(&event, device, 1)?;
@@ -235,41 +236,41 @@ impl EventPool {
             .ok_or_else(|| invariant("device event is not an active lease"))
     }
 
-    /// Orders the installed completion wake after `event`, on an
-    /// independent notification stream per producer. Without a wake this
-    /// does nothing.
+    /// Orders the installed completion wake after `event`, whose record
+    /// was made, on an independent notification stream per producer.
+    /// Without a wake this does nothing.
     pub fn wake_after(&self, event: &Arc<Event>) -> Result<()> {
-        let (stream, wake) = {
-            let mut state = self.lock();
-            let Some(wake) = state.wake.clone() else {
-                return Ok(());
-            };
-            require_open(&state)?;
-            let (device, producer) = state
-                .active
-                .get(&key(event))
-                .and_then(|active| Some((active.device, active.stream?)))
-                .ok_or_else(|| {
-                    invariant("completion notification requires a recorded producer event")
-                })?;
-            let stream = match state.wake_streams.get(&(device, producer)) {
-                Some(stream) => Arc::clone(stream),
-                None => {
-                    let _device = DeviceGuard::new(DeviceId(device))?;
-                    let stream = Arc::new(Stream::new(DeviceId(device))?);
-                    state
-                        .wake_streams
-                        .insert((device, producer), Arc::clone(&stream));
-                    stream
-                }
-            };
-            (stream, wake)
+        None::<&Stream>.wake(self, event)
+    }
+
+    /// The stream and wake that notify of `event`'s completion: one
+    /// notification stream per producer stream, created when first asked
+    /// for. `None` without an installed wake.
+    pub(crate) fn notification(&self, event: &Arc<Event>) -> Result<Option<(Arc<Stream>, Wake)>> {
+        let mut state = self.lock();
+        let Some(wake) = state.wake.clone() else {
+            return Ok(None);
         };
-        stream.wait_event(event)?;
-        // The host function only signals the service's wake: it never calls
-        // CUDA or blocks, as host functions must not.
-        stream.launch_host_fn(move || wake.wake())?;
-        Ok(())
+        require_open(&state)?;
+        let (device, producer) = state
+            .active
+            .get(&key(event))
+            .and_then(|active| Some((active.device, active.stream?)))
+            .ok_or_else(|| {
+                invariant("completion notification requires a recorded producer event")
+            })?;
+        let stream = match state.wake_streams.get(&(device, producer)) {
+            Some(stream) => Arc::clone(stream),
+            None => {
+                let _device = DeviceGuard::new(DeviceId(device))?;
+                let stream = Arc::new(Stream::new(DeviceId(device))?);
+                state
+                    .wake_streams
+                    .insert((device, producer), Arc::clone(&stream));
+                stream
+            }
+        };
+        Ok(Some((stream, wake)))
     }
 
     /// Stops new work, waits for every recorded lease on the host and runs
@@ -391,6 +392,14 @@ fn collect_completed(state: &mut State) -> (Vec<Deferred>, Result<()>) {
         }
     }
     (completed, failure)
+}
+
+/// The device and raw handle of the stream `stream` records on.
+fn producer(stream: &impl Issue) -> Result<(i32, usize)> {
+    let stream = stream
+        .stream()
+        .ok_or_else(|| invariant("a device event is recorded on a stream"))?;
+    Ok((stream.device().0, stream.raw()))
 }
 
 fn require_open(state: &State) -> Result<()> {

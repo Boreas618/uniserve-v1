@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use uniserve_core::TokenLogprob;
-use uniserve_cuda::{Event, SourceOrder, Stream};
+use uniserve_cuda::{Event, SourceOrder};
 
 use crate::ffi::{Backing, DType, Device};
 use crate::storage::memory::{Memory, StorageView};
-use crate::transfer::{Spans, copy_on_host, copy_planner};
+use crate::stream::Issue;
+use crate::transfer::{Spans, copy_planner};
 use crate::{Error, EventPool, Result};
 
 mod logprobs;
@@ -140,7 +141,7 @@ impl OutputBuffer {
     pub fn capture(
         &mut self,
         source: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         events: &EventPool,
     ) -> Result<(usize, usize)> {
         let dtype = source.dtype();
@@ -165,7 +166,7 @@ impl OutputBuffer {
     pub fn capture_bytes(
         &mut self,
         source: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         events: &EventPool,
     ) -> Result<StorageView> {
         if source.dtype() != DType::U8 {
@@ -182,13 +183,13 @@ impl OutputBuffer {
     }
 
     /// Copy `source` into host storage at `address`: on `stream` for a
-    /// device source (after fencing its device for timing), on this thread
-    /// for host memory.
+    /// device source (after fencing its device for timing), as a host copy
+    /// in `stream`'s order for host memory.
     fn copy(
         &mut self,
         source: &StorageView,
         address: u64,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         events: &EventPool,
     ) -> Result<()> {
         let memory: Arc<dyn Backing> = Arc::clone(&self.storage()?.memory) as Arc<dyn Backing>;
@@ -204,10 +205,10 @@ impl OutputBuffer {
 
         match source.device() {
             Device::Cuda(device) => {
-                let stream = stream.ok_or_else(|| {
+                let producer = stream.stream().ok_or_else(|| {
                     Error::Invalid("a device capture requires its producing stream".into())
                 })?;
-                if stream.device().0 != device {
+                if producer.device().0 != device {
                     return Err(Error::Invalid(
                         "a capture stream must belong to its source device".into(),
                     ));
@@ -218,7 +219,7 @@ impl OutputBuffer {
                 // SAFETY: the pinned destination stays allocated until the
                 // seal fences complete; the source is the producer's storage,
                 // which the producer keeps until its stream passes this copy.
-                unsafe { plan.submit(stream) }?;
+                unsafe { stream.copy_strided(&plan) }?;
             }
             Device::Cpu | Device::CudaHost => {
                 self.register_device(None)?;
@@ -226,8 +227,9 @@ impl OutputBuffer {
                 let mut plan = copy_planner(None, SourceOrder::Stream)?;
                 target.plan_copy(&source_spans, &mut plan)?;
                 // SAFETY: both operands are host memory; the reserved words
-                // belong to this buffer and no device copy writes them.
-                unsafe { copy_on_host(&plan) };
+                // belong to this buffer and no device copy writes them. The
+                // producer keeps its storage until the copy ran.
+                unsafe { stream.host().copy_strided(&plan) }?;
             }
         }
         Ok(())
@@ -395,7 +397,7 @@ impl OutputBuffer {
     pub fn begin_device(
         &mut self,
         device: Option<i32>,
-        stream: &Stream,
+        stream: impl Issue,
         pool: &EventPool,
     ) -> Result<()> {
         self.register_device(device)?;
@@ -416,7 +418,7 @@ impl OutputBuffer {
     pub fn begin_copy(
         &mut self,
         device: Option<i32>,
-        stream: &Stream,
+        stream: impl Issue,
         pool: &EventPool,
     ) -> Result<()> {
         self.register_device(device)?;
@@ -439,17 +441,17 @@ impl OutputBuffer {
     /// Record all producer fences once, one per declared device on that
     /// device's stream. The caller transfers their pool references to
     /// deferred release and calls `copies_finished` after they complete.
-    pub fn seal(
+    pub fn seal<I: Issue>(
         &mut self,
-        streams: &[&Stream],
+        streams: &[I],
         pool: &EventPool,
     ) -> Result<Option<Vec<Arc<Event>>>> {
         if self.sealed {
             return Ok(None);
         }
 
-        for stream in streams {
-            let device = stream.device().0;
+        for &stream in streams {
+            let device = device_of(&stream)?;
             if self.timing_events {
                 self.begin_copy(Some(device), stream, pool)?;
             }
@@ -602,8 +604,16 @@ fn micros(end: Instant, start: Instant) -> u64 {
     end.saturating_duration_since(start).as_micros() as u64
 }
 
-fn record(pool: &EventPool, stream: &Stream, timing: bool) -> Result<Arc<Event>> {
-    let device = stream.device().0;
+/// The device of the stream `stream` issues on.
+fn device_of(stream: &impl Issue) -> Result<i32> {
+    stream
+        .stream()
+        .map(|stream| stream.device().0)
+        .ok_or_else(|| Error::Invariant("an output fence is recorded on a stream".into()))
+}
+
+fn record(pool: &EventPool, stream: impl Issue, timing: bool) -> Result<Arc<Event>> {
+    let device = device_of(&stream)?;
     let event = pool.acquire(device, timing, false)?;
     pool.retain(&event, device, 1)?;
     pool.record(&event, stream)?;
