@@ -15,7 +15,7 @@ use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::StepParts;
-use super::batch::TokenBatch;
+use super::batch::Batch;
 use super::calls::{self, Prepared};
 use super::context::{self, Sources};
 use crate::cuda_graph::GraphMode;
@@ -151,7 +151,7 @@ impl PromptScore {
     }
 }
 
-impl TokenBatch<'_> {
+impl Batch<'_> {
     /// Build the active calls' invocations, one per microbatch, and run
     /// them as one step.
     ///
@@ -574,7 +574,7 @@ impl TokenBatch<'_> {
     }
 }
 
-impl TokenBatch<'_> {
+impl Batch<'_> {
     /// Write the K/V of latent images inserted as conditioning, through the
     /// image denoiser on its stream, ordered between this batch's text
     /// work.

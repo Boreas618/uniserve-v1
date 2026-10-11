@@ -1,9 +1,9 @@
-//! Startup of the text runtime: bounds, bindings and owned storage.
+//! Startup of a rank's causal LM runners: bounds, bindings and owned storage.
 //!
 //! [`TextBounds`] derives every text bound from the worker configuration and
 //! the KV plan, once for capacity planning (bytes to reserve beside the KV
 //! pool, graph-bounded call limits) and again for allocation, so both agree.
-//! [`TextRuntime::start`] then creates one runner per execution stream
+//! [`CausalLMRunners::start`] then creates one runner per execution stream
 //! serving text call kinds: it prepares and binds the causal LM's component
 //! (operators over Rust workspaces and the K/V pool), allocates the runner's
 //! columns and graph pool, and binds the text steps over them.
@@ -13,10 +13,11 @@ use std::collections::HashMap;
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{CallKind, ForwardMode};
 
-use super::TextRuntime;
+use super::CausalLMRunners;
 use crate::config::{Device, PREFILL_ROW_BUCKETS, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
+use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::{DType, Handle};
 use crate::lane::Lanes;
@@ -30,11 +31,10 @@ use crate::runner::causal_lm::{
     CausalLMRunner, Construction, Dimensions, InputBuffers, Methods, RunnerParts, TableShape,
     model_dtype,
 };
-use crate::runner::{PrefillShape, TextShapes, prefill_shapes};
 use crate::storage::{KVCache, KVPlan, OutputPool};
 use crate::{Error, Result};
 
-use super::super::experts::{ExpertRuntime, WeightRuntime};
+use crate::executor::forward::experts::{ExpertRuntime, WeightRuntime};
 
 /// The text call kinds a runner may serve.
 pub(crate) const TEXT_KINDS: [CallKind; 3] = [
@@ -272,7 +272,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) weights: Option<&'a WeightRuntime>,
 }
 
-impl TextRuntime {
+impl CausalLMRunners {
     /// Create the runners of every text component on this rank, or `None`
     /// on a rank without one.
     pub(crate) fn start(startup: Startup<'_>) -> Result<Option<Self>> {
@@ -583,7 +583,7 @@ impl TextRuntime {
     }
 }
 
-/// Device bytes the text runtime allocates beside the KV pool.
+/// Device bytes the causal LM runners allocate beside the KV pool.
 pub(crate) fn reserved_bytes(
     config: &WorkerConfig,
     request_slots: usize,

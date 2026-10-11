@@ -57,9 +57,6 @@ use crate::executor::forward::image::start::{
     Startup as ImageStartup, reserved_bytes as image_reserved_bytes,
 };
 use crate::executor::forward::image::warmup::ImageWarmup;
-use crate::executor::forward::token::TextRuntime;
-use crate::executor::forward::token::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
-use crate::executor::forward::token::warmup::TextWarmup;
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
@@ -79,6 +76,9 @@ use crate::parallel::world::{World, startup_timeout};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
+use crate::runner::causal_lm::CausalLMRunners;
+use crate::runner::causal_lm::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
+use crate::runner::causal_lm::warmup::CausalLMWarmup;
 use crate::service::Service;
 use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
 use crate::stream::{CUDAStream, EventPool};
@@ -324,7 +324,7 @@ impl Worker {
                 .map(|name| (name.clone(), world.collective_groups(name, first)))
                 .collect(),
         };
-        let text = TextRuntime::start(Startup {
+        let text = CausalLMRunners::start(Startup {
             interface: &interface,
             config: &config,
             request_slots: info.request_slots as usize,
@@ -490,7 +490,7 @@ impl Worker {
             hooks.push(Box::new(ImageWarmup));
         }
         if text_warmup {
-            hooks.push(Box::new(TextWarmup {
+            hooks.push(Box::new(CausalLMWarmup {
                 row_tokens: config
                     .max_sequence_tokens
                     .min(config.max_batch_tokens)
