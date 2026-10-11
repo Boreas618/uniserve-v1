@@ -2,20 +2,23 @@
 //! rules.
 //!
 //! A model declares one entry per IPC-addressable component: the module
-//! paths and methods serving ranks may invoke. `model.describe` reports
-//! them with the capability tags of each call's module (the classes it is an
-//! instance of, as fixed tag names) and the axis selections each call
-//! communicates over. Everything else is decided here, without inspecting
-//! Python objects: the call kinds a call serves, which components a rank
-//! holds, which media routes it advertises and which placements are legal.
+//! paths and methods serving ranks may invoke. The description `read_config`
+//! returns reports them, one flat list per method, with the capability tags
+//! of each call's module (the classes it is an instance of, as fixed tag
+//! names) and the axis selections each component communicates over.
+//! Everything else is decided here, without inspecting Python objects: the
+//! call kinds a call serves, which components a rank holds, which media
+//! routes it advertises and which placements are legal.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
+use tvm_ffi::Any;
 use uniserve_core::ComponentConfig;
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall, TransferMode};
 
-use crate::ffi::Record;
+use crate::ffi::{Handle, integers, texts};
+use crate::model::interface::Interface;
 use crate::parallel::topology::{HOST_COMPONENTS, is_host_component};
 use crate::{Error, Result};
 
@@ -123,9 +126,6 @@ pub struct CallDecl {
     pub method: String,
     pub stage: Stage,
     pub capabilities: BTreeSet<Capability>,
-    /// Axis selections the call communicates over; empty on a rank that
-    /// does not place the component's mesh.
-    pub axes: Vec<Vec<String>>,
 }
 
 impl CallDecl {
@@ -262,64 +262,106 @@ pub fn host_kinds(name: &str) -> &'static [MediaCall] {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Declarations {
     entries: IndexMap<String, Vec<CallDecl>>,
+    /// Axis selections each component's calls communicate over; empty for a
+    /// component whose mesh this rank does not place.
+    axes: BTreeMap<String, BTreeSet<Vec<String>>>,
+}
+
+/// The library class whose methods report a description's declarations.
+const DESCRIPTION: &str = "uniserve_models.interface.loading.Description";
+
+/// Split a concatenated column into consecutive runs of `lengths`.
+fn runs<T>(lengths: &[i64], values: Vec<T>) -> Vec<Vec<T>> {
+    let mut values = values.into_iter();
+    lengths
+        .iter()
+        .map(|&length| values.by_ref().take(length as usize).collect())
+        .collect()
 }
 
 impl Declarations {
-    /// Decode `model.describe`'s `entries`.
+    /// Read the declarations of the `description` that `read_config`
+    /// returned.
     ///
     /// A call no runner can execute (other than a runner's helper methods)
     /// is refused. A model that reconstructs video also declares the host
     /// components that encode and assemble its units.
-    pub fn from_record(description: &Record) -> Result<Self> {
+    pub fn read(interface: &Interface, description: &Handle) -> Result<Self> {
+        let call = |method: &str, component: Option<&str>| -> Result<Any> {
+            let mut arguments = vec![description.to_any()];
+            if let Some(component) = component {
+                arguments.push(Any::from(tvm_ffi::String::from(component)));
+            }
+            interface
+                .import(&format!("{DESCRIPTION}.{method}"))?
+                .call_values(&arguments)
+        };
+        let strings = |method: &str, component: Option<&str>| -> Result<Vec<String>> {
+            texts(call(method, component)?).map_err(|error| Error::numerical(method, &error))
+        };
+        let counts = |method: &str, component: &str| -> Result<Vec<i64>> {
+            integers(call(method, Some(component))?)
+                .map_err(|error| Error::numerical(method, &error))
+        };
+
         let mut entries = IndexMap::new();
-        for entry in description.records("entries")? {
-            let name = entry.string("name")?;
-            let mut calls = Vec::new();
-            for call in entry.records("calls")? {
-                let stage = match call.string("stage")?.as_str() {
+        let mut axes = BTreeMap::new();
+        for name in strings("components", None)? {
+            let component = Some(name.as_str());
+            let paths = strings("call_paths", component)?;
+            let methods = strings("call_methods", component)?;
+            let stages = strings("call_stages", component)?;
+            let capabilities = runs(
+                &counts("capability_counts", &name)?,
+                strings("capabilities", component)?,
+            );
+
+            let mut calls = Vec::with_capacity(paths.len());
+            for (((path, method), stage), tags) in
+                paths.into_iter().zip(methods).zip(stages).zip(capabilities)
+            {
+                let stage = match stage.as_str() {
                     "all" => Stage::All,
                     "first" => Stage::First,
                     "last" => Stage::Last,
                     other => {
                         return Err(Error::Interface(format!(
-                            "model.describe reports the unknown stage {other:?}"
+                            "{DESCRIPTION}.call_stages reports the unknown stage {other:?}"
                         )));
                     }
                 };
-                let capabilities = call
-                    .strings("capabilities")?
+                let capabilities = tags
                     .iter()
                     .map(|tag| {
                         Capability::from_tag(tag).ok_or_else(|| {
                             Error::Interface(format!(
-                                "model.describe reports the unknown capability {tag:?}"
+                                "{DESCRIPTION}.capabilities reports the unknown capability {tag:?}"
                             ))
                         })
                     })
                     .collect::<Result<_>>()?;
-                let axes = call
-                    .list("axes")?
-                    .into_iter()
-                    .map(|axes| {
-                        tvm_ffi::Array::<tvm_ffi::String>::try_from(axes)
-                            .map(|axes| axes.iter().map(|axis| axis.as_str().to_owned()).collect())
-                            .map_err(|error| Error::numerical("model.describe", &error))
-                    })
-                    .collect::<Result<_>>()?;
                 calls.push(CallDecl {
-                    path: call.string("path")?,
-                    method: call.string("method")?,
+                    path,
+                    method,
                     stage,
                     capabilities,
-                    axes,
                 });
             }
+            let selections = runs(
+                &counts("selection_sizes", &name)?,
+                strings("selection_axes", component)?,
+            );
+            axes.insert(name.clone(), selections.into_iter().collect());
             entries.insert(name, calls);
         }
-        Self::new(entries)
+        Ok(Self {
+            axes,
+            ..Self::new(entries)?
+        })
     }
 
-    /// Check calls and add the host components a video model needs.
+    /// Check calls and add the host components a video model needs. The
+    /// components communicate over no axes.
     pub fn new(mut entries: IndexMap<String, Vec<CallDecl>>) -> Result<Self> {
         for call in entries.values().flatten() {
             if call.kinds().is_empty() && !call.auxiliary() {
@@ -338,7 +380,10 @@ impl Declarations {
                 entries.insert(name.to_owned(), Vec::new());
             }
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            axes: BTreeMap::new(),
+        })
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -501,17 +546,14 @@ impl Declarations {
             .collect()
     }
 
-    /// Axis selections per component for the group plan: every call's
-    /// selections, plus `tp` for a causal LM, whose sampling needs it even
-    /// with replicated logits.
+    /// Axis selections per component for the group plan: the selections
+    /// its calls communicate over, plus `tp` for a causal LM, whose sampling
+    /// needs it even with replicated logits.
     pub fn selections(&self) -> BTreeMap<String, BTreeSet<Vec<String>>> {
         self.entries
             .iter()
             .map(|(name, calls)| {
-                let mut selections: BTreeSet<Vec<String>> = calls
-                    .iter()
-                    .flat_map(|call| call.axes.iter().cloned())
-                    .collect();
+                let mut selections = self.axes.get(name).cloned().unwrap_or_default();
                 if calls.iter().any(|call| call.is(Capability::CausalLm)) {
                     selections.insert(vec!["tp".to_owned()]);
                 }
@@ -554,7 +596,6 @@ mod tests {
             method: method.into(),
             stage: Stage::All,
             capabilities: capabilities.iter().copied().collect(),
-            axes: Vec::new(),
         }
     }
 

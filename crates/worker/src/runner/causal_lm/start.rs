@@ -21,11 +21,11 @@ use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::{DType, Handle};
 use crate::lane::Lanes;
+use crate::model::LoadedModel;
 use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
-use crate::model::{LoadedModel, ModelFacts};
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::{
     CausalLMRunner, Construction, Dimensions, RunnerParts, TableShape, methods, model_dtype,
@@ -255,7 +255,8 @@ pub(crate) struct Startup<'a> {
     pub(crate) queue_depth: usize,
     pub(crate) max_payload_bytes: usize,
     pub(crate) model: &'a LoadedModel,
-    pub(crate) facts: &'a ModelFacts,
+    /// The model declares an image policy.
+    pub(crate) image_processor: bool,
     pub(crate) lanes: &'a Lanes,
     pub(crate) kv: Option<&'a KVCache>,
     pub(crate) components: &'a mut Components,
@@ -491,7 +492,7 @@ impl CausalLMRunners {
             let mut dimensions = bounds.dimensions(vocab, shard.width(), hidden, dtype);
             // Prompts of a model with an image processor place vision
             // features in place of token embeddings.
-            dimensions.embeddings = startup.facts.image_processor;
+            dimensions.embeddings = startup.image_processor;
             let buffers = InputBuffers::allocate(dimensions, ordinal, startup.preparation)?;
 
             let pool = match (
@@ -583,7 +584,7 @@ pub(crate) fn reserved_bytes(
     config: &WorkerConfig,
     request_slots: usize,
     cache: &KVPlan,
-    facts: &ModelFacts,
+    image_processor: bool,
     streams: usize,
 ) -> Result<u64> {
     // A rank without a causal language model reports no vocabulary.
@@ -596,7 +597,7 @@ pub(crate) fn reserved_bytes(
     let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
     let dtype = model_dtype(&config.model_dtype)?;
     let mut dimensions = bounds.dimensions(vocab, vocab, hidden, dtype);
-    dimensions.embeddings = facts.image_processor;
+    dimensions.embeddings = image_processor;
     Ok(InputBuffers::bytes(&dimensions) * streams.max(1) as u64
         + DecodeState::bytes(request_slots, vocab, dtype))
 }

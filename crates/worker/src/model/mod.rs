@@ -1,17 +1,19 @@
 //! Model description, loading and component bindings.
 //!
-//! Loading runs in phases around process-group creation:
+//! Loading runs in two phases around process-group creation:
 //!
 //! 1. [`Description::describe`] reads the checkpoint configuration and
 //!    describes a meta-device skeleton: components, calls and capability
 //!    tags. Placement is validated here, before any collective, so a bad
 //!    placement cannot leave peers waiting in one.
-//! 2. [`Description::resolve`] narrows the checkpoint to the modules this
-//!    rank calls and applies the launch's weight choices.
-//! 3. [`LoadedModel::load`] materializes those modules on the component
-//!    meshes and resolves each declared call on the loaded model.
-//! 4. [`LoadedModel::facts`] reports the model-derived quantities capacity
-//!    planning and reporting need, so Rust never inspects modules.
+//! 2. [`LoadedModel::load`] narrows the checkpoint to the modules this rank
+//!    calls, applies the launch's weight choices, materializes the modules
+//!    on the component meshes and resolves each declared call on the loaded
+//!    model.
+//!
+//! The rank reads what it needs of a loaded model from the owner of each
+//! fact: the loaded model's own (its attention backend and numerical
+//! formats) here, a capability's from that capability's runner.
 //!
 //! Component bindings ([`bind`]) and the registry of placed components by
 //! capability ([`registry`]) follow.
@@ -21,13 +23,10 @@ pub mod components;
 pub mod interface;
 pub mod registry;
 
-use std::collections::BTreeMap;
-
 use tvm_ffi::Any;
-use uniserve_ipc::{DType, DimBound, OutputInfo, RasterAxes, ShapeBound};
 
 use crate::config::{Device, WorkerLaunch};
-use crate::ffi::{Fields, Handle, Record, integer_list, list, strings};
+use crate::ffi::{Handle, integer_list, list, strings, texts};
 
 /// The library module that reads and loads a rank's model.
 const LOADING: &str = "uniserve_models.interface.loading";
@@ -59,61 +58,48 @@ impl Description {
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));
         let optional = |value: Option<&str>| value.map(text).unwrap_or_default();
         let generation = execution.generation_device.map(|device| device.to_string());
-        let result: tvm_ffi::Array<Any> = interface
-            .import(&format!("{LOADING}.read_config"))?
-            .call_values(&[
-                Any::from(launch.stub),
-                optional(model.map(|model| model.path.as_str())),
-                optional(model.and_then(|model| model.base_model.as_deref())),
-                text(&launch.load.format),
-                text(&launch.load.mode),
-                optional(launch.load.download_dir.as_deref()),
-                launch
-                    .load
-                    .num_threads
-                    .map(|threads| Any::from(i64::from(threads)))
-                    .unwrap_or_default(),
-                optional(launch.load.checksum_manifest.as_deref()),
-                text(&execution.device.to_string()),
-                optional(generation.as_deref()),
-                text(&components),
-                Any::from(execution.rank as i64),
-                text(&execution.role),
-                Any::from(
-                    launch
-                        .expert_parallel
-                        .as_ref()
-                        .is_some_and(|union| union.disaggregated()),
-                ),
-            ])
-            .and_then(|result| {
-                tvm_ffi::Array::<Any>::try_from(result)
-                    .map_err(|error| Error::numerical("read_config", &error))
-            })?;
-        if result.len() != 2 {
-            return Err(Error::Interface(
-                "read_config returns [description, info]".into(),
-            ));
-        }
         let handle = Handle::new(
-            result
-                .get(0)
-                .map_err(|error| Error::numerical("read_config", &error))?,
+            interface
+                .import(&format!("{LOADING}.read_config"))?
+                .call_values(&[
+                    Any::from(launch.stub),
+                    optional(model.map(|model| model.path.as_str())),
+                    optional(model.and_then(|model| model.base_model.as_deref())),
+                    text(&launch.load.format),
+                    text(&launch.load.mode),
+                    optional(launch.load.download_dir.as_deref()),
+                    launch
+                        .load
+                        .num_threads
+                        .map(|threads| Any::from(i64::from(threads)))
+                        .unwrap_or_default(),
+                    optional(launch.load.checksum_manifest.as_deref()),
+                    text(&execution.device.to_string()),
+                    optional(generation.as_deref()),
+                    text(&components),
+                    Any::from(execution.rank as i64),
+                    text(&execution.role),
+                    Any::from(
+                        launch
+                            .expert_parallel
+                            .as_ref()
+                            .is_some_and(|union| union.disaggregated()),
+                    ),
+                ])?,
         )?;
-        let info = Record::new(
-            "read_config",
-            result
-                .get(1)
-                .map_err(|error| Error::numerical("read_config", &error))?,
-        )?;
-        let declarations = Declarations::from_record(&info)?;
+        let method = |name: &str| interface.import(&format!("{LOADING}.Description.{name}"));
+        let model_name: tvm_ffi::String = method("model_name")?.call_as(&[handle.view()])?;
+        let expert_paths = texts(method("routed_experts")?.call_values(&[handle.to_any()])?)
+            .map_err(|error| Error::numerical("routed_experts", &error))?;
+        let video_decoder = method("decodes_video")?.call_as(&[handle.view()])?;
+        let declarations = Declarations::read(interface, &handle)?;
         declarations.validate(&launch.components)?;
         Ok(Self {
             handle,
-            model_name: info.string("model_name")?,
+            model_name: model_name.as_str().to_owned(),
             declarations,
-            expert_paths: info.strings("expert_paths")?,
-            video_decoder: info.flag("video_decoder")?,
+            expert_paths,
+            video_decoder,
         })
     }
 }
@@ -143,6 +129,8 @@ pub struct LoadedModel {
     pub model_name: String,
     pub declarations: Declarations,
     pub video_decoder: bool,
+    /// The attention backend the model was loaded with.
+    pub attention_backend: String,
 }
 
 impl LoadedModel {
@@ -233,11 +221,15 @@ impl LoadedModel {
                     attention.use_tensor_core.map(Any::from).unwrap_or_default(),
                 ])?,
         )?;
+        let backend: tvm_ffi::String = interface
+            .import(&format!("{LOADING}.attention_backend"))?
+            .call_as(&[handle.view()])?;
         Ok(Self {
             handle,
             model_name: description.model_name,
             declarations: description.declarations,
             video_decoder: description.video_decoder,
+            attention_backend: backend.as_str().to_owned(),
         })
     }
 
@@ -245,21 +237,22 @@ impl LoadedModel {
         &self.handle
     }
 
-    /// Model-derived quantities for capacity and reporting.
-    pub fn facts(&self, interface: &Interface, launch: &WorkerLaunch) -> Result<ModelFacts> {
-        let execution = &launch.execution;
-        let bounds = Fields::new()
-            .with("max_sequence_tokens", execution.max_sequence_tokens as i64)
-            .text("model_dtype", &execution.model_dtype)
-            .text("role", &execution.role)
-            .into_any();
-        let record = Record::new(
-            "model.facts",
-            interface
-                .facts
-                .call(&[self.handle.view(), (&bounds).into()])?,
-        )?;
-        ModelFacts::from_record(&record)
+    /// The storage formats of the loaded parameters (`weight_formats`).
+    pub fn weight_formats(&self, interface: &Interface) -> Result<Vec<String>> {
+        self.formats(interface, "weight_formats")
+    }
+
+    /// The input formats of the loaded linear layers
+    /// (`activation_formats`).
+    pub fn activation_formats(&self, interface: &Interface) -> Result<Vec<String>> {
+        self.formats(interface, "activation_formats")
+    }
+
+    fn formats(&self, interface: &Interface, function: &str) -> Result<Vec<String>> {
+        let value = interface
+            .import(&format!("{LOADING}.{function}"))?
+            .call_values(&[self.handle.to_any()])?;
+        texts(value).map_err(|error| Error::numerical(function, &error))
     }
 
     /// The KV layout for `block_size`-token pages of the widest rows, as
@@ -293,129 +286,6 @@ impl LoadedModel {
             plan.into(),
         ])
     }
-}
-
-/// The image flow of a model with an image denoiser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImageFlow {
-    /// Longest image sequence the network accepts, in patch rows.
-    pub max_tokens: usize,
-    pub latent_channels: usize,
-    pub patch_size: usize,
-}
-
-/// Model-derived quantities reported by `model.facts`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModelFacts {
-    pub model_name: String,
-    /// The attention backend the model was loaded with.
-    pub attention_backend: String,
-    /// Products each component publishes, by component.
-    pub outputs: BTreeMap<String, Vec<OutputInfo>>,
-    pub weight_formats: Vec<String>,
-    pub activation_formats: Vec<String>,
-    pub image_processor: bool,
-    pub vision_feature_bytes: u64,
-    pub image_flow: Option<ImageFlow>,
-}
-
-impl ModelFacts {
-    fn from_record(record: &Record) -> Result<Self> {
-        let outputs_record = record.record("outputs")?;
-        let mut outputs = BTreeMap::new();
-        for component in outputs_record.keys() {
-            let entries = outputs_record
-                .records(&component)?
-                .iter()
-                .map(|output| output_info(&component, output))
-                .collect::<Result<Vec<_>>>()?;
-            outputs.insert(component, entries);
-        }
-        let image_flow = record
-            .optional_record("image_flow")?
-            .map(|flow| -> Result<ImageFlow> {
-                Ok(ImageFlow {
-                    max_tokens: flow.count("max_tokens")?,
-                    latent_channels: flow.count("latent_channels")?,
-                    patch_size: flow.count("patch_size")?,
-                })
-            })
-            .transpose()?;
-        Ok(Self {
-            model_name: record.string("model_name")?,
-            attention_backend: record.string("attention_backend")?,
-            outputs,
-            weight_formats: record.strings("weight_formats")?,
-            activation_formats: record.strings("activation_formats")?,
-            image_processor: record.flag("image_processor")?,
-            vision_feature_bytes: record.count("vision_feature_bytes")? as u64,
-            image_flow,
-        })
-    }
-}
-
-/// Translate a numerical output layout into a bounded protocol product.
-pub(crate) fn output_info(component: &str, output: &Record) -> Result<OutputInfo> {
-    let name = output.string("name")?;
-    let dtype = match output.string("dtype")?.as_str() {
-        "uint8" => DType::U8,
-        "int16" => DType::I16,
-        "int32" => DType::I32,
-        "int64" => DType::I64,
-        "float16" => DType::F16,
-        "bfloat16" => DType::BF16,
-        "float32" => DType::F32,
-        _ => {
-            return Err(Error::Unsupported(format!(
-                "result {component}.{name} has no protocol dtype"
-            )));
-        }
-    };
-    let shape = output.shape("shape")?;
-    let variable = output.shape("variable_axes")?;
-    if variable.len() > 1 {
-        return Err(Error::Unsupported(format!(
-            "result {component}.{name} exceeds the protocol dynamic axes"
-        )));
-    }
-    let extent = |value: i64| {
-        u32::try_from(value).map_err(|_| {
-            Error::Unsupported(format!("result {component}.{name} has an invalid extent"))
-        })
-    };
-    let dims = shape
-        .iter()
-        .enumerate()
-        .map(|(axis, &size)| {
-            Ok(if variable.contains(&(axis as i64)) {
-                DimBound::Device { max: extent(size)? }
-            } else {
-                DimBound::Static(extent(size)?)
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let raster_axes = match output.optional_value("raster_axes")? {
-        Some(value) => {
-            let axes = crate::ffi::integers(value)
-                .map_err(|error| Error::numerical("model.facts", &error))?;
-            let [height, width] = axes[..] else {
-                return Err(Error::Interface(format!(
-                    "result {component}.{name} raster axes name two axes"
-                )));
-            };
-            Some(RasterAxes {
-                height: extent(height)?,
-                width: extent(width)?,
-            })
-        }
-        None => None,
-    };
-    Ok(OutputInfo {
-        name,
-        dtype,
-        shape_bound: ShapeBound { dims },
-        raster_axes,
-    })
 }
 
 /// The sequence-parallel kind name of a placement.

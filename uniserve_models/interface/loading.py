@@ -1,25 +1,27 @@
-"""Reading a checkpoint's configuration, loading a rank's model, and facts.
+"""Reading a checkpoint's configuration and loading a rank's model.
 
 A rank loads a model in two calls around process-group creation, each
 reached by import path with explicit arguments:
 
-1. :func:`read_config` reads the checkpoint configuration, builds a meta
-   skeleton and reports the declared components, their capability tags and
-   the axes they communicate over, before any collective exists.
+1. :func:`read_config` reads the checkpoint configuration and builds a meta
+   skeleton, before any collective exists. The rank reads the declared
+   components, their calls, capability tags and communication axes from the
+   returned :class:`Description`, one scalar or flat list per method.
 2. :func:`load_model` narrows the checkpoint to this rank's modules and the
    launch's weight choices and materializes them on the meshes the rank
    created.
 
-``model.facts`` reports model-derived quantities capacity planning and
-reporting need. Objects returned here are opaque to the rank and passed
-back unchanged.
+The objects returned here are opaque to the rank and passed back unchanged.
+What the rank reports of a loaded model it reads from the functions below
+:func:`load_model`; a fact of one capability belongs to that capability's
+runner.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
@@ -32,15 +34,10 @@ from uniserve_models import loading as library
 from uniserve_models.distributed import Communicator, communication_axes
 from uniserve_models.loading.precision import weight_config
 from uniserve_models.model import (
-    AudioEncoder,
     CausalLM,
     Denoiser,
     ImageDecoder,
-    ImageDenoiser,
-    PatchEncoder,
-    TextEncoder,
     VideoDecoder,
-    VideoEncoder,
     VideoPostprocessor,
 )
 from uniserve_models.nn.attention.vsa import BlockAttention
@@ -63,12 +60,6 @@ logger = logging.getLogger(__name__)
 _Kind = TypeVar("_Kind")
 
 
-def functions() -> dict[str, Callable[..., Any]]:
-    return {
-        "model.facts": facts,
-    }
-
-
 def _text(value: Any) -> str | None:
     return None if value is None else str(value)
 
@@ -76,6 +67,12 @@ def _text(value: Any) -> str | None:
 @dataclass
 class Description:
     """A checkpoint's configuration and meta skeleton before loading.
+
+    The rank reads its declarations through the methods: each returns a
+    scalar or one flat list. A method over a component returns one value per
+    declared call of that component, in declared order; ``capabilities`` and
+    ``selection_axes`` concatenate their per-call and per-selection lists,
+    with the lengths in ``capability_counts`` and ``selection_sizes``.
 
     ``metadata`` is ``None`` for the stub model.
     """
@@ -88,6 +85,72 @@ class Description:
     io: library.Config
     entries: Mapping[str, Any]
     calls: dict[str, tuple[Call, ...]]
+    # Axis selections each component's calls communicate over on the reading
+    # rank's mesh; empty for a component the rank does not place.
+    selections: Mapping[str, tuple[tuple[str, ...], ...]]
+    # Module paths of the routed experts a split deployment places apart.
+    expert_paths: tuple[str, ...]
+
+    def model_name(self) -> str:
+        """``module.QualName`` of the model class."""
+        return _name(self.model)
+
+    def components(self) -> list[str]:
+        """The declared components, in declared order."""
+        return list(self.calls)
+
+    def call_paths(self, component: str) -> list[str]:
+        """Each call's module path within the model; empty for the root."""
+        return [call.path for call in self.calls[str(component)]]
+
+    def call_methods(self, component: str) -> list[str]:
+        """Each call's method name on its module."""
+        return [call.entry_point.method for call in self.calls[str(component)]]
+
+    def call_stages(self, component: str) -> list[str]:
+        """The pipeline stages running each call.
+
+        ``"all"``, ``"first"`` or ``"last"``.
+        """
+        return [call.entry_point.stage for call in self.calls[str(component)]]
+
+    def capability_counts(self, component: str) -> list[int]:
+        """How many of ``capabilities`` belong to each call."""
+        return [
+            len(capability_tags(call.module))
+            for call in self.calls[str(component)]
+        ]
+
+    def capabilities(self, component: str) -> list[str]:
+        """Every call's capability tags, concatenated in call order."""
+        return [
+            tag
+            for call in self.calls[str(component)]
+            for tag in capability_tags(call.module)
+        ]
+
+    def selection_sizes(self, component: str) -> list[int]:
+        """The axis count of each selection the component communicates over."""
+        return [len(axes) for axes in self.selections[str(component)]]
+
+    def selection_axes(self, component: str) -> list[str]:
+        """Every selection's mesh axes, concatenated in selection order."""
+        return [
+            axis for axes in self.selections[str(component)] for axis in axes
+        ]
+
+    def routed_experts(self) -> list[str]:
+        """Module paths of the routed expert layers placed on dedicated ranks.
+
+        Empty unless routed experts run apart from attention.
+        """
+        return list(self.expert_paths)
+
+    def decodes_video(self) -> bool:
+        """Whether the model reconstructs video."""
+        return any(
+            isinstance(module, VideoDecoder) for module in self.model.modules()
+        )
 
 
 @dataclass
@@ -110,7 +173,6 @@ class Loaded:
     image_processor: Any = None
     flow_prompt: Any = None
     tokenizer: Path | None = None
-    model_name: str = ""
 
     @property
     def model(self) -> nn.Module:
@@ -132,7 +194,7 @@ def read_config(
     rank: int,
     role: str,
     expert_split: bool,
-) -> list[Any]:
+) -> Description:
     """Read a checkpoint's configuration and this rank's view of it.
 
     Args:
@@ -148,11 +210,6 @@ def read_config(
         rank: This rank.
         role: ``"model"`` or ``"experts"``.
         expert_split: Routed experts run on dedicated ranks.
-
-    Returns:
-        ``[description, info]`` where ``info`` is ``{"model_name",
-        "entries": [{"name", "calls": [{"path", "method", "stage",
-        "capabilities", "axes"}]}], "expert_paths", "video_decoder"}``.
 
     Raises:
         SetupError: The placement does not fit the declarations, no installed
@@ -217,46 +274,39 @@ def read_config(
                 "disaggregated workers require routed expert layers"
             )
 
-    reported = []
+    selections = {}
     for name, items in calls.items():
         placement = placed.get(name)
         topology = None if placement is None else placement.topology(rank)
-        reported.append(
-            {
-                "name": name,
-                "calls": [
-                    {
-                        "path": call.path,
-                        "method": call.entry_point.method,
-                        "stage": call.entry_point.stage,
-                        "capabilities": capability_tags(call.module),
-                        "axes": [
-                            list(axes)
-                            for axes in _axes(call, placement, topology)
-                        ],
-                    }
+        selections[name] = tuple(
+            sorted(
+                {
+                    axes
                     for call in items
-                ],
-            }
+                    for axes in _axes(call, placement, topology)
+                }
+            )
         )
-    description = Description(
-        stub, model, metadata, path, base, io, entries, calls
+    return Description(
+        stub,
+        model,
+        metadata,
+        path,
+        base,
+        io,
+        entries,
+        calls,
+        selections,
+        tuple(expert_paths),
     )
-    info = {
-        "model_name": f"{type(model).__module__}.{type(model).__qualname__}",
-        "entries": reported,
-        "expert_paths": expert_paths,
-        "video_decoder": any(
-            isinstance(module, VideoDecoder) for module in model.modules()
-        ),
-    }
-    return [description, info]
 
 
-def _axes(call: Call, placement: Placement | None, topology):
+def _axes(
+    call: Call, placement: Placement | None, topology
+) -> set[tuple[str, ...]]:
     """Axis selections a call communicates over on this rank's mesh."""
     if placement is None or topology is None:
-        return []
+        return set()
     axes = set(
         communication_axes(
             call.module,
@@ -265,7 +315,7 @@ def _axes(call: Call, placement: Placement | None, topology):
         )
     )
     axes |= set(call.entry_point.communication_axes(topology))
-    return sorted(axes)
+    return {tuple(str(axis) for axis in selection) for selection in axes}
 
 
 def _resolve(
@@ -406,7 +456,6 @@ def load_model(
             description,
             image_processor=image_processor(),
             attention_backend="torch",
-            model_name=f"{type(module).__module__}.{type(module).__qualname__}",
         )
     elif host_only:
         # Only the stub model resolves to a bare description.
@@ -423,7 +472,6 @@ def load_model(
             attention_backend=backend,
             image_processor=source.image_processor,
             flow_prompt=source.flow_prompt,
-            model_name=_name(description.model),
         )
     else:
         # Only the stub model resolves to a bare description.
@@ -440,7 +488,6 @@ def load_model(
             experts=partition,
         )
         module = result.model
-        name = _name(module)
         if dedicated:
             # The worker owns invocation of the loaded expert modules, in
             # numerical traversal order; no other capability is fabricated.
@@ -457,7 +504,6 @@ def load_model(
             image_processor=source.image_processor,
             flow_prompt=source.flow_prompt,
             tokenizer=None if dedicated else source.tokenizer,
-            model_name=name,
         )
 
     if not dedicated and not host_only:
@@ -592,18 +638,6 @@ def _devices(
     return paths
 
 
-# Torch dtypes a product may carry on the wire.
-_PRODUCT_DTYPES = {
-    torch.uint8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-    torch.float16,
-    torch.bfloat16,
-    torch.float32,
-}
-
-
 def capability(model: nn.Module, kind: type[_Kind]) -> _Kind | None:
     """The model's unique module of ``kind``, if any."""
     found: list[_Kind] = []
@@ -617,147 +651,41 @@ def capability(model: nn.Module, kind: type[_Kind]) -> _Kind | None:
     return found[0] if found else None
 
 
-def product_name(module: nn.Module, name: str) -> str:
-    """Name a numerical output by its downstream protocol use."""
-    if isinstance(module, Denoiser):
-        return {"video": "video_latents", "audio": "audio_latents"}.get(
-            name, name
-        )
-    if isinstance(module, PatchEncoder) and name == "features":
-        return "vision_features"
-    if isinstance(module, VideoEncoder) and name == "video":
-        return "condition_video_latents"
-    if isinstance(module, AudioEncoder) and name == "audio":
-        return "condition_audio_latents"
-    if isinstance(module, VideoDecoder) and name == "video":
-        return "video_units"
-    return name
+def attention_backend(loaded: Loaded) -> str:
+    """The name of the attention backend the model was loaded with."""
+    return loaded.attention_backend
 
 
-def _outputs(
-    calls: Mapping[str, Sequence[Call]], max_sequence_tokens: int, dtype
-) -> dict[str, list[dict[str, Any]]]:
-    """Products the loaded calls publish, bounded by the admitted sizes.
+def weight_formats(loaded: Loaded) -> list[str]:
+    """The storage formats of the loaded parameters, sorted.
 
-    A text encoder's ``encode`` publishes its encoded conditioning. Products
-    of media timelines (denoisers, decoders and condition encoders, sized by
-    a media builder) are declared by the media runtimes' facts.
+    ``"dense"`` or a quantizer's format name.
     """
-    result = {}
-    for component, items in calls.items():
-        outputs = []
-        for call in items:
-            if not (
-                isinstance(call.module, TextEncoder)
-                and call.entry_point.method == "encode"
-            ):
-                continue
-            layouts = call.module.output_layout(max_sequence_tokens, dtype)
-            for name, layout in layouts.items():
-                if layout.dtype not in _PRODUCT_DTYPES:
-                    raise SetupError(
-                        f"result {component}.{name} has no protocol dtype"
-                    )
-                if len(layout.variable_axes) > 1:
-                    raise SetupError(
-                        f"result {component}.{name} exceeds the protocol "
-                        "dynamic axes"
-                    )
-                outputs.append(
-                    {
-                        "name": product_name(call.module, name),
-                        "dtype": str(layout.dtype).removeprefix("torch."),
-                        "shape": list(layout.shape),
-                        "variable_axes": list(layout.variable_axes),
-                        "raster_axes": None,
-                    }
-                )
-        if outputs:
-            result[component] = outputs
-    return result
-
-
-def _vision_feature_bytes(model: nn.Module, processor) -> int:
-    """Bytes of the largest vision feature product the processor admits.
-
-    Rows come from the processor's ViT transform pixel bound and the
-    encoder stride; zero without a ``PatchEncoder``, processor or ViT.
-    """
-    encoder = capability(model, PatchEncoder)
-    if encoder is None or processor is None or processor.vit is None:
-        return 0
-    from uniserve_models.media import image
-    from uniserve_models.processing import PatchTransform
-
-    transform = processor.vit
-    pixels = (
-        transform.pixel_bound()
-        if isinstance(transform, PatchTransform)
-        else min(transform.resize.max_pixels, transform.resize.max_size**2)
-    )
-    stride = encoder.patch_size * encoder.downsample
-    tokens = pixels // stride**2
-    if tokens == 0:
-        return 0
-    feature = encoder.output_layout(image.Config(stride, stride))["features"]
-    return tokens * feature.shape[1] * feature.dtype.itemsize
-
-
-def _image_flow(model: nn.Module) -> dict[str, int] | None:
-    """The image denoiser's latent geometry for the latent pool plan."""
-    # mypy rejects an abstract class as a ``type`` argument; the lookup
-    # only tests membership.
-    denoiser = capability(model, ImageDenoiser)  # type: ignore[type-abstract]
-    if denoiser is None:
-        return None
-    return {
-        "max_tokens": int(denoiser.max_sequence_tokens),
-        "latent_channels": int(denoiser.latent_channels),
-        "patch_size": int(denoiser.patch_size),
-    }
-
-
-def facts(loaded: Loaded, bounds: Mapping[str, Any]) -> dict[str, Any]:
-    """Report model-derived quantities for capacity planning and reporting.
-
-    ``bounds`` carries ``max_sequence_tokens``, ``model_dtype`` and
-    ``role``.
-    """
-    from uniserve_models.nn import Linear
     from uniserve_models.quantization import QuantizedTensor
 
-    model = loaded.module
-    dtype = getattr(torch, str(bounds["model_dtype"]).removeprefix("torch."))
-    weight_formats = sorted(
+    return sorted(
         {
             value.quantizer.format
             if isinstance(value, QuantizedTensor)
             else "dense"
-            for value in model.parameters()
+            for value in loaded.module.parameters()
         }
     )
-    activation_formats = sorted(
+
+
+def activation_formats(loaded: Loaded) -> list[str]:
+    """The input formats of the loaded linear layers, sorted.
+
+    ``"dense"`` or an input quantizer's format name.
+    """
+    from uniserve_models.nn import Linear
+
+    return sorted(
         {
             "dense"
             if child.input_quantizer is None
             else child.input_quantizer.format
-            for child in model.modules()
+            for child in loaded.module.modules()
             if isinstance(child, Linear)
         }
     )
-    experts = str(bounds["role"]) == "experts"
-    return {
-        "model_name": loaded.model_name or _name(model),
-        "attention_backend": loaded.attention_backend,
-        # Expert results return through the bound exchange, not request IPC.
-        "outputs": {}
-        if experts
-        else _outputs(loaded.calls, int(bounds["max_sequence_tokens"]), dtype),
-        "weight_formats": weight_formats,
-        "activation_formats": activation_formats,
-        "image_processor": loaded.image_processor is not None,
-        "vision_feature_bytes": _vision_feature_bytes(
-            model, loaded.image_processor
-        ),
-        "image_flow": None if experts else _image_flow(model),
-    }

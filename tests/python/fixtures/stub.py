@@ -84,7 +84,7 @@ def load_stub():
 
     Returns the loaded model.
     """
-    description, _ = read_config(
+    description = read_config(
         components=json.dumps({"model": LOCAL, "vision_encoder": LOCAL})
     )
     return load_model(description)
