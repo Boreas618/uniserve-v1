@@ -523,6 +523,55 @@ class EncoderRunner:
         return int(bound // module.patch_size**2)
 
     @staticmethod
+    def processes_images(loaded) -> bool:
+        """Whether the model declares an image policy."""
+        return getattr(loaded, "image_processor", None) is not None
+
+    @staticmethod
+    def image_towers(loaded) -> list[str]:
+        """The image transforms the policy declares.
+
+        ``"vit"`` prepares understanding features (vision encoding),
+        ``"vae"`` latent encoding.
+        """
+        processor = loaded.image_processor
+        return [
+            tower
+            for tower in ("vit", "vae")
+            if getattr(processor, tower) is not None
+        ]
+
+    @staticmethod
+    def packs_patches(loaded) -> bool:
+        """Whether the understanding transform packs patch rows."""
+        return isinstance(loaded.image_processor.vit, PatchTransform)
+
+    @staticmethod
+    def feature_injection(loaded) -> list[str]:
+        """How image features enter a prompt; empty without injection.
+
+        ``[layout, positions]``: the feature layout (``"direct"`` or
+        ``"framed"``) and the position layout (``"temporal"``,
+        ``"temporal_spatial"`` or ``"sequential"``).
+        """
+        injection = loaded.image_processor.feature_injection
+        if injection is None:
+            return []
+        return [injection.layout.value, injection.positions.value]
+
+    @staticmethod
+    def injection_tokens(loaded) -> list[int]:
+        """The ``[start, end]`` token ids framing injected features.
+
+        -1 stands for a token the injection does not place.
+        """
+        injection = loaded.image_processor.feature_injection
+        return [
+            -1 if token is None else int(token)
+            for token in (injection.start_token_id, injection.end_token_id)
+        ]
+
+    @staticmethod
     def pixel_dtype(loaded) -> str:
         """The dtype of the pixels the image policy prepares."""
         processor = getattr(loaded, "image_processor", None)

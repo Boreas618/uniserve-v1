@@ -94,7 +94,6 @@ from uniserve_models.model import (
     AudioEncoder,
     Condition,
     ConditionRole,
-    ImageDecoder,
     ImageDenoiser,
     LatentInput,
     PatchEncoder,
@@ -115,8 +114,6 @@ from uniserve_models.nn.attention import (
 from uniserve_models.nn.attention.gather import gather_request_rows
 from uniserve_models.nn.rng import flow_noise_seed
 from uniserve_models.processing import (
-    FeatureInjection,
-    PatchTransform,
     load_tokenizer,
     resolve_prefix,
 )
@@ -294,6 +291,11 @@ def _view(tensor: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
 
 def _dtype(dtype) -> str:
     return str(dtype).removeprefix("torch.")
+
+
+def _image_denoiser(loaded):
+    """The loaded model's image denoiser, or None."""
+    return capability(loaded.module, ImageDenoiser)
 
 
 def _image_rows(values: Sequence[int]) -> list[tuple[int, ...]]:
@@ -1193,70 +1195,39 @@ class DenoiserRunner:
 
     # Image denoisers.
 
+    # Facts of a loaded model's image denoiser, answered before a runner
+    # of it exists.
+
     @staticmethod
-    def describe(loaded) -> dict[str, Any]:
-        """The image facts of a loaded model.
+    def image_layout(loaded) -> list[int]:
+        """The image denoiser's latent layout; empty without one.
 
-        Returns:
-            ``{"processor", "denoiser", "decoder_range"}``:
-
-            - ``processor``: None without image processing, else ``{"vit",
-              "vae"}`` (whether each tower is declared), ``patch_tower``
-              (whether the vit tower packs patches), ``pixel_dtype`` and
-              ``injection`` (``{"layout", "positions", "start_token",
-              "end_token"}`` or None).
-            - ``denoiser``: None without an image denoiser, else its latent
-              layout: ``patch_size``, ``latent_channels``, ``downsample``
-              (pixels per latent patch on each axis), ``framing_tokens``,
-              ``image_unconditional`` (the branch source of its
-              image-unconditional guidance), ``max_sequence_tokens``
-              (latent patch rows, framing excluded) and
-              ``prediction_dtype``.
-            - ``decoder_range``: the image decoder's ``[low, high]`` pixel
-              range, or None without an image decoder.
+        ``[patch_size, latent_channels, downsample, framing_tokens,
+        max_sequence_tokens]``: ``downsample`` is pixels per latent patch
+        on each axis, ``framing_tokens`` the tokens framing a generated
+        image and ``max_sequence_tokens`` the longest image sequence in
+        latent patch rows, framing excluded.
         """
-        # FIXME: these facts still cross as one record.
-        model = loaded.module
-        processor = loaded.image_processor
-        # mypy rejects an abstract class as a ``type`` argument; the lookup
-        # only tests membership.
-        denoiser = capability(model, ImageDenoiser)  # type: ignore[type-abstract]
-        decoder = capability(model, ImageDecoder)
-        injection: FeatureInjection | None = (
-            None if processor is None else processor.feature_injection
-        )
-        return {
-            "processor": None
-            if processor is None
-            else {
-                "vit": processor.vit is not None,
-                "vae": processor.vae is not None,
-                "patch_tower": isinstance(processor.vit, PatchTransform),
-                "pixel_dtype": _dtype(processor.output_dtype or "float32"),
-                "injection": None
-                if injection is None
-                else {
-                    "layout": injection.layout.value,
-                    "positions": injection.positions.value,
-                    "start_token": injection.start_token_id,
-                    "end_token": injection.end_token_id,
-                },
-            },
-            "denoiser": None
-            if denoiser is None
-            else {
-                "patch_size": int(denoiser.patch_size),
-                "latent_channels": int(denoiser.latent_channels),
-                "downsample": int(denoiser.downsample),
-                "framing_tokens": int(denoiser.framing_tokens),
-                "image_unconditional": denoiser.image_unconditional.value,
-                "max_sequence_tokens": int(denoiser.max_sequence_tokens),
-                "prediction_dtype": _dtype(denoiser.prediction_dtype),
-            },
-            "decoder_range": None
-            if decoder is None
-            else [float(value) for value in decoder.decoder.value_range],
-        }
+        denoiser = _image_denoiser(loaded)
+        if denoiser is None:
+            return []
+        return [
+            int(denoiser.patch_size),
+            int(denoiser.latent_channels),
+            int(denoiser.downsample),
+            int(denoiser.framing_tokens),
+            int(denoiser.max_sequence_tokens),
+        ]
+
+    @staticmethod
+    def image_unconditional(loaded) -> str:
+        """What the image-unconditional guidance branch conditions on."""
+        return str(_image_denoiser(loaded).image_unconditional.value)
+
+    @staticmethod
+    def prediction_dtype(loaded) -> str:
+        """The dtype of the image denoiser's predictions."""
+        return _dtype(_image_denoiser(loaded).prediction_dtype)
 
     @staticmethod
     def guidance_prefix(

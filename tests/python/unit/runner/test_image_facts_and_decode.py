@@ -27,28 +27,22 @@ def loaded():
 
 def test_the_stub_reports_its_image_facts(loaded):
     _, model = loaded
-    facts = DenoiserRunner.describe(model)
-    processor = facts["processor"]
-    assert (processor["vit"], processor["vae"]) == (True, True)
-    assert processor["patch_tower"] is True
-    assert processor["pixel_dtype"] == "bfloat16"
-    assert dict(processor["injection"]) == {
-        "layout": "direct",
-        "positions": "temporal_spatial",
-        "start_token": None,
-        "end_token": 1007,
-    }
-    assert dict(facts["denoiser"]) == {
-        "patch_size": 16,
-        "latent_channels": 3,
-        "downsample": 16,
-        "framing_tokens": 2,
-        "image_unconditional": "start",
-        "max_sequence_tokens": 1024,
-        "prediction_dtype": "bfloat16",
-    }
+    assert EncoderRunner.processes_images(model)
+    assert EncoderRunner.image_towers(model) == ["vit", "vae"]
+    assert EncoderRunner.packs_patches(model) is True
+    assert EncoderRunner.pixel_dtype(model) == "bfloat16"
+    assert EncoderRunner.feature_injection(model) == [
+        "direct",
+        "temporal_spatial",
+    ]
+    # The stub places an end token only.
+    assert EncoderRunner.injection_tokens(model) == [-1, 1007]
+    # Patch size, latent channels, downsample, framing and longest sequence.
+    assert DenoiserRunner.image_layout(model) == [16, 3, 16, 2, 1024]
+    assert DenoiserRunner.image_unconditional(model) == "start"
+    assert DenoiserRunner.prediction_dtype(model) == "bfloat16"
     # The stub decodes RGB patches in [-1, 1].
-    assert list(facts["decoder_range"]) == [-1.0, 1.0]
+    assert DecoderRunner.value_range(model) == [-1.0, 1.0]
 
 
 def test_patch_grids_follow_the_shared_pixel_budget(loaded):
