@@ -278,13 +278,7 @@ impl LoadedModel {
         let bounds = Fields::new()
             .with("max_sequence_tokens", execution.max_sequence_tokens as i64)
             .text("model_dtype", &execution.model_dtype)
-            .optional_text("kv_cache_dtype", execution.kv_cache_dtype.as_deref())
             .text("role", &execution.role)
-            .with(
-                "deployment_components",
-                strings(&execution.deployment_components),
-            )
-            .with("max_condition_rows", execution.max_condition_rows as i64)
             .into_any();
         let record = Record::new(
             "model.facts",

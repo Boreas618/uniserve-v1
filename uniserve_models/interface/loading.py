@@ -632,9 +632,8 @@ def _image_flow(model: nn.Module) -> dict[str, int] | None:
 def facts(loaded: Loaded, bounds: Mapping[str, Any]) -> dict[str, Any]:
     """Report model-derived quantities for capacity planning and reporting.
 
-    ``bounds`` carries ``max_sequence_tokens``, ``model_dtype``,
-    ``kv_cache_dtype``, ``role``, ``deployment_components`` and
-    ``max_condition_rows``.
+    ``bounds`` carries ``max_sequence_tokens``, ``model_dtype`` and
+    ``role``.
     """
     from uniserve_models.nn import Linear
     from uniserve_models.quantization import QuantizedTensor

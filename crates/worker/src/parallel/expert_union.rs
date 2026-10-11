@@ -573,7 +573,7 @@ impl ExpertUnion {
             )?);
         }
         // Expert layers declare no symmetric workspace.
-        self.bindings = bind::bind(interface, workspaces, prepared, None)?;
+        self.bindings = bind::bind(interface, workspaces, prepared)?;
         let handles: Vec<Handle> = self
             .bindings
             .iter()
