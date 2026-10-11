@@ -35,7 +35,6 @@ _AREAS = (
     "kernels",
     "profiling",
     "runtime",
-    "text",
 )
 
 

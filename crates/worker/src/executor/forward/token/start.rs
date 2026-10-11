@@ -24,17 +24,17 @@ use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextS
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
-use crate::model::text::{self, TextModel};
 use crate::model::{LoadedModel, ModelFacts};
 use crate::request::decode_state::DecodeState;
-use crate::runner::text::{
-    Dimensions, RunnerParts, TableShape, TextBuffers, TextRunner, model_dtype,
+use crate::runner::causal_lm::{
+    CausalLMRunner, Construction, Dimensions, InputBuffers, Methods, RunnerParts, TableShape,
+    model_dtype,
 };
 use crate::runner::{PrefillShape, TextShapes, prefill_shapes};
 use crate::storage::{KVCache, KVPlan, OutputPool};
 use crate::{Error, Result};
 
-use super::super::experts::ExpertRuntime;
+use super::super::experts::{ExpertRuntime, WeightRuntime};
 
 /// The text call kinds a runner may serve.
 pub(crate) const TEXT_KINDS: [CallKind; 3] = [
@@ -153,6 +153,11 @@ impl TextBounds {
     }
 
     /// The column dimensions of a runner over `vocab` tokens.
+    /// Pages a row selects from one block table, at most.
+    fn width(&self) -> usize {
+        self.widths.iter().copied().max().unwrap_or(1).max(1) as usize
+    }
+
     pub(crate) fn dimensions(
         &self,
         vocab: usize,
@@ -164,7 +169,7 @@ impl TextBounds {
             rows: self.rows,
             tokens: self.tokens,
             tables: self.tables.len(),
-            width: self.widths.iter().copied().max().unwrap_or(1).max(1) as usize,
+            width: self.width(),
             local_vocab,
             vocab,
             hidden,
@@ -264,8 +269,8 @@ pub(crate) struct Startup<'a> {
     pub(crate) experts: Option<&'a mut ExpertRuntime>,
     /// The worker's ranks, across which symmetric workspaces are mapped.
     pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
-    /// The distributed expert weights' prefetch object, with DWDP.
-    pub(crate) weights: Option<&'a Handle>,
+    /// The distributed expert weights, with DWDP.
+    pub(crate) weights: Option<&'a WeightRuntime>,
 }
 
 impl TextRuntime {
@@ -393,7 +398,7 @@ impl TextRuntime {
                             backends: Backends::default(),
                             derive_host_lengths: false,
                             experts: transport,
-                            weights: startup.weights.cloned(),
+                            weights: startup.weights.map(|weights| weights.prefetch().clone()),
                             cache: Some(pool.clone()),
                         },
                     )?);
@@ -447,11 +452,47 @@ impl TextRuntime {
         let mut shared: HashMap<usize, usize> = HashMap::new();
         for ((component, device, stream, served), binding) in targets.into_iter().zip(&bindings) {
             let ordinal = device.cuda_index();
-            // The binding's vocabulary shard sizes its logits columns.
-            let (shard, hidden) = text::describe(startup.interface, binding.prepared())?;
+            let handle = stream.as_ref().map_or(0, Stream::raw);
+            let slot_tables = kv.storage().views();
+            let slot_table = |name: &str| {
+                slot_tables
+                    .iter()
+                    .find(|(table, _)| table == name)
+                    .map(|(_, view)| view)
+                    .ok_or_else(|| Error::Invariant(format!("block tables have no {name}")))
+            };
+            let methods = Methods::construct(
+                startup.interface,
+                &Construction {
+                    prepared: binding.prepared(),
+                    stream: handle,
+                    rows: bounds.rows,
+                    tokens: bounds.tokens,
+                    width: bounds.width(),
+                    page_tokens: &table_layout,
+                    windowed: &windowed,
+                    state: [
+                        slot_table("unit_tables")?,
+                        slot_table("start_pages")?,
+                        slot_table("table_shapes")?,
+                        state.verified_lengths(),
+                        state.future_input_tokens(),
+                        state.logical_lengths(),
+                        state.predicates(),
+                        state.sampling_positions(),
+                        state.penalty_counts(),
+                        state.prompt_logits(),
+                    ],
+                },
+            )?;
+
+            // The runner's vocabulary shard sizes its logits columns.
+            let shard = methods.vocab(startup.interface)?;
+            let hidden = methods.hidden_size(startup.interface)?;
+            let plans_attention = methods.plans_attention(startup.interface)?;
             if shard.size != vocab {
                 return Err(Error::Interface(format!(
-                    "the text binding's vocabulary ({}) differs from the model's ({vocab})",
+                    "the text runner's vocabulary ({}) differs from the model's ({vocab})",
                     shard.size
                 )));
             }
@@ -459,27 +500,7 @@ impl TextRuntime {
             // Prompts of a model with an image processor place vision
             // features in place of token embeddings.
             dimensions.embeddings = startup.facts.image_processor;
-            let buffers = TextBuffers::allocate(dimensions, ordinal, startup.preparation)?;
-            let mut views = buffers.views();
-            views.extend(
-                kv.storage()
-                    .views()
-                    .into_iter()
-                    .filter(|(name, _)| name != "verified_lengths" && name != "alloced_lens")
-                    .map(|(name, view)| (format!("slot.{name}"), view)),
-            );
-            views.extend(state.views());
-            let handle = stream.as_ref().map_or(0, Stream::raw);
-            let model = TextModel::bind(
-                startup.interface,
-                binding.prepared(),
-                handle,
-                &views,
-                &table_layout,
-                &windowed,
-                shard,
-                hidden,
-            )?;
+            let buffers = InputBuffers::allocate(dimensions, ordinal, startup.preparation)?;
 
             let pool = match (
                 ordinal,
@@ -516,11 +537,13 @@ impl TextRuntime {
                     }
                 }
             }
-            runners.push(TextRunner::new(RunnerParts {
+            runners.push(CausalLMRunner::new(RunnerParts {
                 component,
                 device: ordinal,
                 stream,
-                model,
+                methods,
+                plans_attention,
+                breaks: startup.weights.map(|weights| weights.breaks().clone()),
                 buffers,
                 tables: bounds.tables.clone(),
                 widths: bounds.widths.clone(),

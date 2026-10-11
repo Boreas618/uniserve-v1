@@ -4,7 +4,7 @@
 //! functions. [`Interface`] resolves the entries startup needs into typed
 //! fields once, failing startup with the name of any missing entry, and
 //! keeps every entry so capability runtimes can resolve their own
-//! (`text.bind`, `canvas.bind`, ...) by name.
+//! (`canvas.bind`, ...) by name.
 
 use std::collections::BTreeMap;
 

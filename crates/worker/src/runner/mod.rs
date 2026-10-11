@@ -3,13 +3,13 @@
 pub(crate) mod allocate;
 pub(crate) mod attention;
 pub(crate) mod canvas;
+pub(crate) mod causal_lm;
 pub(crate) mod decoder;
 pub(crate) mod denoiser;
 pub(crate) mod diffusion;
 pub(crate) mod encoder;
 mod graph_shapes;
 pub(crate) mod media;
-pub(crate) mod text;
 pub(crate) mod vision;
 
 pub use graph_shapes::{PrefillShape, TextShapes, prefill_shapes, prefill_units};

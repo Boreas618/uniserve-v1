@@ -22,7 +22,6 @@ pub mod components;
 pub mod image;
 pub mod interface;
 pub mod registry;
-pub mod text;
 
 use std::collections::BTreeMap;
 
