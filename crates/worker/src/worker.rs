@@ -46,10 +46,6 @@ use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
-use crate::executor::forward::canvas::warmup::CanvasWarmup;
-use crate::executor::forward::canvas::{
-    CanvasRuntime, Startup as CanvasStartup, reserved_bytes as canvas_bytes,
-};
 use crate::executor::forward::experts::warmup::ExpertWarmup;
 use crate::executor::forward::experts::{ExpertRuntime, ExpertStart, WeightRuntime};
 use crate::executor::forward::image::ImageRuntime;
@@ -79,6 +75,7 @@ use crate::parallel::world::{World, startup_timeout};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
+use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
 use crate::service::Service;
 use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
 use crate::stream::{CUDAStream, EventPool};
@@ -365,7 +362,7 @@ impl Worker {
             })
             .map_err(phase("bind"))?
         };
-        let canvas = CanvasRuntime::start(CanvasStartup {
+        let diffusion_lm = DiffusionLMRunner::start(diffusion_lm::Startup {
             interface: &interface,
             config: &config,
             request_slots: info.request_slots as usize,
@@ -432,9 +429,9 @@ impl Worker {
         if let Some(image) = image {
             backend.set_image(image);
         }
-        let canvas_warmup = canvas.is_some();
-        if let Some(canvas) = canvas {
-            backend.set_canvas(canvas);
+        let diffusion_lm_warmup = diffusion_lm.is_some();
+        if let Some(runner) = diffusion_lm {
+            backend.set_diffusion_lm(runner);
         }
         if let Some(weights) = weights {
             backend.set_weights(weights);
@@ -497,8 +494,8 @@ impl Worker {
                     .max(1),
             }));
         }
-        if canvas_warmup {
-            hooks.push(Box::new(CanvasWarmup));
+        if diffusion_lm_warmup {
+            hooks.push(Box::new(DiffusionLMWarmup));
         }
         if expert_warmup {
             // After the text captures, whose eager warmups were announced
@@ -863,13 +860,13 @@ impl Worker {
                     .map_err(phase("warmup"))?;
             }
         }
-        if let Some(canvas) = executor.backend_mut().canvas_mut() {
-            for (label, kernels) in canvas.kernels().map_err(phase("warmup"))? {
+        if let Some(runner) = executor.backend_mut().diffusion_lm_mut() {
+            for (label, kernels) in runner.kernels().map_err(phase("warmup"))? {
                 records
                     .add(&label, &self.config.device.to_string(), &kernels)
                     .map_err(phase("warmup"))?;
             }
-            canvas.seal();
+            runner.seal();
         }
         records.log("startup", self.config.rank, &self.config.device.to_string());
         if let Some(text) = executor.backend_mut().text_mut() {
@@ -1310,10 +1307,10 @@ fn plan(
                 ),
             );
         }
-        // The canvas runners' buffers and the resident canvas banks.
+        // The diffusion LM runner's buffers, banks and sampler workspace.
         layout.reserve(
             config.device,
-            canvas_bytes(
+            diffusion_lm::reserved_bytes(
                 interface,
                 model,
                 components,
@@ -1321,7 +1318,6 @@ fn plan(
                 config,
                 layout.info().request_slots as usize,
                 &cache,
-                unit_columns,
             )?,
         );
         let columns = KVCache::import_workers(import_capacity) + unit_columns;

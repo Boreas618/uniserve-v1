@@ -3,7 +3,6 @@
 
 mod block_tables;
 mod buffer;
-pub mod canvas;
 mod host_buffers;
 mod kv;
 mod kv_cache;

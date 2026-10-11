@@ -13,10 +13,10 @@ from uniserve_models.model import (
     CanvasTokens,
     CausalLM,
     ComponentEntry,
+    DiffusionLM,
     EntryPoint,
     PatchEncoder,
     SelfConditioning,
-    TokenDenoiser,
 )
 from uniserve_models.nn.linear import VocabParallelEmbedding, VocabParallelHead
 from uniserve_models.nn.mlp import GatedMLP
@@ -58,7 +58,7 @@ class Model(nn.Module):
         self.text = CausalLM(backbone, head)
 
         size, eps = text.hidden_size, text.rms_norm_eps
-        self.denoiser = TokenDenoiser(
+        self.denoiser = DiffusionLM(
             backbone,
             head,
             SelfConditioning(

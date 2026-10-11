@@ -1,21 +1,67 @@
-//! Token-denoising calls: validation and their canvas rows.
+//! Diffusion LM calls: validation and their rows.
 //!
-//! A token-denoising call carries either a readout or a canvas step
+//! A token-denoising call carries either a readout or a denoising step
 //! (`Call::validate`). Its forward rows read the request's unchanged cached
-//! prefix (`seq_len - query_len` is the accepted visible KV length) and
-//! write no KV. A readout's rows partition its canvas tokens, back to back,
-//! and every row reads at least one answer slot. A canvas step is one row of
-//! the canvas length over the request's prefix, stepping the canvas its
-//! request keeps resident with the sampling the deployment serves.
+//! prefix (`seq_len - query_len` is the accepted visible prefix cache
+//! length) and write no prefix cache. A readout's rows partition its
+//! tokens, back to back, and every row reads at least one answer slot. A
+//! denoising step is one row of the block length over the request's prefix,
+//! stepping the block its request keeps resident with the sampling the
+//! deployment serves.
 
 use std::ops::Range;
 
 use uniserve_core::CanvasSampling;
 use uniserve_ipc::{Batch, Call, CanvasStep, ForwardBatch, NewRequest};
 
-use crate::runner::canvas::{CanvasRow, StepRow};
-use crate::storage::AttentionRow;
+use crate::storage::{AttentionRow, TablePages};
 use crate::{Error, Result};
+
+/// One sequence of a forward: a block of tokens over its request's prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sequence {
+    /// Block tokens.
+    pub(crate) query: usize,
+    /// Cached prefix tokens the block reads: its request's visible KV.
+    pub(crate) prefix: u32,
+    /// Position of the block's first token.
+    pub(crate) position: u64,
+}
+
+/// A readout forward: the sequences of one or more calls, back to back.
+pub(crate) struct ReadoutPass<'a> {
+    pub(crate) rows: Vec<Sequence>,
+    /// Packed block tokens of every row.
+    pub(crate) tokens: Vec<i64>,
+    /// Packed token index of every answer slot, strictly increasing.
+    pub(crate) slots: Vec<i64>,
+    /// `slots + 1` offsets of each slot's candidates in `candidates`.
+    pub(crate) slot_candidates: Vec<usize>,
+    /// Candidate token ids, in row, slot and candidate order.
+    pub(crate) candidates: Vec<i64>,
+    /// The rows' selected pages, one entry per numerical table.
+    pub(crate) pages: &'a [TablePages],
+}
+
+impl ReadoutPass<'_> {
+    /// Tokens of the longest block.
+    pub(crate) fn longest(&self) -> usize {
+        self.rows.iter().map(|row| row.query).max().unwrap_or(0)
+    }
+}
+
+/// One denoising step: the request slot whose resident block it denoises and
+/// its sampling coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DenoiseRow {
+    pub(crate) slot: u32,
+    /// The request's sampling seed, carried as its two's-complement bits.
+    pub(crate) seed: u64,
+    pub(crate) block: u32,
+    pub(crate) step: u32,
+    pub(crate) prefix: u32,
+    pub(crate) position: u64,
+}
 
 /// The forward rows of each call of `plan`, in row order.
 pub(crate) fn rows_by_call(plan: &Batch) -> Result<Vec<Vec<usize>>> {
@@ -41,17 +87,17 @@ fn read_only(forward: &ForwardBatch, descriptors: &[usize], slot: u32, visible: 
         })
     {
         return Err(Error::Invalid(
-            "canvas rows must read the request's unchanged prefix".into(),
+            "block rows must read the request's unchanged prefix".into(),
         ));
     }
     Ok(())
 }
 
-/// A readout invocation under construction: the canvas rows, answer slots
+/// A readout forward under construction: the sequences, answer slots
 /// and candidates of its calls, back to back.
 #[derive(Default)]
 pub(crate) struct Readouts {
-    pub(crate) rows: Vec<CanvasRow>,
+    pub(crate) rows: Vec<Sequence>,
     pub(crate) attention: Vec<AttentionRow>,
     pub(crate) tokens: Vec<i64>,
     pub(crate) slots: Vec<i64>,
@@ -68,7 +114,7 @@ impl Readouts {
     }
 
     /// Append the readout `call` of the request in `slot`, whose accepted
-    /// visible KV is `visible` tokens and whose canvases start at logical
+    /// visible KV is `visible` tokens and whose blocks start at logical
     /// position `position`. Returns the call's range of the invocation's
     /// candidates.
     pub(crate) fn add(
@@ -83,7 +129,7 @@ impl Readouts {
         let readout = call
             .readout
             .as_ref()
-            .ok_or_else(|| Error::Invalid("a canvas pass requires a readout".into()))?;
+            .ok_or_else(|| Error::Invalid("a readout forward requires a readout".into()))?;
         read_only(forward, descriptors, slot, visible)?;
         let lengths: Vec<usize> = descriptors
             .iter()
@@ -91,11 +137,11 @@ impl Readouts {
             .collect();
         if lengths.iter().sum::<usize>() != call.input_token_ids.len() {
             return Err(Error::Invalid(
-                "canvas rows must partition the call's tokens over its prefix".into(),
+                "block rows must partition the call's tokens over its prefix".into(),
             ));
         }
         let prefix = u32::try_from(visible)
-            .map_err(|_| Error::Invalid("a canvas prefix exceeds the token range".into()))?;
+            .map_err(|_| Error::Invalid("a block prefix exceeds the token range".into()))?;
 
         // Every row reads at least one of the call's slots, which address
         // the call's own tokens in increasing order.
@@ -109,9 +155,9 @@ impl Readouts {
                 next += 1;
             }
             if next == start {
-                return Err(Error::Invalid("every canvas row must read a slot".into()));
+                return Err(Error::Invalid("every block row must read a slot".into()));
             }
-            self.rows.push(CanvasRow {
+            self.rows.push(Sequence {
                 query: length,
                 prefix,
                 position,
@@ -126,7 +172,7 @@ impl Readouts {
         }
         if next != readout.slot_tokens.len() {
             return Err(Error::Invalid(
-                "a readout slot lies outside its canvas rows".into(),
+                "a readout slot lies outside its block rows".into(),
             ));
         }
 
@@ -151,10 +197,10 @@ impl Readouts {
     }
 }
 
-/// The canvas step `call` of `admission`'s request in `slot`, whose
-/// accepted visible KV is `visible` tokens and whose canvas starts at
+/// The denoising step `call` of `admission`'s request in `slot`, whose
+/// accepted visible KV is `visible` tokens and whose block starts at
 /// logical position `position`. `served` is the sampling this worker steps
-/// canvases with (`None` on a rank that serves readouts only).
+/// blocks with (`None` on a rank that serves readouts only).
 pub(crate) fn step_row(
     forward: &ForwardBatch,
     call: &Call,
@@ -163,27 +209,27 @@ pub(crate) fn step_row(
     served: Option<&CanvasSampling>,
     visible: u64,
     position: u64,
-) -> Result<(CanvasStep, StepRow)> {
+) -> Result<(CanvasStep, DenoiseRow)> {
     let step = call
         .canvas
-        .ok_or_else(|| Error::Invalid("a canvas step requires its coordinates".into()))?;
+        .ok_or_else(|| Error::Invalid("a block step requires its coordinates".into()))?;
     let generation = admission
         .ar
         .as_ref()
-        .ok_or_else(|| Error::Invalid("a canvas step requires admitted canvas sampling".into()))?;
+        .ok_or_else(|| Error::Invalid("a block step requires admitted block sampling".into()))?;
     let sampling = generation
         .canvas
         .as_ref()
-        .ok_or_else(|| Error::Invalid("a canvas step requires admitted canvas sampling".into()))?;
+        .ok_or_else(|| Error::Invalid("a block step requires admitted block sampling".into()))?;
     let seed = generation
         .sampling
         .seed
-        .ok_or_else(|| Error::Invalid("a canvas step requires a seeded request".into()))?;
+        .ok_or_else(|| Error::Invalid("a block step requires a seeded request".into()))?;
     let served =
-        served.ok_or_else(|| Error::Invalid("this worker keeps no generating canvases".into()))?;
+        served.ok_or_else(|| Error::Invalid("this worker keeps no generating blocks".into()))?;
     if served != sampling {
         return Err(Error::Invalid(
-            "the admitted canvas sampling is not the sampling this worker serves".into(),
+            "the admitted block sampling is not the sampling this worker serves".into(),
         ));
     }
     let slot = admission.request_pool_idx;
@@ -194,19 +240,19 @@ pub(crate) fn step_row(
         || forward.query_lens[descriptors[0]] != length
     {
         return Err(Error::Invalid(
-            "a canvas step is one read-only canvas row over its prefix".into(),
+            "a block step is one read-only block row over its prefix".into(),
         ));
     }
     if step.step >= sampling.max_steps {
         return Err(Error::Invalid(
-            "the canvas step exceeds its step limit".into(),
+            "the block step exceeds its step limit".into(),
         ));
     }
     let prefix = u32::try_from(visible)
-        .map_err(|_| Error::Invalid("a canvas prefix exceeds the token range".into()))?;
+        .map_err(|_| Error::Invalid("a block prefix exceeds the token range".into()))?;
     Ok((
         step,
-        StepRow {
+        DenoiseRow {
             slot,
             seed,
             block: step.block,
@@ -337,17 +383,17 @@ mod tests {
         assert_eq!(
             readouts.rows,
             [
-                CanvasRow {
+                Sequence {
                     query: 3,
                     prefix: 6,
                     position: 40
                 },
-                CanvasRow {
+                Sequence {
                     query: 2,
                     prefix: 6,
                     position: 40
                 },
-                CanvasRow {
+                Sequence {
                     query: 2,
                     prefix: 1,
                     position: 9
@@ -417,7 +463,7 @@ mod tests {
         assert_eq!(coordinates, step);
         assert_eq!(
             row,
-            StepRow {
+            DenoiseRow {
                 slot: 2,
                 seed,
                 block: 2,
@@ -453,7 +499,7 @@ mod tests {
             Some(&served),
             &call(4, None, Some(CanvasStep { block: 0, step: 3 }))
         ));
-        // A step is exactly one canvas-length row.
+        // A step is exactly one block-length row.
         assert!(refused(&seeded, Some(&served), &call(3, None, Some(step))));
         Ok(())
     }

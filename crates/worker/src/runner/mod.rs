@@ -2,9 +2,9 @@
 
 pub(crate) mod allocate;
 pub(crate) mod attention;
-pub(crate) mod canvas;
 pub(crate) mod decoder;
 pub(crate) mod diffusion;
+pub(crate) mod diffusion_lm;
 pub(crate) mod encoder;
 mod graph_shapes;
 pub(crate) mod text;
