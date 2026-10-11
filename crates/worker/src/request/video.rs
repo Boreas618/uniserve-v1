@@ -14,8 +14,8 @@ use std::sync::Arc;
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, ConditionRole, VideoCondition};
 
-use crate::ffi::{integer_list, list};
-use crate::model::video::VideoModel;
+use crate::ffi::integer_list;
+use crate::runner::denoiser::VideoModel;
 use crate::{Error, Result};
 
 /// A layout descriptor: `[frames, width, height, text_rows, condition_rows]`.
@@ -81,7 +81,8 @@ impl ConditionShape {
         }
     }
 
-    fn descriptor(&self) -> Any {
+    /// `[role, frames, width, height, audio_samples]`.
+    fn descriptor(&self) -> [i64; 5] {
         let role = match self.role {
             ConditionRole::FirstFrame => 0,
             ConditionRole::LastFrame => 1,
@@ -94,13 +95,13 @@ impl ConditionShape {
                 height: 0,
             },
         ));
-        Any::from(integer_list([
+        [
             role,
             i64::from(frames),
             i64::from(canvas.width),
             i64::from(canvas.height),
             self.audio_samples as i64,
-        ]))
+        ]
     }
 }
 
@@ -138,9 +139,11 @@ impl VideoSize {
         ]))
     }
 
-    /// The conditions descriptor, in request order.
+    /// The flat conditions descriptor, in request order.
     pub(crate) fn conditions_descriptor(&self) -> Any {
-        Any::from(list(self.conditions.iter().map(ConditionShape::descriptor)))
+        Any::from(integer_list(
+            self.conditions.iter().flat_map(ConditionShape::descriptor),
+        ))
     }
 
     /// The flat vision spans descriptor.

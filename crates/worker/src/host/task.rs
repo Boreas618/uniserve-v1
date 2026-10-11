@@ -5,7 +5,7 @@
 //! reads (product views, borrowed shared-memory rows, the request's
 //! [`MuxSession`]) until the lane retires it, so the executor can retire
 //! the batch that configured it independently of the task's thread. Python
-//! runs only inside the interface functions a task calls.
+//! runs only inside the library functions a task calls.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -15,7 +15,7 @@ use uniserve_core::VideoCondition;
 use super::mux::{MuxSession, frame_unit};
 use super::reader::{ConditionProducts, ConditionReader};
 use super::{HostAction, HostTask};
-use crate::ffi::{Backing, DType, Device, Function, Handle};
+use crate::ffi::{Backing, DType, Device, Function};
 use crate::storage::memory::StorageView;
 use crate::transfer::{SharedMapping, SharedRead};
 use crate::{Error, Outcome};
@@ -93,12 +93,6 @@ impl UnitFrames {
 
 /// One host-lane action.
 pub(crate) enum MediaTask {
-    /// Draw a video request's noise and fill its slot's host sources
-    /// (`prepare_request` of the denoiser binding).
-    Prepare {
-        function: Function,
-        arguments: Vec<Handle>,
-    },
     /// Decode a conditioned request's media into its products.
     Read {
         reader: Arc<ConditionReader>,
@@ -145,14 +139,6 @@ pub(crate) type TaskCallback = Box<dyn FnOnce() + Send>;
 impl MediaTask {
     fn execute(&self) -> crate::Result<TaskOutput> {
         match self {
-            Self::Prepare {
-                function,
-                arguments,
-            } => {
-                let views: Vec<AnyView<'_>> = arguments.iter().map(Handle::view).collect();
-                function.invoke(&views)?;
-                Ok(TaskOutput::Done)
-            }
             Self::Read {
                 reader,
                 conditions,

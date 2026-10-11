@@ -16,8 +16,9 @@
 //!
 //! Reference videos are decoded by one FFmpeg process per condition whose
 //! standard input is the shared-memory object; images, audio and patch
-//! packing are the model library's (`media.read_image`, `media.read_audio`,
-//! `pack_vision`). Every product must be filled exactly.
+//! packing are the model library's (`media.reader.read_image`,
+//! `media.reader.read_audio`, `EncoderRunner.pack_pixels`). Every product
+//! must be filled exactly.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -28,7 +29,7 @@ use uniserve_core::{
     AudioClip, ConditionMedia, MediaLocator, SharedMemory, VideoClip, VideoCondition,
 };
 
-use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list};
+use crate::ffi::{Backing, DType, Function, Handle, integer_list};
 use crate::model::interface::Interface;
 use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
@@ -39,24 +40,28 @@ pub(crate) struct ReaderFunctions {
     read_image: Function,
     read_audio: Function,
     pack_vision: Function,
+    /// The loaded model, whose vision encoder packs patches.
+    loaded: Handle,
     /// The audio encoder's sample rate, which tracks are resampled to.
     pub(crate) sample_rate: u32,
 }
 
 impl ReaderFunctions {
-    /// Resolve the reader functions of the model `loaded` describes.
+    /// Resolve the reader functions of the model `loaded` describes: the
+    /// library's condition decoders, and the patch packing and audio rate
+    /// the Python `EncoderRunner` answers from the model's description.
     pub(crate) fn new(interface: &Interface, loaded: &Handle) -> Result<Self> {
-        let record = Record::new(
-            "media.reader",
-            interface.function("media.reader")?.call(&[loaded.view()])?,
-        )?;
-        let pack_vision = record.get::<tvm_ffi::Function>("pack_vision")?;
+        const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
+        let sample_rate: i64 = interface
+            .import(&format!("{ENCODER}.sample_rate"))?
+            .call_as(&[loaded.view()])?;
         Ok(Self {
-            read_image: interface.function("media.read_image")?,
-            read_audio: interface.function("media.read_audio")?,
-            pack_vision: Function::new("media.reader.pack_vision", pack_vision),
-            sample_rate: u32::try_from(record.count("sample_rate")?)
-                .map_err(|_| Error::Interface("media.reader sample rate is invalid".into()))?,
+            read_image: interface.import("uniserve_models.media.reader.read_image")?,
+            read_audio: interface.import("uniserve_models.media.reader.read_audio")?,
+            pack_vision: interface.import(&format!("{ENCODER}.pack_pixels"))?,
+            loaded: loaded.clone(),
+            sample_rate: u32::try_from(sample_rate)
+                .map_err(|_| Error::Interface("the audio encoder's rate is invalid".into()))?,
         })
     }
 }
@@ -172,21 +177,14 @@ impl ConditionReader {
                     )?
                     .reshape(DType::U8, &[1, i64::from(height), i64::from(width), 3])?;
                     let data = host_bytes(read_bytes(&condition.source)?)?;
-                    let geometry = integer_list(
-                        [
-                            fit.resized.width,
-                            fit.resized.height,
-                            fit.left,
-                            fit.top,
-                            width,
-                            height,
-                        ]
-                        .map(i64::from),
-                    );
+                    let resized =
+                        integer_list([fit.resized.width, fit.resized.height].map(i64::from));
+                    let window = integer_list([fit.left, fit.top, width, height].map(i64::from));
                     let target = Any::from(pixels.to_tensor()?);
                     self.functions.read_image.invoke(&[
                         AnyView::from(&data),
-                        AnyView::from(&Any::from(geometry)),
+                        AnyView::from(&Any::from(resized)),
+                        AnyView::from(&Any::from(window)),
                         AnyView::from(&target),
                     ])?;
                     self.pack(condition, &target, products, &mut cursor)?;
@@ -255,6 +253,7 @@ impl ConditionReader {
         let indices = integer_list(vision.frame_indices.iter().map(|&index| i64::from(index)));
         let grid = integer_list([vision.grid.t, vision.grid.h, vision.grid.w].map(i64::from));
         self.functions.pack_vision.invoke(&[
+            self.functions.loaded.view(),
             AnyView::from(frames),
             AnyView::from(&Any::from(indices)),
             AnyView::from(&Any::from(grid)),
@@ -276,15 +275,12 @@ impl ConditionReader {
             "samples",
         )?;
         let data = host_bytes(read_bytes(source)?)?;
-        let clip = integer_list([
-            i64::from(track.sample_rate),
-            track.start_sample as i64,
-            track.source_samples as i64,
-            track.samples as i64,
-        ]);
         self.functions.read_audio.invoke(&[
             AnyView::from(&data),
-            AnyView::from(&Any::from(clip)),
+            AnyView::from(&Any::from(i64::from(track.sample_rate))),
+            AnyView::from(&Any::from(track.start_sample as i64)),
+            AnyView::from(&Any::from(track.source_samples as i64)),
+            AnyView::from(&Any::from(track.samples as i64)),
             AnyView::from(&Any::from(i64::from(self.functions.sample_rate))),
             AnyView::from(&Any::from(samples.to_tensor()?)),
         ])
