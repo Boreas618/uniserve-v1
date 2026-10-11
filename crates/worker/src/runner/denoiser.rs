@@ -35,7 +35,8 @@ use tvm_ffi::Any;
 use uniserve_core::{Canvas, VideoCondition};
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memcpy_async, memset_d8, memset_d32};
 use uniserve_ipc::{
-    Batch as BatchPlan, Call, ConditionTiles, LatentParams, OutputInfo, VideoDenoiserInfo,
+    Batch as BatchPlan, Call, ConditionTiles, DimBound, LatentParams, OutputInfo, RasterAxes,
+    ShapeBound, VideoDenoiserInfo,
 };
 
 use crate::cuda_graph::GraphPool;
@@ -1604,6 +1605,7 @@ impl Trajectories for DenoiserRunner {
 
 const DENOISER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
 const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
+const OUTPUTS: &str = "uniserve_models.runner.denoiser.Outputs";
 
 /// What the model reports about its video timeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -1697,6 +1699,9 @@ struct SizingMethods {
     workspace_elements: Function,
     products: Function,
     reader_products: Function,
+    /// The column methods of the `Outputs` the two product methods return:
+    /// owners, names, dtypes, ranks, extents, variable and raster axes.
+    output_columns: [Function; 7],
     unit_frames: Function,
     segment: Function,
     window_rows: Function,
@@ -1798,6 +1803,20 @@ impl VideoModel {
             workspace_elements: of_denoiser("workspace_elements")?,
             products: of_denoiser("products")?,
             reader_products: of_denoiser("reader_products")?,
+            output_columns: [
+                "owners",
+                "names",
+                "dtypes",
+                "ranks",
+                "extents",
+                "variable_axes",
+                "raster_axes",
+            ]
+            .map(|column| interface.import(&format!("{OUTPUTS}.{column}")))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| Error::Invariant("the outputs have seven columns".into()))?,
             unit_frames: of_decoder("unit_frames")?,
             segment: of_decoder("segment")?,
             window_rows: of_decoder("window_rows")?,
@@ -2196,29 +2215,21 @@ impl VideoModel {
         canvases: &[Canvas],
     ) -> Result<BTreeMap<String, Vec<OutputInfo>>> {
         let method = &self.methods.products;
-        let record = Record::new(
-            method.name(),
-            self.denoiser(
-                method,
-                vec![
-                    Any::from(i64::from(frames)),
-                    Any::from(i64::from(tokens)),
-                    Any::from(i64::from(rows)),
-                    text(dtype),
-                    Any::from(integer_list(canvases.iter().flat_map(|canvas| {
-                        [i64::from(canvas.width), i64::from(canvas.height)]
-                    }))),
-                ],
-            )?,
+        let outputs = self.denoiser(
+            method,
+            vec![
+                Any::from(i64::from(frames)),
+                Any::from(i64::from(tokens)),
+                Any::from(i64::from(rows)),
+                text(dtype),
+                Any::from(integer_list(canvases.iter().flat_map(|canvas| {
+                    [i64::from(canvas.width), i64::from(canvas.height)]
+                }))),
+            ],
         )?;
-        let mut result = BTreeMap::new();
-        for component in record.keys() {
-            let outputs = record
-                .records(&component)?
-                .iter()
-                .map(|output| crate::model::output_info(&component, output))
-                .collect::<Result<Vec<_>>>()?;
-            result.insert(component, outputs);
+        let mut result: BTreeMap<String, Vec<OutputInfo>> = BTreeMap::new();
+        for (component, output) in self.output_infos(outputs)? {
+            result.entry(component).or_default().push(output);
         }
         Ok(result)
     }
@@ -2239,15 +2250,86 @@ impl VideoModel {
                 Any::from(i64::from(rows)),
             ],
         )?;
-        let records: tvm_ffi::Array<Any> = value
-            .try_into()
-            .map_err(|error| Error::numerical(method.name(), &error))?;
-        records
-            .iter()
-            .map(|record| {
-                crate::model::output_info("media_reader", &Record::new(method.name(), record)?)
-            })
-            .collect()
+        Ok(self
+            .output_infos(value)?
+            .into_iter()
+            .map(|(_, output)| output)
+            .collect())
+    }
+
+    /// Read the outputs a product method returned (`Outputs`), column by
+    /// column, as each output's component and bound.
+    fn output_infos(&self, outputs: Any) -> Result<Vec<(String, OutputInfo)>> {
+        let [owners, names, dtypes, ranks, extents, variable, raster] =
+            &self.methods.output_columns;
+        let strings = |column: &Function| -> Result<Vec<String>> {
+            let values: tvm_ffi::Array<tvm_ffi::String> = column.call_as(&[(&outputs).into()])?;
+            Ok(values
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect())
+        };
+        let numbers = |column: &Function| -> Result<Vec<i64>> {
+            self.integers(column, column.call_values(std::slice::from_ref(&outputs))?)
+        };
+        let (owners, names, dtypes) = (strings(owners)?, strings(names)?, strings(dtypes)?);
+        let (ranks, extents) = (numbers(ranks)?, numbers(extents)?);
+        let (variable, raster) = (numbers(variable)?, numbers(raster)?);
+        let mut extents = extents.into_iter();
+        let mut result = Vec::with_capacity(names.len());
+        for (index, name) in names.into_iter().enumerate() {
+            let component = &owners[index];
+            let extent = |value: i64| {
+                u32::try_from(value).map_err(|_| {
+                    Error::Unsupported(format!("result {component}.{name} has an invalid extent"))
+                })
+            };
+            let dtype = [
+                uniserve_ipc::DType::U8,
+                uniserve_ipc::DType::I16,
+                uniserve_ipc::DType::I32,
+                uniserve_ipc::DType::I64,
+                uniserve_ipc::DType::F16,
+                uniserve_ipc::DType::BF16,
+                uniserve_ipc::DType::F32,
+            ]
+            .into_iter()
+            .find(|dtype| dtype.storage_name() == dtypes[index])
+            .ok_or_else(|| {
+                Error::Unsupported(format!("result {component}.{name} has no protocol dtype"))
+            })?;
+            let dims = extents
+                .by_ref()
+                .take(ranks[index] as usize)
+                .enumerate()
+                .map(|(axis, size)| {
+                    Ok(if variable[index] == axis as i64 {
+                        DimBound::Device { max: extent(size)? }
+                    } else {
+                        DimBound::Static(extent(size)?)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // A negative axis stands for an output that is not laid out at
+            // the canvas.
+            let raster_axes = match (raster[2 * index], raster[2 * index + 1]) {
+                (height, width) if height >= 0 && width >= 0 => Some(RasterAxes {
+                    height: extent(height)?,
+                    width: extent(width)?,
+                }),
+                _ => None,
+            };
+            result.push((
+                component.clone(),
+                OutputInfo {
+                    name,
+                    dtype,
+                    shape_bound: ShapeBound { dims },
+                    raster_axes,
+                },
+            ));
+        }
+        Ok(result)
     }
 }
 

@@ -120,7 +120,7 @@ from uniserve_models.processing import (
 from uniserve_models.runner.context import execution_context
 from uniserve_models.tensors import BufferConfig
 
-__all__ = ["DenoiserRunner"]
+__all__ = ["DenoiserRunner", "Outputs"]
 
 # Guidance branch mask bits, in evaluation order.
 _BITS = {
@@ -307,6 +307,76 @@ def _image_rows(values: Sequence[int]) -> list[tuple[int, ...]]:
 @functools.cache
 def _tokenizer(path: Path):
     return load_tokenizer(path)
+
+
+@dataclass(frozen=True)
+class Outputs:
+    """The bounded outputs components publish, read column by column.
+
+    Output ``i`` is the tensor ``names()[i]`` of component ``owners()[i]``.
+    Its shape bound is the next ``ranks()[i]`` values of ``extents()``; at
+    most one of its axes, ``variable_axes()[i]``, varies per request.
+    """
+
+    owned: tuple[tuple[str, Mapping[str, Any]], ...]
+
+    @classmethod
+    def of(cls, components: Mapping[str, Sequence[Mapping[str, Any]]]):
+        """The outputs of ``components``, each in its declared order."""
+        owned = tuple(
+            (owner, output)
+            for owner, outputs in components.items()
+            for output in outputs
+        )
+        for owner, output in owned:
+            if len(output["variable_axes"]) > 1:
+                raise ValueError(
+                    f"{owner}.{output['name']} varies along more than one axis"
+                )
+        return cls(owned)
+
+    def owners(self) -> list[str]:
+        """The component publishing each output."""
+        return [owner for owner, _ in self.owned]
+
+    def names(self) -> list[str]:
+        """Each output's name, unique within its component."""
+        return [str(output["name"]) for _, output in self.owned]
+
+    def dtypes(self) -> list[str]:
+        """Each output's element type name."""
+        return [str(output["dtype"]) for _, output in self.owned]
+
+    def ranks(self) -> list[int]:
+        """Each output's number of axes."""
+        return [len(output["shape"]) for _, output in self.owned]
+
+    def extents(self) -> list[int]:
+        """Every output's largest extents, concatenated in output order."""
+        return [
+            int(extent)
+            for _, output in self.owned
+            for extent in output["shape"]
+        ]
+
+    def variable_axes(self) -> list[int]:
+        """The axis of each output a request sizes; -1 for a fixed shape."""
+        return [
+            int(output["variable_axes"][0]) if output["variable_axes"] else -1
+            for _, output in self.owned
+        ]
+
+    def raster_axes(self) -> list[int]:
+        """Each output's ``[height, width]`` axes, flattened.
+
+        The axes hold a video request's raster; ``[-1, -1]`` for an output
+        that is not laid out at the canvas.
+        """
+        return [
+            int(axis)
+            for _, output in self.owned
+            for axis in (output["raster_axes"] or (-1, -1))
+        ]
 
 
 def _product(name, layout, *, raster_axes=None) -> dict[str, Any]:
@@ -706,11 +776,6 @@ class DenoiserRunner:
         )
         return sum(_elements(config.shape) for config in buffers.values())
 
-    # FIXME: the two product tables below still cross as records. Each
-    # product's shape is derivable from the scalar methods of the runners;
-    # the tables remain until the rank composes its product declarations
-    # from them.
-
     @staticmethod
     def products(
         loaded,
@@ -720,7 +785,7 @@ class DenoiserRunner:
         rows: int,
         dtype: str,
         canvases: Sequence[int],
-    ) -> dict[str, Any]:
+    ) -> Outputs:
         """Products the model's components publish, bounded for any request.
 
         ``frames`` is the longest admitted video, ``tokens`` the prompt
@@ -728,7 +793,8 @@ class DenoiserRunner:
         tasks), ``dtype`` the model dtype the text encoder runs at and
         ``canvases`` the flat ``[width, height]`` canvases the deployment
         prepares. Each video product bounds the video of ``frames`` frames
-        at every one of them. Returns each publishing component's products.
+        at every one of them. Returns each publishing component's products
+        (:class:`Outputs`).
         """
         root = loaded.module
         network = _denoiser(loaded, component)
@@ -825,12 +891,12 @@ class DenoiserRunner:
                     vision.features_layout(int(tokens))["features"],
                 ),
             )
-        return result
+        return Outputs.of(result)
 
     @staticmethod
     def reader_products(
         loaded, component: str, frames: int, tokens: int, rows: int
-    ) -> list[Any]:
+    ) -> Outputs:
         """The media reader's products for a deployment serving conditions.
 
         A condition's pixels are its rows times the pixels per row of its
@@ -869,7 +935,7 @@ class DenoiserRunner:
             for count in counts
         )
         rows = int(rows)
-        return [
+        products = [
             {
                 "name": "condition_pixels",
                 "dtype": "uint8",
@@ -886,6 +952,7 @@ class DenoiserRunner:
             },
             _product("vision_pixels", vision.pixels_layout(int(tokens))),
         ]
+        return Outputs.of({"media_reader": products})
 
     # Layouts.
 
