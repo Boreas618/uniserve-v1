@@ -1,4 +1,4 @@
-//! The Python half of the text runner:
+//! The Python half of [`super::CausalLMRunner`]:
 //! `uniserve_models.runner.causal_lm.CausalLMRunner`.
 //!
 //! [`Methods`] holds the Python runner and its methods, reached by import
