@@ -413,12 +413,7 @@ impl CausalLMRunners {
                 groups.len()
             )));
         }
-        let bindings = bind::bind(
-            startup.interface,
-            startup.workspaces,
-            prepared,
-            startup.peers,
-        )?;
+        let bindings = bind::bind(startup.interface, startup.workspaces, prepared)?;
         let mut collectives = Vec::new();
         if let Some(peers) = startup.peers {
             for ((_, _, stream, _), binding) in targets.iter().zip(&bindings) {

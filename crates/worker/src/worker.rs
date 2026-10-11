@@ -313,7 +313,6 @@ impl Worker {
             .map_or(0, |union| union.rank - launch.execution.rank);
         let peers = PeerGroup {
             group: &world.host,
-            node: &node,
             collectives: launch
                 .components
                 .keys()
@@ -357,7 +356,6 @@ impl Worker {
                 workspaces: &mut workspaces,
                 graphs: &mut graphs,
                 preparation,
-                peers: Some(&peers),
             })
             .map_err(phase("bind"))?
         };
