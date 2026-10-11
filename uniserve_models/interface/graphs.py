@@ -392,13 +392,24 @@ def export(graph: Graph, owner: Any = None) -> list[Any]:
     return [graph if owner is None else owner, graph.raw_cuda_graph_execs()]
 
 
-def begin_capture(pool, stream: int, device: int) -> Capture:
-    """Begin capturing work Rust submits on ``stream`` into ``pool``."""
+def begin_capture(
+    pool, stream: int, device: int, peers: Sequence[Sequence[Any]] = ()
+) -> Capture:
+    """Begin capturing work Rust submits on ``stream`` into ``pool``.
+
+    ``peers`` are ``[device, pool]`` pairs: the allocator pool receiving the
+    work's allocations on each other device its modules run on (see
+    :func:`capture`).
+    """
     global _capturing
     computation = torch.cuda.ExternalStream(
         int(stream), device=torch.device("cuda", int(device))
     )
-    recording = Capture(computation, pool)
+    placed = tuple(
+        (torch.device("cuda", int(ordinal)), handle)
+        for ordinal, handle in peers
+    )
+    recording = Capture(computation, pool, peers=placed)
     recording.begin()
     _capturing = recording
     return recording
