@@ -9,7 +9,7 @@
 //! admission, dependencies, retirement and result delivery are handled
 //! here for every batch, with or without calls.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use uniserve_core::CallId;
@@ -18,22 +18,31 @@ use uniserve_ipc::{
     RequestKind, WorkerInfo, WorkerResponseError,
 };
 
+use super::forward::batch::image::ImageParts;
 use super::forward::{self, launch::Launched};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
-use crate::ffi::Function;
+use crate::ffi::{Device, Function};
+use crate::host::HostLane;
+use crate::host::image::ImageTask;
 use crate::lane::JobQueues;
 use crate::model::registry::Components;
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
+use crate::request::diffusion::Trajectories;
 use crate::request::video::VideoRequests;
 use crate::runner::decoder::runners::DecoderRunners;
+use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::encoder::inputs::Inputs;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
+use crate::runner::start::ImageOwners;
 use crate::service::ServiceBackend;
+use crate::storage::ImageLatents;
+use crate::storage::memory::StorageView;
 use crate::worker::RankStorage;
 use crate::{Error, OutputPool, Result};
 
@@ -56,9 +65,18 @@ pub struct WorkerBackend {
     rank_storage: Option<RankStorage>,
     /// The text runtime, on ranks holding a causal language model.
     text: Option<crate::runner::causal_lm::CausalLMRunners>,
-    /// The image runtime, on ranks holding encoders, image denoisers or
-    /// image decoders of a model that is not a video model.
-    image: Option<forward::image::ImageRuntime>,
+    /// An image model's facts and host policy, on ranks holding encoders,
+    /// image denoisers or image decoders of a model that is not a video
+    /// model.
+    image: Option<(ImageModel, ImagePolicy)>,
+    /// The latent pool of a rank holding an image denoiser.
+    latents: Option<ImageLatents>,
+    /// The open image trajectory of each request slot.
+    trajectories: Trajectories,
+    /// The product arena of each device, which bindings name products in.
+    arenas: HashMap<Device, StorageView>,
+    /// The lane preparing input images and encoding output images.
+    image_host: Option<HostLane<ImageTask>>,
     /// The canvas runtime, on ranks holding a token denoiser.
     canvas: Option<forward::canvas::CanvasRuntime>,
     /// The expert-parallel runtime, on ranks of an expert union.
@@ -95,15 +113,16 @@ pub(crate) struct Parts<'a> {
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut RankStorage>,
     pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
-    pub image: Option<&'a mut forward::image::ImageRuntime>,
+    pub image: Option<ImageParts<'a>>,
     pub canvas: Option<&'a mut forward::canvas::CanvasRuntime>,
     pub experts: Option<&'a forward::experts::ExpertRuntime>,
     pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
 }
 
-/// Every request storage owner, in lifecycle order: rank storage, then the
-/// text, image, canvas and transfer runtimes, a video model's requests,
-/// denoiser runners and output leases, then the other runtimes' owners.
+/// Every request storage owner, in lifecycle order: rank storage, the text
+/// runners, an image model's trajectories, output leases and latent pool,
+/// the canvas and transfer runtimes, a video model's requests, denoiser
+/// runners and output leases, then the other runtimes' owners.
 #[expect(
     clippy::too_many_arguments,
     reason = "one argument per owner the backend holds"
@@ -111,7 +130,9 @@ pub(crate) struct Parts<'a> {
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<crate::runner::causal_lm::CausalLMRunners>,
-    image: &'a mut Option<forward::image::ImageRuntime>,
+    image: bool,
+    trajectories: &'a mut Trajectories,
+    latents: &'a mut Option<ImageLatents>,
     canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
     transfer: &'a mut Option<forward::transfer::TransferRuntime>,
     video: &'a mut Option<VideoRequests>,
@@ -126,8 +147,15 @@ fn owners<'a>(
     if let Some(text) = text {
         owners.push(text);
     }
-    if let Some(image) = image {
-        owners.push(image);
+    let mut media_outputs = media_outputs.as_mut();
+    if image {
+        owners.push(trajectories);
+        if let Some(outputs) = media_outputs.take() {
+            owners.push(outputs);
+        }
+        if let Some(latents) = latents {
+            owners.push(latents);
+        }
     }
     if let Some(canvas) = canvas {
         owners.push(canvas);
@@ -138,7 +166,7 @@ fn owners<'a>(
     if let Some(video) = video {
         owners.push(video);
         owners.push(denoisers);
-        if let Some(outputs) = media_outputs {
+        if let Some(outputs) = media_outputs.take() {
             owners.push(outputs);
         }
     }
@@ -159,7 +187,7 @@ pub struct WorkerBatch {
     /// A capability runtime's launched work awaiting materialization.
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
-    image_inputs: Option<forward::image::Inputs>,
+    image_inputs: Option<Inputs>,
     /// Products and KV transfers imported from other calls.
     inputs: forward::inputs::Inputs,
     /// A media batch's calls and completion.
@@ -222,15 +250,15 @@ impl WorkerBatch {
         self.running = Some(running);
     }
 
-    pub(crate) fn image_inputs(&self) -> Option<&forward::image::Inputs> {
+    pub(crate) fn image_inputs(&self) -> Option<&Inputs> {
         self.image_inputs.as_ref()
     }
 
-    pub(crate) fn set_image_inputs(&mut self, inputs: forward::image::Inputs) {
+    pub(crate) fn set_image_inputs(&mut self, inputs: Inputs) {
         self.image_inputs = Some(inputs);
     }
 
-    pub(crate) fn take_image_inputs(&mut self) -> Option<forward::image::Inputs> {
+    pub(crate) fn take_image_inputs(&mut self) -> Option<Inputs> {
         self.image_inputs.take()
     }
 
@@ -265,6 +293,10 @@ impl WorkerBackend {
             rank_storage: None,
             text: None,
             image: None,
+            latents: None,
+            trajectories: Trajectories::default(),
+            arenas: HashMap::new(),
+            image_host: None,
             canvas: None,
             experts: None,
             weights: None,
@@ -358,13 +390,55 @@ impl WorkerBackend {
         self.text.as_mut()
     }
 
-    /// Install the image runtime.
-    pub(crate) fn set_image(&mut self, image: forward::image::ImageRuntime) {
-        self.image = Some(image);
+    /// Install what serves an image model on this rank.
+    pub(crate) fn set_image(&mut self, owners: ImageOwners) {
+        self.image = Some((owners.model, owners.policy));
+        self.encoders = owners.encoders;
+        self.denoisers = owners.denoisers;
+        self.decoders = owners.decoders;
+        self.latents = owners.latents;
+        self.arenas = owners.arenas;
+        self.media_outputs = Some(owners.outputs);
+        self.image_host = Some(owners.host);
     }
 
-    pub(crate) fn image_mut(&mut self) -> Option<&mut forward::image::ImageRuntime> {
-        self.image.as_mut()
+    /// Release what serves an image model: the encoders' and the
+    /// denoiser's graphs, the host lane and the output storage, after the
+    /// lanes drained.
+    fn close_image(&mut self, aborted: bool) -> Result<()> {
+        let Some(image) = self.image.take() else {
+            return Ok(());
+        };
+        let mut result = self.encoders.close_image(aborted);
+        result = result.and(self.denoisers.close_image(aborted));
+        if let Some(host) = self.image_host.take() {
+            if aborted {
+                host.abort();
+            } else if let Some(error) = host.close().into_iter().next() {
+                result = result.and(Err(error));
+            }
+        }
+        if let Some(mut outputs) = self.media_outputs.take() {
+            outputs.begin_close();
+            if !aborted {
+                outputs.finish_close();
+            }
+        }
+        // The owners end here, as the model's facts do.
+        drop(image);
+        self.release_media();
+        result
+    }
+
+    /// Drop the rank's media runners and the storage their forwards use.
+    fn release_media(&mut self) {
+        self.encoders = EncoderRunners::default();
+        self.denoisers = DenoiserRunners::default();
+        self.decoders = DecoderRunners::default();
+        self.latents = None;
+        self.trajectories = Trajectories::default();
+        self.arenas.clear();
+        self.media = None;
     }
 
     /// Install the canvas runtime.
@@ -445,7 +519,21 @@ impl WorkerBackend {
             requests: &mut self.requests,
             storage: self.rank_storage.as_mut(),
             text: self.text.as_mut(),
-            image: self.image.as_mut(),
+            image: match (&self.image, &mut self.media_outputs, &self.image_host) {
+                (Some((model, policy)), Some(outputs), Some(host)) => Some(ImageParts {
+                    model,
+                    policy,
+                    encoders: &mut self.encoders,
+                    denoisers: &mut self.denoisers,
+                    decoders: &mut self.decoders,
+                    latents: self.latents.as_mut(),
+                    trajectories: &mut self.trajectories,
+                    arenas: &self.arenas,
+                    outputs,
+                    host,
+                }),
+                _ => None,
+            },
             canvas: self.canvas.as_mut(),
             experts: self.experts.as_ref(),
             transfer: self.transfer.as_mut(),
@@ -543,7 +631,9 @@ impl WorkerBackend {
             for owner in owners(
                 &mut self.rank_storage,
                 &mut self.text,
-                &mut self.image,
+                self.image.is_some(),
+                &mut self.trajectories,
+                &mut self.latents,
                 &mut self.canvas,
                 &mut self.transfer,
                 &mut self.video,
@@ -675,8 +765,8 @@ impl WorkerBackend {
         if let Some(text) = &self.text {
             text.set_wake(wake.clone());
         }
-        if let Some(image) = &self.image {
-            image.set_wake(wake.clone());
+        if let Some(host) = &self.image_host {
+            host.set_wake(wake.clone());
         }
         if let Some(transfer) = &self.transfer {
             transfer.set_wake(wake.clone());
@@ -713,6 +803,7 @@ impl WorkerBackend {
             if let Some(mut outputs) = self.media_outputs.take() {
                 result = result.and(outputs.close(aborted));
             }
+            self.release_media();
         }
         if let Some(mut transfer) = self.transfer.take() {
             result = result.and(transfer.close(aborted));
@@ -720,9 +811,7 @@ impl WorkerBackend {
         if let Some(mut canvas) = self.canvas.take() {
             result = result.and(canvas.close(aborted));
         }
-        if let Some(mut image) = self.image.take() {
-            result = result.and(image.close(aborted));
-        }
+        result = result.and(self.close_image(aborted));
         if let Some(mut text) = self.text.take() {
             result = result.and(text.close(aborted));
         }
@@ -740,10 +829,7 @@ impl WorkerBackend {
             .canvas
             .take()
             .map_or(Ok(()), |mut canvas| canvas.close(aborted));
-        let image = self
-            .image
-            .take()
-            .map_or(Ok(()), |mut image| image.close(aborted));
+        let image = self.close_image(aborted);
         let text = self
             .text
             .take()
@@ -851,7 +937,9 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
-            &mut self.image,
+            self.image.is_some(),
+            &mut self.trajectories,
+            &mut self.latents,
             &mut self.canvas,
             &mut self.transfer,
             &mut self.video,
@@ -892,7 +980,7 @@ impl Backend for WorkerBackend {
         // launches once they are ready (the lane notifies `submission`).
         // Other batches' inputs are prepared when their runtime executes.
         if self.image.is_some() && !self.serves_video() {
-            return forward::image::prepare_inputs(self, batch, submission);
+            return crate::runner::encoder::inputs::prepare_inputs(self, batch, submission);
         }
         Ok(true)
     }
@@ -934,7 +1022,9 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
-            &mut self.image,
+            self.image.is_some(),
+            &mut self.trajectories,
+            &mut self.latents,
             &mut self.canvas,
             &mut self.transfer,
             &mut self.video,
@@ -972,7 +1062,9 @@ impl Backend for WorkerBackend {
         let mut owners = owners(
             &mut self.rank_storage,
             &mut self.text,
-            &mut self.image,
+            self.image.is_some(),
+            &mut self.trajectories,
+            &mut self.latents,
             &mut self.canvas,
             &mut self.transfer,
             &mut self.video,
@@ -1020,7 +1112,9 @@ impl Backend for WorkerBackend {
         for owner in owners(
             &mut self.rank_storage,
             &mut self.text,
-            &mut self.image,
+            self.image.is_some(),
+            &mut self.trajectories,
+            &mut self.latents,
             &mut self.canvas,
             &mut self.transfer,
             &mut self.video,

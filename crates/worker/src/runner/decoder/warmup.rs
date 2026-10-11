@@ -15,6 +15,15 @@ impl WarmupHooks for DecoderWarmup {
                 .decoders
                 .prepare_startup(&parts.video.model, &parts.video.plan, parts.rank)
                 .map_err(|error| WorkerError::classify(error, Some("warmup")))?;
+        } else if let Some(image) = backend.parts().image {
+            let layout = image.model.denoiser;
+            let side = layout.map_or(64, |layout| 2 * layout.downsample);
+            image
+                .decoders
+                .warm_image(image.latents.as_deref(), layout, side)
+                .map_err(|error| {
+                    WorkerError::classify(error, Some("image warmup")).with_phase("warmup")
+                })?;
         }
         Ok(())
     }

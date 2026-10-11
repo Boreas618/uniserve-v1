@@ -52,11 +52,6 @@ use crate::executor::forward::canvas::{
 };
 use crate::executor::forward::experts::warmup::ExpertWarmup;
 use crate::executor::forward::experts::{ExpertRuntime, ExpertStart, WeightRuntime};
-use crate::executor::forward::image::ImageRuntime;
-use crate::executor::forward::image::start::{
-    Startup as ImageStartup, reserved_bytes as image_reserved_bytes,
-};
-use crate::executor::forward::image::warmup::ImageWarmup;
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
@@ -78,15 +73,14 @@ use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::causal_lm::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
 use crate::runner::causal_lm::warmup::CausalLMWarmup;
 use crate::runner::component::VideoSetup;
-use crate::runner::decoder::runners::DecoderRunners;
 use crate::runner::decoder::warmup::DecoderWarmup;
 use crate::runner::denoiser::image_model::ImageModel;
-use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::denoiser::warmup::DenoiserWarmup;
 use crate::runner::denoiser::{VideoModel, placed_denoiser};
-use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::encoder::warmup::EncoderWarmup;
-use crate::runner::media::MediaRunner;
+use crate::runner::start::{
+    ImageOwners, Startup as ImageStartup, reserved_bytes as image_reserved_bytes, start_video,
+};
 use crate::service::Service;
 use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
 use crate::stream::{CUDAStream, EventPool};
@@ -355,7 +349,7 @@ impl Worker {
         let image = if video.is_some() {
             None
         } else {
-            ImageRuntime::start(ImageStartup {
+            ImageOwners::start(ImageStartup {
                 interface: &interface,
                 config: &config,
                 request_slots: info.request_slots as usize,
@@ -502,14 +496,11 @@ impl Worker {
         )
         .map_err(|error| error.with_phase("executor"))?;
         let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
-        if video_warmup {
+        if video_warmup || image_warmup {
             // Prepared and captured in this order on every rank.
             hooks.push(Box::new(EncoderWarmup));
             hooks.push(Box::new(DenoiserWarmup));
             hooks.push(Box::new(DecoderWarmup));
-        }
-        if image_warmup {
-            hooks.push(Box::new(ImageWarmup));
         }
         if text_warmup {
             hooks.push(Box::new(CausalLMWarmup {
@@ -902,8 +893,9 @@ impl Worker {
         if let Some(text) = executor.backend_mut().text_mut() {
             text.seal();
         }
-        if let Some(image) = executor.backend_mut().image_mut() {
-            image.seal();
+        if let Some(image) = executor.backend_mut().parts().image {
+            image.encoders.seal_image();
+            image.denoisers.seal_image();
         }
         self.workspaces.seal();
         let choices: i64 = self
@@ -1325,7 +1317,7 @@ fn plan(
                 unit_columns,
             )?,
         );
-        // The image runtime's denoiser columns and decoder staging.
+        // The image denoiser's columns and the image decoder's staging.
         if facts.image_flow.is_some() {
             let image = ImageModel::describe(interface, model.handle())?;
             layout.reserve(
@@ -1453,59 +1445,4 @@ fn expert_exchange(launch: &WorkerLaunch) -> (bool, usize) {
             },
         )
     })
-}
-
-/// Start the runners of a video model's components placed on this rank, in
-/// placement order, and the host media of its host components.
-fn start_video(
-    mut setup: VideoSetup<'_>,
-    components: &Components,
-) -> Result<(
-    EncoderRunners,
-    DenoiserRunners,
-    DecoderRunners,
-    Option<MediaRunner>,
-)> {
-    use crate::model::components::Capability;
-
-    let mut encoders = EncoderRunners::default();
-    let mut denoisers = DenoiserRunners::default();
-    let mut decoders = DecoderRunners::default();
-    let mut host_components = std::collections::BTreeMap::new();
-    for placed in components.placed() {
-        if placed.host() {
-            host_components.insert(placed.name.clone(), placed.config.clone());
-            continue;
-        }
-        if placed.has(Capability::TextEncoder) {
-            encoders.start_text(&mut setup, placed)?;
-        }
-        if placed.name == setup.model.denoiser {
-            denoisers.start_video(&mut setup, placed)?;
-        }
-        if placed.has(Capability::VideoDecoder) {
-            decoders.start_video(&mut setup, placed)?;
-        }
-        if placed.has(Capability::AudioDecoder) {
-            decoders.start_audio(&mut setup, placed)?;
-        }
-        if placed.has(Capability::VideoEncoder) {
-            encoders.start_conditions(&mut setup, placed)?;
-        }
-    }
-    let media = if host_components.is_empty() {
-        None
-    } else {
-        let info = setup.info;
-        let capacity = (info.queue_depth as usize * info.max_batch_calls.max(1) as usize).max(1);
-        Some(MediaRunner::new(
-            setup.interface,
-            setup.loaded,
-            host_components,
-            setup.config.ffmpeg.clone(),
-            setup.model.facts.frame_rate,
-            capacity,
-        )?)
-    };
-    Ok((encoders, denoisers, decoders, media))
 }

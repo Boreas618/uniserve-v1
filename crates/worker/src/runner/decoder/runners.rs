@@ -2,12 +2,14 @@
 
 use std::collections::HashSet;
 
-use super::{DecoderRunner, Segment, TrackUnits, UnitShape};
+use super::{DecodeImage, DecoderRunner, Segment, TrackUnits, UnitShape};
 use crate::Result;
 use crate::ffi::Record;
 use crate::request::video::{MediaPlan, VideoSize};
 use crate::runner::component::Component;
 use crate::runner::denoiser::VideoModel;
+use crate::runner::denoiser::image_model::ImageDenoiserLayout;
+use crate::storage::ImageLatents;
 
 /// The decoder runners of a rank.
 #[derive(Default)]
@@ -22,9 +24,56 @@ pub(crate) struct DecoderRunners {
     /// The track units startup warmed, which it then captures, each with
     /// its track's latent rows.
     track_units: Vec<(TrackUnits, u64)>,
+    /// An image model's decoder, with its component.
+    pub(crate) image: Option<(String, DecoderRunner)>,
+    /// Output words of an image decoding batch's pixels at most.
+    pub(crate) max_pixel_words: usize,
 }
 
 impl DecoderRunners {
+    /// The decoder of an image model and the most output words a decoding
+    /// batch's pixels take.
+    pub(crate) fn image(decoder: Option<(String, DecoderRunner)>, max_pixel_words: usize) -> Self {
+        Self {
+            image: decoder,
+            max_pixel_words,
+            ..Self::default()
+        }
+    }
+
+    /// Warm the image decoder on one black `side` x `side` image whose
+    /// latent rows are the head of the step workspace of `latents`.
+    pub(crate) fn warm_image(
+        &self,
+        latents: Option<&ImageLatents>,
+        layout: Option<ImageDenoiserLayout>,
+        side: u32,
+    ) -> Result<()> {
+        let (Some((_, decoder)), Some(latents), Some(layout)) = (&self.image, latents, layout)
+        else {
+            return Ok(());
+        };
+        let units = layout.latent_rows(side, side)?;
+        let workspace = latents.workspace()?;
+        workspace
+            .narrow(0, 0, i64::from(units))?
+            .zero(decoder.stream())?;
+        decoder.decode(
+            &[DecodeImage {
+                sample: 0,
+                units,
+                height: side,
+                width: side,
+                product: None,
+            }],
+            |_, _| Ok(()),
+        )?;
+        if let Some(stream) = decoder.stream() {
+            stream.synchronize()?;
+        }
+        Ok(())
+    }
+
     /// Prepare and warm the video decoder's segments and every round shape
     /// of its unit ring, then the audio decoder's durations. Runs on every
     /// rank of the group in the same order, because rounds exchange

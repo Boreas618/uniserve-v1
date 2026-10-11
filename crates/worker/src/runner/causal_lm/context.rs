@@ -23,7 +23,7 @@ use uniserve_cuda::Stream;
 use uniserve_ipc::{Call, ForwardBatch};
 
 use crate::executor::PendingOutput;
-use crate::executor::forward::image::ImageRuntime;
+use crate::executor::forward::batch::image::ImageParts;
 use crate::ffi::{Device, Region};
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};
@@ -57,7 +57,7 @@ pub(super) struct Media {
 /// What a media call borrows from the rank.
 pub(super) struct Sources<'a> {
     pub(super) tensors: &'a TensorStore,
-    pub(super) image: Option<&'a ImageRuntime>,
+    pub(super) image: Option<&'a ImageParts<'a>>,
     pub(super) tables: &'a BlockTables,
     pub(super) device: Option<i32>,
     pub(super) stream: Option<&'a Stream>,
