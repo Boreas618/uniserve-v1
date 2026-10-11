@@ -27,8 +27,6 @@ STARTUP_ENTRIES = {
     "distributed.create_groups",
     "distributed.mesh",
     "distributed.destroy",
-    "memory.stats",
-    "memory.release_cached",
     "kernels.choices",
     "profiling.start",
     "profiling.stop",

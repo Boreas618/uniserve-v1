@@ -54,7 +54,7 @@ use crate::executor::forward::image::warmup::ImageWarmup;
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
-use crate::ffi::{DType, Handle, Record};
+use crate::ffi::{DType, Handle};
 use crate::lane::Lanes;
 use crate::launch::Endpoint;
 use crate::model::bind::{PeerGroup, StreamWorkspaces};
@@ -252,7 +252,15 @@ impl Worker {
             .map_err(phase("experts"))?;
         let budget = match device {
             Device::Cuda(_) => Some(
-                DeviceBudget::new(interface.release_cached.clone()).map_err(phase("capacity"))?,
+                DeviceBudget::new(
+                    interface
+                        .import("torch.cuda.synchronize")
+                        .map_err(phase("capacity"))?,
+                    interface
+                        .import("torch.cuda.empty_cache")
+                        .map_err(phase("capacity"))?,
+                )
+                .map_err(phase("capacity"))?,
             ),
             Device::Cpu => None,
         };
@@ -756,28 +764,21 @@ impl Worker {
         Ok(())
     }
 
-    /// Allocator segments of `device`.
+    /// Bytes the caching allocator holds in each of its pools on `device`.
     fn segments(&self, device: i32) -> Result<Vec<Segment>> {
-        let stats = Record::new(
-            "memory.stats",
-            self.interface
-                .memory_stats
-                .call_values(&[Any::from(i64::from(device))])?,
-        )?;
-        stats
-            .list("segments")?
-            .into_iter()
-            .map(|segment| {
-                let values = crate::ffi::integers(segment)
-                    .map_err(|error| Error::numerical("memory.stats", &error))?;
-                let [first, second, bytes] = values[..] else {
-                    return Err(Error::Interface(
-                        "memory.stats segments are [pool, pool, bytes]".into(),
-                    ));
-                };
-                Ok((device, (first as u64, second as u64), bytes as u64))
-            })
-            .collect()
+        let function = "uniserve_models.interface.graphs.pool_bytes";
+        let pools = self
+            .interface
+            .import(function)?
+            .call_values(&[Any::from(i64::from(device))])?;
+        let pools =
+            crate::ffi::integers(pools).map_err(|error| Error::numerical(function, &error))?;
+        Ok(pools
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&[first, second, bytes]| (device, (first as u64, second as u64), bytes as u64))
+            .collect())
     }
 
     fn require_codecs(&self) -> std::result::Result<(), WorkerError> {
@@ -818,15 +819,13 @@ impl Worker {
             self.graphs.check(&residency).map_err(phase("warmup"))?;
             for &device in &cuda_devices {
                 let process = budget.process_bytes(device).map_err(phase("warmup"))?;
-                let stats = Record::new(
-                    "memory.stats",
-                    self.interface
-                        .memory_stats
-                        .call_values(&[Any::from(i64::from(device))])
-                        .map_err(phase("warmup"))?,
-                )
-                .map_err(phase("warmup"))?;
-                let reserved = stats.count("reserved").map_err(phase("warmup"))?;
+                let reserved: i64 = self
+                    .interface
+                    .import("torch.cuda.memory_reserved")
+                    .and_then(|reserved| {
+                        reserved.call_as(&[(&Any::from(i64::from(device))).into()])
+                    })
+                    .map_err(phase("warmup"))?;
                 let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
                 tracing::info!(
                     target: crate::profiling::kernels::TARGET,
