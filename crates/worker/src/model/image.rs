@@ -1,16 +1,20 @@
 //! A loaded model's image facts and the host-side image interface.
 //!
-//! `image.describe` reports, once at startup, what the image runtime plans
-//! with: the model's image processing (which towers it declares, its pixel
+//! `DenoiserRunner.describe` reports, once at startup, what the image
+//! runtime plans with: the model's image processing (which towers it declares, its pixel
 //! dtype and feature injection), its image denoiser's latent layout and its
 //! image decoder's pixel range. Rust derives every per-call geometry from
 //! these facts: latent rows, sequence lengths with framing, and denoising
 //! positions.
 //!
-//! Two host functions complete the policy: `image.patch_grid` (the vision
-//! tower's patch grid of an image, which places its features) and
-//! `image.guidance_prefix` (a guidance prefix's tokens, by the model's
-//! prompt framing and tokenizer).
+//! Two host functions complete the policy: `EncoderRunner.patch_grid` (the
+//! vision tower's patch grid of an image, which places its features) and
+//! `DenoiserRunner.guidance_prefix` (a guidance prefix's tokens, by the
+//! model's prompt framing and tokenizer).
+//!
+//! FIXME: these facts and host functions belong with the runners they
+//! describe. The file stays while `executor/forward/token/` names
+//! `model::image::ROPE_ADVANCE`.
 
 use std::sync::Arc;
 

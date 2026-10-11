@@ -855,6 +855,11 @@ impl EncoderRunner {
     /// Unpacked encoders run one numerical call per pixel shape, in first
     /// appearance order; packed vision runs chunks of the packed capacity.
     /// Returns each image's result shape.
+    ///
+    /// FIXME: unpacked vision and latent encoding are eager Python calls
+    /// over Python-held pixels of request-chosen shapes, and a latent
+    /// encoder's posterior draws from the device's default generator
+    /// inside the call instead of reading noise the caller supplies.
     pub fn encode(&mut self, images: &[&PreparedImage], out: &[Region]) -> Result<Encoded> {
         if images.len() != out.len() {
             return Err(Error::Invariant(

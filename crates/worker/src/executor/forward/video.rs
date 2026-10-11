@@ -83,6 +83,12 @@ pub(crate) fn units(
 }
 
 /// A rank's video runtime.
+///
+/// FIXME: this composition of a rank's runners with its admitted requests,
+/// their retirement and the choice of the runner serving a call is the
+/// executor's and the request pool's; it stays here until
+/// `executor/backend.rs` holds runners and requests instead of one runtime
+/// per model family.
 pub(crate) struct VideoRuntime {
     pub(crate) model: VideoModel,
     pub(crate) plan: MediaPlan,
