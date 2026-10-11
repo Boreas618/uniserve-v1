@@ -626,7 +626,7 @@ impl Batch<'_> {
         let results = self
             .runner
             .buffers
-            .view("denoise.results")
+            .column("denoise.results")
             .and_then(|results| results.prefix(steps.len() as i64))
             .map_err(&execute)?;
         let (offset, _) = lock(buffer)
@@ -644,7 +644,7 @@ impl Batch<'_> {
         let continued = self
             .runner
             .buffers
-            .view("denoise.continued")
+            .column("denoise.continued")
             .map_err(&execute)?;
         let mut start = 0;
         while start < active.len() {

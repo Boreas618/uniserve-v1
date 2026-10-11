@@ -7,6 +7,8 @@ pub(crate) mod decoder;
 pub(crate) mod diffusion;
 pub(crate) mod diffusion_lm;
 pub(crate) mod encoder;
+pub(crate) mod input_buffers;
+pub(crate) mod methods;
 pub(crate) mod video;
 pub(crate) mod vision;
 

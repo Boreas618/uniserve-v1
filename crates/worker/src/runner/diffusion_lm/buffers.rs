@@ -8,112 +8,21 @@
 //! numerical commits skip it, so it stays zero. The Python runner receives
 //! the banks once, at construction.
 //!
-//! [`Buffers`] holds the tensors of one forward: packed tokens and
-//! positions, the attention metadata the sequences read, readout slot and
-//! candidate columns, the final stage's attend state, and on generating
-//! ranks the denoising columns, the gathered state rows and the results.
-//! Every buffer is carved from one allocation; a method receives the
-//! buffers it reads and writes as arguments, and a captured graph addresses
-//! the buffers its capture was given, so the storage is fixed for the
-//! runner's life. The runner writes host values into them with
-//! [`ColumnWrites`] and gathers bank rows into the state rows natively
-//! ([`Banks::gather`]).
-
-use std::sync::Arc;
+//! [`Dimensions`] states the columns of the runner's input buffers: packed
+//! tokens and positions, the attention metadata the sequences read, readout
+//! slot and candidate columns, the final stage's attend state, and on
+//! generating ranks the denoising columns, the gathered state rows and the
+//! results. The runner writes host values into them with [`ColumnWrites`]
+//! and gathers bank rows into the state rows natively ([`Banks::gather`]).
 
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8};
 
 use super::calls::Sequence;
-use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Memory, StorageView};
+use crate::ffi::DType;
+use crate::runner::input_buffers::{Columns, InputBuffers};
+use crate::storage::memory::StorageView;
 use crate::storage::{RequestSlots, SlotField, TablePages};
 use crate::{Error, Result};
-
-/// Byte alignment of every carved buffer.
-const ALIGNMENT: usize = 256;
-
-/// Views of carved fields, by name.
-type Views = Vec<(String, StorageView)>;
-
-/// Fields carved from one allocation, by name.
-struct Carving {
-    fields: Vec<(String, DType, Vec<i64>)>,
-}
-
-impl Carving {
-    fn new() -> Self {
-        Self { fields: Vec::new() }
-    }
-
-    fn field(&mut self, name: impl Into<String>, dtype: DType, shape: &[i64]) {
-        self.fields.push((name.into(), dtype, shape.to_vec()));
-    }
-
-    /// Byte offset of every field and the total length.
-    fn layout(&self) -> (Vec<usize>, usize) {
-        let mut cursor = 0;
-        let offsets = self
-            .fields
-            .iter()
-            .map(|(_, dtype, shape)| {
-                let offset = cursor;
-                let bytes = shape.iter().product::<i64>().max(0) as usize * dtype.bytes();
-                cursor += bytes.next_multiple_of(ALIGNMENT);
-                offset
-            })
-            .collect();
-        (offsets, cursor.max(ALIGNMENT))
-    }
-
-    fn bytes(&self) -> u64 {
-        self.layout().1 as u64
-    }
-
-    /// Allocate zeroed storage on `device` (host memory when `None`) and
-    /// view every field. Device memory is zeroed on `stream`, which is
-    /// synchronized before returning.
-    fn allocate(
-        &self,
-        device: Option<i32>,
-        stream: Option<&Stream>,
-    ) -> Result<(Arc<Memory>, Views)> {
-        let (offsets, bytes) = self.layout();
-        let memory = match device {
-            Some(device) => Memory::device(device, bytes)?,
-            None => Memory::host(bytes),
-        };
-        if device.is_some() {
-            let stream = stream.ok_or_else(|| {
-                Error::Invalid("device block storage is zeroed on a stream".into())
-            })?;
-            // SAFETY: the fresh allocation spans `bytes`; the stream drains
-            // before the storage is used.
-            unsafe { memset_d8(memory.address(), 0, bytes, stream) }?;
-            stream.synchronize()?;
-        }
-        let backing = Arc::clone(&memory) as Arc<dyn Backing>;
-        let views = self
-            .fields
-            .iter()
-            .zip(offsets)
-            .map(|((name, dtype, shape), offset)| {
-                Ok((
-                    name.clone(),
-                    StorageView::contiguous(Arc::clone(&backing), offset, *dtype, shape)?,
-                ))
-            })
-            .collect::<Result<_>>()?;
-        Ok((memory, views))
-    }
-}
-
-fn find(views: &[(String, StorageView)], name: &str) -> Result<StorageView> {
-    views
-        .iter()
-        .find(|(field, _)| field == name)
-        .map(|(_, view)| view.clone())
-        .ok_or_else(|| Error::Invariant(format!("block storage has no {name} buffer")))
-}
 
 /// Dimensions of the resident banks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,20 +211,20 @@ impl Banks {
     }
 }
 
-/// The step buffers of a generating lane.
+/// The denoising columns of a generating rank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DenoiseLayout {
-    /// Block rows of one step invocation.
+    /// Rows of one denoising step.
     pub(super) rows: usize,
     pub(super) banks: BankLayout,
 }
 
-/// The fixed buffers of one block lane.
+/// The dimensions of the runner's columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct BufferLayout {
-    /// Packed sequences of one invocation, padding included.
+pub(super) struct Dimensions {
+    /// Packed sequences of one forward, padding included.
     pub(super) rows: usize,
-    /// Packed tokens of one invocation, padding included.
+    /// Packed tokens of one forward, padding included.
     pub(super) tokens: usize,
     /// Numerical block tables.
     pub(super) tables: usize,
@@ -323,7 +232,7 @@ pub(super) struct BufferLayout {
     pub(super) width: usize,
     /// Slot rows of the largest `readout` graph.
     pub(super) slot_rows: usize,
-    /// Candidates selected per readout pass.
+    /// Candidates one `readout` selects.
     pub(super) candidates: usize,
     /// Per-token widths of the attend state (final stage only).
     pub(super) attend_widths: Vec<usize>,
@@ -331,63 +240,93 @@ pub(super) struct BufferLayout {
     pub(super) denoise: Option<DenoiseLayout>,
 }
 
-impl BufferLayout {
-    fn carving(&self) -> Carving {
+impl Columns for Dimensions {
+    type Name = String;
+
+    fn columns(&self) -> Vec<(String, DType, Vec<i64>)> {
         let (rows, tokens) = (self.rows as i64, self.tokens as i64);
         let tables = self.tables as i64;
-        let mut carving = Carving::new();
-        carving.field("input_ids", DType::I64, &[tokens]);
-        carving.field("positions", DType::I64, &[tokens]);
-        carving.field("attention.query_lengths", DType::I32, &[rows]);
-        carving.field("attention.query_offsets", DType::I32, &[rows + 1]);
-        carving.field("attention.prefix_lengths", DType::I32, &[rows]);
-        carving.field("attention.prefix_offsets", DType::I32, &[rows + 1]);
-        carving.field(
-            "attention.block_tables",
-            DType::I32,
-            &[tables, rows, self.width as i64],
-        );
-        carving.field("attention.start_pages", DType::I32, &[tables, rows]);
-        carving.field(
-            "slot_rows",
-            DType::I64,
-            &[tokens.max(self.slot_rows as i64)],
-        );
-        carving.field("candidate_index", DType::I64, &[self.candidates as i64]);
-        carving.field("candidate_logprobs", DType::F32, &[self.candidates as i64]);
+        let candidates = self.candidates as i64;
+        let mut columns = vec![
+            ("input_ids".to_owned(), DType::I64, vec![tokens]),
+            ("positions".to_owned(), DType::I64, vec![tokens]),
+            ("attention.query_lengths".to_owned(), DType::I32, vec![rows]),
+            (
+                "attention.query_offsets".to_owned(),
+                DType::I32,
+                vec![rows + 1],
+            ),
+            (
+                "attention.prefix_lengths".to_owned(),
+                DType::I32,
+                vec![rows],
+            ),
+            (
+                "attention.prefix_offsets".to_owned(),
+                DType::I32,
+                vec![rows + 1],
+            ),
+            (
+                "attention.block_tables".to_owned(),
+                DType::I32,
+                vec![tables, rows, self.width as i64],
+            ),
+            (
+                "attention.start_pages".to_owned(),
+                DType::I32,
+                vec![tables, rows],
+            ),
+            (
+                "slot_rows".to_owned(),
+                DType::I64,
+                vec![tokens.max(self.slot_rows as i64)],
+            ),
+            ("candidate_index".to_owned(), DType::I64, vec![candidates]),
+            (
+                "candidate_logprobs".to_owned(),
+                DType::F32,
+                vec![candidates],
+            ),
+        ];
         for (index, &width) in self.attend_widths.iter().enumerate() {
-            carving.field(
+            columns.push((
                 format!("attend_state.{index}"),
                 self.attend_dtype,
-                &[tokens, width as i64],
-            );
+                vec![tokens, width as i64],
+            ));
         }
-        if let Some(step) = &self.denoise {
-            let banks = &step.banks;
-            let rows = step.rows as i64;
+        if let Some(denoise) = &self.denoise {
+            let banks = &denoise.banks;
+            let rows = denoise.rows as i64;
             let (length, depth, hidden) =
                 (banks.length as i64, banks.depth as i64, banks.hidden as i64);
-            carving.field("denoise.columns", DType::I64, &[4, rows]);
-            carving.field("denoise.tokens", DType::I64, &[rows, length]);
-            carving.field("denoise.history", DType::I64, &[rows, depth, length]);
-            carving.field(
-                "denoise.self_conditioning",
-                banks.dtype,
-                &[rows, length, hidden],
-            );
-            carving.field("denoise.results", DType::I64, &[rows, 1 + length]);
-            carving.field("denoise.continued", DType::U8, &[rows]);
+            columns.extend([
+                ("denoise.columns".to_owned(), DType::I64, vec![4, rows]),
+                ("denoise.tokens".to_owned(), DType::I64, vec![rows, length]),
+                (
+                    "denoise.history".to_owned(),
+                    DType::I64,
+                    vec![rows, depth, length],
+                ),
+                (
+                    "denoise.self_conditioning".to_owned(),
+                    banks.dtype,
+                    vec![rows, length, hidden],
+                ),
+                (
+                    "denoise.results".to_owned(),
+                    DType::I64,
+                    vec![rows, 1 + length],
+                ),
+                ("denoise.continued".to_owned(), DType::U8, vec![rows]),
+            ]);
         }
-        carving
-    }
-
-    /// Bytes one lane's buffers allocate.
-    pub(super) fn bytes(&self) -> u64 {
-        self.carving().bytes()
+        columns
     }
 }
 
-/// The step views a gather fills and a step reads.
+/// The state rows of a denoising step: a gather fills them from the banks
+/// and the step reads and steps them.
 pub(super) struct DenoiseViews {
     pub(super) rows: usize,
     pub(super) tokens: StorageView,
@@ -395,62 +334,18 @@ pub(super) struct DenoiseViews {
     pub(super) self_conditioning: StorageView,
 }
 
-/// The fixed buffers of one block lane.
-pub(super) struct Buffers {
-    layout: BufferLayout,
-    device: Option<i32>,
-    views: Vec<(String, StorageView)>,
-    step: Option<DenoiseViews>,
-    _memory: Arc<Memory>,
-}
-
-impl Buffers {
-    /// Allocate zeroed buffers on `device` (host memory when `None`).
-    pub(super) fn allocate(
-        layout: BufferLayout,
-        device: Option<i32>,
-        stream: Option<&Stream>,
-    ) -> Result<Self> {
-        if layout.rows == 0 || layout.tokens == 0 || layout.tables == 0 || layout.width == 0 {
-            return Err(Error::Invalid(
-                "block buffer dimensions must be positive".into(),
-            ));
-        }
-        let (memory, views) = layout.carving().allocate(device, stream)?;
-        let step = match &layout.denoise {
-            Some(step) => Some(DenoiseViews {
-                rows: step.rows,
-                tokens: find(&views, "denoise.tokens")?,
-                history: find(&views, "denoise.history")?,
-                self_conditioning: find(&views, "denoise.self_conditioning")?,
-            }),
-            None => None,
+impl DenoiseViews {
+    /// The state rows among `buffers`' columns, on a generating rank.
+    pub(super) fn of(buffers: &InputBuffers<Dimensions>) -> Result<Option<Self>> {
+        let Some(denoise) = &buffers.dimensions.denoise else {
+            return Ok(None);
         };
-        Ok(Self {
-            layout,
-            device,
-            views,
-            step,
-            _memory: memory,
-        })
-    }
-
-    pub(super) fn layout(&self) -> &BufferLayout {
-        &self.layout
-    }
-
-    pub(super) fn device(&self) -> Option<i32> {
-        self.device
-    }
-
-    /// One named buffer.
-    pub(super) fn view(&self, name: &str) -> Result<StorageView> {
-        find(&self.views, name)
-    }
-
-    /// The gathered step views of a generating lane.
-    pub(super) fn denoise(&self) -> Option<&DenoiseViews> {
-        self.step.as_ref()
+        Ok(Some(Self {
+            rows: denoise.rows,
+            tokens: buffers.column("denoise.tokens")?.clone(),
+            history: buffers.column("denoise.history")?.clone(),
+            self_conditioning: buffers.column("denoise.self_conditioning")?.clone(),
+        }))
     }
 }
 
@@ -603,14 +498,14 @@ impl AttentionMetadata {
 /// prefix. Each table's rows hold `widths[table]` page columns: the pages a
 /// live row selects, then zeros.
 pub(crate) fn write_attention(
-    buffers: &Buffers,
+    buffers: &InputBuffers<Dimensions>,
     writes: &mut ColumnWrites,
     rows: &[Sequence],
     padding: &[usize],
     pages: &[TablePages],
     widths: &[usize],
 ) -> Result<AttentionMetadata> {
-    let layout = buffers.layout();
+    let layout = &buffers.dimensions;
     let count = rows.len() + padding.len();
     if count > layout.rows {
         return Err(crate::Error::Invalid(format!(
@@ -650,28 +545,28 @@ pub(crate) fn write_attention(
     let narrow =
         |values: &[i64]| -> Vec<i32> { values.iter().map(|&value| value as i32).collect() };
     writes.write(
-        &buffers.view("attention.query_lengths")?,
+        buffers.column("attention.query_lengths")?,
         0,
         &narrow(&queries),
     )?;
     writes.write(
-        &buffers.view("attention.query_offsets")?,
+        buffers.column("attention.query_offsets")?,
         0,
         &offsets(&queries)?,
     )?;
     writes.write(
-        &buffers.view("attention.prefix_lengths")?,
+        buffers.column("attention.prefix_lengths")?,
         0,
         &narrow(&prefixes),
     )?;
     writes.write(
-        &buffers.view("attention.prefix_offsets")?,
+        buffers.column("attention.prefix_offsets")?,
         0,
         &offsets(&prefixes)?,
     )?;
 
-    let tables = buffers.view("attention.block_tables")?;
-    let start_pages = buffers.view("attention.start_pages")?;
+    let tables = buffers.column("attention.block_tables")?;
+    let start_pages = buffers.column("attention.start_pages")?;
     let mut starts = Vec::with_capacity(layout.tables * count);
     for (table, (selected, &width)) in pages.iter().zip(widths).enumerate() {
         if width > layout.width {
@@ -684,7 +579,7 @@ pub(crate) fn write_attention(
         // Zero every row first, so unselected columns and padding rows read
         // unit zero.
         let base = table * layout.rows * layout.width;
-        writes.zero(&tables, base, count * layout.width)?;
+        writes.zero(tables, base, count * layout.width)?;
         for (row, units) in selected.rows().enumerate() {
             let units: Vec<i32> = units.map(|unit| unit as i32).collect();
             if units.len() > width {
@@ -693,7 +588,7 @@ pub(crate) fn write_attention(
                     units.len()
                 )));
             }
-            writes.write(&tables, base + row * layout.width, &units)?;
+            writes.write(tables, base + row * layout.width, &units)?;
         }
         let first: Vec<i32> = selected
             .starts
@@ -701,7 +596,7 @@ pub(crate) fn write_attention(
             .map(|&page| page as i32)
             .chain(padding.iter().map(|_| 0))
             .collect();
-        writes.write(&start_pages, table * layout.rows, &first)?;
+        writes.write(start_pages, table * layout.rows, &first)?;
         starts.extend(first.iter().map(|&page| i64::from(page)));
     }
     Ok(AttentionMetadata {
@@ -715,7 +610,7 @@ pub(crate) fn write_attention(
 /// Write each row's positions `position..position + query` into
 /// `positions` back to back, then zeros up to `tokens`.
 pub(crate) fn write_positions(
-    buffers: &Buffers,
+    buffers: &InputBuffers<Dimensions>,
     writes: &mut ColumnWrites,
     rows: &[Sequence],
     tokens: usize,
@@ -724,10 +619,10 @@ pub(crate) fn write_positions(
         .iter()
         .flat_map(|row| (row.position..row.position + row.query as u64).map(|value| value as i64))
         .collect();
-    let view = buffers.view("positions")?;
-    writes.write(&view, 0, &positions)?;
+    let view = buffers.column("positions")?;
+    writes.write(view, 0, &positions)?;
     writes.zero(
-        &view,
+        view,
         positions.len(),
         tokens.saturating_sub(positions.len()),
     )
@@ -757,13 +652,13 @@ mod tests {
         let layout = banks();
         let resident = Banks::allocate(layout, None, None)?;
         let mut writes = ColumnWrites::new();
-        let tokens = find(resident.views(), "tokens")?;
+        let tokens = resident.views()[0].1.clone();
         assert_eq!(tokens.shape(), &[4, 4]);
         writes.write(&tokens, 0, &(0..16).collect::<Vec<i64>>())?;
         writes.submit(None, None)?;
 
-        let lane = Buffers::allocate(
-            BufferLayout {
+        let lane = InputBuffers::allocate(
+            Dimensions {
                 rows: 6,
                 tokens: 12,
                 tables: 1,
@@ -780,7 +675,8 @@ mod tests {
             None,
             None,
         )?;
-        let step = lane.denoise().expect("a generating runner has state rows");
+        let step = DenoiseViews::of(&lane)?.expect("a generating runner has state rows");
+        let step = &step;
         // Stale contents of the padding row must not survive a gather.
         let mut stale = ColumnWrites::new();
         stale.write(&step.tokens, 8, &[7i64; 4])?;
@@ -799,8 +695,8 @@ mod tests {
 
     #[test]
     fn column_writes_check_their_destination() -> Result<()> {
-        let lane = Buffers::allocate(
-            BufferLayout {
+        let lane = InputBuffers::allocate(
+            Dimensions {
                 rows: 2,
                 tokens: 4,
                 tables: 1,
@@ -814,14 +710,14 @@ mod tests {
             None,
             None,
         )?;
-        let ids = lane.view("input_ids")?;
+        let ids = lane.column("input_ids")?;
         let mut writes = ColumnWrites::new();
-        assert!(writes.write(&ids, 2, &[1i64, 2, 3]).is_err());
-        assert!(writes.write(&ids, 0, &[1i32]).is_err());
-        writes.write(&ids, 1, &[5i64, 6])?;
-        writes.zero(&ids, 3, 1)?;
+        assert!(writes.write(ids, 2, &[1i64, 2, 3]).is_err());
+        assert!(writes.write(ids, 0, &[1i32]).is_err());
+        writes.write(ids, 1, &[5i64, 6])?;
+        writes.zero(ids, 3, 1)?;
         writes.submit(None, None)?;
-        assert_eq!(read::<i64>(&ids, 4), [0, 5, 6, 0]);
+        assert_eq!(read::<i64>(ids, 4), [0, 5, 6, 0]);
         Ok(())
     }
 }
