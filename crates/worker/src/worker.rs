@@ -337,7 +337,7 @@ impl Worker {
             preparation,
             experts: experts.as_mut(),
             peers: Some(&peers),
-            weights: weights.as_ref().map(WeightRuntime::prefetch),
+            weights: weights.as_ref(),
         })
         .map_err(phase("bind"))?;
         // A video model's encoders and denoiser run in the video runtime.

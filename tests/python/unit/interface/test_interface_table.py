@@ -21,8 +21,6 @@ STARTUP_ENTRIES = {
     "cache.bind_conversion",
     "cache.pool",
     "graphs.pool",
-    "text.describe",
-    "text.bind",
     "component.prepare",
     "component.bind",
     "distributed.initialize",
