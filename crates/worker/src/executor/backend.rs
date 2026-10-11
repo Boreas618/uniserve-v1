@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use uniserve_core::CallId;
 use uniserve_ipc::{
-    Batch as BatchPlan, BatchCommand, BatchOutput, CallKind, ErrorCallIdentity, RequestKind,
-    WorkerInfo, WorkerResponseError,
+    Batch as BatchPlan, BatchCommand, BatchOutput, CallKind, ErrorCallIdentity, ForwardMode,
+    RequestKind, WorkerInfo, WorkerResponseError,
 };
 
 use super::forward::{self, launch::Launched};
@@ -23,6 +23,7 @@ use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
 use crate::ffi::Function;
+use crate::lane::JobQueues;
 use crate::model::registry::Components;
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::Profiler;
@@ -69,6 +70,9 @@ pub struct WorkerBackend {
     components: Components,
     profiler: Option<Profiler>,
     kernels: Option<KernelWatch>,
+    /// The lanes' job queues: each forward's submission runs on the
+    /// execution thread of its lane.
+    jobs: JobQueues,
 }
 
 /// Disjoint borrows of a backend for one batch's execution.
@@ -247,7 +251,41 @@ impl WorkerBackend {
             components,
             profiler: None,
             kernels: None,
+            jobs: JobQueues::default(),
         })
+    }
+
+    /// Use the job queues of the rank's lanes for forward submission.
+    pub fn set_job_queues(&mut self, jobs: JobQueues) {
+        self.jobs = jobs;
+    }
+
+    /// Issue one batch's forward: complete its imported inputs, then run
+    /// its calls on the runtime serving `kind`.
+    fn submit_forward(
+        &mut self,
+        batch: &mut WorkerBatch,
+        kind: CallKind,
+    ) -> std::result::Result<(), WorkerError> {
+        // Imported values become resident before the runtime consumes them
+        // like local ones; an import that failed fails the batch's calls.
+        if let Err(error) = forward::inputs::complete(self, batch) {
+            forward::fail(self, batch, error, "input import")?;
+            self.release_predecessors(batch, true)?;
+            return Ok(());
+        }
+
+        // Each executed batch with calls is one profiler step.
+        let mut profiler = self.profiler.take();
+        let executed = match &mut profiler {
+            Some(profiler) => profiler.step(|| forward::execute(self, batch, kind)),
+            None => forward::execute(self, batch, kind),
+        };
+        self.profiler = profiler;
+        self.report_new_kernels();
+        executed?;
+        self.release_predecessors(batch, true)?;
+        Ok(())
     }
 
     pub fn info(&self) -> &WorkerInfo {
@@ -810,25 +848,11 @@ impl Backend for WorkerBackend {
             return Ok(());
         };
 
-        // Imported values become resident before the runtime consumes them
-        // like local ones; an import that failed fails the batch's calls.
-        if let Err(error) = forward::inputs::complete(self, batch) {
-            forward::fail(self, batch, error, "input import")?;
-            self.release_predecessors(batch, true)?;
-            return Ok(());
-        }
-
-        // Each executed batch with calls is one profiler step.
-        let mut profiler = self.profiler.take();
-        let executed = match &mut profiler {
-            Some(profiler) => profiler.step(|| forward::execute(self, batch, kind)),
-            None => forward::execute(self, batch, kind),
-        };
-        self.profiler = profiler;
-        self.report_new_kernels();
-        executed?;
-        self.release_predecessors(batch, true)?;
-        Ok(())
+        // The forward's submission is one job of its lane: the lane's
+        // execution thread issues everything the forward puts on the
+        // stream, and this thread waits for it.
+        let jobs = self.jobs.clone();
+        jobs.run(kind, || self.submit_forward(batch, kind))
     }
 
     fn begin_retirement(
@@ -997,6 +1021,9 @@ impl ServiceBackend for WorkerBackend {
     }
 
     fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
-        forward::experts::join_step(self, leaving)
+        // A join launches on the lane the union's forwards run on.
+        self.jobs.run(CallKind::Forward(ForwardMode::Decode), || {
+            forward::experts::join_step(self, leaving)
+        })
     }
 }

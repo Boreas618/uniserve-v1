@@ -25,6 +25,7 @@ use crate::executor::forward::decodes_video;
 use crate::executor::forward::token::start::TextBounds;
 use crate::ffi::{DType, Device as StorageDevice, Handle};
 use crate::host::HostLane;
+use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
 use crate::model::components::Capability;
@@ -37,7 +38,7 @@ use crate::runner::diffusion::image::{DiffusionCapacity, DiffusionStorage, Image
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::text::model_dtype;
 use crate::storage::{LatentPool, LatentStorage, OutputPool, TensorStore};
-use crate::worker::{Lanes, RankStorage};
+use crate::worker::RankStorage;
 use crate::{Error, Result};
 
 /// Guidance branches one image evaluates at most per step.

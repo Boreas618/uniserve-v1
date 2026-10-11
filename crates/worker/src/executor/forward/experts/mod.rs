@@ -34,7 +34,7 @@ use uniserve_cuda::Stream;
 
 use super::super::backend::WorkerBackend;
 use crate::error::WorkerError;
-use crate::ffi::{DeferredCall, Function, Handle};
+use crate::ffi::{DeferredCall, Function, Handle, cooperative};
 use crate::model::bind::ComponentBinding;
 use crate::parallel::joins::{GraphFunctions, JoinGraphs};
 use crate::parallel::{ExpertParallel, MicrobatchCall, MicrobatchLanes};
@@ -117,6 +117,22 @@ pub(crate) struct ExpertRuntime {
 // other field is Send. The runtime is used by the executor thread, and its
 // lanes' threads only receive owned calls.
 unsafe impl Send for ExpertRuntime {}
+
+/// One microbatch's forward in an expert step.
+pub(crate) struct MicrobatchForward {
+    pub(crate) call: DeferredCall,
+    /// Whether the forward passes the host turn at its expert dispatch
+    /// points: an eager forward does and stays suspended in Python
+    /// meanwhile; a captured forward submits its whole step at once.
+    pub(crate) yields: bool,
+}
+
+/// Make `call` a cooperative turn of its microbatch thread: the thread
+/// calls Python itself, because a call that yields at a dispatch point
+/// keeps its Python frames on that thread until the rotation returns to it.
+fn turn(call: MicrobatchCall<()>) -> MicrobatchCall<()> {
+    Box::new(move || cooperative(call))
+}
 
 impl ExpertRuntime {
     pub(crate) fn parallel(&self) -> &Arc<ExpertParallel> {
@@ -260,32 +276,35 @@ impl ExpertRuntime {
         }
     }
 
-    /// Run one expert step of `capacity`: every populated microbatch's call
-    /// and every empty microbatch's join. With microbatches, the calls run
-    /// in rotation on the microbatch threads, and `parent` waits on every
-    /// microbatch stream before this returns.
+    /// Run one expert step of `capacity`: every populated microbatch's
+    /// forward and every empty microbatch's join. With microbatches, they
+    /// run in rotation on the microbatch threads, and `parent` waits on
+    /// every microbatch stream before this returns.
     pub(crate) fn run(
         &self,
         parent: &Stream,
-        calls: Vec<Option<DeferredCall>>,
+        forwards: Vec<Option<MicrobatchForward>>,
         capacity: usize,
     ) -> Result<()> {
-        if calls.len() != self.peers.len() {
+        if forwards.len() != self.peers.len() {
             return Err(Error::Invariant(
                 "an expert step has one call per microbatch".into(),
             ));
         }
         let Some(lanes) = &self.lanes else {
-            return match calls.into_iter().next().flatten() {
-                Some(call) => call.invoke(),
+            return match forwards.into_iter().next().flatten() {
+                Some(forward) => forward.call.invoke(),
                 None => self.peer_join(0, capacity)?(),
             };
         };
-        let calls = calls
+        let calls = forwards
             .into_iter()
             .enumerate()
-            .map(|(peer, call)| match call {
-                Some(call) => Ok(Box::new(move || call.invoke()) as MicrobatchCall<()>),
+            .map(|(peer, forward)| match forward {
+                Some(forward) if forward.yields => {
+                    Ok(turn(Box::new(move || forward.call.invoke())))
+                }
+                Some(forward) => Ok(Box::new(move || forward.call.invoke()) as MicrobatchCall<()>),
                 None => self.peer_join(peer, capacity),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -308,7 +327,7 @@ impl ExpertRuntime {
         match &self.lanes {
             Some(lanes) => {
                 let calls = (0..self.peers.len())
-                    .map(|peer| self.eager_join(peer, capacity))
+                    .map(|peer| self.eager_join(peer, capacity).map(turn))
                     .collect::<Result<Vec<_>>>()?;
                 lanes
                     .run(&self.peers[0].stream, &self.streams(), calls)
@@ -338,7 +357,12 @@ impl ExpertRuntime {
             let stream = state.stream.clone();
             return Ok(Box::new(move || graph.launch(&stream)));
         }
-        self.eager_join(peer, capacity)
+        let join = self.eager_join(peer, capacity)?;
+        Ok(if self.lanes.is_some() {
+            turn(join)
+        } else {
+            join
+        })
     }
 
     fn eager_join(&self, peer: usize, capacity: usize) -> Result<MicrobatchCall<()>> {

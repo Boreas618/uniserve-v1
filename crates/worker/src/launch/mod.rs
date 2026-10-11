@@ -1,9 +1,11 @@
 //! The rank process: arguments, descriptor, signals, endpoint and exit
 //! status.
 //!
-//! [`main`] is the body of the worker library's exported `main`. It runs on
-//! the interpreter's main thread with the GIL released and returns the
-//! process exit status:
+//! [`main`] is the body of the worker library's exported `main`. The thread
+//! the Python entry calls it on becomes the rank's Python thread
+//! ([`Interpreter`]): it serves the Python calls of every other thread until
+//! the control thread, which [`main`] starts and which runs the rank, has
+//! finished. [`main`] returns the process exit status:
 //!
 //! | condition | status |
 //! | --- | --- |
@@ -27,6 +29,7 @@ use uniserve_ipc::LaunchDescriptor;
 
 use crate::config::{DescriptorError, WorkerLaunch, resolve};
 use crate::error::WorkerError;
+use crate::ffi::Interpreter;
 use crate::model::interface::Interface;
 use crate::worker::Worker;
 
@@ -88,12 +91,40 @@ pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> 
     }
 }
 
+/// Run the rank on a control thread while the calling thread serves its
+/// Python calls.
 fn run(
     launch: WorkerLaunch,
     table: Map<tvm_ffi::String, tvm_ffi::Function>,
     signals: &Signals,
 ) -> std::result::Result<(), WorkerError> {
     let interface = Interface::from_table(table)?;
+    let interpreter = Interpreter::start()?;
+    let (finished, outcome) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("control".into())
+            .spawn_scoped(scope, move || {
+                // The receiver outlives this thread: the interpreter holds
+                // it until this value arrives.
+                let _ = finished.send(serve(launch, interface, signals));
+            })
+            .map_err(|error| crate::Error::Transport(format!("control thread: {error}")))?;
+
+        interpreter.run(&outcome).unwrap_or_else(|| {
+            Err(crate::Error::State("the control thread ended without a result").into())
+        })
+    })
+}
+
+/// The rank's life on the control thread: bind, register, start, warm up,
+/// serve and close.
+fn serve(
+    launch: WorkerLaunch,
+    interface: Interface,
+    signals: &Signals,
+) -> std::result::Result<(), WorkerError> {
     let rank = launch.execution.rank as u32;
     let mut endpoint = Endpoint::bind(&launch.ipc, rank)?;
     endpoint.register(&launch.ipc, &launch.worker_id, rank)?;
