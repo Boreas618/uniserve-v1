@@ -53,9 +53,8 @@ def bound(table, model, component, root, path):
     table["component.bind"](prepared, {"workspaces": {}})
     arena = torch.zeros(ARENA_BYTES, dtype=torch.uint8)
     module = ".".join(part for part in (root, path) if part)
-    info = EncoderRunner.describe(model, module, "bfloat16")
     runner = EncoderRunner.bound(prepared, path, model, arena)
-    return info, runner, arena
+    return (model, module), runner, arena
 
 
 def payload(height, width, seed=0):
@@ -76,9 +75,11 @@ def test_vision_features_fill_their_product_regions(loaded):
     info, runner, arena = bound(
         table, model, "vision_encoder", "vision_encoder", ""
     )
-    assert info["kind"] == "vision"
-    assert (info["patch_size"], info["downsample"]) == (16, 1)
-    assert (info["max_patches"], info["pixel_dtype"]) == (0, "bfloat16")
+    assert EncoderRunner.kind(*info) == "vision"
+    assert EncoderRunner.patch_size(*info) == 16
+    assert EncoderRunner.downsample(*info) == 1
+    assert EncoderRunner.max_patches(*info) == 0
+    assert EncoderRunner.pixel_dtype(info[0]) == "bfloat16"
 
     images = [
         EncoderRunner.prepare_image(model, "vit", payload(32, 48, seed), 2, 0)

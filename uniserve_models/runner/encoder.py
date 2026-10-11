@@ -55,6 +55,12 @@ def _image_facts(prepared: PreparedImage) -> dict[str, Any]:
     }
 
 
+def _module(loaded, path: str):
+    """The module at ``path`` of the loaded model (``""`` for its root)."""
+    path = str(path)
+    return loaded.module.get_submodule(path) if path else loaded.module
+
+
 def _chunks(values: Sequence[int], width: int) -> list[tuple[int, ...]]:
     """A flat integer list as consecutive tuples of ``width``."""
     flat = [int(value) for value in values]
@@ -427,83 +433,109 @@ class EncoderRunner:
 
     # Image models.
 
+    # Facts of an encoder, answered from the loaded model before a runner
+    # of it exists. ``path`` is the encoder's module path in the model.
+
     @staticmethod
-    def describe(loaded, path: str, dtype: str) -> dict[str, Any]:
-        """Facts of the encoder at module ``path`` of the loaded model.
-
-        ``dtype`` is the deployment's model dtype, which a text encoder's
-        hidden states carry.
-
-        Returns:
-            ``kind`` (``"vision"``, ``"latent"`` or ``"text"``) and:
-
-            - vision: ``patch_size``, ``downsample`` (input patches per
-              feature on each axis), ``output_size``, ``output_dtype``,
-              ``max_patches`` (patch rows of one packed slot, 0 for an
-              unpacked encoder), ``image_patches`` (patch rows of the
-              largest image the image policy admits), ``row_width``
-              (values per packed patch row) and ``pixel_dtype`` (the image
-              policy's output dtype).
-            - latent: ``downsample`` (pixels per latent patch on each
-              axis), ``width`` (values per latent patch row) and
-              ``output_dtype``.
-            - text: ``hidden_size``, ``output_dtype`` and ``positions``
-              (whether the encoder places vision tokens with rotary
-              coordinates).
+    def kind(loaded, path: str) -> str:
+        """``"vision"``, ``"latent"`` or ``"text"``.
 
         Raises:
             NotImplementedError: The module is no encoder a runner serves.
         """
-        # FIXME: these facts still cross as one record.
-        path = str(path)
-        module = loaded.module.get_submodule(path) if path else loaded.module
+        module = _module(loaded, path)
         if isinstance(module, PatchEncoder):
-            processor = getattr(loaded, "image_processor", None)
-            pixel_dtype = (
-                None if processor is None else processor.output_dtype
-            ) or torch.float32
-            layout = module.features_layout(1)["features"]
-            transform = None if processor is None else processor.vit
-            if transform is None:
-                image_patches = 0
-            else:
-                bound = (
-                    transform.pixel_bound()
-                    if isinstance(transform, PatchTransform)
-                    else min(
-                        transform.resize.max_pixels,
-                        transform.resize.max_size**2,
-                    )
-                )
-                image_patches = bound // module.patch_size**2
-            return {
-                "kind": "vision",
-                "patch_size": module.patch_size,
-                "downsample": module.downsample,
-                "output_size": int(layout.shape[1]),
-                "output_dtype": str(layout.dtype).removeprefix("torch."),
-                "max_patches": module.max_patches or 0,
-                "image_patches": image_patches,
-                "row_width": 3 * module.patch_size**2,
-                "pixel_dtype": str(pixel_dtype).removeprefix("torch."),
-            }
+            return "vision"
         if isinstance(module, PatchAutoencoder):
-            return {
-                "kind": "latent",
-                "downsample": module.downsample,
-                "width": module.latent_channels * module.patch_size**2,
-                "output_dtype": str(module.latent_dtype).removeprefix("torch."),
-            }
+            return "latent"
         if isinstance(module, TextEncoder):
-            return {
-                "kind": "text",
-                "hidden_size": int(module.network.hidden_size),
-                "output_dtype": str(dtype).removeprefix("torch."),
-                "positions": type(module).positions
-                is not TextEncoder.positions,
-            }
+            return "text"
         raise NotImplementedError(
             f"{type(module).__qualname__} is no encoder a runner serves"
+        )
+
+    @staticmethod
+    def patch_size(loaded, path: str) -> int:
+        """Pixels per input patch of a vision encoder, on each axis."""
+        return int(_module(loaded, path).patch_size)
+
+    @staticmethod
+    def downsample(loaded, path: str) -> int:
+        """Input units per output row on each axis.
+
+        A vision encoder's input patches per feature; a latent encoder's
+        pixels per latent patch.
+        """
+        return int(_module(loaded, path).downsample)
+
+    @staticmethod
+    def output_width(loaded, path: str) -> int:
+        """Values per output row.
+
+        A vision encoder's feature width, a latent encoder's patch row
+        width, a text encoder's hidden size.
+        """
+        module = _module(loaded, path)
+        if isinstance(module, PatchEncoder):
+            return int(module.features_layout(1)["features"].shape[1])
+        if isinstance(module, PatchAutoencoder):
+            return int(module.latent_channels * module.patch_size**2)
+        return int(module.network.hidden_size)
+
+    @staticmethod
+    def output_dtype(loaded, path: str) -> str:
+        """The dtype of a vision or latent encoder's output rows.
+
+        A text encoder's hidden states carry the deployment's model dtype.
+        """
+        module = _module(loaded, path)
+        dtype = (
+            module.features_layout(1)["features"].dtype
+            if isinstance(module, PatchEncoder)
+            else module.latent_dtype
+        )
+        return str(dtype).removeprefix("torch.")
+
+    @staticmethod
+    def max_patches(loaded, path: str) -> int:
+        """Patch rows of one packed slot of a vision encoder.
+
+        0 for an unpacked encoder.
+        """
+        return int(_module(loaded, path).max_patches or 0)
+
+    @staticmethod
+    def image_patches(loaded, path: str) -> int:
+        """Patch rows of the largest image the image policy admits.
+
+        0 for a model without an understanding transform.
+        """
+        module = _module(loaded, path)
+        processor = getattr(loaded, "image_processor", None)
+        transform = None if processor is None else processor.vit
+        if transform is None:
+            return 0
+        bound = (
+            transform.pixel_bound()
+            if isinstance(transform, PatchTransform)
+            else min(transform.resize.max_pixels, transform.resize.max_size**2)
+        )
+        return int(bound // module.patch_size**2)
+
+    @staticmethod
+    def pixel_dtype(loaded) -> str:
+        """The dtype of the pixels the image policy prepares."""
+        processor = getattr(loaded, "image_processor", None)
+        dtype = (
+            None if processor is None else processor.output_dtype
+        ) or torch.float32
+        return str(dtype).removeprefix("torch.")
+
+    @staticmethod
+    def places_vision(loaded, path: str) -> bool:
+        """Whether a text encoder gives vision tokens rotary coordinates."""
+        return (
+            type(_module(loaded, path)).positions is not TextEncoder.positions
         )
 
     @staticmethod
