@@ -28,9 +28,9 @@ use crate::model::registry::Components;
 use crate::model::{LoadedModel, ModelFacts};
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::{
-    CausalLMRunner, Construction, Dimensions, InputBuffers, Methods, RunnerParts, TableShape,
-    model_dtype,
+    CausalLMRunner, Construction, Dimensions, RunnerParts, TableShape, methods, model_dtype,
 };
+use crate::runner::input_buffers::InputBuffers;
 use crate::storage::{KVCache, KVPlan, OutputPool};
 use crate::{Error, Result};
 
@@ -460,7 +460,7 @@ impl CausalLMRunners {
                     .map(|(_, view)| view)
                     .ok_or_else(|| Error::Invariant(format!("block tables have no {name}")))
             };
-            let methods = Methods::construct(
+            let methods = methods::construct(
                 startup.interface,
                 &Construction {
                     prepared: binding.prepared(),
@@ -486,9 +486,9 @@ impl CausalLMRunners {
             )?;
 
             // The runner's vocabulary shard sizes its logits columns.
-            let shard = methods.vocab(startup.interface)?;
-            let hidden = methods.hidden_size(startup.interface)?;
-            let plans_attention = methods.plans_attention(startup.interface)?;
+            let shard = methods::vocab(&methods)?;
+            let hidden = methods::hidden_size(&methods)?;
+            let plans_attention = methods::plans_attention(&methods)?;
             if shard.size != vocab {
                 return Err(Error::Interface(format!(
                     "the text runner's vocabulary ({}) differs from the model's ({vocab})",
@@ -599,8 +599,6 @@ pub(crate) fn reserved_bytes(
     let dtype = model_dtype(&config.model_dtype)?;
     let mut dimensions = bounds.dimensions(vocab, vocab, facts.hidden_size.unwrap_or(0), dtype);
     dimensions.embeddings = facts.image_processor;
-    Ok(
-        dimensions.bytes() * streams.max(1) as u64
-            + DecodeState::bytes(request_slots, vocab, dtype),
-    )
+    Ok(InputBuffers::bytes(&dimensions) * streams.max(1) as u64
+        + DecodeState::bytes(request_slots, vocab, dtype))
 }

@@ -14,10 +14,10 @@ use uniserve_core::CanvasSampling;
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{CallKind, ForwardMode};
 
-use super::buffers::{BankLayout, Banks, BufferLayout, Buffers, DenoiseLayout};
-use super::methods::{Argument, Facts, Methods};
+use super::buffers::{BankLayout, Banks, DenoiseLayout, DenoiseViews, Dimensions};
+use super::facts::Facts;
 use super::shapes::{SLOT_BUCKETS, Shapes, chunk_rows};
-use super::{CANDIDATES, DiffusionLMRunner};
+use super::{CANDIDATES, DiffusionLMRunner, METHODS, RUNNER};
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
 use crate::executor::forward::experts::{ExpertRuntime, WeightRuntime};
@@ -28,6 +28,8 @@ use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextS
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
+use crate::runner::input_buffers::InputBuffers;
+use crate::runner::methods::{Argument, Methods};
 use crate::storage::{GroupShape, KVCache, KVPlan, OutputPool};
 use crate::{Error, Result};
 
@@ -154,9 +156,9 @@ impl Bounds {
         })
     }
 
-    /// The runner's buffers.
-    fn layout(&self, facts: &Facts, banks: Option<BankLayout>) -> BufferLayout {
-        BufferLayout {
+    /// The dimensions of the runner's input buffers.
+    fn dimensions(&self, facts: &Facts, banks: Option<BankLayout>) -> Dimensions {
+        Dimensions {
             rows: self.rows,
             tokens: self.tokens,
             tables: self.widths.len(),
@@ -402,11 +404,12 @@ impl DiffusionLMRunner {
                 experts.bind_joins(&[binding.prepared()])?;
             }
 
-            let layout = bounds.layout(&facts, banks);
+            let dimensions = bounds.dimensions(&facts, banks);
             let banks = banks
                 .map(|layout| Banks::allocate(layout, cuda, startup.preparation))
                 .transpose()?;
-            let buffers = Buffers::allocate(layout, cuda, startup.preparation)?;
+            let buffers = InputBuffers::allocate(dimensions, cuda, startup.preparation)?;
+            let state = DenoiseViews::of(&buffers)?;
             let chunk_rows = bounds.denoise.map_or(0, |(_, chunk_rows)| chunk_rows);
             let mut arguments = vec![
                 Argument::Handle(binding.prepared().clone()),
@@ -427,12 +430,12 @@ impl DiffusionLMRunner {
                     arguments.push(view.into());
                 }
             }
-            let methods = Methods::construct(interface, &arguments)?;
+            let methods = Methods::construct(interface, RUNNER, &METHODS, arguments)?;
 
             let owner = format!("diffusion_lm:{component}");
             let pool = match (cuda, bounds.graphs) {
                 (Some(ordinal), true) => {
-                    let key = buffers.view("input_ids")?.address() as usize;
+                    let key = buffers.column("input_ids")?.address() as usize;
                     reserve_pools(
                         startup.graphs,
                         &interface.function("graphs.pool")?,
@@ -475,6 +478,7 @@ impl DiffusionLMRunner {
                 methods,
                 facts,
                 buffers,
+                state,
                 banks,
                 sampling,
                 chunk_rows,
@@ -525,7 +529,8 @@ pub(crate) fn reserved_bytes(
             _ => 0,
         };
         let resident = banks.map(|banks| banks.bytes()).transpose()?.unwrap_or(0);
-        bytes += bounds.layout(&facts, banks).bytes() + resident + workspace;
+        let dimensions = bounds.dimensions(&facts, banks);
+        bytes += InputBuffers::bytes(&dimensions) + resident + workspace;
     }
     Ok(bytes)
 }
