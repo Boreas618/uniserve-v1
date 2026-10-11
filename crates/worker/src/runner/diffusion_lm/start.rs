@@ -24,7 +24,6 @@ use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
 use crate::ffi::Handle;
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
-use crate::model::bind;
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
@@ -221,8 +220,8 @@ pub(crate) struct Startup<'a> {
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The device's startup stream, which zeroes new storage.
     pub(crate) preparation: Option<&'a Stream>,
-    /// The worker's ranks, across which symmetric workspaces are mapped.
-    pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
+    /// The worker's ranks and the mesh groups the model communicates over.
+    pub(crate) peers: Option<&'a crate::parallel::PeerGroup<'a>>,
     /// The expert union member, when forwards are expert steps: the component
     /// exchanges through its transport on its stream.
     pub(crate) expert_runtime: Option<&'a mut ExpertUnion>,

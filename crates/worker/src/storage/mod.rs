@@ -15,7 +15,6 @@ mod output;
 mod request_slots;
 pub mod tensor;
 mod tensor_store;
-mod workspace;
 
 pub use block_tables::{
     AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
@@ -35,4 +34,3 @@ pub use request_slots::{RequestSlots, SlotField};
 pub use tensor_store::{
     Metadata, OutputPlacement, ProductBuffer, ProductRead, Scalar, TensorStore, ValueRange,
 };
-pub use workspace::{WorkspaceRequest, Workspaces};

@@ -1,5 +1,6 @@
 //! Stream-ordered NCCL collectives and registered window lifetime.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError};
 
 use tvm_ffi::{Any, AnyView};
@@ -8,6 +9,7 @@ use indexmap::IndexMap;
 use uniserve_cuda::nccl::{self, Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
 
+use crate::config::Device;
 use crate::model::interface::Interface;
 use crate::{CUDAStream, Error, Result};
 
@@ -389,7 +391,43 @@ impl<T> Drop for StreamCommunicator<T> {
     }
 }
 
-/// One mesh group a binding's numerical calls communicate over.
+/// The worker's ranks and the mesh groups its components communicate over.
+pub struct PeerGroup<'a> {
+    /// Host collectives over the worker's ranks; member `i` is rank `i`.
+    pub group: &'a super::host::HostGroup,
+    /// Each component's multi-member mesh groups on this rank.
+    pub collectives: BTreeMap<String, Vec<CollectiveGroup>>,
+}
+
+impl PeerGroup<'_> {
+    /// Bind the collectives of `component` on `device` to NCCL
+    /// communicators on its stream (`owner`), collectively over each
+    /// group's members. `None` when the component communicates over no
+    /// group, and on the host: a host component has no stream, and its
+    /// collectives run on the component's host process groups.
+    pub fn stream_collectives(
+        &self,
+        component: &str,
+        device: Device,
+        owner: Option<&CUDAStream>,
+    ) -> Result<Option<StreamCollectives>> {
+        let Some(groups) = self
+            .collectives
+            .get(component)
+            .filter(|groups| !groups.is_empty())
+        else {
+            return Ok(None);
+        };
+        if device == Device::Cpu {
+            return Ok(None);
+        }
+        let owner = owner
+            .ok_or_else(|| Error::Unsupported("stream collectives require a CUDA stream".into()))?;
+        StreamCollectives::bind(owner, self.group, groups).map(Some)
+    }
+}
+
+/// One mesh group a component's numerical calls communicate over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectiveGroup {
     /// The communicator's name: its mesh axes joined by `.` (`tp`).
