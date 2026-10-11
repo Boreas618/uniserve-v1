@@ -48,11 +48,11 @@ use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageBatch;
 use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::experts::ExpertRuntime;
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, Region, integer_list, list};
 use crate::model::bind::ComponentBinding;
 use crate::model::interface::Interface;
+use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
 use crate::request::diffusion::{BranchSet, GuidancePlan};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
@@ -1105,7 +1105,7 @@ impl ImageBatch<'_> {
     pub(crate) fn denoise(
         &mut self,
         mut text: Option<&mut CausalLMRunners>,
-        experts: Option<&ExpertRuntime>,
+        experts: Option<&ExpertUnion>,
     ) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();

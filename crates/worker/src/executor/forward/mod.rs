@@ -1,12 +1,13 @@
 //! Numerical execution of a batch's calls, by capability.
 //!
 //! Every batch carries calls of one kind on one component. [`execute`]
-//! routes it to what serves the kind: text (`runner::causal_lm`), canvas,
-//! image batches (`batch::image`), a video model's media batches (`batch`),
-//! host media (`media`), transfers (`transfer`); expert-only ranks
-//! participate in expert steps through `experts`. These modules are the
-//! integration seam of the capabilities: each owns its runners, its own
-//! input preparation and result materialization. Inputs imported
+//! routes it to what serves the kind: text (`runner::causal_lm`), the
+//! diffusion LM runner (`runner::diffusion_lm`), image batches
+//! (`batch::image`), a video model's media batches (`batch`), host media
+//! (`media`), transfers (`transfer`); expert-only ranks participate in
+//! expert steps through `experts`. These modules are the integration seam
+//! of the capabilities: each owns its runners, its own input preparation
+//! and result materialization. Inputs imported
 //! from other ranks and workers are prepared for every runtime alike
 //! (`inputs`), and products are published to them alike (`products`). A
 //! runtime that has not been integrated reports its call kind as
@@ -14,8 +15,6 @@
 //! the rank serving.
 
 pub(crate) mod batch;
-pub(crate) mod canvas;
-pub(crate) mod experts;
 pub(crate) mod inputs;
 pub(crate) mod launch;
 pub(crate) mod placement;
@@ -113,7 +112,9 @@ pub(crate) fn execute(
         Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
             crate::runner::causal_lm::execute(backend, batch, kind)
         }
-        Forward(ForwardMode::TokenDenoising) => canvas::execute(backend, batch, kind),
+        Forward(ForwardMode::TokenDenoising) => {
+            crate::runner::diffusion_lm::execute(backend, batch, kind)
+        }
         Transfer(_) => transfer::execute(backend, batch, kind),
         Media(MediaReading | VideoEncoding | AudioEncoding | Muxing) => {
             let (plan, borrowed, state) = batch.media_parts();

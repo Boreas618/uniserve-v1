@@ -121,10 +121,7 @@ def test_facts_report_text_geometry_and_formats(loaded):
         {
             "max_sequence_tokens": 64,
             "model_dtype": "bfloat16",
-            "kv_cache_dtype": None,
             "role": "model",
-            "deployment_components": ["model"],
-            "max_condition_rows": 0,
         },
     )
     assert facts["attention_backend"] == "torch"
