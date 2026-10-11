@@ -28,7 +28,7 @@ use std::ops::{Deref, Range};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use uniserve_core::CallId;
-use uniserve_cuda::{CopyBatch, Event, SourceOrder, Stream, memset_d8, memset_d16, memset_d32};
+use uniserve_cuda::{CopyBatch, Event, SourceOrder, Stream};
 use uniserve_ipc::{
     BufferAllocation, BufferId, Call, CallKind, DimBound, FeatureKind, MediaCall, RequestKey,
     TensorExport, TensorRef, TensorTransfer, TransferHandle, subtract_region,
@@ -40,6 +40,7 @@ use super::tensor::{
     Backing, Buffer, Fence, StoreState, TensorImport, TensorRead, WriteState, buffer_key,
 };
 use crate::ffi::{DType, Device};
+use crate::stream::{Fill, Issue};
 use crate::transfer::exports::{self, Location};
 use crate::transfer::{ReadRef, Retirement, Spans, Transports, copy_on_host, copy_planner, fetch};
 use crate::{Error, EventPool, Result};
@@ -500,16 +501,16 @@ impl TensorStore {
     fn producer_fence(
         &self,
         device: Device,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         count: usize,
     ) -> Result<Option<Fence>> {
         let Device::Cuda(index) = device else {
             return Ok(None);
         };
-        let stream = stream.ok_or_else(|| {
+        let producer = stream.stream().ok_or_else(|| {
             Error::Invalid("a device product write requires its producer stream".into())
         })?;
-        if stream.device().0 != index {
+        if producer.device().0 != index {
             return Err(Error::Invalid(
                 "a producer stream is on another device than its product".into(),
             ));
@@ -520,33 +521,34 @@ impl TensorStore {
         }
         Ok(Some(Fence {
             event,
-            stream: stream.raw(),
+            stream: producer.raw(),
         }))
     }
 
     /// Order `stream` after the buffer's producer, once per fence.
     fn wait_producer(
         buffer: &Buffer<ReadRef, Arc<Retirement>>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         waited: &mut HashSet<usize>,
     ) -> Result<()> {
         if let Some(fence) = &buffer.producer {
-            let stream = stream.ok_or_else(|| {
+            let consumer = stream.stream().ok_or_else(|| {
                 Error::Invalid("device product consumption requires its consumer stream".into())
             })?;
-            if waited.insert(Arc::as_ptr(&fence.event) as usize) && stream.raw() != fence.stream {
-                stream.wait_event(&fence.event)?;
+            if waited.insert(Arc::as_ptr(&fence.event) as usize) && consumer.raw() != fence.stream {
+                stream.wait(&fence.event)?;
             }
         }
         Ok(())
     }
 
-    /// Wake the service when a released buffer's fences complete.
-    fn wake_retirement(&self, buffer: &ProductBuffer) -> Result<()> {
+    /// Wake the service when a released buffer's fences complete. `stream`
+    /// is what records the fences that are not recorded yet.
+    fn wake_retirement(&self, buffer: &ProductBuffer, stream: impl Issue) -> Result<()> {
         let events: Vec<_> = lock(buffer).events().cloned().collect();
         for event in events {
             if !event.query()? {
-                self.events.wake_after(&event)?;
+                stream.wake(&self.events, &event)?;
             }
         }
         Ok(())
@@ -554,7 +556,7 @@ impl TensorStore {
 
     /// Wake on retirement and cancel the imports of a never-produced buffer.
     fn retire_buffer(&self, buffer: &ProductBuffer) -> Result<()> {
-        self.wake_retirement(buffer)?;
+        self.wake_retirement(buffer, None::<&Stream>)?;
         let transfers: Vec<_> = {
             let value = lock(buffer);
             if value.state.produced() {
@@ -1084,7 +1086,7 @@ impl TensorStore {
         &self,
         writes: &[ProductBuffer],
         values: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Vec<StorageView>> {
         self.events.reap()?;
         let state = lock(&self.state);
@@ -1129,25 +1131,18 @@ impl TensorStore {
         }
         match first.device() {
             Device::Cuda(_) => {
-                let stream = stream.ok_or_else(|| {
-                    Error::Invalid("a device product write requires its producer stream".into())
-                })?;
+                if stream.stream().is_none() {
+                    return Err(Error::Invalid(
+                        "a device product write requires its producer stream".into(),
+                    ));
+                }
                 // SAFETY: each destination is one reserved element; the
                 // producer keeps its column until its stream passes the copy.
-                unsafe { batch.submit(stream) }?;
+                unsafe { stream.copy(&batch) }?;
             }
-            _ => {
-                for (destination, source, bytes) in batch.iter() {
-                    // SAFETY: host elements of reserved products.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            source as *const u8,
-                            destination as *mut u8,
-                            bytes,
-                        );
-                    }
-                }
-            }
+            // SAFETY: host elements of reserved products, copied in the
+            // producer's order.
+            _ => unsafe { stream.host().copy(&batch) }?,
         }
 
         let fence = self.producer_fence(first.device(), stream, writes.len())?;
@@ -1163,7 +1158,7 @@ impl TensorStore {
         &self,
         buffer: &ProductBuffer,
         value: Scalar,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<StorageView> {
         self.events.reap()?;
         let state = lock(&self.state);
@@ -1176,33 +1171,33 @@ impl TensorStore {
         let view = value_view(&buffer.view(), &[1], 1)?;
         let (bits, width) = scalar_bits(value, view.dtype())?;
         let address = view.address();
+        // An eight-byte element is two words, low word first.
+        let words = [(address, bits as u32), (address + 4, (bits >> 32) as u32)];
+        let fills = words[..width.div_ceil(4)]
+            .iter()
+            .map(|&(address, value)| Fill {
+                address,
+                value,
+                width: width.min(4),
+                count: 1,
+            });
         match view.device() {
             Device::Cuda(_) => {
-                let stream = stream.ok_or_else(|| {
-                    Error::Invalid("a device product write requires its producer stream".into())
-                })?;
-                // SAFETY: one reserved element of `width` bytes on the
-                // stream's device.
-                unsafe {
-                    match width {
-                        1 => memset_d8(address, bits as u8, 1, stream)?,
-                        2 => memset_d16(address, bits as u16, 1, stream)?,
-                        4 => memset_d32(address, bits as u32, 1, stream)?,
-                        _ => {
-                            memset_d32(address, bits as u32, 1, stream)?;
-                            memset_d32(address + 4, (bits >> 32) as u32, 1, stream)?;
-                        }
-                    }
+                if stream.stream().is_none() {
+                    return Err(Error::Invalid(
+                        "a device product write requires its producer stream".into(),
+                    ));
+                }
+                for fill in fills {
+                    // SAFETY: one reserved element of `width` bytes on the
+                    // stream's device.
+                    unsafe { stream.fill(fill) }?;
                 }
             }
             _ => {
-                // SAFETY: one reserved host element of `width` bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bits.to_le_bytes().as_ptr(),
-                        address as *mut u8,
-                        width,
-                    );
+                for fill in fills {
+                    // SAFETY: one reserved host element of `width` bytes.
+                    unsafe { stream.host().fill(fill) }?;
                 }
             }
         }
@@ -1218,7 +1213,7 @@ impl TensorStore {
         &self,
         requests: &[(TensorRef, CallId, Option<Device>)],
         device: Option<Device>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Vec<Arc<ProductRead>>> {
         let state = lock(&self.state);
         let mut resolved = Vec::with_capacity(requests.len());
@@ -1280,7 +1275,7 @@ impl TensorStore {
         reference: &TensorRef,
         consumer: CallId,
         device: Option<Device>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<ProductRead>> {
         let mut reads =
             self.consume_batch(&[(reference.clone(), consumer, device)], None, stream)?;
@@ -1295,7 +1290,7 @@ impl TensorStore {
     pub fn complete_reads(
         &self,
         reads: &[Arc<ProductRead>],
-        stream: Option<&Stream>,
+        stream: impl Issue,
         after_writes: &[ProductBuffer],
     ) -> Result<()> {
         self.events.reap()?;
@@ -1311,8 +1306,8 @@ impl TensorStore {
         for read in &pending {
             let buffer = lock(&read.lease).buffer.clone();
             state.require_buffer(&buffer)?;
-            if let (Some(stream), Device::Cuda(device)) = (stream, read.value.device())
-                && stream.device().0 != device
+            if let (Some(consumer), Device::Cuda(device)) = (stream.stream(), read.value.device())
+                && consumer.device().0 != device
             {
                 return Err(Error::Invariant(
                     "device-product reader completed on a different device".into(),
@@ -1340,7 +1335,7 @@ impl TensorStore {
             let Device::Cuda(device) = read.value.device() else {
                 continue;
             };
-            let stream = stream.ok_or_else(|| {
+            let raw = stream.stream().map(Stream::raw).ok_or_else(|| {
                 Error::Invalid("device product reads complete on their consumer stream".into())
             })?;
             let (buffer, consumer) = {
@@ -1349,7 +1344,7 @@ impl TensorStore {
             };
             let name = lock(&buffer).device.clone();
             let event = consumer
-                .and_then(|consumer| write_fences.get(&(consumer, name, stream.raw())))
+                .and_then(|consumer| write_fences.get(&(consumer, name, raw)))
                 .cloned();
             let event = match event {
                 Some(event) => event,
@@ -1401,7 +1396,7 @@ impl TensorStore {
             read.close()?;
         }
         for buffer in released {
-            self.wake_retirement(&buffer)?;
+            self.wake_retirement(&buffer, stream)?;
         }
         let mut state = lock(&self.state);
         self.reclaim(&mut state)
