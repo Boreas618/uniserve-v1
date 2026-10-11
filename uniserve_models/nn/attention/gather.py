@@ -10,13 +10,13 @@ its block table, positions and query starts
   verification, padded graph buckets). The host supplies only per-row
   scalars, each table's selected page count per row and each token's row,
   packed in one int64 column array (:func:`row_columns_size`).
-- :func:`gather_request_decode_inputs` serves decode rows whose token,
+- :func:`gather_request_decode_inputs` serves decode rows, whose token,
   position and cache length are resident request state: it reads them by
-  request slot and initializes the whole row capacity, so a padded decode
-  graph replays consistent inputs.
+  request slot and initializes padding rows (slot 0), so it can be captured
+  in a decode graph of any row bucket.
 
-Both write disjoint outputs in one launch per call; the row gather also has
-a tensor-operation path for devices where Triton cannot launch.
+Both write disjoint outputs in one launch per call and have a
+tensor-operation path for devices where Triton cannot launch.
 """
 
 from __future__ import annotations
@@ -412,10 +412,10 @@ def row_columns_size(max_rows: int, tables: int, max_tokens: int) -> int:
 
 
 if triton is not None:
-    # Request counts and input widths change during serving. Keeping them as
-    # unspecialized runtime values means an arrival does not load another
-    # kernel variant.
-    @triton.jit(do_not_specialize=["rows", "columns"])
+    # Row counts and input widths change between eager forwards. Keeping
+    # them unspecialized runtime values means another count does not load
+    # another kernel variant; only the power-of-two row block does.
+    @triton.jit(do_not_specialize=["max_rows", "columns"])
     def _gather_request_decode_inputs_kernel(
         request_pool_indices,
         request_unit_tables,
@@ -433,7 +433,6 @@ if triton is not None:
         query_offsets,
         prefix_offsets,
         write_indices,
-        rows,
         unit_table_stride: tl.constexpr,
         unit_row_stride: tl.constexpr,
         request_width: tl.constexpr,
@@ -446,7 +445,7 @@ if triton is not None:
         block_table_row_stride: tl.constexpr,
         start_page_stride: tl.constexpr,
         write_stride: tl.constexpr,
-        max_rows: tl.constexpr,
+        max_rows,
         row_block: tl.constexpr,
         columns,
         block: tl.constexpr,
@@ -456,10 +455,9 @@ if triton is not None:
         Axis 1 of the grid selects the numerical table. On it, program 0
         writes the table's start pages and write addresses, and on table 0
         also every shared per-row scalar column; the other programs copy the
-        table's cells. Their outputs are disjoint, and the only input a
-        program stores to (``request_pool_indices`` past ``rows``, on table
-        0) is never loaded by another program, which reads slots only for
-        live rows, so no global barrier is needed.
+        table's cells. Their outputs are disjoint and no program stores to
+        an input, so no global barrier is needed. A row is live when its
+        slot is not the padding slot 0.
         """
         table = tl.program_id(1)
 
@@ -472,10 +470,10 @@ if triton is not None:
         if tl.program_id(0) == 0:
             offsets = tl.arange(0, row_block)
             scalar_mask = offsets < max_rows
-            live_rows = scalar_mask & (offsets < rows)
             slots = tl.load(
-                request_pool_indices + offsets, mask=live_rows, other=0
+                request_pool_indices + offsets, mask=scalar_mask, other=0
             )
+            live_rows = scalar_mask & (slots != 0)
             cache = tl.load(
                 request_cache_lengths + slots, mask=live_rows, other=0
             )
@@ -526,13 +524,6 @@ if triton is not None:
                     mask=live_rows,
                     other=0,
                 )
-                # Padded rows are redirected to slot 0, the permanent
-                # inactive slot of `BlockTables` and `DecodeState`.
-                tl.store(
-                    request_pool_indices + offsets,
-                    0,
-                    mask=scalar_mask & ~live_rows,
-                )
                 tl.store(input_ids + offsets, tokens, mask=scalar_mask)
 
                 # Only the first axis carries the token position; the
@@ -570,14 +561,14 @@ if triton is not None:
             table_mask = table_offsets < table_elements
             table_rows = table_offsets // columns
             cells = table_offsets - table_rows * columns
-            live_table = table_mask & (table_rows < rows)
             # Names differ from the scalar branch's: Triton requires a name
             # bound in both branches of a runtime condition to keep one type.
             table_slots = tl.load(
                 request_pool_indices + table_rows,
-                mask=live_table,
+                mask=table_mask,
                 other=0,
             )
+            live_table = table_mask & (table_slots != 0)
             cell_cache = tl.load(
                 request_cache_lengths + table_slots, mask=live_table, other=0
             )
@@ -607,6 +598,74 @@ if triton is not None:
             )
 
 
+def _gather_decode_inputs(
+    request_pool_indices,
+    request_unit_tables,
+    request_start_pages,
+    table_shapes,
+    request_cache_lengths,
+    request_tokens,
+    request_positions,
+    input_ids,
+    positions,
+    block_tables,
+    start_pages,
+    cache_lengths,
+    query_lengths,
+    query_offsets,
+    prefix_offsets,
+    write_indices,
+    *,
+    columns,
+):
+    """Compute the decode kernel's outputs with tensor operations."""
+    slots = request_pool_indices
+    rows = int(slots.numel())
+    live = slots != 0
+    request_width = int(request_unit_tables.shape[2])
+    cache = torch.where(live, request_cache_lengths[slots].to(torch.int64), 0)
+    cells = torch.arange(columns, device=slots.device)
+
+    for table, (group, page_tokens, window) in enumerate(table_shapes.tolist()):
+        installed = torch.where(
+            live, request_start_pages[group, slots].to(torch.int64), 0
+        )
+        first = (
+            (cache - window).clamp(min=0) // page_tokens
+            if window >= 0
+            else torch.zeros_like(cache)
+        )
+        start_pages[table, :rows] = first
+
+        # Cache length identifies the append page and its token offset.
+        column = cache // page_tokens - installed
+        appendable = live & (column >= 0) & (column < request_width)
+        unit = request_unit_tables[
+            table, slots, column.clamp(0, request_width - 1)
+        ].to(torch.int64)
+        write_indices[table, :rows] = torch.where(
+            appendable & (unit >= 0),
+            unit * page_tokens + cache % page_tokens,
+            -1,
+        )
+
+        source = (first - installed)[:, None] + cells[None]
+        selected = live[:, None] & (source >= 0) & (source < request_width)
+        units = request_unit_tables[
+            table, slots[:, None], source.clamp(0, request_width - 1)
+        ]
+        block_tables[table, :rows, :columns] = torch.where(selected, units, 0)
+
+    input_ids[:rows] = torch.where(live, request_tokens[slots], 1)
+    positions[:, :rows] = 0
+    positions[0, :rows] = torch.where(live, request_positions[slots], 0)
+    cache_lengths[:rows] = cache
+    query_lengths[:rows] = 1
+    query_offsets[: rows + 1] = torch.arange(rows + 1, device=slots.device)
+    prefix_offsets[0] = 0
+    prefix_offsets[1 : rows + 1] = torch.cumsum(cache, dim=0)
+
+
 def gather_request_decode_inputs(
     *,
     request_pool_indices: torch.Tensor,
@@ -625,12 +684,15 @@ def gather_request_decode_inputs(
     query_offsets: torch.Tensor,
     prefix_offsets: torch.Tensor,
     write_indices: torch.Tensor,
-    rows: int,
     columns: int,
 ) -> None:
-    """Gather live request state into fixed-capacity decode buffers in place.
+    """Gather request state into fixed-capacity decode buffers in place.
 
-    ``request_pool_indices[:rows]`` identifies scheduler-owned request slots.
+    Each element of ``request_pool_indices`` is one decode row's
+    scheduler-owned request slot; slot 0 is the padding slot, and a row
+    naming it is padding. Every value the function reads is the contents of
+    a tensor, so a captured graph of it serves any rows of its shape.
+
     The function materializes, for every numerical table ``t`` described by
     ``table_shapes[t] = (group, page_tokens, window or -1)``, the slots'
     units from their first selected page into ``block_tables[t]``, that page
@@ -641,13 +703,12 @@ def gather_request_decode_inputs(
     ``max(0, cache - window) // page_tokens``; of a full table, page zero.
     ``request_unit_tables[t, slot]`` holds the slot's units from its
     installed start page ``request_start_pages[group, slot]`` on. Each table
-    writes ``columns`` cells per row. Output rows beyond ``rows`` are
-    initialized for safe fixed-shape graph replay: token id 1, zero
-    positions, cache length and start page, one query token, a zeroed table
-    row, and the write-index sentinel -1. The function also overwrites
-    ``request_pool_indices[rows:]`` with slot 0.
+    writes ``columns`` cells per row. Padding rows are initialized for a
+    fixed-shape forward: token id 1, zero positions, cache length and start
+    page, one query token, a zeroed table row, and the write-index sentinel
+    -1.
 
-    Every tensor must reside on the same CUDA device. The kernel honors the
+    Every tensor must reside on the same device. The kernel honors the
     table and slot strides of ``request_unit_tables``, the group stride of
     ``request_start_pages``, the first-axis strides of ``request_tokens`` and
     ``request_positions``, the table and row strides of ``block_tables``, the
@@ -657,16 +718,13 @@ def gather_request_decode_inputs(
     tables.
 
     Raises:
-        ValueError: When the tensors are not on one CUDA device, ``rows`` is
-            outside ``[1, request_pool_indices.numel()]``, a table has the
-            wrong rank, count or capacity, ``columns`` is not positive,
-            ``positions`` is not one or three unit-stride axes, or an output
-            buffer is smaller than the capacity requires.
-        RuntimeError: When Triton is unavailable or cannot launch on the
-            device.
+        ValueError: When the tensors are not on one device, there is no
+            row, a table has the wrong rank, count or capacity, ``columns``
+            is not positive, ``positions`` is not one or three unit-stride
+            axes, or an output buffer is smaller than the rows require.
     """
     # The fused kernel dereferences every tensor directly, so all must share
-    # one CUDA device. All validation precedes the launch, so a rejected call
+    # one device. All validation precedes the launch, so a rejected call
     # writes nothing.
     tensors = (
         request_pool_indices,
@@ -687,21 +745,13 @@ def gather_request_decode_inputs(
         write_indices,
     )
     device = request_pool_indices.device
-    if device.type != "cuda" or any(
-        value.device != device for value in tensors
-    ):
-        raise ValueError("request-indexed decode requires one CUDA device")
-    if triton is None or not launchable(device):
-        raise RuntimeError("request-indexed decode requires Triton")
+    if any(value.device != device for value in tensors):
+        raise ValueError("request-indexed decode requires one device")
 
-    # ``request_pool_indices`` defines scalar output capacity; ``rows`` selects
-    # the live prefix populated from request-owned state.
-    row_count = int(rows)
+    # ``request_pool_indices`` defines the rows every output holds.
     max_rows = int(request_pool_indices.numel())
-    if row_count < 1 or row_count > max_rows:
-        raise ValueError(
-            "request-indexed decode row count exceeds buffer capacity"
-        )
+    if max_rows < 1:
+        raise ValueError("request-indexed decode requires a row")
     if (
         request_unit_tables.ndim != 3
         or request_start_pages.ndim != 2
@@ -749,6 +799,10 @@ def gather_request_decode_inputs(
     if min(query_offsets.numel(), prefix_offsets.numel()) < max_rows + 1:
         raise ValueError("request-indexed decode offset buffers are undersized")
 
+    if triton is None or device.type != "cuda" or not launchable(device):
+        _gather_decode_inputs(*tensors, columns=int(columns))
+        return
+
     # Per table, one program produces the scalar columns over a power-of-two
     # row block (``tl.arange`` extents must be powers of two) masked to
     # ``max_rows``; the remaining programs copy ``block`` table cells each.
@@ -756,7 +810,6 @@ def gather_request_decode_inputs(
     grid = (1 + triton.cdiv(max_rows * int(columns), block), tables)
     _gather_request_decode_inputs_kernel[grid](
         *tensors,
-        rows=row_count,
         unit_table_stride=int(request_unit_tables.stride(0)),
         unit_row_stride=int(request_unit_tables.stride(1)),
         request_width=int(request_unit_tables.shape[2]),

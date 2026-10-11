@@ -11,7 +11,7 @@ use uniserve_ipc::{Call, CallKind, DType, ForwardMode};
 use super::context::Media;
 use crate::executor::PendingOutput;
 use crate::runner::TokenSelection;
-use crate::runner::text::{RowSource, TokenRow};
+use crate::runner::text::{COMMIT_CACHE as CACHE, FINISH_IDS, RowSource, TokenRow};
 use crate::sampling::SamplingMetadata;
 use crate::storage::BlockTables;
 use crate::{Error, Result};
@@ -20,7 +20,6 @@ use crate::{Error, Result};
 pub(super) const DECODE: i64 = 0;
 pub(super) const EXPLICIT: i64 = 1;
 pub(super) const VERIFY: i64 = 2;
-pub(super) const CACHE: i64 = 3;
 
 /// A call's input row and how it uses the row's logits.
 pub(super) struct Prepared {
@@ -57,16 +56,15 @@ pub(super) fn parameters(admission: &uniserve_ipc::NewRequest) -> Result<&Sampli
 
 /// Build a call's input row.
 ///
-/// `indexed` reports whether the runner gathers decode rows from slot state
-/// on the device. A decode or verification gated by a relayed token reads
-/// that token from the slot state instead of a host token.
+/// A decode gated by a relayed token reads its token, position and cache
+/// length from the slot state; a verification gated by one reads that token
+/// from the slot state instead of a host token.
 pub(super) fn prepare(
     call: &Call,
     output: &PendingOutput,
     params: &SamplingParams,
     slot: u32,
     tables: &BlockTables,
-    indexed: bool,
 ) -> Result<Prepared> {
     let mode = kind(call)?;
     let decode = mode == ForwardMode::Decode;
@@ -77,7 +75,7 @@ pub(super) fn prepare(
         .predicate
         .as_ref()
         .is_some_and(|predicate| predicate.dtype == DType::I64);
-    let indexed = decode && indexed && tagged;
+    let indexed = decode && tagged;
     let relay = call.predicate.is_some()
         && !indexed
         && (decode || verify || call.input_token_ids.is_empty());
@@ -125,7 +123,7 @@ pub(super) fn prepare(
     let query = match &source {
         RowSource::Host { tokens, .. } | RowSource::Placed { tokens, .. } => tokens.len(),
         RowSource::Relay { drafts, .. } => drafts.len() + 1,
-        RowSource::Resident | RowSource::Indexed => 1,
+        RowSource::Indexed => 1,
     };
     let first = usize::from(call.predicate.is_none());
     let drafts = if verify {
@@ -305,19 +303,22 @@ pub(super) fn finish(
     }
 }
 
-/// Whether every call of a decode invocation can use the decode body's
-/// greedy selections: unshaped greedy sampling without host masks, a relayed
-/// continuation gate, a token relay output and no transition output.
+/// Whether a decode call can use the decode forward's greedy selection:
+/// unshaped greedy sampling without host masks, finish tokens the forward
+/// reads (`finish`, at most [`FINISH_IDS`]), a relayed continuation gate, a
+/// token relay output and no transition output.
 pub(super) fn greedy_eligible(
     call: &Call,
     params: &SamplingParams,
     prepared: &Prepared,
+    finish: &[u32],
     token_output: bool,
     transition_output: bool,
 ) -> bool {
     let state = call.sampling_state.as_ref();
     call.code == CallKind::Forward(ForwardMode::Decode)
         && params.device_greedy()
+        && finish.len() <= FINISH_IDS
         && params.allowed_token_ids.is_none()
         && params.forced_token_ids.is_empty()
         && !state.is_some_and(|state| {

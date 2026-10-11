@@ -1,27 +1,32 @@
-//! Text invocations of a causal language model on one lane binding.
+//! Text forwards of a causal language model on one lane binding.
 //!
-//! A [`TextRunner`] owns one binding's fixed columns ([`TextBuffers`]), its
-//! graph shapes and captured graphs, and the typed Python steps
-//! ([`TextModel`]). Per invocation it:
+//! A [`TextRunner`] owns one binding's input and output tensors
+//! ([`TextBuffers`]), its graph shapes and captured graphs, and the Python
+//! runner ([`Methods`]). Per forward it:
 //!
 //! 1. resolves the rows' attention pages against the installed block tables
 //!    (checking every write against the cache's live accesses);
-//! 2. selects an eager run, a resident graph (replay) or, before the rank is
-//!    sealed, a graph to capture;
-//! 3. packs the rows' host columns, including graph padding, and copies
-//!    them to the device in one batched copy on the lane stream, followed by
-//!    device copies of relayed tokens and positions from the slot state;
-//! 4. calls the binding's `step` once.
+//! 2. selects an eager run, a resident graph or, before the rank is sealed,
+//!    a graph to capture;
+//! 3. writes the forward's inputs on the lane stream in one batched copy;
+//! 4. launches the graph, or calls the runner method.
 //!
-//! Rows are packed in order. Graph padding follows the captured shapes:
-//! decode buckets pad with inert one-token rows of slot 0; prefill buckets
-//! add one sequence holding every padding token, then empty sequences. Inert
-//! rows never write K/V (their write addresses are -1).
+//! A decode forward evaluates one token per row from the slot state: its
+//! inputs are each row's slot, forced-finish flag and finish tokens, and a
+//! row whose token comes from the host has it written to its slot first.
+//! Its graph gathers, runs the model and selects greedily, so a launch runs
+//! no Python; rows that sample then run the runner's `sample`. A decode
+//! bucket pads with rows of slot 0. A prefill forward packs its rows' host
+//! columns; its buckets add one sequence holding every padding token, then
+//! empty sequences. Padding rows never write K/V (their write addresses are
+//! -1).
 
 pub(crate) mod buffers;
+pub(crate) mod methods;
 pub(crate) mod rows;
 
-pub(crate) use buffers::{Dimensions, TextBuffers};
+pub(crate) use buffers::{Dimensions, FINISH_IDS, TextBuffers};
+pub(crate) use methods::{Construction, Methods};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
 
 use std::sync::Arc;
@@ -29,9 +34,9 @@ use std::sync::Arc;
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
 use super::{TextShapes, TokenSelection};
-use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
-use crate::ffi::{DType, DeferredCall, Handle};
-use crate::model::text::{CaptureArgs, StepArgs, TextModel};
+use crate::cuda_graph::{CUDAGraph, GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
+use crate::ffi::{DType, Handle};
+use crate::parallel::MicrobatchCall;
 use crate::request::decode_state::DecodeState;
 use crate::storage::memory::StorageView;
 use crate::storage::{AttentionRow, BlockTables, KVCacheManager};
@@ -39,6 +44,11 @@ use crate::transfer::Retirement;
 use crate::{Error, Result};
 
 use buffers::ROW_SECTIONS;
+use methods::{Argument, MethodCall};
+
+/// The commit mode of a row that only sets its slot's cache length
+/// (`uniserve_models.sampling.state.CACHE`).
+pub(crate) const COMMIT_CACHE: i64 = 3;
 
 /// A numerical block table's page layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,15 +57,21 @@ pub(crate) struct TableShape {
     pub(crate) windowed: bool,
 }
 
-/// What a captured text graph depends on besides the runner's fixed table
-/// widths: the decode or prefill body, the bucket and whether a prefill
-/// family computes hidden outputs.
+/// What identifies a captured text graph besides the runner's fixed table
+/// widths and tensors: the method and its scalar arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct TextGraphKey {
-    pub(crate) decode: bool,
-    pub(crate) rows: usize,
-    pub(crate) tokens: usize,
-    pub(crate) outputs: bool,
+pub(crate) enum TextGraphKey {
+    /// `decode` of a row bucket.
+    Decode { rows: usize },
+    /// The model forward of a prefill bucket, with hidden outputs or
+    /// writing only the prefix cache.
+    Prefill {
+        rows: usize,
+        tokens: usize,
+        outputs: bool,
+    },
+    /// `commit` of a row bucket.
+    Commit { rows: usize },
 }
 
 /// The sampling inputs of one invocation (see `crate::sampling::plan`).
@@ -69,8 +85,6 @@ pub(crate) struct SamplingColumns<'a> {
     /// Each task's slot, then each task's gate (1 when gated).
     pub(crate) slots: &'a [i64],
     pub(crate) gates: &'a [i64],
-    /// A decode graph's greedy selections are final.
-    pub(crate) greedy: bool,
 }
 
 /// Precomputed embeddings replacing the token embeddings of consecutive
@@ -86,6 +100,12 @@ pub(crate) struct Embeddings {
 pub(crate) struct StepRequest<'a> {
     pub(crate) decode: bool,
     pub(crate) rows: &'a [TokenRow],
+    /// Each decode row's finish tokens, padded with -1; a row beyond the
+    /// slice has none. A decode forward without `sampling` selects with
+    /// them.
+    pub(crate) finish_ids: &'a [[i64; FINISH_IDS]],
+    /// The tasks the runner's `sample` selects; absent when no row samples
+    /// or a decode forward's greedy selections are final.
     pub(crate) sampling: Option<SamplingColumns<'a>>,
     /// The prompt scoring descriptor; empty when no row scores its prompt.
     pub(crate) prompt: &'a [i64],
@@ -115,42 +135,45 @@ enum Choice {
     Graph(TextGraphKey),
 }
 
-/// A planned invocation whose host columns are staged on the runner's
-/// stream, awaiting its expert step capacity.
+/// A planned forward whose inputs are written on the runner's stream,
+/// awaiting its expert step capacity.
 pub(crate) struct Staged {
     plan: Plan,
+    /// The sampling descriptor; empty when no row samples.
     sampling: Vec<i64>,
-    greedy: bool,
     prompt: Vec<i64>,
     /// Vision features replace some of the tokens' embeddings.
     embedded: bool,
 }
 
 impl Staged {
-    /// Tokens the invocation sends to each expert layer: its graph's padded
+    /// Tokens the forward sends to each expert layer: its graph's padded
     /// tokens, or its live tokens when it runs eagerly.
     pub(crate) fn expert_tokens(&self) -> usize {
         self.plan.tokens
     }
 }
 
-/// A staged invocation's numerical call at its expert capacity.
+/// A staged forward's numerical work at its expert capacity.
 pub(crate) struct Launch {
     pub(crate) mode: GraphMode,
-    /// The step: an eager forward (a capture's warmup included) or a graph
-    /// replay. Submitted from the lane's execution thread, or from a
-    /// microbatch thread in its turn of an expert step.
-    pub(crate) call: DeferredCall,
+    /// The forward: a graph launch, or the runner method (also a capture's
+    /// warmup), then `sample` for rows that sample. Run on the lane's
+    /// execution thread, or on a microbatch thread in its turn of an expert
+    /// step.
+    pub(crate) call: MicrobatchCall<()>,
+    /// The call enters Python for the model forward, which passes the host
+    /// turn at its expert dispatch points.
+    pub(crate) yields: bool,
 }
 
-/// One planned invocation: its shapes and host columns.
+/// One planned forward: its shapes and host columns.
 struct Plan {
     decode: bool,
     live: usize,
     rows: usize,
     live_tokens: usize,
     tokens: usize,
-    indexed: bool,
     widths: Vec<i64>,
     queries: Vec<i64>,
     prefixes: Vec<i64>,
@@ -163,22 +186,33 @@ struct Plan {
     all_last: bool,
     cache_only: bool,
     choice: Choice,
-    /// Host column words of the row gather (absent for indexed decode).
+    /// Host column words of the row gather (absent for decode).
     row_columns: Vec<i64>,
     token_ids: Vec<i64>,
     positions: Vec<i64>,
     slots: Vec<i64>,
     force: Vec<u8>,
+    /// `[rows, FINISH_IDS]` finish tokens of a decode, padded with -1.
+    finish_ids: Vec<i64>,
     logit_rows: Vec<i64>,
-    /// `(token offset, slot, position from state)` device copies.
-    relays: Vec<(usize, u32, bool)>,
+    /// `(token offset, slot)` device copies of a prefill row's first token
+    /// from its slot's next input token.
+    relays: Vec<(usize, u32)>,
+    /// Slot state a decode row's host source supplies: `(address, value)`
+    /// of a next input token or a logical position.
+    slot_words: Vec<(u64, i64)>,
 }
 
 /// One lane binding of a causal language model.
 pub(crate) struct TextRunner {
     device: Option<i32>,
     stream: Option<Stream>,
-    model: TextModel,
+    methods: Methods,
+    /// An attention operator plans each launch on the host.
+    plans_attention: bool,
+    /// Where the distributed expert weights note the copies a captured
+    /// forward performs between its segments.
+    breaks: Option<GraphBreaks>,
     buffers: TextBuffers,
     tables: Vec<TableShape>,
     /// Configured per-table widths every graph addresses.
@@ -186,7 +220,6 @@ pub(crate) struct TextRunner {
     shapes: TextShapes,
     graphs: GraphTable<TextGraphKey>,
     pool: Option<Handle>,
-    indexed: bool,
 }
 
 /// What the runner is built from.
@@ -195,7 +228,9 @@ pub(crate) struct RunnerParts {
     pub(crate) component: String,
     pub(crate) device: Option<i32>,
     pub(crate) stream: Option<Stream>,
-    pub(crate) model: TextModel,
+    pub(crate) methods: Methods,
+    pub(crate) plans_attention: bool,
+    pub(crate) breaks: Option<GraphBreaks>,
     pub(crate) buffers: TextBuffers,
     pub(crate) tables: Vec<TableShape>,
     pub(crate) widths: Vec<i64>,
@@ -206,22 +241,22 @@ pub(crate) struct RunnerParts {
 
 impl TextRunner {
     pub(crate) fn new(parts: RunnerParts) -> Self {
-        let indexed = parts.device.is_some();
         let graphs = GraphTable::new(
             format!("text runner of {}", parts.component),
-            parts.model.release().clone(),
+            parts.methods.graphs.release.clone(),
         );
         Self {
             device: parts.device,
             stream: parts.stream,
-            model: parts.model,
+            methods: parts.methods,
+            plans_attention: parts.plans_attention,
+            breaks: parts.breaks,
             buffers: parts.buffers,
             tables: parts.tables,
             widths: parts.widths,
             shapes: parts.shapes,
             graphs,
             pool: parts.pool,
-            indexed,
         }
     }
 
@@ -246,11 +281,6 @@ impl TextRunner {
         self.buffers.dimensions
     }
 
-    /// Decode rows of this runner can gather their inputs from slot state.
-    pub(crate) fn indexed(&self) -> bool {
-        self.indexed
-    }
-
     pub(crate) fn column(&self, name: &str) -> Result<&StorageView> {
         self.buffers.column(name)
     }
@@ -265,7 +295,7 @@ impl TextRunner {
         self.graphs.seal();
     }
 
-    /// Plan `request` and stage its host columns on the runner's stream.
+    /// Plan `request` and write its inputs on the runner's stream.
     pub(crate) fn stage(
         &self,
         request: &StepRequest<'_>,
@@ -273,71 +303,238 @@ impl TextRunner {
     ) -> Result<Staged> {
         let plan = self.plan(request, context)?;
         self.copy_columns(&plan, request, context.state)?;
-        let (sampling, greedy) = match &request.sampling {
-            Some(sampling) => (sampling.words.to_vec(), sampling.greedy),
-            None => (Vec::new(), false),
-        };
         Ok(Staged {
             plan,
-            sampling,
-            greedy,
+            sampling: request
+                .sampling
+                .as_ref()
+                .map_or_else(Vec::new, |sampling| sampling.words.to_vec()),
             prompt: request.prompt.to_vec(),
             embedded: !request.embeddings.is_empty(),
         })
     }
 
-    /// The numerical call of a staged invocation at `capacity`: a replay
-    /// of the resident graph variant, or an eager forward (also the warmup
-    /// of a capture [`Self::finish`] then records). Without `replay`, a
-    /// resident graph's shapes run eagerly instead.
+    /// The columns `names` as method arguments, in order.
+    fn tensors(&self, names: &[&str]) -> Result<Vec<Argument>> {
+        names
+            .iter()
+            .map(|name| self.buffers.column(name).map(Argument::from))
+            .collect()
+    }
+
+    /// An optional column as a method argument.
+    fn optional(&self, name: &str) -> Argument {
+        self.buffers
+            .column(name)
+            .map_or(Argument::None, Argument::from)
+    }
+
+    /// The runner's `decode` of `plan` at `capacity`.
+    fn decode(&self, plan: &Plan, capacity: Option<usize>) -> Result<MethodCall> {
+        let mut arguments = vec![
+            plan.rows.into(),
+            plan.widths.as_slice().into(),
+            plan.prefixes.as_slice().into(),
+            plan.starts.as_slice().into(),
+            capacity.unwrap_or(0).into(),
+        ];
+        arguments.extend(self.tensors(&[
+            "request_pool_indices",
+            "decode_force_finish",
+            "finish_ids",
+            "logits",
+            "completion",
+            "continuation",
+            "tagged",
+            "points",
+            "transition",
+        ])?);
+        Ok(self.methods.call(&self.methods.decode, arguments))
+    }
+
+    /// The runner's `plan_decode` of `plan`.
+    fn plan_decode(&self, plan: &Plan) -> Result<MethodCall> {
+        let mut arguments = vec![
+            plan.rows.into(),
+            plan.widths.as_slice().into(),
+            plan.prefixes.as_slice().into(),
+            plan.starts.as_slice().into(),
+        ];
+        arguments.extend(self.tensors(&["request_pool_indices"])?);
+        Ok(self.methods.call(&self.methods.plan_decode, arguments))
+    }
+
+    /// The runner's `sample` of a decode's `rows` candidate rows.
+    fn sample(&self, rows: usize, words: &[i64]) -> Result<MethodCall> {
+        let mut arguments = vec![rows.into(), words.into()];
+        arguments.extend(self.tensors(&[
+            "logits",
+            "draws",
+            "params",
+            "tasks",
+            "completion",
+            "continuation",
+            "tagged",
+            "points",
+            "transition",
+            "logprobs",
+        ])?);
+        Ok(self.methods.call(&self.methods.sample, arguments))
+    }
+
+    /// The runner's `prefill` of a staged forward, replaying `graph` for
+    /// its model forward when given.
+    fn prefill(
+        &self,
+        staged: &Staged,
+        graph: Option<&CUDAGraph>,
+        capacity: Option<usize>,
+    ) -> Result<MethodCall> {
+        let plan = &staged.plan;
+        let mut arguments = vec![
+            graph.map_or(Argument::None, |graph| {
+                Argument::Handle(graph.handle().clone())
+            }),
+            plan.rows.into(),
+            plan.live.into(),
+            plan.tokens.into(),
+            plan.widths.as_slice().into(),
+            plan.queries.as_slice().into(),
+            plan.prefixes.as_slice().into(),
+            plan.starts.as_slice().into(),
+            plan.causal.as_slice().into(),
+            plan.logit_count.into(),
+            plan.all_last.into(),
+            plan.cache_only.into(),
+            staged.sampling.as_slice().into(),
+            staged.prompt.as_slice().into(),
+            plan.axes.into(),
+            staged.embedded.into(),
+            capacity.unwrap_or(0).into(),
+        ];
+        arguments.extend(self.tensors(&[
+            "row_columns",
+            "input_ids",
+            "positions",
+            "causal_values",
+            "logit_rows",
+        ])?);
+        arguments.extend(
+            ["input_embeddings", "embedding_mask", "hidden"].map(|name| self.optional(name)),
+        );
+        arguments.extend(self.tensors(&[
+            "logits",
+            "draws",
+            "params",
+            "tasks",
+            "completion",
+            "continuation",
+            "tagged",
+            "points",
+            "transition",
+            "logprobs",
+            "prompt_tail",
+        ])?);
+        Ok(self.methods.call(&self.methods.prefill, arguments))
+    }
+
+    /// The numerical work of a staged forward at `capacity`: the launch of
+    /// its resident graph, or the eager method (also the warmup of a
+    /// capture [`Self::finish`] then records). Without `launch`, a resident
+    /// graph's shapes run eagerly instead.
     pub(crate) fn launch(
         &self,
         staged: &Staged,
         capacity: Option<usize>,
-        replay: bool,
+        launch: bool,
     ) -> Result<Launch> {
         let (mode, graph) = match &staged.plan.choice {
             Choice::Eager => (GraphMode::Eager, None),
             Choice::Graph(key) => match self.graphs.lookup(key, capacity)? {
-                Lookup::Replay(graph) if replay => {
-                    (GraphMode::Replay, Some(graph.handle().clone()))
-                }
+                Lookup::Replay(graph) if launch => (GraphMode::Replay, Some(graph.clone())),
                 Lookup::Replay(_) => (GraphMode::Eager, None),
                 // The eager run is the capture's warmup and produces this
-                // invocation's results; capture records without executing.
+                // forward's results; capture records without executing.
                 Lookup::Capture => (GraphMode::Capture, None),
             },
         };
         let plan = &staged.plan;
-        let call = self.model.step_call(
-            &StepArgs {
-                graph: graph.as_ref(),
-                decode: plan.decode,
-                rows: plan.rows,
-                live: plan.live,
-                tokens: plan.tokens,
-                indexed: plan.indexed,
-                widths: &plan.widths,
-                queries: &plan.queries,
-                prefixes: &plan.prefixes,
-                starts: &plan.starts,
-                causal: &plan.causal,
-                writes: true,
-                logit_count: plan.logit_count,
-                all_last: plan.all_last,
-                cache_only: plan.cache_only,
-                sampling: &staged.sampling,
-                greedy: staged.greedy,
-                prompt: &staged.prompt,
-                axes: plan.axes,
-                embedded: staged.embedded,
-            },
-            capacity.unwrap_or(0),
-        );
-        Ok(Launch { mode, call })
+        if !plan.decode {
+            let call = self.prefill(staged, graph.as_ref(), capacity)?;
+            return Ok(Launch {
+                mode,
+                call: Box::new(move || call.invoke().map(drop)),
+                yields: mode != GraphMode::Replay,
+            });
+        }
+
+        // Rows that sample select from the logits the forward wrote.
+        let sample = if staged.sampling.is_empty() {
+            None
+        } else {
+            Some(self.sample(plan.live, &staged.sampling)?)
+        };
+        let sample = move || sample.map_or(Ok(()), |call| call.invoke().map(drop));
+        match graph {
+            Some(graph) => {
+                let stream = self
+                    .stream
+                    .clone()
+                    .ok_or(Error::State("a graph is launched on a CUDA stream"))?;
+                let planned = self
+                    .plans_attention
+                    .then(|| self.plan_decode(plan))
+                    .transpose()?;
+                Ok(Launch {
+                    mode,
+                    call: Box::new(move || {
+                        if let Some(call) = planned {
+                            call.invoke()?;
+                        }
+                        graph.launch(&stream)?;
+                        sample()
+                    }),
+                    yields: false,
+                })
+            }
+            None => {
+                let call = self.decode(plan, capacity)?;
+                Ok(Launch {
+                    mode,
+                    call: Box::new(move || {
+                        call.invoke()?;
+                        sample()
+                    }),
+                    yields: true,
+                })
+            }
+        }
     }
 
-    /// Complete an invocation whose call ran: capture its graph after the
+    /// Capture whatever `method` enqueues on the runner's stream as one
+    /// graph in the runner's pool.
+    fn capture(&self, method: MethodCall) -> Result<CUDAGraph> {
+        let (Some(pool), Some(stream), Some(device)) = (&self.pool, &self.stream, self.device)
+        else {
+            return Err(Error::State(
+                "graph capture requires a graph pool on a CUDA stream",
+            ));
+        };
+        let captured = self
+            .methods
+            .graphs
+            .capture(pool, stream.raw(), device, || method.invoke().map(drop));
+
+        // The breaks the forward reached belong to this capture, whether or
+        // not it succeeded.
+        let breaks = self
+            .breaks
+            .as_ref()
+            .map_or_else(Vec::new, GraphBreaks::take);
+        Ok(captured?.with_breaks(breaks))
+    }
+
+    /// Complete a forward whose call ran: capture its graph after the
     /// eager warmup when its launch chose capture, and count the mode.
     /// Capture submits no device work and no communication.
     pub(crate) fn finish(
@@ -346,30 +543,42 @@ impl TextRunner {
         capacity: Option<usize>,
         mode: GraphMode,
     ) -> Result<Executed> {
-        let plan = staged.plan;
+        let plan = &staged.plan;
         if mode == GraphMode::Capture
             && let Choice::Graph(key) = &plan.choice
         {
-            let pool = self
-                .pool
-                .as_ref()
-                .ok_or(Error::State("graph capture requires a graph pool"))?;
-            let graph = self.model.capture(
-                &CaptureArgs {
-                    decode: plan.decode,
-                    rows: plan.rows,
-                    tokens: plan.tokens,
-                    widths: &plan.widths,
-                    queries: &plan.queries,
-                    prefixes: &plan.prefixes,
-                    starts: &plan.starts,
-                    causal: &plan.causal,
-                    writes: true,
-                    cache_only: plan.cache_only && !key.outputs,
-                },
-                pool,
-                capacity.unwrap_or(0),
-            )?;
+            let graph = match key {
+                TextGraphKey::Prefill { outputs, .. } => {
+                    let pool = self
+                        .pool
+                        .as_ref()
+                        .ok_or(Error::State("graph capture requires a graph pool"))?;
+                    let mut arguments = vec![
+                        plan.rows.into(),
+                        plan.tokens.into(),
+                        plan.widths.as_slice().into(),
+                        plan.queries.as_slice().into(),
+                        plan.prefixes.as_slice().into(),
+                        plan.starts.as_slice().into(),
+                        plan.causal.as_slice().into(),
+                        (plan.cache_only && !outputs).into(),
+                        Argument::Handle(pool.clone()),
+                        capacity.unwrap_or(0).into(),
+                    ];
+                    arguments.extend(self.tensors(&["input_ids", "positions", "causal_values"])?);
+                    arguments.push(self.optional("hidden"));
+                    CUDAGraph::captured(
+                        self.methods
+                            .call(&self.methods.capture_prefill, arguments)
+                            .invoke()?,
+                    )?
+                }
+                _ => {
+                    // The plans a capture reads are built outside it.
+                    self.plan_decode(plan)?.invoke()?;
+                    self.capture(self.decode(plan, capacity)?)?
+                }
+            };
             self.graphs.insert(key.clone(), capacity, graph)?;
         }
         self.graphs.record(mode);
@@ -430,7 +639,6 @@ impl TextRunner {
             ));
         }
 
-        let indexed = self.indexed && rows.iter().all(|row| row.source == RowSource::Indexed);
         let cache_only = rows
             .iter()
             .all(|row| row.selection == TokenSelection::Cache);
@@ -465,11 +673,14 @@ impl TextRunner {
                 last_logits,
                 cache_only,
             )? {
-                choice = Choice::Graph(TextGraphKey {
-                    decode,
-                    rows: bucket_rows,
-                    tokens: bucket_tokens,
-                    outputs,
+                choice = Choice::Graph(if decode {
+                    TextGraphKey::Decode { rows: bucket_rows }
+                } else {
+                    TextGraphKey::Prefill {
+                        rows: bucket_rows,
+                        tokens: bucket_tokens,
+                        outputs,
+                    }
                 });
                 bucket = (bucket_rows, bucket_tokens);
             }
@@ -494,7 +705,7 @@ impl TextRunner {
                     )));
                 }
                 configured
-            } else if indexed {
+            } else if request.decode {
                 live_width.next_power_of_two().min(dimensions.width)
             } else {
                 live_width
@@ -513,7 +724,6 @@ impl TextRunner {
         // then empty sequences.
         let mut queries: Vec<i64> = rows.iter().map(|row| i64::from(row.query)).collect();
         let mut prefixes: Vec<i64> = rows.iter().map(|row| i64::from(row.prefix)).collect();
-        let mut writes = vec![1_i64; live];
         let mut slots: Vec<i64> = rows.iter().map(|row| i64::from(row.slot)).collect();
         if padded_rows > live {
             if request.decode {
@@ -523,7 +733,6 @@ impl TextRunner {
                 queries.resize(padded_rows, 0);
             }
             prefixes.resize(padded_rows, 0);
-            writes.resize(padded_rows, 0);
             slots.resize(padded_rows, 0);
         } else if padded_tokens > live_tokens {
             return Err(Error::Invariant(
@@ -550,13 +759,40 @@ impl TextRunner {
             .collect();
         force.resize(padded_rows, 0);
 
+        // A decode reads its rows from the slot state: a row whose token or
+        // position comes from the host has it written to its slot.
+        let mut finish_ids = Vec::new();
+        let mut slot_words = Vec::new();
+        if request.decode {
+            finish_ids = vec![-1_i64; padded_rows * FINISH_IDS];
+            for (row, ids) in request.finish_ids.iter().enumerate() {
+                finish_ids[row * FINISH_IDS..][..FINISH_IDS].copy_from_slice(ids);
+            }
+            for row in rows {
+                let slot = row.slot as usize;
+                match &row.source {
+                    RowSource::Indexed => {}
+                    RowSource::Host { tokens, position } => {
+                        slot_words.push((context.state.future_token(slot)?, i64::from(tokens[0])));
+                        slot_words.push((context.state.logical_length(slot)?, *position as i64));
+                    }
+                    RowSource::Relay { position, .. } => {
+                        slot_words.push((context.state.logical_length(slot)?, *position as i64));
+                    }
+                    RowSource::Placed { .. } => {
+                        return Err(Error::Invalid("a decode row places no positions".into()));
+                    }
+                }
+            }
+        }
+
         // The row gather's host columns: per-row sections of stride R + 1,
         // then each token's row.
         let mut row_columns = Vec::new();
         let mut token_ids = Vec::new();
         let mut positions = Vec::new();
         let mut relays = Vec::new();
-        if !indexed {
+        if !request.decode {
             let stride = dimensions.rows + 1;
             row_columns = vec![0_i64; (ROW_SECTIONS + pages.len()) * stride + padded_tokens];
             let mut query_offset = 0;
@@ -565,7 +801,8 @@ impl TextRunner {
                 row_columns[row] = slots[row];
                 row_columns[stride + row] = prefixes[row];
                 row_columns[2 * stride + row] = queries[row];
-                row_columns[3 * stride + row] = writes[row];
+                // Live rows write the cache; padding rows do not.
+                row_columns[3 * stride + row] = i64::from(row < live);
                 row_columns[4 * stride + row] = query_offset;
                 row_columns[5 * stride + row] = prefix_offset;
                 for (table, selected) in pages.iter().enumerate() {
@@ -595,7 +832,7 @@ impl TextRunner {
                         }
                     }
                     RowSource::Relay { drafts, position } => {
-                        relays.push((offset, row.slot, false));
+                        relays.push((offset, row.slot));
                         for index in 0..=drafts.len() {
                             if index > 0 {
                                 token_ids[offset + index] = i64::from(drafts[index - 1]);
@@ -603,8 +840,10 @@ impl TextRunner {
                             positions[offset + index] = (position + index as u64) as i64;
                         }
                     }
-                    RowSource::Resident | RowSource::Indexed => {
-                        relays.push((offset, row.slot, true));
+                    RowSource::Indexed => {
+                        return Err(Error::Invalid(
+                            "only a decode row reads its position from its slot".into(),
+                        ));
                     }
                     RowSource::Placed {
                         tokens,
@@ -643,7 +882,6 @@ impl TextRunner {
             rows: padded_rows,
             live_tokens,
             tokens: padded_tokens,
-            indexed,
             widths,
             queries,
             prefixes,
@@ -659,13 +897,15 @@ impl TextRunner {
             positions,
             slots,
             force,
+            finish_ids,
             logit_rows,
             relays,
+            slot_words,
         })
     }
 
     /// Copy the plan's host columns and sampling inputs to the device, then
-    /// relay slot-state tokens and positions, in stream order.
+    /// relay slot-state tokens, in stream order.
     fn copy_columns(
         &self,
         plan: &Plan,
@@ -678,10 +918,15 @@ impl TextRunner {
         let mut push = |destination: u64, source: &[u8]| {
             entries.push((destination, source.as_ptr() as u64, source.len()));
         };
-        push(column("request_pool_indices")?, bytes(&plan.slots));
-        push(column("decode_force_finish")?, &plan.force);
         let mut causal_values = Vec::new();
-        if !plan.indexed {
+        if plan.decode {
+            push(column("request_pool_indices")?, bytes(&plan.slots));
+            push(column("decode_force_finish")?, &plan.force);
+            push(column("finish_ids")?, bytes(&plan.finish_ids));
+            for (address, value) in &plan.slot_words {
+                push(*address, bytes(std::slice::from_ref(value)));
+            }
+        } else {
             push(column("row_columns")?, bytes(&plan.row_columns));
             push(column("input_ids")?, bytes(&plan.token_ids));
             // Each axis is one row of the `[3, T]` column.
@@ -737,20 +982,12 @@ impl TextRunner {
         }
 
         let mut relays = Vec::new();
-        for &(offset, slot, resident) in &plan.relays {
-            let slot = slot as usize;
+        for &(offset, slot) in &plan.relays {
             relays.push((
                 column("input_ids")? + 8 * offset as u64,
-                state.future_token(slot)?,
+                state.future_token(slot as usize)?,
                 8,
             ));
-            if resident {
-                relays.push((
-                    column("positions")? + 8 * offset as u64,
-                    state.logical_length(slot)?,
-                    8,
-                ));
-            }
         }
 
         match &self.stream {
@@ -807,8 +1044,10 @@ impl TextRunner {
     }
 
     /// Install `rows` commit rows (`[slot, mode, task, cache, logical,
-    /// sampling, visible, penalties]` each) into the slot state.
-    pub(crate) fn commit(&self, rows: &[[i64; 8]]) -> Result<()> {
+    /// sampling, visible, penalties]` each) into the slot state: the launch
+    /// of the commit graph of the smallest decode bucket holding them, or
+    /// the runner's `commit` where no graph serves.
+    pub(crate) fn commit(&mut self, rows: &[[i64; 8]]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -816,9 +1055,27 @@ impl TextRunner {
         if rows.len() > capacity {
             return Err(Error::Invariant("commit rows exceed the binding".into()));
         }
+        let key = self
+            .pool
+            .as_ref()
+            .and_then(|_| bucket(self.shapes.decode(), rows.len()))
+            .map(|rows| TextGraphKey::Commit { rows });
+
+        // A bucket pads with rows that store the padding slot's zero cache
+        // length again.
+        let count = match &key {
+            Some(TextGraphKey::Commit { rows }) => *rows,
+            _ => rows.len(),
+        };
+        let padding = [0, COMMIT_CACHE, -1, 0, 0, 0, 0, 0];
         let base = self.buffers.column("commit")?.address();
         let fields: Vec<Vec<i64>> = (0..8)
-            .map(|field| rows.iter().map(|row| row[field]).collect())
+            .map(|field| {
+                rows.iter()
+                    .chain(std::iter::repeat_n(&padding, count - rows.len()))
+                    .map(|row| row[field])
+                    .collect()
+            })
             .collect();
         match &self.stream {
             Some(stream) => {
@@ -848,14 +1105,32 @@ impl TextRunner {
                 }
             }
         }
-        self.model.commit(rows.len())
+
+        let method = || -> Result<MethodCall> {
+            let mut arguments = vec![count.into()];
+            arguments.extend(self.tensors(&["commit", "completion", "continuation", "points"])?);
+            Ok(self.methods.call(&self.methods.commit, arguments))
+        };
+        let Some(key) = key else {
+            return method()?.invoke().map(drop);
+        };
+        if let Lookup::Replay(graph) = self.graphs.lookup(&key, None)? {
+            let stream = self
+                .stream
+                .as_ref()
+                .ok_or(Error::State("a graph is launched on a CUDA stream"))?;
+            return graph.launch(stream);
+        }
+        // The eager commit installs these rows and compiles the kernel;
+        // the capture records without executing.
+        method()?.invoke()?;
+        let graph = self.capture(method()?)?;
+        self.graphs.insert(key, None, graph)
     }
 
-    /// Release graphs and the binding's views. The caller drained the lane.
+    /// Release the graphs. The caller drained the lane.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
-        let graphs = self.graphs.close(aborted);
-        let closed = self.model.close(aborted);
-        graphs.and(closed)
+        self.graphs.close(aborted)
     }
 }
 

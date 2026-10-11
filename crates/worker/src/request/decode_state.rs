@@ -14,8 +14,8 @@
 //!
 //! The slot's verified KV length is the block tables' `verified_lengths`,
 //! shared with attention gathers. `S` is the request slot count plus one:
-//! slot 0 is padding. Rust allocates, resets and copies; the numerical
-//! commit (`text.bind`'s `commit`) installs selections.
+//! slot 0 is padding. Rust allocates, resets and copies; the runner's
+//! `commit` installs selections.
 
 use std::sync::Arc;
 
@@ -135,20 +135,32 @@ impl DecodeState {
         Ok(state)
     }
 
-    /// The state keyed as text bindings receive it.
-    pub(crate) fn views(&self) -> Vec<(String, StorageView)> {
-        [
-            ("slot.future_input_tokens", &self.future_input_tokens),
-            ("slot.predicates", &self.predicates),
-            ("slot.logical_lengths", &self.logical_lengths),
-            ("slot.sampling_positions", &self.sampling_positions),
-            ("slot.penalty_counts", &self.penalty_counts),
-            ("slot.prompt_logits", &self.prompt_logits),
-            ("slot.verified_lengths", &self.verified_lengths),
-        ]
-        .into_iter()
-        .map(|(name, view)| (name.to_owned(), view.clone()))
-        .collect()
+    pub(crate) fn future_input_tokens(&self) -> &StorageView {
+        &self.future_input_tokens
+    }
+
+    pub(crate) fn predicates(&self) -> &StorageView {
+        &self.predicates
+    }
+
+    pub(crate) fn logical_lengths(&self) -> &StorageView {
+        &self.logical_lengths
+    }
+
+    pub(crate) fn sampling_positions(&self) -> &StorageView {
+        &self.sampling_positions
+    }
+
+    pub(crate) fn penalty_counts(&self) -> &StorageView {
+        &self.penalty_counts
+    }
+
+    pub(crate) fn prompt_logits(&self) -> &StorageView {
+        &self.prompt_logits
+    }
+
+    pub(crate) fn verified_lengths(&self) -> &StorageView {
+        &self.verified_lengths
     }
 
     /// The address of slot `slot`'s next input token.

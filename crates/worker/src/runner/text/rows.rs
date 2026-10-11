@@ -12,11 +12,9 @@ pub(crate) enum RowSource {
     /// draft tokens, at consecutive host positions from `position`: a
     /// continuation whose predecessor's token was never observed.
     Relay { drafts: Vec<u32>, position: u64 },
-    /// One token and its position read from the slot's continuation state
-    /// on the device: a decode row of a call that also has other rows.
-    Resident,
-    /// One token, its position and the slot's verified KV length gathered on
-    /// the device by the decode gather: a decode row of an all-indexed call.
+    /// One token, its position and the slot's verified KV length gathered
+    /// from the slot's continuation state on the device: a decode row
+    /// following its request's last committed selection.
     Indexed,
     /// Host tokens with explicit rotary positions (temporal, row, column):
     /// a vision block, or text of a prompt holding one, whose positions do
@@ -59,7 +57,7 @@ impl TokenRow {
         let tokens = match &self.source {
             RowSource::Host { tokens, .. } => tokens.len(),
             RowSource::Relay { drafts, .. } => drafts.len() + 1,
-            RowSource::Resident | RowSource::Indexed => 1,
+            RowSource::Indexed => 1,
             RowSource::Placed {
                 tokens, positions, ..
             } => {

@@ -1355,6 +1355,17 @@ class ExecutionContext:
 
     # Calls.
 
+    def plans_attention(self) -> bool:
+        """Whether an attention layer plans each launch on the host.
+
+        A captured forward of such a context reads plans that
+        :meth:`bind_attention` builds before every launch; without one, the
+        launch reads only device metadata.
+        """
+        return any(
+            binding.builds_launch_plan for binding in self._attention.values()
+        )
+
     def bind_attention(self, batch, *, replay: bool = False) -> None:
         """Bind only layers reading this batch's cache tables.
 
