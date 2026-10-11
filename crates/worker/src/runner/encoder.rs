@@ -241,7 +241,7 @@ pub struct TextEncoder {
     pub positions: bool,
 }
 
-/// What an encoder computes, as `encoder.describe` reports it.
+/// What an encoder computes, as the `EncoderRunner` fact methods report it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderInfo {
     Vision(VisionEncoder),
@@ -261,17 +261,71 @@ impl EncoderInfo {
         path: &str,
         dtype: DType,
     ) -> Result<Self> {
-        // FIXME: an encoder's facts still cross as one record.
-        let function = interface.import(&format!("{ENCODER}.describe"))?;
-        let record = Record::new(
-            function.name(),
-            function.call_values(&[
-                loaded.to_any(),
-                Any::from(tvm_ffi::String::from(path)),
-                Any::from(tvm_ffi::String::from(dtype.name())),
-            ])?,
-        )?;
-        Self::from_record(&record)
+        let path = Any::from(tvm_ffi::String::from(path));
+        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let extent = |name: &str| -> Result<u32> {
+            let function = method(name)?;
+            let value: i64 = function.call_as(&[loaded.view(), (&path).into()])?;
+            u32::try_from(value)
+                .map_err(|_| Error::Interface(format!("{} is out of range", function.name())))
+        };
+        let dtype_named = |function: &Function, name: tvm_ffi::String| -> Result<DType> {
+            DType::from_name(name.as_str()).ok_or_else(|| {
+                Error::Interface(format!(
+                    "{} reports the unknown dtype {:?}",
+                    function.name(),
+                    name.as_str()
+                ))
+            })
+        };
+        let output_dtype = || -> Result<DType> {
+            let function = method("output_dtype")?;
+            let name = function.call_as(&[loaded.view(), (&path).into()])?;
+            dtype_named(&function, name)
+        };
+        let kind: tvm_ffi::String = method("kind")?.call_as(&[loaded.view(), (&path).into()])?;
+        Ok(match kind.as_str() {
+            "vision" => {
+                let patch_size = extent("patch_size")?;
+                let max_patches = extent("max_patches")?;
+                let downsample = extent("downsample")?;
+                if downsample == 0 || max_patches % (downsample * downsample) != 0 {
+                    return Err(Error::Interface(
+                        "packed vision slots must hold whole output features".into(),
+                    ));
+                }
+                let pixels = method("pixel_dtype")?;
+                let pixel_dtype = dtype_named(&pixels, pixels.call_as(&[loaded.view()])?)?;
+                Self::Vision(VisionEncoder {
+                    patch_size,
+                    downsample,
+                    output_size: extent("output_width")?,
+                    output_dtype: output_dtype()?,
+                    max_patches: (max_patches > 0).then_some(max_patches),
+                    image_patches: extent("image_patches")?,
+                    // A patch row holds the RGB values of one patch.
+                    row_width: 3 * patch_size * patch_size,
+                    pixel_dtype,
+                })
+            }
+            "latent" => Self::Latent(LatentEncoder {
+                downsample: extent("downsample")?,
+                width: extent("output_width")?,
+                output_dtype: output_dtype()?,
+            }),
+            "text" => Self::Text(TextEncoder {
+                hidden_size: extent("output_width")?,
+                // A text encoder's hidden states carry the model dtype.
+                output_dtype: dtype,
+                positions: method("places_vision")?
+                    .call_as::<bool>(&[loaded.view(), (&path).into()])?,
+            }),
+            other => {
+                return Err(Error::Interface(format!(
+                    "{ENCODER}.kind reports the unknown encoder kind {other:?}"
+                )));
+            }
+        })
     }
 
     /// The text size the encoder's component binding prepares its
@@ -306,59 +360,6 @@ impl EncoderInfo {
             }),
             Self::Latent(_) | Self::Condition => None,
         }
-    }
-
-    fn from_record(record: &Record) -> Result<Self> {
-        let dtype = |key: &str| -> Result<DType> {
-            let name = record.string(key)?;
-            DType::from_name(&name).ok_or_else(|| {
-                Error::Interface(format!(
-                    "{} reports the unknown dtype {name:?}",
-                    record.owner()
-                ))
-            })
-        };
-        let extent = |key: &str| -> Result<u32> {
-            u32::try_from(record.count(key)?)
-                .map_err(|_| Error::Interface(format!("{} {key} overflows", record.owner())))
-        };
-        Ok(match record.string("kind")?.as_str() {
-            "vision" => {
-                let max_patches = extent("max_patches")?;
-                let downsample = extent("downsample")?;
-                if downsample == 0 || max_patches % (downsample * downsample) != 0 {
-                    return Err(Error::Interface(
-                        "packed vision slots must hold whole output features".into(),
-                    ));
-                }
-                Self::Vision(VisionEncoder {
-                    patch_size: extent("patch_size")?,
-                    downsample,
-                    output_size: extent("output_size")?,
-                    output_dtype: dtype("output_dtype")?,
-                    max_patches: (max_patches > 0).then_some(max_patches),
-                    image_patches: extent("image_patches")?,
-                    row_width: extent("row_width")?,
-                    pixel_dtype: dtype("pixel_dtype")?,
-                })
-            }
-            "latent" => Self::Latent(LatentEncoder {
-                downsample: extent("downsample")?,
-                width: extent("width")?,
-                output_dtype: dtype("output_dtype")?,
-            }),
-            "text" => Self::Text(TextEncoder {
-                hidden_size: extent("hidden_size")?,
-                output_dtype: dtype("output_dtype")?,
-                positions: record.flag("positions")?,
-            }),
-            other => {
-                return Err(Error::Interface(format!(
-                    "{} reports the unknown encoder kind {other:?}",
-                    record.owner()
-                )));
-            }
-        })
     }
 }
 
@@ -2150,7 +2151,6 @@ impl ImageBatch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi::Fields;
 
     #[test]
     fn packed_grids_describe_images_and_slot_padding() -> Result<()> {
@@ -2209,51 +2209,29 @@ mod tests {
     }
 
     #[test]
-    fn encoder_descriptions_are_validated() -> Result<()> {
-        let record = |fields: Fields| Record::new("encoder.describe", fields.into_any());
-        let vision = Fields::new()
-            .text("kind", "vision")
-            .with("patch_size", 16_i64)
-            .with("downsample", 3_i64)
-            .with("output_size", 32_i64)
-            .text("output_dtype", "bfloat16")
-            .with("max_patches", 2520_i64)
-            .with("image_patches", 2520_i64)
-            .with("row_width", 768_i64)
-            .text("pixel_dtype", "float32");
-        let described = EncoderInfo::from_record(&record(vision)?)?;
-        let EncoderInfo::Vision(info) = described else {
-            panic!("vision encoder");
+    fn a_packed_binding_covers_every_slot_of_its_capacity() {
+        let info = VisionEncoder {
+            patch_size: 16,
+            downsample: 3,
+            output_size: 32,
+            output_dtype: DType::BF16,
+            max_patches: Some(2520),
+            image_patches: 2520,
+            row_width: 768,
+            pixel_dtype: DType::F32,
         };
         assert_eq!(info.slot_tokens(), Some(280));
-        assert_eq!(info.pixel_dtype, DType::F32);
-        // A packed binding covers every slot of its capacity, two segments
-        // per slot.
+        // Two segments per slot.
         let config = EncoderConfig {
             max_images: 40,
             ..EncoderConfig::default()
         };
         assert_eq!(
-            described.binding_size(&config),
+            EncoderInfo::Vision(info).binding_size(&config),
             Some(TextSize {
                 tokens: 16 * 2520,
                 rows: 32,
             })
         );
-
-        let unaligned = Fields::new()
-            .text("kind", "vision")
-            .with("patch_size", 16_i64)
-            .with("downsample", 3_i64)
-            .with("output_size", 32_i64)
-            .text("output_dtype", "bfloat16")
-            .with("max_patches", 100_i64)
-            .with("image_patches", 100_i64)
-            .with("row_width", 768_i64)
-            .text("pixel_dtype", "float32");
-        assert!(EncoderInfo::from_record(&record(unaligned)?).is_err());
-        let unknown = Fields::new().text("kind", "audio");
-        assert!(EncoderInfo::from_record(&record(unknown)?).is_err());
-        Ok(())
     }
 }
