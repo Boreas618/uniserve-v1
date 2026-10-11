@@ -310,8 +310,6 @@ pub struct ModelFacts {
     pub model_name: String,
     /// The attention backend the model was loaded with.
     pub attention_backend: String,
-    pub vocab_size: Option<usize>,
-    pub hidden_size: Option<usize>,
     /// Products each component publishes, by component.
     pub outputs: BTreeMap<String, Vec<OutputInfo>>,
     pub weight_formats: Vec<String>,
@@ -346,8 +344,6 @@ impl ModelFacts {
         Ok(Self {
             model_name: record.string("model_name")?,
             attention_backend: record.string("attention_backend")?,
-            vocab_size: record.optional_count("vocab_size")?,
-            hidden_size: record.optional_count("hidden_size")?,
             outputs,
             weight_formats: record.strings("weight_formats")?,
             activation_formats: record.strings("activation_formats")?,
