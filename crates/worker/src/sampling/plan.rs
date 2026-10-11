@@ -5,7 +5,7 @@
 //! [`SamplingPath`] in first-appearance order and produces:
 //!
 //! - `words`: the host descriptor the step decodes
-//!   (`uniserve_models.interface.text.decode_tasks`): `[task count, group
+//!   (`uniserve_models.runner.causal_lm.decode_tasks`): `[task count, group
 //!   count]`, seven words per group (`path, top_k, first task, task count,
 //!   logprob offset, logprob words, parameter row`), then one record per
 //!   task in group order;
@@ -220,16 +220,6 @@ impl SamplingPlan {
             .map(|entry| entry.offset + entry.words)
             .max()
     }
-}
-
-/// The descriptor of tasks that only finish a decode graph's greedy
-/// selections: every task in row order, no groups.
-pub(crate) fn greedy_finish_words(tasks: &[SampleTask<'_>], vocab: usize) -> Vec<i64> {
-    let mut words = vec![tasks.len() as i64, 0];
-    for task in tasks {
-        encode(task, vocab, &mut words);
-    }
-    words
 }
 
 /// Top count and deduplicated in-range ids a call reports per position.

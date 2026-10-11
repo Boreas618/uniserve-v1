@@ -8,8 +8,8 @@
 //! verification every candidate row. A prefill chunk that scores its prompt
 //! projects all of its rows; they score its tokens, its last row also
 //! samples. A decode invocation whose calls all qualify uses the decode
-//! body's greedy selections and only applies terminal policy; otherwise the
-//! tasks form a [`SamplingPlan`].
+//! forward's greedy selections, made with each call's finish tokens;
+//! otherwise the tasks form a [`SamplingPlan`].
 
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
@@ -19,14 +19,12 @@ use super::batch::TokenBatch;
 use super::calls::{self, Prepared};
 use super::context::{self, Sources};
 use crate::cuda_graph::GraphMode;
+use crate::runner::causal_lm::{
+    Embeddings, Executed, FINISH_IDS, SamplingColumns, StepRequest, TokenRow, logit_layout,
+};
 use crate::runner::diffusion::image::ConditionRow;
-use crate::runner::text::{
-    Embeddings, Executed, RowSource, SamplingColumns, StepRequest, TokenRow, logit_layout,
-};
 use crate::sampling::SamplingMetadata;
-use crate::sampling::plan::{
-    SampleTask, SamplingPlan, greedy_finish_words, logprob_request, logprob_words,
-};
+use crate::sampling::plan::{SampleTask, SamplingPlan, logprob_request, logprob_words};
 use crate::storage::LogprobLayout;
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
@@ -107,37 +105,27 @@ struct Planned {
     runner: usize,
     rows: Vec<TokenRow>,
     embeddings: Vec<Embeddings>,
+    /// Each row's finish tokens when the decode forward's greedy
+    /// selections are final; empty otherwise.
+    finish_ids: Vec<[i64; FINISH_IDS]>,
     sampling: Option<SamplingPlan>,
-    greedy: Vec<i64>,
     prompt: Vec<i64>,
     tasks: usize,
 }
 
 impl Planned {
     fn request(&self, decode: bool) -> StepRequest<'_> {
-        let columns = if !self.greedy.is_empty() {
-            Some(SamplingColumns {
-                words: &self.greedy,
-                draws: &[],
-                params: &[],
-                slots: &[],
-                gates: &[],
-                greedy: true,
-            })
-        } else {
-            self.sampling.as_ref().map(|plan| SamplingColumns {
+        StepRequest {
+            decode,
+            rows: &self.rows,
+            finish_ids: &self.finish_ids,
+            sampling: self.sampling.as_ref().map(|plan| SamplingColumns {
                 words: &plan.words,
                 draws: &plan.draws,
                 params: &plan.params,
                 slots: &plan.slots,
                 gates: &plan.gates,
-                greedy: false,
-            })
-        };
-        StepRequest {
-            decode,
-            rows: &self.rows,
-            sampling: columns,
+            }),
             prompt: &self.prompt,
             embeddings: &self.embeddings,
         }
@@ -175,7 +163,6 @@ impl TokenBatch<'_> {
     pub(super) fn step(&mut self) -> Result<Stepped> {
         let plan = self.plan;
         let peers = self.runtime.groups[self.group].clone();
-        let indexed = self.runtime.runners[peers[0]].indexed();
         let kv = self
             .storage
             .kv
@@ -242,14 +229,7 @@ impl TokenBatch<'_> {
                     tagged: false,
                 }
             } else {
-                calls::prepare(
-                    call,
-                    &state.output,
-                    &admitted,
-                    state.slot as u32,
-                    tables,
-                    indexed,
-                )?
+                calls::prepare(call, &state.output, &admitted, state.slot as u32, tables)?
             };
             match &prepared.media {
                 Some(media) => {
@@ -394,21 +374,12 @@ impl TokenBatch<'_> {
             spans.push((rows.len(), input.rows.len()));
             rows.extend(input.rows.iter().cloned());
         }
-        // An all-indexed decode gathers on the device; mixed calls read the
-        // indexed rows' tokens and positions from the slot state.
-        if !rows.iter().all(|row| row.source == RowSource::Indexed) {
-            for row in &mut rows {
-                if row.source == RowSource::Indexed {
-                    row.source = RowSource::Resident;
-                }
-            }
-        }
-
         let layout = logit_layout(&rows);
         let vocab = self.runtime.vocab;
         let dimensions = self.runtime.runners[runner].dimensions();
         let mut sampled = Vec::new();
         let mut greedy = self.mode == ForwardMode::Decode;
+        let mut finish_ids = vec![[-1_i64; FINISH_IDS]; rows.len()];
         // Prompt chunks: call, candidate rows, first token and what
         // predicts the first token (see `PromptScore::continued`).
         let mut prompts: Vec<(usize, (usize, usize), usize, i64)> = Vec::new();
@@ -441,11 +412,18 @@ impl TokenBatch<'_> {
                 call,
                 admitted,
                 prepared,
+                &controls.finish_token_ids,
                 state.token_write.is_some(),
                 state.transition_write.is_some(),
             );
             // The call samples from its last row.
             let position = first_row + row_count - 1;
+            for (id, &token) in finish_ids[position]
+                .iter_mut()
+                .zip(&controls.finish_token_ids)
+            {
+                *id = i64::from(token);
+            }
             let (first, count) = layout[position];
             // A verification samples every candidate row; the others their
             // last projected row.
@@ -516,9 +494,12 @@ impl TokenBatch<'_> {
                 })
             })
             .collect::<Result<_>>()?;
-        // The decode body's greedy selections are final only when every call
-        // qualifies; otherwise its logits are sampled like any other.
+        // The decode forward's greedy selections are final only when every
+        // call qualifies; otherwise its logits are sampled like any other.
         greedy &= tasks.len() == inputs.len();
+        if !greedy {
+            finish_ids.clear();
+        }
         let sampling = if tasks.is_empty() || greedy {
             None
         } else {
@@ -575,11 +556,6 @@ impl TokenBatch<'_> {
                 "logprob words exceed the binding's capacity",
             ));
         }
-        let greedy_words = if greedy {
-            greedy_finish_words(&tasks, vocab)
-        } else {
-            Vec::new()
-        };
         let task_count = tasks.len();
         drop(tasks);
         metadata.extend(
@@ -591,8 +567,8 @@ impl TokenBatch<'_> {
             runner,
             rows,
             embeddings,
+            finish_ids,
             sampling,
-            greedy: greedy_words,
             prompt: prompt_words,
             tasks: task_count,
         })
