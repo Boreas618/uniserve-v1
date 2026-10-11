@@ -1,26 +1,22 @@
 //! A loaded model's image facts and the host-side image interface.
 //!
-//! `DenoiserRunner.describe` reports, once at startup, what the image
-//! runtime plans with: the model's image processing (which towers it declares, its pixel
-//! dtype and feature injection), its image denoiser's latent layout and its
-//! image decoder's pixel range. Rust derives every per-call geometry from
-//! these facts: latent rows, sequence lengths with framing, and denoising
-//! positions.
+//! Read once at startup from the runners that own each fact: the model's
+//! image processing (which towers it declares, its pixel dtype and feature
+//! injection) from `EncoderRunner`, its image denoiser's latent layout from
+//! `DenoiserRunner` and its image decoder's pixel range from
+//! `DecoderRunner`. Rust derives every per-call geometry from these facts:
+//! latent rows, sequence lengths with framing, and denoising positions.
 //!
 //! Two host functions complete the policy: `EncoderRunner.patch_grid` (the
 //! vision tower's patch grid of an image, which places its features) and
 //! `DenoiserRunner.guidance_prefix` (a guidance prefix's tokens, by the
 //! model's prompt framing and tokenizer).
-//!
-//! FIXME: one record carries the image processing, the denoiser's latent
-//! layout and the decoder's pixel range; each fact goes to the runner it
-//! describes with the fact records.
 
 use std::sync::Arc;
 
 use tvm_ffi::Any;
 
-use crate::ffi::{DType, Function, Handle, Record, integers};
+use crate::ffi::{DType, Function, Handle, integers};
 use crate::model::interface::Interface;
 use crate::request::diffusion::{BranchSource, Prefix};
 use crate::runner::vision::{FeatureInjection, FeatureLayout, PositionLayout};
@@ -28,6 +24,7 @@ use crate::{Error, Result};
 
 const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
 const DENOISER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
+const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
 
 /// Language positions a generated image spans in its conversation: its
 /// closing framing token sits this far past the opening one, and the
@@ -137,127 +134,146 @@ pub(crate) struct ImageModel {
     pub(crate) decoder_range: Option<(f32, f32)>,
 }
 
-fn dtype(record: &Record, key: &str) -> Result<DType> {
-    let name = record.string(key)?;
-    DType::from_name(&name).ok_or_else(|| {
+/// The dtype a fact method names.
+fn dtype(function: &Function, name: tvm_ffi::String) -> Result<DType> {
+    DType::from_name(name.as_str()).ok_or_else(|| {
         Error::Interface(format!(
-            "{} reports the unknown dtype {name:?}",
-            record.owner()
+            "{} reports the unknown dtype {:?}",
+            function.name(),
+            name.as_str()
         ))
     })
 }
 
-fn extent(record: &Record, key: &str) -> Result<u32> {
-    u32::try_from(record.count(key)?)
-        .map_err(|_| Error::Interface(format!("{} {key} overflows", record.owner())))
-}
-
-fn token(record: &Record, key: &str) -> Result<Option<u32>> {
-    record
-        .optional_count(key)?
-        .map(|value| {
-            u32::try_from(value)
-                .map_err(|_| Error::Interface(format!("{} {key} overflows", record.owner())))
-        })
-        .transpose()
-}
-
 impl ImageModel {
-    /// Describe a loaded model's image facts.
+    /// Read a loaded model's image facts from the runners that own them:
+    /// the image policy from `EncoderRunner`, the latent layout from
+    /// `DenoiserRunner` and the pixel range from `DecoderRunner`.
     pub(crate) fn describe(interface: &Interface, loaded: &Handle) -> Result<Self> {
-        // FIXME: the image facts still cross as one record.
-        let function = interface.import(&format!("{DENOISER}.describe"))?;
-        Self::from_record(&Record::new(
-            function.name(),
-            function.call_values(&[loaded.to_any()])?,
-        )?)
-    }
+        let encoder = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let denoiser = |name: &str| interface.import(&format!("{DENOISER}.{name}"));
+        let model = [loaded.view()];
 
-    fn from_record(record: &Record) -> Result<Self> {
-        let processing = record
-            .optional_record("processor")?
-            .map(|processor| -> Result<ImageProcessing> {
-                let injection = processor
-                    .optional_record("injection")?
-                    .map(|injection| -> Result<FeatureInjection> {
-                        Ok(FeatureInjection {
-                            layout: match injection.string("layout")?.as_str() {
-                                "direct" => FeatureLayout::Direct,
-                                "framed" => FeatureLayout::Framed,
-                                other => {
-                                    return Err(Error::Interface(format!(
-                                        "unknown feature layout {other:?}"
-                                    )));
-                                }
-                            },
-                            positions: match injection.string("positions")?.as_str() {
-                                "temporal" => PositionLayout::Temporal,
-                                "temporal_spatial" => PositionLayout::TemporalSpatial,
-                                "sequential" => PositionLayout::Sequential,
-                                other => {
-                                    return Err(Error::Interface(format!(
-                                        "unknown feature position layout {other:?}"
-                                    )));
-                                }
-                            },
-                            start_token: token(&injection, "start_token")?,
-                            end_token: token(&injection, "end_token")?,
-                        })
+        let processing = if encoder("processes_images")?.call_as::<bool>(&model)? {
+            let towers: tvm_ffi::Array<tvm_ffi::String> =
+                encoder("image_towers")?.call_as(&model)?;
+            let declares = |tower: &str| towers.iter().any(|name| name.as_str() == tower);
+            let layouts: tvm_ffi::Array<tvm_ffi::String> =
+                encoder("feature_injection")?.call_as(&model)?;
+            let layouts: Vec<String> = layouts
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect();
+            let injection = match &layouts[..] {
+                [] => None,
+                [layout, positions] => {
+                    let tokens =
+                        integers(encoder("injection_tokens")?.call_values(&[loaded.to_any()])?)
+                            .map_err(|error| Error::numerical("injection_tokens", &error))?;
+                    let [start, end] = tokens[..] else {
+                        return Err(Error::Interface(
+                            "feature injection names a start and an end token".into(),
+                        ));
+                    };
+                    // A negative id stands for a token that is not placed.
+                    let token = |id: i64| u32::try_from(id).ok();
+                    Some(FeatureInjection {
+                        layout: match layout.as_str() {
+                            "direct" => FeatureLayout::Direct,
+                            "framed" => FeatureLayout::Framed,
+                            other => {
+                                return Err(Error::Interface(format!(
+                                    "unknown feature layout {other:?}"
+                                )));
+                            }
+                        },
+                        positions: match positions.as_str() {
+                            "temporal" => PositionLayout::Temporal,
+                            "temporal_spatial" => PositionLayout::TemporalSpatial,
+                            "sequential" => PositionLayout::Sequential,
+                            other => {
+                                return Err(Error::Interface(format!(
+                                    "unknown feature position layout {other:?}"
+                                )));
+                            }
+                        },
+                        start_token: token(start),
+                        end_token: token(end),
                     })
-                    .transpose()?;
-                Ok(ImageProcessing {
-                    vit: processor.flag("vit")?,
-                    vae: processor.flag("vae")?,
-                    patch_tower: processor.flag("patch_tower")?,
-                    pixel_dtype: dtype(&processor, "pixel_dtype")?,
-                    injection,
-                })
+                }
+                _ => {
+                    return Err(Error::Interface(
+                        "feature injection names a layout and a position layout".into(),
+                    ));
+                }
+            };
+            let pixels = encoder("pixel_dtype")?;
+            Some(ImageProcessing {
+                vit: declares("vit"),
+                vae: declares("vae"),
+                patch_tower: encoder("packs_patches")?.call_as::<bool>(&model)?,
+                pixel_dtype: dtype(&pixels, pixels.call_as(&model)?)?,
+                injection,
             })
-            .transpose()?;
-        let denoiser = record
-            .optional_record("denoiser")?
-            .map(|denoiser| -> Result<ImageDenoiserLayout> {
+        } else {
+            None
+        };
+
+        let layout = integers(denoiser("image_layout")?.call_values(&[loaded.to_any()])?)
+            .map_err(|error| Error::numerical("image_layout", &error))?;
+        let denoiser = match layout[..] {
+            [] => None,
+            [
+                patch_size,
+                latent_channels,
+                downsample,
+                framing_tokens,
+                max_sequence_tokens,
+            ] => {
+                let extent = |value: i64| -> Result<u32> {
+                    u32::try_from(value).map_err(|_| {
+                        Error::Interface("an image denoiser's layout is out of range".into())
+                    })
+                };
+                let unconditional: tvm_ffi::String =
+                    denoiser("image_unconditional")?.call_as(&model)?;
+                let prediction = denoiser("prediction_dtype")?;
                 let layout = ImageDenoiserLayout {
-                    patch_size: extent(&denoiser, "patch_size")?,
-                    latent_channels: extent(&denoiser, "latent_channels")?,
-                    downsample: extent(&denoiser, "downsample")?,
-                    framing_tokens: extent(&denoiser, "framing_tokens")?,
-                    image_unconditional: BranchSource::parse(
-                        &denoiser.string("image_unconditional")?,
-                    )?,
-                    max_sequence_tokens: extent(&denoiser, "max_sequence_tokens")?,
-                    prediction_dtype: dtype(&denoiser, "prediction_dtype")?,
+                    patch_size: extent(patch_size)?,
+                    latent_channels: extent(latent_channels)?,
+                    downsample: extent(downsample)?,
+                    framing_tokens: extent(framing_tokens)?,
+                    image_unconditional: BranchSource::parse(unconditional.as_str())?,
+                    max_sequence_tokens: extent(max_sequence_tokens)?,
+                    prediction_dtype: dtype(&prediction, prediction.call_as(&model)?)?,
                 };
                 if layout.downsample == 0 || !matches!(layout.framing_tokens, 0 | 2) {
                     return Err(Error::Interface(
                         "an image denoiser frames an image with zero or two tokens".into(),
                     ));
                 }
-                Ok(layout)
-            })
-            .transpose()?;
-        let decoder_range = record
-            .optional_value("decoder_range")?
-            .map(|range| -> Result<(f32, f32)> {
-                let values: tvm_ffi::Array<Any> = tvm_ffi::Array::try_from(range)
-                    .map_err(|error| Error::numerical(record.owner(), &error))?;
-                let bound = |index: usize| -> Result<f32> {
-                    f64::try_from(
-                        values
-                            .get(index)
-                            .map_err(|error| Error::numerical(record.owner(), &error))?,
-                    )
-                    .map(|value| value as f32)
-                    .map_err(|error| Error::numerical(record.owner(), &error))
-                };
-                if values.len() != 2 {
-                    return Err(Error::Interface(
-                        "an image decoder range names two bounds".into(),
-                    ));
-                }
-                Ok((bound(0)?, bound(1)?))
-            })
-            .transpose()?;
+                Some(layout)
+            }
+            _ => {
+                return Err(Error::Interface(
+                    "an image denoiser's layout names five sizes".into(),
+                ));
+            }
+        };
+
+        let range: tvm_ffi::Array<f64> = interface
+            .import(&format!("{DECODER}.value_range"))?
+            .call_as(&model)?;
+        let range: Vec<f64> = range.iter().collect();
+        let decoder_range = match range[..] {
+            [] => None,
+            [low, high] => Some((low as f32, high as f32)),
+            _ => {
+                return Err(Error::Interface(
+                    "an image decoder range names two bounds".into(),
+                ));
+            }
+        };
         Ok(Self {
             processing,
             denoiser,
@@ -367,7 +383,6 @@ impl ImagePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi::Fields;
 
     fn layout(framing: u32) -> ImageDenoiserLayout {
         ImageDenoiserLayout {
@@ -410,75 +425,6 @@ mod tests {
         let positions = layout(2).conditioning_positions(32, 48, 10)?;
         assert_eq!(positions[0], vec![10, 11, 11, 11, 11, 11, 11, 12]);
         assert!(layout(0).conditioning_positions(32, 48, 10).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn descriptions_parse_processing_denoiser_and_decoder() -> Result<()> {
-        let record = Record::new(
-            "image.describe",
-            Fields::new()
-                .with(
-                    "processor",
-                    Fields::new()
-                        .with("vit", true)
-                        .with("vae", false)
-                        .with("patch_tower", true)
-                        .text("pixel_dtype", "bfloat16")
-                        .with(
-                            "injection",
-                            Fields::new()
-                                .text("layout", "framed")
-                                .text("positions", "temporal")
-                                .with("start_token", 5_i64)
-                                .with("end_token", 6_i64)
-                                .map(),
-                        )
-                        .map(),
-                )
-                .with(
-                    "denoiser",
-                    Fields::new()
-                        .with("patch_size", 2_i64)
-                        .with("latent_channels", 16_i64)
-                        .with("downsample", 16_i64)
-                        .with("framing_tokens", 2_i64)
-                        .text("image_unconditional", "conditioning")
-                        .with("max_sequence_tokens", 4096_i64)
-                        .text("prediction_dtype", "bfloat16")
-                        .map(),
-                )
-                .with(
-                    "decoder_range",
-                    crate::ffi::list([Any::from(0.0_f64), Any::from(1.0_f64)]),
-                )
-                .into_any(),
-        )?;
-        let model = ImageModel::from_record(&record)?;
-        let processing = model.processing.expect("processing");
-        assert_eq!(
-            processing.injection.map(|value| value.start_token),
-            Some(Some(5))
-        );
-        assert_eq!(model.denoiser, Some(layout(2)));
-        assert_eq!(model.decoder_range, Some((0.0, 1.0)));
-
-        let empty = Record::new(
-            "image.describe",
-            Fields::new()
-                .none("processor")
-                .none("denoiser")
-                .none("decoder_range")
-                .into_any(),
-        )?;
-        assert_eq!(
-            ImageModel::from_record(&empty)?,
-            ImageModel {
-                processing: None,
-                denoiser: None,
-                decoder_range: None,
-            }
-        );
         Ok(())
     }
 }

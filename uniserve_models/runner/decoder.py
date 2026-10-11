@@ -232,6 +232,17 @@ class DecoderRunner:
     # Sizing, answered from configuration.
 
     @staticmethod
+    def value_range(loaded) -> list[float]:
+        """The image decoder's ``[low, high]`` pixel range.
+
+        Empty without an image decoder.
+        """
+        decoder = capability(loaded.module, ImageDecoder)
+        if decoder is None:
+            return []
+        return [float(value) for value in decoder.decoder.value_range]
+
+    @staticmethod
     def frame_rate(loaded) -> int:
         """Output video frames per second."""
         return int(_require(loaded, VideoPostprocessor).frame_rate)
