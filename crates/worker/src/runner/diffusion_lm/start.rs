@@ -376,7 +376,7 @@ impl DiffusionLMRunner {
                 stream,
             });
         }
-        let bindings = bind::bind(interface, startup.workspaces, prepared, startup.peers)?;
+        let bindings = bind::bind(interface, startup.workspaces, prepared)?;
 
         let mut runners = Vec::new();
         for (index, (plan, binding)) in planned.into_iter().zip(&bindings).enumerate() {
