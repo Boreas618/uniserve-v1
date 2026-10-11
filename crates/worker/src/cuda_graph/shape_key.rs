@@ -1,23 +1,41 @@
-//! Capture sizes and serving selection for homogeneous text graphs.
+//! Shape keys of text graphs: what identifies a captured graph, the sizes
+//! startup captures and the bucket serving selects for a forward.
 
 use std::collections::BTreeSet;
 
 use crate::{Error, Result};
 
+/// What identifies a captured text graph besides the runner's fixed table
+/// widths and tensors: the method and its scalar arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShapeKey {
+    /// `decode` of a row bucket.
+    Decode { rows: usize },
+    /// `prefill` of a row and token bucket, with outputs or writing only
+    /// the prefix cache.
+    Prefill {
+        rows: usize,
+        tokens: usize,
+        outputs: bool,
+    },
+    /// `commit` of a row bucket.
+    Commit { rows: usize },
+}
+
 /// One prefill capture, including its extra padding row and attention mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PrefillShape {
+pub(crate) struct PrefillShape {
     /// Flat tokens and rows held by the captured numerical input.
-    pub token_bucket: usize,
-    pub row_bucket: usize,
+    pub(crate) token_bucket: usize,
+    pub(crate) row_bucket: usize,
     /// Least rows served by this bucket: one, or the preceding row bucket.
     /// Startup uses this count to fit scratch KV within the physical pool.
-    pub live_rows: usize,
+    pub(crate) live_rows: usize,
     /// None selects per-row device causality flags.
-    pub causal: Option<bool>,
-    pub embeddings: bool,
+    pub(crate) causal: Option<bool>,
+    pub(crate) embeddings: bool,
     /// False captures KV writes alone, without computing hidden outputs.
-    pub outputs: bool,
+    pub(crate) outputs: bool,
 }
 
 impl PrefillShape {
@@ -26,7 +44,7 @@ impl PrefillShape {
     ///
     /// Cache groups supply `(tokens per page, units per page)`. Page sizes are
     /// positive powers of two; the pool holds at least one page of each group.
-    pub fn scratch_lengths(
+    pub(crate) fn scratch_lengths(
         &self,
         row_tokens: usize,
         pages: &[(usize, usize)],
@@ -110,7 +128,7 @@ fn spread(
 
 /// Fewest units held by independent rows over all cache groups.
 /// Each group supplies `(tokens per page, pool units per page)` in `pages`.
-pub fn prefill_units(pages: &[(usize, usize)], rows: usize, tokens: usize) -> usize {
+pub(crate) fn prefill_units(pages: &[(usize, usize)], rows: usize, tokens: usize) -> usize {
     pages
         .iter()
         .map(|&(page, units)| units * rows.max(tokens.div_ceil(page)))
@@ -121,7 +139,7 @@ pub fn prefill_units(pages: &[(usize, usize)], rows: usize, tokens: usize) -> us
 /// A row bucket needs an extra sequence for padding. Its first token bucket
 /// serves one token per live row; later buckets begin above the previous size.
 #[allow(clippy::too_many_arguments)]
-pub fn prefill_shapes(
+pub(crate) fn prefill_shapes(
     token_sizes: &[usize],
     row_sizes: &[usize],
     max_rows: usize,
@@ -167,7 +185,7 @@ pub fn prefill_shapes(
 
 /// Immutable capture sizes of one text runner. The numerical backend owns
 /// graph objects and fixed buffers; this owner chooses their serving shape.
-pub struct TextShapes {
+pub(crate) struct TextShapes {
     decode: Vec<usize>,
     prefill: Vec<PrefillShape>,
     cache_only: bool,
@@ -175,7 +193,7 @@ pub struct TextShapes {
 }
 
 impl TextShapes {
-    pub fn new(decode: Vec<usize>, prefill: Vec<PrefillShape>) -> Self {
+    pub(crate) fn new(decode: Vec<usize>, prefill: Vec<PrefillShape>) -> Self {
         Self {
             cache_only: prefill.iter().any(|shape| !shape.outputs),
             outputs: prefill.iter().any(|shape| shape.outputs),
@@ -184,11 +202,11 @@ impl TextShapes {
         }
     }
 
-    pub fn decode(&self) -> &[usize] {
+    pub(crate) fn decode(&self) -> &[usize] {
         &self.decode
     }
 
-    pub fn prefill(&self) -> &[PrefillShape] {
+    pub(crate) fn prefill(&self) -> &[PrefillShape] {
         &self.prefill
     }
 
@@ -196,7 +214,7 @@ impl TextShapes {
     /// Decode never borrows a prefill bucket. A cache-only prefill uses a
     /// hidden-state graph only when no cache-only graph family was captured.
     #[allow(clippy::too_many_arguments)]
-    pub fn select(
+    pub(crate) fn select(
         &self,
         queries: &[usize],
         tokens: usize,

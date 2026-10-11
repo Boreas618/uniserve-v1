@@ -15,15 +15,23 @@ everywhere. The tensors of one forward are parameters of its method.
   into one CUDA graph per row bucket and launched without Python.
 - :meth:`CausalLMRunner.commit` installs a forward's accepted selections
   into the slot state; it is captured per row bucket the same way.
-- :meth:`CausalLMRunner.sample` selects tokens of rows whose sampling is not
-  the unshaped greedy selection of ``decode``; it runs eagerly.
 - :meth:`CausalLMRunner.prefill` evaluates rows of any length (prompt
-  chunks, speculative verification) from host tokens.
+  chunks, speculative verification) from host tokens: it gathers their
+  attention metadata, runs the model and, unless the forward only writes
+  the prefix cache, keeps the hidden states and projects each row's last
+  position. It is captured per row and token bucket.
+- :meth:`CausalLMRunner.sample` selects tokens from the logits a forward
+  projected, for rows that do not use the greedy selection of ``decode``.
+  :meth:`CausalLMRunner.verify` projects every position of a verification
+  forward and selects with speculative acceptance, and
+  :meth:`CausalLMRunner.prompt_logprobs` scores prompt tokens. These run
+  eagerly.
 
 Attention operators that plan a launch on the host read the host mirrors of
-the lengths; :meth:`CausalLMRunner.plan_decode` builds their plans before a
-captured decode is launched. Operators driven by device metadata need no
-call between forwards.
+the lengths; :meth:`CausalLMRunner.plan_decode` and
+:meth:`CausalLMRunner.plan_prefill` build their plans before a captured
+forward is launched. Operators driven by device metadata need no call
+between forwards.
 """
 
 from __future__ import annotations
@@ -35,7 +43,6 @@ from typing import Any
 import torch
 
 from uniserve_models.bindings import capturing
-from uniserve_models.interface import graphs
 from uniserve_models.model import (
     EmbeddingReplacement,
     Logits,
@@ -616,213 +623,143 @@ class CausalLMRunner:
                 )
                 transition[:rows].zero_()
 
-    def prefill(
+    def _prefill_attention(
         self,
-        graph,
         rows: int,
-        live: int,
         tokens: int,
         widths: Sequence[int],
         queries: Sequence[int],
         prefixes: Sequence[int],
         starts: Sequence[int],
         causal: Sequence[int],
-        logit_count: int,
-        all_last: int,
-        cache_only: int,
-        sampling: Sequence[int],
-        prompt: Sequence[int],
+        row_columns: torch.Tensor,
+        causal_values: torch.Tensor,
+    ) -> AttentionBatch:
+        """Gather the attention metadata of ``rows`` rows of host tokens."""
+        gather_request_rows(
+            columns=row_columns,
+            rows=rows,
+            tokens=tokens,
+            width=int(max(widths)),
+            request_unit_tables=self._unit_tables,
+            request_start_pages=self._slot_start_pages,
+            table_shapes=self._table_shapes,
+            block_tables=self._block_tables,
+            start_pages=self._start_pages,
+            cache_lengths=self._cache_lengths,
+            query_lengths=self._query_lengths,
+            query_offsets=self._query_offsets,
+            prefix_offsets=self._prefix_offsets,
+            write_indices=self._write_indices,
+        )
+        return self._attention(
+            rows,
+            tokens,
+            widths,
+            queries,
+            prefixes,
+            starts,
+            causal,
+            causal_values,
+        )
+
+    def plan_prefill(
+        self,
+        rows: int,
+        tokens: int,
+        widths: Sequence[int],
+        queries: Sequence[int],
+        prefixes: Sequence[int],
+        starts: Sequence[int],
+        causal: Sequence[int],
+        row_columns: torch.Tensor,
+        causal_values: torch.Tensor,
+    ) -> None:
+        """Plan the attention launches of the next captured prefill.
+
+        The counterpart of :meth:`plan_decode`; the arguments are those of
+        :meth:`prefill`.
+        """
+        with torch.inference_mode(), self._context.activate():
+            attention = self._prefill_attention(
+                int(rows),
+                int(tokens),
+                widths,
+                queries,
+                prefixes,
+                starts,
+                causal,
+                row_columns,
+                causal_values,
+            )
+            self._context.bind_attention(attention)
+
+    def prefill(
+        self,
+        rows: int,
+        tokens: int,
+        widths: Sequence[int],
+        queries: Sequence[int],
+        prefixes: Sequence[int],
+        starts: Sequence[int],
+        causal: Sequence[int],
         axes: int,
-        embedded: int,
+        outputs: int,
         expert_capacity: int,
         row_columns: torch.Tensor,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         causal_values: torch.Tensor,
-        logit_rows: torch.Tensor,
         input_embeddings: torch.Tensor | None,
         embedding_mask: torch.Tensor | None,
-        hidden: torch.Tensor | None,
+        hidden: torch.Tensor,
         logits: torch.Tensor,
-        draws: torch.Tensor,
-        params: torch.Tensor,
-        tasks: torch.Tensor,
-        completion: torch.Tensor,
-        continuation: torch.Tensor,
-        tagged: torch.Tensor,
-        points: torch.Tensor,
-        transition: torch.Tensor,
-        logprobs: torch.Tensor,
-        prompt_tail: torch.Tensor,
     ) -> None:
-        """Evaluate rows of host tokens, then score and sample them.
+        """Evaluate ``rows`` rows of host tokens over their slots' caches.
 
-        ``rows`` and ``tokens`` describe the forward including graph
-        padding, ``live`` its rows that produce results. The caller packed
-        the rows' columns in ``row_columns`` (see
+        The caller packed the rows' columns in ``row_columns`` (see
         :func:`~uniserve_models.nn.attention.gather.gather_request_rows`)
-        and their tokens and positions in ``input_ids`` and ``positions``.
-        ``logit_count`` rows are projected, at the ``logit_rows`` token
-        positions or, with ``all_last``, at every live row's last query
-        token; a ``cache_only`` forward only writes the prefix cache.
-        ``axes`` is the rotary position axes staged (3 for prompts placing
-        vision blocks) and ``embedded`` replaces the masked tokens'
-        embeddings with ``input_embeddings``. ``prompt`` is the prompt
-        scoring descriptor (:meth:`_score_prompts`) and ``sampling`` the
-        sampling descriptor (:meth:`sample`), each empty when unused.
+        and their tokens and positions in ``input_ids`` and ``positions``;
+        a padding row has no token or holds the padding tokens, and writes
+        no cache entry. The forward writes the rows' keys and values to the
+        prefix cache. With ``outputs`` it also writes every token's hidden
+        state and each row's last-position logits; :meth:`sample` selects
+        from those logits, and :meth:`verify` and :meth:`prompt_logprobs`
+        project other positions from the hidden states.
 
-        FIXME: with ``graph`` (a graph of :meth:`capture_prefill`) the
-        model forward is replayed from Python between the gather and the
-        projection. The gather and the last-position projection belong
-        inside the graph, launched by the caller; scoring and sampling
-        belong in calls of their own.
+        Args:
+            rows: Rows evaluated, padding included.
+            tokens: Tokens evaluated, padding included.
+            widths: Pages each numerical block table holds per row.
+            queries: Each row's token count, mirrored on the host.
+            prefixes: Each row's cache length, mirrored on the host.
+            starts: First selected pages ``[table][row]``, mirrored on the
+                host; read for windowed tables.
+            causal: Each row's causality; a vision block attends to all of
+                itself.
+            axes: Rotary position axes the rows carry: 1, or 3 for prompts
+                placing vision blocks.
+            outputs: Whether the forward keeps hidden states and logits.
+            expert_capacity: The agreed per-rank token capacity of the
+                expert step this forward runs as; zero for a model without
+                expert-parallel layers.
+            row_columns: The packed int64 row columns.
+            input_ids: ``[T]`` int64 tokens.
+            positions: ``[3, T]`` int64 positions, axis-major.
+            causal_values: ``[R]`` int32 causality of rows that differ.
+            input_embeddings: ``[T, hidden]`` vision features replacing the
+                embeddings of the tokens ``embedding_mask`` (``[T]`` uint8)
+                marks, or ``None`` for a prompt without them.
+            hidden: ``[T, hidden]`` output, every token's hidden state.
+            logits: ``[R, local vocab]`` output, each row's last-position
+                logits.
+
+        The host mirrors serve an eager forward and the capture; a launched
+        graph reads the device columns.
         """
-        rows, live, tokens = int(rows), int(live), int(tokens)
-        with torch.inference_mode(), self._context.activate():
-            gather_request_rows(
-                columns=row_columns,
-                rows=rows,
-                tokens=tokens,
-                width=int(max(widths)),
-                request_unit_tables=self._unit_tables,
-                request_start_pages=self._slot_start_pages,
-                table_shapes=self._table_shapes,
-                block_tables=self._block_tables,
-                start_pages=self._start_pages,
-                cache_lengths=self._cache_lengths,
-                query_lengths=self._query_lengths,
-                query_offsets=self._query_offsets,
-                prefix_offsets=self._prefix_offsets,
-                write_indices=self._write_indices,
-            )
-            attention = self._attention(
-                rows,
-                tokens,
-                widths,
-                queries,
-                prefixes,
-                starts,
-                causal,
-                causal_values,
-            )
-            self._context.bind_attention(attention, replay=graph is not None)
-
-            states = None
-            if graph is not None:
-                graph.replay()
-                if hidden is not None and not cache_only:
-                    states = hidden[:tokens]
-            else:
-                inputs = self._inputs(
-                    tokens,
-                    axes,
-                    attention,
-                    input_ids,
-                    positions,
-                    input_embeddings if embedded else None,
-                    embedding_mask,
-                )
-                with self._context.expert_step(int(expert_capacity)):
-                    if cache_only:
-                        self._model.fill_cache(inputs)
-                    else:
-                        states = self._model(inputs)
-
-            if cache_only or not logit_count:
-                return
-            count = int(logit_count)
-            if all_last:
-                indices = self._query_offsets[1 : live + 1].to(torch.int64) - 1
-            else:
-                indices = logit_rows[:count]
-            # FIXME: more rows than the logits tensor holds (a verification
-            # or a scored prompt of many tokens) are projected into a
-            # tensor allocated here.
-            out = logits[:count] if count <= logits.shape[0] else None
-            candidates = self._project(states, indices, count, out)
-
-            if prompt:
-                self._score_prompts(
-                    candidates, prompt, input_ids, logprobs, prompt_tail
-                )
-            if sampling:
-                self._sample(
-                    candidates,
-                    sampling,
-                    draws,
-                    params,
-                    tasks,
-                    completion,
-                    continuation,
-                    tagged,
-                    points,
-                    transition,
-                    logprobs,
-                )
-
-    def _inputs(
-        self,
-        tokens: int,
-        axes: int,
-        attention: AttentionBatch,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        input_embeddings: torch.Tensor | None,
-        embedding_mask: torch.Tensor | None,
-    ) -> TextInput:
-        """The model input of ``tokens`` host tokens."""
-        embeddings = None
-        if input_embeddings is not None and embedding_mask is not None:
-            embeddings = EmbeddingReplacement(
-                input_embeddings[:tokens],
-                embedding_mask[:tokens].view(torch.bool),
-            )
-        return TextInput(
-            input_ids[:tokens],
-            positions[0, :tokens]
-            if int(axes) == 1
-            else positions[: int(axes), :tokens],
-            attention,
-            embeddings,
-        )
-
-    def capture_prefill(
-        self,
-        rows: int,
-        tokens: int,
-        widths: Sequence[int],
-        queries: Sequence[int],
-        prefixes: Sequence[int],
-        starts: Sequence[int],
-        causal: Sequence[int],
-        cache_only: int,
-        pool,
-        expert_capacity: int,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        causal_values: torch.Tensor,
-        hidden: torch.Tensor | None,
-    ) -> list[Any]:
-        """Capture the model forward of the shapes the last prefill ran.
-
-        The graph reads the gathered metadata and ``input_ids`` and
-        ``positions``, and writes ``hidden`` or, for a ``cache_only``
-        forward, only the prefix cache. With ``expert_capacity``, the graph
-        is the expert step of that capacity, including the joins of expert
-        layers the forward does not reach.
-
-        Returns:
-            ``[graph, executables]`` (:func:`graphs.export`).
-        """
-        if self._stream is None:
-            raise ValueError("graph capture requires a CUDA stream")
-        if hidden is None and not cache_only:
-            raise ValueError("a forward with outputs writes its hidden states")
         rows, tokens = int(rows), int(tokens)
-        output = None if cache_only else hidden
-        context = self._context
-        with torch.inference_mode():
-            attention = self._attention(
+        with torch.inference_mode(), self._context.activate():
+            attention = self._prefill_attention(
                 rows,
                 tokens,
                 widths,
@@ -830,28 +767,37 @@ class CausalLMRunner:
                 prefixes,
                 starts,
                 causal,
+                row_columns,
                 causal_values,
             )
-            context.bind_attention(attention)
-            inputs = self._inputs(
-                tokens, 1, attention, input_ids, positions, None, None
+            if not capturing(self._device):
+                self._context.bind_attention(attention)
+
+            embeddings = None
+            if input_embeddings is not None and embedding_mask is not None:
+                embeddings = EmbeddingReplacement(
+                    input_embeddings[:tokens],
+                    embedding_mask[:tokens].view(torch.bool),
+                )
+            inputs = TextInput(
+                input_ids[:tokens],
+                positions[0, :tokens]
+                if int(axes) == 1
+                else positions[: int(axes), :tokens],
+                attention,
+                embeddings,
             )
 
-        def body():
-            with context.activate(), context.expert_step(int(expert_capacity)):
-                if output is None:
+            with self._context.expert_step(int(expert_capacity)):
+                if not outputs:
                     self._model.fill_cache(inputs)
-                else:
-                    output[:tokens].copy_(self._model(inputs))
-
-        segments = None
-        if context.weights is not None:
-            segments = context.weights.capture
-        return graphs.export(
-            graphs.capture(
-                body, stream=self._stream, pool=pool, segments=segments
-            )
-        )
+                    return
+                states = hidden[:tokens].copy_(self._model(inputs))
+                # A row without tokens repeats the position before it.
+                indices = (
+                    self._query_offsets[1 : rows + 1].to(torch.int64) - 1
+                ).clamp_min(0)
+                self._project(states, indices, rows, logits[:rows])
 
     # Selection.
 
@@ -908,7 +854,9 @@ class CausalLMRunner:
         """Select the tokens of the tasks sampling ``logits[:rows]``.
 
         Args:
-            rows: Candidate rows a forward wrote to ``logits``.
+            rows: Candidate rows a forward wrote to ``logits``: the rows of
+                a decode, or of a prefill, whose logits are their last
+                positions.
             words: The sampling descriptor: ``[task count, group count]``,
                 ``GROUP_FIELDS`` words per group, then one record per task
                 (:func:`decode_tasks`).
@@ -927,6 +875,53 @@ class CausalLMRunner:
         with torch.inference_mode(), self._context.activate():
             self._sample(
                 logits[: int(rows)],
+                words,
+                draws,
+                params,
+                tasks,
+                completion,
+                continuation,
+                tagged,
+                points,
+                transition,
+                logprobs,
+            )
+
+    def _candidates(
+        self, count: int, hidden: torch.Tensor, logit_rows: torch.Tensor
+    ) -> torch.Tensor:
+        """The logits of ``count`` token positions of a forward."""
+        return self._project(hidden, logit_rows[:count], count, None)
+
+    def verify(
+        self,
+        count: int,
+        words: Sequence[int],
+        hidden: torch.Tensor,
+        logit_rows: torch.Tensor,
+        draws: torch.Tensor,
+        params: torch.Tensor,
+        tasks: torch.Tensor,
+        completion: torch.Tensor,
+        continuation: torch.Tensor,
+        tagged: torch.Tensor,
+        points: torch.Tensor,
+        transition: torch.Tensor,
+        logprobs: torch.Tensor,
+    ) -> None:
+        """Verify the draft tokens of a verification forward.
+
+        A verification row evaluates its request's next token followed by
+        draft tokens. This projects the ``count`` token positions
+        ``logit_rows`` of the forward's ``hidden`` states, one candidate row
+        per position, and selects each task's tokens with speculative
+        acceptance: the accepted draft prefix and the token after it. The
+        remaining arguments are those of :meth:`sample`, whose tasks index
+        these candidate rows.
+        """
+        with torch.inference_mode(), self._context.activate():
+            self._sample(
+                self._candidates(int(count), hidden, logit_rows),
                 words,
                 draws,
                 params,
@@ -1064,47 +1059,61 @@ class CausalLMRunner:
         points[first:end].copy_(selection.points)
         transition[first:end].copy_(selection.transition)
 
-    def _score_prompts(
-        self, candidates, descriptor, input_ids, logprobs, prompt_tail
+    def prompt_logprobs(
+        self,
+        count: int,
+        prompt: Sequence[int],
+        hidden: torch.Tensor,
+        logit_rows: torch.Tensor,
+        input_ids: torch.Tensor,
+        logprobs: torch.Tensor,
+        prompt_tail: torch.Tensor,
     ) -> None:
-        """Score prompt chunks into logprob words and retained tail rows.
+        """Score the prompt tokens of a prefill forward.
 
-        Each record is ``[row, count, token, continued, slot, words, tail,
-        top, requested, ids...]``: the chunk's candidate rows and input
-        tokens, what predicts its first token (nothing for 0, the slot's
-        retained logits for 1, candidate row ``continued - 2`` otherwise:
-        the vision block before it), the logprob words it writes and the
-        tail row its last logits go to. A record of no rows only retains
-        candidate row ``row`` (a prompt ending with a vision block).
+        This projects the ``count`` token positions ``logit_rows`` of the
+        forward's ``hidden`` states into candidate rows and scores each
+        prompt chunk ``prompt`` describes into ``logprobs``, retaining the
+        chunk's last logits in ``prompt_tail`` for the chunk after it.
+
+        Each record of ``prompt`` is ``[row, count, token, continued, slot,
+        words, tail, top, requested, ids...]``: the chunk's candidate rows
+        and input tokens, what predicts its first token (nothing for 0, the
+        slot's retained logits for 1, candidate row ``continued - 2``
+        otherwise: the vision block before it), the logprob words it writes
+        and the tail row its last logits go to. A record of no rows only
+        retains candidate row ``row`` (a prompt ending with a vision block).
         """
-        cursor = _Cursor(descriptor)
-        while not cursor.done():
-            row, count, token, continued, slot, words, tail = cursor.take(7)
-            top = cursor.next()
-            ids = cursor.take(cursor.next())
-            if not count:
-                prompt_tail[tail].copy_(
-                    self._gathered(candidates[row : row + 1])[0]
+        with torch.inference_mode(), self._context.activate():
+            candidates = self._candidates(int(count), hidden, logit_rows)
+            cursor = _Cursor(prompt)
+            while not cursor.done():
+                row, rows, token, continued, slot, words, tail = cursor.take(7)
+                top = cursor.next()
+                ids = cursor.take(cursor.next())
+                if not rows:
+                    prompt_tail[tail].copy_(
+                        self._gathered(candidates[row : row + 1])[0]
+                    )
+                    continue
+                scored = self._gathered(candidates[row : row + rows])
+                if continued == 1:
+                    previous = self._prompt_logits[slot]
+                elif continued > 1:
+                    previous = self._gathered(
+                        candidates[continued - 2 : continued - 1]
+                    )[0]
+                else:
+                    previous = None
+                retained, packed = prompt_logprobs(
+                    input_ids[token : token + rows],
+                    scored,
+                    previous,
+                    LogprobRequest(top, ids),
                 )
-                continue
-            logits = self._gathered(candidates[row : row + count])
-            if continued == 1:
-                previous = self._prompt_logits[slot]
-            elif continued > 1:
-                previous = self._gathered(
-                    candidates[continued - 2 : continued - 1]
-                )[0]
-            else:
-                previous = None
-            retained, packed = prompt_logprobs(
-                input_ids[token : token + count],
-                logits,
-                previous,
-                LogprobRequest(top, ids),
-            )
-            prompt_tail[tail].copy_(retained)
-            if packed is not None:
-                logprobs[words : words + int(packed.numel())].copy_(packed)
+                prompt_tail[tail].copy_(retained)
+                if packed is not None:
+                    logprobs[words : words + int(packed.numel())].copy_(packed)
 
     # Slot state.
 
