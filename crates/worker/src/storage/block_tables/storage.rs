@@ -7,6 +7,7 @@ use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d32};
 use super::{BlockTableUpdate, GroupShape};
 use crate::ffi::{Backing, DType, Device};
 use crate::storage::memory::{Memory, StorageView};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// Byte alignment of each carved table inside the shared allocation.
@@ -223,7 +224,7 @@ impl BlockTableStorage {
     /// tail of a longer previous row), then start pages and lengths. The
     /// host payload is consumed during the call, so installs never wait on
     /// the device. Commit the update on the host after this succeeds.
-    pub fn install(&self, update: &BlockTableUpdate, stream: Option<&Stream>) -> Result<()> {
+    pub fn install(&self, update: &BlockTableUpdate, stream: impl Issue) -> Result<()> {
         let width = self.width as usize;
         let mut payload: Vec<i32> = Vec::with_capacity(
             update.rows.len() * width + update.start_values.len() + update.length_values.len(),
@@ -275,37 +276,22 @@ impl BlockTableStorage {
         &self,
         entries: &[(u64, usize, usize)],
         payload: &[i32],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
-        match (self.device, stream) {
-            (Some(_), Some(stream)) => {
-                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                for &(address, first, words) in entries {
-                    batch.push(address, payload[first..].as_ptr() as u64, words * 4);
-                }
-                // SAFETY: destinations lie inside this allocation and never
-                // overlap (one entry per changed row, start and slot length);
-                // the driver reads the pageable payload during the call.
-                unsafe { batch.submit(stream) }.map_err(Error::from)
-            }
-            (None, None) => {
-                for &(address, first, words) in entries {
-                    // SAFETY: host tables owned by this value; the caller
-                    // serializes table writes with their readers.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            payload[first..].as_ptr(),
-                            address as *mut i32,
-                            words,
-                        );
-                    }
-                }
-                Ok(())
-            }
-            _ => Err(Error::Invalid(
+        if self.device.is_some() != stream.stream().is_some() {
+            return Err(Error::Invalid(
                 "block-table writes use a stream exactly for device tables".into(),
-            )),
+            ));
         }
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        for &(address, first, words) in entries {
+            batch.push(address, payload[first..].as_ptr() as u64, words * 4);
+        }
+        // SAFETY: destinations lie inside this allocation and never overlap
+        // (one entry per changed row, start and slot length); the payload
+        // is read during the call. Host tables are written in the order of
+        // their readers.
+        unsafe { stream.copy(&batch) }
     }
 
     /// Zero released slots' rows, start pages and lengths on `stream`, which
