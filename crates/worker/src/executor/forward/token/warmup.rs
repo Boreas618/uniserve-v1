@@ -286,7 +286,11 @@ fn step(
 ) -> Result<()> {
     let (tables, cache) = kv.split();
     let request = StepRequest {
-        decode,
+        mode: if decode {
+            ForwardMode::Decode
+        } else {
+            ForwardMode::Prefill
+        },
         rows,
         finish_ids: &[],
         sampling: None,
