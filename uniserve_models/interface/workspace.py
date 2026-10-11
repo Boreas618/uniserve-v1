@@ -27,8 +27,33 @@ from types import MappingProxyType
 import torch
 
 from uniserve_models.bindings import capturing
-from uniserve_models.bindings.context import role_name
+from uniserve_models.bindings.context import (
+    ExecutionContext,
+    role_name,
+)
 from uniserve_models.tensors import BufferConfig
+
+
+def execution_context(
+    module, stream: int, attention: str, allocate, name: str
+) -> ExecutionContext:
+    """An execution context of ``module`` on a caller's stream.
+
+    ``stream`` is the CUDA stream handle the context enqueues on (0 for the
+    current stream), ``attention`` the attention backend the model loaded
+    with and ``allocate`` the caller's allocation function, which serves the
+    context's workspace under ``name`` (see :class:`RuntimeWorkspace`).
+    """
+    return ExecutionContext(
+        module,
+        stream=int(stream) if stream else None,
+        attention=attention,
+        vsa="auto",
+        matmul="auto",
+        moe="auto",
+        derive_host_lengths=False,
+        workspace=RuntimeWorkspace(allocate, name),
+    )
 
 
 class RuntimeWorkspace:

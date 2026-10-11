@@ -4,20 +4,27 @@ pub(crate) mod allocate;
 pub(crate) mod attention;
 pub(crate) mod canvas;
 pub(crate) mod decoder;
+pub(crate) mod denoiser;
 pub(crate) mod diffusion;
 pub(crate) mod encoder;
 mod graph_shapes;
+pub(crate) mod media;
 pub(crate) mod text;
-pub(crate) mod video;
 pub(crate) mod vision;
 
 pub use graph_shapes::{PrefillShape, TextShapes, prefill_shapes, prefill_units};
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::sync::Arc;
 
+use tvm_ffi::Any;
+use uniserve_cuda::Stream;
 use uniserve_ipc::{Call, CallKind};
 
+use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list};
+use crate::model::interface::Interface;
+use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
 
 /// Per-sequence language output, independently of the input's cache writes.
@@ -169,4 +176,101 @@ impl<R> ModelRunners<R> {
     fn route(&self, component: &str, kind: CallKind) -> Option<usize> {
         self.routes.get(component)?.get(&kind).copied()
     }
+}
+
+/// What the Python runners of one module are constructed with.
+pub(crate) struct RunnerSetup<'a> {
+    pub(crate) interface: &'a Interface,
+    pub(crate) loaded: &'a Handle,
+    /// The module's path in the model.
+    pub(crate) path: &'a str,
+    pub(crate) stream: Stream,
+    pub(crate) device: i32,
+    pub(crate) attention: String,
+    /// The worker's workspace allocation function.
+    pub(crate) allocate: tvm_ffi::Function,
+}
+
+/// The Python runners of one module: their constructor's fixed arguments
+/// and their methods, each called with a runner first.
+pub(crate) struct Methods {
+    pub(crate) construct: Function,
+    pub(crate) loaded: Handle,
+    pub(crate) path: String,
+    pub(crate) stream: Stream,
+    pub(crate) attention: String,
+    pub(crate) allocate: tvm_ffi::Function,
+    pub(crate) forward: Function,
+    pub(crate) kernels: Function,
+    pub(crate) close: Function,
+}
+
+impl Methods {
+    /// The methods of the runner class at import path `class`, whose
+    /// forward method is `forward`.
+    pub(crate) fn new(setup: &RunnerSetup<'_>, class: &str, forward: &str) -> Result<Self> {
+        let method = |name: &str| setup.interface.import(&format!("{class}.{name}"));
+        Ok(Self {
+            construct: setup.interface.import(class)?,
+            loaded: setup.loaded.clone(),
+            path: setup.path.to_owned(),
+            stream: setup.stream.clone(),
+            attention: setup.attention.clone(),
+            allocate: setup.allocate.clone(),
+            forward: method(forward)?,
+            kernels: method("kernels")?,
+            close: method("close")?,
+        })
+    }
+
+    /// Construct the runner of `size`.
+    pub(crate) fn runner(&self, size: impl IntoIterator<Item = i64>) -> Result<Handle> {
+        Handle::new(self.construct.call_values(&[
+            self.loaded.to_any(),
+            Any::from(tvm_ffi::String::from(self.path.as_str())),
+            Any::from(self.stream.raw() as i64),
+            Any::from(tvm_ffi::String::from(self.attention.as_str())),
+            Any::from(self.allocate.clone()),
+            Any::from(integer_list(size)),
+        ])?)
+    }
+
+    /// The kernels the operators of `runners` selected.
+    pub(crate) fn kernels<'a>(
+        &self,
+        label: &str,
+        runners: impl IntoIterator<Item = &'a Handle>,
+    ) -> Result<Vec<Record>> {
+        let mut values: Vec<Any> = Vec::new();
+        for runner in runners {
+            let records: tvm_ffi::Array<Any> = self.kernels.call_as(&[runner.view()])?;
+            values.extend(records.iter());
+        }
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+            .collect()
+    }
+
+    /// Close `runners`; an aborted close keeps what device work may still
+    /// address.
+    pub(crate) fn close<'a>(
+        &self,
+        aborted: bool,
+        runners: impl IntoIterator<Item = &'a Handle>,
+    ) -> Result<()> {
+        let flag = Any::from(aborted);
+        let mut result = Ok(());
+        for runner in runners {
+            result = result.and(self.close.invoke(&[runner.view(), (&flag).into()]));
+        }
+        result
+    }
+}
+
+pub(crate) fn device_buffer(device: i32, dtype: DType, shape: &[i64]) -> Result<StorageView> {
+    let elements: i64 = shape.iter().product();
+    let memory = Memory::device(device, (elements as usize * dtype.bytes()).max(1))?;
+    StorageView::contiguous(memory as Arc<dyn Backing>, 0, dtype, shape)
 }

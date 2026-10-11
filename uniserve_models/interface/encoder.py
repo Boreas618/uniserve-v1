@@ -1,14 +1,15 @@
-"""Encoder bindings: vision patch encoders, latent encoders, text encoders.
+"""Encoder bindings of image models: vision patch and latent encoders.
 
 The worker's ``EncoderRunner`` (``crates/worker/src/runner/encoder.rs``)
 serves one encoder call of a bound component: the module at ``path``
-within the binding's root (``""`` for the root itself, ``"vision"`` for a
-text encoder's vision tower bound with it). Two table entries serve it:
+within the binding's root (``""`` for the root itself). Two table entries
+serve it:
 
 - ``encoder.describe(loaded, path, dtype)`` reports, before the encoder's
   component is bound, the facts the worker sizes the binding, the
   encoder's buffers and its calls with (``path`` is the module's path in
-  the model).
+  the model). It also describes a text encoder, whose forward is
+  ``uniserve_models.runner.encoder.EncoderRunner``.
 - ``encoder.bind(prepared, loaded, path, buffers)`` binds the worker's
   buffers once and returns the encoder's step functions.
 
@@ -32,10 +33,6 @@ Vision (``PatchEncoder``) functions:
 
 - ``encode(images, out) -> shapes``: encode unpacked images, one product
   region per image.
-- ``encode_patches(rows, grids, out) -> shapes``: encode vision blocks
-  whose patch rows are already packed (a product region holding every
-  block's rows back to back), one ``[time, height, width]`` patch grid and
-  one product region per block.
 - ``prepare_resident(image, tower, signed_unit) -> prepared``: prepare a
   resident image product (a region) for encoding.
 - ``warm(side)``: encode a black ``side`` x ``side`` image through the
@@ -56,30 +53,11 @@ Latent (``PatchAutoencoder``) functions: ``encode(images, out) -> shapes``
 encodes images of one pixel shape into latent patch rows; ``warm`` and
 ``prepare_resident`` as above. A latent encoder that samples its posterior
 draws from the device's default generator, as every encode does.
-
-Text (``TextEncoder``) functions bind ``tokens`` ``[capacity]`` int64,
-``features`` ``[capacity, hidden]`` and, for an encoder that places vision
-tokens, ``positions`` ``[3, capacity]`` int64; ``capacity`` is the largest
-text capacity. The worker writes a prompt's token ids, zero-padded to the
-call's capacity, into ``tokens``.
-
-- ``text_positions(capacity, token_ids, image_grids, video_grids)`` writes
-  the prompt's rotary coordinates into ``positions``.
-- ``encode_text(capacity, count, graph, positions, visual, out) -> shape``
-  encodes ``tokens[:capacity]`` (replaying ``graph`` when given), with the
-  bound positions when ``positions`` is nonzero and the vision rows of the
-  ``visual`` region when given, and writes the first ``count`` feature rows
-  to ``out``. Causal attention keeps the padding out of those rows. On a
-  pipeline stage without features the call writes nothing and returns an
-  empty shape.
-- ``capture_text(capacity, pool) -> graph`` captures the text-only encode
-  of one capacity; ``release(graph)`` drops it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from math import prod
 from typing import Any, cast
 
 import torch
@@ -218,7 +196,9 @@ def bind(
             cast(PatchAutoencoder, module), loaded, context, tensors
         )
     else:
-        steps = _text(cast(TextEncoder, module), context, tensors)
+        raise NotImplementedError(
+            "a text encoder computes through its runner, not a binding"
+        )
     return binding(steps)
 
 
@@ -241,12 +221,6 @@ def _device_grid(
     if device.type == "cuda":
         grid = grid.pin_memory()
     return grid.to(device, non_blocking=True)
-
-
-def _grid(values: Sequence[int]) -> tuple[int, int, int]:
-    """A vision block's patch grid as integers."""
-    # The worker sends three extents per block; the encoder reads them.
-    return cast("tuple[int, int, int]", tuple(int(value) for value in values))
 
 
 def _warm(loaded, context, tower: Tower, run):
@@ -317,31 +291,8 @@ def _vision(encoder: PatchEncoder, loaded, context, tensors):
                 for value, region in zip(features, out, strict=True)
             ]
 
-    def encode_patches(rows, grids: Sequence, out: Sequence) -> list:
-        shapes = [tuple(int(extent) for extent in grid) for grid in grids]
-        if len(shapes) != len(out):
-            raise ValueError("vision blocks and products must align")
-        with calls.scope(context):
-            # Each block is one packed sample: its patch rows and its grid,
-            # which the encoder also takes as a [1, 3] device tensor.
-            samples = regions.view(products, rows).split(
-                [prod(shape) for shape in shapes]
-            )
-            features = encoder.encode(
-                VisionInput(
-                    tuple(samples),
-                    tuple(_device_grid(shape, device) for shape in shapes),
-                    tuple(shapes),
-                )
-            )
-            return [
-                calls.write(regions.view(products, region), value)
-                for value, region in zip(features, out, strict=True)
-            ]
-
     steps: dict[str, Callable[..., Any]] = {
         "encode": encode,
-        "encode_patches": encode_patches,
         "prepare_resident": _resident(loaded, context, products),
         "warm": _warm(loaded, context, "vit", lambda image: run((image,))),
     }
@@ -448,87 +399,4 @@ def _latent(autoencoder: PatchAutoencoder, loaded, context, tensors):
         "encode": encode,
         "prepare_resident": _resident(loaded, context, products),
         "warm": _warm(loaded, context, "vae", lambda image: run((image,))),
-    }
-
-
-def _text(encoder: TextEncoder, context, tensors):
-    products = tensors["products"]
-    tokens, features = tensors["tokens"], tensors["features"]
-    positions = tensors.get("positions")
-    # Whether this pipeline stage computes the final features; captured
-    # replays of a stage without them write nothing.
-    final = {"stage": True}
-
-    def compute(capacity: int, place: bool, visual) -> bool:
-        options: dict[str, Any] = {}
-        if place:
-            if positions is None:
-                raise ValueError("this text encoder places no vision tokens")
-            options["positions"] = (positions[:, :capacity],)
-        if visual is not None:
-            options["visual"] = (visual,)
-        values = encoder.encode((tokens[:capacity],), **options)
-        final["stage"] = values is not None
-        if values is None:
-            # A pipeline stage without the final layers has no features.
-            return False
-        features[:capacity].copy_(values[0])
-        return True
-
-    def text_positions(
-        capacity: int,
-        token_ids: Sequence[int],
-        image_grids: Sequence[Sequence[int]],
-        video_grids: Sequence[Sequence[int]],
-    ) -> None:
-        if positions is None:
-            raise ValueError("this text encoder places no vision tokens")
-        capacity = int(capacity)
-        values = encoder.positions(
-            [int(token) for token in token_ids],
-            image_grids=[_grid(grid) for grid in image_grids],
-            video_grids=[_grid(grid) for grid in video_grids],
-        )
-        if values.shape != (3, capacity):
-            raise ValueError("rotary coordinates must cover the capacity")
-        with calls.scope(context):
-            positions[:, :capacity].copy_(values, non_blocking=True)
-
-    def encode_text(
-        capacity: int, count: int, graph, place: int, visual, out
-    ) -> list:
-        capacity, count = int(capacity), int(count)
-        if not 0 < count <= capacity <= tokens.numel():
-            raise ValueError("text encoder input exceeds its token capacity")
-        with calls.scope(context):
-            if graph is not None:
-                graph.replay()
-                if not final["stage"]:
-                    return []
-            elif not compute(
-                capacity,
-                bool(place),
-                None if visual is None else regions.view(products, visual),
-            ):
-                return []
-            return calls.write(regions.view(products, out), features[:count])
-
-    def capture_text(capacity: int, pool) -> list[Any]:
-        capacity = int(capacity)
-        with calls.scope(context):
-            compute(capacity, False, None)
-        return graphs.export(
-            graphs.capture(
-                lambda: compute(capacity, False, None),
-                stream=context.stream
-                or torch.cuda.current_stream(context.device),
-                pool=pool,
-            )
-        )
-
-    return {
-        "text_positions": text_positions,
-        "encode_text": encode_text,
-        "capture_text": capture_text,
-        "release": lambda graph: graph.release(),
     }

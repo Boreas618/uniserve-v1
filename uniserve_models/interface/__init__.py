@@ -36,8 +36,6 @@ _AREAS = (
     "profiling",
     "runtime",
     "text",
-    "video",
-    "media",
 )
 
 

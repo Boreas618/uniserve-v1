@@ -35,6 +35,7 @@ STARTUP_ENTRIES = {
     "profiling.start",
     "profiling.stop",
     "runtime.freeze_gc",
+    "runtime.import",
 }
 
 
