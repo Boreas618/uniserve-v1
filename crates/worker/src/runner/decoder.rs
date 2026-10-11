@@ -386,6 +386,12 @@ impl ImageDecoder {
     /// order) to `stage`, which must enqueue their consumption on the
     /// runner's stream before it returns: the next sub-batch reuses the
     /// staging bytes.
+    ///
+    /// FIXME: every sub-batch is one eager Python call. A graph per (size,
+    /// count) needs fixed latent rows, a runner-owned buffer of decoded
+    /// values with native copies to the product regions, and a bound on
+    /// the activations each captured size retains; a decoder on a
+    /// generation tower returns its pixels through a delivery stream.
     fn decode(
         &self,
         images: &[DecodeImage],
