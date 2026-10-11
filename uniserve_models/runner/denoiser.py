@@ -85,7 +85,6 @@ from uniserve_models.diffusion import (
     advance_,
     normal_noise,
 )
-from uniserve_models.interface import regions
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
 from uniserve_models.media import image, video
@@ -445,7 +444,6 @@ class DenoiserRunner:
     _pipeline: Any
     _samples: torch.Tensor
     _slot_timesteps: torch.Tensor
-    _products: torch.Tensor
     _unit_tables: torch.Tensor
     _slot_start_pages: torch.Tensor
     _table_shapes: torch.Tensor
@@ -500,7 +498,6 @@ class DenoiserRunner:
         windowed: Sequence[int],
         samples: torch.Tensor,
         slot_timesteps: torch.Tensor,
-        products: torch.Tensor,
         unit_tables: torch.Tensor,
         start_pages: torch.Tensor,
         table_shapes: torch.Tensor,
@@ -524,8 +521,6 @@ class DenoiserRunner:
                 before a step and from which it scatters them after it.
             slot_timesteps: The latent pool's ``[slots + 1, 1]`` float32
                 per-slot timesteps the solver update reads.
-            products: The device's uint8 product arena, in which latent
-                feature products are regions.
             unit_tables: ``[tables, S, units]`` int32, each slot's installed
                 units from its installed start page on.
             start_pages: ``[groups, S]`` int32, each slot's installed start
@@ -555,7 +550,6 @@ class DenoiserRunner:
         runner._windowed = tuple(bool(value) for value in windowed)
         runner._samples = samples
         runner._slot_timesteps = slot_timesteps
-        runner._products = products
         runner._unit_tables = unit_tables
         runner._slot_start_pages = start_pages
         runner._table_shapes = table_shapes
@@ -1027,8 +1021,8 @@ class DenoiserRunner:
 
         A video denoiser takes ``(layout, size, conditions, spans,
         condition_noise, out, counts, *rows)``. An image denoiser takes
-        the arguments of :meth:`denoise` and ``features``, one latent
-        feature product region per row: row ``i`` reads ``features[i]``
+        the arguments of :meth:`denoise` and ``*features``, one latent
+        feature product tensor per row: row ``i`` reads ``features[i]``
         instead of samples, at timestep zero, and writes its keys and
         values after its slot's visible tokens; its prediction is computed
         and unused.
@@ -1529,7 +1523,7 @@ class DenoiserRunner:
             values = (
                 self._samples[offset : offset + units]
                 if features is None
-                else regions.view(self._products, features[index])
+                else features[index]
             )
             latents.append(LatentInput(values, timesteps[index : index + 1]))
         # The denoiser binds its inputs inside the forward: whatever it
@@ -1630,7 +1624,7 @@ class DenoiserRunner:
         prefixes: Sequence[int],
         starts: Sequence[int],
         widths: Sequence[int],
-        features: Sequence,
+        *features: torch.Tensor,
     ) -> None:
         described = _image_rows(rows)
         if len(features) != len(described):

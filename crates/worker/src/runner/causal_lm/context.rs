@@ -24,7 +24,7 @@ use uniserve_ipc::{Call, ForwardBatch};
 
 use crate::executor::PendingOutput;
 use crate::executor::forward::batch::image::ImageParts;
-use crate::ffi::{Device, Region};
+use crate::ffi::Device;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};
 use crate::runner::denoiser::image::ConditionRow;
@@ -409,7 +409,7 @@ pub(super) fn visual(
                 "image state query span exceeds the call token bound".into(),
             ));
         }
-        let features = Region::within(image.arena(diffusion_device(diffusion))?, read.value())?;
+        let features = read.value().clone();
         let row = TokenRow {
             slot,
             source: RowSource::Placed {
@@ -464,11 +464,4 @@ pub(super) fn visual(
             latent: None,
         },
     ))
-}
-
-fn diffusion_device(diffusion: &crate::runner::denoiser::image::ImageDiffusion) -> Device {
-    match diffusion.device() {
-        crate::config::Device::Cuda(index) => Device::Cuda(index),
-        crate::config::Device::Cpu => Device::Cpu,
-    }
 }

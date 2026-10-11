@@ -17,7 +17,7 @@ from typing import Any, cast
 import torch
 
 from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.interface import calls, regions
+from uniserve_models.interface import calls
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
 from uniserve_models.media.pixels import (
@@ -102,9 +102,8 @@ class EncoderRunner:
 
     # The encoder, of one of the capability classes :meth:`encode` lists.
     _module: Any
-    # The loaded model and the product arena of an image model's encoder.
+    # The loaded model of an image model's encoder.
     _loaded: Any = None
-    _products: Any = None
 
     def __init__(
         self,
@@ -156,16 +155,13 @@ class EncoderRunner:
         return runner
 
     @classmethod
-    def bound(
-        cls, prepared, path: str, loaded=None, products=None
-    ) -> EncoderRunner:
+    def bound(cls, prepared, path: str, loaded) -> EncoderRunner:
         """A runner of the encoder at ``path`` of a bound component.
 
         ``path`` is relative to the component's root (``""`` for the root
         itself); the runner computes with the component's execution
-        context. It takes ``loaded``, whose image policy prepares resident
-        images, and ``products``, the device's uint8 product arena in which
-        its products are regions.
+        context. ``loaded`` is the loaded model, whose image policy
+        prepares resident images.
         """
         # FIXME: an image model's encoders are still prepared by the
         # component binding, which sizes their operators and declares their
@@ -182,16 +178,14 @@ class EncoderRunner:
             )
         runner = cls.__new__(cls)
         runner._loaded = loaded
-        runner._products = products
         runner._bind(module, context)
-        if products is not None:
-            # An image model's encoder takes prepared images.
-            runner._encode = (
-                runner._encode_packed
-                if isinstance(module, PatchEncoder)
-                and module.max_patches is not None
-                else runner._encode_images
-            )
+        # An image model's encoder takes prepared images.
+        runner._encode = (
+            runner._encode_packed
+            if isinstance(module, PatchEncoder)
+            and module.max_patches is not None
+            else runner._encode_images
+        )
         return runner
 
     def _bind(self, module, context: ExecutionContext) -> None:
@@ -675,7 +669,7 @@ class EncoderRunner:
     def prepare_resident(
         self, image, tower: str, signed_unit: int
     ) -> dict[str, Any]:
-        """Prepare a resident image product (a region) for encoding.
+        """Prepare a resident image product (a tensor) for encoding.
 
         ``signed_unit`` declares pixel values in ``[-1, 1]`` rather than
         ``[0, 1]``. Returns the prepared image's facts (see
@@ -685,7 +679,7 @@ class EncoderRunner:
             prepared = prepare_tensor_image(
                 self._processor(),
                 cast(Tower, str(tower)),
-                regions.view(self._products, image),
+                image,
                 device=self._device,
                 signed_unit=bool(signed_unit),
             )
@@ -754,13 +748,15 @@ class EncoderRunner:
         )
 
     def _encode_images(
-        self, images: Sequence[PreparedImage], out: Sequence
+        self, images: Sequence[PreparedImage], *out: torch.Tensor
     ) -> list[list[int]]:
         if len(images) != len(out):
             raise ValueError("images and products must align")
         return [
-            calls.write(regions.view(self._products, region), value)
-            for value, region in zip(self._run_images(images), out, strict=True)
+            calls.write(product, value)
+            for value, product in zip(
+                self._run_images(images), out, strict=True
+            )
         ]
 
     def _encode_packed(

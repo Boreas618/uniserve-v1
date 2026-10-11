@@ -45,7 +45,6 @@ use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::inputs::Inputs;
 use crate::runner::encoder::runners::EncoderRunners;
-use crate::storage::memory::StorageView;
 use crate::storage::{
     ImageLatents, LatentStorage, LatentUpdate, OutputLease, OutputPlacement, OutputPool,
     ProductBuffer, ProductRead, Scalar,
@@ -415,8 +414,6 @@ pub(crate) struct ImageParts<'a> {
     pub(crate) decoders: &'a mut DecoderRunners,
     pub(crate) latents: Option<&'a mut ImageLatents>,
     pub(crate) trajectories: &'a mut Trajectories,
-    /// The product arena of each device, which bindings name products in.
-    pub(crate) arenas: &'a HashMap<Device, StorageView>,
     /// The output leases of image batches.
     pub(crate) outputs: &'a mut OutputPool,
     pub(crate) host: &'a HostLane<ImageTask>,
@@ -466,13 +463,6 @@ impl ImageParts<'_> {
     /// End work on `stream` that used the latent pool's pages.
     pub(crate) fn leave_latents(&mut self, stream: Option<&Stream>) -> Result<()> {
         self.latents_mut()?.leave(stream)
-    }
-
-    /// The product arena of `device`.
-    pub(crate) fn arena(&self, device: Device) -> Result<&StorageView> {
-        self.arenas
-            .get(&device)
-            .ok_or_else(|| Error::Invariant("no product arena is bound on this device".into()))
     }
 
     /// The image decoder.

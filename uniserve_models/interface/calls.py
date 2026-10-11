@@ -3,7 +3,7 @@
 A binding's step functions run on the binding's stream with its bound
 operators (:func:`scope`), read the worker's buffers through torch views
 imported once at bind time (:func:`tensors`), and publish results into
-product regions (:func:`write`).
+product tensors (:func:`write`).
 """
 
 from __future__ import annotations
