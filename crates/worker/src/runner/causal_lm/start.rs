@@ -263,7 +263,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
-    /// The expert runtime, when forwards are expert steps: each lane binding
+    /// The expert union, when forwards are expert steps: each lane binding
     /// gets one runner per microbatch, bound to its transport and stream.
     pub(crate) experts: Option<&'a mut ExpertUnion>,
     /// The worker's ranks, across which symmetric workspaces are mapped.
