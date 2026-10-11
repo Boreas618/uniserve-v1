@@ -1,6 +1,5 @@
 //! Routing and homogeneous batches for the worker's numerical runners.
 
-pub(crate) mod allocate;
 pub(crate) mod attention;
 pub(crate) mod causal_lm;
 pub(crate) mod component;
@@ -187,8 +186,8 @@ pub(crate) struct RunnerSetup<'a> {
     pub(crate) stream: Stream,
     pub(crate) device: i32,
     pub(crate) attention: String,
-    /// The worker's workspace allocation function.
-    pub(crate) allocate: tvm_ffi::Function,
+    /// The stream's shared work areas, a Python `Scratch`.
+    pub(crate) scratch: Handle,
 }
 
 /// The Python runners of one module: their constructor's fixed arguments
@@ -199,7 +198,7 @@ pub(crate) struct Methods {
     pub(crate) path: String,
     pub(crate) stream: Stream,
     pub(crate) attention: String,
-    pub(crate) allocate: tvm_ffi::Function,
+    pub(crate) scratch: Handle,
     pub(crate) forward: Function,
     pub(crate) kernels: Function,
     pub(crate) close: Function,
@@ -216,7 +215,7 @@ impl Methods {
             path: setup.path.to_owned(),
             stream: setup.stream.clone(),
             attention: setup.attention.clone(),
-            allocate: setup.allocate.clone(),
+            scratch: setup.scratch.clone(),
             forward: method(forward)?,
             kernels: method("kernels")?,
             close: method("close")?,
@@ -230,7 +229,7 @@ impl Methods {
             Any::from(tvm_ffi::String::from(self.path.as_str())),
             Any::from(self.stream.raw() as i64),
             Any::from(tvm_ffi::String::from(self.attention.as_str())),
-            Any::from(self.allocate.clone()),
+            self.scratch.to_any(),
             Any::from(integer_list(size)),
         ])?)
     }

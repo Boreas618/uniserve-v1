@@ -8,8 +8,10 @@
 //!
 //! A text encoder and the vision tower that encodes its prompt's packed
 //! vision blocks compute through the Python half,
-//! `uniserve_models.runner.encoder.EncoderRunner` ([`EncoderRunner::over`]):
-//! its `encode` takes the tensors of one forward as arguments.
+//! `uniserve_models.runner.encoder.EncoderRunner`, constructed directly
+//! with its stream's shared scratch ([`EncoderRunner::text`]): the text
+//! encoder's half owns the execution context, its tower borrows it, and
+//! `encode` takes the tensors of one forward as arguments.
 //!
 //! An image model's vision and latent encoders compute through the same
 //! Python class, constructed over a bound component by
@@ -79,7 +81,7 @@ use crate::executor::forward::batch::{
 };
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{Backing, DType, Function, Handle, Record, Region, integer_list, list};
-use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize};
+use crate::model::bind::{ComponentBinding, TextSize};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::runner::{Methods, RunnerSetup};
@@ -542,6 +544,12 @@ impl EncoderMethods {
     }
 }
 
+/// The methods of a Python half that owns its execution context.
+struct OwnedContext {
+    kernels: Function,
+    close: Function,
+}
+
 /// The buffers of a text encoder's forward.
 struct TextBuffers {
     /// The `[max capacity]` int64 prompt, zero-padded.
@@ -575,7 +583,9 @@ pub struct EncoderRunner {
     capturing: bool,
     /// The component binding a video model's text encoder owns, with its
     /// workspaces; its vision tower computes with the same binding.
-    binding: Option<Box<(ComponentBinding, StreamWorkspaces)>>,
+    /// The methods releasing the execution context a text encoder's Python
+    /// half constructed; its vision tower computes with the same context.
+    context: Option<OwnedContext>,
     /// The Python runners of condition latent encoders.
     conditions: Option<Box<Conditions>>,
 }
@@ -695,36 +705,35 @@ impl EncoderRunner {
             text_capacities: Vec::new(),
             config: config.clone(),
             capturing: false,
-            binding: None,
+            context: None,
             conditions: None,
         })
     }
 
-    /// The runner of a text encoder (`path` `""`) or of the vision tower
-    /// bound with it (`"vision"`) over the Python half
-    /// `uniserve_models.runner.encoder.EncoderRunner`, which computes with
-    /// `binding`'s execution context. A text encoder's token, feature and
-    /// position buffers are allocated here for the largest prompt capacity.
-    pub fn over(
+    /// The runner of a text encoder (`path` `""`) or of its vision tower
+    /// (`"vision"`) over its constructed Python half `runner`
+    /// (`uniserve_models.runner.encoder.EncoderRunner`). A text encoder's
+    /// token, feature and position buffers are allocated here for the
+    /// largest prompt capacity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the Python half and what its buffers are built from"
+    )]
+    fn over(
         interface: &Interface,
-        binding: &ComponentBinding,
+        component: &str,
+        device: Device,
+        runner: Handle,
         path: &str,
         info: EncoderInfo,
         config: &EncoderConfig,
         stream: Stream,
     ) -> Result<Self> {
         let owner = if path.is_empty() {
-            binding.component.clone()
+            component.to_owned()
         } else {
-            format!("{}.{path}", binding.component)
+            format!("{component}.{path}")
         };
-        let device = binding.device;
-        let runner = Handle::new(interface.import(&format!("{ENCODER}.bound"))?.call_values(
-            &[
-                binding.prepared().to_any(),
-                Any::from(tvm_ffi::String::from(path)),
-            ],
-        )?)?;
         let methods = EncoderMethods::new(interface, runner)?;
 
         let mut text_capacities = config.text_capacities.clone();
@@ -781,7 +790,7 @@ impl EncoderRunner {
             text_capacities,
             config: config.clone(),
             capturing: false,
-            binding: None,
+            context: None,
             conditions: None,
         })
     }
@@ -1282,10 +1291,6 @@ impl EncoderRunner {
         if let Some(table) = &mut self.graphs {
             table.seal();
         }
-        if let Some(binding) = &mut self.binding {
-            // Graphs captured the binding's workspaces: they stop growing.
-            binding.1.seal();
-        }
     }
 
     /// Release the runner's graphs, then what it owns: the Python runners
@@ -1300,8 +1305,13 @@ impl EncoderRunner {
         if let Some(conditions) = &mut self.conditions {
             result = result.and(conditions.close(aborted));
         }
-        if let Some(binding) = &mut self.binding {
-            result = result.and(binding.0.close(aborted));
+        if let Some(context) = &self.context {
+            let flag = Any::from(aborted);
+            result = result.and(
+                context
+                    .close
+                    .invoke(&[self.methods.runner.view(), (&flag).into()]),
+            );
         }
         result
     }
@@ -1487,6 +1497,8 @@ pub(crate) struct TextSetup<'a> {
     pub(crate) path: &'a str,
     pub(crate) device: i32,
     pub(crate) stream: Stream,
+    /// The stream's shared work areas, a Python `Scratch`.
+    pub(crate) scratch: Handle,
     pub(crate) attention: String,
     /// Prompt capacities, the longest admitted prompt and, as the row
     /// budget, the most vision patch rows one request carries.
@@ -1510,6 +1522,7 @@ impl EncoderRunner {
             path,
             device,
             stream,
+            scratch,
             attention,
             config,
             vision,
@@ -1536,52 +1549,55 @@ impl EncoderRunner {
             },
             _ => config,
         };
-        let prepared = crate::model::bind::prepare(
-            interface,
-            loaded,
-            BindingRequest {
-                component: component.to_owned(),
-                path: path.to_owned(),
-                device: crate::config::Device::Cuda(device),
-                stream: stream.raw(),
-                // The binding serves both encoders, so its operators are
-                // declared for the larger of their workloads: a prompt
-                // padded to the largest capacity, and a request's vision
-                // blocks.
-                size: [
-                    text_info.binding_size(&config),
-                    vision_info.and_then(|info| info.binding_size(&config)),
-                ]
-                .into_iter()
-                .flatten()
-                .reduce(|left, right| TextSize {
-                    tokens: left.tokens.max(right.tokens),
-                    rows: left.rows.max(right.rows),
-                }),
-                backends: Backends {
-                    attention,
-                    ..Backends::default()
-                },
-                derive_host_lengths: false,
-                experts: None,
-                weights: None,
-                cache: None,
-            },
-        )?;
-        let mut workspaces = StreamWorkspaces::default();
-        // The encoders declare no symmetric workspace, so none is
-        // allocated over the worker's ranks.
-        let binding = crate::model::bind::bind(interface, &mut workspaces, vec![prepared])?
-            .pop()
-            .ok_or_else(|| Error::Invariant("the text encoder was not bound".into()))?;
-        let mut text =
-            EncoderRunner::over(interface, &binding, "", text_info, &config, stream.clone())?;
+        // The context serves both encoders, so its operators are prepared
+        // for the larger of their workloads: a prompt padded to the largest
+        // capacity, and a request's vision blocks.
+        let size = [
+            text_info.binding_size(&config),
+            vision_info.and_then(|info| info.binding_size(&config)),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|left, right| TextSize {
+            tokens: left.tokens.max(right.tokens),
+            rows: left.rows.max(right.rows),
+        })
+        .ok_or_else(|| Error::Invariant("a text encoder declares its size".into()))?;
+        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let runner = Handle::new(interface.import(ENCODER)?.call_values(&[
+            loaded.to_any(),
+            Any::from(tvm_ffi::String::from(path)),
+            Any::from(stream.raw() as i64),
+            Any::from(tvm_ffi::String::from(attention.as_str())),
+            scratch.to_any(),
+            Any::from(integer_list([size.tokens as i64, size.rows as i64])),
+        ])?)?;
+        let device = Device::Cuda(device);
         let vision = vision_info
             .map(|info| {
-                EncoderRunner::over(interface, &binding, "vision", info, &config, stream.clone())
+                let tower = Handle::new(method("tower")?.call_values(&[
+                    runner.to_any(),
+                    Any::from(tvm_ffi::String::from("vision")),
+                ])?)?;
+                EncoderRunner::over(
+                    interface,
+                    component,
+                    device,
+                    tower,
+                    "vision",
+                    info,
+                    &config,
+                    stream.clone(),
+                )
             })
             .transpose()?;
-        text.binding = Some(Box::new((binding, workspaces)));
+        let mut text = EncoderRunner::over(
+            interface, component, device, runner, "", text_info, &config, stream,
+        )?;
+        text.context = Some(OwnedContext {
+            kernels: method("kernels")?,
+            close: method("close")?,
+        });
         Ok((text, vision))
     }
 
@@ -1603,7 +1619,7 @@ impl EncoderRunner {
             config: EncoderConfig::default(),
             graphs: None,
             capturing: false,
-            binding: None,
+            context: None,
             conditions: Some(Box::new(Conditions::new(video, audio)?)),
         })
     }
@@ -1640,8 +1656,16 @@ impl EncoderRunner {
     /// The kernels the operators of a text encoder's binding or of the
     /// condition encoders selected.
     pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
-        match (&self.binding, &self.conditions) {
-            (Some(binding), _) => binding.0.kernels(),
+        match (&self.context, &self.conditions) {
+            (Some(context), _) => {
+                let records: tvm_ffi::Array<Any> =
+                    context.kernels.call_as(&[self.methods.runner.view()])?;
+                records
+                    .iter()
+                    .enumerate()
+                    .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
+                    .collect()
+            }
             (_, Some(conditions)) => conditions.kernels(label),
             _ => Ok(Vec::new()),
         }

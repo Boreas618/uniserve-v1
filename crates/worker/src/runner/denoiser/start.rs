@@ -47,7 +47,7 @@ impl DenoiserRunners {
             .envelope
             .clone()
             .ok_or_else(|| Error::Invariant("a denoising rank has no slot state".into()))?;
-        let (stream, allocate) = setup.stream(MediaCall::Denoising, device)?;
+        let (stream, scratch) = setup.stream(MediaCall::Denoising, device)?;
         let graph_pool = setup.graph_pool(DENOISER_GRAPHS, &placed.name, device)?;
         let conditioner = placed.calls.iter().find(|call| {
             call.method == "encode" && call.is(crate::model::components::Capability::Encoder)
@@ -84,7 +84,7 @@ impl DenoiserRunners {
             conditioning,
             conditioning_width: u64::from(model.facts.text_condition_width),
             attention: attention.clone(),
-            allocate,
+            scratch,
             graph_pool,
             transient_layouts: config.max_request_pool_size,
         })?;

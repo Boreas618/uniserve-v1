@@ -88,7 +88,6 @@ from uniserve_models.diffusion import (
 from uniserve_models.interface import regions
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
-from uniserve_models.interface.workspace import execution_context
 from uniserve_models.media import image, video
 from uniserve_models.model import (
     AudioDecoder,
@@ -121,6 +120,7 @@ from uniserve_models.processing import (
     load_tokenizer,
     resolve_prefix,
 )
+from uniserve_models.runner.context import execution_context
 from uniserve_models.tensors import BufferConfig
 
 __all__ = ["DenoiserRunner"]
@@ -357,8 +357,8 @@ class DenoiserRunner:
         component: The declared component of the video denoiser.
         stream: The CUDA stream handle every forward enqueues on.
         attention: The attention backend the model loaded with.
-        allocate: The caller's allocation function for workspace torch
-            cannot provide.
+        scratch: The stream's shared work areas
+            (``uniserve_models.bindings.context.Scratch``).
         maximum: The largest layout, whose capacity the operators and the
             workspace are prepared for.
     """
@@ -393,14 +393,14 @@ class DenoiserRunner:
         component: str,
         stream: int,
         attention: str,
-        allocate,
+        scratch,
         maximum: Sequence[int],
     ) -> None:
         network = _denoiser(loaded, str(component))
         self._network = network
         self._device = next(network.parameters()).device
         self._context: ExecutionContext = execution_context(
-            network, int(stream), str(attention), allocate, "denoiser"
+            network, int(stream), str(attention), scratch
         )
         self._maximum = _layout(network, maximum)
         self._context.prepare(self._maximum)
