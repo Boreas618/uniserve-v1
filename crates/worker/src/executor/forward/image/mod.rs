@@ -61,6 +61,11 @@ use host::{ImageResult, ImageTask, ImageWork};
 use latents::{ImageLatents, Pool};
 
 /// The image runtime of a rank.
+///
+/// FIXME: as with the video runtime, the composition of the encoder,
+/// denoiser and decoder runners with a rank's image requests is the
+/// executor's and the request pool's. `executor/forward/token/` names this
+/// type and path.
 pub(crate) struct ImageRuntime {
     facts: ImageModel,
     pub(crate) policy: ImagePolicy,

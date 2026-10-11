@@ -639,6 +639,8 @@ class EncoderRunner:
             for prepared in images
         )
         if isinstance(module, PatchAutoencoder):
+            # FIXME: the posterior draws from the device's default
+            # generator; its noise becomes an input the caller supplies.
             return module.encode(torch.stack(pixels)).unbind(0)
         return module.encode(
             VisionInput(

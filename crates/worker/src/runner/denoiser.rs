@@ -1702,6 +1702,10 @@ struct SizingMethods {
 }
 
 /// A video model's facts and sizing rules.
+///
+/// FIXME: admission and planning size a request before any runner of its
+/// layout exists, so the facts record and the sizing functions are held
+/// here apart from `DenoiserRunner`; they go with the fact records.
 pub(crate) struct VideoModel {
     /// The component of the deployment's video denoiser.
     pub(crate) denoiser: String,
