@@ -18,7 +18,7 @@ use uniserve_ipc::{CallKind, ForwardMode};
 use super::buffers::{BankLayout, Banks, DenoiseLayout, DenoiseViews, Dimensions};
 use super::facts::Facts;
 use super::shapes::{SLOT_BUCKETS, Shapes, chunk_rows};
-use super::{CANDIDATES, DiffusionLMRunner, METHODS, RUNNER};
+use super::{CANDIDATES, DiffusionLMRunner, Functions, RUNNER};
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
 use crate::ffi::Handle;
@@ -419,7 +419,8 @@ impl DiffusionLMRunner {
                     arguments.push(view.into());
                 }
             }
-            let methods = Methods::construct(interface, RUNNER, &METHODS, arguments)?;
+            let methods = Methods::construct(interface, RUNNER, arguments)?;
+            let functions = Functions::resolve(interface, &methods)?;
             // Idle ranks join expert steps through the model's expert
             // layers; a text binding may already provide them.
             if let Some(experts) = experts.as_deref_mut()
@@ -472,6 +473,7 @@ impl DiffusionLMRunner {
                 owner,
                 component,
                 methods,
+                functions,
                 facts,
                 buffers,
                 state,

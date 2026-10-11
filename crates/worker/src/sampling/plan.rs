@@ -1,20 +1,24 @@
-//! One invocation's sampling tasks, grouped by selector and encoded for the
-//! text step.
+//! One forward's sampling tasks, grouped by sampler.
 //!
 //! [`SamplingPlan::build`] validates every task on the host, groups tasks by
 //! [`SamplingPath`] in first-appearance order and produces:
 //!
-//! - `words`: the host descriptor the step decodes
-//!   (`uniserve_models.runner.causal_lm.decode_tasks`): `[task count, group
-//!   count]`, seven words per group (`path, top_k, first task, task count,
-//!   logprob offset, logprob words, parameter row`), then one record per
-//!   task in group order;
-//! - `draws` and `params`: per candidate row in group order, staged into the
-//!   binding's device columns;
+//! - one [`SamplingGroup`] per sampler: what the runner's sampling method
+//!   of that sampler takes besides the tensors, as flat integer lists;
+//! - `draws` and `params`: per candidate row in group order, written into
+//!   the runner's input tensors, with each task's slot and gate;
 //! - each group's logprob layout, so readback decodes the packed words.
 //!
 //! Tasks are reordered into groups; [`SamplingPlan::position`] maps an input
 //! task to its output position (its column in the selection outputs).
+//!
+//! A token set crosses in the form the sampler indexes with. A per-task set
+//! (finish and transition tokens, reported logprob ids) is a row-major
+//! matrix of at least one column, padded with -1. A set applied to logits
+//! (allowed, suppressed and biased tokens, draft tokens counted by
+//! penalties) is a list of scatter indices `row * vocab + token` over the
+//! group's candidate rows, with tokens outside the vocabulary dropped and,
+//! for masks, repeated tokens dropped.
 
 use indexmap::IndexMap;
 use uniserve_core::SamplingParams;
@@ -26,15 +30,6 @@ use crate::{Error, Result};
 /// Parameters per candidate row: temperature, top-p, min-p, typical-p,
 /// repetition, frequency and presence penalties, and one spare column.
 pub(crate) const PARAMETER_COLUMNS: usize = 8;
-
-const FORCE_FINISH: i64 = 1 << 0;
-const RETURN_TRANSITION: i64 = 1 << 1;
-const GATED: i64 = 1 << 2;
-const PENALTIES: i64 = 1 << 3;
-const LOGPROBS: i64 = 1 << 4;
-const TOP_P: i64 = 1 << 5;
-const MIN_P: i64 = 1 << 6;
-const TYPICAL_P: i64 = 1 << 7;
 
 /// One sampled call of an invocation.
 pub(crate) struct SampleTask<'a> {
@@ -63,9 +58,187 @@ pub(crate) struct GroupLogprobs {
     pub(crate) layout: LogprobLayout,
 }
 
-/// The encoded sampling inputs of one invocation.
+/// The tasks of one sampler: the host lists of the runner's sampling
+/// method. Rows are the group's candidate rows, task by task; a task has
+/// one row, or one per draft token plus one in a verification.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SamplingGroup {
+    pub(crate) path: SamplingPath,
+    /// Output position of the group's first task; the others follow.
+    pub(crate) first: usize,
+    /// Each task's first candidate row in the forward's logits.
+    pub(crate) rows: Vec<i64>,
+    /// Each task's candidate rows.
+    pub(crate) row_counts: Vec<i64>,
+    /// The group's first row of `draws` and `params`.
+    pub(crate) parameters: usize,
+    /// Per task, whether it finishes whatever it selects.
+    pub(crate) force_finish: Vec<i64>,
+    /// `[tasks, width]` finish tokens.
+    pub(crate) finish_ids: Vec<i64>,
+    /// `[tasks, width]` tokens selecting a transition; an empty row for a
+    /// task without a transition output.
+    pub(crate) transition_ids: Vec<i64>,
+    /// Per row, its top-k width inside the vocabulary, or zero.
+    pub(crate) top_ks: Vec<i64>,
+    /// Rows with a nucleus cutoff below one and no top-k width.
+    pub(crate) top_p_rows: Vec<i64>,
+    /// Rows with a minimum-probability cutoff.
+    pub(crate) min_p_rows: Vec<i64>,
+    /// Rows with a typical-probability cutoff below one.
+    pub(crate) typical_p_rows: Vec<i64>,
+    /// Rows restricted to their `allowed` scatter indices.
+    pub(crate) allowed_rows: Vec<i64>,
+    pub(crate) allowed: Vec<i64>,
+    /// Scatter indices of tokens masked from selection.
+    pub(crate) suppressed: Vec<i64>,
+    /// Rows with penalties, and each one's request slot.
+    pub(crate) penalty_rows: Vec<i64>,
+    pub(crate) penalty_slots: Vec<i64>,
+    /// Scatter indices `penalized row * vocab + token`: the draft tokens
+    /// before each penalized row.
+    pub(crate) penalty_drafts: Vec<i64>,
+    /// Scatter indices of the additive offsets `bias_values`.
+    pub(crate) bias: Vec<i64>,
+    pub(crate) bias_values: Vec<f64>,
+    /// The tasks' draft tokens, concatenated.
+    pub(crate) drafts: Vec<i64>,
+    /// Per task, the one-based length of its draft prefix ending at the
+    /// first finish token, or zero.
+    pub(crate) terminal_prefixes: Vec<i64>,
+    /// The tasks reporting logprobs, each one's top count and its row of
+    /// the `[tasks, width]` explicit token ids.
+    pub(crate) logprob_tasks: Vec<i64>,
+    pub(crate) logprob_counts: Vec<i64>,
+    pub(crate) logprob_ids: Vec<i64>,
+    /// Where the group's logprob words start in the logprob tensor.
+    pub(crate) logprob_offset: usize,
+}
+
+/// Row-major `[sets.len(), width]` matrix of token sets padded with -1,
+/// with at least one column.
+pub(crate) fn padded(sets: &[&[u32]]) -> Vec<i64> {
+    let width = sets.iter().map(|set| set.len()).max().unwrap_or(0).max(1);
+    let mut matrix = vec![-1; sets.len() * width];
+    for (row, set) in sets.iter().enumerate() {
+        for (column, &token) in set.iter().enumerate() {
+            matrix[row * width + column] = i64::from(token);
+        }
+    }
+    matrix
+}
+
+/// Scatter indices of `tokens` in `row`, without tokens outside the
+/// vocabulary or repeated.
+fn scatter(row: usize, tokens: &[u32], vocab: usize) -> Vec<i64> {
+    let mut seen = Vec::new();
+    for &token in tokens {
+        if (token as usize) < vocab && !seen.contains(&token) {
+            seen.push(token);
+        }
+    }
+    seen.into_iter()
+        .map(|token| (row * vocab + token as usize) as i64)
+        .collect()
+}
+
+impl SamplingGroup {
+    /// An empty group of `path` whose first task has output position
+    /// `first` and whose rows start at row `parameters` of the draws.
+    fn new(path: SamplingPath, first: usize, parameters: usize) -> Self {
+        Self {
+            path,
+            first,
+            rows: Vec::new(),
+            row_counts: Vec::new(),
+            parameters,
+            force_finish: Vec::new(),
+            finish_ids: Vec::new(),
+            transition_ids: Vec::new(),
+            top_ks: Vec::new(),
+            top_p_rows: Vec::new(),
+            min_p_rows: Vec::new(),
+            typical_p_rows: Vec::new(),
+            allowed_rows: Vec::new(),
+            allowed: Vec::new(),
+            suppressed: Vec::new(),
+            penalty_rows: Vec::new(),
+            penalty_slots: Vec::new(),
+            penalty_drafts: Vec::new(),
+            bias: Vec::new(),
+            bias_values: Vec::new(),
+            drafts: Vec::new(),
+            terminal_prefixes: Vec::new(),
+            logprob_tasks: Vec::new(),
+            logprob_counts: Vec::new(),
+            logprob_ids: Vec::new(),
+            logprob_offset: 0,
+        }
+    }
+
+    /// Add `task`, whose candidate rows follow the group's so far.
+    fn push(&mut self, task: &SampleTask<'_>, vocab: usize) {
+        let params = task.params;
+        let metadata = &task.metadata;
+        let index = self.rows.len() as i64;
+        let first_row = self.top_ks.len();
+        let rows = task.rows();
+        self.rows.push(task.row as i64);
+        self.row_counts.push(rows as i64);
+        self.force_finish.push(i64::from(metadata.force_finish));
+        self.drafts
+            .extend(metadata.draft_token_ids.iter().map(|&id| i64::from(id)));
+        self.terminal_prefixes
+            .push(metadata.terminal_draft_prefix.unwrap_or(0) as i64);
+        if params.generated_logprobs_requested() {
+            self.logprob_tasks.push(index);
+        }
+
+        let top_k = params.top_k as usize;
+        let top_k = if top_k < vocab { top_k } else { 0 };
+        let penalized = params.uses_penalties();
+        for (offset, allowed) in metadata.allowed.iter().enumerate() {
+            let row = first_row + offset;
+            self.top_ks.push(top_k as i64);
+            if top_k == 0 && params.top_p > 0.0 && params.top_p < 1.0 {
+                self.top_p_rows.push(row as i64);
+            }
+            if params.min_p > 0.0 {
+                self.min_p_rows.push(row as i64);
+            }
+            if params.typical_p < 1.0 {
+                self.typical_p_rows.push(row as i64);
+            }
+            if let Some(tokens) = allowed {
+                self.allowed_rows.push(row as i64);
+                self.allowed.extend(scatter(row, tokens, vocab));
+            }
+            self.suppressed
+                .extend(scatter(row, &metadata.suppress, vocab));
+            if penalized {
+                // A row's counts include the draft tokens before it.
+                let counted = self.penalty_rows.len();
+                self.penalty_rows.push(row as i64);
+                self.penalty_slots.push(i64::from(task.slot));
+                self.penalty_drafts.extend(
+                    metadata.draft_token_ids[..offset]
+                        .iter()
+                        .map(|&token| (counted * vocab + token as usize) as i64),
+                );
+            }
+            for &(token, bias) in &params.logit_bias {
+                if (token as usize) < vocab {
+                    self.bias.push((row * vocab + token as usize) as i64);
+                    self.bias_values.push(f64::from(bias));
+                }
+            }
+        }
+    }
+}
+
+/// The sampling inputs of one forward.
 pub(crate) struct SamplingPlan {
-    pub(crate) words: Vec<i64>,
+    pub(crate) groups: Vec<SamplingGroup>,
     pub(crate) draws: Vec<f32>,
     pub(crate) params: Vec<f32>,
     pub(crate) slots: Vec<i64>,
@@ -78,8 +251,8 @@ pub(crate) struct SamplingPlan {
 }
 
 impl SamplingPlan {
-    /// Validate and encode `tasks`. `vocab` is the global vocabulary,
-    /// `logprob_base` the first free word of the logprob column and
+    /// Validate and group `tasks`. `vocab` is the global vocabulary,
+    /// `logprob_base` the first free word of the logprob tensor and
     /// `logprob_capacity` its size.
     pub(crate) fn build(
         tasks: &[SampleTask<'_>],
@@ -93,29 +266,28 @@ impl SamplingPlan {
                 "vocabulary exceeds the device token decision range".into(),
             ));
         }
-        let mut groups: IndexMap<SamplingPath, Vec<usize>> = IndexMap::new();
+        let mut paths: IndexMap<SamplingPath, Vec<usize>> = IndexMap::new();
         for (index, task) in tasks.iter().enumerate() {
             validate(task, vocab)?;
-            groups
+            paths
                 .entry(task.metadata.path(task.params, vocab, cuda))
                 .or_default()
                 .push(index);
         }
 
-        let mut words = vec![tasks.len() as i64, groups.len() as i64];
-        let mut records = Vec::new();
+        let mut groups = Vec::with_capacity(paths.len());
         let mut draws = Vec::new();
         let mut params = Vec::new();
         let mut slots = Vec::with_capacity(tasks.len());
         let mut gates = Vec::with_capacity(tasks.len());
         let mut positions = vec![0; tasks.len()];
         let mut members = vec![(0, 0); tasks.len()];
-        let mut logprobs = Vec::with_capacity(groups.len());
+        let mut logprobs = Vec::with_capacity(paths.len());
         let mut logprob_offset = logprob_base;
         let mut first = 0;
 
-        for (group, (path, indices)) in groups.iter().enumerate() {
-            let parameter_row = draws.len();
+        for (number, (path, indices)) in paths.iter().enumerate() {
+            let mut group = SamplingGroup::new(*path, first, draws.len());
             let mut layout = LogprobLayout {
                 rows: Vec::new(),
                 counts: Vec::new(),
@@ -123,13 +295,21 @@ impl SamplingPlan {
                 max_count: 0,
                 max_requested: 0,
             };
+            let mut finish: Vec<&[u32]> = Vec::with_capacity(indices.len());
+            let mut transitions: Vec<&[u32]> = Vec::with_capacity(indices.len());
             for (local, &index) in indices.iter().enumerate() {
                 let task = &tasks[index];
                 positions[index] = first + local;
-                members[index] = (group, local);
+                members[index] = (number, local);
                 slots.push(i64::from(task.slot));
                 gates.push(i64::from(task.gated));
-                encode(task, vocab, &mut records);
+                group.push(task, vocab);
+                finish.push(task.metadata.finish_token_ids.as_slice());
+                transitions.push(if task.metadata.return_transition {
+                    task.metadata.transition_token_ids.as_slice()
+                } else {
+                    &[]
+                });
                 let rows = task.rows();
                 match &task.draws {
                     Some(values) => draws.extend_from_slice(values),
@@ -147,19 +327,20 @@ impl SamplingPlan {
                     layout.requested_ids.push(ids);
                 }
             }
+            group.finish_ids = padded(&finish);
+            group.transition_ids = padded(&transitions);
+            group.logprob_counts = layout.counts.iter().map(|&count| count as i64).collect();
+            let requested: Vec<&[u32]> = layout.requested_ids.iter().map(Vec::as_slice).collect();
+            group.logprob_ids = padded(&requested);
+
             let size = layout.rows.len() * (3 + 3 * layout.max_count + 2 * layout.max_requested);
-            let (top_k, path_code) = match *path {
-                SamplingPath::Greedy { suppressed: false } => (0, 0),
-                SamplingPath::Greedy { suppressed: true } => (0, 1),
-                SamplingPath::TopK(width) => (i64::from(width), 2),
-                SamplingPath::Categorical => (0, 3),
-            };
             let entry = if size > 0 {
                 if logprob_offset + size > logprob_capacity {
                     return Err(Error::Resource(
                         "logprob words exceed the binding's capacity",
                     ));
                 }
+                group.logprob_offset = logprob_offset;
                 let entry = GroupLogprobs {
                     offset: logprob_offset,
                     words: size,
@@ -170,21 +351,12 @@ impl SamplingPlan {
             } else {
                 None
             };
-            words.extend_from_slice(&[
-                path_code,
-                top_k,
-                first as i64,
-                indices.len() as i64,
-                entry.as_ref().map_or(-1, |entry| entry.offset as i64),
-                entry.as_ref().map_or(0, |entry| entry.words as i64),
-                parameter_row as i64,
-            ]);
             logprobs.push(entry);
             first += indices.len();
+            groups.push(group);
         }
-        words.extend(records);
         Ok(Self {
-            words,
+            groups,
             draws,
             params,
             slots,
@@ -284,69 +456,6 @@ fn validate(task: &SampleTask<'_>, vocab: usize) -> Result<()> {
     Ok(())
 }
 
-fn encode(task: &SampleTask<'_>, vocab: usize, words: &mut Vec<i64>) {
-    let params = task.params;
-    let metadata = &task.metadata;
-    let mut flags = 0;
-    for (set, bit) in [
-        (metadata.force_finish, FORCE_FINISH),
-        (metadata.return_transition, RETURN_TRANSITION),
-        (task.gated, GATED),
-        (params.uses_penalties(), PENALTIES),
-        (params.generated_logprobs_requested(), LOGPROBS),
-        (params.top_p > 0.0 && params.top_p < 1.0, TOP_P),
-        (params.min_p > 0.0, MIN_P),
-        (params.typical_p < 1.0, TYPICAL_P),
-    ] {
-        if set {
-            flags |= bit;
-        }
-    }
-    let (count, ids) = logprob_request(params, vocab);
-    let allowed = metadata.allowed.iter().any(Option::is_some);
-    words.extend_from_slice(&[
-        task.row as i64,
-        task.rows() as i64,
-        i64::from(task.slot),
-        flags,
-        i64::from(params.top_k),
-        count as i64,
-        metadata.terminal_draft_prefix.unwrap_or(0) as i64,
-        metadata.finish_token_ids.len() as i64,
-        metadata.transition_token_ids.len() as i64,
-        metadata.suppress.len() as i64,
-        params.logit_bias.len() as i64,
-        ids.len() as i64,
-        metadata.draft_token_ids.len() as i64,
-        i64::from(allowed),
-    ]);
-    words.extend(metadata.finish_token_ids.iter().map(|&id| i64::from(id)));
-    words.extend(
-        metadata
-            .transition_token_ids
-            .iter()
-            .map(|&id| i64::from(id)),
-    );
-    words.extend(metadata.suppress.iter().map(|&id| i64::from(id)));
-    for &(token, bias) in &params.logit_bias {
-        words.push(i64::from(token));
-        words.push(i64::from(bias.to_bits()));
-    }
-    words.extend(ids.iter().map(|&id| i64::from(id)));
-    words.extend(metadata.draft_token_ids.iter().map(|&id| i64::from(id)));
-    if allowed {
-        for row in &metadata.allowed {
-            match row {
-                Some(ids) => {
-                    words.push(ids.len() as i64);
-                    words.extend(ids.iter().map(|&id| i64::from(id)));
-                }
-                None => words.push(-1),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,11 +496,28 @@ mod tests {
             (0..3).map(|index| plan.position(index)).collect::<Vec<_>>(),
             vec![0, 2, 1]
         );
-        assert_eq!(&plan.words[..2], &[3, 2]);
-        // Categorical group: path 3, tasks 0..2, logprobs at 10, two rows of
-        // (3 + 3 * 2 + 2 * 1) words, parameter rows from 0.
-        assert_eq!(&plan.words[2..9], &[3, 0, 0, 2, 10, 22, 0]);
-        assert_eq!(&plan.words[9..16], &[0, 0, 2, 1, -1, 0, 2]);
+        // Categorical group: tasks 0 and 2 at output positions 0 and 1,
+        // parameter rows from 0, logprobs at 10 for both tasks with the
+        // explicit ids deduplicated and kept inside the vocabulary.
+        let categorical = &plan.groups[0];
+        assert_eq!(categorical.path, SamplingPath::Categorical);
+        assert_eq!((categorical.first, categorical.parameters), (0, 0));
+        assert_eq!(categorical.rows, vec![0, 2]);
+        assert_eq!(categorical.logprob_tasks, vec![0, 1]);
+        assert_eq!(categorical.logprob_counts, vec![2, 2]);
+        assert_eq!(categorical.logprob_ids, vec![5, 5]);
+        assert_eq!(categorical.logprob_offset, 10);
+        // Greedy group: task 1 at output position 2, parameter row 2, with
+        // one padded column of finish and transition tokens.
+        let greedy_group = &plan.groups[1];
+        assert_eq!(
+            greedy_group.path,
+            SamplingPath::Greedy { suppressed: false }
+        );
+        assert_eq!((greedy_group.first, greedy_group.parameters), (2, 2));
+        assert_eq!(greedy_group.rows, vec![1]);
+        assert_eq!(greedy_group.finish_ids, vec![-1]);
+        assert_eq!(greedy_group.transition_ids, vec![-1]);
         assert_eq!(plan.draws, vec![0.25, 0.5, 0.0]);
         assert_eq!(plan.params.len(), 3 * PARAMETER_COLUMNS);
         assert_eq!(plan.logprob_span(2), Some((10, 22, 1)));
