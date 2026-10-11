@@ -8,7 +8,7 @@ use crate::config::DescriptorError;
 
 /// Usage line printed with an argument or descriptor error.
 pub const USAGE: &str = "usage: python -m uniserve_models.worker --head ADDRESS --worker-id ID \
-                         --rank R --generation G [--world-size N]";
+                         --rank R --generation G";
 
 /// Parsed command-line arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,8 +21,6 @@ pub struct Arguments {
     pub rank: u32,
     /// The launch of the group that started this rank.
     pub generation: u64,
-    /// Informational; the launch descriptor is authoritative.
-    pub world_size: Option<u32>,
 }
 
 impl Arguments {
@@ -32,7 +30,6 @@ impl Arguments {
         let mut worker_id = None;
         let mut rank = None;
         let mut generation = None;
-        let mut world_size = None;
         let mut items = argv.iter().map(AsRef::as_ref);
         while let Some(item) = items.next() {
             let (flag, inline) = match item.split_once('=') {
@@ -60,7 +57,6 @@ impl Arguments {
                 "--worker-id" => worker_id = Some(value()?),
                 "--rank" => rank = Some(number(flag, value()?)?),
                 "--generation" => generation = Some(number(flag, value()?)?),
-                "--world-size" => world_size = Some(number(flag, value()?)?),
                 other => {
                     return Err(DescriptorError::new(format!(
                         "unrecognized arguments: {other}"
@@ -76,7 +72,6 @@ impl Arguments {
             worker_id: worker_id.ok_or_else(|| required("--worker-id"))?,
             rank: rank.ok_or_else(|| required("--rank"))?,
             generation: generation.ok_or_else(|| required("--generation"))?,
-            world_size,
         })
     }
 }
@@ -91,8 +86,6 @@ mod tests {
             "--worker-id",
             "text",
             "--rank=1",
-            "--world-size",
-            "2",
             "--generation=3",
             "--head",
             "unix:/tmp/head.sock",
@@ -101,7 +94,6 @@ mod tests {
         assert_eq!(arguments.head, "unix:/tmp/head.sock");
         assert_eq!(arguments.worker_id, "text");
         assert_eq!((arguments.rank, arguments.generation), (1, 3));
-        assert_eq!(arguments.world_size, Some(2));
     }
 
     #[test]

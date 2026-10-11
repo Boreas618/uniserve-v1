@@ -232,7 +232,6 @@ fn start_rank(
         &spawn.head,
         &spawn.worker_id,
         spawn.rank,
-        spawn.world_size,
         spawn.generation,
     );
     for (name, value) in &spawn.environment {

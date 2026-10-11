@@ -380,11 +380,9 @@ pub(crate) struct RemoteHost<'a> {
 impl RemoteHost<'_> {
     /// Sends one rank's launch to this host's launcher: a member of launch
     /// `generation` of its group, which connects to the head at `head`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn deliver(
         &mut self,
         rank: u32,
-        world_size: u32,
         python: &std::path::Path,
         worker_id: &str,
         generation: u64,
@@ -416,7 +414,6 @@ impl RemoteHost<'_> {
                 rank,
                 worker_id: worker_id.to_owned(),
                 generation,
-                world_size,
                 python: python.to_owned(),
                 head: head.to_owned(),
                 environment,
@@ -492,7 +489,6 @@ mod tests {
             rank,
             worker_id: worker_id.to_owned(),
             generation,
-            world_size: 8,
             python: "python3".to_owned(),
             head: "127.0.0.1:1".to_owned(),
             environment: HashMap::new(),
