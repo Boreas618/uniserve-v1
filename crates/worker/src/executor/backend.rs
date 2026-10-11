@@ -23,7 +23,7 @@ use super::forward::{self, launch::Launched};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
-use crate::ffi::{Function, Record};
+use crate::ffi::Function;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::JobQueues;
@@ -403,7 +403,7 @@ impl WorkerBackend {
 
     /// The kernels each image runner's operators selected, as `(name,
     /// device, kernels)` in construction order.
-    pub(crate) fn image_kernels(&self) -> Result<Vec<(String, String, Vec<Record>)>> {
+    pub(crate) fn image_kernels(&self) -> Result<Vec<(String, String, Vec<String>)>> {
         image_kernels(
             &self.image_order,
             &self.encoders,
@@ -791,9 +791,9 @@ impl WorkerBackend {
             &self.decoders,
         )
         .and_then(|listed| {
-            listed
-                .iter()
-                .try_for_each(|(label, device, records)| current.add(label, device, records))
+            listed.iter().try_for_each(|(label, device, listings)| {
+                current.add_listings(label, device, listings)
+            })
         });
         if let Err(error) = added {
             tracing::warn!(target: "uniserve_worker.profiling", "kernel report failed: {error}");
@@ -956,20 +956,20 @@ fn image_kernels(
     encoders: &EncoderRunners,
     denoisers: &DenoiserRunners,
     decoders: &DecoderRunners,
-) -> Result<Vec<(String, String, Vec<Record>)>> {
+) -> Result<Vec<(String, String, Vec<String>)>> {
     let mut listed = Vec::new();
     for (runner, name) in order {
         let (device, kernels) = match runner {
             ImageRunner::Encoder(index) => match encoders.image.get(*index) {
-                Some(runner) => (runner.device().to_string(), runner.kernels(name)?),
+                Some(runner) => (runner.device().to_string(), runner.kernels()?),
                 None => continue,
             },
             ImageRunner::Denoiser => match &denoisers.image {
-                Some((_, runner)) => (runner.device().to_string(), runner.kernels(name)?),
+                Some((_, runner)) => (runner.device().to_string(), runner.kernels()?),
                 None => continue,
             },
             ImageRunner::Decoder => match &decoders.image {
-                Some((_, runner)) => (runner.device().to_string(), runner.kernels(name)?),
+                Some((_, runner)) => (runner.device().to_string(), runner.kernels()?),
                 None => continue,
             },
         };

@@ -80,11 +80,12 @@ use crate::executor::forward::batch::{
     Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
 };
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list, list};
+use crate::ffi::{Backing, DType, Function, Handle, integer_list, list};
 use crate::model::bind::TextSize;
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
-use crate::runner::{ImageSetup, Methods, RunnerSetup};
+use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_listing};
+use crate::runner::{ImageSetup, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{Metadata, OutputPlacement, ValueRange};
 use crate::{Error, Result};
@@ -131,33 +132,43 @@ pub struct PreparedImage {
 }
 
 impl PreparedImage {
-    fn from_value(owner: &str, value: Any) -> Result<Self> {
-        let record = Record::new(owner, value)?;
-        let grid = record
-            .optional_value("grid")?
-            .map(|grid| -> Result<[u32; 2]> {
-                let values =
-                    crate::ffi::integers(grid).map_err(|error| Error::numerical(owner, &error))?;
-                match values[..] {
-                    [rows, columns] if rows > 0 && columns > 0 => Ok([rows as u32, columns as u32]),
-                    _ => Err(Error::Interface(format!(
-                        "{owner} reports a grid that is not two positive extents"
-                    ))),
-                }
-            })
-            .transpose()?;
-        let dimension = |key: &str| -> Result<u32> {
-            u32::try_from(record.count(key)?)
+    /// The image `value` a preparation returned, with what `facts`
+    /// (`EncoderRunner.image_facts`) reports of it.
+    fn from_value(facts: &Function, value: Any) -> Result<Self> {
+        let image = Handle::new(value)?;
+        let values = crate::ffi::integers(facts.call_values(&[image.to_any()])?)
+            .map_err(|error| Error::numerical(facts.name(), &error))?;
+        let [height, width, rows, columns, ref shape @ ..] = values[..] else {
+            return Err(Error::Interface(format!(
+                "{} reports a canvas, a grid and a pixel shape",
+                facts.name()
+            )));
+        };
+        let dimension = |extent: i64, name: &str| -> Result<u32> {
+            u32::try_from(extent)
                 .ok()
                 .filter(|&extent| extent > 0)
-                .ok_or_else(|| Error::Interface(format!("{owner} reports an invalid {key}")))
+                .ok_or_else(|| {
+                    Error::Interface(format!("{} reports an invalid {name}", facts.name()))
+                })
+        };
+        // A patch tower reports its grid; other towers report zeros.
+        let grid = match (rows, columns) {
+            (0, 0) => None,
+            (rows, columns) if rows > 0 && columns > 0 => Some([rows as u32, columns as u32]),
+            _ => {
+                return Err(Error::Interface(format!(
+                    "{} reports a grid that is not two positive extents",
+                    facts.name()
+                )));
+            }
         };
         Ok(Self {
-            value: Handle::new(record.value("image")?)?,
-            shape: record.shape("shape")?,
+            value: image,
+            shape: shape.to_vec(),
             grid,
-            height: dimension("height")?,
-            width: dimension("width")?,
+            height: dimension(height, "height")?,
+            width: dimension(width, "width")?,
         })
     }
 
@@ -175,6 +186,7 @@ impl PreparedImage {
 /// asynchronous copy to a CUDA device.
 pub fn prepare_input(
     function: &Function,
+    facts: &Function,
     loaded: &Handle,
     tower: Tower,
     payload: &str,
@@ -193,7 +205,7 @@ pub fn prepare_input(
         Any::from(i64::from(input_images)),
         Any::from(pin),
     ])?;
-    PreparedImage::from_value(function.name(), value)
+    PreparedImage::from_value(facts, value)
 }
 
 /// A vision patch encoder (`PatchEncoder`).
@@ -524,6 +536,7 @@ struct EncoderMethods {
     encode: Function,
     position_ids: Function,
     prepare_resident: Function,
+    image_facts: Function,
     warm: Function,
     pack_images: Function,
     /// Captures a forward between its begin and end.
@@ -538,6 +551,7 @@ impl EncoderMethods {
             encode: method("encode")?,
             position_ids: method("position_ids")?,
             prepare_resident: method("prepare_resident")?,
+            image_facts: method("image_facts")?,
             warm: method("warm")?,
             pack_images: method("pack_images")?,
             capture: GraphFunctions::from_interface(interface)?,
@@ -838,7 +852,7 @@ impl EncoderRunner {
             Any::from(tvm_ffi::String::from(tower.name())),
             Any::from(signed_unit),
         ])?;
-        PreparedImage::from_value(function.name(), value)
+        PreparedImage::from_value(&self.methods.image_facts, value)
     }
 
     /// Encode images, writing image `i`'s result into `out[i]`.
@@ -1359,21 +1373,23 @@ fn grid_bytes(layout: &[[i64; 2]]) -> Vec<u8> {
 /// The condition latent encoders of a video model: the Python runners of
 /// its video encoder and of its audio encoder, one per input shapes.
 struct Conditions {
-    video: Methods,
-    audio: Methods,
+    video: RunnerClass,
+    audio: RunnerClass,
+    loaded: Handle,
     /// Frames of each visual unit of a condition of some frame count.
     unit_frames: Function,
     /// The runner of each call's input shapes, created at its first call.
-    video_runners: HashMap<Vec<i64>, Handle>,
-    audio_runners: HashMap<Vec<i64>, Handle>,
+    video_runners: HashMap<Vec<i64>, Methods>,
+    audio_runners: HashMap<Vec<i64>, Methods>,
 }
 
 impl Conditions {
     fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
         Ok(Self {
             unit_frames: video.interface.import(&format!("{ENCODER}.unit_frames"))?,
-            video: Methods::new(&video, ENCODER, "encode")?,
-            audio: Methods::new(&audio, ENCODER, "encode")?,
+            loaded: video.loaded.clone(),
+            video: RunnerClass::new(video.interface, ENCODER, "encode", video.arguments())?,
+            audio: RunnerClass::new(audio.interface, ENCODER, "encode", audio.arguments())?,
             video_runners: HashMap::new(),
             audio_runners: HashMap::new(),
         })
@@ -1392,7 +1408,7 @@ impl Conditions {
         for &[_, frames, width, height, unit] in units {
             let value = self
                 .unit_frames
-                .call_values(&[self.video.loaded.to_any(), Any::from(frames)])?;
+                .call_values(&[self.loaded.to_any(), Any::from(frames)])?;
             let lengths = crate::ffi::integers(value)
                 .map_err(|error| Error::numerical(self.unit_frames.name(), &error))?;
             let length = lengths.get(unit as usize).copied().ok_or_else(|| {
@@ -1400,16 +1416,15 @@ impl Conditions {
             })?;
             shapes.extend([length, height, width, 3]);
         }
-        let runner = match self.video_runners.get(&shapes) {
-            Some(runner) => runner.clone(),
-            None => {
-                let runner = self.video.runner(shapes.iter().copied())?;
-                self.video_runners.insert(shapes, runner.clone());
-                runner
-            }
-        };
+        if !self.video_runners.contains_key(&shapes) {
+            let runner = self
+                .video
+                .construct(vec![Argument::Integers(shapes.clone())])?;
+            self.video_runners.insert(shapes.clone(), runner);
+        }
+        let runner = &self.video_runners[&shapes];
         self.video.forward.call_values(&[
-            runner.to_any(),
+            runner.runner().to_any(),
             Any::from(pixels.to_tensor()?),
             Any::from(out.to_tensor()?),
             Any::from(integer_list(units.iter().flatten().copied())),
@@ -1429,16 +1444,15 @@ impl Conditions {
             .iter()
             .flat_map(|&length| [length as i64, 2])
             .collect();
-        let runner = match self.audio_runners.get(&shapes) {
-            Some(runner) => runner.clone(),
-            None => {
-                let runner = self.audio.runner(shapes.iter().copied())?;
-                self.audio_runners.insert(shapes, runner.clone());
-                runner
-            }
-        };
+        if !self.audio_runners.contains_key(&shapes) {
+            let runner = self
+                .audio
+                .construct(vec![Argument::Integers(shapes.clone())])?;
+            self.audio_runners.insert(shapes.clone(), runner);
+        }
+        let runner = &self.audio_runners[&shapes];
         self.audio.forward.call_values(&[
-            runner.to_any(),
+            runner.runner().to_any(),
             Any::from(samples.to_tensor()?),
             Any::from(out.to_tensor()?),
             Any::from(integer_list(lengths.iter().map(|&length| length as i64))),
@@ -1446,10 +1460,10 @@ impl Conditions {
         Ok(())
     }
 
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
-        let mut records = self.video.kernels(label, self.video_runners.values())?;
-        records.extend(self.audio.kernels(label, self.audio_runners.values())?);
-        Ok(records)
+    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
+        let mut listings = self.video.kernels(self.video_runners.values())?;
+        listings.extend(self.audio.kernels(self.audio_runners.values())?);
+        Ok(listings)
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1624,18 +1638,13 @@ impl EncoderRunner {
 
     /// The kernels the operators of the runner's execution context or of the
     /// condition encoders selected.
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
         match (&self.context, &self.conditions) {
-            (Some(context), _) => {
-                let records: tvm_ffi::Array<Any> =
-                    context.kernels.call_as(&[self.methods.runner.view()])?;
-                records
-                    .iter()
-                    .enumerate()
-                    .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
-                    .collect()
-            }
-            (_, Some(conditions)) => conditions.kernels(label),
+            (Some(context), _) => Ok(vec![kernel_listing(
+                &context.kernels,
+                &self.methods.runner,
+            )?]),
+            (_, Some(conditions)) => conditions.kernels(),
             _ => Ok(Vec::new()),
         }
     }

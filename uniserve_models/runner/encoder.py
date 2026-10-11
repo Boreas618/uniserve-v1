@@ -10,6 +10,7 @@ capacity; a text conditioner's forward likewise.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from math import prod
 from typing import Any, cast
@@ -40,19 +41,6 @@ from uniserve_models.processing import PatchTransform
 from uniserve_models.runner.context import execution_context
 
 __all__ = ["EncoderRunner"]
-
-
-def _image_facts(prepared: PreparedImage) -> dict[str, Any]:
-    """The host facts a caller plans an encode with."""
-    return {
-        "image": prepared,
-        "shape": list(prepared.pixels.shape),
-        "grid": None
-        if prepared.grid_shape is None
-        else list(prepared.grid_shape),
-        "height": prepared.height,
-        "width": prepared.width,
-    }
 
 
 def _module(loaded, path: str):
@@ -603,7 +591,7 @@ class EncoderRunner:
     @staticmethod
     def prepare_image(
         loaded, tower: str, payload: str, input_images: int, pin: int
-    ) -> dict[str, Any]:
+    ) -> PreparedImage:
         """Decode and transform one inline image of a request on the host.
 
         Touches no device and keeps no state, so the caller runs it beside
@@ -620,35 +608,47 @@ class EncoderRunner:
                 asynchronous copy to a CUDA device.
 
         Returns:
-            ``{"image", "shape", "grid", "height", "width"}``: the prepared
-            image (opaque), its pixel shape (``[patches, row]`` for a patch
-            tower, ``[channels, height, width]`` otherwise), its ``[rows,
-            columns]`` patch grid or None, and the canvas dimensions the
-            encoder's features describe.
+            The prepared image, opaque to the caller, which reads what it
+            plans an encode with through :meth:`image_facts`.
 
         Raises:
             ValueError: The model declares no image policy, or the payload
                 is not an image the policy accepts.
         """
-        # FIXME: a prepared image crosses as an opaque handle with a record
-        # of its facts; its pixels become a tensor of the caller's
-        # page-locked storage.
+        # FIXME: a prepared image crosses as an opaque handle; its pixels
+        # become a tensor of the caller's page-locked storage.
         processor = loaded.image_processor
         if processor is None:
             raise ValueError("the model declares no image processing")
         if int(input_images) < 1:
             raise ValueError("request admission declares no input images")
-        return _image_facts(
-            prepare_host_image(
-                processor,
-                # The caller sends a plain string; the selection rejects
-                # unknown towers.
-                cast(Tower, str(tower)),
-                str(payload),
-                input_images=int(input_images),
-                pin=bool(pin),
-            )
+        return prepare_host_image(
+            processor,
+            # The caller sends a plain string; the selection rejects
+            # unknown towers.
+            cast(Tower, str(tower)),
+            str(payload),
+            input_images=int(input_images),
+            pin=bool(pin),
         )
+
+    @staticmethod
+    def image_facts(prepared: PreparedImage) -> list[int]:
+        """What a caller plans an encode of a prepared image with.
+
+        ``[height, width, grid_rows, grid_columns, *pixel_shape]``: the
+        canvas the encoder's features describe, the patch grid of a patch
+        tower (``0, 0`` otherwise) and the pixel shape (``[patches, row]``
+        for a patch tower, ``[channels, height, width]`` otherwise).
+        """
+        rows, columns = prepared.grid_shape or (0, 0)
+        return [
+            int(prepared.height),
+            int(prepared.width),
+            int(rows),
+            int(columns),
+            *(int(extent) for extent in prepared.pixels.shape),
+        ]
 
     @staticmethod
     def patch_grid(
@@ -687,12 +687,11 @@ class EncoderRunner:
 
     def prepare_resident(
         self, image, tower: str, signed_unit: int
-    ) -> dict[str, Any]:
+    ) -> PreparedImage:
         """Prepare a resident image product (a tensor) for encoding.
 
         ``signed_unit`` declares pixel values in ``[-1, 1]`` rather than
-        ``[0, 1]``. Returns the prepared image's facts (see
-        :meth:`prepare_image`).
+        ``[0, 1]``. Returns the prepared image (see :meth:`prepare_image`).
         """
         with torch.inference_mode(), self._context.activate():
             prepared = prepare_tensor_image(
@@ -702,7 +701,7 @@ class EncoderRunner:
                 device=self._device,
                 signed_unit=bool(signed_unit),
             )
-        return _image_facts(prepared)
+        return prepared
 
     def warm(self, side: int) -> None:
         """Encode a black ``side`` x ``side`` image and discard the result.
@@ -783,9 +782,13 @@ class EncoderRunner:
     ) -> None:
         features.copy_(self._module.encode_packed(pixels, grids))
 
-    def kernels(self) -> list[dict]:
-        """The kernels the runner's operators selected."""
-        return list(self._context.kernels())
+    def kernels(self) -> str:
+        """The kernels the runner's operators selected.
+
+        A JSON array of records, one per prepared operator, each with its
+        layer ``path``.
+        """
+        return json.dumps(list(self._context.kernels()))
 
     def close(self, aborted: bool) -> None:
         """Release the runner's operators and workspace.

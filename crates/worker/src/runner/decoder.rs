@@ -51,11 +51,12 @@ use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::batch::image::{Encoding, ImageBatch, allocations, lock};
 use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::ffi::{DType, Function, Handle, Record, integer_list};
+use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
 use crate::parallel::joins::GraphFunctions;
-use crate::runner::{ImageSetup, Methods, RunnerSetup, device_buffer};
+use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_listing};
+use crate::runner::{ImageSetup, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
     LatentUpdate, Metadata, OutputPlacement, ProductBuffer, RequestSlots, SlotField, ValueRange,
@@ -169,8 +170,8 @@ impl DecoderRunner {
     pub fn stream(&self) -> Option<&Stream> {
         match &self.family {
             Family::Image(image) => image.stream.as_ref(),
-            Family::Video(video) => Some(&video.methods.stream),
-            Family::Audio(audio) => Some(&audio.methods.stream),
+            Family::Video(video) => Some(&video.stream),
+            Family::Audio(audio) => Some(&audio.stream),
         }
     }
 
@@ -281,19 +282,13 @@ impl DecoderRunner {
         }
     }
 
-    /// The kernels the operators of a video or audio decoder selected.
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
+    /// The kernel listings (JSON arrays of records) of the decoder's
+    /// Python runners.
+    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
         match &self.family {
-            Family::Image(image) => {
-                let records: tvm_ffi::Array<Any> = image.kernels.call_as(&[image.runner.view()])?;
-                records
-                    .iter()
-                    .enumerate()
-                    .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
-                    .collect()
-            }
-            Family::Video(video) => video.kernels(label),
-            Family::Audio(audio) => audio.kernels(label),
+            Family::Image(image) => Ok(vec![kernel_listing(&image.kernels, &image.runner)?]),
+            Family::Video(video) => video.kernels(),
+            Family::Audio(audio) => audio.kernels(),
         }
     }
 
@@ -843,10 +838,12 @@ pub(crate) struct DecodeCapacity {
 /// retained overlap and the unit's RGB frames. The runner copies a
 /// request's values in and out of them natively around the forward.
 struct VideoDecoder {
-    methods: Methods,
+    class: RunnerClass,
+    loaded: Handle,
+    stream: Stream,
     device: i32,
     /// The runner of each segment, in preparation order.
-    runners: Vec<(Segment, Handle)>,
+    runners: Vec<(Segment, Methods)>,
     /// The retained overlap of each request slot (`[slots + 1, elements]`):
     /// the decoded tail a request's previous round left for its next.
     overlap: RequestSlots,
@@ -907,12 +904,14 @@ impl VideoDecoder {
             graphs: GraphTable::new(format!("{}.decoder", setup.path), capture.release.clone()),
             capture,
             pool,
-            methods: Methods::new(&setup, DECODER, "decode")?,
+            loaded: setup.loaded.clone(),
+            class: RunnerClass::new(setup.interface, DECODER, "decode", setup.arguments())?,
+            stream: setup.stream.clone(),
         })
     }
 
     pub(crate) fn stream(&self) -> &Stream {
-        &self.methods.stream
+        &self.stream
     }
 
     /// Construct the runner of every segment, the largest first.
@@ -926,11 +925,11 @@ impl VideoDecoder {
                 continue;
             }
             let (frames, canvas) = segment;
-            let runner = self.methods.runner([
+            let runner = self.class.construct(vec![Argument::Integers(vec![
                 i64::from(frames),
                 i64::from(canvas.width),
                 i64::from(canvas.height),
-            ])?;
+            ])])?;
             self.runners.push((segment, runner));
         }
         Ok(())
@@ -949,7 +948,7 @@ impl VideoDecoder {
             .ok_or_else(|| Error::Invariant("a video segment has no decoder runner".into()))?;
         let frames = self.unit_frames(canvas, longest)?;
         Ok(vec![
-            runner.to_any(),
+            runner.runner().to_any(),
             Any::from(self.latent.to_tensor()?),
             Any::from(self.rows.prefix(rows as i64)?.to_tensor()?),
             Any::from(self.retained.to_tensor()?),
@@ -979,7 +978,7 @@ impl VideoDecoder {
         let key = (frames, canvas, unit);
         if !self.windows.contains_key(&key) {
             let value = self.window_rows.call_values(&[
-                self.methods.loaded.to_any(),
+                self.loaded.to_any(),
                 Any::from(i64::from(frames)),
                 Any::from(i64::from(canvas.width)),
                 Any::from(i64::from(canvas.height)),
@@ -1004,7 +1003,7 @@ impl VideoDecoder {
         self.rows.zero(Some(self.stream()))?;
         self.retained.zero(Some(self.stream()))?;
         let arguments = self.arguments(shape, rows, longest)?;
-        self.methods.forward.call_values(&arguments)?;
+        self.class.forward.call_values(&arguments)?;
         self.stream().synchronize()?;
         Ok(())
     }
@@ -1018,11 +1017,11 @@ impl VideoDecoder {
             return Ok(());
         }
         let arguments = self.arguments(shape, rows, longest)?;
-        let graph =
-            self.capture
-                .capture(&pool.value, self.methods.stream.raw(), self.device, || {
-                    self.methods.forward.call_values(&arguments).map(drop)
-                })?;
+        let graph = self
+            .capture
+            .capture(&pool.value, self.stream.raw(), self.device, || {
+                self.class.forward.call_values(&arguments).map(drop)
+            })?;
         self.graphs.insert(shape, None, graph)?;
         self.graphs.record(GraphMode::Capture);
         Ok(())
@@ -1048,7 +1047,7 @@ impl VideoDecoder {
         out: &StorageView,
     ) -> Result<GraphMode> {
         let canvas = shape.segment.1;
-        let stream = self.methods.stream.clone();
+        let stream = self.stream.clone();
         let latent_bytes = latent.numel() * latent.dtype().bytes() as u64;
         if !latent.is_contiguous()
             || latent.dtype() != DType::F32
@@ -1091,7 +1090,7 @@ impl VideoDecoder {
             // A shape startup did not capture runs on the Python thread.
             _ => {
                 let arguments = self.arguments(shape, rows, longest)?;
-                self.methods.forward.call_values(&arguments)?;
+                self.class.forward.call_values(&arguments)?;
                 GraphMode::Eager
             }
         };
@@ -1117,15 +1116,15 @@ impl VideoDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
-        self.methods
-            .kernels(label, self.runners.iter().map(|(_, runner)| runner))
+    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
+        self.class
+            .kernels(self.runners.iter().map(|(_, runner)| runner))
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let graphs = self.graphs.close(aborted);
         graphs.and(
-            self.methods
+            self.class
                 .close(aborted, self.runners.iter().map(|(_, runner)| runner)),
         )
     }
@@ -1151,10 +1150,11 @@ pub(crate) struct TrackUnits {
 /// fixed addresses, so one captured graph per [`TrackUnits`] serves every
 /// request; the runner copies a request's values in and out natively.
 struct AudioDecoder {
-    methods: Methods,
+    class: RunnerClass,
+    stream: Stream,
     device: i32,
     /// The runner of each track length, by its latent frames.
-    runners: BTreeMap<u32, Handle>,
+    runners: BTreeMap<u32, Methods>,
     /// `[rows, width]` FP32: a request's complete audio latent.
     latent: StorageView,
     /// `[samples, 2]` int16: the samples of the decoded units.
@@ -1188,18 +1188,21 @@ impl AudioDecoder {
             graphs: GraphTable::new(format!("{}.decoder", setup.path), capture.release.clone()),
             capture,
             pool,
-            methods: Methods::new(&setup, DECODER, "decode")?,
+            class: RunnerClass::new(setup.interface, DECODER, "decode", setup.arguments())?,
+            stream: setup.stream.clone(),
         })
     }
 
     pub(crate) fn stream(&self) -> &Stream {
-        &self.methods.stream
+        &self.stream
     }
 
     /// Construct the runner of tracks of `latent_frames` latent frames.
     pub(crate) fn prepare(&mut self, latent_frames: u32) -> Result<()> {
         if !self.runners.contains_key(&latent_frames) {
-            let runner = self.methods.runner([i64::from(latent_frames)])?;
+            let runner = self
+                .class
+                .construct(vec![Argument::Integers(vec![i64::from(latent_frames)])])?;
             self.runners.insert(latent_frames, runner);
         }
         Ok(())
@@ -1212,7 +1215,7 @@ impl AudioDecoder {
             Error::Invalid("the audio track's length has no decoder runner".into())
         })?;
         Ok(vec![
-            runner.to_any(),
+            runner.runner().to_any(),
             Any::from(self.latent.prefix(rows as i64)?.to_tensor()?),
             Any::from(self.samples.prefix(units.span as i64)?.to_tensor()?),
             Any::from(units.samples as i64),
@@ -1227,7 +1230,7 @@ impl AudioDecoder {
     pub(crate) fn warm(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
         self.latent.zero(Some(self.stream()))?;
         let arguments = self.arguments(units, rows)?;
-        self.methods.forward.call_values(&arguments)?;
+        self.class.forward.call_values(&arguments)?;
         self.stream().synchronize()?;
         Ok(())
     }
@@ -1241,11 +1244,11 @@ impl AudioDecoder {
             return Ok(());
         }
         let arguments = self.arguments(units, rows)?;
-        let graph =
-            self.capture
-                .capture(&pool.value, self.methods.stream.raw(), self.device, || {
-                    self.methods.forward.call_values(&arguments).map(drop)
-                })?;
+        let graph = self
+            .capture
+            .capture(&pool.value, self.stream.raw(), self.device, || {
+                self.class.forward.call_values(&arguments).map(drop)
+            })?;
         self.graphs.insert(units, None, graph)?;
         self.graphs.record(GraphMode::Capture);
         Ok(())
@@ -1259,7 +1262,7 @@ impl AudioDecoder {
         units: TrackUnits,
         out: &StorageView,
     ) -> Result<GraphMode> {
-        let stream = self.methods.stream.clone();
+        let stream = self.stream.clone();
         let rows = latent.shape().first().copied().unwrap_or(0).max(0) as u64;
         let latent_bytes = latent.numel() * latent.dtype().bytes() as u64;
         if !latent.is_contiguous()
@@ -1289,7 +1292,7 @@ impl AudioDecoder {
             // Units startup did not capture run on the Python thread.
             _ => {
                 let arguments = self.arguments(units, rows)?;
-                self.methods.forward.call_values(&arguments)?;
+                self.class.forward.call_values(&arguments)?;
                 GraphMode::Eager
             }
         };
@@ -1308,13 +1311,13 @@ impl AudioDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
-        self.methods.kernels(label, self.runners.values())
+    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
+        self.class.kernels(self.runners.values())
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let graphs = self.graphs.close(aborted);
-        graphs.and(self.methods.close(aborted, self.runners.values()))
+        graphs.and(self.class.close(aborted, self.runners.values()))
     }
 }
 
