@@ -12,18 +12,20 @@
 //! | the head cannot be reached or refuses the registration | 1 |
 //! | SIGINT before serving | 130 |
 //! | SIGTERM before serving | signal death |
-//! | startup or serving failure, or the head's connection closing | 1, after an aborted close |
+//! | the head's connection closing before serving | 1, at once |
+//! | startup or serving failure, or the head's connection closing while serving | 1, after an aborted close |
 //! | close by the head, or after a fatal response | 0 |
 
 mod arguments;
-mod endpoint;
+mod registration;
 mod signals;
 
 pub use arguments::{Arguments, USAGE};
-pub use endpoint::Connection;
+pub use registration::{ExitOnClose, register};
 pub use signals::Signals;
 
 use tvm_ffi::Map;
+use uniserve_ipc::Channel;
 
 use crate::config::{DescriptorError, WorkerLaunch, resolve};
 use crate::error::WorkerError;
@@ -57,7 +59,7 @@ pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> 
         );
         return 1;
     }
-    let (connection, descriptor) = match Connection::register(&arguments) {
+    let (channel, descriptor) = match register(&arguments) {
         Ok(registered) => registered,
         Err(error) => {
             tracing::error!(target: "uniserve_worker.launch", "worker failed: {error}");
@@ -68,7 +70,7 @@ pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> 
         Ok(launch) => launch,
         Err(error) => return usage(error),
     };
-    match run(launch, connection, table, &signals) {
+    match run(launch, channel, table, &signals) {
         Ok(()) => {
             tracing::info!(target: "uniserve_worker.launch", "worker shut down");
             0
@@ -88,21 +90,32 @@ pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> 
 
 fn run(
     launch: WorkerLaunch,
-    mut connection: Connection,
+    mut channel: Channel,
     table: Map<tvm_ffi::String, tvm_ffi::Function>,
     signals: &Signals,
 ) -> std::result::Result<(), WorkerError> {
     let interface = Interface::from_table(table)?;
-    connection.configure(&launch.ipc);
+    // Size the channel for the batches and results the descriptor allows.
+    channel.set_capacity(launch.ipc.max_payload_bytes, launch.ipc.queue_depth);
+
+    // Until the service observes the connection, the head's close ends the
+    // process from the watch's thread.
+    let hangup = channel
+        .hangup()
+        .map_err(|error| crate::Error::Transport(error.to_string()))?;
+    let mut starting = Some(ExitOnClose::watch(hangup)?);
 
     let mut worker = Worker::start(launch, interface)?;
     let served = worker.warmup().and_then(|()| {
+        starting.take();
         signals.serving();
-        worker.run(&mut connection)
+        worker.run(&mut channel)
     });
+    // An orderly failure of the startup closes the rank below, not the watch.
+    drop(starting);
     let closed = worker.close(served.is_err());
     // The worker's readers retire before the connection is released.
     drop(worker);
-    drop(connection);
+    drop(channel);
     served.and(closed)
 }
