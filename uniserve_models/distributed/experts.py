@@ -35,7 +35,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from functools import partial
 from typing import Any
 
 import torch
@@ -404,9 +403,9 @@ class WeightPrefetch:
     Expert calls bracket their computation with :meth:`before` and
     :meth:`after`; an activation brackets one invocation. The worker's
     hooks submit peer reads and order them by events against the calling
-    stream. Under graph capture, reads cannot be recorded: :meth:`before`
-    hands them to the capture's recorder (:meth:`capture`), which ends the
-    current graph segment, replays the read eagerly and begins the next.
+    stream. Under graph capture a read cannot be recorded: the worker's
+    ``before`` ends the current graph segment and performs the read between
+    segments at every launch.
 
     The hooks are the worker's functions, as :func:`bind_prefetch` receives
     them.
@@ -419,7 +418,6 @@ class WeightPrefetch:
         end: Callable[..., Any],
         before: Callable[..., Any],
         after: Callable[..., Any],
-        copy: Callable[..., Any],
     ):
         self._ordinals = {
             id(layer): index for index, layer in enumerate(layers)
@@ -429,8 +427,6 @@ class WeightPrefetch:
         self._end = end
         self._before = before
         self._after = after
-        self._copy = copy
-        self._submit: Callable[[Callable[[], object]], None] | None = None
 
     def _stream(self) -> int:
         return torch.cuda.current_stream(self.device).cuda_stream
@@ -447,29 +443,9 @@ class WeightPrefetch:
         finally:
             self._end(self._stream())
 
-    @contextmanager
-    def capture(
-        self, submit: Callable[[Callable[[], object]], None]
-    ) -> Iterator[None]:
-        """Route reads to a graph capture's segment recorder."""
-        previous, self._submit = self._submit, submit
-        try:
-            yield
-        finally:
-            self._submit = previous
-
     def before(self, module) -> None:
         """Wait for this layer's weights and prefetch the next layer's."""
-        # Under capture the worker hands each read to the recorder while it
-        # orders the layer's waits, so every wait lands in the segment after
-        # the read it depends on.
-        record = None if self._submit is None else self._record
-        self._before(self._ordinals[id(module)], self._stream(), record)
-
-    def _record(self, index: int) -> None:
-        if self._submit is None:
-            raise RuntimeError("capture expert weight reads with a recorder")
-        self._submit(partial(self._copy, int(index)))
+        self._before(self._ordinals[id(module)], self._stream())
 
     def after(self, module) -> None:
         """Release the layer's slots after its last reader."""
@@ -482,22 +458,16 @@ def bind_prefetch(
     end: Callable[..., Any],
     before: Callable[..., Any],
     after: Callable[..., Any],
-    copy: Callable[..., Any],
 ) -> WeightPrefetch:
-    """The prefetch object bindings pass to their expert calls.
+    """The prefetch object execution contexts pass to their expert calls.
 
     Args:
         model: The loaded model.
         begin: ``()`` opens one invocation.
         end: ``(stream)`` closes it on the calling CUDA stream handle.
-        before: ``(layer, stream, record)`` waits for a layer's weights and
-            prefetches the next layer's. ``record`` is ``None`` eagerly
-            and, under capture, receives each copy index to submit between
-            graph segments.
+        before: ``(layer, stream)`` waits for a layer's weights and
+            prefetches the next layer's.
         after: ``(layer, stream)`` releases the layer's slots after its
             last reader.
-        copy: ``(index)`` runs one recorded peer read.
     """
-    return WeightPrefetch(
-        _prefetched_layers(model), begin, end, before, after, copy
-    )
+    return WeightPrefetch(_prefetched_layers(model), begin, end, before, after)
