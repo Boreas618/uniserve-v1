@@ -22,7 +22,7 @@ pub(crate) struct EncoderRunners {
     pub(crate) text_pool: Option<Arc<GraphPool<Handle>>>,
     /// A video model's condition latent encoders.
     pub(crate) latent: Option<Component<EncoderRunner>>,
-    /// An image model's encoders, in binding order.
+    /// An image model's encoders, in construction order.
     pub(crate) image: Vec<EncoderRunner>,
     /// The image encoder serving each component's call kind.
     routes: HashMap<(String, CallKind), usize>,
@@ -60,7 +60,7 @@ impl EncoderRunners {
     }
 
     /// Warm every unpacked image encoder on one black `side` x `side`
-    /// image, in binding order, as serving prepares its images.
+    /// image, in construction order, as serving prepares its images.
     pub(crate) fn warm_image(&self, side: u32) -> Result<()> {
         for runner in &self.image {
             runner.warm(side)?;
@@ -86,15 +86,6 @@ impl EncoderRunners {
         for runner in &mut self.image {
             runner.seal();
         }
-    }
-
-    /// Release the image encoders.
-    pub(crate) fn close_image(&mut self, aborted: bool) -> Result<()> {
-        let mut result = Ok(());
-        for runner in &mut self.image {
-            result = result.and(runner.close(aborted));
-        }
-        result
     }
 
     /// Capture the text encoder's prompt capacities, then refuse further
@@ -135,7 +126,8 @@ impl EncoderRunners {
     }
 
     /// Release the text encoder and its vision tower. The tower computes
-    /// with the text encoder's binding, which the text encoder releases.
+    /// with the text encoder's execution context, which the text encoder
+    /// releases.
     pub(crate) fn close_text(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         if let Some(vision) = &mut self.vision {

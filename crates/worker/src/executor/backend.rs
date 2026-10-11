@@ -23,7 +23,7 @@ use super::forward::{self, launch::Launched};
 use super::lifecycle::{RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
-use crate::ffi::Function;
+use crate::ffi::{Function, Record};
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::JobQueues;
@@ -39,7 +39,7 @@ use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::inputs::Inputs;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
-use crate::runner::start::ImageOwners;
+use crate::runner::start::{ImageOwners, ImageRunner};
 use crate::service::ServiceBackend;
 use crate::storage::ImageLatents;
 use crate::worker::RankStorage;
@@ -74,6 +74,8 @@ pub struct WorkerBackend {
     trajectories: Trajectories,
     /// The lane preparing input images and encoding output images.
     image_host: Option<HostLane<ImageTask>>,
+    /// An image model's runners with their names, in construction order.
+    image_order: Vec<(ImageRunner, String)>,
     /// The runner of each diffusion LM component placed on the rank.
     diffusion_lm: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
     /// The expert-parallel runtime, on ranks of an expert union.
@@ -293,6 +295,7 @@ impl WorkerBackend {
             latents: None,
             trajectories: Trajectories::default(),
             image_host: None,
+            image_order: Vec::new(),
             diffusion_lm: Vec::new(),
             experts: None,
             weights: None,
@@ -395,17 +398,49 @@ impl WorkerBackend {
         self.latents = owners.latents;
         self.media_outputs = Some(owners.outputs);
         self.image_host = Some(owners.host);
+        self.image_order = owners.order;
     }
 
-    /// Release what serves an image model: the encoders' and the
-    /// denoiser's graphs, the host lane and the output storage, after the
-    /// lanes drained.
+    /// The kernels each image runner's operators selected, as `(name,
+    /// device, kernels)` in construction order.
+    pub(crate) fn image_kernels(&self) -> Result<Vec<(String, String, Vec<Record>)>> {
+        image_kernels(
+            &self.image_order,
+            &self.encoders,
+            &self.denoisers,
+            &self.decoders,
+        )
+    }
+
+    /// Release what serves an image model: its runners, the host lane and
+    /// the output storage, after the lanes drained.
     fn close_image(&mut self, aborted: bool) -> Result<()> {
         let Some(image) = self.image.take() else {
             return Ok(());
         };
-        let mut result = self.encoders.close_image(aborted);
-        result = result.and(self.denoisers.close_image(aborted));
+        // Each runner releases its graphs and then the execution context
+        // its Python half constructed, newest first.
+        let mut result = Ok(());
+        for (runner, _) in std::mem::take(&mut self.image_order).into_iter().rev() {
+            let closed = match runner {
+                ImageRunner::Encoder(index) => self
+                    .encoders
+                    .image
+                    .get_mut(index)
+                    .map_or(Ok(()), |runner| runner.close(aborted)),
+                ImageRunner::Denoiser => self
+                    .denoisers
+                    .image
+                    .as_mut()
+                    .map_or(Ok(()), |(_, runner)| runner.close(aborted)),
+                ImageRunner::Decoder => self
+                    .decoders
+                    .image
+                    .as_mut()
+                    .map_or(Ok(()), |(_, runner)| runner.close(aborted)),
+            };
+            result = result.and(closed);
+        }
         if let Some(host) = self.image_host.take() {
             if aborted {
                 host.abort();
@@ -749,6 +784,21 @@ impl WorkerBackend {
                 return;
             }
         }
+        let added = image_kernels(
+            &self.image_order,
+            &self.encoders,
+            &self.denoisers,
+            &self.decoders,
+        )
+        .and_then(|listed| {
+            listed
+                .iter()
+                .try_for_each(|(label, device, records)| current.add(label, device, records))
+        });
+        if let Err(error) = added {
+            tracing::warn!(target: "uniserve_worker.profiling", "kernel report failed: {error}");
+            return;
+        }
         if watch.records.merge(current) {
             watch.records.log("serving", watch.rank, &watch.device);
         }
@@ -897,6 +947,35 @@ impl WorkerBackend {
             profiler.close();
         }
     }
+}
+
+/// The kernels of an image model's runners, in the order `order` names
+/// them: each runner's name, its device and what its operators selected.
+fn image_kernels(
+    order: &[(ImageRunner, String)],
+    encoders: &EncoderRunners,
+    denoisers: &DenoiserRunners,
+    decoders: &DecoderRunners,
+) -> Result<Vec<(String, String, Vec<Record>)>> {
+    let mut listed = Vec::new();
+    for (runner, name) in order {
+        let (device, kernels) = match runner {
+            ImageRunner::Encoder(index) => match encoders.image.get(*index) {
+                Some(runner) => (runner.device().to_string(), runner.kernels(name)?),
+                None => continue,
+            },
+            ImageRunner::Denoiser => match &denoisers.image {
+                Some((_, runner)) => (runner.device().to_string(), runner.kernels(name)?),
+                None => continue,
+            },
+            ImageRunner::Decoder => match &decoders.image {
+                Some((_, runner)) => (runner.device().to_string(), runner.kernels(name)?),
+                None => continue,
+            },
+        };
+        listed.push((name.clone(), device, kernels));
+    }
+    Ok(listed)
 }
 
 /// A binding's kernel-table label: component, root path and call kinds.
