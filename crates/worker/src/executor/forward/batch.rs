@@ -18,10 +18,11 @@ use uniserve_core::MediaSource;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
     Batch as BatchPlan, BatchOutput, BufferAllocation, BufferId, Call, CallKind, CallStatus,
-    ErrorCode, MediaCall, RequestKey, TensorExport, TensorRef, WorkerInfo,
+    ErrorCode, ForwardStats, MediaCall, RequestKey, TensorExport, TensorRef, WorkerInfo,
 };
 
 use super::products::Publications;
+use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::forward::placement::{
     OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export, skipped,
@@ -108,6 +109,8 @@ pub(crate) struct MediaBatch {
     /// The stream the batch's device work runs on, when it has any.
     pub(crate) stream: Option<Stream>,
     pub(crate) device: Device,
+    /// The graph modes of the batch's forwards, reported with its result.
+    stats: ForwardStats,
     committed: bool,
     delivered: bool,
 }
@@ -117,6 +120,25 @@ fn lock(lease: &OutputLease) -> std::sync::MutexGuard<'_, crate::OutputBuffer> {
 }
 
 impl MediaBatch {
+    /// Count one forward of the batch by the graph mode it ran in: a
+    /// captured graph's launch, a capture, or an eager call.
+    pub(crate) fn record(&mut self, mode: GraphMode) {
+        let name = mode.as_str();
+        *self.stats.mode_counts.entry(name.into()).or_default() += 1;
+        match mode {
+            GraphMode::Capture => self.stats.cuda_graph_captures += 1,
+            GraphMode::Replay => self.stats.cuda_graph_replays += 1,
+            GraphMode::Eager => {}
+        }
+        if mode != GraphMode::Eager {
+            *self
+                .stats
+                .cuda_graph_runtime_mode_counts
+                .entry(name.into())
+                .or_default() += 1;
+        }
+    }
+
     /// Open a batch of `calls` calls on `device` and `stream` that reads
     /// `inputs`.
     pub(crate) fn new(
@@ -137,6 +159,7 @@ impl MediaBatch {
             output,
             stream,
             device,
+            stats: ForwardStats::default(),
             committed: false,
             delivered: false,
         })
@@ -321,7 +344,7 @@ impl MediaBatch {
                 completions,
                 products,
                 worker_exec_us: None,
-                forward_stats: None,
+                forward_stats: (!self.stats.is_empty()).then(|| self.stats.clone()),
             },
             media,
         }))
