@@ -328,7 +328,7 @@ impl PeerGroup<'_> {
         };
         interface
             .function("distributed.bind_collectives")?
-            .call_values(&[binding.prepared().to_any(), collectives.tables()])?;
+            .call_values(&[binding.prepared().to_any(), collectives.natives(interface)?])?;
         Ok(Some(collectives))
     }
 }

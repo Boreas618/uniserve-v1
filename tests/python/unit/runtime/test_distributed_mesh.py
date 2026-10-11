@@ -17,17 +17,8 @@ def test_launch_rejects_unavailable_rank_device(monkeypatch):
         ValueError,
         match=r"cuda device cuda:1 is outside the 1 visible CUDA device",
     ):
-        initialize(
-            {
-                "rank": 1,
-                "local_rank": 1,
-                "world_size": 2,
-                "device": "cuda",
-                "backend": None,
-                "store": None,
-                "union": None,
-            }
-        )
+        # The second of two ranks on a bare CUDA device, before any store.
+        initialize(1, 1, 2, "cuda", None, None, None, None, None, None)
 
 
 def test_mesh_maps_ordered_members_and_independent_axes():

@@ -33,7 +33,7 @@ component's expert calls prefetch peers' weights through.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
@@ -85,30 +85,26 @@ def layers(model, disaggregated: int) -> list[int]:
     ]
 
 
-def _group(group: Mapping[str, Any], device: torch.device) -> Communicator:
-    """The union communicator: ranks in member order, unbound."""
-    size = int(group["size"])
-    return Communicator(
-        tuple(range(size)), int(group["rank"]), "experts", device
-    )
-
-
 def symmetric_bytes(
-    model, transport: str, group: Mapping[str, Any], max_tokens: int
+    model, transport: str, size: int, attention_ranks: int, max_tokens: int
 ) -> int:
     """Bytes of one microbatch's peer-mapped storage on every member.
 
     Only split MegaMoE (``megamoe`` with dedicated expert ranks) exchanges
     through storage the worker maps; every other transport returns zero.
+    ``size`` and ``attention_ranks`` are the union's member count and its
+    attention ranks, as in :func:`create_exchange`.
     """
-    attention_ranks = int(group["attention_ranks"])
+    attention_ranks = int(attention_ranks)
     if transport != "megamoe" or not attention_ranks:
         return 0
-    from uniserve_models.backends.experts.split import symmetric_bytes as size
+    from uniserve_models.backends.experts.split import (
+        symmetric_bytes as storage_bytes,
+    )
 
     first = _layers(model, True)[0]
-    return size(
-        size=int(group["size"]),
+    return storage_bytes(
+        size=int(size),
         attention_ranks=attention_ranks,
         max_tokens=int(max_tokens),
         num_experts=int(first.num_experts),
@@ -122,48 +118,53 @@ def symmetric_bytes(
 def create_exchange(
     model,
     transport: str,
-    group: Mapping[str, Any],
-    host: Mapping[str, Any],
+    rank: int,
+    size: int,
+    attention_ranks: int,
+    host: transports.HostBootstrap,
     max_tokens: int,
     device: int,
     stream: int,
-    hooks: Mapping[str, Any],
-    symmetric: Mapping[str, Any] | None,
+    yield_turn: Any,
+    storage: torch.Tensor | None,
+    pointers: Sequence[int],
 ):
     """Construct one microbatch's token transport, collectively.
 
     Args:
-        model: The ``model.load`` handle.
+        model: The loaded model.
         transport: ``alltoall``, ``deepep`` or ``megamoe``.
-        group: ``{"rank", "size", "attention_ranks"}`` of the union.
-        host: The worker's host functions over the union
-            (:class:`uniserve_models.backends.experts.HostBootstrap`).
+        rank: This member's index in the expert union.
+        size: The union's member count.
+        attention_ranks: The union's attention ranks when routed experts
+            run on dedicated ranks; zero when every rank holds its experts.
+        host: The worker's host collectives over the union.
         max_tokens: Tokens one rank sends per step at most.
         device: The CUDA ordinal.
         stream: The microbatch's CUDA stream handle; construction enqueues
             its device work there.
-        hooks: ``{"yield": function or None}``: hands the host turn to the
-            next microbatch after a dispatch.
-        symmetric: Split MegaMoE's mapped storage, ``{"storage": int8
-            tensor, "pointers": every member's address}``, else ``None``.
+        yield_turn: The worker's function handing the host turn to the next
+            microbatch after a dispatch; ``None`` with one microbatch.
+        storage: Split MegaMoE's mapped storage as an int8 tensor, else
+            ``None``.
+        pointers: Every member's address of that storage; empty without it.
 
     Returns:
         The transport, an opaque handle passed back unchanged.
     """
-    attention_ranks = int(group["attention_ranks"])
+    attention_ranks = int(attention_ranks)
     candidates = _layers(model, bool(attention_ranks))
     if not candidates:
         raise ValueError("expert parallelism requires routed expert layers")
     first = candidates[0]
     target = torch.device("cuda", int(device))
     computation = torch.cuda.ExternalStream(int(stream), device=target)
-    storage = None
-    if symmetric is not None:
-        storage = {
-            "storage": torch.from_dlpack(symmetric["storage"]),
-            "pointers": [int(value) for value in symmetric["pointers"]],
+    symmetric = None
+    if storage is not None:
+        symmetric = {
+            "storage": storage,
+            "pointers": [int(value) for value in pointers],
         }
-    yield_turn = hooks.get("yield")
     if yield_turn is not None:
         # The worker's function waits for this microbatch's next turn. Other
         # microbatch threads run numerical code meanwhile, so the wait must
@@ -173,8 +174,9 @@ def create_exchange(
     with torch.cuda.device(target), torch.cuda.stream(computation):
         return transports.create(
             str(transport),
-            _group(group, target),
-            transports.HostBootstrap(host),
+            # The union communicator: ranks in member order, unbound.
+            Communicator(tuple(range(int(size))), int(rank), "experts", target),
+            host,
             max_tokens=int(max_tokens),
             top_k=int(first.top_k),
             num_experts=int(first.num_experts),
@@ -185,7 +187,7 @@ def create_exchange(
             device=target,
             yield_turn=yield_turn,
             encoding=_encoding(first),
-            symmetric=storage,
+            symmetric=symmetric,
         )
 
 
@@ -405,14 +407,29 @@ class WeightPrefetch:
     stream. Under graph capture, reads cannot be recorded: :meth:`before`
     hands them to the capture's recorder (:meth:`capture`), which ends the
     current graph segment, replays the read eagerly and begins the next.
+
+    The hooks are the worker's functions, as :func:`bind_prefetch` receives
+    them.
     """
 
-    def __init__(self, layers: list[FusedMoE], hooks: Mapping[str, Any]):
+    def __init__(
+        self,
+        layers: list[FusedMoE],
+        begin: Callable[..., Any],
+        end: Callable[..., Any],
+        before: Callable[..., Any],
+        after: Callable[..., Any],
+        copy: Callable[..., Any],
+    ):
         self._ordinals = {
             id(layer): index for index, layer in enumerate(layers)
         }
         self.device = layers[0].up_gate.weight.device
-        self._hooks = hooks
+        self._begin = begin
+        self._end = end
+        self._before = before
+        self._after = after
+        self._copy = copy
         self._submit: Callable[[Callable[[], object]], None] | None = None
 
     def _stream(self) -> int:
@@ -424,11 +441,11 @@ class WeightPrefetch:
     @contextmanager
     def activate(self) -> Iterator[None]:
         """Bracket one eager or captured invocation."""
-        self._hooks["begin"]()
+        self._begin()
         try:
             yield
         finally:
-            self._hooks["end"](self._stream())
+            self._end(self._stream())
 
     @contextmanager
     def capture(
@@ -447,26 +464,40 @@ class WeightPrefetch:
         # orders the layer's waits, so every wait lands in the segment after
         # the read it depends on.
         record = None if self._submit is None else self._record
-        self._hooks["before"](
-            self._ordinals[id(module)], self._stream(), record
-        )
+        self._before(self._ordinals[id(module)], self._stream(), record)
 
     def _record(self, index: int) -> None:
         if self._submit is None:
             raise RuntimeError("capture expert weight reads with a recorder")
-        self._submit(partial(self._hooks["copy"], int(index)))
+        self._submit(partial(self._copy, int(index)))
 
     def after(self, module) -> None:
         """Release the layer's slots after its last reader."""
-        self._hooks["after"](self._ordinals[id(module)], self._stream())
+        self._after(self._ordinals[id(module)], self._stream())
 
 
-def bind_prefetch(model, hooks: Mapping[str, Any]) -> WeightPrefetch:
+def bind_prefetch(
+    model,
+    begin: Callable[..., Any],
+    end: Callable[..., Any],
+    before: Callable[..., Any],
+    after: Callable[..., Any],
+    copy: Callable[..., Any],
+) -> WeightPrefetch:
     """The prefetch object bindings pass to their expert calls.
 
-    ``hooks`` are the worker's ``begin()``, ``end(stream)``, ``before(layer,
-    stream, record)``, ``after(layer, stream)`` and ``copy(index)``;
-    ``record`` is ``None`` eagerly and, under capture, receives each copy
-    index to submit between graph segments.
+    Args:
+        model: The loaded model.
+        begin: ``()`` opens one invocation.
+        end: ``(stream)`` closes it on the calling CUDA stream handle.
+        before: ``(layer, stream, record)`` waits for a layer's weights and
+            prefetches the next layer's. ``record`` is ``None`` eagerly
+            and, under capture, receives each copy index to submit between
+            graph segments.
+        after: ``(layer, stream)`` releases the layer's slots after its
+            last reader.
+        copy: ``(index)`` runs one recorded peer read.
     """
-    return WeightPrefetch(_prefetched_layers(model), hooks)
+    return WeightPrefetch(
+        _prefetched_layers(model), begin, end, before, after, copy
+    )

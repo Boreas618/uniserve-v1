@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -21,7 +21,7 @@ def execution_context(
     cache=None,
     experts=None,
     weights=None,
-    collectives: Mapping[str, Any] | None = None,
+    collectives: Sequence[Any] | None = None,
 ) -> ExecutionContext:
     """An execution context of ``module`` on a caller's stream.
 
@@ -44,9 +44,9 @@ def execution_context(
         cache: The prefix cache view object attention layers read.
         experts: The expert exchange routed experts communicate through.
         weights: The distributed expert weights' prefetch object.
-        collectives: The collective functions of each of the module's
-            communicators on ``stream``, by communicator name; ``None``
-            when the module communicates over no multi-member group.
+        collectives: The ``NativeCollectives`` of each of the module's
+            communicators on ``stream``; ``None`` when the module
+            communicates over no multi-member group.
     """
     bound = None
     if collectives is not None:

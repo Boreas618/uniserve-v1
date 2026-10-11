@@ -268,8 +268,8 @@ class DiffusionLMRunner:
             ``None``.
         weights: The distributed expert weights' prefetch object, or
             ``None``.
-        collectives: The collective functions of the model's communicators
-            on the stream, by communicator name, or ``None``.
+        collectives: The ``NativeCollectives`` of the model's communicators
+            on the stream, or ``None``.
         tokens: The most tokens one forward evaluates.
         rows: The most sequences one forward evaluates.
         page_tokens: Tokens per page of each numerical block table.

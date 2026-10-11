@@ -13,7 +13,7 @@ use tvm_ffi::{Any, AnyView};
 use super::world::World;
 use crate::config::{Device, WorkerLaunch};
 use crate::cuda_graph::GraphBreaks;
-use crate::ffi::{Fields, Function, Handle};
+use crate::ffi::{Function, Handle};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::interface::Interface;
@@ -722,10 +722,11 @@ impl DwdpManager {
         let prefetch = Handle::new(
             interface
                 .import(&format!("{MODULE}.bind_prefetch"))?
-                .call_values(&[
-                    model.handle().to_any(),
-                    hooks(&weights, &break_graph, &breaks),
-                ])?,
+                .call_values(
+                    &std::iter::once(model.handle().to_any())
+                        .chain(hooks(&weights, &break_graph, &breaks))
+                        .collect::<Vec<_>>(),
+                )?,
         )?;
         Ok(Some(Self {
             weights,
@@ -768,16 +769,15 @@ impl Drop for DwdpManager {
     }
 }
 
-/// The prefetch hooks as TVM-FFI functions closed over `weights`:
-/// `begin()`, `end(stream)`, `before(layer, stream, record)`,
-/// `after(layer, stream)` and `copy(index)`. They block on no peer.
+/// The prefetch hooks as TVM-FFI functions closed over `weights`, in the
+/// order `bind_prefetch` takes them after the model: `begin()`,
+/// `end(stream)`, `before(layer, stream)` and `after(layer, stream)`. They
+/// block on no peer.
 ///
-/// Under graph capture a copy is a graph break. With `record`, a function
-/// of a copy index, the binding that records the capture in Python submits
-/// the copy between its segments. Without it the capture is the runtime's:
-/// `before` ends the segment with `break_graph` and notes the copy in
-/// `breaks`, and the runtime performs it at every launch.
-fn hooks(weights: &Arc<ExpertWeights>, break_graph: &Function, breaks: &GraphBreaks) -> Any {
+/// Under graph capture a copy is a graph break: `before` ends the segment
+/// with `break_graph` and notes the copy in `breaks`, and the runtime
+/// performs it at every launch.
+fn hooks(weights: &Arc<ExpertWeights>, break_graph: &Function, breaks: &GraphBreaks) -> Vec<Any> {
     type Hook = dyn Fn(&ExpertWeights, &[AnyView<'_>]) -> std::result::Result<Any, tvm_ffi::Error>;
     let function = |call: Box<Hook>| {
         let weights = Arc::clone(weights);
@@ -788,65 +788,39 @@ fn hooks(weights: &Arc<ExpertWeights>, break_graph: &Function, breaks: &GraphBre
             .map(|()| Any::default())
             .map_err(|error| ffi_error(&error))
     };
-    Fields::new()
-        .with(
-            "begin",
-            function(Box::new(move |weights, _| unit(weights.begin()))),
-        )
-        .with(
-            "end",
-            function(Box::new(move |weights, args| {
-                let [stream] = args else {
-                    return Err(ffi_error(&Error::Invalid("end takes a stream".into())));
-                };
-                unit(weights.end(&compute(weights, stream)?))
-            })),
-        )
-        .with("before", {
-            let owner = Arc::clone(weights);
-            let break_graph = break_graph.clone();
-            let breaks = breaks.clone();
-            function(Box::new(move |weights, args| {
-                let [layer, stream, record] = args else {
-                    return Err(ffi_error(&Error::Invalid(
-                        "before takes a layer, a stream and a recorder".into(),
-                    )));
-                };
-                let record = Option::<tvm_ffi::Function>::try_from(*record)?;
-                let stream = compute(weights, stream)?;
-                unit(weights.before(count(layer)?, &stream, |index| {
-                    if let Some(record) = &record {
-                        return record
-                            .call_packed(&[(&Any::from(index as i64)).into()])
-                            .map(drop)
-                            .map_err(|error| Error::numerical("experts.prefetch.record", &error));
-                    }
-                    break_graph.invoke(&[])?;
-                    let owner = Arc::clone(&owner);
-                    breaks.note(Arc::new(move || owner.copy(index)));
-                    Ok(())
-                }))
+    let begin = Any::from(function(Box::new(move |weights, _| unit(weights.begin()))));
+    let end = Any::from(function(Box::new(move |weights, args| {
+        let [stream] = args else {
+            return Err(ffi_error(&Error::Invalid("end takes a stream".into())));
+        };
+        unit(weights.end(&compute(weights, stream)?))
+    })));
+    let before = Any::from({
+        let owner = Arc::clone(weights);
+        let break_graph = break_graph.clone();
+        let breaks = breaks.clone();
+        function(Box::new(move |weights, args| {
+            let [layer, stream] = args else {
+                return Err(ffi_error(&Error::Invalid(
+                    "before takes a layer and a stream".into(),
+                )));
+            };
+            let stream = compute(weights, stream)?;
+            unit(weights.before(count(layer)?, &stream, |index| {
+                break_graph.invoke(&[])?;
+                let owner = Arc::clone(&owner);
+                breaks.note(Arc::new(move || owner.copy(index)));
+                Ok(())
             }))
-        })
-        .with(
-            "after",
-            function(Box::new(move |weights, args| {
-                let [layer, stream] = args else {
-                    return Err(ffi_error(&Error::Invalid(
-                        "after takes a layer and a stream".into(),
-                    )));
-                };
-                unit(weights.after(count(layer)?, &compute(weights, stream)?))
-            })),
-        )
-        .with(
-            "copy",
-            function(Box::new(move |weights, args| {
-                let [index] = args else {
-                    return Err(ffi_error(&Error::Invalid("copy takes an index".into())));
-                };
-                unit(weights.copy(count(index)?))
-            })),
-        )
-        .into_any()
+        }))
+    });
+    let after = Any::from(function(Box::new(move |weights, args| {
+        let [layer, stream] = args else {
+            return Err(ffi_error(&Error::Invalid(
+                "after takes a layer and a stream".into(),
+            )));
+        };
+        unit(weights.after(count(layer)?, &compute(weights, stream)?))
+    })));
+    vec![begin, end, before, after]
 }

@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-import tvm_ffi
 
 from tests.python.fixtures.stub import load_model, read_config
 from uniserve_models import interface
@@ -116,29 +115,21 @@ def test_component_binding_serves_its_declared_workspace(loaded):
 
 def test_a_single_rank_world_binds_local_communicators():
     table = interface.table()
+    # One CPU rank outside a union: no backend choice, store or union.
     world = table["distributed.initialize"](
-        {
-            "rank": 0,
-            "local_rank": 0,
-            "world_size": 1,
-            "device": "cpu",
-            "backend": None,
-            "store": None,
-            "union": None,
-        }
+        0, 0, 1, "cpu", None, None, None, None, None, None
     )
-    assert table["distributed.create_groups"](world, []) == []
+    assert table["distributed.create_groups"](world, [], [], [], []) == []
     mesh = table["distributed.mesh"](
         world,
-        tvm_ffi.convert(
-            {
-                "ranks": [0],
-                "shape": [1, 1, 1, 1],
-                "axes": ["pp", "cp", "tp", "ulysses"],
-                "rank": 0,
-                "groups": {"tp": {"members": [0], "group": None}},
-            }
-        ),
+        [0],
+        [1, 1, 1, 1],
+        ["pp", "cp", "tp", "ulysses"],
+        0,
+        ["tp"],
+        [1],
+        [0],
+        [None],
     )
     group = mesh.get_group("tp")
     assert (group.name, group.ranks, group.rank) == ("tp", (0,), 0)
