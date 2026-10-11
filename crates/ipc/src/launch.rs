@@ -30,15 +30,13 @@ use crate::{LaneConfig, ValidationResult};
 ///
 /// argv carries the address of the head the rank connects to and the rank's
 /// identity: its worker group, its rank, and the generation of the launch
-/// that starts it, which its registration states. The world size is there so
-/// that a running rank is identifiable from the process table. The caller
-/// adds the environment and any inherited sockets.
+/// that starts it, which its registration states. The caller adds the
+/// environment and any inherited sockets.
 pub fn rank_command(
     python: impl AsRef<OsStr>,
     head: &str,
     worker_id: &str,
     rank: u32,
-    world_size: u32,
     generation: u64,
 ) -> Command {
     let mut command = Command::new(python);
@@ -51,8 +49,6 @@ pub fn rank_command(
         .arg(worker_id)
         .arg("--rank")
         .arg(rank.to_string())
-        .arg("--world-size")
-        .arg(world_size.to_string())
         .arg("--generation")
         .arg(generation.to_string());
     command

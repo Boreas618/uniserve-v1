@@ -61,7 +61,6 @@ fn spawn(worker_id: &str, rank: u32, generation: u64, python: &str) -> RankSpawn
         rank,
         worker_id: worker_id.into(),
         generation,
-        world_size: 2,
         python: python.into(),
         head: "127.0.0.1:1".into(),
         environment: HashMap::new(),

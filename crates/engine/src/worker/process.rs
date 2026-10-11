@@ -166,8 +166,7 @@ impl Default for WorkerProcessArgs {
             peers: Default::default(),
             stub: false,
             queue_depth: 2,
-            req_slot_cap: 1 << 20,
-            resp_slot_cap: 8 << 20,
+            max_message_bytes: 8 << 20,
             kv_token_capacity: None,
             block_size: None,
             max_batch_calls: 128,
@@ -265,7 +264,7 @@ impl WorkerProcessArgs {
         expert_listen_fd: Option<std::os::fd::RawFd>,
     ) -> anyhow::Result<LaunchDescriptor> {
         let depth = self.queue_depth.max(1);
-        let max_payload = self.req_slot_cap.max(self.resp_slot_cap).max(1);
+        let max_payload = self.max_message_bytes.max(1);
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (transfer_backends, export_backends) =
             self.transfer.rank_backends(&self.worker_id, rank);
@@ -604,7 +603,7 @@ impl PendingRank {
         generation: u64,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
-        let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
+        let max_payload = args.max_message_bytes.max(1);
         let world_size = args.world_size();
 
         let mut cmd = uniserve_ipc::launch::rank_command(
@@ -612,7 +611,6 @@ impl PendingRank {
             head,
             &args.worker_id,
             rank,
-            world_size,
             generation,
         );
 
@@ -654,15 +652,7 @@ impl PendingRank {
         // have used. The head derives both once, here, for either path.
         let child = match remote {
             Some(remote) => {
-                remote.deliver(
-                    rank,
-                    world_size,
-                    &args.python,
-                    &args.worker_id,
-                    generation,
-                    head,
-                    &cmd,
-                )?;
+                remote.deliver(rank, &args.python, &args.worker_id, generation, head, &cmd)?;
                 None
             }
             None => Some(cmd.spawn().context("spawning the rank process")?),
@@ -746,8 +736,8 @@ impl PendingRank {
 }
 
 impl Drop for PendingChild {
-    /// A rank that never reported an endpoint has no channel to close through,
-    /// so a failed launch terminates its process here rather than leaking it.
+    /// A rank that never registered has no channel to close through, so a
+    /// failed launch terminates its process here rather than leaking it.
     fn drop(&mut self) {
         if let Some(child) = self.0.as_mut() {
             let _ = child.kill();
@@ -1073,7 +1063,8 @@ impl RankProcess {
     /// `Ok(None)` when the timeout passes with nothing ready. An entry is a
     /// result or the error that draining or routing a response produced.
     /// Results already received are returned before a rank exit, startup
-    /// cancellation, a channel death wake, or a failed wait fails the call.
+    /// cancellation, the rank's connection closing, or a failed wait fails
+    /// the call.
     pub(super) fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -1208,9 +1199,10 @@ impl RankProcess {
             if remaining.is_zero() {
                 break;
             }
-            // A response raises a wake; a process exit does not, so the wait
-            // is also bounded by the exit poll interval. A channel that cannot
-            // wait any more still gets the interval, so the loop never spins.
+            // A response ends the wait; a process exit does not, so the wait
+            // is also bounded by the exit poll interval. A closed channel
+            // fails the wait at once and still gets the interval, so the
+            // loop never spins.
             let interval = remaining.min(EXIT_POLL_INTERVAL);
             if self.client.wait(interval).is_err() {
                 std::thread::sleep(interval);
