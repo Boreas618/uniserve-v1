@@ -96,6 +96,33 @@ TYPICAL_P = 1 << 7
 GROUP_FIELDS = 7
 
 
+def _causal_lm(loaded):
+    """The causal LM of a loaded model, or ``None`` on a rank without one."""
+    from uniserve_models.interface.loading import capability
+    from uniserve_models.model import CausalLM
+
+    return capability(loaded.module, CausalLM)
+
+
+def vocab_size(loaded) -> int:
+    """Real vocabulary entries of the loaded model's causal LM.
+
+    A caller sizes per-slot vocabulary tensors from it before a runner
+    exists. Zero on a rank that holds no causal LM.
+    """
+    model = _causal_lm(loaded)
+    return 0 if model is None else int(model.backbone.vocab_size)
+
+
+def hidden_size(loaded) -> int:
+    """The hidden width of the loaded model's causal LM.
+
+    Zero on a rank that holds no causal LM.
+    """
+    model = _causal_lm(loaded)
+    return 0 if model is None else int(model.backbone.hidden_size)
+
+
 def _vocabulary(model) -> tuple[Any, VocabShard, Any]:
     """Share the vocabulary descriptor of the last pipeline stage.
 

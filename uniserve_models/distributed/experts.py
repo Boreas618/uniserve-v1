@@ -33,7 +33,7 @@ component's expert calls prefetch peers' weights through.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
@@ -71,32 +71,17 @@ def _encoding(layer: FusedMoE) -> str:
     return "bf16" if quantizer is None else str(quantizer.format)
 
 
-def layers(model, disaggregated: int) -> list[dict[str, Any]]:
-    """Describe the expert layers that exchange tokens.
+def layers(model, disaggregated: int) -> list[int]:
+    """The sizes of the expert layers that exchange tokens.
 
     Returns:
-        One record per layer: ``path``, ``num_experts``, ``top_k``,
-        ``hidden_size``, ``intermediate_size``, ``activation``,
-        ``partitioned`` (the expert group size), ``input_encoding``
-        (``bf16``, ``nvfp4`` or ``mxfp8``) and ``meta`` (whether this rank
-        holds no expert weights).
+        A flat list of ``num_experts, top_k, hidden_size`` per layer, the
+        layers back to back in collective (traversal) order.
     """
-    names = {
-        id(module): path for path, module in _module(model).named_modules()
-    }
     return [
-        {
-            "path": names[id(layer)],
-            "num_experts": int(layer.num_experts),
-            "top_k": int(layer.top_k),
-            "hidden_size": int(layer.hidden_size),
-            "intermediate_size": int(layer.intermediate_size),
-            "activation": str(layer.activation),
-            "partitioned": int(layer.expert_group.size),
-            "input_encoding": _encoding(layer),
-            "meta": int(layer.up_gate.weight.is_meta),
-        }
+        int(value)
         for layer in _layers(model, bool(disaggregated))
+        for value in (layer.num_experts, layer.top_k, layer.hidden_size)
     ]
 
 
@@ -301,7 +286,7 @@ def _prefetched_layers(model) -> list[FusedMoE]:
 
 
 @torch.inference_mode()
-def weight_fields(model) -> list[dict[str, Any]]:
+def weight_fields(model) -> list[Any]:
     """Place every distributed expert layer's weights and list its shards.
 
     Each layer's weights are placed in the CuTeDSL kernels' representation
@@ -311,9 +296,9 @@ def weight_fields(model) -> list[dict[str, Any]]:
     expert group by its leading (expert) axis.
 
     Returns:
-        One record per layer, in traversal order: ``{"layer": ordinal,
-        "fields": [{"name", "shard"}]}``, ``shard`` a contiguous tensor of
-        this rank's experts.
+        ``[counts, names, shards]``: the number of fields of each layer in
+        traversal order, then every field's name and its shard (a
+        contiguous tensor of this rank's experts), the layers back to back.
 
     Raises:
         ValueError: No layer is distributed, the layers span several groups
@@ -331,8 +316,10 @@ def weight_fields(model) -> list[dict[str, Any]]:
         raise ValueError("DWDP weights must share one expert group")
     if device.type != "cuda":
         raise ValueError("DWDP requires CUDA peer memory")
-    result = []
-    for ordinal, layer in enumerate(layers):
+    counts: list[int] = []
+    names: list[str] = []
+    shards: list[torch.Tensor] = []
+    for layer in layers:
         provider = moe.resolve("auto", module=layer, device=device)
         if provider.name != "cutedsl":
             raise ValueError("DWDP requires CuTeDSL expert kernels")
@@ -341,7 +328,7 @@ def weight_fields(model) -> list[dict[str, Any]]:
         provider.prepare(
             module=layer, size=TextSize(1, 1), workspace={}
         ).close()
-        fields = []
+        fields = 0
         for name in ("up_gate", "down"):
             weight = getattr(layer, name).weight
             parts = (
@@ -352,25 +339,28 @@ def weight_fields(model) -> list[dict[str, Any]]:
             for field, value in parts:
                 if field == "tensor_scale":
                     continue
-                fields.append(
-                    {"name": f"{name}.{field}", "shard": value.contiguous()}
-                )
-        result.append({"layer": ordinal, "fields": fields})
-    return result
+                names.append(f"{name}.{field}")
+                shards.append(value.contiguous())
+                fields += 1
+        counts.append(fields)
+    return [counts, names, shards]
 
 
 @torch.inference_mode()
-def bind_weights(model, layer: int, fields: Mapping[str, Any]) -> None:
-    """Install one layer's full weights over the worker's mapped views.
+def bind_weights(
+    model, layer: int, names: Sequence[str], *fields: torch.Tensor
+) -> None:
+    """Install one layer's full weights over the caller's mapped views.
 
-    ``fields`` maps each name :func:`weight_fields` listed to the full
-    field as a contiguous byte tensor (every rank's shard in expert order).
-    The layer then holds every expert; its group stays, so an unbound call
-    still requires the prefetch.
+    ``names`` are the field names :func:`weight_fields` listed for the
+    layer and ``fields`` the full field of each, as a contiguous byte
+    tensor (every rank's shard in expert order). The layer then holds every
+    expert; its group stays, so an unbound call still requires the
+    prefetch.
     """
     module = _prefetched_layers(model)[int(layer)]
     views = {
-        str(name): torch.from_dlpack(value) for name, value in fields.items()
+        str(name): value for name, value in zip(names, fields, strict=True)
     }
     group = module.expert_group
     for name in ("up_gate", "down"):

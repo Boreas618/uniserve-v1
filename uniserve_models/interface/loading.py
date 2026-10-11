@@ -728,11 +728,6 @@ def facts(loaded: Loaded, bounds: Mapping[str, Any]) -> dict[str, Any]:
 
     model = loaded.module
     dtype = getattr(torch, str(bounds["model_dtype"]).removeprefix("torch."))
-    text = (
-        None
-        if str(bounds["role"]) == "experts"
-        else capability(model, CausalLM)
-    )
     weight_formats = sorted(
         {
             value.quantizer.format
@@ -754,8 +749,6 @@ def facts(loaded: Loaded, bounds: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "model_name": loaded.model_name or _name(model),
         "attention_backend": loaded.attention_backend,
-        "vocab_size": None if text is None else int(text.backbone.vocab_size),
-        "hidden_size": None if text is None else int(text.backbone.hidden_size),
         # Expert results return through the bound exchange, not request IPC.
         "outputs": {}
         if experts

@@ -13,7 +13,7 @@ use tvm_ffi::{Any, AnyView};
 use super::world::World;
 use crate::config::{Device, WorkerLaunch};
 use crate::cuda_graph::GraphBreaks;
-use crate::ffi::{Fields, Function, Handle, Record};
+use crate::ffi::{Fields, Function, Handle};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::interface::Interface;
@@ -669,45 +669,43 @@ impl DwdpManager {
             .as_ref()
             .ok_or(Error::State("DWDP requires its union's host group"))?;
 
-        let records: tvm_ffi::Array<Any> = interface
-            .import(&format!("{MODULE}.weight_fields"))?
+        // The number of fields of each layer, then every field's name and
+        // shard, the layers back to back.
+        let function = format!("{MODULE}.weight_fields");
+        let mismatch = |error: tvm_ffi::Error| Error::numerical(&function, &error);
+        let listed: tvm_ffi::Array<Any> = interface
+            .import(&function)?
             .call_as(&[model.handle().view()])?;
+        let part = |index: usize| listed.get(index).map_err(mismatch);
+        let counts = crate::ffi::integers(part(0)?).map_err(mismatch)?;
+        let names = tvm_ffi::Array::<tvm_ffi::String>::try_from(part(1)?).map_err(mismatch)?;
         // Shard tensors stay referenced by `shards` through the setup copies.
-        let mut shards = Vec::new();
-        let mut layers = Vec::new();
-        for (index, record) in records.iter().enumerate() {
-            let record = Record::new(format!("{MODULE}.weight_fields[{index}]"), record)?;
-            let mut fields = Vec::new();
-            for field in record.records("fields")? {
-                let shard: tvm_ffi::Tensor = field.get("shard")?;
-                if !shard.is_contiguous() {
-                    return Err(Error::Interface(format!(
-                        "{MODULE}.weight_fields returns contiguous shards"
-                    )));
-                }
-                let bits = usize::from(shard.dtype().bits) * usize::from(shard.dtype().lanes);
-                fields.push(ShardField {
-                    name: field.string("name")?,
-                    address: shard.data_ptr() as u64,
-                    bytes: shard.numel() * bits / 8,
-                });
-                shards.push(shard);
+        let shards = tvm_ffi::Array::<tvm_ffi::Tensor>::try_from(part(2)?).map_err(mismatch)?;
+        let mut fields = names.iter().zip(shards.iter()).map(|(name, shard)| {
+            let bits = usize::from(shard.dtype().bits) * usize::from(shard.dtype().lanes);
+            ShardField {
+                name: name.as_str().to_owned(),
+                address: shard.data_ptr() as u64,
+                bytes: shard.numel() * bits / 8,
             }
-            layers.push(fields);
-        }
+        });
+        let layers: Vec<Vec<ShardField>> = counts
+            .iter()
+            .map(|&count| fields.by_ref().take(count as usize).collect())
+            .collect();
         let (weights, views) = ExpertWeights::build(union_group, device, node, &layers, &stream)?;
         drop(shards);
         let bind = interface.import(&format!("{MODULE}.bind_weights"))?;
         for (layer, (fields, views)) in layers.iter().zip(views).enumerate() {
-            let mut tensors = Fields::new();
-            for (field, view) in fields.iter().zip(views) {
-                tensors = tensors.with(&field.name, view.to_tensor()?);
-            }
-            bind.call_values(&[
+            let mut arguments = vec![
                 model.handle().to_any(),
                 Any::from(layer as i64),
-                tensors.into_any(),
-            ])?;
+                Any::from(crate::ffi::strings(fields.iter().map(|field| &field.name))),
+            ];
+            for view in views {
+                arguments.push(Any::from(view.to_tensor()?));
+            }
+            bind.call_values(&arguments)?;
         }
         tracing::info!(
             target: "uniserve_worker.launch",
