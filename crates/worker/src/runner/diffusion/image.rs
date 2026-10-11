@@ -44,7 +44,6 @@ use crate::executor::forward::experts::ExpertRuntime;
 use crate::executor::forward::image::ImageRuntime;
 use crate::executor::forward::image::batch::ImageBatch;
 use crate::executor::forward::image::latents::Scratch;
-use crate::executor::forward::token::TextRuntime;
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, Region, integer_list, list};
 use crate::model::bind::ComponentBinding;
@@ -54,6 +53,7 @@ use crate::parallel::joins::GraphFunctions;
 use crate::request::diffusion::{BranchSet, GuidancePlan};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
+use crate::runner::causal_lm::CausalLMRunners;
 use crate::storage::LatentUpdate;
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable};
@@ -1098,7 +1098,7 @@ impl ImageBatch<'_> {
     /// rank with `experts`.
     pub(crate) fn denoise(
         &mut self,
-        mut text: Option<&mut TextRuntime>,
+        mut text: Option<&mut CausalLMRunners>,
         experts: Option<&ExpertRuntime>,
     ) -> Result<ForwardStats> {
         let plan = self.plan;
