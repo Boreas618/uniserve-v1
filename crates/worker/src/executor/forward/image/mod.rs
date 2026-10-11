@@ -62,7 +62,7 @@ use latents::{ImageLatents, Pool};
 
 /// The image runtime of a rank.
 ///
-/// FIXME: as with the video runtime, this composition of the encoder,
+/// FIXME: this composition of the encoder,
 /// denoiser and decoder runners with a rank's image requests, latent
 /// pools, product arenas, host tasks and batch execution is the executor's
 /// and the request pool's; it stays here until `executor/backend.rs` holds

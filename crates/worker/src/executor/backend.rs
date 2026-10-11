@@ -28,9 +28,14 @@ use crate::model::registry::Components;
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
+use crate::request::video::VideoRequests;
+use crate::runner::decoder::runners::DecoderRunners;
+use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::encoder::runners::EncoderRunners;
+use crate::runner::media::MediaRunner;
 use crate::service::ServiceBackend;
 use crate::worker::RankStorage;
-use crate::{Error, Result};
+use crate::{Error, OutputPool, Result};
 
 /// Serving-time kernel reporting: a cheap counter tells when any provider
 /// choice changed, and only then are the bindings' records gathered.
@@ -63,8 +68,16 @@ pub struct WorkerBackend {
     /// The transfer runtime: tensor transfers, KV exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<forward::transfer::TransferRuntime>,
-    /// The video runtime, on ranks of a video model.
-    video: Option<forward::video::VideoRuntime>,
+    /// The admitted video requests, on ranks of a video model.
+    video: Option<VideoRequests>,
+    /// The rank's encoder, denoiser and decoder runners.
+    encoders: EncoderRunners,
+    denoisers: DenoiserRunners,
+    decoders: DecoderRunners,
+    /// The host media of a rank holding host components.
+    media: Option<MediaRunner>,
+    /// The output leases of media batches.
+    media_outputs: Option<OutputPool>,
     /// Other capability runtimes' request storage.
     storage: Vec<Box<dyn RequestStorage>>,
     components: Components,
@@ -89,15 +102,21 @@ pub(crate) struct Parts<'a> {
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, then the
-/// text, image, canvas, transfer and video runtimes, then the other
-/// runtimes' owners.
+/// text, image, canvas and transfer runtimes, a video model's requests,
+/// denoiser runners and output leases, then the other runtimes' owners.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per owner the backend holds"
+)]
 fn owners<'a>(
     rank: &'a mut Option<RankStorage>,
     text: &'a mut Option<crate::runner::causal_lm::CausalLMRunners>,
     image: &'a mut Option<forward::image::ImageRuntime>,
     canvas: &'a mut Option<forward::canvas::CanvasRuntime>,
     transfer: &'a mut Option<forward::transfer::TransferRuntime>,
-    video: &'a mut Option<forward::video::VideoRuntime>,
+    video: &'a mut Option<VideoRequests>,
+    denoisers: &'a mut DenoiserRunners,
+    media_outputs: &'a mut Option<OutputPool>,
     others: &'a mut [Box<dyn RequestStorage>],
 ) -> Vec<&'a mut dyn RequestStorage> {
     let mut owners: Vec<&'a mut dyn RequestStorage> = Vec::new();
@@ -118,6 +137,10 @@ fn owners<'a>(
     }
     if let Some(video) = video {
         owners.push(video);
+        owners.push(denoisers);
+        if let Some(outputs) = media_outputs {
+            owners.push(outputs);
+        }
     }
     owners.extend(
         others
@@ -139,7 +162,7 @@ pub struct WorkerBatch {
     image_inputs: Option<forward::image::Inputs>,
     /// Products and KV transfers imported from other calls.
     inputs: forward::inputs::Inputs,
-    /// A video runtime batch's calls and completion.
+    /// A media batch's calls and completion.
     media: Option<forward::batch::MediaBatch>,
     output: Option<BatchResult>,
 }
@@ -247,6 +270,11 @@ impl WorkerBackend {
             weights: None,
             transfer: None,
             video: None,
+            encoders: EncoderRunners::default(),
+            denoisers: DenoiserRunners::default(),
+            decoders: DecoderRunners::default(),
+            media: None,
+            media_outputs: None,
             storage: Vec::new(),
             components,
             profiler: None,
@@ -437,33 +465,61 @@ impl WorkerBackend {
         self.kernels = Some(watch);
     }
 
-    /// Whether the rank serves a video model: its encoders and denoisers
-    /// run in the video runtime.
+    /// Whether the rank serves a video model: its calls run as media
+    /// batches on the rank's video runners.
     pub fn serves_video(&self) -> bool {
         self.video.is_some()
     }
 
-    /// Install the video runtime of a video model's rank.
-    pub(crate) fn set_video(&mut self, video: forward::video::VideoRuntime) {
+    /// Install what serves a video model on this rank: its request
+    /// records, its runners, its host media and its output leases.
+    pub(crate) fn set_video(
+        &mut self,
+        video: VideoRequests,
+        encoders: EncoderRunners,
+        denoisers: DenoiserRunners,
+        decoders: DecoderRunners,
+        media: Option<MediaRunner>,
+        outputs: OutputPool,
+    ) {
         self.video = Some(video);
+        self.encoders = encoders;
+        self.denoisers = denoisers;
+        self.decoders = decoders;
+        self.media = media;
+        self.media_outputs = Some(outputs);
     }
 
-    pub(crate) fn video_mut(&mut self) -> Option<&mut forward::video::VideoRuntime> {
-        self.video.as_mut()
+    pub(crate) fn encoders(&self) -> &EncoderRunners {
+        &self.encoders
+    }
+
+    pub(crate) fn denoisers(&self) -> &DenoiserRunners {
+        &self.denoisers
+    }
+
+    pub(crate) fn decoders(&self) -> &DecoderRunners {
+        &self.decoders
     }
 
     /// The parts a video batch executes with.
-    pub(crate) fn media_parts(&mut self) -> Result<forward::video::Parts<'_>> {
-        Ok(forward::video::Parts {
+    pub(crate) fn media_parts(&mut self) -> Result<forward::batch::Parts<'_>> {
+        let unserved =
+            || Error::Unsupported("video calls are served on a video model's rank".into());
+        Ok(forward::batch::Parts {
             requests: &mut self.requests,
             storage: self
                 .rank_storage
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("the rank has no storage owners".into()))?,
-            video: self.video.as_mut().ok_or_else(|| {
-                Error::Unsupported("video calls are served by the video runtime".into())
-            })?,
             info: &self.info,
+            rank: self.rank,
+            video: self.video.as_mut().ok_or_else(unserved)?,
+            encoders: &mut self.encoders,
+            denoisers: &mut self.denoisers,
+            decoders: &mut self.decoders,
+            media: self.media.as_ref(),
+            outputs: self.media_outputs.as_mut().ok_or_else(unserved)?,
         })
     }
 
@@ -491,6 +547,8 @@ impl WorkerBackend {
                 &mut self.canvas,
                 &mut self.transfer,
                 &mut self.video,
+                &mut self.denoisers,
+                &mut self.media_outputs,
                 &mut self.storage,
             ) {
                 owner.admit_slots(&admitted)?;
@@ -499,7 +557,7 @@ impl WorkerBackend {
         started?;
         if let Some(video) = &mut self.video {
             for request in installed {
-                video.admit(request)?;
+                video.admit(request, &mut self.denoisers)?;
             }
         }
 
@@ -623,26 +681,38 @@ impl WorkerBackend {
         if let Some(transfer) = &self.transfer {
             transfer.set_wake(wake.clone());
         }
-        if let Some(video) = &self.video {
-            video.set_wake(wake.clone());
+        if let Some(media) = &self.media {
+            media.lane.set_wake(wake.clone());
         }
         for owner in &self.storage {
             owner.set_wake(wake.clone());
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, the video,
-    /// transfer, canvas, image and text runtimes, then rank storage), after
+    /// Close every storage owner, newest first (other runtimes, a video
+    /// model's owners, the transfer, canvas, image and text runtimes, then
+    /// rank storage), after
     /// the executor drained; returns the first failure.
     pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
         }
-        // The video runtime closes before the rank storage its products
-        // live in.
+        // A video model's owners close before the rank storage their
+        // products live in: the host lane, the request records, then the
+        // runners and the output leases.
         if let Some(mut video) = self.video.take() {
+            if let Some(media) = &self.media {
+                result = result.and(media.close(aborted));
+            }
             result = result.and(video.close(aborted));
+            result = result.and(self.encoders.close_text(aborted));
+            result = result.and(self.denoisers.close(aborted));
+            result = result.and(self.decoders.close(aborted));
+            result = result.and(self.encoders.close_latent(aborted));
+            if let Some(mut outputs) = self.media_outputs.take() {
+                result = result.and(outputs.close(aborted));
+            }
         }
         if let Some(mut transfer) = self.transfer.take() {
             result = result.and(transfer.close(aborted));
@@ -785,6 +855,8 @@ impl Backend for WorkerBackend {
             &mut self.canvas,
             &mut self.transfer,
             &mut self.video,
+            &mut self.denoisers,
+            &mut self.media_outputs,
             &mut self.storage,
         );
         batch.retirement.admit(&mut owners)?;
@@ -866,6 +938,8 @@ impl Backend for WorkerBackend {
             &mut self.canvas,
             &mut self.transfer,
             &mut self.video,
+            &mut self.denoisers,
+            &mut self.media_outputs,
             &mut self.storage,
         );
         batch.retirement.begin(&self.requests, &mut owners)?;
@@ -902,6 +976,8 @@ impl Backend for WorkerBackend {
             &mut self.canvas,
             &mut self.transfer,
             &mut self.video,
+            &mut self.denoisers,
+            &mut self.media_outputs,
             &mut self.storage,
         );
         let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
@@ -948,6 +1024,8 @@ impl Backend for WorkerBackend {
             &mut self.canvas,
             &mut self.transfer,
             &mut self.video,
+            &mut self.denoisers,
+            &mut self.media_outputs,
             &mut self.storage,
         ) {
             owner.reap()?;

@@ -58,7 +58,6 @@ use crate::executor::forward::image::start::{
 };
 use crate::executor::forward::image::warmup::ImageWarmup;
 use crate::executor::forward::transfer::TransferRuntime;
-use crate::executor::forward::video::{RuntimeSetup, VideoRuntime, VideoWarmup};
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Record};
 use crate::lane::Lanes;
@@ -74,11 +73,20 @@ use crate::parallel::world::{World, startup_timeout};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
+use crate::request::video::VideoRequests;
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::causal_lm::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
 use crate::runner::causal_lm::warmup::CausalLMWarmup;
+use crate::runner::component::VideoSetup;
+use crate::runner::decoder::runners::DecoderRunners;
+use crate::runner::decoder::warmup::DecoderWarmup;
 use crate::runner::denoiser::image_model::ImageModel;
+use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::denoiser::warmup::DenoiserWarmup;
 use crate::runner::denoiser::{VideoModel, placed_denoiser};
+use crate::runner::encoder::runners::EncoderRunners;
+use crate::runner::encoder::warmup::EncoderWarmup;
+use crate::runner::media::MediaRunner;
 use crate::service::Service;
 use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
 use crate::stream::{CUDAStream, EventPool};
@@ -343,7 +351,7 @@ impl Worker {
             weights: weights.as_ref(),
         })
         .map_err(phase("bind"))?;
-        // A video model's encoders and denoiser run in the video runtime.
+        // A video model's encoders and denoiser run as media batches.
         let image = if video.is_some() {
             None
         } else {
@@ -393,22 +401,38 @@ impl Worker {
             reserve_join_pools(&interface, &config, experts, &mut graphs).map_err(phase("bind"))?;
         }
         let mut lanes = lanes;
-        let video_runtime = match (video, video_capacity) {
-            (Some(video), Some(capacity)) => Some(
-                VideoRuntime::create(RuntimeSetup {
-                    interface: &interface,
-                    loaded: model.handle(),
-                    model: video,
-                    capacity,
-                    info: &info,
-                    config: &config,
-                    components: &components,
-                    lanes: &mut lanes,
-                    graphs: &mut graphs,
-                    attention: facts.attention_backend.clone(),
-                })
-                .map_err(phase("storage"))?,
-            ),
+        let video_owners = match (video, video_capacity) {
+            (Some(video), Some(capacity)) => {
+                let (encoders, denoisers, decoders, media) = start_video(
+                    VideoSetup {
+                        interface: &interface,
+                        loaded: model.handle(),
+                        model: &video,
+                        capacity: &capacity,
+                        info: &info,
+                        config: &config,
+                        lanes: &mut lanes,
+                        graphs: &mut graphs,
+                        attention: facts.attention_backend.clone(),
+                    },
+                    &components,
+                )
+                .map_err(phase("storage"))?;
+                let device = match config.device {
+                    crate::config::Device::Cuda(index) => Some(index),
+                    crate::config::Device::Cpu => None,
+                };
+                let leases = 2 * info.queue_depth as usize + 2;
+                let words = info.max_batch_calls.max(1) as usize;
+                Some((
+                    VideoRequests::new(video, capacity.media),
+                    encoders,
+                    denoisers,
+                    decoders,
+                    media,
+                    crate::OutputPool::new(device, leases, words),
+                ))
+            }
             _ => None,
         };
         let mut backend =
@@ -416,9 +440,9 @@ impl Worker {
         backend.set_rank_storage(storage);
         backend.set_job_queues(lanes.job_queues());
         let text_warmup = text.is_some();
-        let video_warmup = video_runtime.is_some();
-        if let Some(runtime) = video_runtime {
-            backend.set_video(runtime);
+        let video_warmup = video_owners.is_some();
+        if let Some((requests, encoders, denoisers, decoders, media, outputs)) = video_owners {
+            backend.set_video(requests, encoders, denoisers, decoders, media, outputs);
         }
         if let Some(text) = text {
             backend.set_text(text);
@@ -479,7 +503,10 @@ impl Worker {
         .map_err(|error| error.with_phase("executor"))?;
         let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
         if video_warmup {
-            hooks.push(Box::new(VideoWarmup));
+            // Prepared and captured in this order on every rank.
+            hooks.push(Box::new(EncoderWarmup));
+            hooks.push(Box::new(DenoiserWarmup));
+            hooks.push(Box::new(DecoderWarmup));
         }
         if image_warmup {
             hooks.push(Box::new(ImageWarmup));
@@ -846,8 +873,18 @@ impl Worker {
                 .add(&label, &binding.device.to_string(), &kernels)
                 .map_err(phase("warmup"))?;
         }
-        if let Some(video) = executor.backend_mut().video_mut() {
-            for (label, kernels) in video.kernels().map_err(phase("warmup"))? {
+        if executor.backend().serves_video() {
+            let backend = executor.backend();
+            let mut video = backend.encoders().text_kernels().map_err(phase("warmup"))?;
+            video.extend(backend.denoisers().kernels().map_err(phase("warmup"))?);
+            video.extend(backend.decoders().kernels().map_err(phase("warmup"))?);
+            video.extend(
+                backend
+                    .encoders()
+                    .latent_kernels()
+                    .map_err(phase("warmup"))?,
+            );
+            for (label, kernels) in video {
                 records
                     .add(&label, &self.config.device.to_string(), &kernels)
                     .map_err(phase("warmup"))?;
@@ -1416,4 +1453,59 @@ fn expert_exchange(launch: &WorkerLaunch) -> (bool, usize) {
             },
         )
     })
+}
+
+/// Start the runners of a video model's components placed on this rank, in
+/// placement order, and the host media of its host components.
+fn start_video(
+    mut setup: VideoSetup<'_>,
+    components: &Components,
+) -> Result<(
+    EncoderRunners,
+    DenoiserRunners,
+    DecoderRunners,
+    Option<MediaRunner>,
+)> {
+    use crate::model::components::Capability;
+
+    let mut encoders = EncoderRunners::default();
+    let mut denoisers = DenoiserRunners::default();
+    let mut decoders = DecoderRunners::default();
+    let mut host_components = std::collections::BTreeMap::new();
+    for placed in components.placed() {
+        if placed.host() {
+            host_components.insert(placed.name.clone(), placed.config.clone());
+            continue;
+        }
+        if placed.has(Capability::TextEncoder) {
+            encoders.start_text(&mut setup, placed)?;
+        }
+        if placed.name == setup.model.denoiser {
+            denoisers.start_video(&mut setup, placed)?;
+        }
+        if placed.has(Capability::VideoDecoder) {
+            decoders.start_video(&mut setup, placed)?;
+        }
+        if placed.has(Capability::AudioDecoder) {
+            decoders.start_audio(&mut setup, placed)?;
+        }
+        if placed.has(Capability::VideoEncoder) {
+            encoders.start_conditions(&mut setup, placed)?;
+        }
+    }
+    let media = if host_components.is_empty() {
+        None
+    } else {
+        let info = setup.info;
+        let capacity = (info.queue_depth as usize * info.max_batch_calls.max(1) as usize).max(1);
+        Some(MediaRunner::new(
+            setup.interface,
+            setup.loaded,
+            host_components,
+            setup.config.ffmpeg.clone(),
+            setup.model.facts.frame_rate,
+            capacity,
+        )?)
+    };
+    Ok((encoders, denoisers, decoders, media))
 }

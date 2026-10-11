@@ -22,14 +22,15 @@ use uniserve_ipc::{
 
 use crate::error::WorkerError;
 use crate::executor::forward::batch::{MediaBatch, Publication, request_slots};
+use crate::executor::forward::batch::{Parts, open, product_name};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, supplied};
-use crate::executor::forward::video::{Parts, open, units};
 use crate::ffi::{Device, Function, Handle};
 use crate::host::mux::{MuxFunctions, read_unit};
 use crate::host::reader::{ConditionProducts, ConditionReader, ReaderFunctions};
 use crate::host::task::{MediaTask, UnitFrames};
 use crate::host::{HostLane, HostTask};
 use crate::model::interface::Interface;
+use crate::runner::component::units;
 use crate::transfer::TransportKind;
 use crate::{Error, ProductBuffer, Result};
 
@@ -75,6 +76,22 @@ impl MediaRunner {
             lane: HostLane::new(capacity, 1, "uniserve-media")?,
             components,
         })
+    }
+
+    /// Stop the host lane: abandon its tasks when `aborted`, otherwise
+    /// finish them and report every failure.
+    pub(crate) fn close(&self, aborted: bool) -> Result<()> {
+        let mut result = Ok(());
+        if aborted {
+            self.lane.abort();
+        } else {
+            for error in self.lane.close() {
+                result = result.and(Err(Error::Invariant(format!(
+                    "closing a host lane failed: {error}"
+                ))));
+            }
+        }
+        result
     }
 }
 
@@ -126,9 +143,7 @@ pub(crate) fn execute(
 /// Reserve a host task, configure it with `action` and submit it.
 fn submit(parts: &Parts<'_>, action: MediaTask) -> Result<Arc<HostTask<MediaTask>>> {
     let host = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .ok_or_else(|| Error::Invalid("this rank holds no host media component".into()))?;
     let task = host.lane.reserve()?;
     if let Err(error) = task.configure(action).and_then(|()| task.submit()) {
@@ -188,9 +203,7 @@ fn read_media(
         ));
     }
     let reader = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .and_then(|host| host.reader.clone())
         .ok_or_else(|| Error::Invalid("media reading requires the condition encoders".into()))?;
     let mut products = ConditionProducts {
@@ -200,7 +213,7 @@ fn read_media(
     };
     let mut written = Vec::new();
     for output in &call.outputs {
-        let name = parts.video.product_name(call, output)?.to_owned();
+        let name = product_name(parts.info, call, output)?.to_owned();
         let (rows, width): (u64, u64) = match name.as_str() {
             "condition_pixels" => (
                 conditions
@@ -316,13 +329,11 @@ fn encode_units(
         (request.canvas, Arc::clone(&request.units))
     };
     let config = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .and_then(|host| host.components.get(&call.component))
         .cloned()
         .ok_or_else(|| Error::Invalid("video encoding has no codec component".into()))?;
-    let run = units(&config, parts.video.rank, 0, range.max_units)?;
+    let run = units(&config, parts.rank, 0, range.max_units)?;
     if run.is_empty() {
         return Ok(());
     }
@@ -347,9 +358,7 @@ fn encode_units(
     };
     let frame_rate = parts.video.model.facts.frame_rate;
     let function = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .map(|host| host.encode_video.clone())
         .ok_or_else(|| Error::Invalid("this rank holds no video codec".into()))?;
     let mut tasks = Vec::new();
@@ -417,13 +426,13 @@ fn encode_audio(
     let pcm = batch
         .inputs
         .read(store, &call.inputs[0], call.call_id, Device::Cpu, None)?;
-    let session = parts.video.mux_session(slot, call.request_key)?;
+    let session = parts
+        .video
+        .mux_session(slot, call.request_key, parts.media)?;
     let samples = session.config().audio_samples();
     let rate = parts.video.model.facts.sample_rate;
     let function = parts
-        .video
-        .host
-        .as_ref()
+        .media
         .map(|host| host.encode_audio.clone())
         .ok_or_else(|| Error::Invalid("this rank holds no muxer".into()))?;
     let task = submit(
@@ -519,7 +528,9 @@ fn mux(
     call: &Call,
     slot: usize,
 ) -> Result<()> {
-    let session = parts.video.mux_session(slot, call.request_key)?;
+    let session = parts
+        .video
+        .mux_session(slot, call.request_key, parts.media)?;
     let (action, publication) = if call.inputs.is_empty() {
         (MediaTask::Finalize { session }, Some(Publication::Media))
     } else {

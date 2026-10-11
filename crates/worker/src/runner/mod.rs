@@ -4,6 +4,7 @@ pub(crate) mod allocate;
 pub(crate) mod attention;
 pub(crate) mod canvas;
 pub(crate) mod causal_lm;
+pub(crate) mod component;
 pub(crate) mod decoder;
 pub(crate) mod denoiser;
 pub(crate) mod encoder;
