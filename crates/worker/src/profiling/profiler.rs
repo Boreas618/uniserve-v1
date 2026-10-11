@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use tvm_ffi::Any;
 use uniserve_cuda::DeviceId;
 
-use crate::ffi::{Fields, Function, Handle, strings};
+use crate::ffi::{Function, Handle, strings};
 use crate::{Error, Result};
 
 use super::flag;
@@ -133,12 +133,11 @@ impl Profiler {
                     self.config.output_dir.display()
                 ))
             })?;
-            let options = Fields::new()
-                .with("activities", strings(&self.config.activities))
-                .with("with_stack", self.config.with_stack)
-                .with("record_shapes", self.config.record_shapes)
-                .into_any();
-            let profile = Handle::new(self.start.call(&[(&options).into()])?)?;
+            let profile = Handle::new(self.start.call_values(&[
+                Any::from(strings(&self.config.activities)),
+                Any::from(self.config.with_stack),
+                Any::from(self.config.record_shapes),
+            ])?)?;
             if !profile.is_none() {
                 self.torch = Some(profile);
             }
