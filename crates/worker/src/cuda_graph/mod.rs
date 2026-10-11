@@ -140,11 +140,6 @@ impl CUDAGraph {
         &self.graph
     }
 
-    /// Segments of the graph: one more than its graph breaks.
-    pub fn segments(&self) -> usize {
-        self.segments.len()
-    }
-
     /// Submit one execution of the forward to `stream` without waiting for
     /// it: every segment in order, and after each segment the break that
     /// follows it. The inputs the graph reads were written on `stream`

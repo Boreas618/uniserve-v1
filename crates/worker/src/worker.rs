@@ -378,7 +378,7 @@ impl Worker {
             preparation,
             peers: Some(&peers),
             expert_runtime: experts.as_mut(),
-            weights: weights.as_ref().map(WeightRuntime::prefetch),
+            weights: weights.as_ref(),
         })
         .map_err(phase("bind"))?;
         if let Some(experts) = experts.as_mut() {

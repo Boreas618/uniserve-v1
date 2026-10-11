@@ -19,7 +19,7 @@ use super::shapes::{SLOT_BUCKETS, Shapes, chunk_rows};
 use super::{CANDIDATES, DiffusionLMRunner};
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
-use crate::executor::forward::experts::ExpertRuntime;
+use crate::executor::forward::experts::{ExpertRuntime, WeightRuntime};
 use crate::ffi::Handle;
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
@@ -220,8 +220,8 @@ pub(crate) struct Startup<'a> {
     /// The expert runtime, when forwards are expert steps: the component
     /// exchanges through its transport on its stream.
     pub(crate) expert_runtime: Option<&'a mut ExpertRuntime>,
-    /// The distributed expert weights' prefetch object, with DWDP.
-    pub(crate) weights: Option<&'a Handle>,
+    /// The distributed expert weights, with DWDP.
+    pub(crate) weights: Option<&'a WeightRuntime>,
 }
 
 /// The diffusion LM component placed on this rank: name, module path and
@@ -338,7 +338,7 @@ impl DiffusionLMRunner {
                 backends: Backends::default(),
                 derive_host_lengths: false,
                 experts: experts.as_ref().map(|experts| experts.transport(0).clone()),
-                weights: startup.weights.cloned(),
+                weights: startup.weights.map(|weights| weights.prefetch().clone()),
                 cache: Some(cache),
             },
         )?;
@@ -425,7 +425,9 @@ impl DiffusionLMRunner {
             stream.synchronize()?;
         }
         Ok(Some(Self {
-            graphs: GraphTable::new(owner.clone(), methods.release.clone()),
+            graphs: GraphTable::new(owner.clone(), methods.graphs.release.clone()),
+            breaks: startup.weights.map(|weights| weights.breaks().clone()),
+            segments: 0,
             owner,
             component,
             methods,
