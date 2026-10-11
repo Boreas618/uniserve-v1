@@ -296,6 +296,24 @@ class VideoDecoder(nn.Module):
         """Describe the decoder input of a window decoding to ``segment``."""
         raise NotImplementedError
 
+    def window_rows(self, frames: slice, size: video.Config) -> torch.Tensor:
+        """Name the packed latent rows the window of ``frames`` reads.
+
+        Returns the CPU int64 rows of the complete packed latent of a video
+        of ``size``, in the order :meth:`unpack_window` takes them.
+        """
+        raise NotImplementedError
+
+    def unpack_window(
+        self, tokens: torch.Tensor, segment: video.Config, *, out: torch.Tensor
+    ) -> None:
+        """Unpack one window's packed rows into the decoder input ``out``.
+
+        ``tokens`` are the rows :meth:`window_rows` names, in its order;
+        ``out`` is laid out as ``window_input(segment)``.
+        """
+        raise NotImplementedError
+
     def unpack_latents(
         self,
         latent: torch.Tensor,

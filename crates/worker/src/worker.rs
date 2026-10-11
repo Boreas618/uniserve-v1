@@ -66,7 +66,6 @@ use crate::model::components::Capability;
 use crate::model::image::ImageModel;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
-use crate::model::video::{VideoModel, placed_denoiser};
 use crate::model::{
     ComponentMesh, Description, ExpertPartition, LoadedModel, ModelFacts, sequence_kind,
 };
@@ -74,6 +73,7 @@ use crate::parallel::world::{World, startup_timeout};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
+use crate::runner::denoiser::{VideoModel, placed_denoiser};
 use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
 use crate::service::Service;
 use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
@@ -402,11 +402,6 @@ impl Worker {
                     lanes: &mut lanes,
                     graphs: &mut graphs,
                     attention: facts.attention_backend.clone(),
-                    products: device
-                        .cuda_index()
-                        .map(|index| storage.tensors.arena(StorageDevice::Cuda(index)))
-                        .transpose()
-                        .map_err(phase("storage"))?,
                 })
                 .map_err(phase("storage"))?,
             ),
@@ -781,15 +776,10 @@ impl Worker {
     }
 
     fn require_codecs(&self) -> std::result::Result<(), WorkerError> {
-        let function = self
-            .interface
-            .optional("media.require_codecs")
-            .ok_or_else(|| {
-                WorkerError::from(Error::Unsupported(
-                    "video encoding and muxing are served by the host media runtime".into(),
-                ))
-            })?;
-        function.invoke(&[]).map_err(phase("warmup"))
+        self.interface
+            .import("uniserve_models.media.codec.require_codecs")
+            .and_then(|function| function.invoke(&[]))
+            .map_err(phase("warmup"))
     }
 
     /// Check graph residency, report memory and kernels, then seal.
