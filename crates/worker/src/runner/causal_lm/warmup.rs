@@ -21,24 +21,24 @@ use uniserve_ipc::{
     ShapeBound, TensorRef,
 };
 
-use super::super::experts::ExpertRuntime;
-use super::{StepParts, TextRuntime};
+use super::{CausalLMRunners, StepParts};
 use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
+use crate::executor::forward::experts::ExpertRuntime;
 use crate::runner::TokenSelection;
-use crate::runner::text::{COMMIT_CACHE, RowSource, StepRequest, TokenRow};
+use crate::runner::causal_lm::{COMMIT_CACHE, RowSource, StepRequest, TokenRow};
 use crate::storage::KVCache;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
 
-/// The text runtime's warmup work.
-pub(crate) struct TextWarmup {
+/// The causal LM runners' warmup work.
+pub(crate) struct CausalLMWarmup {
     /// Tokens one capture row may hold.
     pub(crate) row_tokens: usize,
 }
 
-impl WarmupHooks for TextWarmup {
+impl WarmupHooks for CausalLMWarmup {
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         let parts = backend.parts();
         let (Some(runtime), Some(storage)) = (parts.text, parts.storage) else {
@@ -143,7 +143,7 @@ fn rows(
 /// collective expert step at that capacity (announced to dedicated expert
 /// ranks), in which the other microbatches join.
 fn capture(
-    runtime: &mut TextRuntime,
+    runtime: &mut CausalLMRunners,
     kv: &mut KVCache,
     row_tokens: usize,
     experts: Option<&ExpertRuntime>,
@@ -191,7 +191,7 @@ fn capture(
             .max(1);
         let stream = runtime.runners[index].stream().cloned();
         let stream = stream.as_ref();
-        let run = |runtime: &mut TextRuntime,
+        let run = |runtime: &mut CausalLMRunners,
                    kv: &mut KVCache,
                    rows: &[TokenRow],
                    decode: bool,
@@ -276,7 +276,7 @@ fn capture(
 /// One warmup step of `rows` on microbatch `peer` of `group`; the group's
 /// other microbatches join. `capacity` forces the expert step capacity.
 fn step(
-    runtime: &mut TextRuntime,
+    runtime: &mut CausalLMRunners,
     experts: Option<&ExpertRuntime>,
     (group, peer): (usize, usize),
     kv: &mut KVCache,
@@ -286,7 +286,11 @@ fn step(
 ) -> Result<()> {
     let (tables, cache) = kv.split();
     let request = StepRequest {
-        decode,
+        mode: if decode {
+            ForwardMode::Decode
+        } else {
+            ForwardMode::Prefill
+        },
         rows,
         finish_ids: &[],
         sampling: None,
@@ -382,7 +386,7 @@ fn tokens(scenarios: &mut Scenarios<'_>) -> std::result::Result<(), WorkerError>
     finish.collective_seq = sequence;
     scenarios.run(finish)?;
     scenarios.release(key);
-    tracing::info!(target: "uniserve_worker.warmup", "completed token runtime warmup");
+    tracing::info!(target: "uniserve_worker.warmup", "completed causal LM warmup");
     Ok(())
 }
 
