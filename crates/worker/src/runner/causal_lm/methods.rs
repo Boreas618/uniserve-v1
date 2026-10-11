@@ -2,7 +2,7 @@
 //! `uniserve_models.runner.causal_lm.CausalLMRunner`, its construction and
 //! the facts it reports.
 
-use crate::ffi::Handle;
+use crate::ffi::{Function, Handle};
 use crate::model::interface::Interface;
 use crate::runner::methods::{Argument, Methods};
 use crate::storage::memory::StorageView;
@@ -10,21 +10,38 @@ use crate::{Error, Result};
 
 const RUNNER: &str = "uniserve_models.runner.causal_lm.CausalLMRunner";
 
-/// The methods of the Python runner the rank calls.
-const METHODS: [&str; 12] = [
-    "decode",
-    "plan_decode",
-    "prefill",
-    "plan_prefill",
-    "sample",
-    "sample_top_k",
-    "sample_greedy",
-    "verify",
-    "prompt_logprobs",
-    "commit",
-    "vocab",
-    "plans_attention",
-];
+/// The methods of the Python runner a forward calls.
+pub(crate) struct Functions {
+    pub(crate) decode: Function,
+    pub(crate) plan_decode: Function,
+    pub(crate) prefill: Function,
+    pub(crate) plan_prefill: Function,
+    pub(crate) sample: Function,
+    pub(crate) sample_top_k: Function,
+    pub(crate) sample_greedy: Function,
+    pub(crate) verify: Function,
+    pub(crate) prompt_logprobs: Function,
+    pub(crate) commit: Function,
+}
+
+impl Functions {
+    /// Resolve the methods of `methods`' runner.
+    pub(crate) fn resolve(interface: &Interface, methods: &Methods) -> Result<Self> {
+        let method = |name: &str| methods.method(interface, name);
+        Ok(Self {
+            decode: method("decode")?,
+            plan_decode: method("plan_decode")?,
+            prefill: method("prefill")?,
+            plan_prefill: method("plan_prefill")?,
+            sample: method("sample")?,
+            sample_top_k: method("sample_top_k")?,
+            sample_greedy: method("sample_greedy")?,
+            verify: method("verify")?,
+            prompt_logprobs: method("prompt_logprobs")?,
+            commit: method("commit")?,
+        })
+    }
+}
 
 /// The vocabulary a text runner computes over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +91,7 @@ pub(crate) fn construct(interface: &Interface, construction: &Construction<'_>) 
         construction.windowed.into(),
     ];
     arguments.extend(construction.state.iter().map(|&view| view.into()));
-    Methods::construct(interface, RUNNER, &METHODS, arguments)
+    Methods::construct(interface, RUNNER, arguments)
 }
 
 /// A size of the loaded model's causal LM, read before a runner exists:
@@ -98,11 +115,18 @@ pub(crate) fn hidden_size(interface: &Interface, loaded: &Handle) -> Result<usiz
     size(interface, loaded, "hidden_size")
 }
 
+/// A fact the runner reports once, by its method name.
+fn fact(interface: &Interface, methods: &Methods, name: &str) -> Result<tvm_ffi::Any> {
+    methods
+        .call(&methods.method(interface, name)?, Vec::new())
+        .invoke()
+}
+
 /// The vocabulary shard of this rank's logits.
-pub(crate) fn vocab(methods: &Methods) -> Result<Vocab> {
+pub(crate) fn vocab(interface: &Interface, methods: &Methods) -> Result<Vocab> {
     let malformed = || Error::Interface(format!("{RUNNER}.vocab returns four integers"));
-    let values = crate::ffi::integers(methods.call("vocab", Vec::new())?.invoke()?)
-        .map_err(|_| malformed())?;
+    let values =
+        crate::ffi::integers(fact(interface, methods, "vocab")?).map_err(|_| malformed())?;
     let [size, _padded, start, stop] = values[..] else {
         return Err(malformed());
     };
@@ -115,7 +139,7 @@ pub(crate) fn vocab(methods: &Methods) -> Result<Vocab> {
 
 /// Whether an attention operator plans each launch on the host, so a
 /// captured forward is launched after `plan_decode` or `plan_prefill`.
-pub(crate) fn plans_attention(methods: &Methods) -> Result<bool> {
-    bool::try_from(methods.call("plans_attention", Vec::new())?.invoke()?)
+pub(crate) fn plans_attention(interface: &Interface, methods: &Methods) -> Result<bool> {
+    bool::try_from(fact(interface, methods, "plans_attention")?)
         .map_err(|_| Error::Interface(format!("{RUNNER}.plans_attention returns a flag")))
 }

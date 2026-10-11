@@ -48,7 +48,7 @@ mod step;
 pub(crate) mod warmup;
 
 pub(crate) use input_buffers::{Dimensions, FINISH_IDS};
-pub(crate) use methods::Construction;
+pub(crate) use methods::{Construction, Functions};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
 pub(crate) use runners::{CausalLMRunners, execute};
 
@@ -245,6 +245,7 @@ pub(crate) struct CausalLMRunner {
     device: Option<i32>,
     stream: Option<Stream>,
     methods: Methods,
+    functions: Functions,
     /// An attention operator plans each launch on the host.
     plans_attention: bool,
     /// Where the distributed expert weights note the copies a captured
@@ -266,6 +267,7 @@ pub(crate) struct RunnerParts {
     pub(crate) device: Option<i32>,
     pub(crate) stream: Option<Stream>,
     pub(crate) methods: Methods,
+    pub(crate) functions: Functions,
     pub(crate) plans_attention: bool,
     pub(crate) breaks: Option<GraphBreaks>,
     pub(crate) buffers: InputBuffers<Dimensions>,
@@ -286,6 +288,7 @@ impl CausalLMRunner {
             device: parts.device,
             stream: parts.stream,
             methods: parts.methods,
+            functions: parts.functions,
             plans_attention: parts.plans_attention,
             breaks: parts.breaks,
             buffers: parts.buffers,
@@ -383,7 +386,7 @@ impl CausalLMRunner {
                 "points",
                 "transition",
             ])?);
-            return self.methods.call("decode", arguments);
+            return Ok(self.methods.call(&self.functions.decode, arguments));
         }
 
         let mut arguments = vec![
@@ -410,7 +413,7 @@ impl CausalLMRunner {
             arguments.extend([Argument::None, Argument::None]);
         }
         arguments.extend(self.tensors(&["hidden", "logits"])?);
-        self.methods.call("prefill", arguments)
+        Ok(self.methods.call(&self.functions.prefill, arguments))
     }
 
     /// The runner's method planning the attention launches of `plan`'s
@@ -424,7 +427,7 @@ impl CausalLMRunner {
                 plan.starts.as_slice().into(),
             ];
             arguments.extend(self.tensors(&["request_pool_indices"])?);
-            return self.methods.call("plan_decode", arguments);
+            return Ok(self.methods.call(&self.functions.plan_decode, arguments));
         }
 
         let mut arguments = vec![
@@ -437,7 +440,7 @@ impl CausalLMRunner {
             plan.causal.as_slice().into(),
         ];
         arguments.extend(self.tensors(&["row_columns", "causal_values"])?);
-        self.methods.call("plan_prefill", arguments)
+        Ok(self.methods.call(&self.functions.plan_prefill, arguments))
     }
 
     /// The eager methods that follow a staged forward: one sampling method
@@ -505,7 +508,7 @@ impl CausalLMRunner {
                 arguments.extend(self.tensors(&["hidden", "logit_rows", "draws", "params"])?);
                 arguments.extend(self.tensors(&outputs)?);
                 arguments.extend(self.tensors(&["logprobs"])?);
-                "verify"
+                &self.functions.verify
             } else {
                 arguments = vec![group.first.into(), group.rows.as_slice().into()];
                 match group.path {
@@ -514,7 +517,7 @@ impl CausalLMRunner {
                         arguments.extend(lists(&decisions));
                         arguments.extend(self.tensors(&["logits"])?);
                         arguments.extend(self.tensors(&outputs)?);
-                        "sample_greedy"
+                        &self.functions.sample_greedy
                     }
                     SamplingPath::TopK(width) => {
                         arguments.push((width as usize).into());
@@ -526,7 +529,7 @@ impl CausalLMRunner {
                         arguments.extend(self.tensors(&["logits", "draws", "params"])?);
                         arguments.extend(self.tensors(&outputs)?);
                         arguments.extend(self.tensors(&["logprobs"])?);
-                        "sample_top_k"
+                        &self.functions.sample_top_k
                     }
                     SamplingPath::Categorical => {
                         arguments.push(group.parameters.into());
@@ -534,11 +537,11 @@ impl CausalLMRunner {
                         arguments.extend(self.tensors(&["logits", "draws", "params"])?);
                         arguments.extend(self.tensors(&outputs)?);
                         arguments.extend(self.tensors(&["logprobs"])?);
-                        "sample"
+                        &self.functions.sample
                     }
                 }
             };
-            calls.push(self.methods.call(method, arguments)?);
+            calls.push(self.methods.call(method, arguments));
         }
 
         let prompt = &staged.prompt;
@@ -563,7 +566,10 @@ impl CausalLMRunner {
                 "logprobs",
                 "prompt_tail",
             ])?);
-            calls.push(self.methods.call("prompt_logprobs", arguments)?);
+            calls.push(
+                self.methods
+                    .call(&self.functions.prompt_logprobs, arguments),
+            );
         }
         Ok(calls)
     }
@@ -1206,7 +1212,7 @@ impl CausalLMRunner {
         let method = || -> Result<MethodCall> {
             let mut arguments = vec![count.into()];
             arguments.extend(self.tensors(&["commit", "completion", "continuation", "points"])?);
-            self.methods.call("commit", arguments)
+            Ok(self.methods.call(&self.functions.commit, arguments))
         };
         let Some(key) = key else {
             return method()?.invoke().map(drop);
