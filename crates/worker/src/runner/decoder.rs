@@ -506,10 +506,10 @@ impl ImageDecoder {
 /// The decoder serving a batch, with its device and stream, and the
 /// output words its pixels need.
 pub(crate) fn image_placement(
-    runtime: &ImageParts<'_>,
+    image: &ImageParts<'_>,
     plan: &BatchPlan,
 ) -> Result<(Option<i32>, Option<Stream>, usize)> {
-    let runner = runtime
+    let runner = image
         .decoder()
         .ok_or_else(|| Error::Unsupported("image decoding is served by an image decoder".into()))?;
     let stream = runner.stream().cloned();
@@ -524,7 +524,7 @@ pub(crate) fn image_placement(
     Ok((
         runner.device().cuda_index(),
         stream,
-        words.min(runtime.decoders.max_pixel_words),
+        words.min(image.decoders.max_pixel_words),
     ))
 }
 
@@ -557,7 +557,7 @@ impl ImageBatch<'_> {
         let target = self.target();
         let stream = self.stream.clone();
         let decoder_range = self
-            .runtime
+            .parts
             .decoder()
             .ok_or_else(|| Error::Unsupported("image decoding requires a decoder".into()))?
             .range()?;
@@ -567,7 +567,7 @@ impl ImageBatch<'_> {
         let mut tasks: HashMap<usize, Arc<HostTask<ImageTask>>> = HashMap::new();
         if self.reports {
             for &index in &active {
-                let task = self.runtime.host.reserve()?;
+                let task = self.parts.host.reserve()?;
                 self.encodings.push(Encoding {
                     call: index,
                     task: Arc::clone(&task),
@@ -655,7 +655,7 @@ impl ImageBatch<'_> {
                     ));
                 }
             };
-            let arena = self.runtime.arena(target)?;
+            let arena = self.parts.arena(target)?;
             let region = Region::within(arena, read.value());
             self.reads.push(read);
             sources.push(Some(Source::Resident(region?, range, height, width)));
@@ -693,7 +693,7 @@ impl ImageBatch<'_> {
                 }
                 trajectories.push((index, params));
             }
-            let latents = self.runtime.latents()?;
+            let latents = self.parts.latents()?;
             latents.enter(stream.as_ref())?;
             self.latents_entered = true;
             let params: Vec<_> = trajectories.iter().map(|(_, params)| params).collect();
@@ -719,7 +719,7 @@ impl ImageBatch<'_> {
                     .image_output
                     .as_ref()
                     .and_then(product)
-                    .map(|write| Region::within(self.runtime.arena(target)?, &write.view()))
+                    .map(|write| Region::within(self.parts.arena(target)?, &write.view()))
                     .transpose()?;
                 let position = active
                     .iter()
@@ -757,7 +757,7 @@ impl ImageBatch<'_> {
                 Ok(())
             };
         let runner = self
-            .runtime
+            .parts
             .decoders
             .image
             .as_ref()
