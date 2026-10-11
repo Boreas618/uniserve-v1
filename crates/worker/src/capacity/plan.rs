@@ -212,8 +212,6 @@ pub struct TokenFacts {
     pub latent_feature_bytes: u64,
     /// The latent pool of an image flow.
     pub latent: Option<LatentPlan>,
-    /// Aligned product bytes per request over every component.
-    pub product_bytes: u64,
 }
 
 /// The resolved capacity of a rank.
@@ -330,8 +328,7 @@ impl TokenLayout {
         } else {
             feature_bytes
         };
-        info.buffer_pool_bytes = (u64::from(info.encoder_cache_entries) + 1) * feature_bytes
-            + u64::from(info.request_slots) * facts.product_bytes;
+        info.buffer_pool_bytes = (u64::from(info.encoder_cache_entries) + 1) * feature_bytes;
         info.max_unresolved_calls = narrow(
             call_window(queue_depth, config.max_batch_calls)?,
             "unresolved calls",
@@ -682,7 +679,6 @@ mod tests {
             vision_feature_bytes: 0,
             latent_feature_bytes: 0,
             latent: None,
-            product_bytes: 0,
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
         let fixed_before = layout.fixed[&Device::Cuda(0)];
@@ -729,7 +725,6 @@ mod tests {
             vision_feature_bytes: 1024,
             latent_feature_bytes: 512,
             latent: Some(LatentPlan::image(8, 1000, None, 64, 12, 2)),
-            product_bytes: 256,
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
         let capacity = layout.fit_cache(&cache(), 0, &config, 0, &group()).unwrap();
@@ -737,7 +732,8 @@ mod tests {
         let plan = layout.finish(&config, Some(Arc::new(cache())));
         assert_eq!(plan.info.max_batch_calls, 4);
         assert_eq!(plan.info.encoder_entry_bytes, 1024);
-        assert_eq!(plan.info.buffer_pool_bytes, 257 * 1024 + 8 * 256);
+        // One feature per encoder cache entry and one in flight.
+        assert_eq!(plan.info.buffer_pool_bytes, 257 * 1024);
         // 1000 tokens in 64-unit pages, plus the sentinel page.
         assert_eq!(plan.info.latent_pages, 17);
         assert_eq!(plan.info.latent_page_units, 64);

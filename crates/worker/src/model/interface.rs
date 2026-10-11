@@ -15,8 +15,6 @@ use crate::{Error, Result};
 
 /// Startup and lifecycle entries of the interface table.
 pub struct Interface {
-    /// Model-derived quantities for capacity, reporting and warmup.
-    pub facts: Function,
     /// Declare a component call set's workspace requirements.
     pub prepare: Function,
     /// Bind Rust-allocated workspaces to a prepared component.
@@ -58,7 +56,6 @@ impl Interface {
             })
         };
         Ok(Self {
-            facts: require("model.facts")?,
             prepare: require("component.prepare")?,
             bind: require("component.bind")?,
             initialize: require("distributed.initialize")?,
