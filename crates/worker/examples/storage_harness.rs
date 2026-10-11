@@ -21,9 +21,18 @@ use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
 use uniserve_worker::ffi::{Function, Handle, Record};
 use uniserve_worker::model::interface::Interface;
-use uniserve_worker::storage::{KVCache, KVPlan, tensor_map};
+use uniserve_worker::storage::memory::StorageView;
+use uniserve_worker::storage::{KVCache, KVPlan};
 use uniserve_worker::transfer::{Capacity, TransportKind, TransportOptions, Transports, notify};
 use uniserve_worker::{EventPool, Result};
+
+/// Named views as the map of DLPack tensors the test reads.
+fn tensor_map(views: &[(String, StorageView)]) -> Result<Map<FfiString, tvm_ffi::Tensor>> {
+    views
+        .iter()
+        .map(|(name, view)| Ok((FfiString::from(name.as_str()), view.to_tensor()?)))
+        .collect()
+}
 
 fn failure(error: impl std::fmt::Display) -> tvm_ffi::Error {
     tvm_ffi::Error::new(tvm_ffi::RUNTIME_ERROR, &error.to_string(), "")
@@ -118,8 +127,6 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         config.count("destination_device")? as i32,
     ];
     let kind = TransportKind::parse(&config.string("transport")?)?;
-    let bind_units = interface.function("cache.bind_units")?;
-    let bind_conversion = interface.function("cache.bind_conversion")?;
     let fill: Function = Function::new("fill", config.get("fill")?);
     let source_units = units(config.value("source_units")?)?;
     let destination_units = units(config.value("destination_units")?)?;
@@ -137,8 +144,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         1,
         Some(devices[0]),
         Some(&streams[0]),
-        &bind_units,
-        &bind_conversion,
+        &interface,
     )?;
     let mut destination = KVCache::new(
         Arc::clone(&destination_plan),
@@ -148,8 +154,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         2,
         Some(devices[1]),
         Some(&streams[1]),
-        &bind_units,
-        &bind_conversion,
+        &interface,
     )?;
 
     // Python writes the producer's tokens through the bound views.

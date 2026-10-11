@@ -408,7 +408,6 @@ impl CausalLMRunners {
             .iter()
             .map(|table| i64::from(table.windowed))
             .collect();
-        let bind_units = startup.interface.function("cache.bind_units")?;
         let create_pool = startup.interface.function("graphs.pool")?;
         let mut runners = Vec::new();
         let mut columns = Vec::new();
@@ -518,7 +517,7 @@ impl CausalLMRunners {
                 }
                 _ => None,
             };
-            columns.push(kv.bind_units(&bind_units, stream.as_ref())?);
+            columns.push(kv.bind_units(startup.interface, stream.as_ref())?);
             let group = groups
                 .iter()
                 .position(|peers| peers.contains(&runners.len()))

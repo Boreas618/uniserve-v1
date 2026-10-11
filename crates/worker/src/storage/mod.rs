@@ -25,7 +25,7 @@ pub use host_buffers::HostBuffers;
 pub use kv::{KVCache, PendingImport, ScratchUnits};
 pub use kv_cache::KVCacheManager;
 pub use kv_plan::{GroupAxis, KVGroupPlan, KVPlan};
-pub use kv_planes::{FIELDS, KVPlanes, UnitColumn, UnitSnapshot, tensor_map};
+pub use kv_planes::{FIELDS, KVPlanes, UnitColumn, UnitSnapshot};
 pub(crate) use latent::image::{ImageLatents, Scratch};
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 pub use latent_storage::LatentStorage;

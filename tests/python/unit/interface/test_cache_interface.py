@@ -5,10 +5,9 @@ import sys
 
 import pytest
 import torch
-import tvm_ffi
 from torch import nn
 
-from uniserve_models.interface import cache, errors
+from uniserve_models.interface import cache, errors, runtime
 from uniserve_models.model import CausalLM, TransformerDecoder
 from uniserve_models.nn.attention import Attention
 
@@ -153,33 +152,36 @@ def test_unit_bindings_reset_the_units_rust_selects():
     for name, tensor in fields.items():
         tensor.fill_(1 if name.endswith("initialized") else 3)
     units = torch.tensor([2, 1, 0, 0], dtype=torch.int64)
-    bound = cache.bind_units(
-        {**fields, "unit_tables": torch.zeros(1)}, units, 0
-    )
+    resets = cache.UnitResets(units, 0, list(fields), *fields.values())
 
-    bound["recycle"](1)
+    resets.recycle(1)
     assert not torch.any(fields["key.initialized"][:, 2])
     assert torch.all(fields["value.scale"][:, 2] == 1)
     assert torch.all(fields["key.values"][:, 2] == 3)
 
-    bound["zero"](2)
+    resets.zero(2)
     assert torch.count_nonzero(fields["value.values"][:, (1, 2)]).item() == 0
     assert torch.all(fields["key.scale"][:, 1] == 1)
     assert torch.all(fields["key.values"][:, 3] == 3)
 
-    bound["mark_initialized"](2)
+    resets.mark_initialized(2)
     assert torch.all(fields["value.initialized"][:, (1, 2)])
     assert torch.all(fields["value.initialized"][:, 0])
 
 
 def test_a_failed_unit_reset_crosses_the_interface_with_its_kind():
     plan = cache.cache_plan(_model(layers=6), 16, "float8_e4m3fn")
+    fields = _fields(plan, 4)
     # Unit 9 lies outside the four-unit pool.
     units = torch.tensor([9, 0, 0, 0], dtype=torch.int64)
-    bound = tvm_ffi.convert(cache.bind_units(_fields(plan, 4), units, 0))
+    resets = cache.UnitResets(units, 0, list(fields), *fields.values())
+    # The rank reaches the method by import path.
+    zero = runtime.import_path(
+        "uniserve_models.interface.cache.UnitResets.zero"
+    )
 
     with pytest.raises(errors.InputError):
-        bound["zero"](1)
+        zero(resets, 1)
 
 
 @pytest.mark.parametrize(
@@ -194,11 +196,11 @@ def test_a_recycled_fp8_unit_encodes_like_a_fresh_unit(device):
     (name,) = plan.layers()
     state = pool.state(name)
     units = torch.tensor([1, 0, 0], dtype=torch.int64, device=device)
-    bound = cache.bind_units(fields, units, 0)
+    resets = cache.UnitResets(units, 0, list(fields), *fields.values())
 
     large = torch.full((4, 4, 4), 1792.0, device=device)
     state.write((1,), start=0, key=large, value=-large)
-    bound["recycle"](1)
+    resets.recycle(1)
 
     # 1.1 encodes exactly at its own scale but not at the stale scale 4
     # the previous owner left, so only a reset scale reproduces it.
@@ -222,9 +224,16 @@ def test_conversion_binding_encodes_scratch_spans_like_writes():
     scales_count = 4 * layers * heads
     fields = _fields(plan, 3)
     scratch = torch.zeros(20 * elements + 8 * scales_count, dtype=torch.uint8)
-    convert = cache.bind_conversion(
-        plan, 3, fields, scratch, elements, scales_count, 0
-    )["convert"]
+    conversion = cache.PageConversion(
+        plan,
+        3,
+        scratch,
+        elements,
+        scales_count,
+        0,
+        list(fields),
+        *fields.values(),
+    )
 
     # Three tokens at offset 1 of the destination page, from a source page
     # of 8 tokens starting at token 2, with one scale group of two heads.
@@ -242,7 +251,7 @@ def test_conversion_binding_encodes_scratch_spans_like_writes():
     scratch[20 * elements : 20 * elements + scales.numel() * 4].copy_(
         scales.reshape(-1).view(torch.uint8)
     )
-    convert(0, "float8_e4m3fn", "bfloat16", 3, 1, 2, 8, 2, 1, [2])
+    conversion.convert(0, "float8_e4m3fn", "bfloat16", 3, 1, 2, 8, 2, 1, [2])
 
     reference = _fields(plan, 3)
     expected = cache.pool(plan, 3, list(reference), *reference.values())
@@ -277,8 +286,6 @@ def test_interface_import_does_not_initialize_cuda():
     code = (
         "import torch\n"
         "from uniserve_models.interface import cache\n"
-        "assert set(cache.functions()) == {'cache.bind_units', "
-        "'cache.bind_conversion'}\n"
         "assert not torch.cuda.is_initialized()\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)

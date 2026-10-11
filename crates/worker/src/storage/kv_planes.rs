@@ -22,12 +22,13 @@
 
 use std::sync::Arc;
 
-use tvm_ffi::AnyView;
+use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_2d_d8, memset_2d_d32};
 
 use super::kv_plan::KVPlan;
 use super::memory::{Memory, StorageView};
-use crate::ffi::{Backing, DType, Device, Function, Functions, Tensor};
+use crate::ffi::{Backing, DType, Device, Function, Handle, strings};
+use crate::model::interface::Interface;
 use crate::{Error, Result};
 
 /// The two K/V fields, in storage order.
@@ -233,6 +234,17 @@ impl KVPlanes {
             )));
         }
         Ok(())
+    }
+
+    /// The pool's unit fields as the library's cache classes take them: the
+    /// list of their names, then one tensor per field.
+    pub fn field_arguments(&self) -> Result<Vec<Any>> {
+        let fields = self.views()?;
+        let mut arguments = vec![Any::from(strings(fields.iter().map(|(name, _)| name)))];
+        for (_, view) in &fields {
+            arguments.push(Any::from(view.to_tensor()?));
+        }
+        Ok(arguments)
     }
 
     /// The bound field tensors' views, keyed as the numerical library reads
@@ -492,36 +504,38 @@ impl UnitSnapshot {
 pub struct UnitColumn {
     units: StorageView,
     stream: Option<usize>,
+    /// The library's `UnitResets` over the column and the pool's fields.
+    resets: Handle,
     zero: Function,
     recycle: Function,
     mark_initialized: Function,
 }
 
+/// The library class of the scattered unit resets.
+const UNIT_RESETS: &str = "uniserve_models.interface.cache.UnitResets";
+
 impl UnitColumn {
-    /// Allocate a column for `planes` and bind `cache.bind_units` to it on
-    /// `stream` (`None` for a CPU pool).
-    pub fn bind(planes: &KVPlanes, bind_units: &Function, stream: Option<&Stream>) -> Result<Self> {
+    /// Allocate a column for `planes` and construct the library's
+    /// `UnitResets` over it on `stream` (`None` for a CPU pool).
+    pub fn bind(planes: &KVPlanes, interface: &Interface, stream: Option<&Stream>) -> Result<Self> {
         let count = i64::from(planes.num_units);
         let memory = allocate(planes.device, planes.num_units as usize * 8)?;
         let units = StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[count])?;
 
-        let cache = tensor_map(&planes.views()?)?;
-        let tensor = units.to_tensor()?;
-        let handle = stream.map_or(0, |stream| stream.raw() as i64);
-        let functions = Functions::new(
-            bind_units.name(),
-            bind_units.call(&[
-                AnyView::from(&cache),
-                AnyView::from(&tensor),
-                AnyView::from(&handle),
-            ])?,
-        )?;
+        let mut arguments = vec![
+            Any::from(units.to_tensor()?),
+            Any::from(stream.map_or(0, |stream| stream.raw() as i64)),
+        ];
+        arguments.extend(planes.field_arguments()?);
+        let resets = Handle::new(interface.import(UNIT_RESETS)?.call_values(&arguments)?)?;
+        let method = |name: &str| interface.import(&format!("{UNIT_RESETS}.{name}"));
         Ok(Self {
             units,
             stream: stream.map(Stream::raw),
-            zero: functions.get("zero")?,
-            recycle: functions.get("recycle")?,
-            mark_initialized: functions.get("mark_initialized")?,
+            resets,
+            zero: method("zero")?,
+            recycle: method("recycle")?,
+            mark_initialized: method("mark_initialized")?,
         })
     }
 
@@ -575,7 +589,7 @@ impl UnitColumn {
             return Ok(());
         }
         let count = self.upload(planes, units, stream)?;
-        function.invoke(&[AnyView::from(&count)])
+        function.invoke(&[self.resets.view(), AnyView::from(&count)])
     }
 
     /// Reset `units` completely: values zero, flags clear, scales one.
@@ -608,15 +622,4 @@ impl UnitColumn {
     ) -> Result<()> {
         self.apply(&self.mark_initialized, planes, units, stream)
     }
-}
-
-/// Convert named views into the `Map<String, Tensor>` bindings receive.
-/// Tensors are created on the calling thread, which owns them.
-pub fn tensor_map(
-    views: &[(String, StorageView)],
-) -> Result<tvm_ffi::Map<tvm_ffi::String, Tensor>> {
-    views
-        .iter()
-        .map(|(name, view)| Ok((tvm_ffi::String::from(name.as_str()), view.to_tensor()?)))
-        .collect()
 }
