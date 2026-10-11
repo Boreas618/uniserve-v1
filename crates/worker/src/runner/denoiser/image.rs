@@ -1,6 +1,12 @@
 //! KV-conditioned image denoising (`ImageDenoiser` models: BAGEL,
 //! SenseNova-U1).
 //!
+//! FIXME: [`ImageDiffusion`] is the image family of `DenoiserRunner` under
+//! its own type. Its forward is driven per row with a trajectory plan
+//! handle (`plan`, `predict`, `integrate`), the video family's per layout
+//! with slot state; the two become one type once the image forward reads
+//! per-slot state rows.
+//!
 //! An [`ImageDiffusion`] runner serves one bound image denoiser. A denoising
 //! step evaluates, for every image of the batch, one row per guidance
 //! branch: the image's framed latent sequence attending (non-causally, read
@@ -47,13 +53,13 @@ use crate::executor::forward::image::latents::Scratch;
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, Region, integer_list, list};
 use crate::model::bind::ComponentBinding;
-use crate::model::image::ImageDenoiserLayout;
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::request::diffusion::{BranchSet, GuidancePlan};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
 use crate::runner::causal_lm::CausalLMRunners;
+use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::storage::LatentUpdate;
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable};

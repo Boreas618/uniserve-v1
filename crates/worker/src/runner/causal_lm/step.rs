@@ -22,7 +22,7 @@ use crate::cuda_graph::GraphMode;
 use crate::runner::causal_lm::{
     Embeddings, Executed, FINISH_IDS, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };
-use crate::runner::diffusion::image::ConditionRow;
+use crate::runner::denoiser::image::ConditionRow;
 use crate::sampling::SamplingMetadata;
 use crate::sampling::plan::{SampleTask, SamplingPlan, logprob_request, logprob_words};
 use crate::storage::LogprobLayout;
