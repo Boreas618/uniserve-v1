@@ -19,7 +19,7 @@ use serde::Serialize;
 use tvm_ffi::{Any, AnyView};
 
 use super::host::HostGroup;
-use crate::ffi::{Fields, Record};
+use crate::ffi::Fields;
 use crate::profiling::range;
 use crate::{Error, Result};
 
@@ -261,23 +261,12 @@ pub struct Agreement {
     pub released: bool,
 }
 
-/// One expert layer as `uniserve_models.distributed.experts.layers` describes
-/// it.
+/// The sizes of one expert layer, as the library's `layers` lists them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExpertLayer {
     pub num_experts: usize,
     pub top_k: usize,
     pub hidden_size: usize,
-}
-
-impl ExpertLayer {
-    pub fn from_record(record: &Record) -> Result<Self> {
-        Ok(Self {
-            num_experts: record.count("num_experts")?,
-            top_k: record.count("top_k")?,
-            hidden_size: record.count("hidden_size")?,
-        })
-    }
 }
 
 /// What every rank of a union must agree on before warmup enters

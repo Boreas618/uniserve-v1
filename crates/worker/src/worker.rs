@@ -1297,6 +1297,8 @@ fn plan(
         layout.reserve(
             config.device,
             reserved_bytes(
+                interface,
+                model,
                 config,
                 layout.info().request_slots as usize,
                 &cache,
