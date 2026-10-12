@@ -257,16 +257,14 @@ impl<'a> Job<'a> {
         self.operations.borrow_mut().push(operation);
     }
 
-    /// The job's event operations alone, in order: what its builder submits
-    /// when recording failed part way. The events the job queued are still
-    /// recorded, waited on and woken for, so the storage they fence is
-    /// returned, and none of the work recorded between them is performed.
-    pub(crate) fn orders_only(self) -> Self {
-        let mut operations = self.operations.into_inner();
-        operations.retain(Operation::orders);
-        Self {
-            operations: RefCell::new(operations),
-        }
+    /// Keep of the operations recorded from `start` on only the event
+    /// operations, in order: a failed attempt's events are still recorded,
+    /// waited on and woken for, so the storage they fence is returned, and
+    /// none of the work recorded between them is performed.
+    fn keep_orders(&self, start: usize) {
+        let mut operations = self.operations.borrow_mut();
+        let attempted = operations.split_off(start);
+        operations.extend(attempted.into_iter().filter(Operation::orders));
     }
 
     /// Record what its user issues as operations of this job on `stream`
@@ -654,6 +652,15 @@ impl Issue for Recorder<'_, '_> {
         });
         Ok(())
     }
+
+    fn attempt<T>(&self, record: impl FnOnce() -> Result<T>) -> Result<T> {
+        let start = self.job.len();
+        let result = record();
+        if result.is_err() {
+            self.job.keep_orders(start);
+        }
+        result
+    }
 }
 
 /// The submitting end of a lane's job queue.
@@ -800,19 +807,36 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_recording_performs_none_of_its_work() -> Result<()> {
-        let mut target = 0_u8;
+    fn a_failed_attempt_performs_none_of_its_work() -> Result<()> {
+        let mut target = [0_u8; 3];
         let job = Job::new();
-        // SAFETY: one byte of the test.
-        unsafe { job.on(None).fill(byte(&raw mut target, 5)) }?;
-        job.on(None).read(&raw const target as u64, 1);
+        let issue = job.on(None);
+        // SAFETY: bytes of the test's array, here and below.
+        unsafe { issue.fill(byte(&raw mut target[0], 5)) }?;
 
-        // Without a stream the job holds no event operation.
-        let job = job.orders_only();
-        assert!(job.is_empty());
-        let mut completion = job.perform().check().unwrap();
-        assert_eq!(target, 0);
-        assert!(completion.read().is_err());
+        // An attempt that fails after recording work: its storage is given
+        // back, so its work is dropped from the job.
+        let failed: Result<()> = issue.attempt(|| {
+            unsafe { issue.fill(byte(&raw mut target[1], 6)) }?;
+            Err(Error::State("the attempt failed"))
+        });
+        assert!(failed.is_err());
+
+        // What was recorded before and after it stays, as does an attempt
+        // that succeeds.
+        issue.attempt(|| unsafe { issue.fill(byte(&raw mut target[2], 7)) })?;
+        assert_eq!(job.len(), 2);
+        job.perform().check().unwrap();
+        assert_eq!(target, [5, 0, 7]);
+
+        // A stream issued a failed attempt's work at once.
+        let mut issued = 0_u8;
+        let failed: Result<()> = None::<&Stream>.attempt(|| {
+            unsafe { None::<&Stream>.fill(byte(&raw mut issued, 9)) }?;
+            Err(Error::State("the attempt failed"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(issued, 9);
         Ok(())
     }
 

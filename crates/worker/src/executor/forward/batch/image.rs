@@ -449,11 +449,8 @@ impl<'a> ImageBatch<'a> {
 
     /// Retire every reservation after a failure before the commit point,
     /// recording the fences that end them; storage returns once those
-    /// fences were performed and complete. What the batch recorded and did
-    /// not perform is reduced to its event operations: the failed forward's
-    /// remaining work addresses storage this releases.
+    /// fences were performed and complete.
     pub(crate) fn discard(&mut self) -> Result<()> {
-        self.job = std::mem::take(&mut self.job).orders_only();
         let left = self.leave_latents();
         self.exports
             .drain(..)
@@ -690,6 +687,16 @@ fn run(
         }
         Err(failure) if failure.committed => Err(failure),
         Err(failure) => {
+            // What the batch recorded before it failed is performed before
+            // its reservations are retired: the events it queued are due,
+            // and its writes are abandoned only behind its work.
+            if let Err(error) = batch.perform() {
+                tracing::warn!(
+                    target: "uniserve_worker.execution",
+                    "image batch {} failed again in what it had recorded: {error}",
+                    plan.batch_id
+                );
+            }
             if let Err(cleanup) = batch.discard().and(batch.perform()) {
                 return Err(Failure {
                     error: cleanup,

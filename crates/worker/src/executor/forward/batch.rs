@@ -13,8 +13,8 @@
 //! is jobs of its lane instead: one that reads its host-gated predicates,
 //! when it has any, then one holding its calls' forwards with the device
 //! half of its commit. Its commit is applied from that job's completion.
-//! When recording fails part way, the event operations already recorded
-//! are still submitted, alone, and the batch fails from their completion.
+//! When recording fails part way, what was recorded before is still
+//! submitted and the batch fails from its completion.
 
 pub(crate) mod image;
 
@@ -170,8 +170,8 @@ enum Phase {
     Committing(Commit),
     /// The commit was applied: nothing is left for the lane.
     Committed,
-    /// Recording failed after the job queued event records: the job on the
-    /// lane makes them, and the batch then fails with this error.
+    /// Recording failed part way: the job on the lane performs what was
+    /// recorded before, and the batch then fails with this error.
     Failed(WorkerError),
 }
 
@@ -839,11 +839,12 @@ pub(crate) fn forward<'a>(
         return Err(error);
     }
 
-    // The events the job queued are still due: storage fenced by them is
-    // returned only once they are recorded. The work between them is not
-    // performed, since what it addresses was released.
+    // What the batch recorded before it failed is still performed: the
+    // events it queued are due, and storage the batch gives up is returned
+    // only behind them. An export that failed kept only its event
+    // operations ([`Issue::attempt`]).
     batch.phase = Phase::Failed(error);
-    Ok(job.orders_only())
+    Ok(job)
 }
 
 /// Record the next job of `batch` into `job` and advance its phase.
@@ -967,7 +968,7 @@ pub(crate) fn complete(
         "a media batch's job completed before it opened",
     ))?;
     match std::mem::replace(&mut batch.phase, Phase::Opened) {
-        // The job made the event records of a recording that failed.
+        // The job performed what a failed recording had recorded.
         Phase::Failed(error) => {
             batch.phase = Phase::Committed;
             Err(error)
