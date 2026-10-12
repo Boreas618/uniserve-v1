@@ -337,7 +337,7 @@ impl CausalLMRunner {
         &self,
         request: &StepRequest<'_>,
         context: &mut StepContext<'_>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Staged> {
         let plan = self.plan(request, context)?;
         self.copy_columns(&plan, request, context.state, job)?;
@@ -588,8 +588,8 @@ impl CausalLMRunner {
         staged: &Staged,
         capacity: Option<usize>,
         launch: bool,
-        job: &Job<'_>,
-        then: &Job<'_>,
+        job: &Job,
+        then: &Job,
     ) -> Result<GraphMode> {
         let (mode, graph) = match &staged.plan.choice {
             Choice::Eager => (GraphMode::Eager, None),
@@ -623,7 +623,7 @@ impl CausalLMRunner {
     /// Record in `job` the eager selection of a staged forward's rows that
     /// sample, verify drafts or score their prompt. It reads the logits the
     /// forward left, at whatever capacity it ran.
-    pub(crate) fn select(&self, staged: &Staged, job: &Job<'_>) -> Result<()> {
+    pub(crate) fn select(&self, staged: &Staged, job: &Job) -> Result<()> {
         for call in self.selection(staged)? {
             job.call(call);
         }
@@ -1002,7 +1002,7 @@ impl CausalLMRunner {
         plan: &Plan,
         request: &StepRequest<'_>,
         state: &DecodeState,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let column = |name: &str| self.buffers.column(name).map(StorageView::address);
         let rows = self.buffers.dimensions.rows as u64;
@@ -1131,7 +1131,7 @@ impl CausalLMRunner {
     /// Before the runner is sealed, a bucket without a graph commits
     /// eagerly and captures it: the bucket's key is returned, and the job's
     /// completion carries the graph for [`Self::complete_commit`].
-    pub(crate) fn commit(&self, rows: &[[i64; 8]], job: &Job<'_>) -> Result<Option<ShapeKey>> {
+    pub(crate) fn commit(&self, rows: &[[i64; 8]], job: &Job) -> Result<Option<ShapeKey>> {
         if rows.is_empty() {
             return Ok(None);
         }

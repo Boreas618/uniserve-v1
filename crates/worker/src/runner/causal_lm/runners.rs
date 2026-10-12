@@ -46,10 +46,10 @@ use crate::executor::BatchResult;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::forward::Stage;
 use crate::executor::forward::launch::{Launched, StreamOrder, error_code, failed_output};
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::lane::{Completion, ExpertStep, ExpertVariant, Job};
 use crate::parallel::{ExpertUnion, MicrobatchForward};
-use crate::profiling::kernels::KernelRecord;
+use crate::profiling::kernels::KernelCalls;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{
@@ -204,7 +204,7 @@ impl CausalLMRunners {
         requests: &[Option<StepRequest<'_>>],
         context: &mut StepParts<'_>,
         forced: Option<usize>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Step> {
         let peers = &self.groups[group];
         if requests.len() != peers.len() {
@@ -446,7 +446,7 @@ impl CausalLMRunners {
         prefixes: &[(u32, &[u32])],
         tables: &BlockTables,
         cache: &mut KVCacheManager<Arc<Retirement>>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Step> {
         let (lane, group) = self.prefill_lane(component)?;
         let rows: Vec<TokenRow> = prefixes
@@ -510,26 +510,15 @@ impl CausalLMRunners {
 
     pub(crate) fn set_wake(&self, _wake: Option<Wake>) {}
 
-    /// Each runner's kernel-table label, device name and the kernels its
-    /// operators selected, after numerical warmup.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
+    /// Each runner's kernel-table label, device name and the call that
+    /// lists the kernels its operators selected.
+    pub(crate) fn kernel_calls(&self) -> Vec<KernelCalls> {
         self.runners
             .iter()
             .zip(&self.labels)
             .map(|(runner, (label, device))| {
-                let records = runner
-                    .methods
-                    .call(&runner.functions.kernels, Vec::new())
-                    .invoke()?;
-                let records = tvm_ffi::Array::<tvm_ffi::Any>::try_from(records)
-                    .map_err(|error| Error::numerical("kernels", &error))?
-                    .iter()
-                    .enumerate()
-                    .map(|(index, record)| {
-                        KernelRecord::new(format!("{label}.kernels[{index}]"), record)
-                    })
-                    .collect::<Result<_>>()?;
-                Ok((label.clone(), device.clone(), records))
+                let call = runner.methods.call(&runner.functions.kernels, Vec::new());
+                (label.clone(), device.clone(), vec![call])
             })
             .collect()
     }
@@ -563,16 +552,22 @@ impl CausalLMRunners {
 }
 
 impl RequestStorage for CausalLMRunners {
-    fn admit_slots(&mut self, slots: &[usize]) -> Result<()> {
-        // Reset on the first runner's stream; other streams order after it
-        // before their next batch.
+    fn admit_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()> {
+        // Reset on the first runner's stream, by the lane that owns it;
+        // other streams order after it before their next batch.
         let stream = self.runners.first().and_then(CausalLMRunner::stream);
-        self.order.wait(stream)?;
-        self.state.reset(slots, stream)?;
-        self.order.record(stream)
+        let group = self
+            .groups
+            .iter()
+            .position(|group| group.contains(&0))
+            .ok_or_else(|| Error::Invariant("the first text runner is in no group".into()))?;
+        let issue = jobs.job(self.kind(group)?)?.on(stream);
+        self.order.wait(issue)?;
+        self.state.reset(slots, issue)?;
+        self.order.record(issue)
     }
 
-    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -580,6 +575,7 @@ impl RequestStorage for CausalLMRunners {
         &mut self,
         _requests: &HashSet<RequestKey>,
         _retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -593,7 +589,7 @@ impl RequestStorage for CausalLMRunners {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -605,11 +601,11 @@ impl RequestStorage for CausalLMRunners {
 
 /// The next job of a token batch on its lane, or `None` when the batch
 /// advanced without one: it failed and its calls are reported.
-pub(crate) fn forward<'a>(
-    backend: &'a mut WorkerBackend,
-    batch: &'a mut WorkerBatch,
+pub(crate) fn forward(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
     kind: CallKind,
-) -> std::result::Result<Option<Job<'a>>, WorkerError> {
+) -> std::result::Result<Option<Job>, WorkerError> {
     let experts = backend.experts().cloned();
     let state = match batch.token_parts().1.take() {
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
@@ -748,7 +744,7 @@ pub(crate) fn complete(
 /// Lease the opened batch's output storage, reserve for its active calls
 /// and record the image denoiser's conditioning of its latent images, its
 /// step and its commit.
-fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job<'a>) -> (Option<Job<'a>>, Pending) {
+fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, Pending) {
     let mut batch = match Batch::lease(owners, opening, job) {
         Ok(batch) => batch,
         // Nothing is reserved yet, and the job was dropped with only the
@@ -797,7 +793,7 @@ fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job<'a>) -> (Option<Jo
 fn commit<'a>(
     batch: Batch<'a>,
     committing: std::result::Result<Commit, Failure>,
-) -> (Option<Job<'a>>, Pending) {
+) -> (Option<Job>, Pending) {
     match committing {
         Ok(commit) => {
             let (job, state, _) = batch.park();
@@ -809,7 +805,7 @@ fn commit<'a>(
 
 /// Retire what a failed batch reserved: the job that records its fences, or
 /// nothing where it holds no stream work.
-fn discard<'a>(mut batch: Batch<'a>, failure: Failure) -> (Option<Job<'a>>, Pending) {
+fn discard<'a>(mut batch: Batch<'a>, failure: Failure) -> (Option<Job>, Pending) {
     if failure.committed {
         return (None, Pending::Failed(failure));
     }

@@ -52,7 +52,7 @@ use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};
-use crate::runner::methods::{Argument, MethodCall, kernel_records};
+use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::storage::{RequestSlots, SlotField};
 use crate::stream::{Fill, Issue};
@@ -760,7 +760,7 @@ impl DenoiserRunner {
         slot: usize,
         size: &VideoSize,
         seed: u64,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let layout = self.layout(id)?;
         let host = |name: String| -> Result<Argument> {
@@ -833,7 +833,7 @@ impl DenoiserRunner {
         slot: usize,
         call: &Call,
         params: &LatentParams,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<LatentUpdate> {
         let pages = self.slot_pages(slot, params)?;
         self.pool.require_initial(slot, &pages)?;
@@ -872,7 +872,7 @@ impl DenoiserRunner {
         slot: usize,
         features: &StorageView,
         count: u64,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         let layout = self.layout(id)?;
         let (rows, width) = layout.fields.text_condition;
@@ -949,7 +949,7 @@ impl DenoiserRunner {
 
     /// Record the conditioner's forward at `capacity`: the launch of its
     /// graph or the eager call.
-    fn run_conditioner(&mut self, capacity: u32, job: &Job<'_>) -> Result<GraphMode> {
+    fn run_conditioner(&mut self, capacity: u32, job: &Job) -> Result<GraphMode> {
         let capturing = self.pool_handle.is_some();
         let conditioner = self
             .conditioner
@@ -988,7 +988,7 @@ impl DenoiserRunner {
         slot: usize,
         size: &VideoSize,
         latents: &[Vec<StorageView>],
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let layout = self.layout(id)?;
         let mut arguments = vec![
@@ -1021,7 +1021,7 @@ impl DenoiserRunner {
         slot: usize,
         call: &Call,
         params: &LatentParams,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<(LatentUpdate, GraphMode)> {
         if params.step_count != 1 {
             return Err(Error::Invalid(
@@ -1116,7 +1116,7 @@ impl DenoiserRunner {
 
     /// Record a solver step of layout `id`: the launch of its graph or the
     /// eager call.
-    fn run_step(&mut self, id: usize, job: &Job<'_>) -> Result<GraphMode> {
+    fn run_step(&mut self, id: usize, job: &Job) -> Result<GraphMode> {
         let mode = match self.graphs.lookup(&id, None) {
             Ok(Lookup::Replay(graph)) => {
                 job.on(Some(&self.stream)).launch(graph)?;
@@ -1327,13 +1327,13 @@ impl DenoiserRunner {
 
     /// The kernels the denoiser's and the conditioner's operators selected.
     pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        let mut records = kernel_records(&self.methods.kernels, &self.methods.runner, DENOISER)?;
+        let mut calls = vec![kernels_call(&self.methods.kernels, &self.methods.runner)];
         if let Some(conditioner) = &self.conditioner {
             for runner in conditioner.runners.values() {
-                records.extend(kernel_records(&conditioner.kernels, runner, ENCODER)?);
+                calls.push(kernels_call(&conditioner.kernels, runner));
             }
         }
-        Ok(records)
+        list_kernels(calls)
     }
 
     /// Release graphs and the Python half. An aborted close keeps
@@ -1370,7 +1370,7 @@ pub(crate) fn prepare(
     batch: &mut MediaBatch,
     index: usize,
     slot: usize,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let params = latent_params(plan, call)?;
@@ -1541,7 +1541,7 @@ pub(crate) fn denoise(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let params = latent_params(plan, call)?;

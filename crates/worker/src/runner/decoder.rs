@@ -57,7 +57,9 @@ use crate::host::image::{ImageTask, ImageWork};
 use crate::lane::Job;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass, kernel_records};
+use crate::runner::methods::{
+    Argument, MethodCall, Methods, RunnerClass, kernels_call, list_kernels,
+};
 use crate::runner::{ImageSetup, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
@@ -202,7 +204,7 @@ impl DecoderRunner {
         &self,
         images: &[DecodeImage],
         stage: impl FnMut(usize, StorageView) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
         self.image_decoder()?
@@ -217,7 +219,7 @@ impl DecoderRunner {
         image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
         self.image_decoder()?
@@ -261,7 +263,7 @@ impl DecoderRunner {
         longest: u32,
         written: u32,
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         self.video_decoder()?.decode(
             slot, latent, frames, unit, shape, longest, written, out, job,
@@ -292,7 +294,7 @@ impl DecoderRunner {
         latent: &StorageView,
         units: TrackUnits,
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         self.audio_decoder()?.decode(latent, units, out, job)
     }
@@ -306,13 +308,19 @@ impl DecoderRunner {
         }
     }
 
+    /// The calls that list the kernels the operators of the decoder's
+    /// Python runners selected.
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        match &self.family {
+            Family::Image(image) => vec![kernels_call(&image.kernels, &image.runner)],
+            Family::Video(video) => video.kernel_calls(),
+            Family::Audio(audio) => audio.kernel_calls(),
+        }
+    }
+
     /// The kernels the operators of the decoder's Python runners selected.
     pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        match &self.family {
-            Family::Image(image) => kernel_records(&image.kernels, &image.runner, DECODER),
-            Family::Video(video) => video.kernels(),
-            Family::Audio(audio) => audio.kernels(),
-        }
+        list_kernels(self.kernel_calls())
     }
 
     /// Release the graphs and Python runners of a video or audio decoder;
@@ -488,7 +496,7 @@ impl ImageDecoder {
         &self,
         images: &[DecodeImage],
         mut stage: impl FnMut(usize, StorageView) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
         for chunk in self.chunks(images)? {
@@ -514,7 +522,7 @@ impl ImageDecoder {
         image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
         // The quantized pixels are one byte per element of the image.
@@ -620,7 +628,7 @@ impl ImageBatch<'_> {
         stats
     }
 
-    fn record_decode(&mut self, job: &Job<'_>) -> Result<ForwardStats> {
+    fn record_decode(&mut self, job: &Job) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();
         if active.is_empty() {
@@ -1156,7 +1164,7 @@ impl VideoDecoder {
         longest: u32,
         written: u32,
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         let canvas = shape.segment.1;
         let stream = self.stream.clone();
@@ -1228,9 +1236,9 @@ impl VideoDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
         self.class
-            .kernels(self.runners.iter().map(|(_, runner)| runner))
+            .kernel_calls(self.runners.iter().map(|(_, runner)| runner))
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1376,7 +1384,7 @@ impl AudioDecoder {
         latent: &StorageView,
         units: TrackUnits,
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         let stream = self.stream.clone();
         let issue = job.on(Some(&stream));
@@ -1429,8 +1437,8 @@ impl AudioDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        self.class.kernels(self.runners.values())
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        self.class.kernel_calls(self.runners.values())
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1448,7 +1456,7 @@ pub(crate) fn decode_video(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let range = decode_range(plan, call)?;
@@ -1576,7 +1584,7 @@ pub(crate) fn decode_audio(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let range = decode_range(plan, call)?;

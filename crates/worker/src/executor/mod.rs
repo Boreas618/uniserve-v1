@@ -6,20 +6,32 @@
 //! ([`Executor::complete`]) and delivers one result per batch
 //! ([`Executor::poll`]).
 //!
-//! A batch's forward is a sequence of jobs on its lane. Two rules order
-//! forwards so that what a job needs has happened when the job is prepared:
+//! A batch's forward is a sequence of jobs on its lane. The executor
+//! submits one and returns; the job's completion, which arrives through the
+//! caller's wake, is applied and the next job submitted from there. The
+//! executor waits for no job: a lane that stopped making progress holds up
+//! the forwards behind its job, while the executor goes on admitting
+//! batches, revoking freed products, delivering the results of forwards
+//! that completed and returning to its caller. Two rules order forwards so
+//! that what a job needs has happened when the job is prepared:
 //!
 //! - a batch that follows another on a request, or reads what another
 //!   produces, starts once that batch's forward has completed: its host
 //!   state (visible products, pending calls) is committed by the completion
 //!   of its last job;
-//! - a batch starts only when no other forward is in flight on another
-//!   lane: a job that waits on an event recorded by another lane's job
-//!   orders behind the record only if the record is already made, and a
-//!   lane records in the order of its own jobs.
+//! - a batch starts only when no other batch's forward is in flight. A job
+//!   that waits on an event recorded by another lane's job orders behind
+//!   the record only if the record is already made, and what a batch
+//!   records is prepared against host state that the jobs of a forward
+//!   still in flight may read. Forwards therefore follow one another, as
+//!   they did when the executor waited for each.
 //!
-//! Forwards on one lane may be in flight together: the lane performs their
-//! jobs in the order they were submitted.
+//! A forward is complete when its lane has performed its jobs, which is
+//! when the stream holds its work, not when the device finished it: the
+//! next forward is queued on the stream behind work still running, and a
+//! batch's outputs are read later, from the completion of a job of their
+//! own. A batch a rule keeps from starting is started when the forward it
+//! waits for completed.
 
 pub mod backend;
 pub(crate) mod forward;
@@ -40,7 +52,7 @@ use uniserve_ipc::Wake;
 use crate::Error;
 use crate::profiling::range;
 
-/// A job's name and what its lane posted for it.
+/// A job's name and what was posted for it when it was performed.
 pub type Completed<B> = (<B as Backend>::Job, <B as Backend>::Completion);
 
 /// Execution resources and numerical operations borrowed by one executor.
@@ -98,15 +110,13 @@ pub trait Backend {
     /// forward or without a lane.
     fn lane(&self, batch: &Self::Batch) -> Option<usize>;
 
-    /// Prepare the next job of the batch's forward and submit it to its
-    /// lane. `None` once the forward has nothing left for the lane.
-    ///
-    /// FIXME: this waits for the job it submits and returns its completion.
-    /// It is to return the job's name alone, and the completion to arrive
-    /// through [`Self::completed`].
-    fn forward(&mut self, batch: &mut Self::Batch) -> Result<Option<Completed<Self>>, Self::Error>;
+    /// Prepare the next job of the batch's forward and submit it without
+    /// waiting for it. `None` once the forward has nothing left to submit.
+    /// The job's completion arrives through [`Self::completed`] and is
+    /// applied by [`Self::complete`] before this is called again.
+    fn forward(&mut self, batch: &mut Self::Batch) -> Result<Option<Self::Job>, Self::Error>;
 
-    /// Apply the completion of one of the batch's jobs.
+    /// Apply the completion of the job [`Self::forward`] submitted last.
     fn complete(
         &mut self,
         batch: &mut Self::Batch,
@@ -127,7 +137,7 @@ pub trait Backend {
         completion: Self::Completion,
     ) -> Result<(), Self::Error>;
 
-    /// The next completion that arrived for a job nobody waited for.
+    /// The next completion that arrived, without waiting for one.
     fn completed(&mut self) -> Result<Option<Completed<Self>>, Self::Error>;
 
     fn begin_retirement(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error>;
@@ -152,9 +162,14 @@ pub struct Batch<B: Backend> {
     submission: Option<Arc<Submission>>,
     /// The lane its forward runs on.
     lane: Option<usize>,
+    /// It is to be started: it was admitted, or what its start waited for
+    /// arrived, and the ordering rules have not let it start since.
+    startable: bool,
     prepared: bool,
     /// Its forward has jobs to run or in flight.
     forwarding: bool,
+    /// The job of its forward that is in flight.
+    forward: Option<B::Job>,
     /// Its forward completed: every job ran and its host state is
     /// committed.
     launched: bool,
@@ -217,8 +232,10 @@ impl<B: Backend> Batch<B> {
             data,
             submission: None,
             lane: None,
+            startable: false,
             prepared: false,
             forwarding: false,
+            forward: None,
             launched: false,
             inputs: None,
             outputs: None,
@@ -272,25 +289,48 @@ impl<B: Backend> Batch<B> {
                 *last_sequence = Some(sequence);
             }
 
-            {
-                let _range = range(c"uniserve.worker.execute", Some(self.id));
-                self.forwarding = true;
-                while let Some((job, completion)) = backend.forward(&mut self.data)? {
-                    backend.complete(&mut self.data, job, completion)?;
-                }
-                self.forwarding = false;
-            }
-
-            self.launched = true;
-            {
-                let _range = range(c"uniserve.worker.retire", Some(self.id));
-                backend.begin_retirement(&mut self.data)?;
-            }
-            self.outputs = backend.await_outputs(&mut self.data)?;
-            Ok(())
+            self.forwarding = true;
+            self.advance_forward(backend)
         })();
 
         if let Err(error) = result {
+            self.fail(backend, error, "execute");
+        }
+    }
+
+    /// Submit the next job of the batch's forward and return; once the
+    /// forward has none left, begin the batch's retirement and ask for the
+    /// notice that its outputs can be read.
+    fn advance_forward(&mut self, backend: &mut B) -> Result<(), B::Error> {
+        {
+            let _range = range(c"uniserve.worker.execute", Some(self.id));
+            self.forward = backend.forward(&mut self.data)?;
+            if self.forward.is_some() {
+                return Ok(());
+            }
+            self.forwarding = false;
+        }
+
+        self.launched = true;
+        {
+            let _range = range(c"uniserve.worker.retire", Some(self.id));
+            backend.begin_retirement(&mut self.data)?;
+        }
+        self.outputs = backend.await_outputs(&mut self.data)?;
+        Ok(())
+    }
+
+    /// Apply the completion of the forward's job in flight and go on with
+    /// the forward.
+    fn complete_forward(&mut self, backend: &mut B, job: B::Job, completion: B::Completion) {
+        self.forward = None;
+        if self.complete {
+            return;
+        }
+        let advanced = backend
+            .complete(&mut self.data, job, completion)
+            .and_then(|()| self.advance_forward(backend));
+        if let Err(error) = advanced {
             self.fail(backend, error, "execute");
         }
     }
@@ -339,6 +379,7 @@ impl<B: Backend> Batch<B> {
         }
 
         self.error = Some(error);
+        self.forwarding = false;
         self.complete = true;
     }
 }
@@ -473,6 +514,7 @@ impl<B: Backend> Executor<B> {
 
         batch.submission = Some(Arc::clone(&submission));
         batch.lane = self.backend.lane(&batch.data);
+        batch.startable = true;
         self.batches.insert(batch.id, batch);
         self.start(submission.batch_id);
         let batch = &mut self.batches[&submission.batch_id];
@@ -510,10 +552,11 @@ impl<B: Backend> Executor<B> {
         while let Ok(notice) = self.ready_receiver.try_recv() {
             if let Some(submission) = notice.upgrade()
                 && self.owns(&submission)
-                && let Some(batch) = self.batches.get(&submission.batch_id)
+                && let Some(batch) = self.batches.get_mut(&submission.batch_id)
                 && !batch.launched
                 && !batch.complete
             {
+                batch.startable = true;
                 self.start(submission.batch_id);
                 advanced = true;
                 break;
@@ -524,30 +567,36 @@ impl<B: Backend> Executor<B> {
             advanced |= batch.advance_completion(&mut self.backend);
         }
 
-        let queued: Vec<_> = self
+        // What kept a batch from starting may be gone: the forward it
+        // follows, or a forward on another lane, completed.
+        let startable: Vec<_> = self
             .batches
             .values()
-            .filter(|batch| !batch.prepared && !batch.complete)
+            .filter(|batch| batch.startable && !batch.complete)
             .map(|batch| batch.id)
             .collect();
-        for id in queued {
+        for id in startable {
             advanced |= self.start(id);
         }
 
         Ok(advanced)
     }
 
-    /// Apply the completion of `job` to the batch it belongs to. The
-    /// completion of a job whose batch is gone (closed, or failed and
-    /// consumed) has nothing left to apply to.
+    /// Apply the completion of `job` to the batch it belongs to and go on
+    /// with that batch: the next job of its forward, its inputs behind
+    /// their admission, or its outputs. The completion of a job whose batch
+    /// is gone (closed, or failed and consumed) has nothing left to apply
+    /// to.
     pub fn complete(&mut self, job: B::Job, completion: B::Completion) {
-        let Some(batch) = self
-            .batches
-            .values_mut()
-            .find(|batch| batch.outputs == Some(job) || batch.inputs == Some(job))
-        else {
+        let Some(batch) = self.batches.values_mut().find(|batch| {
+            batch.forward == Some(job) || batch.outputs == Some(job) || batch.inputs == Some(job)
+        }) else {
             return;
         };
+        if batch.forward == Some(job) {
+            batch.complete_forward(&mut self.backend, job, completion);
+            return;
+        }
         if batch.outputs == Some(job) {
             batch.complete_outputs(&mut self.backend, completion);
             return;
@@ -562,6 +611,7 @@ impl<B: Backend> Executor<B> {
         }
         match self.backend.inputs_admitted(&mut batch.data, completion) {
             Ok(()) => {
+                batch.startable = true;
                 self.start(id);
             }
             Err(error) => batch.fail(&mut self.backend, error, "input admission"),
@@ -646,21 +696,22 @@ impl<B: Backend> Executor<B> {
         }
 
         let batch = &mut self.batches[&id];
+        batch.startable = false;
         batch.advance_execution(&mut self.backend, &mut self.last_sequence, self.distributed);
         true
     }
 
     fn can_start(&self, id: u64) -> bool {
         let batch = &self.batches[&id];
-        if batch.launched || batch.complete {
+        // A forward in flight goes on from its job's completion.
+        if batch.launched || batch.complete || batch.forwarding {
             return false;
         }
-        // A forward in flight on another lane records events this batch's
-        // jobs may wait on: the batch starts behind it.
+        // Forwards follow one another: see the module documentation.
         if self
             .batches
             .values()
-            .any(|other| other.forwarding && other.id != id && other.lane != batch.lane)
+            .any(|other| other.forwarding && other.id != id)
         {
             return false;
         }
@@ -710,17 +761,25 @@ impl<B: Backend> Executor<B> {
 mod tests {
     use super::*;
 
-    /// A backend that submits one input admission job per batch and logs
-    /// what the executor asks of it.
-    #[derive(Default)]
-    struct Admitting {
-        log: Vec<&'static str>,
-        /// The admission job still to submit.
+    /// A batch of the test backend: its name in the log, the lane its
+    /// forward runs on, the admission job it submits first and the jobs of
+    /// its forward still to submit.
+    struct Planned {
+        name: &'static str,
+        lane: Option<usize>,
         admission: Option<u32>,
+        jobs: Vec<u32>,
     }
 
-    impl Backend for Admitting {
-        type Batch = ();
+    /// A backend that submits the jobs its batches plan and logs what the
+    /// executor asks of it.
+    #[derive(Default)]
+    struct Recording {
+        log: Vec<String>,
+    }
+
+    impl Backend for Recording {
+        type Batch = Planned;
         type Output = ();
         type Error = Error;
         type Job = u32;
@@ -730,65 +789,76 @@ mod tests {
             error
         }
 
-        fn classify(&self, error: Error, _batch: &(), _context: &str) -> Error {
+        fn classify(&self, error: Error, _batch: &Planned, _context: &str) -> Error {
             error
         }
 
         fn note_cleanup(&self, _error: &mut Error, _cleanup: Error) {}
 
-        fn admit(&mut self, _batch: &mut ()) -> Result<(), Error> {
+        fn admit(&mut self, _batch: &mut Planned) -> Result<(), Error> {
             Ok(())
         }
 
-        fn prepare(&mut self, _batch: &mut ()) -> Result<(), Error> {
-            self.log.push("prepare");
+        fn prepare(&mut self, batch: &mut Planned) -> Result<(), Error> {
+            self.log.push(format!("{} prepared", batch.name));
             Ok(())
         }
 
-        fn admit_inputs(&mut self, _batch: &mut ()) -> Result<Option<u32>, Error> {
-            Ok(self.admission.take())
+        fn admit_inputs(&mut self, batch: &mut Planned) -> Result<Option<u32>, Error> {
+            Ok(batch.admission.take())
         }
 
-        fn inputs_admitted(&mut self, _batch: &mut (), _completion: ()) -> Result<(), Error> {
-            self.log.push("inputs admitted");
+        fn inputs_admitted(&mut self, batch: &mut Planned, _completion: ()) -> Result<(), Error> {
+            self.log.push(format!("{} inputs admitted", batch.name));
             Ok(())
         }
 
         fn prepare_inputs(
             &mut self,
-            _batch: &mut (),
+            batch: &mut Planned,
             _submission: &Arc<Submission>,
         ) -> Result<bool, Error> {
-            self.log.push("inputs ready");
+            self.log.push(format!("{} inputs ready", batch.name));
             Ok(true)
         }
 
         fn await_inputs(
             &mut self,
-            _batch: &mut (),
+            _batch: &mut Planned,
             _submission: &Arc<Submission>,
         ) -> Result<(), Error> {
             Ok(())
         }
 
-        fn lane(&self, _batch: &()) -> Option<usize> {
-            None
+        fn lane(&self, batch: &Planned) -> Option<usize> {
+            batch.lane
         }
 
-        fn forward(&mut self, _batch: &mut ()) -> Result<Option<Completed<Self>>, Error> {
-            self.log.push("forward");
-            Ok(None)
+        fn forward(&mut self, batch: &mut Planned) -> Result<Option<u32>, Error> {
+            if batch.jobs.is_empty() {
+                self.log.push(format!("{} forwarded", batch.name));
+                return Ok(None);
+            }
+            let job = batch.jobs.remove(0);
+            self.log.push(format!("{} submits {job}", batch.name));
+            Ok(Some(job))
         }
 
-        fn complete(&mut self, _batch: &mut (), _job: u32, _completion: ()) -> Result<(), Error> {
+        fn complete(
+            &mut self,
+            batch: &mut Planned,
+            job: u32,
+            _completion: (),
+        ) -> Result<(), Error> {
+            self.log.push(format!("{} completes {job}", batch.name));
             Ok(())
         }
 
-        fn await_outputs(&mut self, _batch: &mut ()) -> Result<Option<u32>, Error> {
+        fn await_outputs(&mut self, _batch: &mut Planned) -> Result<Option<u32>, Error> {
             Ok(None)
         }
 
-        fn outputs_ready(&mut self, _batch: &mut (), _completion: ()) -> Result<(), Error> {
+        fn outputs_ready(&mut self, _batch: &mut Planned, _completion: ()) -> Result<(), Error> {
             Ok(())
         }
 
@@ -796,19 +866,19 @@ mod tests {
             Ok(None)
         }
 
-        fn begin_retirement(&mut self, _batch: &mut ()) -> Result<(), Error> {
+        fn begin_retirement(&mut self, _batch: &mut Planned) -> Result<(), Error> {
             Ok(())
         }
 
-        fn poll(&mut self, _batch: &mut ()) -> Result<(bool, bool), Error> {
+        fn poll(&mut self, _batch: &mut Planned) -> Result<(bool, bool), Error> {
             Ok((true, true))
         }
 
-        fn result(&mut self, _batch: &mut ()) -> Result<(), Error> {
+        fn result(&mut self, _batch: &mut Planned) -> Result<(), Error> {
             Ok(())
         }
 
-        fn close(&mut self, _batch: &mut ()) -> Result<(), Error> {
+        fn close(&mut self, _batch: &mut Planned) -> Result<(), Error> {
             Ok(())
         }
 
@@ -817,33 +887,128 @@ mod tests {
         }
     }
 
+    /// A batch of one request of its own, so no batch follows another.
+    fn batch(id: u64, data: Planned) -> Batch<Recording> {
+        Batch::new(id, None, HashSet::from([id]), HashSet::new(), data)
+    }
+
+    /// The log entries since the last call.
+    fn logged(executor: &mut Executor<Recording>) -> Vec<String> {
+        std::mem::take(&mut executor.backend_mut().log)
+    }
+
     #[test]
     fn a_batch_goes_on_from_the_completion_of_its_input_admission() -> Result<(), Error> {
-        let backend = Admitting {
+        let mut executor = Executor::new(Recording::default(), 4, false, false)?;
+        let planned = Planned {
+            name: "a",
+            lane: None,
             admission: Some(7),
-            ..Admitting::default()
+            jobs: Vec::new(),
         };
-        let mut executor = Executor::new(backend, 4, false, false)?;
-        let batch = Batch::new(1, None, HashSet::new(), HashSet::new(), ());
-        let submission = executor.admit(batch, true)?;
+        let submission = executor.admit(batch(1, planned), true)?;
 
         // The admission job is in flight: the batch has not gone further,
         // and advancing does not start it again.
         executor.advance()?;
-        assert_eq!(executor.backend().log, ["prepare"]);
+        assert_eq!(logged(&mut executor), ["a prepared"]);
         assert!(executor.poll(&submission)?.is_none());
 
         // A completion of no job of the batch changes nothing; the
         // admission's completion lets the batch run to its result.
         executor.complete(8, ());
-        assert_eq!(executor.backend().log, ["prepare"]);
+        assert!(logged(&mut executor).is_empty());
         executor.complete(7, ());
         assert_eq!(
-            executor.backend().log,
-            ["prepare", "inputs admitted", "inputs ready", "forward"]
+            logged(&mut executor),
+            ["a inputs admitted", "a inputs ready", "a forwarded"]
         );
         executor.advance()?;
         assert!(executor.poll(&submission)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_forward_is_submitted_job_by_job_from_each_completion() -> Result<(), Error> {
+        let mut executor = Executor::new(Recording::default(), 4, false, false)?;
+        let planned = Planned {
+            name: "a",
+            lane: Some(0),
+            admission: None,
+            jobs: vec![10, 11],
+        };
+        let submission = executor.admit(batch(1, planned), true)?;
+
+        // The executor returned with the first job in flight; without its
+        // completion nothing more is submitted and the batch has no result.
+        assert_eq!(
+            logged(&mut executor),
+            ["a prepared", "a inputs ready", "a submits 10"]
+        );
+        executor.advance()?;
+        assert!(logged(&mut executor).is_empty());
+        assert!(executor.poll(&submission)?.is_none());
+
+        // Each completion is applied and the next job submitted from it.
+        executor.complete(10, ());
+        assert_eq!(logged(&mut executor), ["a completes 10", "a submits 11"]);
+        executor.complete(11, ());
+        assert_eq!(logged(&mut executor), ["a completes 11", "a forwarded"]);
+        executor.advance()?;
+        assert!(executor.poll(&submission)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_starts_when_no_other_forward_is_in_flight() -> Result<(), Error> {
+        let mut executor = Executor::new(Recording::default(), 4, false, false)?;
+        let planned = |name, lane, jobs| Planned {
+            name,
+            lane: Some(lane),
+            admission: None,
+            jobs,
+        };
+
+        // A forward is in flight on lane 0.
+        executor.admit(batch(1, planned("a", 0, vec![10, 11])), true)?;
+        assert_eq!(
+            logged(&mut executor),
+            ["a prepared", "a inputs ready", "a submits 10"]
+        );
+
+        // Batches admitted meanwhile are not started, on another lane or
+        // on the same one, however often the executor passes.
+        let other = executor.admit(batch(2, planned("b", 1, vec![20])), true)?;
+        let same = executor.admit(batch(3, planned("c", 0, vec![30])), true)?;
+        executor.complete(10, ());
+        executor.advance()?;
+        assert_eq!(logged(&mut executor), ["a completes 10", "a submits 11"]);
+
+        // The forward completed: the oldest waiting batch starts at the
+        // executor's next pass, and the next one behind its forward.
+        executor.complete(11, ());
+        assert_eq!(logged(&mut executor), ["a completes 11", "a forwarded"]);
+        executor.advance()?;
+        assert_eq!(
+            logged(&mut executor),
+            ["b prepared", "b inputs ready", "b submits 20"]
+        );
+        executor.complete(20, ());
+        executor.advance()?;
+        assert_eq!(
+            logged(&mut executor),
+            [
+                "b completes 20",
+                "b forwarded",
+                "c prepared",
+                "c inputs ready",
+                "c submits 30"
+            ]
+        );
+        executor.complete(30, ());
+        executor.advance()?;
+        assert!(executor.poll(&other)?.is_some());
+        assert!(executor.poll(&same)?.is_some());
         Ok(())
     }
 }
