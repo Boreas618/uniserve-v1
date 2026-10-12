@@ -8,10 +8,12 @@
 //! denoising step denoises each row's resident block by one step of block
 //! diffusion (`denoise`). The runner owns the lane's buffers, the resident
 //! banks, the graph table and the Python half. For one batch
-//! ([`forward`]) it writes the forward's inputs into the buffers on the
-//! lane's stream, gathers resident bank rows natively, pads to a graph
-//! bucket, launches the bucket's graph and copies the outputs to the
-//! batch's output lease.
+//! ([`forward`]) it records a job of its lane: the writes of the forward's
+//! inputs into the buffers, the native gather of resident bank rows, the
+//! launch of the graph of the bucket the forward pads to, and the copies of
+//! the outputs to the batch's output lease. The lane's execution thread
+//! performs the job, and the runner applies its completion
+//! ([`DiffusionLMRunner::complete`]).
 //!
 //! With a graph pool, startup captures (largest first):
 //!
@@ -27,15 +29,17 @@
 //! A graph is captured by calling its method between the begin and the end
 //! of a capture, after one eager call of the same shape, and launched
 //! natively; a distributed expert weight prefetch is a graph break its
-//! launch performs between two segments. Without a pool (CPU lanes, graph
-//! policy off) every forward calls its method on the Python thread. A
-//! `readout` that exchanges tokens with expert peers also runs there, once
-//! over every slot of the forward.
+//! launch performs between two segments. The capture is an operation of
+//! the forward's job, whose completion carries the graph. Without a pool
+//! (CPU lanes, graph policy off) every forward calls its method on the
+//! Python thread. A `readout` that exchanges tokens with expert peers also
+//! runs there, once over every slot of the forward.
 //!
 //! With expert-parallel layers, a readout (`attend` and an exchanging
-//! `readout`) and a denoising step are each one expert step: the caller's
-//! coordinator ([`Coordinate`]) turns the forward's token extent into the
-//! step's agreed capacity, and graphs are captured and launched per
+//! `readout`) and a denoising step are each one expert step of the job
+//! ([`Expert`]): the execution thread agrees on the step's capacity for the
+//! forward's token extent, and the job carries the forward at every
+//! capacity the agreement can choose. Graphs are captured and launched per
 //! capacity.
 
 mod buffers;
@@ -45,6 +49,7 @@ mod forward;
 mod shapes;
 mod start;
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -58,8 +63,9 @@ use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::ffi::Function;
 use crate::ffi::{Backing, DType, Handle};
+use crate::lane::{Capture, Completion, ExpertStep, ExpertVariant, Job, JobQueues};
 use crate::model::interface::Interface;
-use crate::parallel::ExpertUnion;
+use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{GroupShape, GroupTable, KVCache, OutputPool, TablePages, table_pages};
@@ -71,12 +77,18 @@ use calls::{DenoiseRow, ReadoutPass, Sequence};
 use facts::Facts;
 use shapes::{SLOT_BUCKETS, ShapeKey, Shapes};
 
-pub(crate) use forward::execute;
+pub(crate) use forward::{Pending, complete, forward};
 pub(crate) use start::{KIND, Startup, reserved_bytes};
 
-/// Turns a forward's expert token extent into its expert step's capacity;
-/// `None` without expert-parallel layers.
-type Coordinate<'a> = &'a mut dyn FnMut(usize) -> Result<Option<usize>>;
+/// The expert steps of a runner's forwards.
+struct Expert<'a> {
+    union: &'a Arc<ExpertUnion>,
+    /// The runner's call kind in the union's agreement.
+    kind: i64,
+    /// The capacity a warmup step runs at; `None` runs it at the smallest
+    /// capacity holding the forward.
+    forced: Option<usize>,
+}
 
 /// Candidates one `readout` graph selects: the size of the candidate
 /// buffers.
@@ -166,6 +178,35 @@ struct Executed {
     padded_tokens: usize,
 }
 
+/// A method of the Python half as a forward runs it.
+struct Method<'a> {
+    /// The graph bucket of the forward.
+    key: &'a ShapeKey,
+    function: &'a Function,
+    /// The arguments of the `plan_attention` call a launch of a method
+    /// that attends follows.
+    plan: Option<&'a [Argument]>,
+}
+
+/// One forward recorded into a job, which [`DiffusionLMRunner::complete`]
+/// applies the job's completion for.
+struct Recorded {
+    /// The graph bucket of the forward's method.
+    key: ShapeKey,
+    /// How the method runs at every capacity its expert step can be agreed
+    /// at; one entry of no capacity without an expert step.
+    modes: Vec<(Option<usize>, GraphMode)>,
+    /// How each `readout` of a slot chunk runs, in job order, with the
+    /// bucket of one that is captured.
+    readouts: Vec<(GraphMode, Option<ShapeKey>)>,
+    /// Storage of the forward's own that the job's copies read. The job
+    /// ends with a read of it, which waits for those copies, so it is
+    /// returned with this value at completion.
+    own: Option<Arc<Memory>>,
+    tokens: usize,
+    padded_tokens: usize,
+}
+
 /// The host lists of a method's attention arguments, in parameter order.
 fn mirrors(metadata: &AttentionMetadata) -> [Argument; 4] {
     [
@@ -202,8 +243,8 @@ impl DiffusionLMRunner {
         Ok((self.owner.clone(), records))
     }
 
-    /// Call `method` on the Python thread: an eager forward, or the
-    /// forward a capture in progress records.
+    /// Call `method` on the Python thread, outside any job: startup and
+    /// retirement.
     fn call(&self, method: &Function, arguments: &[Argument]) -> Result<()> {
         self.methods
             .call(method, arguments.to_vec())
@@ -234,8 +275,9 @@ impl DiffusionLMRunner {
         result
     }
 
-    fn submit(&self, writes: ColumnWrites) -> Result<()> {
-        writes.submit(self.buffers.device(), self.stream.as_ref())
+    /// Record `writes` to the runner's buffers in `job`.
+    fn submit(&self, writes: ColumnWrites, job: &Job<'_>) -> Result<()> {
+        writes.submit(job.on(self.stream.as_ref()))
     }
 
     fn tensor(&self, name: &str) -> Result<Argument> {
@@ -265,73 +307,210 @@ impl DiffusionLMRunner {
             .collect()
     }
 
-    /// Run one forward of `method`: launch the graph resident for `key` at
-    /// expert `capacity`, or call the method and capture it; without a pool
-    /// call the method. `plan` is the `plan_attention` call of a method
-    /// that attends.
-    fn run(
-        &mut self,
-        key: ShapeKey,
+    /// Record one forward of `method` at expert `capacity`: into `forward`
+    /// the launch of the resident graph (behind the `plan_attention` call
+    /// of a method that attends), or the method's eager call; into `then`
+    /// the capture that follows an eager call. Without a pool the method
+    /// is called.
+    fn method<'j>(
+        &self,
+        method: &Method<'_>,
         capacity: Option<usize>,
-        method: &Function,
-        arguments: &[Argument],
-        plan: Option<&[Argument]>,
+        arguments: Vec<Argument>,
+        forward: &Job<'j>,
+        then: &Job<'j>,
     ) -> Result<GraphMode> {
-        let (Some(pool), Some(stream), Some(device)) = (
-            self.pool.clone(),
-            self.stream.clone(),
-            self.buffers.device(),
-        ) else {
-            self.call(method, arguments)?;
-            self.graphs.record(GraphMode::Eager);
+        let Method {
+            key,
+            function,
+            plan,
+        } = *method;
+        let (Some(pool), Some(stream), Some(device)) =
+            (&self.pool, &self.stream, self.buffers.device())
+        else {
+            forward.call(self.methods.call(function, arguments));
             return Ok(GraphMode::Eager);
         };
-        let mode = match self.graphs.lookup(&key, capacity)? {
+        match self.graphs.lookup(key, capacity)? {
             Lookup::Replay(graph) => {
                 if let (true, Some(plan)) = (self.plans_attention, plan) {
-                    self.call(&self.functions.plan_attention, plan)?;
+                    forward.call(
+                        self.methods
+                            .call(&self.functions.plan_attention, plan.to_vec()),
+                    );
                 }
-                graph.launch(&stream)?;
-                GraphMode::Replay
+                forward.on(Some(stream)).launch(graph)?;
+                Ok(GraphMode::Replay)
             }
             Lookup::Capture => {
                 // The eager call produces this forward's results, plans its
                 // attention and warms the capture, which records the same
                 // call without executing it.
-                self.call(method, arguments)?;
-                let captured = self
-                    .methods
-                    .graphs
-                    .capture(&pool, stream.raw(), device, || self.call(method, arguments));
-
-                // The breaks the forward reached (weight prefetches) belong
-                // to this capture, whether or not it succeeded.
-                let breaks = self
-                    .breaks
-                    .as_ref()
-                    .map_or_else(Vec::new, GraphBreaks::take);
-                self.segments = self.segments.max(breaks.len() + 1);
-                self.graphs
-                    .insert(key, capacity, captured?.with_breaks(breaks))?;
-                GraphMode::Capture
+                forward.call(self.methods.call(function, arguments.clone()));
+                then.capture(Capture {
+                    functions: self.methods.graphs.clone(),
+                    pool: pool.clone(),
+                    stream: stream.raw(),
+                    device,
+                    method: self.methods.call(function, arguments),
+                    // The breaks the forward reaches (weight prefetches)
+                    // belong to this capture.
+                    breaks: self.breaks.clone(),
+                });
+                Ok(GraphMode::Capture)
             }
-        };
-        self.graphs.record(mode);
-        Ok(mode)
+        }
     }
 
-    /// Evaluate a readout and read every candidate's log-probability.
+    /// Record the forward of `method` over `extent` expert tokens in `job`.
     ///
-    /// `sink(range, values)` receives the FP32 values of the candidates
-    /// `range` (in row, slot and candidate order), which later device work
-    /// on the stream overwrites. Every pipeline stage receives the same
-    /// values.
+    /// `arguments(capacity)` are the method's arguments at an expert
+    /// capacity (zero without expert-parallel layers) and
+    /// `completes(capacity)` the call that completes the method's expert
+    /// step behind it (an exchanging `readout`). Without `expert` the
+    /// forward is the next operations of `job`. With it the forward is one
+    /// expert step: the job carries the method at every capacity the step
+    /// can be agreed at, each with the capture and completing call that
+    /// follow it at that capacity.
+    fn step(
+        &self,
+        method: &Method<'_>,
+        arguments: &dyn Fn(usize) -> Vec<Argument>,
+        completes: Option<&dyn Fn(usize) -> Vec<Argument>>,
+        expert: Option<&Expert<'_>>,
+        extent: usize,
+        job: &Job<'_>,
+    ) -> Result<Vec<(Option<usize>, GraphMode)>> {
+        let completing = |capacity: usize| {
+            completes.map(|arguments| {
+                self.methods
+                    .call(&self.functions.readout, arguments(capacity))
+            })
+        };
+        let Some(expert) = expert else {
+            let mode = self.method(method, None, arguments(0), job, job)?;
+            if let Some(call) = completing(0) {
+                job.call(call);
+            }
+            return Ok(vec![(None, mode)]);
+        };
+
+        let lane = self
+            .stream
+            .clone()
+            .ok_or(Error::State("expert steps run on a CUDA stream"))?;
+        let union = expert.union;
+        // The capacities the step can run at: the one a warmup step
+        // announces, or every capacity an agreement can choose for a rank
+        // that sends `extent` tokens.
+        let capacities = if union.warming() {
+            vec![match expert.forced {
+                Some(capacity) => capacity,
+                None => union.parallel().capacity_for(extent)?,
+            }]
+        } else {
+            union
+                .parallel()
+                .capacities()
+                .iter()
+                .copied()
+                .filter(|&capacity| capacity >= extent)
+                .collect()
+        };
+        let mut variants = Vec::with_capacity(capacities.len());
+        let mut modes = Vec::with_capacity(capacities.len());
+        for capacity in capacities {
+            let (forward, then) = (Job::new(), Job::new());
+            let mode = self.method(method, Some(capacity), arguments(capacity), &forward, &then)?;
+            if let Some(call) = completing(capacity) {
+                then.call(call);
+            }
+            variants.push(ExpertVariant {
+                capacity,
+                forwards: vec![Some(MicrobatchForward {
+                    job: forward,
+                    // An eager forward enters Python, which passes the host
+                    // turn at its expert dispatch points.
+                    yields: mode != GraphMode::Replay,
+                })],
+                then,
+            });
+            modes.push((Some(capacity), mode));
+        }
+        job.expert_step(ExpertStep {
+            union: Arc::clone(union),
+            lane,
+            tokens: extent,
+            kind: expert.kind,
+            forced: expert.forced,
+            variants,
+            after: vec![None],
+        });
+        Ok(modes)
+    }
+
+    /// Apply the completion of the job that ran `recorded`: store the
+    /// graphs its captures produced and count how its methods ran.
+    fn complete(&mut self, recorded: Recorded, completion: &mut Completion) -> Result<Executed> {
+        let Recorded {
+            key,
+            modes,
+            readouts,
+            own,
+            tokens,
+            padded_tokens,
+        } = recorded;
+        let capacity = match modes.first() {
+            Some((None, _)) => None,
+            _ => Some(completion.capacity()?),
+        };
+        let mode = modes
+            .into_iter()
+            .find(|(variant, _)| *variant == capacity)
+            .ok_or_else(|| Error::Invariant("an expert step ran at an unplanned capacity".into()))?
+            .1;
+        let mut store = |key: ShapeKey, capacity: Option<usize>| -> Result<()> {
+            let graph = completion.captured()?;
+            self.segments = self.segments.max(graph.segments());
+            self.graphs.insert(key, capacity, graph)
+        };
+        if mode == GraphMode::Capture {
+            store(key, capacity)?;
+        }
+        for (_, captured) in &readouts {
+            if let Some(key) = captured {
+                store(*key, None)?;
+            }
+        }
+        self.graphs.record(mode);
+        for (mode, _) in readouts {
+            self.graphs.record(mode);
+        }
+        if own.is_some() {
+            // The read that waited for the copies out of `own`.
+            completion.read()?;
+        }
+        Ok(Executed {
+            mode,
+            tokens,
+            padded_tokens,
+        })
+    }
+
+    /// Record in `job` the evaluation of a readout and the read of every
+    /// candidate's log-probability.
+    ///
+    /// `sink(range, values)` records the copy of the FP32 values of the
+    /// candidates `range` (in row, slot and candidate order) out of
+    /// `values`, which later operations of the job overwrite. Every
+    /// pipeline stage receives the same values.
     fn readout(
-        &mut self,
+        &self,
         pass: &ReadoutPass<'_>,
-        coordinate: Coordinate<'_>,
+        expert: Option<&Expert<'_>>,
+        job: &Job<'_>,
         mut sink: impl FnMut(Range<usize>, &StorageView) -> Result<()>,
-    ) -> Result<Executed> {
+    ) -> Result<Recorded> {
         let layout = self.buffers.dimensions.clone();
         let tokens = pass.tokens.len();
         if pass.rows.is_empty() || pass.rows.iter().map(|row| row.query).sum::<usize>() != tokens {
@@ -398,7 +577,7 @@ impl DiffusionLMRunner {
             pass.pages,
             &widths,
         )?;
-        self.submit(writes)?;
+        self.submit(writes, job)?;
 
         // The expert step carries the tokens and, when `readout`
         // exchanges, the slot rows.
@@ -408,41 +587,46 @@ impl DiffusionLMRunner {
         } else {
             padded_tokens.max(pass.slots.len())
         };
-        let capacity = coordinate(extent)?;
-        let expert_capacity = capacity.unwrap_or(0);
         let state = self.attend_state()?;
         let attention = self.attention_tensors()?;
 
         let mut plan: Vec<Argument> = vec![metadata.rows().into(), visible.into()];
         plan.extend(mirrors(&metadata));
         plan.extend(attention.iter().cloned());
-        let mut arguments: Vec<Argument> =
-            vec![metadata.rows().into(), padded_tokens.into(), visible.into()];
-        arguments.extend(mirrors(&metadata));
-        arguments.push(expert_capacity.into());
-        arguments.push(self.tensor("input_ids")?);
-        arguments.push(self.tensor("positions")?);
-        arguments.extend(attention);
-        arguments.extend(state.iter().cloned());
-        let attend = self.functions.attend.clone();
-        let mode = self.run(key, capacity, &attend, &arguments, Some(&plan))?;
+        let (input_ids, positions) = (self.tensor("input_ids")?, self.tensor("positions")?);
+        let attend = |capacity: usize| {
+            let mut arguments: Vec<Argument> =
+                vec![metadata.rows().into(), padded_tokens.into(), visible.into()];
+            arguments.extend(mirrors(&metadata));
+            arguments.push(capacity.into());
+            arguments.push(input_ids.clone());
+            arguments.push(positions.clone());
+            arguments.extend(attention.iter().cloned());
+            arguments.extend(state.iter().cloned());
+            arguments
+        };
 
         let slot_rows = self.buffers.column("slot_rows")?.clone();
         let index = self.buffers.column("candidate_index")?.clone();
         let values = self.buffers.column("candidate_logprobs")?.clone();
-        let readout =
-            |slots: usize, candidates: usize, index: &StorageView, values: &StorageView| {
-                let mut arguments: Vec<Argument> = vec![
-                    slots.into(),
-                    candidates.into(),
-                    expert_capacity.into(),
-                    (&slot_rows).into(),
-                    index.into(),
-                    values.into(),
-                ];
-                arguments.extend(state.iter().cloned());
-                arguments
-            };
+        // The arguments of `readout` at an expert capacity, which only an
+        // exchanging `readout` reads.
+        let readout = |slots: usize,
+                       candidates: usize,
+                       capacity: usize,
+                       index: &StorageView,
+                       values: &StorageView| {
+            let mut arguments: Vec<Argument> = vec![
+                slots.into(),
+                candidates.into(),
+                capacity.into(),
+                (&slot_rows).into(),
+                index.into(),
+                values.into(),
+            ];
+            arguments.extend(state.iter().cloned());
+            arguments
+        };
         // The flat index of candidate `candidate` in the `[slots, vocab]`
         // log-probabilities of the slots from `base` on.
         let flat = |range: Range<usize>, base: usize| {
@@ -457,10 +641,20 @@ impl DiffusionLMRunner {
                 .collect::<Vec<i64>>()
         };
 
-        if graph && local {
-            // One `readout` per slot chunk and window of its candidates.
-            // Every stage runs the same windows, whose candidate values the
-            // final stage broadcasts.
+        let attending = Method {
+            key: &key,
+            function: &self.functions.attend,
+            plan: Some(&plan),
+        };
+        let mut readouts = Vec::new();
+        let mut own = None;
+        let modes = if graph && local {
+            let modes = self.step(&attending, &attend, None, expert, extent, job)?;
+
+            // One `readout` per slot chunk and window of its candidates,
+            // behind the step. Every stage runs the same windows, whose
+            // candidate values the final stage broadcasts.
+            let mut capturing = HashSet::new();
             for (start, live, bucket) in shapes::slot_chunks(pass.slots.len()) {
                 let first = pass.slot_candidates[start];
                 let last = pass.slot_candidates[start + live];
@@ -473,18 +667,31 @@ impl DiffusionLMRunner {
                     // Unused candidates select the first log-probability.
                     writes.write(&index, 0, &selected)?;
                     writes.zero(&index, selected.len(), CANDIDATES - selected.len())?;
-                    self.submit(writes)?;
-                    let arguments = readout(bucket, CANDIDATES, &index, &values);
-                    if self.facts.last_stage() {
-                        let key = ShapeKey::Readout { slots: bucket };
-                        let readout = self.functions.readout.clone();
-                        self.run(key, None, &readout, &arguments, None)?;
+                    self.submit(writes, job)?;
+                    let arguments = readout(bucket, CANDIDATES, 0, &index, &values);
+                    let key = ShapeKey::Readout { slots: bucket };
+                    if !self.facts.last_stage() || capturing.contains(&key) {
+                        // A stage without the head has no `readout` graph,
+                        // and a bucket this job already captures is stored
+                        // only at its completion.
+                        job.call(self.methods.call(&self.functions.readout, arguments));
+                        readouts.push((GraphMode::Eager, None));
                     } else {
-                        self.call(&self.functions.readout, &arguments)?;
+                        let reading = Method {
+                            key: &key,
+                            function: &self.functions.readout,
+                            plan: None,
+                        };
+                        let mode = self.method(&reading, None, arguments, job, job)?;
+                        if mode == GraphMode::Capture {
+                            capturing.insert(key);
+                        }
+                        readouts.push((mode, (mode == GraphMode::Capture).then_some(key)));
                     }
                     sink(window..end, &values.prefix((end - window) as i64)?)?;
                 }
             }
+            modes
         } else {
             // One `readout` over every slot and candidate, on the Python
             // thread: an exchanging `readout` completes the expert step
@@ -500,6 +707,7 @@ impl DiffusionLMRunner {
                 };
                 let backing = Arc::clone(&memory) as Arc<dyn Backing>;
                 let shape = [total as i64];
+                own = Some(memory);
                 Some((
                     StorageView::contiguous(Arc::clone(&backing), 0, DType::I64, &shape)?,
                     StorageView::contiguous(backing, total * 8, DType::F32, &shape)?,
@@ -513,33 +721,39 @@ impl DiffusionLMRunner {
             let mut writes = ColumnWrites::new();
             writes.write(&slot_rows, 0, &pass.slots)?;
             writes.write(index, 0, &flat(0..total, 0))?;
-            self.submit(writes)?;
-            self.call(
-                &self.functions.readout,
-                &readout(pass.slots.len(), total, index, values),
-            )?;
+            self.submit(writes, job)?;
+            let completes =
+                |capacity: usize| readout(pass.slots.len(), total, capacity, index, values);
+            let modes = self.step(&attending, &attend, Some(&completes), expert, extent, job)?;
             sink(0..total, &values.prefix(total as i64)?)?;
-            if let (Some(_), Some(stream)) = (&larger, &self.stream) {
-                // The forward's own storage is freed once its copies ran.
-                stream.synchronize()?;
+            if own.is_some() {
+                // The forward's own storage is returned at the job's
+                // completion: this read waits for the copies out of it.
+                job.on(self.stream.as_ref()).read(values.address(), 4);
             }
-        }
-        Ok(Executed {
-            mode,
+            modes
+        };
+        Ok(Recorded {
+            key,
+            modes,
+            readouts,
+            own,
             tokens,
             padded_tokens,
         })
     }
 
-    /// Denoise the resident blocks of `rows` by one step. The rows' int64
-    /// `[1 + length]` results are the leading rows of `denoise.results` and
-    /// their continuation flags those of `denoise.continued`.
+    /// Record in `job` one denoising step of the resident blocks of
+    /// `rows`. The rows' int64 `[1 + length]` results are the leading rows
+    /// of `denoise.results` and their continuation flags those of
+    /// `denoise.continued`.
     fn denoise(
-        &mut self,
+        &self,
         rows: &[DenoiseRow],
         pages: &[TablePages],
-        coordinate: Coordinate<'_>,
-    ) -> Result<Executed> {
+        expert: Option<&Expert<'_>>,
+        job: &Job<'_>,
+    ) -> Result<Recorded> {
         let (Some(banks), Some(state)) = (&self.banks, &self.state) else {
             return Err(Error::Invalid(
                 "this worker keeps no generating blocks".into(),
@@ -597,39 +811,50 @@ impl DiffusionLMRunner {
             pages,
             &widths,
         )?;
-        self.submit(writes)?;
+        self.submit(writes, job)?;
         let slots: Vec<u32> = rows.iter().map(|row| row.slot).collect();
-        banks.gather(&slots, padded, state, self.stream.as_ref())?;
+        banks.gather(&slots, padded, state, job.on(self.stream.as_ref()))?;
 
         let first = rows.iter().all(|row| row.step == 0);
-        let capacity = coordinate(padded * length)?;
         let attention = self.attention_tensors()?;
         let mut plan: Vec<Argument> = vec![padded.into(), length.into()];
         plan.extend(mirrors(&metadata));
         plan.extend(attention.iter().cloned());
-        let mut arguments: Vec<Argument> = vec![padded.into(), first.into()];
-        arguments.extend(mirrors(&metadata));
-        arguments.push(capacity.unwrap_or(0).into());
-        arguments.push(self.tensor("denoise.columns")?);
-        arguments.push(self.tensor("positions")?);
-        arguments.extend(attention);
-        for name in [
+        let columns = [self.tensor("denoise.columns")?, self.tensor("positions")?];
+        let outputs = [
             "denoise.tokens",
             "denoise.history",
             "denoise.self_conditioning",
             "denoise.results",
             "denoise.continued",
-        ] {
-            arguments.push(self.tensor(name)?);
-        }
+        ]
+        .into_iter()
+        .map(|name| self.tensor(name))
+        .collect::<Result<Vec<_>>>()?;
+        let arguments = |capacity: usize| {
+            let mut arguments: Vec<Argument> = vec![padded.into(), first.into()];
+            arguments.extend(mirrors(&metadata));
+            arguments.push(capacity.into());
+            arguments.extend(columns.iter().cloned());
+            arguments.extend(attention.iter().cloned());
+            arguments.extend(outputs.iter().cloned());
+            arguments
+        };
         let key = ShapeKey::Denoise {
             rows: padded,
             first,
         };
-        let denoise = self.functions.denoise.clone();
-        let mode = self.run(key, capacity, &denoise, &arguments, Some(&plan))?;
-        Ok(Executed {
-            mode,
+        let denoising = Method {
+            key: &key,
+            function: &self.functions.denoise,
+            plan: Some(&plan),
+        };
+        let modes = self.step(&denoising, &arguments, None, expert, padded * length, job)?;
+        Ok(Recorded {
+            key,
+            modes,
+            readouts: Vec::new(),
+            own: None,
             tokens: live * length,
             padded_tokens: padded * length,
         })
@@ -650,7 +875,15 @@ impl DiffusionLMRunner {
     /// With expert-parallel layers every graph is captured at every expert
     /// capacity holding its tokens, largest first, each warmup an announced
     /// expert step; every rank warms the same sequence.
-    fn warm(&mut self, kv: &mut KVCache, experts: Option<&ExpertUnion>) -> Result<()> {
+    ///
+    /// Every forward is a job of the runner's lane (`lanes`). The scratch
+    /// units are startup work this call issues itself, between jobs.
+    fn warm(
+        &mut self,
+        kv: &mut KVCache,
+        experts: Option<&Arc<ExpertUnion>>,
+        lanes: &JobQueues,
+    ) -> Result<()> {
         let row_units: usize = self
             .groups
             .iter()
@@ -661,7 +894,7 @@ impl DiffusionLMRunner {
             self.stream.as_ref(),
         )?;
         let first = *scratch.units().start() as usize;
-        let warmed = self.warm_shapes(first, row_units, experts);
+        let warmed = self.warm_shapes(first, row_units, experts, lanes);
         let finished = scratch.finish(kv, self.stream.as_ref());
         warmed.and(finished)?;
         if let Some(stream) = &self.stream {
@@ -700,12 +933,32 @@ impl DiffusionLMRunner {
         Ok(())
     }
 
+    /// Submit `job`, which recorded `recorded`, to the runner's lane and
+    /// apply its completion.
+    fn perform(&mut self, lanes: &JobQueues, job: Job<'_>, recorded: Recorded) -> Result<()> {
+        let mut completion = lanes
+            .submit(KIND, job)?
+            .check()
+            .map_err(|failure| failure.error)?;
+        self.complete(recorded, &mut completion).map(drop)
+    }
+
     fn warm_shapes(
         &mut self,
         first_unit: usize,
         row_units: usize,
-        experts: Option<&ExpertUnion>,
+        experts: Option<&Arc<ExpertUnion>>,
+        lanes: &JobQueues,
     ) -> Result<()> {
+        // The expert step of a warmup forward at `capacity`.
+        let index = self.index;
+        let step = |capacity: Option<usize>| {
+            experts.map(|union| Expert {
+                union,
+                kind: forward::expert_kind(index),
+                forced: capacity,
+            })
+        };
         // The expert capacities a forward of `tokens` is captured at.
         let variants = |tokens: usize| -> Vec<Option<usize>> {
             match experts {
@@ -728,11 +981,14 @@ impl DiffusionLMRunner {
             }
             for count in 1..=self.chunk_rows {
                 let pages = self.scratch_pages(count, length, first_unit, row_units)?;
-                self.denoise(
+                let job = Job::new();
+                let recorded = self.denoise(
                     &synthetic_steps(count, true),
                     &pages,
-                    &mut forward::coordinator(experts, self.index, None),
+                    step(None).as_ref(),
+                    &job,
                 )?;
+                self.perform(lanes, job, recorded)?;
             }
             return Ok(());
         }
@@ -742,7 +998,7 @@ impl DiffusionLMRunner {
         let local = self.facts.local_tail;
         if local && self.facts.last_stage() {
             for slots in SLOT_BUCKETS {
-                self.warm_readout(slots)?;
+                self.warm_readout(slots, lanes)?;
             }
         }
         for &count in &rows {
@@ -767,11 +1023,10 @@ impl DiffusionLMRunner {
                 let tokens = rows * length;
                 let extent = if local { tokens } else { tokens.max(count) };
                 for capacity in variants(extent) {
-                    self.readout(
-                        &pass,
-                        &mut forward::coordinator(experts, self.index, capacity),
-                        |_, _| Ok(()),
-                    )?;
+                    let job = Job::new();
+                    let recorded =
+                        self.readout(&pass, step(capacity).as_ref(), &job, |_, _| Ok(()))?;
+                    self.perform(lanes, job, recorded)?;
                 }
             }
         }
@@ -781,11 +1036,14 @@ impl DiffusionLMRunner {
                 let padded = self.shapes.denoise(count)?;
                 for first in [true, false] {
                     for capacity in variants(padded * length) {
-                        self.denoise(
+                        let job = Job::new();
+                        let recorded = self.denoise(
                             &synthetic_steps(count, first),
                             &pages,
-                            &mut forward::coordinator(experts, self.index, capacity),
+                            step(capacity).as_ref(),
+                            &job,
                         )?;
+                        self.perform(lanes, job, recorded)?;
                     }
                 }
             }
@@ -793,14 +1051,16 @@ impl DiffusionLMRunner {
         Ok(())
     }
 
-    /// Capture the `readout` graph of `slots` slot rows.
-    fn warm_readout(&mut self, slots: usize) -> Result<()> {
+    /// Capture the `readout` graph of `slots` slot rows, as a job of the
+    /// runner's lane.
+    fn warm_readout(&mut self, slots: usize, lanes: &JobQueues) -> Result<()> {
+        let job = Job::new();
         let slot_rows = self.buffers.column("slot_rows")?.clone();
         let index = self.buffers.column("candidate_index")?.clone();
         let mut writes = ColumnWrites::new();
         writes.write(&slot_rows, 0, &(0..slots as i64).collect::<Vec<_>>())?;
         writes.zero(&index, 0, CANDIDATES)?;
-        self.submit(writes)?;
+        self.submit(writes, &job)?;
         // A local `readout` exchanges no tokens: it has no expert capacity.
         let mut arguments: Vec<Argument> = vec![
             slots.into(),
@@ -812,8 +1072,23 @@ impl DiffusionLMRunner {
         ];
         arguments.extend(self.attend_state()?);
         let key = ShapeKey::Readout { slots };
-        let readout = self.functions.readout.clone();
-        self.run(key, None, &readout, &arguments, None).map(drop)
+        let reading = Method {
+            key: &key,
+            function: &self.functions.readout,
+            plan: None,
+        };
+        let mode = self.method(&reading, None, arguments, &job, &job)?;
+        let mut completion = lanes
+            .submit(KIND, job)?
+            .check()
+            .map_err(|failure| failure.error)?;
+        if mode == GraphMode::Capture {
+            let graph = completion.captured()?;
+            self.segments = self.segments.max(graph.segments());
+            self.graphs.insert(key, None, graph)?;
+        }
+        self.graphs.record(mode);
+        Ok(())
     }
 
     /// Pages of `count` rows of `length` tokens reading a one-token prefix
@@ -870,6 +1145,8 @@ pub(crate) struct DiffusionLMWarmup;
 
 impl WarmupHooks for DiffusionLMWarmup {
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
+        let lanes = backend.job_queues().clone();
+        let experts = backend.experts().cloned();
         let parts = backend.parts();
         let Some(storage) = parts.storage else {
             return Ok(());
@@ -879,12 +1156,10 @@ impl WarmupHooks for DiffusionLMWarmup {
                 .kv
                 .as_mut()
                 .ok_or(Error::State("diffusion LM warmup requires a KV cache"))?;
-            runner
-                .warm(kv, parts.experts.map(|experts| &**experts))
-                .map_err(|error| {
-                    WorkerError::classify(error, Some("diffusion LM graph capture"))
-                        .with_phase("warmup")
-                })?;
+            runner.warm(kv, experts.as_ref(), &lanes).map_err(|error| {
+                WorkerError::classify(error, Some("diffusion LM graph capture"))
+                    .with_phase("warmup")
+            })?;
         }
         Ok(())
     }

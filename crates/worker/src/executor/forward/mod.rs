@@ -148,6 +148,9 @@ pub(crate) fn forward<'a>(
             Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
                 crate::runner::causal_lm::forward(backend, batch, kind)
             }
+            Forward(ForwardMode::TokenDenoising) => {
+                crate::runner::diffusion_lm::forward(backend, batch, kind)
+            }
             _ => {
                 let job = Job::new();
                 job.forward(move || {
@@ -179,6 +182,9 @@ pub(crate) fn complete(
     match kind {
         Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
             crate::runner::causal_lm::complete(backend, batch, completion)
+        }
+        Forward(ForwardMode::TokenDenoising) => {
+            crate::runner::diffusion_lm::complete(backend, batch, completion)
         }
         _ => {
             batch.set_stage(Stage::Done);
@@ -223,9 +229,7 @@ fn execute(
         Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
             Err(unsupported(kind, "text"))
         }
-        Forward(ForwardMode::TokenDenoising) => {
-            crate::runner::diffusion_lm::execute(backend, batch, kind)
-        }
+        Forward(ForwardMode::TokenDenoising) => Err(unsupported(kind, "diffusion LM")),
         Transfer(_) => transfer::execute(backend, batch, kind),
         Media(MediaReading | VideoEncoding | AudioEncoding | Muxing) => {
             let (plan, borrowed, state) = batch.media_parts();

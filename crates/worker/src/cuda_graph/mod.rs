@@ -138,6 +138,11 @@ impl CUDAGraph {
         self
     }
 
+    /// The graph's segments: one more than its graph breaks.
+    pub(crate) fn segments(&self) -> usize {
+        self.segments.len()
+    }
+
     /// The Python graph.
     pub fn handle(&self) -> &Handle {
         &self.graph
