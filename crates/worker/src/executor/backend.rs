@@ -21,7 +21,7 @@ use uniserve_ipc::{
 
 use super::forward::batch::image::ImageParts;
 use super::forward::{self, launch::Launched};
-use super::lifecycle::{RequestStorage, Retirement};
+use super::lifecycle::{LaneJobs, RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
 use crate::ffi::Function;
@@ -106,6 +106,9 @@ pub struct WorkerBackend {
     kernels: Option<KernelWatch>,
     /// The lanes' job queues: each forward runs as jobs of its lane.
     jobs: JobQueues,
+    /// What lifecycle commands record for the lanes; submitted after each
+    /// command.
+    lifecycle: LaneJobs,
 }
 
 /// Disjoint borrows of a backend for one batch's execution.
@@ -363,6 +366,7 @@ impl WorkerBatch {
 
 impl WorkerBackend {
     pub fn new(info: WorkerInfo, rank: usize, components: Components) -> Result<Self> {
+        let lifecycle = LaneJobs::new(&info.supported_calls);
         Ok(Self {
             requests: RequestPool::new(info.request_slots as usize)?,
             info,
@@ -389,7 +393,21 @@ impl WorkerBackend {
             profiler: None,
             kernels: None,
             jobs: JobQueues::default(),
+            lifecycle,
         })
+    }
+
+    /// Submit the jobs the last lifecycle command recorded, each to the
+    /// lane of its kind.
+    fn perform_lifecycle(&mut self) -> Result<()> {
+        for (kind, job) in self.lifecycle.take() {
+            let completion = match kind {
+                Some(kind) => self.jobs.submit(kind, job)?.1,
+                None => job.perform(),
+            };
+            completion.check().map_err(|failure| failure.error)?;
+        }
+        Ok(())
     }
 
     /// Use the job queues of the rank's lanes for forward submission.
@@ -754,8 +772,9 @@ impl WorkerBackend {
                 &mut self.media_outputs,
                 &mut self.storage,
             ) {
-                owner.admit_slots(&admitted)?;
+                owner.admit_slots(&admitted, &self.lifecycle)?;
             }
+            self.perform_lifecycle()?;
         }
         started?;
         if let Some(video) = &mut self.video {
@@ -1013,10 +1032,10 @@ impl WorkerBackend {
                 })
                 .collect();
             if !predicates.is_empty() {
-                storage.release_buffers(&predicates)?;
+                storage.release_buffers(&predicates, &self.lifecycle)?;
             }
         }
-        Ok(())
+        self.perform_lifecycle()
     }
 
     /// Release request references after the executor drained its work.
@@ -1096,8 +1115,9 @@ impl Backend for WorkerBackend {
             &mut self.media_outputs,
             &mut self.storage,
         );
-        batch.retirement.admit(&mut owners)?;
-        Ok(())
+        batch.retirement.admit(&mut owners, &self.lifecycle)?;
+        drop(owners);
+        Ok(self.perform_lifecycle()?)
     }
 
     fn prepare(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
@@ -1283,8 +1303,11 @@ impl Backend for WorkerBackend {
             &mut self.media_outputs,
             &mut self.storage,
         );
-        batch.retirement.begin(&self.requests, &mut owners)?;
-        Ok(())
+        batch
+            .retirement
+            .begin(&self.requests, &mut owners, &self.lifecycle)?;
+        drop(owners);
+        Ok(self.perform_lifecycle()?)
     }
 
     fn poll(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(bool, bool), WorkerError> {
@@ -1323,7 +1346,11 @@ impl Backend for WorkerBackend {
             &mut self.media_outputs,
             &mut self.storage,
         );
-        let retired = batch.retirement.poll(&mut self.requests, &mut owners)?;
+        let retired = batch
+            .retirement
+            .poll(&mut self.requests, &mut owners, &self.lifecycle)?;
+        drop(owners);
+        self.perform_lifecycle()?;
         Ok((advanced || retired, retired))
     }
 

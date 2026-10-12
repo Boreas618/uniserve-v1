@@ -258,7 +258,11 @@ fn relay_lanes_are_bounded_by_the_unresolved_window() -> Result<()> {
     );
     store.complete_reads(&[lease], None, &[])?;
     store.release_calls(&[(request(), first.producer_call_id)]);
-    store.release_requests(&HashSet::new(), &HashSet::new())?;
+    store.release_requests(
+        &HashSet::new(),
+        &HashSet::new(),
+        None::<&uniserve_cuda::Stream>,
+    )?;
     store.bind_outputs(&[(second, CPU)], placement)?;
     Ok(())
 }

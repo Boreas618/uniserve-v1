@@ -50,7 +50,7 @@ use crate::executor::forward::launch::{
     Launched, StreamOrder, error_code, failed_output, flag, lock, reports_output, request_flag,
     seal,
 };
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
 use crate::lane::{Completion, Job};
@@ -434,13 +434,13 @@ impl Committing {
 }
 
 impl RequestStorage for DiffusionLMRunner {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         // A request's first denoising step starts its block in the banks
         // before any step reads them; admission resets nothing.
         Ok(())
     }
 
-    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -448,6 +448,7 @@ impl RequestStorage for DiffusionLMRunner {
         &mut self,
         _requests: &HashSet<RequestKey>,
         _retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -461,7 +462,7 @@ impl RequestStorage for DiffusionLMRunner {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
