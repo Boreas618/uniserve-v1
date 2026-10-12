@@ -6,7 +6,7 @@
 //! call's completion scalar, makes every produced write visible, applies
 //! trajectory commits and records the calls as pending in the request pool.
 //! The result follows once the batch's device work completed (its output
-//! fences are query-ready) and its host tasks finished; host tasks publish
+//! fences completed) and its host tasks finished; host tasks publish
 //! the products they wrote before the result is delivered.
 //!
 //! A batch whose calls' forwards are recorded ([`forward`], [`complete`])
@@ -349,9 +349,6 @@ impl MediaBatch {
         let fences = lock(&self.output)
             .seal(&streams, owners.events)?
             .unwrap_or_default();
-        for fence in &fences {
-            stream.wake(owners.events, fence)?;
-        }
         let finished = Arc::clone(&self.output);
         stream.defer(
             owners.events,
@@ -423,7 +420,7 @@ impl MediaBatch {
                 return Ok(None);
             }
         }
-        if lock(&self.output).ready_at()?.is_none() {
+        if lock(&self.output).ready_at().is_none() {
             return Ok(None);
         }
 

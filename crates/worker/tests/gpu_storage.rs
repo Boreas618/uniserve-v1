@@ -309,7 +309,11 @@ fn output_readback_waits_for_device_copies_and_widens_tokens() {
     let (offset, count) = output.capture(&column, Some(&stream), &events).unwrap();
     assert!(output.readback().is_err(), "readback before sealing");
     output.seal(&[&stream], &events).unwrap();
+    // The lease does not ask the driver: its fences have completed once
+    // it is told so, here by the test that waited for the stream.
+    assert!(output.readback().is_err(), "readback before its fences");
     stream.synchronize().unwrap();
+    output.fences_completed();
     output.readback().unwrap();
     assert_eq!(output.read_tokens(offset, count).unwrap(), [-2, -2, -2]);
     let timing = output.observe(0).unwrap();
