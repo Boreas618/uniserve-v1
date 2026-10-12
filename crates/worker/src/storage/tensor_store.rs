@@ -575,9 +575,10 @@ impl TensorStore {
         Ok(())
     }
 
-    /// Wake on retirement and cancel the imports of a never-produced buffer.
-    fn retire_buffer(&self, buffer: &ProductBuffer) -> Result<()> {
-        self.wake_retirement(buffer, None::<&Stream>)?;
+    /// Wake on retirement, through `stream`, and cancel the imports of a
+    /// never-produced buffer.
+    fn retire_buffer(&self, buffer: &ProductBuffer, stream: impl Issue) -> Result<()> {
+        self.wake_retirement(buffer, stream)?;
         let transfers: Vec<_> = {
             let value = lock(buffer);
             if value.state.produced() {
@@ -1442,7 +1443,7 @@ impl TensorStore {
         transports: &Transports,
         placement: OutputPlacement<'_>,
         metadata: Option<Metadata>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<ProductRead>> {
         let id = reference.buffer_id();
         let key = buffer_key(id);
@@ -1715,8 +1716,9 @@ impl TensorStore {
         lock(&self.state).release_calls(calls.iter().copied());
     }
 
-    /// Revoke the exports of released buffers and release the buffers.
-    pub fn release_buffers(&self, buffers: &HashSet<BufferId>) -> Result<()> {
+    /// Revoke the exports of released buffers and release the buffers. The
+    /// wake behind a buffer's outstanding fences is issued to `stream`.
+    pub fn release_buffers(&self, buffers: &HashSet<BufferId>, stream: impl Issue) -> Result<()> {
         let revoked: Vec<_> = {
             let mut exports = lock(&self.exports);
             buffers
@@ -1734,7 +1736,7 @@ impl TensorStore {
                 .collect()
         };
         for buffer in released {
-            self.retire_buffer(&buffer)?;
+            self.retire_buffer(&buffer, stream)?;
         }
         let mut state = lock(&self.state);
         self.reclaim(&mut state)
@@ -1742,11 +1744,13 @@ impl TensorStore {
 
     /// Release retired requests' products, except retained persistent ones,
     /// and revoke every export location registered for their buffers
-    /// (products and published KV extents).
+    /// (products and published KV extents). The wake behind a product's
+    /// outstanding fences is issued to `stream`.
     pub fn release_requests(
         &self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
+        stream: impl Issue,
     ) -> Result<()> {
         let revoked: Vec<_> = {
             let mut exports = lock(&self.exports);
@@ -1770,7 +1774,7 @@ impl TensorStore {
                 .collect()
         };
         for buffer in released {
-            self.retire_buffer(&buffer)?;
+            self.retire_buffer(&buffer, stream)?;
         }
         let mut state = lock(&self.state);
         self.reclaim(&mut state)

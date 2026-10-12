@@ -258,7 +258,11 @@ fn relay_lanes_are_bounded_by_the_unresolved_window() -> Result<()> {
     );
     store.complete_reads(&[lease], None, &[])?;
     store.release_calls(&[(request(), first.producer_call_id)]);
-    store.release_requests(&HashSet::new(), &HashSet::new())?;
+    store.release_requests(
+        &HashSet::new(),
+        &HashSet::new(),
+        None::<&uniserve_cuda::Stream>,
+    )?;
     store.bind_outputs(&[(second, CPU)], placement)?;
     Ok(())
 }
@@ -397,6 +401,7 @@ fn imports_share_pending_reads_and_widen_resident_shards() -> Result<()> {
     // Only the missing rows are read.
     assert_eq!(first.reads().len(), 1);
     for read in first.reads() {
+        read.start()?;
         read.wait_ready();
     }
     consumer.complete_import(&first, None)?;
