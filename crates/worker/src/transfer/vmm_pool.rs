@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use uniserve_cuda::{
     CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream,
-    memset_d32,
 };
 
+use crate::stream::{Fill, Issue};
 use crate::{DescriptorGrants, Error, Result};
 
 pub const ACK_SLOTS: usize = 64;
@@ -100,11 +100,14 @@ impl<B> VmmPool<B> {
         self.capacity
     }
 
-    /// Reserve a payload and clear its reader words on the producer stream.
-    /// None reports capacity exhaustion without reserving any bytes.
-    /// The pool shares `stream` until close, which drains the header
-    /// initialization submitted here.
-    pub fn reserve(&mut self, bytes: usize, stream: &Stream) -> Result<Option<Arc<PoolChunk>>> {
+    /// Reserve a payload and clear its reader words in the order of the
+    /// producer `issue`'s stream. None reports capacity exhaustion without
+    /// reserving any bytes. The pool shares that stream until close, which
+    /// drains the header initialization issued here.
+    pub fn reserve(&mut self, bytes: usize, issue: impl Issue) -> Result<Option<Arc<PoolChunk>>> {
+        let stream = issue
+            .stream()
+            .ok_or_else(|| Error::Invalid("a VMM pool chunk is cleared on a stream".into()))?;
         self.backing()?;
         if self.failed {
             return Err(Error::Resource("VMM pool device completion is unknown"));
@@ -149,10 +152,17 @@ impl<B> VmmPool<B> {
         // SAFETY: this reservation owns all 64 aligned header words. Later
         // payload copies and the export's readiness event use this same
         // stream.
-        let filled = unsafe { memset_d32(header, 0, ACK_SLOTS, stream) };
+        let filled = unsafe {
+            issue.fill(Fill {
+                address: header,
+                value: 0,
+                width: 4,
+                count: ACK_SLOTS,
+            })
+        };
         if let Err(error) = filled {
             self.failed = true;
-            return Err(error.into());
+            return Err(error);
         }
         Ok(Some(chunk))
     }
