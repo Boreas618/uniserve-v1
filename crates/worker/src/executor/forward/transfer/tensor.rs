@@ -40,7 +40,7 @@ enum Placement {
     Relay,
 }
 
-impl TransferBatch<'_, '_> {
+impl TransferBatch<'_> {
     /// Copy every active call's input product into its output product and
     /// export the copy; export trajectory transfers' versions from the
     /// latent pool of `image`.

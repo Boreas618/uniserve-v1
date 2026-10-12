@@ -200,7 +200,7 @@ fn open(
     kind: CallKind,
     device: Option<i32>,
     stream: Option<&Stream>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<Opening> {
     let parts = backend.parts();
     let Some(storage) = parts.storage else {
@@ -236,7 +236,7 @@ fn record(
     opening: Opening,
     device: Option<i32>,
     stream: Option<&Stream>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Pending {
     let cache = transfers_cache(kind);
     let mut parts = backend.parts();
@@ -300,7 +300,7 @@ pub(crate) fn forward<'a>(
     backend: &'a mut WorkerBackend,
     batch: &'a mut WorkerBatch,
     kind: CallKind,
-) -> std::result::Result<Option<Job<'a>>, WorkerError> {
+) -> std::result::Result<Option<Job>, WorkerError> {
     let state = match batch.transfer_parts().2.take() {
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
         state => state,

@@ -8,7 +8,7 @@ use super::kv;
 use crate::storage::UnitColumn;
 use crate::{Error, Result};
 
-impl TransferBatch<'_, '_> {
+impl TransferBatch<'_> {
     /// Install the active calls' block tables on the batch's stream and
     /// reset the units newly assigned to them on `column` (the stream's
     /// unit column), except those an install's import resets itself.
