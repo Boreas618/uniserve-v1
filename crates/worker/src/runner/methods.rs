@@ -71,6 +71,11 @@ impl MethodCall {
         }
     }
 
+    /// The import path of the method called.
+    pub(crate) fn name(&self) -> &str {
+        self.function.name()
+    }
+
     /// Make the call.
     pub(crate) fn invoke(self) -> Result<Any> {
         let values = self

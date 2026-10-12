@@ -108,6 +108,8 @@ enum Operation<'a> {
 enum Call<'a> {
     /// A runner method.
     Method(MethodCall),
+    /// A runner method whose integers the completion carries.
+    Returning(MethodCall),
     /// A library function over values that are no tensors.
     Function(DeferredCall),
     Capture(Capture),
@@ -190,6 +192,8 @@ pub(crate) struct Completion {
     reads: VecDeque<Vec<u8>>,
     /// The capacity each expert step was agreed at.
     capacities: VecDeque<usize>,
+    /// The integers each returning call returned.
+    returned: VecDeque<Vec<i64>>,
     /// Where the job stopped, when it did not run to its end.
     failure: Option<Failure>,
 }
@@ -216,6 +220,12 @@ impl Completion {
     /// The capacity the next expert step was agreed at.
     pub(crate) fn capacity(&mut self) -> Result<usize> {
         self.capacities.pop_front().ok_or(MISSING)
+    }
+
+    /// The integers the next returning call returned
+    /// ([`Job::call_returning`]): one for a call that returns an integer.
+    pub(crate) fn returned(&mut self) -> Result<Vec<i64>> {
+        self.returned.pop_front().ok_or(MISSING)
     }
 }
 
@@ -268,6 +278,13 @@ impl<'a> Job<'a> {
     /// An eager call of a runner method.
     pub(crate) fn call(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Method(method)));
+    }
+
+    /// An eager call of a runner method that returns an integer or a list
+    /// of integers (the counts of what it wrote, say), which the job's
+    /// completion carries ([`Completion::returned`]).
+    pub(crate) fn call_returning(&self, method: MethodCall) {
+        self.push(Operation::Call(Call::Returning(method)));
     }
 
     /// The capture of a runner method. Its completion carries the graph.
@@ -404,8 +421,17 @@ impl Operation<'_> {
 impl Call<'_> {
     fn perform(self, completion: &mut Completion) -> Result<()> {
         match self {
-            // No converted forward reads what its method returns.
             Self::Method(method) => drop(method.invoke()?),
+            Self::Returning(method) => {
+                let name = method.name().to_owned();
+                let value = method.invoke()?;
+                let integers = match i64::try_from(value.clone()) {
+                    Ok(integer) => vec![integer],
+                    Err(_) => crate::ffi::integers(value)
+                        .map_err(|error| Error::numerical(&name, &error))?,
+                };
+                completion.returned.push_back(integers);
+            }
             Self::Function(function) => function.invoke()?,
             Self::Capture(capture) => {
                 let Capture {
@@ -745,6 +771,31 @@ mod tests {
         assert_eq!(seen.load(Ordering::Relaxed), 0);
         job.perform().check().unwrap();
         assert_eq!(seen.load(Ordering::Relaxed), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn a_returning_call_hands_its_integers_to_the_completion() -> Result<()> {
+        let count = Function::new(
+            "test.count",
+            tvm_ffi::Function::from_packed(|_| Ok(tvm_ffi::Any::from(48_i64))),
+        );
+        let counts = Function::new(
+            "test.counts",
+            tvm_ffi::Function::from_packed(|_| {
+                Ok(tvm_ffi::Any::from(crate::ffi::integer_list([12, 36])))
+            }),
+        );
+        let job = Job::new();
+        job.call_returning(MethodCall::new(&count, Vec::new()));
+        job.call(MethodCall::new(&count, Vec::new()));
+        job.call_returning(MethodCall::new(&counts, Vec::new()));
+
+        // Only returning calls are kept, in recording order.
+        let mut completion = job.perform().check().unwrap();
+        assert_eq!(completion.returned()?, vec![48]);
+        assert_eq!(completion.returned()?, vec![12, 36]);
+        assert!(completion.returned().is_err());
         Ok(())
     }
 
