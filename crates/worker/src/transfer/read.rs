@@ -29,6 +29,7 @@ use super::{
 use crate::ffi::{Backing, DType, Device};
 use crate::host::HostTask;
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
+use crate::stream::Issue;
 use crate::{Error, EventPool, Outcome, Result};
 
 /// Reader acknowledgment states written into a VMM chunk header.
@@ -146,7 +147,7 @@ impl Read {
     /// The read's value without a host wait. A device result orders
     /// `stream` after the producing copy; a borrowed result also remembers
     /// `stream`, so [`close`](Self::close) can fence its access.
-    pub fn result(&self, stream: Option<&Stream>) -> Result<Spans> {
+    pub fn result(&self, stream: impl Issue) -> Result<Spans> {
         let mut state = self.lock();
         let value = match state.ticket.result()? {
             Outcome::Success(value) => Spans::clone(&value),
@@ -159,10 +160,10 @@ impl Read {
                     "a fenced transfer result is not device memory".into(),
                 ));
             };
-            let stream = stream.ok_or_else(|| {
+            let consumer = stream.stream().ok_or_else(|| {
                 Error::Invalid("a device transfer result requires a consuming stream".into())
             })?;
-            if stream.device().0 != device {
+            if consumer.device().0 != device {
                 return Err(Error::Invalid(
                     "transfer consumer stream is on another device".into(),
                 ));
@@ -831,7 +832,10 @@ mod tests {
 
         // Both the copy's activity check and the consumer's result report
         // the cancellation with its own class.
-        for observed in [read.require_active(), read.result(None).map(drop)] {
+        for observed in [
+            read.require_active(),
+            read.result(None::<&Stream>).map(drop),
+        ] {
             let Err(error) = observed else {
                 return Err(Error::State("a cancelled read stayed usable"));
             };

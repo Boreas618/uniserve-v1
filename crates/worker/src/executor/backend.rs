@@ -266,15 +266,6 @@ impl WorkerBatch {
         self.stage = stage;
     }
 
-    /// Keep how a forward that issued itself ended, for its submitter.
-    pub(crate) fn set_issued(&mut self, issued: Result<()>) {
-        self.issued = Some(issued);
-    }
-
-    pub(crate) fn take_issued(&mut self) -> Option<Result<()>> {
-        self.issued.take()
-    }
-
     pub(crate) fn set_executed(&mut self, executed: std::result::Result<(), WorkerError>) {
         self.executed = Some(executed);
     }

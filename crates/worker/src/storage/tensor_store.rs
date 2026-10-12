@@ -42,7 +42,7 @@ use super::tensor::{
 use crate::ffi::{DType, Device};
 use crate::stream::{Fill, Issue};
 use crate::transfer::exports::{self, Location};
-use crate::transfer::{ReadRef, Retirement, Spans, Transports, copy_on_host, copy_planner, fetch};
+use crate::transfer::{ReadRef, Retirement, Spans, Transports, copy_planner, fetch};
 use crate::{Error, EventPool, Result};
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -980,7 +980,7 @@ impl TensorStore {
         &self,
         buffer: &ProductBuffer,
         value: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
         if let Some(metadata) = metadata {
@@ -1052,20 +1052,23 @@ impl TensorStore {
             let source = Spans::single(value.clone())?;
             match (view.device(), value.device()) {
                 (Device::Cuda(device), _) | (_, Device::Cuda(device)) => {
-                    let stream = stream.ok_or_else(|| {
-                        Error::Invalid("a device product write requires its producer stream".into())
-                    })?;
+                    if stream.stream().is_none() {
+                        return Err(Error::Invalid(
+                            "a device product write requires its producer stream".into(),
+                        ));
+                    }
                     let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
                     destination.plan_copy(&source, &mut plan)?;
                     // SAFETY: the destination is reserved for this product and
                     // the producer keeps its value until its stream passes.
-                    unsafe { plan.submit(stream) }?;
+                    unsafe { stream.copy_strided(&plan) }?;
                 }
                 _ => {
                     let mut plan = copy_planner(None, SourceOrder::Stream)?;
                     destination.plan_copy(&source, &mut plan)?;
-                    // SAFETY: host operands; the destination has no reader yet.
-                    unsafe { copy_on_host(&plan) };
+                    // SAFETY: host operands, copied in the issuer's order; the
+                    // destination has no reader yet.
+                    unsafe { stream.host().copy_strided(&plan) }?;
                 }
             }
         }
@@ -1614,12 +1617,12 @@ impl TensorStore {
 
     /// Order `stream` after an import's reads (which must be ready) and its
     /// buffer's producer, propagating read failures.
-    pub fn wait_import(&self, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    pub fn wait_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
         let state = lock(&self.state);
         Self::wait_imported(&state, read, stream)
     }
 
-    fn wait_imported(state: &State, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    fn wait_imported(state: &State, read: &ProductRead, stream: impl Issue) -> Result<()> {
         let imported = Self::imported(read)?;
         let imported = lock(&imported);
         state.require_buffer(&imported.buffer)?;
@@ -1633,7 +1636,7 @@ impl TensorStore {
     /// Publish an import's materialized value on `stream`: a new product is
     /// produced and committed; a widened shard gets one fence over the
     /// union of its regions and becomes the whole logical tensor.
-    pub fn complete_import(&self, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    pub fn complete_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
         self.events.reap()?;
         let mut state = lock(&self.state);
         Self::wait_imported(&state, read, stream)?;
