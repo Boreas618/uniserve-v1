@@ -133,6 +133,9 @@ enum Call {
     Returning(MethodCall),
     /// A runner method whose returned object the completion carries.
     Handle(MethodCall),
+    /// A runner method whose returned list the completion carries, value
+    /// by value.
+    Values(MethodCall),
     /// A function whose returned strings the completion carries.
     Texts(MethodCall),
     /// A library function over values that are no tensors.
@@ -212,6 +215,8 @@ pub struct Completion {
     returned: VecDeque<Vec<i64>>,
     /// The object each handle call returned.
     handles: VecDeque<Handle>,
+    /// The values of the list each value call returned.
+    values: VecDeque<Vec<Value>>,
     /// The strings each text call returned.
     texts: VecDeque<Vec<String>>,
     /// Where the job stopped, when it did not run to its end.
@@ -261,6 +266,12 @@ impl Completion {
         self.handles.pop_front().ok_or(MISSING)
     }
 
+    /// The values of the list the next value call returned
+    /// ([`Job::call_values`]), in the list's order.
+    pub(crate) fn values(&mut self) -> Result<Vec<Value>> {
+        self.values.pop_front().ok_or(MISSING)
+    }
+
     /// The strings the next text call returned ([`Job::call_texts`]): one
     /// for a call that returns a string, a list's strings in its order.
     pub(crate) fn texts(&mut self) -> Result<Vec<String>> {
@@ -269,6 +280,47 @@ impl Completion {
 }
 
 const MISSING: Error = Error::State("a job's completion lacks a result its builder recorded");
+
+/// One value of the list a value call returned ([`Job::call_values`]).
+///
+/// The list is converted on the thread that made the call, so its reader
+/// holds plain numbers and, for each object, the handle alone.
+pub(crate) enum Value {
+    /// A shape or a list of integers.
+    Integers(Vec<i64>),
+    /// A list of numbers that are not all integers.
+    Floats(Vec<f64>),
+    /// An object the library holds.
+    Object(Handle),
+}
+
+impl Value {
+    /// Convert one value of the list `name` returned.
+    fn new(value: tvm_ffi::Any, name: &str) -> Result<Self> {
+        let numerical = |error: tvm_ffi::Error| Error::numerical(name, &error);
+        if value.type_index() == tvm_ffi::TypeIndex::kTVMFFIShape as i32 {
+            return crate::ffi::integers(value)
+                .map(Self::Integers)
+                .map_err(numerical);
+        }
+        let Ok(numbers) = tvm_ffi::Array::<tvm_ffi::Any>::try_from(value.clone()) else {
+            return Ok(Self::Object(Handle::new(value)?));
+        };
+
+        let integer = tvm_ffi::TypeIndex::kTVMFFIInt as i32;
+        if numbers.iter().all(|number| number.type_index() == integer) {
+            return crate::ffi::integers(value)
+                .map(Self::Integers)
+                .map_err(numerical);
+        }
+        numbers
+            .iter()
+            .map(f64::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(Self::Floats)
+            .map_err(numerical)
+    }
+}
 
 impl Default for Job {
     fn default() -> Self {
@@ -331,6 +383,13 @@ impl Job {
     /// ([`Completion::handle`]).
     pub(crate) fn call_handle(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Handle(method)));
+    }
+
+    /// An eager call of a runner method that returns a list of objects
+    /// the library holds and lists of numbers (a plan and its schedule),
+    /// which the job's completion carries ([`Completion::values`]).
+    pub(crate) fn call_values(&self, method: MethodCall) {
+        self.push(Operation::Call(Call::Values(method)));
     }
 
     /// An eager call of a function that returns a string or a list of
@@ -529,6 +588,16 @@ impl Call {
             Self::Handle(method) => {
                 let object = Handle::new(method.invoke()?)?;
                 completion.handles.push_back(object);
+            }
+            Self::Values(method) => {
+                let name = method.name().to_owned();
+                let list: tvm_ffi::Array<tvm_ffi::Any> = tvm_ffi::Array::try_from(method.invoke()?)
+                    .map_err(|error| Error::numerical(&name, &error))?;
+                let values = list
+                    .iter()
+                    .map(|value| Value::new(value, &name))
+                    .collect::<Result<Vec<_>>>()?;
+                completion.values.push_back(values);
             }
             Self::Texts(function) => {
                 let name = function.name().to_owned();
@@ -1147,6 +1216,35 @@ mod tests {
         assert!(completion.returned().is_err());
         assert!(completion.handle().is_ok());
         assert!(completion.handle().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_call_hands_its_list_to_the_completion_value_by_value() -> Result<()> {
+        let plan = Function::new(
+            "test.plan",
+            tvm_ffi::Function::from_packed(|_| {
+                Ok(tvm_ffi::Any::from(crate::ffi::list([
+                    tvm_ffi::Any::from(tvm_ffi::String::from("schedule")),
+                    tvm_ffi::Any::from(crate::ffi::list([
+                        tvm_ffi::Any::from(1.0_f64),
+                        tvm_ffi::Any::from(0.5_f64),
+                    ])),
+                    tvm_ffi::Any::from(crate::ffi::integer_list([3, 1])),
+                ])))
+            }),
+        );
+        let job = Job::new();
+        job.call_values(MethodCall::new(&plan, Vec::new()));
+
+        let mut completion = job.perform().check().unwrap();
+        let values = completion.values()?;
+        assert!(matches!(
+            &values[..],
+            [Value::Object(_), Value::Floats(times), Value::Integers(masks)]
+                if times == &[1.0, 0.5] && masks == &[3, 1]
+        ));
+        assert!(completion.values().is_err());
         Ok(())
     }
 
