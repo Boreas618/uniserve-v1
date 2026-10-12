@@ -196,6 +196,8 @@ pub struct WorkerBatch {
     executed: Option<std::result::Result<(), WorkerError>>,
     /// A token batch between its jobs.
     tokens: Option<crate::runner::causal_lm::Pending>,
+    /// A diffusion LM batch between its jobs.
+    denoising: Option<crate::runner::diffusion_lm::Pending>,
     /// A capability runtime's launched work awaiting materialization.
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
@@ -218,6 +220,7 @@ impl WorkerBatch {
             issued: None,
             executed: None,
             tokens: None,
+            denoising: None,
             running: None,
             image_inputs: None,
             inputs: forward::inputs::Inputs::default(),
@@ -290,6 +293,17 @@ impl WorkerBatch {
         &mut Option<Result<()>>,
     ) {
         (&self.plan, &mut self.tokens, &mut self.issued)
+    }
+
+    /// The batch's plan and its diffusion LM batch between jobs, borrowed
+    /// apart.
+    pub(crate) fn denoising_parts(
+        &mut self,
+    ) -> (
+        &BatchPlan,
+        &mut Option<crate::runner::diffusion_lm::Pending>,
+    ) {
+        (&self.plan, &mut self.denoising)
     }
 
     /// Set the batch's result; capability runtimes call this once their
