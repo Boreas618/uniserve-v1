@@ -51,7 +51,8 @@ struct FailedExport {
 /// The outcome of one export attempt.
 pub(crate) enum Exported {
     Located(Box<Locator>),
-    /// The export's bytes are staged for its location (the rank channel).
+    /// The export's location is complete once the work it issued was
+    /// performed ([`Transport::locate`]).
     Staged(Box<Staged>),
     /// The payload does not fit the device's export pool; another mechanism
     /// that reaches the consumers may carry it.
@@ -138,7 +139,7 @@ impl CudaExports {
         let export_id = uuid::Uuid::new_v4().simple().to_string();
         let mut state = ExportState::default();
 
-        let result = (|| -> Result<Option<Locator>> {
+        let result = (|| -> Result<Option<Staged>> {
             let first = source.first().address();
             let (spans, handle, size, offset) = match Memory::exportable_containing(first) {
                 Some((memory, offset)) => {
@@ -214,11 +215,9 @@ impl CudaExports {
             }
 
             let layout = layout(&spans, offset)?;
-            let ready_event_handle = if self.cross_host {
-                Vec::new()
-            } else {
-                ready.ipc_handle()?.0.to_vec()
-            };
+            // A same-host reader waits on the readiness event through its
+            // interprocess handle, which exists once the record was made:
+            // the location receives it where the export is located.
             let locator = locate(TransferTransport::CudaVmm {
                 endpoint: self.endpoint.name().to_owned(),
                 export_id: export_id.clone(),
@@ -227,7 +226,7 @@ impl CudaExports {
                 span_lengths: layout.lengths,
                 span_counts: layout.counts,
                 tensor_stride: spans.first().strides().to_vec(),
-                ready_event_handle,
+                ready_event_handle: Vec::new(),
                 allocation_handle: handle,
                 acknowledgment_offset: state
                     .allocation
@@ -239,7 +238,7 @@ impl CudaExports {
             let buffer = Arc::new(TransportBuffer::cuda(
                 CudaSource {
                     source: spans,
-                    event: ready,
+                    event: Arc::clone(&ready),
                     copied: state.copied.take(),
                     pool: state.allocation.clone(),
                     consumers: if pooled {
@@ -254,13 +253,17 @@ impl CudaExports {
                 nbytes,
                 Arc::clone(capacity),
             ));
-            state.buffer = Some(Arc::clone(&buffer));
-            self.endpoint.register(locator.clone(), buffer)?;
-            Ok(Some(locator))
+            Ok(Some(Staged::Fenced {
+                locator,
+                // Cross-host readers do not wait on the event: the export
+                // waited for its bytes before its handle leaves.
+                ready: (!self.cross_host).then_some(ready),
+                buffer,
+            }))
         })();
 
         match result {
-            Ok(Some(locator)) => Ok(Exported::Located(Box::new(locator))),
+            Ok(Some(staged)) => Ok(Exported::Staged(Box::new(staged))),
             Ok(None) => Ok(Exported::PoolExhausted),
             Err(error) => {
                 self.abandon(state, stream, events, &export_id, capacity, nbytes)?;
@@ -269,10 +272,11 @@ impl CudaExports {
         }
     }
 
-    /// Undo a failed export. A registered or constructed backing retires
-    /// through the event pool; earlier failures drain the producer stream
-    /// before returning the chunk, grant and bytes. A failed drain retains
-    /// everything and fails every later export.
+    /// Undo an export that failed before its backing was constructed: drain
+    /// the producer stream, then return the chunk, grant and bytes. A failed
+    /// drain retains everything and fails every later export. A constructed
+    /// backing is given up by its transport and retires through the event
+    /// pool ([`Transport::discard`]).
     fn abandon(
         &self,
         mut state: ExportState,
@@ -282,11 +286,11 @@ impl CudaExports {
         capacity: &Capacity,
         nbytes: u64,
     ) -> Result<()> {
-        if let Some(buffer) = state.buffer.take() {
-            return TransportBuffer::reclaim(buffer, events, None);
-        }
-
         let cleanup = (|| -> Result<()> {
+            // FIXME: an export recorded into a job issued nothing yet, and
+            // its failed attempt keeps only its event operations, so this
+            // drain waits for nothing of it; it is still a driver call of
+            // the thread that records.
             if state.submitted || state.event.is_some() {
                 stream.synchronize()?;
             }
@@ -431,7 +435,6 @@ struct ExportState {
     allocation: Option<(SharedPool, Arc<super::vmm_pool::PoolChunk>)>,
     descriptor: Option<OwnedFd>,
     grants: Option<Arc<DescriptorGrants>>,
-    buffer: Option<Arc<TransportBuffer>>,
     submitted: bool,
 }
 

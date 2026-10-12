@@ -131,7 +131,7 @@ impl KvExport {
         }
 
         if let Err(error) = result {
-            unlocated.iter().for_each(Exports::revoke);
+            unlocated.into_iter().for_each(Exports::revoke);
             if let Err(cleanup) = exports::release(&locations) {
                 tracing::warn!(target: "uniserve_worker.transfer", "failed to revoke a failed KV export: {cleanup}");
             }
@@ -146,7 +146,7 @@ impl KvExport {
     /// the copies into an export's storage ran before it is given back.
     pub fn revoke(self, manager: &mut KVCacheManager<Arc<Retirement>>) {
         self.exports
-            .iter()
+            .into_iter()
             .flatten()
             .flatten()
             .for_each(Exports::revoke);
