@@ -149,7 +149,7 @@ def _payload(height: int, width: int, seed: int) -> str:
 
 
 def _load(root):
-    description, _ = read_config(stub=False, path=str(root), device="cuda:0")
+    description = read_config(stub=False, path=str(root), device="cuda:0")
     return load_model(description, modules=["vision_encoder"], device="cuda:0")
 
 

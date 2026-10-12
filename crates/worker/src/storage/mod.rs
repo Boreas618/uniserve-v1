@@ -15,7 +15,6 @@ mod output;
 mod request_slots;
 pub mod tensor;
 mod tensor_store;
-mod workspace;
 
 pub use block_tables::{
     AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
@@ -26,7 +25,7 @@ pub use host_buffers::HostBuffers;
 pub use kv::{KVCache, PendingImport, ScratchUnits};
 pub use kv_cache::KVCacheManager;
 pub use kv_plan::{GroupAxis, KVGroupPlan, KVPlan};
-pub use kv_planes::{FIELDS, KVPlanes, UnitColumn, UnitSnapshot, tensor_map};
+pub use kv_planes::{FIELDS, KVPlanes, UnitColumn, UnitSnapshot};
 pub(crate) use latent::image::{ImageLatents, Scratch};
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 pub use latent_storage::LatentStorage;
@@ -35,4 +34,3 @@ pub use request_slots::{RequestSlots, SlotField};
 pub use tensor_store::{
     Metadata, OutputPlacement, ProductBuffer, ProductRead, Scalar, TensorStore, ValueRange,
 };
-pub use workspace::{WorkspaceRequest, Workspaces};

@@ -17,6 +17,7 @@ import pytest
 import torch
 from torch import nn
 
+from uniserve_models import interface
 from uniserve_models.cache.units import UnitPool
 from uniserve_models.interface import cache
 from uniserve_models.model import CausalLM, TransformerDecoder
@@ -26,6 +27,8 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 TOKENS = 24
 WINDOW = 8
+# Units of each pool, sentinel included.
+NUM_UNITS = 48
 
 
 def _harness():
@@ -75,27 +78,27 @@ def _model() -> CausalLM:
 def _units(plan, first: int) -> list[list[int]]:
     """Distinct units for one slot holding ``TOKENS`` tokens per group."""
     groups = []
-    for group in plan["groups"]:
-        pages = -(-TOKENS // int(group["page_tokens"]))
-        count = pages * int(group["units_per_page"])
+    for group in plan.planes.groups:
+        pages = -(-TOKENS // group.page_tokens)
+        count = pages * group.units_per_page
         groups.append(list(range(first, first + count)))
         first += count
     return groups
 
 
-def _pool(views, layout) -> UnitPool:
+def _pool(views, plan) -> UnitPool:
     tensors = {
         str(name): torch.from_dlpack(value) for name, value in views.items()
     }
-    return UnitPool.from_plan(layout, tensors)
+    return UnitPool(plan.planes, tensors, plan.configs, num_units=NUM_UNITS)
 
 
 def _blocks(pool: UnitPool, plan, units: list[list[int]], name: str):
     """The block ids one layer reads: its unit position in every page."""
     first = 0
-    for index, group in enumerate(plan["groups"]):
-        rows = int(group["units_per_page"])
-        if name in [str(layer) for layer in group["layers"]]:
+    for index, group in enumerate(plan.planes.groups):
+        rows = group.units_per_page
+        if name in group.layers:
             row = pool.table(name) - first
             return tuple(units[index][row::rows]), group
         first += rows
@@ -103,17 +106,15 @@ def _blocks(pool: UnitPool, plan, units: list[list[int]], name: str):
 
 
 def _history(group) -> int:
-    window = int(group["window"])
-    return 0 if window < 0 else max(0, TOKENS - window)
+    return 0 if group.window is None else max(0, TOKENS - group.window)
 
 
 def _fill(plan, units):
-    def fill(views, layout):
-        pool = _pool(views, layout)
+    def fill(views):
+        pool = _pool(views, plan)
         device = pool.planes_of(0, "key").device
-        for group in plan["groups"]:
-            for name in group["layers"]:
-                name = str(name)
+        for group in plan.planes.groups:
+            for name in group.layers:
                 state = pool.state(name)
                 blocks, _ = _blocks(pool, plan, units, name)
                 heads = state.key.shape[2]
@@ -139,25 +140,23 @@ def _transfer(transport, source_kv, destination_kv, block_sizes, devices):
     destination_plan = cache.cache_plan(model, block_sizes[1], destination_kv)
     source_units = _units(source_plan, 1)
     destination_units = _units(destination_plan, 3)
-    functions = cache.functions()
     result = _harness()["kv_transfer"](
         {
+            "interface": interface.table(),
             "source_plan": source_plan,
             "destination_plan": destination_plan,
-            "num_units": 48,
+            "num_units": NUM_UNITS,
             "tokens": TOKENS,
             "source_device": devices[0],
             "destination_device": devices[1],
             "transport": transport,
-            "bind_units": functions["cache.bind_units"],
-            "bind_conversion": functions["cache.bind_conversion"],
             "fill": _fill(source_plan, source_units),
             "source_units": source_units,
             "destination_units": destination_units,
         }
     )
-    source = _pool(result["source"], result["source_layout"])
-    destination = _pool(result["destination"], result["destination_layout"])
+    source = _pool(result["source"], source_plan)
+    destination = _pool(result["destination"], destination_plan)
     assert int(result["exported_extent"]) == TOKENS
     return (
         (source, source_plan, source_units),
@@ -203,21 +202,20 @@ def test_direct_imports_copy_pages_and_mark_them_initialized(
     plan = destination[1]
     assert views["key.values"].dtype == torch.uint8
     assert views["key.values"].shape == (
-        int(plan["columns"]),
-        48,
-        int(plan["plane_bytes"]),
+        plan.columns(),
+        NUM_UNITS,
+        plan.plane_bytes(),
     )
     assert views["key.initialized"].dtype == torch.bool
     assert views["unit_tables"].dtype == torch.int32
     assert int(views["verified_lengths"][1]) == TOKENS
 
     # Same layouts copy encoded pages and scales unchanged.
-    for group in source[1]["groups"]:
-        for name in group["layers"]:
-            expected = _decoded(*source, str(name))
-            actual = _decoded(*destination, str(name))
-            assert torch.equal(expected[0], actual[0]), name
-            assert torch.equal(expected[1], actual[1]), name
+    for name in source[1].layers():
+        expected = _decoded(*source, name)
+        actual = _decoded(*destination, name)
+        assert torch.equal(expected[0], actual[0]), name
+        assert torch.equal(expected[1], actual[1]), name
 
 
 @pytest.mark.parametrize(
@@ -246,19 +244,17 @@ def test_converted_imports_match_writes_of_the_decoded_source(
             fields[name] = torch.zeros_like(tensor)
             if name.endswith(".scale"):
                 fields[name].fill_(1)
-    reference = UnitPool.from_plan({**plan, "num_units": 48}, fields)
+    reference = UnitPool(plan.planes, fields, plan.configs, num_units=NUM_UNITS)
     device = fields["key.values"].device
-    for group in plan["groups"]:
-        for name in group["layers"]:
-            name = str(name)
-            blocks, value_group = _blocks(reference, plan, units, name)
-            key, value = _decoded(*source, name)
-            reference.state(name).write(
-                blocks,
-                start=_history(value_group),
-                key=key.to(device=device, dtype=torch.bfloat16),
-                value=value.to(device=device, dtype=torch.bfloat16),
-            )
+    for name in plan.layers():
+        blocks, value_group = _blocks(reference, plan, units, name)
+        key, value = _decoded(*source, name)
+        reference.state(name).write(
+            blocks,
+            start=_history(value_group),
+            key=key.to(device=device, dtype=torch.bfloat16),
+            value=value.to(device=device, dtype=torch.bfloat16),
+        )
     torch.cuda.synchronize(device)
 
     imported = [unit for group in units for unit in group]

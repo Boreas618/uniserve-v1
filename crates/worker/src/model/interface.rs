@@ -15,12 +15,6 @@ use crate::{Error, Result};
 
 /// Startup and lifecycle entries of the interface table.
 pub struct Interface {
-    /// Model-derived quantities for capacity, reporting and warmup.
-    pub facts: Function,
-    /// Declare a component call set's workspace requirements.
-    pub prepare: Function,
-    /// Bind Rust-allocated workspaces to a prepared component.
-    pub bind: Function,
     /// Join the torch process world for numerical collectives.
     pub initialize: Function,
     /// Create torch groups on the Rust plan.
@@ -58,9 +52,6 @@ impl Interface {
             })
         };
         Ok(Self {
-            facts: require("model.facts")?,
-            prepare: require("component.prepare")?,
-            bind: require("component.bind")?,
             initialize: require("distributed.initialize")?,
             create_groups: require("distributed.create_groups")?,
             mesh: require("distributed.mesh")?,

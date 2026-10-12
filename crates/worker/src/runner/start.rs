@@ -269,18 +269,7 @@ impl ImageOwners {
                     width,
                     graph_widths: bounds.widths.iter().map(|&width| width as usize).collect(),
                 };
-                let views = kv
-                    .views()?
-                    .into_iter()
-                    .try_fold(crate::ffi::Fields::new(), |fields, (name, view)| {
-                        Ok::<_, Error>(fields.with(&name, view.to_tensor()?))
-                    })?
-                    .into_any();
-                let pool = Handle::new(
-                    interface
-                        .function("cache.pool")?
-                        .call_values(&[tvm_ffi::Any::from(kv.layout()?), views])?,
-                )?;
+                let pool = kv.pool(interface)?;
                 (Some(bounds), Some(capacity), Some(pool))
             }
             (true, None, _) => {
@@ -416,10 +405,7 @@ impl ImageOwners {
                         },
                     )?;
                     order.push((ImageRunner::Denoiser, setup.owner()));
-                    units = Some(kv.bind_units(
-                        &interface.function("cache.bind_units")?,
-                        target.stream.as_ref(),
-                    )?);
+                    units = Some(kv.bind_units(interface, target.stream.as_ref())?);
                     diffusion = Some((target.component.clone(), runner));
                 }
                 CallKind::Media(MediaCall::ImageDecoding) => {
