@@ -34,7 +34,7 @@ use super::{CausalLMRunners, StepParts};
 use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
-use crate::lane::{Job, JobQueues};
+use crate::lane::{BLOCK_ON_TIMEOUT, Job, JobQueues};
 use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
@@ -236,7 +236,7 @@ impl CausalLMRunners {
                        rows: &[TokenRow],
                        decode: bool,
                        capacity: Option<usize>,
-                       job: Job<'static>| {
+                       job: Job| {
                 runtime.warmup_step(
                     experts,
                     lanes,
@@ -332,10 +332,10 @@ impl CausalLMRunners {
         kv: &mut KVCache,
         lengths: &[usize],
         stream: Option<&uniserve_cuda::Stream>,
-        steps: impl FnOnce(&mut Self, &mut KVCache, &Job<'static>) -> Result<()>,
+        steps: impl FnOnce(&mut Self, &mut KVCache, &Job) -> Result<()>,
     ) -> Result<()> {
-        let perform = |job: Job<'static>| -> Result<()> {
-            let (_, completion) = lanes.submit(kind, job)?;
+        let perform = |job: Job| -> Result<()> {
+            let completion = lanes.block_on(kind, job, BLOCK_ON_TIMEOUT)?;
             completion
                 .check()
                 .map(drop)
@@ -370,7 +370,7 @@ impl CausalLMRunners {
         rows: &[TokenRow],
         decode: bool,
         capacity: Option<usize>,
-        job: Job<'static>,
+        job: Job,
     ) -> Result<()> {
         let (tables, cache) = kv.split();
         let prompt = PromptChunks::default();
@@ -398,7 +398,7 @@ impl CausalLMRunners {
             capacity,
             &job,
         )?;
-        let (_, completion) = lanes.submit(self.kind(group)?, job)?;
+        let completion = lanes.block_on(self.kind(group)?, job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.complete(step, &mut completion).map(drop)
     }
@@ -414,7 +414,7 @@ impl CausalLMRunners {
     ) -> Result<()> {
         let job = Job::new();
         let captured = self.runners[index].commit(rows, &job)?;
-        let (_, completion) = lanes.submit(self.kind(group)?, job)?;
+        let completion = lanes.block_on(self.kind(group)?, job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         match captured {
             Some(key) => self.runners[index].complete_commit(key, &mut completion),

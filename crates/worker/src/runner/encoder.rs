@@ -75,7 +75,7 @@ use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
 use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::batch::image::{ImageBatch, allocations, boundary};
+use crate::executor::forward::batch::image::{ImageBatch, Progress, Resume, allocations};
 use crate::executor::forward::batch::{
     Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
 };
@@ -91,7 +91,7 @@ use crate::runner::methods::{
 };
 use crate::runner::{ImageSetup, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{Metadata, OutputPlacement, ValueRange};
+use crate::storage::{Metadata, OutputPlacement, ProductBuffer, ValueRange};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -914,7 +914,7 @@ impl EncoderRunner {
         image: &StorageView,
         tower: Tower,
         signed_unit: bool,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         if matches!(self.info, EncoderInfo::Text(_)) {
             return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
@@ -934,7 +934,7 @@ impl EncoderRunner {
     /// Record the call that reports the facts of a prepared `image` into
     /// `job`; the job's completion carries them ([`Completion::returned`])
     /// and [`Self::prepared`] reads them.
-    pub(crate) fn image_facts(&self, image: &Handle, job: &Job<'_>) {
+    pub(crate) fn image_facts(&self, image: &Handle, job: &Job) {
         job.call_returning(MethodCall::new(
             &self.methods.image_facts,
             vec![Argument::Handle(image.clone())],
@@ -974,7 +974,7 @@ impl EncoderRunner {
         &mut self,
         images: &[&PreparedImage],
         out: &[StorageView],
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Recorded> {
         if images.len() != out.len() {
             return Err(Error::Invariant(
@@ -1063,7 +1063,7 @@ impl EncoderRunner {
         images: &[&PreparedImage],
         out: &[StorageView],
         result: &mut Encoded,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let (EncoderInfo::Vision(vision), Some(packed)) = (&self.info, &self.packed) else {
             return Err(Error::Invariant("encoder packs no images".into()));
@@ -1165,7 +1165,7 @@ impl EncoderRunner {
         rows: &StorageView,
         grids: &[[u32; 3]],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         if !matches!(self.info, EncoderInfo::Vision(_)) {
             return Err(Error::Invalid(format!(
@@ -1217,7 +1217,7 @@ impl EncoderRunner {
         tokens: &[i64],
         out: &StorageView,
         vision: Option<PromptVision<'_>>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         let (encode, position_ids) = (&self.methods.encode, &self.methods.position_ids);
         let (Some(text), Some(stream)) = (&self.text, &self.stream) else {
@@ -1523,7 +1523,7 @@ impl Conditions {
         pixels: &StorageView,
         units: &[[i64; 5]],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         // The call's input shapes: each unit's frames at its raster.
         let mut shapes = Vec::with_capacity(units.len() * 4);
@@ -1567,7 +1567,7 @@ impl Conditions {
         samples: &StorageView,
         lengths: &[u64],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let shapes: Vec<i64> = lengths
             .iter()
@@ -1754,7 +1754,7 @@ impl EncoderRunner {
         pixels: &StorageView,
         units: &[[i64; 5]],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         self.condition_encoders()?
             .encode_video(pixels, units, out, job)
@@ -1767,7 +1767,7 @@ impl EncoderRunner {
         samples: &StorageView,
         lengths: &[u64],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         self.condition_encoders()?
             .encode_audio(samples, lengths, out, job)
@@ -1819,7 +1819,7 @@ pub(crate) fn encode_text(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.outputs.len() != 1 || call.inputs.len() > 1 {
@@ -1895,7 +1895,7 @@ pub(crate) fn encode_vision(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
@@ -1959,7 +1959,7 @@ pub(crate) fn encode_conditions(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
@@ -2149,42 +2149,150 @@ pub(crate) fn image_placement(
     Ok((runner.device().cuda_index(), stream, 0))
 }
 
+/// An image encoding between two of its jobs.
+pub(crate) enum EncodeResume {
+    /// The job on the lane prepares the resident images: its completion
+    /// carries the prepared images.
+    Handles {
+        call: MediaCall,
+        /// Each active call's image; none yet for a resident one.
+        images: Vec<Option<PreparedImage>>,
+        /// The positions of the resident images in `images`.
+        resident: Vec<usize>,
+    },
+    /// The job on the lane reads the prepared resident images' facts.
+    Facts {
+        call: MediaCall,
+        images: Vec<Option<PreparedImage>>,
+        resident: Vec<usize>,
+        handles: Vec<Handle>,
+    },
+    /// The job on the lane holds an unpacked encoder's calls: its
+    /// completion carries the shapes they wrote.
+    Shapes {
+        images: Vec<PreparedImage>,
+        writes: Vec<ProductBuffer>,
+        recorded: Recorded,
+    },
+}
+
 impl ImageBatch<'_> {
-    /// Encode every active call's image into its feature product.
-    /// `prepared` holds the host-prepared inline images by call index.
+    /// Record the encoding of every active call's image into its feature
+    /// product, up to its first job boundary. `prepared` holds the
+    /// host-prepared inline images by call index.
+    ///
+    /// The encoding's jobs: the preparation of the resident images and then
+    /// the read of their facts, when the batch has any; the encode calls;
+    /// and, after an unpacked encoder's calls returned the shapes they
+    /// wrote, the features' fences and exports.
     pub(crate) fn encode(
         &mut self,
         call: MediaCall,
         prepared: HashMap<usize, PreparedImage>,
-    ) -> Result<ForwardStats> {
+    ) -> Result<Progress> {
         // The forward records into the batch's job, taken for its length so
         // that the batch's owners stay borrowable beside it.
-        let mut job = std::mem::take(&mut self.job);
-        let stats = self.record_encode(&mut job, call, prepared);
+        let job = std::mem::take(&mut self.job);
+        let progress = self.prepare_images(&job, call, prepared);
         self.job = job;
-        stats
+        progress
     }
 
-    /// Record the encoding. Its jobs: the preparation of the resident
-    /// images and then the read of their facts, when the batch has any;
-    /// the encode calls; and, after an unpacked encoder's calls returned
-    /// the shapes they wrote, the features' fences and exports.
-    fn record_encode(
+    /// Continue the encoding from the `completion` of the job its last
+    /// boundary ended.
+    pub(crate) fn resume_encode(
         &mut self,
-        job: &mut Job<'static>,
+        resume: EncodeResume,
+        completion: &mut Completion,
+    ) -> Result<Progress> {
+        let job = std::mem::take(&mut self.job);
+        let progress = self.continue_encode(&job, resume, completion);
+        self.job = job;
+        progress
+    }
+
+    fn continue_encode(
+        &mut self,
+        job: &Job,
+        resume: EncodeResume,
+        completion: &mut Completion,
+    ) -> Result<Progress> {
+        match resume {
+            EncodeResume::Handles {
+                call,
+                images,
+                resident,
+            } => {
+                // The prepared images came back; their facts are calls of
+                // the next job.
+                let route = self.encoder_route(call)?;
+                let runner = &self.parts.encoders.image[route];
+                let handles = resident
+                    .iter()
+                    .map(|_| completion.handle())
+                    .collect::<Result<Vec<_>>>()?;
+                for handle in &handles {
+                    runner.image_facts(handle, job);
+                }
+                Ok(Progress::Boundary(Resume::Encode(EncodeResume::Facts {
+                    call,
+                    images,
+                    resident,
+                    handles,
+                })))
+            }
+            EncodeResume::Facts {
+                call,
+                mut images,
+                resident,
+                handles,
+            } => {
+                let route = self.encoder_route(call)?;
+                let runner = &self.parts.encoders.image[route];
+                for (&position, handle) in resident.iter().zip(handles) {
+                    images[position] = Some(runner.prepared(handle, &completion.returned()?)?);
+                }
+                self.encode_images(job, call, images)
+            }
+            EncodeResume::Shapes {
+                images,
+                writes,
+                recorded,
+            } => {
+                let encoded = recorded.finish(completion)?;
+                self.publish_features(job, &images, &writes, &encoded)
+                    .map(Progress::done)
+            }
+        }
+    }
+
+    /// The image encoder serving the batch's calls of `call`.
+    fn encoder_route(&self, call: MediaCall) -> Result<usize> {
+        let first = self
+            .active()
+            .first()
+            .copied()
+            .ok_or_else(|| Error::Invariant("an encoding batch lost its calls".into()))?;
+        self.parts
+            .encoders
+            .route(&self.plan.calls[first].component, CallKind::Media(call))
+    }
+
+    /// Lease the resident images and record their preparation, then go on
+    /// to the encode when every image is prepared already.
+    fn prepare_images(
+        &mut self,
+        job: &Job,
         call: MediaCall,
         mut prepared: HashMap<usize, PreparedImage>,
-    ) -> Result<ForwardStats> {
+    ) -> Result<Progress> {
         let tower = tower(call)?;
         let plan = self.plan;
         let active = self.active();
-        let Some(&first) = active.first() else {
-            return Ok(ForwardStats::default());
-        };
-        let route = self
-            .parts
-            .encoders
-            .route(&plan.calls[first].component, CallKind::Media(call))?;
+        if active.is_empty() {
+            return Ok(Progress::done(ForwardStats::default()));
+        }
+        let route = self.encoder_route(call)?;
         let target = self.target();
         let stream = self.stream.clone();
 
@@ -2238,23 +2346,31 @@ impl ImageBatch<'_> {
                 }
             }
         }
-        if !resident.is_empty() {
-            // The prepared images come back with the job that prepared
-            // them; their facts with the job that reads them.
-            let runner = &self.parts.encoders.image[route];
-            let mut completion = boundary(job)?;
-            let handles = resident
-                .iter()
-                .map(|_| completion.handle())
-                .collect::<Result<Vec<_>>>()?;
-            for handle in &handles {
-                runner.image_facts(handle, job);
-            }
-            let mut completion = boundary(job)?;
-            for (&position, handle) in resident.iter().zip(handles) {
-                images[position] = Some(runner.prepared(handle, &completion.returned()?)?);
-            }
+        if resident.is_empty() {
+            return self.encode_images(job, call, images);
         }
+
+        // The prepared images come back with the job that prepared them.
+        Ok(Progress::Boundary(Resume::Encode(EncodeResume::Handles {
+            call,
+            images,
+            resident,
+        })))
+    }
+
+    /// Reserve the feature products and record the encode of the prepared
+    /// `images`, then the features' publication when their shapes are
+    /// known already.
+    fn encode_images(
+        &mut self,
+        job: &Job,
+        call: MediaCall,
+        images: Vec<Option<PreparedImage>>,
+    ) -> Result<Progress> {
+        let plan = self.plan;
+        let active = self.active();
+        let route = self.encoder_route(call)?;
+        let target = self.target();
         let images: Vec<PreparedImage> = images
             .into_iter()
             .map(|image| image.ok_or_else(|| Error::Invariant("an image was not prepared".into())))
@@ -2280,15 +2396,33 @@ impl ImageBatch<'_> {
 
         // An unpacked encoder's calls return the shapes they wrote, which
         // the features are fenced and exported with: the next job's work.
-        let encoded = if recorded.returns() {
-            recorded.finish(&mut boundary(job)?)?
-        } else {
-            recorded.finish(&mut Completion::default())?
-        };
+        if recorded.returns() {
+            return Ok(Progress::Boundary(Resume::Encode(EncodeResume::Shapes {
+                images,
+                writes,
+                recorded,
+            })));
+        }
+        let encoded = recorded.finish(&mut Completion::default())?;
+        self.publish_features(job, &images, &writes, &encoded)
+            .map(Progress::done)
+    }
 
+    /// Fence each feature at the shape its encode wrote and issue its
+    /// export; the batch's commit locates the exports.
+    fn publish_features(
+        &mut self,
+        job: &Job,
+        images: &[PreparedImage],
+        writes: &[ProductBuffer],
+        encoded: &Encoded,
+    ) -> Result<ForwardStats> {
+        let plan = self.plan;
+        let active = self.active();
+        let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
         for (((write, image), shape), &index) in
-            writes.iter().zip(&images).zip(&encoded.shapes).zip(&active)
+            writes.iter().zip(images).zip(&encoded.shapes).zip(&active)
         {
             let shape: Vec<u64> = shape.iter().map(|&extent| extent as u64).collect();
             self.storage.tensors.produced(

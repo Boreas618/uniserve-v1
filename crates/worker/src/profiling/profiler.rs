@@ -296,7 +296,7 @@ impl Profiler {
                 let _ = failures.send(error.into());
             }
         }))?;
-        jobs.start(kind, job).map(Some)
+        jobs.start(kind, job, true).map(Some)
     }
 
     /// Note that `phase` failed. A window that did not open is given up,

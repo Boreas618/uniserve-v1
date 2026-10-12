@@ -26,13 +26,13 @@
 //!    lease's device fences complete, decode each call's result and accept
 //!    its progress.
 //!
-//! Two results end a job before the batch's last one: the bytes of
-//! host-gated predicates, which decide the calls stage 1 reserves for
-//! (the opening job reads them), and the image denoiser's conditioning of
-//! latent images, a forward that still issues itself and so closes the job
-//! that holds the reservation, before the step. A graph captured after its
-//! eager warmup needs no job of its own: the capture is an operation of the
-//! job, whose completion carries the graph.
+//! One result ends a job before the batch's last one: the bytes of
+//! host-gated predicates, which decide the calls stage 1 reserves for (the
+//! opening job reads them). The image denoiser's conditioning of latent
+//! images is recorded into the job that holds the reservation, before the
+//! step that reads the K/V it writes. A graph captured after its eager
+//! warmup needs no job of its own: the capture is an operation of the job,
+//! whose completion carries the graph.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -67,7 +67,7 @@ pub(crate) struct StepParts<'a> {
 
 use super::batch::{Batch, Opening, Owners, TokenBatch};
 use super::commit::{Commit, Committed, Failure};
-use super::step::{Rows, condition_latents};
+use super::step::condition_latents;
 
 /// One step's forwards as a job holds them, awaiting its completion.
 pub(crate) struct Step {
@@ -85,11 +85,6 @@ pub(crate) enum Pending {
     Predicates(Opening),
     /// The predicates are known: the batch reserves its storage next.
     Opened(Opening),
-    /// The job on the lane ends with the image denoiser's conditioning of
-    /// the batch's latent images.
-    Conditioning(Box<TokenBatch>, Rows),
-    /// The latent images are conditioned: the batch steps next.
-    Conditioned(Box<TokenBatch>, Rows),
     /// The job on the lane is the batch's last.
     Committing(Box<TokenBatch>, Commit),
     /// A job of the batch failed before its commit point: the batch
@@ -209,7 +204,7 @@ impl CausalLMRunners {
         requests: &[Option<StepRequest<'_>>],
         context: &mut StepParts<'_>,
         forced: Option<usize>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Step> {
         let peers = &self.groups[group];
         if requests.len() != peers.len() {
@@ -451,7 +446,7 @@ impl CausalLMRunners {
         prefixes: &[(u32, &[u32])],
         tables: &BlockTables,
         cache: &mut KVCacheManager<Arc<Retirement>>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Step> {
         let (lane, group) = self.prefill_lane(component)?;
         let rows: Vec<TokenRow> = prefixes
@@ -606,17 +601,17 @@ impl RequestStorage for CausalLMRunners {
 
 /// The next job of a token batch on its lane, or `None` when the batch
 /// advanced without one: it failed and its calls are reported.
-pub(crate) fn forward<'a>(
-    backend: &'a mut WorkerBackend,
-    batch: &'a mut WorkerBatch,
+pub(crate) fn forward(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
     kind: CallKind,
-) -> std::result::Result<Option<Job<'a>>, WorkerError> {
+) -> std::result::Result<Option<Job>, WorkerError> {
     let experts = backend.experts().cloned();
     let state = match batch.token_parts().1.take() {
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
         state => state,
     };
-    let (plan, pending, issued) = batch.token_parts();
+    let (plan, pending, _) = batch.token_parts();
 
     let parts = backend.parts();
     let (Some(runtime), Some(storage)) = (parts.text, parts.storage) else {
@@ -634,27 +629,18 @@ pub(crate) fn forward<'a>(
     let (job, next) = match state {
         None => match Opening::open(&mut owners, parts.info, parts.rank, &job) {
             Ok(opening) if opening.reads_predicates() => (Some(job), Pending::Predicates(opening)),
-            Ok(opening) => reserve(owners, opening, job, issued),
+            Ok(opening) => reserve(owners, opening, job),
             // The fences the opening recorded are still due.
             Err(error) if job.is_empty() => (None, Pending::Failed(error.into())),
             Err(error) => (Some(job), Pending::Discarding(error.into())),
         },
-        Some(Pending::Opened(opening)) => reserve(owners, opening, job, issued),
-        Some(Pending::Conditioned(batch, rows)) => {
-            let mut batch = Batch::resume(owners, *batch, job);
-            let committing = batch
-                .step(rows)
-                .map_err(Failure::from)
-                .and_then(|stepped| batch.finish(Some(stepped)));
-            commit(batch, committing)
-        }
+        Some(Pending::Opened(opening)) => reserve(owners, opening, job),
         Some(Pending::Failing(batch, failure)) => {
             let batch = Batch::resume(owners, *batch, job);
             discard(batch, failure)
         }
         Some(
             state @ (Pending::Predicates(_)
-            | Pending::Conditioning(..)
             | Pending::Committing(..)
             | Pending::Discarding(_)
             | Pending::Failed(_)),
@@ -681,9 +667,8 @@ pub(crate) fn complete(
     completion: Completion,
 ) -> std::result::Result<(), WorkerError> {
     let experts = backend.experts().cloned();
-    let (_, pending, issued) = batch.token_parts();
+    let (_, pending, _) = batch.token_parts();
     let state = pending.take();
-    let conditioned = issued.take();
     let next = match (state, completion.check()) {
         // A predicate that could not be read fails the batch, which has
         // reserved nothing yet.
@@ -692,15 +677,6 @@ pub(crate) fn complete(
             match opening.predicates(&mut completion) {
                 Ok(()) => Pending::Opened(opening),
                 Err(error) => Pending::Failed(error.into()),
-            }
-        }
-        (Some(Pending::Conditioning(state, rows)), completed) => {
-            let conditioned =
-                conditioned.unwrap_or(Err(Error::State("the latent conditioning did not run")));
-            let completed = completed.map(drop).map_err(|failure| failure.error);
-            match completed.and(conditioned) {
-                Ok(()) => Pending::Conditioned(state, rows),
-                Err(error) => Pending::Failing(state, error.into()),
             }
         }
         (Some(Pending::Committing(state, commit)), completed) => {
@@ -766,14 +742,9 @@ pub(crate) fn complete(
 }
 
 /// Lease the opened batch's output storage, reserve for its active calls
-/// and record its step and commit, or its job up to the image denoiser's
-/// conditioning of its latent images.
-fn reserve<'a>(
-    owners: Owners<'a>,
-    opening: Opening,
-    job: Job<'a>,
-    issued: &'a mut Option<Result<()>>,
-) -> (Option<Job<'a>>, Pending) {
+/// and record the image denoiser's conditioning of its latent images, its
+/// step and its commit.
+fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, Pending) {
     let mut batch = match Batch::lease(owners, opening, job) {
         Ok(batch) => batch,
         // Nothing is reserved yet, and the job was dropped with only the
@@ -788,33 +759,25 @@ fn reserve<'a>(
         }
     });
     match rows {
-        Ok(Some(mut rows)) if !rows.conditions.is_empty() => {
-            // The image denoiser issues its own stream work: it ends this
-            // job, and the step follows in the next.
+        Ok(Some(mut rows)) => {
+            // The image denoiser writes the K/V of the batch's latent
+            // images before the step that reads them, in the same job.
             let conditions = std::mem::take(&mut rows.conditions);
-            let (job, state, owners) = batch.park();
-            let stream = state.stream.clone();
-            let Owners {
-                runtime,
-                mut image,
-                storage,
-                ..
-            } = owners;
-            job.forward(move || {
-                *issued = Some(condition_latents(
-                    runtime,
-                    &mut image,
-                    storage,
+            let conditioned = if conditions.is_empty() {
+                Ok(())
+            } else {
+                condition_latents(
+                    batch.runtime,
+                    &mut batch.image,
+                    batch.storage,
                     &conditions,
-                    stream.as_ref(),
-                ));
-            });
-            (Some(job), Pending::Conditioning(Box::new(state), rows))
-        }
-        Ok(Some(rows)) => {
-            let committing = batch
-                .step(rows)
+                    batch.stream.as_ref(),
+                    &batch.job,
+                )
+            };
+            let committing = conditioned
                 .map_err(Failure::from)
+                .and_then(|()| batch.step(rows).map_err(Failure::from))
                 .and_then(|stepped| batch.finish(Some(stepped)));
             commit(batch, committing)
         }
@@ -830,7 +793,7 @@ fn reserve<'a>(
 fn commit<'a>(
     batch: Batch<'a>,
     committing: std::result::Result<Commit, Failure>,
-) -> (Option<Job<'a>>, Pending) {
+) -> (Option<Job>, Pending) {
     match committing {
         Ok(commit) => {
             let (job, state, _) = batch.park();
@@ -842,7 +805,7 @@ fn commit<'a>(
 
 /// Retire what a failed batch reserved: the job that records its fences, or
 /// nothing where it holds no stream work.
-fn discard<'a>(mut batch: Batch<'a>, failure: Failure) -> (Option<Job<'a>>, Pending) {
+fn discard<'a>(mut batch: Batch<'a>, failure: Failure) -> (Option<Job>, Pending) {
     if failure.committed {
         return (None, Pending::Failed(failure));
     }
