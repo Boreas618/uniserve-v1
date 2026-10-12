@@ -166,7 +166,8 @@ impl RequestStorage for RankStorage {
     }
 
     fn reap(&mut self) -> Result<()> {
-        self.events.reap()?;
+        // Work deferred on other threads gets its job from this one.
+        self.events.submit_deferred()?;
         self.transports.reap()?;
         if let Some(kv) = &self.kv {
             kv.reap_imports()?;

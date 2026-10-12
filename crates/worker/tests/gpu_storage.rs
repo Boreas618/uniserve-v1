@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use uniserve_core::UnitId;
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32, reclaim};
-use uniserve_ipc::{BlockTable, Locator, TransferTransport, WorkerEndpoint};
+use uniserve_ipc::{BlockTable, CallKind, ForwardMode, Locator, TransferTransport, WorkerEndpoint};
 use uniserve_worker::ffi::{Backing, DType, Device};
+use uniserve_worker::lane::JobQueues;
 use uniserve_worker::storage::memory::{Memory, StorageView};
 use uniserve_worker::storage::{
     BlockTableStorage, BlockTables, GroupShape, LatentStorage, OutputBuffer, OutputStorage,
@@ -133,11 +134,40 @@ fn endpoint(address_space: &str) -> WorkerEndpoint {
     }
 }
 
+/// What a rank's control thread does for its event pool, done by a test: a
+/// lane of the test's own waits for the events of deferred releases, and
+/// [`Completions::advance`] hands the pool the completions that arrived.
+struct Completions {
+    events: Arc<EventPool>,
+    jobs: JobQueues,
+}
+
+impl Completions {
+    fn serve(events: &Arc<EventPool>) -> Self {
+        let jobs = JobQueues::single_lane().unwrap();
+        let lane = jobs.clone();
+        events.set_submitter(Some(Box::new(move |device, events| {
+            lane.after(CallKind::Forward(ForwardMode::Decode), device, events)
+        })));
+        Self {
+            events: Arc::clone(events),
+            jobs,
+        }
+    }
+
+    fn advance(&self) {
+        self.events.submit_deferred().unwrap();
+        while let Some((job, completion)) = self.jobs.take() {
+            self.events.complete(job, completion).unwrap();
+        }
+    }
+}
+
 fn transports(
     kinds: &[TransportKind],
     address_space: &str,
     slot: usize,
-) -> (Transports, Arc<Capacity>) {
+) -> (Transports, Arc<Capacity>, Completions) {
     let capacity = Arc::new(Capacity::new(1 << 24, 8, notify).unwrap());
     let options = TransportOptions {
         source: endpoint(address_space),
@@ -146,15 +176,17 @@ fn transports(
         cross_host_consumers: false,
         vmm_pool_bytes: 1 << 22,
     };
-    let transports =
-        Transports::new(kinds, Arc::clone(&capacity), EventPool::new(), &options).unwrap();
-    (transports, capacity)
+    let events = EventPool::new();
+    let completions = Completions::serve(&events);
+    let transports = Transports::new(kinds, Arc::clone(&capacity), events, &options).unwrap();
+    (transports, capacity, completions)
 }
 
 /// Reap `transports` until every export credit has returned.
-fn settle(transports: &Transports, capacity: &Capacity) {
+fn settle(transports: &Transports, capacity: &Capacity, completions: &Completions) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while capacity.used() != 0 && std::time::Instant::now() < deadline {
+        completions.advance();
         transports.reap().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -289,7 +321,7 @@ fn output_readback_waits_for_device_copies_and_widens_tokens() {
 fn device_exports_reach_local_shared_and_channel_readers() {
     let _driver = exclusive_driver();
     let stream = stream();
-    let (transports, capacity) = transports(
+    let (transports, capacity, completions) = transports(
         &[
             TransportKind::Local,
             TransportKind::Shm,
@@ -354,6 +386,7 @@ fn device_exports_reach_local_shared_and_channel_readers() {
     exports::release(&locations).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while capacity.used() != 0 && std::time::Instant::now() < deadline {
+        completions.advance();
         transports.reap().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -365,7 +398,7 @@ fn device_exports_reach_local_shared_and_channel_readers() {
 #[ignore = "requires a CUDA device"]
 fn cancelled_reads_keep_credits_until_their_copy_drains() {
     let _driver = exclusive_driver();
-    let (transports, capacity) = transports(&[TransportKind::Local], "space", 0);
+    let (transports, capacity, _completions) = transports(&[TransportKind::Local], "space", 0);
     let stream = stream();
     let source = counting(&[256], Memory::device(DEVICE, 1024).unwrap(), &stream);
     let locations = located(
@@ -443,7 +476,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
     let memory = Memory::device(DEVICE, elements as usize * 4).unwrap();
     let spans = Spans::single(counting(&[elements], memory, &stream)).unwrap();
 
-    let (device_only, capacity) = transports(
+    let (device_only, capacity, completions) = transports(
         &[TransportKind::Local, TransportKind::CudaVmm],
         "producer",
         0,
@@ -458,10 +491,10 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
         |_| Ok(()),
     );
     assert!(matches!(exported, Err(Error::Resource(_))));
-    settle(&device_only, &capacity);
+    settle(&device_only, &capacity, &completions);
     device_only.close().unwrap();
 
-    let (with_shared, capacity) = transports(
+    let (with_shared, capacity, completions) = transports(
         &[
             TransportKind::Local,
             TransportKind::CudaVmm,
@@ -486,7 +519,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
         .collect();
     assert_eq!(kinds, [TransportKind::Local, TransportKind::Shm]);
     exports::release(&locations).unwrap();
-    settle(&with_shared, &capacity);
+    settle(&with_shared, &capacity, &completions);
     with_shared.close().unwrap();
 }
 
@@ -497,7 +530,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
 fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
     let _driver = exclusive_driver();
     let stream = stream();
-    let (transports, capacity) = transports(
+    let (transports, capacity, completions) = transports(
         &[TransportKind::Local, TransportKind::CudaVmm],
         "producer",
         0,
@@ -542,7 +575,7 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
         assert_eq!(kinds, [TransportKind::Local, TransportKind::CudaVmm]);
 
         exports::release(&locations).unwrap();
-        settle(&transports, &capacity);
+        settle(&transports, &capacity, &completions);
     }
     transports.close().unwrap();
 }
@@ -555,7 +588,7 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
 fn vmm_exports_are_imported_by_another_process() {
     let _driver = exclusive_driver();
     let stream = stream();
-    let (transports, capacity) = transports(
+    let (transports, capacity, completions) = transports(
         &[TransportKind::Local, TransportKind::CudaVmm],
         "producer",
         0,
@@ -595,6 +628,7 @@ fn vmm_exports_are_imported_by_another_process() {
     exports::release(&locations).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while capacity.used() != 0 && std::time::Instant::now() < deadline {
+        completions.advance();
         transports.reap().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -612,7 +646,7 @@ fn vmm_export_consumer() {
         return;
     };
     let locator: Locator = serde_json::from_str(&locator).unwrap();
-    let (transports, _) = transports(&[TransportKind::CudaVmm], "consumer", 1);
+    let (transports, _, _completions) = transports(&[TransportKind::CudaVmm], "consumer", 1);
     let transport = transports.get(TransportKind::CudaVmm).unwrap();
     let stream = stream();
     let destination = Spans::single(
