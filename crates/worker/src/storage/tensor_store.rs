@@ -420,9 +420,10 @@ pub struct ProductExport {
 }
 
 impl ProductExport {
-    /// Revoke the locations of an export that is not published.
-    pub fn revoke(&self) {
-        self.exports.iter().for_each(Exports::revoke);
+    /// Revoke the locations of an export that is not published, once the
+    /// issuer it was made with performed its work.
+    pub fn revoke(self) {
+        self.exports.into_iter().for_each(Exports::revoke);
     }
 }
 
@@ -2018,7 +2019,7 @@ impl TensorStore {
             Ok(())
         })();
         if let Err(error) = result {
-            exports.iter().for_each(Exports::revoke);
+            exports.into_iter().for_each(Exports::revoke);
             return Err(error);
         }
 

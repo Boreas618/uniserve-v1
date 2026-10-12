@@ -16,11 +16,11 @@
 //! the batch with `UnsupportedSetup` and leaves the rank serving.
 //!
 //! The jobs of a text batch, of a diffusion LM batch, of a transfer batch,
-//! of a video model's device batches (`batch::forward`: its encoders, its
-//! denoiser and its decoders) and of the completion of imported inputs are
-//! operations their owners recorded. The forward of every other capability
-//! still issues its own stream work: it is one job holding that work as
-//! [`Job::forward`], until the capability is converted.
+//! of a video model's media batches (`batch::forward`: its encoders, its
+//! denoiser, its decoders and its host calls) and of the completion of
+//! imported inputs are operations their owners recorded. The forward of
+//! every other capability still issues its own stream work: it is one job
+//! holding that work as [`Job::forward`], until the capability is converted.
 
 pub(crate) mod batch;
 pub(crate) mod inputs;
@@ -212,21 +212,25 @@ pub(crate) fn complete(
 }
 
 /// Whether the forwards of `kind` on this rank are recorded into jobs
-/// ([`batch::forward`]): a video model's device calls. The others issue
-/// their own stream work.
+/// ([`batch::forward`]): a video model's media calls, on its devices and
+/// on its host lane. The others issue their own stream work.
 fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
     use MediaCall::*;
 
     matches!(
         kind,
         CallKind::Media(
-            TextEncoding
+            MediaReading
+                | TextEncoding
                 | VisionEncoding
                 | LatentEncoding
                 | LatentPreparation
                 | Denoising
                 | VideoDecoding
                 | AudioDecoding
+                | VideoEncoding
+                | AudioEncoding
+                | Muxing
         )
     ) && backend.serves_video()
 }
@@ -264,15 +268,12 @@ fn execute(
         }
         Forward(ForwardMode::TokenDenoising) => Err(unsupported(kind, "diffusion LM")),
         Transfer(_) => Err(unsupported(kind, "transfer")),
-        Media(MediaReading | VideoEncoding | AudioEncoding | Muxing) => {
-            let (plan, borrowed, state) = batch.media_parts();
-            let mut parts = backend.media_parts()?;
-            crate::runner::media::execute(&mut parts, plan, borrowed, state)
-        }
         Media(ImageDecoding) => batch::image::execute(backend, batch, kind),
-        // A video model's rank records its device calls ([`records`]); no
-        // other rank decodes video or audio.
-        Media(VideoDecoding | AudioDecoding) => Err(unsupported(kind, "video")),
+        // A video model's rank records its media calls ([`records`]); no
+        // other rank serves these kinds.
+        Media(
+            MediaReading | VideoEncoding | AudioEncoding | Muxing | VideoDecoding | AudioDecoding,
+        ) => Err(unsupported(kind, "video")),
         // Encoders and denoisers serve both image and video models; these
         // are an image model's.
         Media(VisionEncoding | TextEncoding | LatentEncoding | LatentPreparation | Denoising) => {

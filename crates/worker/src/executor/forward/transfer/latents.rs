@@ -59,8 +59,9 @@ impl PendingExport {
         self.source.buffer
     }
 
-    /// Revoke the locations of an export that is not published.
-    pub(crate) fn revoke(&self) {
+    /// Revoke the locations of an export that is not published, once the
+    /// issuer it was made with performed its work.
+    pub(crate) fn revoke(self) {
         self.exports.revoke();
     }
 }

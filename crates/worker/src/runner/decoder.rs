@@ -1106,6 +1106,10 @@ impl VideoDecoder {
     /// runner captures. Every member holding a unit of the round calls it,
     /// in the same order. The padding slot's overlap serves as the retained
     /// overlap.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub(crate) fn warm(&mut self, shape: UnitShape, rows: u64, longest: u32) -> Result<()> {
         self.latent.zero(Some(self.stream()))?;
         self.rows.zero(Some(self.stream()))?;
@@ -1335,6 +1339,10 @@ impl AudioDecoder {
 
     /// Decode `units` of a zero track whose complete latent has `rows`
     /// rows, so kernels compile before any capture.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub(crate) fn warm(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
         self.latent.zero(Some(self.stream()))?;
         MethodCall::new(&self.class.forward, self.arguments(units, rows)?).invoke()?;
