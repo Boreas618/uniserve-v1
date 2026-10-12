@@ -11,7 +11,7 @@ worker runs them over its own host group.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import MappingProxyType
@@ -30,7 +30,6 @@ def functions() -> dict[str, Callable[..., Any]]:
         "distributed.create_groups": create_groups,
         "distributed.mesh": mesh,
         "distributed.destroy": destroy,
-        "distributed.bind_collectives": bind_collectives,
     }
 
 
@@ -91,7 +90,14 @@ def _options(backend: str, device: torch.device) -> dict[str, Any]:
     return options
 
 
-def _store(store: Mapping[str, Any], rank: int, size: int, backend: str):
+def _store(
+    host: str,
+    port: int,
+    listen_fd: int | None,
+    rank: int,
+    size: int,
+    backend: str,
+):
     """Join the rendezvous store; rank 0 serves it on the handed-over fd.
 
     The worker bound the listening socket and transfers its ownership here.
@@ -99,10 +105,9 @@ def _store(store: Mapping[str, Any], rank: int, size: int, backend: str):
     timeout = (
         dist.constants.default_pg_nccl_timeout if backend == "nccl" else None
     ) or dist.constants.default_pg_timeout
-    listen_fd = store.get("listen_fd")
     return dist.TCPStore(
-        str(store["host"]),
-        int(store["port"]),
+        str(host),
+        int(port),
         size,
         is_master=rank == 0,
         timeout=timeout if isinstance(timeout, timedelta) else None,
@@ -110,34 +115,55 @@ def _store(store: Mapping[str, Any], rank: int, size: int, backend: str):
     )
 
 
-def initialize(request: Mapping[str, Any]) -> World:
+def initialize(
+    rank: int,
+    local_rank: int,
+    world_size: int,
+    device: str,
+    backend: str | None,
+    store_host: str | None,
+    store_port: int | None,
+    listen_fd: int | None,
+    union_rank: int | None,
+    union_size: int | None,
+) -> World:
     """Join this worker's process world, or a replica in the expert union.
 
-    Request: ``rank``, ``local_rank``, ``world_size``, ``device``,
-    ``backend`` (``None`` selects NCCL on CUDA, Gloo otherwise), ``store``
-    (``{host, port, listen_fd}`` for a multi-rank world) and ``union``
-    (``{rank, size, store}`` when replicas share experts).
+    Args:
+        rank: This rank among the worker's ranks.
+        local_rank: This rank among the ranks of its node, which selects a
+            bare CUDA device.
+        world_size: The worker's rank count.
+        device: The rank's device name.
+        backend: The process-group backend; ``None`` selects NCCL on CUDA
+            and Gloo otherwise.
+        store_host, store_port: The rendezvous store of the torch world
+            this rank joins: the expert union's when replicas share
+            experts, else the worker's. ``None`` for a one-rank worker
+            outside a union, which needs no process group.
+        listen_fd: The store's listening socket on the rank that serves it
+            (rank 0 of that world); ``None`` elsewhere.
+        union_rank, union_size: This rank among the expert union's ranks
+            and their count; ``None`` when replicas share no experts.
 
     Raises:
-        ValueError: The rank is outside its world or union, or the device
-            is not visible.
+        ValueError: The rank is outside its world or union, a multi-rank
+            world has no store, or the device is not visible.
     """
-    rank = int(request["rank"])
-    size = int(request["world_size"])
-    local_rank = int(request["local_rank"])
+    rank = int(rank)
+    size = int(world_size)
+    local_rank = int(local_rank)
     if size < 1 or not 0 <= rank < size or local_rank < 0:
         raise ValueError(
             "launch rank must satisfy 0 <= rank < positive world_size"
         )
-    device = _local_device(str(request["device"]), local_rank)
-    backend = request.get("backend") or (
-        "nccl" if device.type == "cuda" else "gloo"
-    )
-    backend = str(backend)
-    union = request.get("union")
+    placed = _local_device(str(device), local_rank)
+    backend = str(backend or ("nccl" if placed.type == "cuda" else "gloo"))
 
-    if union is not None:
-        union_rank, union_size = int(union["rank"]), int(union["size"])
+    if union_rank is not None and union_size is not None:
+        union_rank, union_size = int(union_rank), int(union_size)
+        if store_host is None or store_port is None:
+            raise ValueError("an expert union requires its rendezvous store")
         start = union_rank - rank
         if start < 0 or start + size > union_size:
             raise ValueError("worker ranks must fit inside the expert union")
@@ -145,27 +171,34 @@ def initialize(request: Mapping[str, Any]) -> World:
         # union rank to participate in each independent replica's binding.
         dist.init_process_group(
             backend="cpu:gloo,cuda:nccl",
-            store=_store(union["store"], union_rank, union_size, "nccl"),
+            store=_store(
+                store_host,
+                store_port,
+                listen_fd,
+                union_rank,
+                union_size,
+                "nccl",
+            ),
             rank=union_rank,
             world_size=union_size,
         )
         world_group = dist.group.WORLD
-        if device.type == "cuda":
-            dist.all_reduce(torch.zeros((), device=device))
+        if placed.type == "cuda":
+            dist.all_reduce(torch.zeros((), device=placed))
         experts = Communicator(
-            tuple(range(union_size)), union_rank, "experts", device, world_group
+            tuple(range(union_size)), union_rank, "experts", placed, world_group
         )
         members = tuple(range(start, start + size))
         subgroup = dist.new_group(
             ranks=sorted(members),
             use_local_synchronization=True,
-            **_options(backend, device),
+            **_options(backend, placed),
         )
-        instance = Communicator(members, rank, "instance", device, subgroup)
+        instance = Communicator(members, rank, "instance", placed, subgroup)
         return World(
             rank,
             size,
-            device,
+            placed,
             backend,
             instance,
             experts,
@@ -174,40 +207,69 @@ def initialize(request: Mapping[str, Any]) -> World:
 
     groups = []
     if size > 1:
-        store = request.get("store")
-        if store is None:
+        if store_host is None or store_port is None:
             raise ValueError("a multi-rank world requires its rendezvous store")
         dist.init_process_group(
-            store=_store(store, rank, size, backend),
+            store=_store(
+                store_host, store_port, listen_fd, rank, size, backend
+            ),
             rank=rank,
             world_size=size,
-            **_options(backend, device),
+            **_options(backend, placed),
         )
         groups.append(dist.group.WORLD)
     instance = Communicator(
         tuple(range(size)),
         rank,
         "instance",
-        device,
+        placed,
         dist.group.WORLD if groups else None,
     )
-    return World(rank, size, device, backend, instance, Communicator(), groups)
+    return World(rank, size, placed, backend, instance, Communicator(), groups)
 
 
-def create_groups(world: World, plan: Sequence[Mapping[str, Any]]) -> list:
+def _runs(counts: Sequence[int], values: Sequence[Any]) -> list[list[Any]]:
+    """Split back-to-back ``values`` into runs of ``counts`` items."""
+    runs, first = [], 0
+    for count in counts:
+        runs.append(list(values[first : first + int(count)]))
+        first += int(count)
+    return runs
+
+
+def create_groups(
+    world: World,
+    member_counts: Sequence[int],
+    members: Sequence[int],
+    local_sync: Sequence[bool],
+    keep: Sequence[bool],
+) -> list:
     """Create every planned group in order; return the ones this rank keeps.
 
     Every rank executes every entry, members or not, so creation stays a
     matching sequence of world collectives.
+
+    Args:
+        world: The world :func:`initialize` returned.
+        member_counts: How many of ``members`` each planned group has.
+        members: Every group's torch world ranks, back to back.
+        local_sync: Whether each group is created by its members alone.
+        keep: Whether this rank keeps each group.
+
+    Returns:
+        One entry per planned group: the group this rank keeps, or
+        ``None``.
     """
     handles = []
-    for entry in plan:
+    for ranks, local, kept in zip(
+        _runs(member_counts, members), local_sync, keep, strict=True
+    ):
         group = dist.new_group(
-            ranks=[int(member) for member in entry["members"]],
-            use_local_synchronization=bool(entry["local_sync"]),
+            ranks=[int(member) for member in ranks],
+            use_local_synchronization=bool(local),
             **_options(world.backend, world.device),
         )
-        if entry["keep"]:
+        if kept:
             world.groups.append(group)
             handles.append(group)
         else:
@@ -215,36 +277,57 @@ def create_groups(world: World, plan: Sequence[Mapping[str, Any]]) -> list:
     return handles
 
 
-def mesh(world: World, spec: Mapping[str, Any]) -> DeviceMesh:
+def mesh(
+    world: World,
+    ranks: Sequence[int],
+    shape: Sequence[int],
+    axes: Sequence[str],
+    rank: int,
+    names: Sequence[str],
+    member_counts: Sequence[int],
+    members: Sequence[int],
+    groups: Sequence[Any],
+) -> DeviceMesh:
     """A ``DeviceMesh`` whose communicators borrow created groups.
 
-    ``spec["groups"]`` maps a communicator name (axes joined by ``.``, or
-    ``local``) to its physical members in logical order and its group.
+    Args:
+        world: The world :func:`initialize` returned.
+        ranks, shape, axes, rank: The mesh topology and this rank in it
+            (``DeviceMesh``).
+        names: Each communicator's name: its mesh axes joined by ``.``, or
+            ``local``.
+        member_counts: How many of ``members`` each communicator has.
+        members: Every communicator's torch world ranks in logical order,
+            back to back.
+        groups: Each communicator's created group; ``None`` for a
+            communicator of one member.
     """
-    rank = int(spec["rank"])
+    rank = int(rank)
     result = DeviceMesh(
-        ranks=tuple(int(value) for value in spec["ranks"]),
-        shape=tuple(int(value) for value in spec["shape"]),
-        axes=tuple(str(value) for value in spec["axes"]),
+        ranks=tuple(int(value) for value in ranks),
+        shape=tuple(int(value) for value in shape),
+        axes=tuple(str(value) for value in axes),
         rank=rank,
     )
     physical = world.physical(rank)
-    groups = {}
-    for name, value in dict(spec["groups"]).items():
+    bound = {}
+    for name, ranks_of, group in zip(
+        names, _runs(member_counts, members), groups, strict=True
+    ):
         name = str(name)
-        members = tuple(int(member) for member in value["members"])
-        axes = () if name == "local" else tuple(name.split("."))
-        groups[axes] = Communicator(
-            members,
-            members.index(physical),
+        logical = tuple(int(member) for member in ranks_of)
+        selection = () if name == "local" else tuple(name.split("."))
+        bound[selection] = Communicator(
+            logical,
+            logical.index(physical),
             name,
             world.device,
-            dict(value).get("group"),
+            group,
         )
     # Mesh topology remains a numerical value; its bound communicators are
     # attached after every group exists.
     object.__setattr__(result, "_device", world.device)
-    object.__setattr__(result, "_groups", MappingProxyType(groups))
+    object.__setattr__(result, "_groups", MappingProxyType(bound))
     return result
 
 
@@ -278,97 +361,118 @@ class _Transfer:
 class NativeCollectives:
     """One group's collectives on the worker's NCCL communicator.
 
-    The worker binds one communicator per binding stream and group; every
-    call enqueues on that stream (asynchronous ones on its transfer fork,
-    joined by the consumer). Members are ordered by ascending world rank,
-    the backend order ``Communicator`` assumes; roots and peers are world
-    ranks.
+    The worker binds one communicator per stream and group and constructs
+    this object over its functions; every call enqueues on that stream
+    (asynchronous ones on its transfer fork, joined by the consumer).
+    Members are ordered by ascending world rank, the backend order
+    ``Communicator`` assumes; roots and peers are world ranks.
+
+    Args:
+        name: The communicator's name: its mesh axes joined by ``.``.
+        all_reduce: ``(value, op)`` with ``op`` 0 for sum, 2 for max and 3
+            for min.
+        all_gather, reduce_scatter: ``(output, value)``.
+        start_all_gather, start_all_to_all: ``(output, value)``, returning
+            the token ``wait`` joins.
+        wait: ``(token, stream)`` joins a started collective on the CUDA
+            stream handle ``stream``.
+        all_to_all: ``(output, value, output_splits, input_splits)``.
+        gather: ``(outputs, value, root)``.
+        broadcast: ``(value, root)``.
+        send, recv: ``(value, peer)``.
+        send_recv: ``(output, value, destination, source)``.
     """
 
     _REDUCTIONS = {"sum": 0, "max": 2, "min": 3}
 
-    def __init__(self, table: Mapping[str, Callable[..., Any]]) -> None:
-        self._table = table
+    def __init__(
+        self,
+        name: str,
+        all_reduce: Callable[..., Any],
+        all_gather: Callable[..., Any],
+        start_all_gather: Callable[..., Any],
+        start_all_to_all: Callable[..., Any],
+        wait: Callable[..., Any],
+        all_to_all: Callable[..., Any],
+        gather: Callable[..., Any],
+        broadcast: Callable[..., Any],
+        reduce_scatter: Callable[..., Any],
+        send: Callable[..., Any],
+        recv: Callable[..., Any],
+        send_recv: Callable[..., Any],
+    ) -> None:
+        self.name = str(name)
+        self._all_reduce = all_reduce
+        self._all_gather = all_gather
+        self._start_all_gather = start_all_gather
+        self._start_all_to_all = start_all_to_all
+        self._wait = wait
+        self._all_to_all = all_to_all
+        self._gather = gather
+        self._broadcast = broadcast
+        self._reduce_scatter = reduce_scatter
+        self._send = send
+        self._recv = recv
+        self._send_recv = send_recv
 
     def all_reduce(self, value: torch.Tensor, op: str = "sum") -> None:
-        self._table["all_reduce"](value, self._REDUCTIONS[op])
+        self._all_reduce(value, self._REDUCTIONS[op])
 
     def all_gather(self, output: torch.Tensor, value: torch.Tensor) -> None:
-        self._table["all_gather"](output, value)
+        self._all_gather(output, value)
 
     def start_all_gather(self, output, value) -> _Transfer:
-        return _Transfer(
-            self._table["wait"], self._table["start_all_gather"](output, value)
-        )
+        return _Transfer(self._wait, self._start_all_gather(output, value))
 
     def start_all_to_all(self, output, value) -> _Transfer:
-        return _Transfer(
-            self._table["wait"], self._table["start_all_to_all"](output, value)
-        )
+        return _Transfer(self._wait, self._start_all_to_all(output, value))
 
     def all_to_all(self, output, value, output_splits, input_splits) -> None:
-        self._table["all_to_all"](
-            output, value, list(output_splits), list(input_splits)
-        )
+        self._all_to_all(output, value, list(output_splits), list(input_splits))
 
     def gather(self, outputs, value, root: int) -> None:
-        self._table["gather"](list(outputs or ()), value, int(root))
+        self._gather(list(outputs or ()), value, int(root))
 
     def broadcast(self, value: torch.Tensor, root: int) -> None:
-        self._table["broadcast"](value, int(root))
+        self._broadcast(value, int(root))
 
     def reduce_scatter(self, output, value) -> None:
-        self._table["reduce_scatter"](output, value)
+        self._reduce_scatter(output, value)
 
     def send(self, value: torch.Tensor, peer: int) -> None:
-        self._table["send"](value, int(peer))
+        self._send(value, int(peer))
 
     def recv(self, value: torch.Tensor, peer: int) -> None:
-        self._table["recv"](value, int(peer))
+        self._recv(value, int(peer))
 
     def send_recv(self, output, value, dst: int, src: int) -> None:
-        self._table["send_recv"](output, value, int(dst), int(src))
+        self._send_recv(output, value, int(dst), int(src))
 
     def close(self) -> None:
         """The worker destroys the communicator."""
 
 
-def bind_collectives(prepared, tables: Mapping[str, Any]) -> None:
-    """Route a binding's collectives to the worker's stream communicators.
-
-    ``tables`` maps a communicator name (mesh axes joined by ``.``) to its
-    collective functions. Every multi-member communicator the binding uses
-    must have one: within an activation, a collective never falls back to
-    another stream.
-
-    Raises:
-        ValueError: A used communicator has no table.
-    """
-    context = prepared.context
-    if context is None:
-        raise ValueError("collectives bind to a bound component")
-    context.collectives = stream_collectives(context.groups, tables)
-
-
-def stream_collectives(groups, tables: Mapping[str, Any]) -> dict:
+def stream_collectives(
+    groups, collectives: Sequence[NativeCollectives]
+) -> dict:
     """The stream collectives of ``groups``, for an execution context.
 
-    ``tables`` maps a communicator name (mesh axes joined by ``.``) to the
-    collective functions of that communicator on one stream. Every
-    multi-member communicator of ``groups`` must have one: within an
+    ``collectives`` holds one stream's collectives of each communicator.
+    Every multi-member communicator of ``groups`` must have one: within an
     activation, a collective never falls back to another stream.
 
     Raises:
-        ValueError: A communicator has no table.
+        ValueError: A communicator has no stream collectives.
     """
+    named = {native.name: native for native in collectives}
     bound = {}
     for group in groups:
         if group.size == 1:
             continue
-        table = tables.get(group.name)
-        if table is None:
+        native = named.get(group.name)
+        if native is None:
             raise ValueError(
                 f"communicator {group.name!r} has no stream collectives"
             )
-        bound[group._require().group_name] = NativeCollectives(table)
+        bound[group._require().group_name] = native
     return bound

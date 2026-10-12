@@ -12,13 +12,13 @@
 //! 4. Loading, model facts, execution streams.
 //! 5. Capacity: page size, request slots, KV units and latent pages, all
 //!    agreed over the group; the auxiliary-device check.
-//! 6. Request storage and component bindings, created by the storage and
-//!    capability runtimes on the plan and registered with the backend.
+//! 6. Request storage and the runners, created by the storage and
+//!    capability runtimes on the plan and handed to the backend.
 //! 7. The executor and the profiler.
 //!
 //! [`Worker::warmup`] runs the warmup phases ([`crate::warmup`]),
 //! [`Worker::run`] serves the channel, and [`Worker::close`] releases owners
-//! in dependency order: execution, bindings, streams, requests, the process
+//! in dependency order: execution, runners, streams, requests, the process
 //! world, then deferred device memory.
 
 mod storage;
@@ -36,30 +36,25 @@ use uniserve_ipc::{CallKind, ComponentInfo, ForwardMode, WorkerEndpoint, WorkerI
 
 use crate::capacity::checks;
 use crate::capacity::device::{DeviceBudget, total_bytes};
-use crate::capacity::plan::{
-    LatentPlan, Plan, Report, TokenFacts, TokenLayout, page_size, product_bytes,
-};
+use crate::capacity::plan::{LatentPlan, Plan, Report, TokenFacts, TokenLayout, page_size};
 use crate::capacity::video::VideoCapacity;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
-use crate::executor::backend::{KernelWatch, WorkerBackend, binding_label};
+use crate::executor::backend::{KernelWatch, WorkerBackend};
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle};
 use crate::lane::Lanes;
 use crate::launch::Endpoint;
-use crate::model::bind::{PeerGroup, StreamWorkspaces};
 use crate::model::components::Capability;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
-use crate::model::{
-    ComponentMesh, Description, ExpertPartition, LoadedModel, ModelFacts, sequence_kind,
-};
+use crate::model::{ComponentMesh, Description, ExpertPartition, LoadedModel, sequence_kind};
 use crate::parallel::world::{World, startup_timeout};
-use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup};
+use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, PeerGroup};
 use crate::profiling::kernels::KernelRecords;
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
@@ -73,6 +68,7 @@ use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::denoiser::warmup::DenoiserWarmup;
 use crate::runner::denoiser::{VideoModel, placed_denoiser};
 use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
+use crate::runner::encoder::EncoderInfo;
 use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
 use crate::runner::start::{
@@ -128,8 +124,6 @@ pub struct Worker {
     budget: Option<DeviceBudget>,
     lanes: Lanes,
     graphs: GraphStorage<String, Handle>,
-    /// Shared workspaces of every binding, by stream.
-    workspaces: StreamWorkspaces,
     /// The shared work areas of every stream runners construct their
     /// execution contexts on.
     _scratches: Scratches,
@@ -218,7 +212,7 @@ impl Worker {
         let loading = range(c"uniserve.worker.load", None);
         let model = LoadedModel::load(&interface, description, &launch, meshes, experts, host_only)
             .map_err(phase("load"))?;
-        let facts = model.facts(&interface, &launch).map_err(phase("load"))?;
+        let image = ImageModel::describe(&interface, model.handle()).map_err(phase("load"))?;
         let video = if model.video_decoder {
             let denoiser = placed_denoiser(&model.declarations, &config.deployment_components)
                 .map_err(phase("load"))?;
@@ -266,7 +260,7 @@ impl Worker {
             &interface,
             &mut config,
             &model,
-            &facts,
+            &image,
             &world,
             budget.as_ref(),
             &components,
@@ -296,7 +290,6 @@ impl Worker {
             .collect::<Result<BTreeMap<_, _>>>()
             .map_err(phase("capacity"))?;
         let mut graphs = GraphStorage::new(budgets);
-        let mut workspaces = StreamWorkspaces::default();
         let mut scratches = Scratches::default();
 
         let storage = allocate_storage(&launch, &interface, &config, &plan, &lanes)
@@ -309,7 +302,7 @@ impl Worker {
             .map(CUDAStream::stream)
             .transpose()
             .map_err(phase("bind"))?;
-        // Numerical collectives of each binding run on NCCL communicators
+        // Numerical collectives of each runner run on NCCL communicators
         // bound to its stream, over its component's mesh groups.
         let first = launch
             .expert_parallel
@@ -330,11 +323,11 @@ impl Worker {
             queue_depth: launch.ipc.queue_depth,
             max_payload_bytes: launch.ipc.max_payload_bytes,
             model: &model,
-            facts: &facts,
+            image_processor: image.processing.is_some(),
             lanes: &lanes,
             kv: storage.kv.as_ref(),
-            components: &mut components,
-            workspaces: &mut workspaces,
+            components: &components,
+            scratches: &mut scratches,
             graphs: &mut graphs,
             preparation,
             experts: experts.as_mut(),
@@ -403,7 +396,7 @@ impl Worker {
                         config: &config,
                         lanes: &mut lanes,
                         graphs: &mut graphs,
-                        attention: facts.attention_backend.clone(),
+                        attention: model.attention_backend.clone(),
                     },
                     &components,
                 )
@@ -515,7 +508,7 @@ impl Worker {
             hooks.push(Box::new(ExpertWarmup));
         }
 
-        tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", facts.model_name);
+        tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", model.model_name);
         Ok(Self {
             interface,
             config,
@@ -526,7 +519,6 @@ impl Worker {
             budget,
             lanes,
             graphs,
-            workspaces,
             _scratches: scratches,
             executor: Some(executor),
             hooks,
@@ -701,12 +693,10 @@ impl Worker {
             if !aborted {
                 record(executor.close());
             }
-            // Graphs and steps release before the bindings they run.
+            // Each runner releases its graphs, then its execution context.
             let closed = executor.backend_mut().close_runtimes(aborted);
             record(closed.map_err(WorkerError::from));
-            let closed = executor.backend_mut().components_mut().close(aborted);
-            record(closed.map_err(WorkerError::from));
-            // Transports retire after every binding and graph using them;
+            // Transports retire after every context and graph using them;
             // their close is collective over the expert union.
             let closed = executor.backend_mut().close_experts(aborted);
             record(closed.map_err(WorkerError::from));
@@ -844,22 +834,18 @@ impl Worker {
             .executor
             .as_mut()
             .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
-        let mut records = KernelRecords::default();
-        for binding in executor.backend().components().bindings() {
-            let label = binding_label(binding);
-            let kernels = binding.kernels().map_err(phase("warmup"))?;
-            records
-                .add(&label, &binding.device.to_string(), &kernels)
-                .map_err(phase("warmup"))?;
+        let mut records = KernelRecords::new(&self.interface).map_err(phase("warmup"))?;
+        if let Some(text) = executor.backend().text() {
+            for (label, device, kernels) in text.kernels().map_err(phase("warmup"))? {
+                records.add(&label, &device, &kernels);
+            }
         }
         for (label, device, kernels) in executor
             .backend()
             .image_kernels()
             .map_err(phase("warmup"))?
         {
-            records
-                .add_listings(&label, &device, &kernels)
-                .map_err(phase("warmup"))?;
+            records.add(&label, &device, &kernels);
         }
         if executor.backend().serves_video() {
             let backend = executor.backend();
@@ -873,19 +859,17 @@ impl Worker {
                     .map_err(phase("warmup"))?,
             );
             for (label, kernels) in video {
-                records
-                    .add_listings(&label, &self.config.device.to_string(), &kernels)
-                    .map_err(phase("warmup"))?;
+                records.add(&label, &self.config.device.to_string(), &kernels);
             }
         }
         for runner in executor.backend_mut().diffusion_lm_mut() {
             let (label, kernels) = runner.kernels().map_err(phase("warmup"))?;
-            records
-                .add(&label, &self.config.device.to_string(), &kernels)
-                .map_err(phase("warmup"))?;
+            records.add(&label, &self.config.device.to_string(), &kernels);
             runner.seal();
         }
-        records.log("startup", self.config.rank, &self.config.device.to_string());
+        records
+            .log("startup", self.config.rank, &self.config.device.to_string())
+            .map_err(phase("warmup"))?;
         if let Some(text) = executor.backend_mut().text_mut() {
             text.seal();
         }
@@ -893,7 +877,6 @@ impl Worker {
             image.encoders.seal_image();
             image.denoisers.seal_image();
         }
-        self.workspaces.seal();
         let choices: i64 = self
             .interface
             .kernel_choices
@@ -995,8 +978,7 @@ fn allocate_storage(
             plan.info.max_unresolved_calls as usize,
             device,
             preparation.map(CUDAStream::stream).transpose()?,
-            &interface.function("cache.bind_units")?,
-            &interface.function("cache.bind_conversion")?,
+            interface,
         )?),
         _ => None,
     };
@@ -1115,6 +1097,35 @@ fn endpoint(worker_id: &str, rank: usize) -> Result<WorkerEndpoint> {
     })
 }
 
+/// Bytes of the largest vision feature product the image policy admits: the
+/// feature rows of its largest image at the vision encoder's output width.
+/// Zero for a model without a vision encoder or an understanding transform.
+fn vision_feature_bytes(
+    interface: &Interface,
+    model: &LoadedModel,
+    model_dtype: &str,
+) -> Result<u64> {
+    let declarations = &model.declarations;
+    let Some(call) = declarations
+        .names()
+        .flat_map(|name| declarations.calls(name))
+        .find(|call| call.is(Capability::PatchEncoder))
+    else {
+        return Ok(0);
+    };
+    let dtype = DType::from_name(model_dtype)
+        .ok_or_else(|| Error::Unsupported(format!("unsupported model dtype {model_dtype:?}")))?;
+    let EncoderInfo::Vision(vision) =
+        EncoderInfo::describe(interface, model.handle(), &call.path, dtype)?
+    else {
+        return Ok(0);
+    };
+
+    // The encoder merges `downsample` patches on each axis into one feature.
+    let rows = u64::from(vision.image_patches / (vision.downsample * vision.downsample));
+    Ok(rows * u64::from(vision.output_size) * vision.output_dtype.bytes() as u64)
+}
+
 /// Resolve the rank's capacity on the loaded model.
 #[allow(clippy::too_many_arguments)]
 fn plan(
@@ -1122,7 +1133,7 @@ fn plan(
     interface: &Interface,
     config: &mut WorkerConfig,
     model: &LoadedModel,
-    facts: &ModelFacts,
+    image: &ImageModel,
     world: &World,
     budget: Option<&DeviceBudget>,
     components: &Components,
@@ -1142,8 +1153,13 @@ fn plan(
         config.block_size,
         |size| {
             if text {
-                let plan = model.cache_plan(interface, size, kv_dtype.as_deref())?;
-                model.reads_pages(interface, &facts.attention_backend, &plan)
+                KVPlan::reads_pages(
+                    interface,
+                    model.handle(),
+                    &model.attention_backend,
+                    size,
+                    kv_dtype.as_deref(),
+                )
             } else {
                 Ok(true)
             }
@@ -1186,19 +1202,11 @@ fn plan(
                 .iter()
                 .any(|placed| placed.has(Capability::VideoDecoder));
             Some(crate::capacity::video::plan(
-                video,
-                config,
-                &facts.outputs,
-                sampling,
-                denoising,
-                decoding,
+                video, config, sampling, denoising, decoding,
             )?)
         }
         None => None,
     };
-    let outputs = capacity
-        .as_ref()
-        .map_or(&facts.outputs, |capacity| &capacity.outputs);
     let infos: Vec<ComponentInfo> = launch
         .components
         .iter()
@@ -1206,7 +1214,11 @@ fn plan(
             |(name, config): (&String, &ComponentConfig)| ComponentInfo {
                 name: name.clone(),
                 config: config.clone(),
-                outputs: outputs.get(name).cloned().unwrap_or_default(),
+                // Only a video model's components publish products.
+                outputs: capacity
+                    .as_ref()
+                    .and_then(|capacity| capacity.outputs.get(name).cloned())
+                    .unwrap_or_default(),
             },
         )
         .collect();
@@ -1215,17 +1227,17 @@ fn plan(
         Device::Cpu => false,
     };
     let report = Report {
-        model_name: facts.model_name.clone(),
+        model_name: model.model_name.clone(),
         endpoint: endpoint(&launch.worker_id, config.rank)?,
         device: config.device.to_string(),
         transfer_backends: launch.data_plane.backends.clone(),
         fabric_handles,
-        attention_backend: facts.attention_backend.clone(),
+        attention_backend: model.attention_backend.clone(),
         supported_calls: supported,
         media_components,
         components: infos,
-        weight_formats: facts.weight_formats.clone(),
-        activation_formats: facts.activation_formats.clone(),
+        weight_formats: model.weight_formats(interface)?,
+        activation_formats: model.activation_formats(interface)?,
     };
     if let (Some(video), Some(capacity)) = (video, capacity) {
         let plan = video_layout(
@@ -1247,30 +1259,27 @@ fn plan(
         .ok_or_else(|| {
             Error::Unsupported(format!("unsupported latent dtype {:?}", config.model_dtype))
         })?;
-    let latent = facts.image_flow.map(|flow| {
+    // The longest image sequence an image denoiser accepts, in latent rows.
+    let image_tokens = image
+        .denoiser
+        .map_or(0, |layout| layout.max_sequence_tokens as usize);
+    let latent = image.denoiser.map(|layout| {
         LatentPlan::image(
             config.max_request_pool_size,
-            flow.max_tokens,
+            image_tokens,
             config.kv_token_capacity,
             block_size,
-            flow.latent_channels * flow.patch_size * flow.patch_size,
+            layout.width() as usize,
             element_bytes,
         )
     });
     let token_facts = TokenFacts {
-        image_processor: facts.image_processor,
-        vision_feature_bytes: facts.vision_feature_bytes,
+        image_processor: image.processing.is_some(),
+        vision_feature_bytes: vision_feature_bytes(interface, model, &config.model_dtype)?,
         latent_feature_bytes: latent.map_or(0, |plan| {
-            facts.image_flow.map_or(0, |flow| flow.max_tokens) as u64
-                * plan.latent_width as u64
-                * element_bytes as u64
+            image_tokens as u64 * plan.latent_width as u64 * element_bytes as u64
         }),
         latent,
-        product_bytes: facts
-            .outputs
-            .values()
-            .map(|outputs| product_bytes(outputs))
-            .sum(),
     };
     let mut layout = TokenLayout::new(report, config, launch.ipc.queue_depth, &token_facts)?;
     // Every rank of a worker holding a causal LM component keeps the same
@@ -1284,8 +1293,7 @@ fn plan(
             .any(|call| call.is(Capability::CausalLm))
     });
     let cache = if text && !dedicated && holds_text {
-        let cache =
-            KVPlan::decode(model.cache_plan(interface, block_size, kv_dtype.as_deref())?)?;
+        let cache = KVPlan::plan(interface, model.handle(), block_size, kv_dtype.as_deref())?;
         let total = match device {
             Device::Cuda(index) => total_bytes(index)?,
             Device::Cpu => 0,
@@ -1313,13 +1321,12 @@ fn plan(
                 config,
                 layout.info().request_slots as usize,
                 &cache,
-                facts,
+                image.processing.is_some(),
                 unit_columns,
             )?,
         );
         // The image denoiser's columns and the image decoder's staging.
-        if facts.image_flow.is_some() {
-            let image = ImageModel::describe(interface, model.handle())?;
+        if image.denoiser.is_some() {
             layout.reserve(
                 config.device,
                 image_reserved_bytes(

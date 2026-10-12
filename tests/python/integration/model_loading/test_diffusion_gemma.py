@@ -564,16 +564,14 @@ def _pipeline_stage(rank, rendezvous, root):
     try:
         mesh = distributed.mesh(
             world,
-            {
-                "rank": rank,
-                "ranks": [0, 1],
-                "shape": [2],
-                "axes": ["pp"],
-                "groups": {
-                    "pp": {"members": [0, 1], "group": dist.group.WORLD},
-                    "local": {"members": [rank]},
-                },
-            },
+            [0, 1],
+            [2],
+            ["pp"],
+            rank,
+            ["pp", "local"],
+            [2, 1],
+            [0, 1, rank],
+            [dist.group.WORLD, None],
         )
         _pipeline_forward(rank, mesh, root)
     finally:

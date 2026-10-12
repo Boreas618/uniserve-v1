@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -21,7 +22,7 @@ def execution_context(
     cache=None,
     experts=None,
     weights=None,
-    collectives: Mapping[str, Any] | None = None,
+    collectives: Sequence[Any] | None = None,
 ) -> ExecutionContext:
     """An execution context of ``module`` on a caller's stream.
 
@@ -44,9 +45,9 @@ def execution_context(
         cache: The prefix cache view object attention layers read.
         experts: The expert exchange routed experts communicate through.
         weights: The distributed expert weights' prefetch object.
-        collectives: The collective functions of each of the module's
-            communicators on ``stream``, by communicator name; ``None``
-            when the module communicates over no multi-member group.
+        collectives: The ``NativeCollectives`` of each of the module's
+            communicators on ``stream``; ``None`` when the module
+            communicates over no multi-member group.
     """
     bound = None
     if collectives is not None:
@@ -71,3 +72,14 @@ def execution_context(
         scratch=scratch,
         collectives=bound,
     )
+
+
+def kernel_records(records: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Kernel records as a runner reports them to the rank.
+
+    Each record describes one prepared operator: its layer ``path``, its
+    ``op``, the ``provider`` serving it and fields particular to the
+    operator. The rank only groups and logs them, so each crosses as the
+    text of one JSON object.
+    """
+    return [json.dumps(record) for record in records]

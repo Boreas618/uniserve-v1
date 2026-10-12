@@ -11,6 +11,7 @@ use crate::Result;
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::RequestStorage;
 use crate::ffi::Handle;
+use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
 use crate::runner::causal_lm::warmup::with_scratch;
 use crate::runner::component::Component;
@@ -217,7 +218,7 @@ impl DenoiserRunners {
     }
 
     /// The kernels the video denoiser's operators selected.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<String>)>> {
+    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<KernelRecord>)>> {
         let mut kernels = Vec::new();
         if let Some(denoiser) = &self.video {
             kernels.push((denoiser.name.clone(), denoiser.runner.kernels()?));

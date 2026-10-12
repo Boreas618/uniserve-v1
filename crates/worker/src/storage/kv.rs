@@ -17,15 +17,17 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{BlockTable, BufferId, KvTransfer, RequestKey, Wake};
 
-use super::kv_plan::KVPlan;
+use super::kv_plan::{CACHE, KVPlan};
 use super::kv_planes::{KVPlanes, UnitColumn};
 use super::memory::StorageView;
 use super::{BlockTableStorage, BlockTables, GroupTable, KVCacheManager};
-use crate::ffi::Function;
+use crate::ffi::Handle;
 use crate::host::HostLane;
+use crate::model::interface::Interface;
 use crate::stream::Issue;
 use crate::transfer::exports::Location;
 use crate::transfer::{
@@ -160,9 +162,8 @@ impl KVCache {
     /// Allocate the pool, the tables and the import workspaces on `device`
     /// (host memory when `None`), resetting device storage on `stream`.
     ///
-    /// `bind_units` and `bind_conversion` are the interface's
-    /// `cache.bind_units` and `cache.bind_conversion`; every import
-    /// workspace binds both on its own stream.
+    /// Every import workspace constructs the library's unit resets and
+    /// page conversion on its own stream.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pool's complete startup facts"
@@ -175,8 +176,7 @@ impl KVCache {
         import_capacity: usize,
         device: Option<i32>,
         stream: Option<&Stream>,
-        bind_units: &Function,
-        bind_conversion: &Function,
+        interface: &Interface,
     ) -> Result<Self> {
         let shapes = plan.group_shapes()?;
         let planes = Arc::new(KVPlanes::allocate(plan, device, num_units, stream)?);
@@ -186,7 +186,7 @@ impl KVCache {
 
         let workers = Self::import_workers(import_capacity);
         let workspaces = (0..workers)
-            .map(|_| ImportWorkspace::bind(&planes, bind_units, bind_conversion).map(Arc::new))
+            .map(|_| ImportWorkspace::bind(&planes, interface).map(Arc::new))
             .collect::<Result<Vec<_>>>()?;
         let importer = Arc::new(CacheImporter::new(workspaces));
         let lane = HostLane::new(import_capacity.max(1), workers, "worker-kv-import")?;
@@ -246,14 +246,25 @@ impl KVCache {
         Ok(views)
     }
 
-    /// The plan map with the unit count, as cache bindings receive it.
-    pub fn layout(&self) -> Result<tvm_ffi::Map<tvm_ffi::String, tvm_ffi::Any>> {
-        self.plan().layout(self.planes.num_units())
+    /// The attention layers' view of the unit pool (the library's `pool`
+    /// over the plan, the unit count and the unit fields by name), which
+    /// execution contexts read prefixes through.
+    pub fn pool(&self, interface: &Interface) -> Result<Handle> {
+        let mut arguments = vec![
+            self.plan().handle.to_any(),
+            Any::from(i64::from(self.planes.num_units())),
+        ];
+        arguments.extend(self.planes.field_arguments()?);
+        Handle::new(
+            interface
+                .import(&format!("{CACHE}.pool"))?
+                .call_values(&arguments)?,
+        )
     }
 
     /// Bind the unit resets to another stream (one per executing lane).
-    pub fn bind_units(&self, bind_units: &Function, stream: Option<&Stream>) -> Result<UnitColumn> {
-        UnitColumn::bind(&self.planes, bind_units, stream)
+    pub fn bind_units(&self, interface: &Interface, stream: Option<&Stream>) -> Result<UnitColumn> {
+        UnitColumn::bind(&self.planes, interface, stream)
     }
 
     /// Install scheduler page assignments: validate them all, write the

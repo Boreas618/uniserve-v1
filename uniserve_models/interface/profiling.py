@@ -7,7 +7,7 @@ functions start the installed PyTorch profiler and export its results.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
@@ -22,18 +22,23 @@ def functions() -> dict[str, Callable[..., Any]]:
     }
 
 
-def start(options: Mapping[str, Any]):
+def start(activities: Sequence[str], with_stack: bool, record_shapes: bool):
     """Start a profiler window.
 
-    ``options`` carries ``activities`` (``"CPU"``, ``"GPU"``),
-    ``with_stack`` and ``record_shapes``. Returns the started profiler, or
-    ``None`` when no requested activity is available.
+    Args:
+        activities: What to record: ``"CPU"``, ``"GPU"`` or both.
+        with_stack: Record the source location of each operator.
+        record_shapes: Record the operators' input shapes.
+
+    Returns:
+        The started profiler, or ``None`` when no requested activity is
+        available.
     """
-    activities = {str(name) for name in options["activities"]}
+    requested = {str(name) for name in activities}
     selected = []
-    if "CPU" in activities:
+    if "CPU" in requested:
         selected.append(torch.profiler.ProfilerActivity.CPU)
-    if "GPU" in activities:
+    if "GPU" in requested:
         if torch.cuda.is_available():
             selected.append(torch.profiler.ProfilerActivity.CUDA)
         else:
@@ -45,8 +50,8 @@ def start(options: Mapping[str, Any]):
         return None
     profiler = torch.profiler.profile(
         activities=selected,
-        with_stack=bool(options["with_stack"]),
-        record_shapes=bool(options["record_shapes"]),
+        with_stack=bool(with_stack),
+        record_shapes=bool(record_shapes),
         acc_events=True,
     )
     profiler.start()

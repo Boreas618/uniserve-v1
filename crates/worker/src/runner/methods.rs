@@ -13,6 +13,7 @@ use crate::Result;
 use crate::ffi::{Function, Handle, Shape};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
+use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::StorageView;
 
 /// One argument of a method call.
@@ -193,16 +194,17 @@ impl RunnerClass {
         })
     }
 
-    /// The kernels the operators of `runners` selected: each runner's
-    /// listing, a JSON array of records.
+    /// The kernels the operators of `runners` selected, one record per
+    /// prepared operator.
     pub(crate) fn kernels<'a>(
         &self,
         runners: impl IntoIterator<Item = &'a Methods>,
-    ) -> Result<Vec<String>> {
-        runners
-            .into_iter()
-            .map(|runner| kernel_listing(&self.kernels, runner.runner()))
-            .collect()
+    ) -> Result<Vec<KernelRecord>> {
+        let mut records = Vec::new();
+        for runner in runners {
+            records.extend(kernel_records(&self.kernels, runner.runner(), self.class)?);
+        }
+        Ok(records)
     }
 
     /// Close `runners`; an aborted close keeps what device work may still
@@ -221,9 +223,17 @@ impl RunnerClass {
     }
 }
 
-/// The kernel listing of a Python runner: the JSON array of records its
-/// `kernels` method returns.
-pub(crate) fn kernel_listing(kernels: &Function, runner: &Handle) -> Result<String> {
-    let listing: tvm_ffi::String = kernels.call_as(&[runner.view()])?;
-    Ok(listing.as_str().to_owned())
+/// The kernel records of the Python runner of `class`: what its `kernels`
+/// method returns, one JSON object text per prepared operator.
+pub(crate) fn kernel_records(
+    kernels: &Function,
+    runner: &Handle,
+    class: &str,
+) -> Result<Vec<KernelRecord>> {
+    let records: tvm_ffi::Array<Any> = kernels.call_as(&[runner.view()])?;
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| KernelRecord::new(format!("{class}.kernels[{index}]"), record))
+        .collect()
 }

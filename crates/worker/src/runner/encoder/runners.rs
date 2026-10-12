@@ -8,6 +8,7 @@ use uniserve_ipc::CallKind;
 use super::EncoderRunner;
 use crate::cuda_graph::GraphPool;
 use crate::ffi::Handle;
+use crate::profiling::kernels::KernelRecord;
 use crate::runner::component::Component;
 use crate::{Error, Result};
 
@@ -108,7 +109,7 @@ impl EncoderRunners {
     }
 
     /// The kernels the text encoder's operators selected.
-    pub(crate) fn text_kernels(&self) -> Result<Vec<(String, Vec<String>)>> {
+    pub(crate) fn text_kernels(&self) -> Result<Vec<(String, Vec<KernelRecord>)>> {
         let mut kernels = Vec::new();
         if let Some(text) = &self.text {
             kernels.push((text.name.clone(), text.runner.kernels()?));
@@ -117,7 +118,7 @@ impl EncoderRunners {
     }
 
     /// The kernels the condition latent encoders' operators selected.
-    pub(crate) fn latent_kernels(&self) -> Result<Vec<(String, Vec<String>)>> {
+    pub(crate) fn latent_kernels(&self) -> Result<Vec<(String, Vec<KernelRecord>)>> {
         let mut kernels = Vec::new();
         if let Some(latent) = &self.latent {
             kernels.push((latent.name.clone(), latent.runner.kernels()?));

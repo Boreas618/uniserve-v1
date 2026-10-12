@@ -1,5 +1,6 @@
 //! Stream-ordered NCCL collectives and registered window lifetime.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError};
 
 use tvm_ffi::{Any, AnyView};
@@ -8,7 +9,12 @@ use indexmap::IndexMap;
 use uniserve_cuda::nccl::{self, Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
 
+use crate::config::Device;
+use crate::model::interface::Interface;
 use crate::{CUDAStream, Error, Result};
+
+/// The library class over one communicator's collective functions.
+const NATIVE_COLLECTIVES: &str = "uniserve_models.interface.distributed.NativeCollectives";
 
 /// An NCCL communicator bound to one computation stream.
 ///
@@ -385,7 +391,43 @@ impl<T> Drop for StreamCommunicator<T> {
     }
 }
 
-/// One mesh group a binding's numerical calls communicate over.
+/// The worker's ranks and the mesh groups its components communicate over.
+pub struct PeerGroup<'a> {
+    /// Host collectives over the worker's ranks; member `i` is rank `i`.
+    pub group: &'a super::host::HostGroup,
+    /// Each component's multi-member mesh groups on this rank.
+    pub collectives: BTreeMap<String, Vec<CollectiveGroup>>,
+}
+
+impl PeerGroup<'_> {
+    /// Bind the collectives of `component` on `device` to NCCL
+    /// communicators on its stream (`owner`), collectively over each
+    /// group's members. `None` when the component communicates over no
+    /// group, and on the host: a host component has no stream, and its
+    /// collectives run on the component's host process groups.
+    pub fn stream_collectives(
+        &self,
+        component: &str,
+        device: Device,
+        owner: Option<&CUDAStream>,
+    ) -> Result<Option<StreamCollectives>> {
+        let Some(groups) = self
+            .collectives
+            .get(component)
+            .filter(|groups| !groups.is_empty())
+        else {
+            return Ok(None);
+        };
+        if device == Device::Cpu {
+            return Ok(None);
+        }
+        let owner = owner
+            .ok_or_else(|| Error::Unsupported("stream collectives require a CUDA stream".into()))?;
+        StreamCollectives::bind(owner, self.group, groups).map(Some)
+    }
+}
+
+/// One mesh group a component's numerical calls communicate over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectiveGroup {
     /// The communicator's name: its mesh axes joined by `.` (`tp`).
@@ -403,7 +445,7 @@ struct GroupComm {
 }
 
 /// NCCL communicators bound to one binding's stream, one per mesh group its
-/// numerical calls use, and their TVM-FFI collective tables.
+/// numerical calls use, and their TVM-FFI collective functions.
 ///
 /// Communicator ranks follow ascending process-world rank, as the backend
 /// order of `uniserve_models.distributed.Communicator` assumes; collectives
@@ -480,13 +522,30 @@ impl StreamCollectives {
         self.groups.is_empty()
     }
 
-    /// Every group's collective table, by communicator name.
-    pub fn tables(&self) -> Any {
-        let mut tables = crate::ffi::Fields::new();
-        for group in &self.groups {
-            tables = tables.with(&group.group.name, table(group));
-        }
-        tables.into_any()
+    /// Every group's collectives on this stream, as the list of
+    /// `NativeCollectives` an execution context routes its communicators'
+    /// collectives to.
+    pub fn natives(&self, interface: &Interface) -> Result<Any> {
+        let construct = interface.import(NATIVE_COLLECTIVES)?;
+        let natives = self
+            .groups
+            .iter()
+            .map(|group| {
+                let mut arguments =
+                    vec![Any::from(tvm_ffi::String::from(group.group.name.as_str()))];
+                arguments.extend(functions(group).arguments());
+                construct.call_values(&arguments)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Any::from(crate::ffi::list(natives)))
+    }
+
+    /// The collective functions of the communicator `name`.
+    pub fn functions(&self, name: &str) -> Option<CollectiveFunctions> {
+        self.groups
+            .iter()
+            .find(|group| group.group.name == name)
+            .map(functions)
     }
 
     /// Destroy the communicators collectively after every graph and call
@@ -569,9 +628,59 @@ fn integers(value: &AnyView<'_>) -> Result<Vec<i64>> {
 /// issued and each pending token's completion event.
 type Started = (i64, std::collections::HashMap<i64, Arc<Event>>);
 
-/// The TVM-FFI functions of one group's communicator. Roots and peers are
-/// process-world ranks; `all_to_all` splits count leading-axis rows.
-fn table(group: &GroupComm) -> Any {
+/// The TVM-FFI functions of one group's communicator, which the library's
+/// `NativeCollectives` calls. Roots and peers are process-world ranks;
+/// `all_to_all` splits count leading-axis rows.
+pub struct CollectiveFunctions {
+    /// `(value, op)`: op 0 sums, 2 takes the maximum and 3 the minimum.
+    pub all_reduce: tvm_ffi::Function,
+    /// `(output, value)`.
+    pub all_gather: tvm_ffi::Function,
+    /// `(output, value)`, returning the token `wait` joins.
+    pub start_all_gather: tvm_ffi::Function,
+    /// `(output, value)`, returning the token `wait` joins.
+    pub start_all_to_all: tvm_ffi::Function,
+    /// `(token, stream)`: join a started collective on a CUDA stream.
+    pub wait: tvm_ffi::Function,
+    /// `(output, value, output_splits, input_splits)`.
+    pub all_to_all: tvm_ffi::Function,
+    /// `(outputs, value, root)`.
+    pub gather: tvm_ffi::Function,
+    /// `(value, root)`.
+    pub broadcast: tvm_ffi::Function,
+    /// `(output, value)`.
+    pub reduce_scatter: tvm_ffi::Function,
+    /// `(value, peer)`.
+    pub send: tvm_ffi::Function,
+    /// `(value, peer)`.
+    pub recv: tvm_ffi::Function,
+    /// `(output, value, destination, source)`.
+    pub send_recv: tvm_ffi::Function,
+}
+
+impl CollectiveFunctions {
+    /// The functions in the order `NativeCollectives` takes them after the
+    /// communicator's name.
+    fn arguments(self) -> [Any; 12] {
+        [
+            self.all_reduce,
+            self.all_gather,
+            self.start_all_gather,
+            self.start_all_to_all,
+            self.wait,
+            self.all_to_all,
+            self.gather,
+            self.broadcast,
+            self.reduce_scatter,
+            self.send,
+            self.recv,
+            self.send_recv,
+        ]
+        .map(Any::from)
+    }
+}
+
+fn functions(group: &GroupComm) -> CollectiveFunctions {
     type Call = dyn Fn(&mut StreamCommunicator<()>, &[AnyView<'_>]) -> Result<Any>;
     let mut ranks: Vec<usize> = group.group.ranks.clone();
     ranks.sort_unstable();
@@ -626,7 +735,7 @@ fn table(group: &GroupComm) -> Any {
             },
         ) as Box<Call>
     };
-    let wait = {
+    let joined = {
         let tokens = Arc::clone(&tokens);
         Box::new(
             move |comm: &mut StreamCommunicator<()>, args: &[AnyView<'_>]| -> Result<Any> {
@@ -653,224 +762,208 @@ fn table(group: &GroupComm) -> Any {
     let send_peer = peer.clone();
     let recv_peer = peer.clone();
     let pair_peer = peer;
-    crate::ffi::Fields::new()
-        .with(
-            "all_reduce",
-            function(Box::new(|comm, args| {
-                let [value, op] = args else {
-                    return Err(Error::Invalid("all_reduce takes a value and an op".into()));
-                };
-                let (data, count, kind) = operand(value)?;
-                let op = match integer(op)? {
-                    0 => ReduceOp::Sum,
-                    2 => ReduceOp::Max,
-                    3 => ReduceOp::Min,
-                    other => return Err(Error::Invalid(format!("unknown reduction {other}"))),
-                };
-                // SAFETY: a live device tensor of `count` elements.
-                unsafe { comm.all_reduce(data, count, kind, op) }?;
-                Ok(Any::default())
-            })),
-        )
-        .with(
-            "all_gather",
-            function(Box::new(|comm, args| {
-                let [output, value] = args else {
-                    return Err(Error::Invalid(
-                        "all_gather takes an output and a value".into(),
-                    ));
-                };
-                let (output, _, _) = operand(output)?;
-                let (input, count, kind) = operand(value)?;
-                // SAFETY: live device tensors sized for the group.
-                unsafe { comm.all_gather(output, input, count, kind, false) }?;
-                Ok(Any::default())
-            })),
-        )
-        .with("start_all_gather", function(started(false)))
-        .with("start_all_to_all", function(started(true)))
-        .with("wait", function(wait))
-        .with(
-            "all_to_all",
-            function(Box::new(|comm, args| {
-                let [output, value, output_splits, input_splits] = args else {
-                    return Err(Error::Invalid(
-                        "all_to_all takes an output, a value and two split lists".into(),
-                    ));
-                };
-                let (output, output_count, kind) = operand(output)?;
-                let (input, input_count, _) = operand(value)?;
-                let (output_splits, input_splits) =
-                    (integers(output_splits)?, integers(input_splits)?);
-                let size = comm_size(comm)?;
-                let equal = output_splits.is_empty()
-                    || (output_count == input_count
-                        && output_splits
-                            .iter()
-                            .chain(&input_splits)
-                            .all(|&split| split == output_splits[0]));
-                if equal {
-                    // SAFETY: live device tensors of `size` equal blocks.
-                    unsafe { comm.all_to_all(output, input, input_count / size, kind, false) }?;
-                    return Ok(Any::default());
-                }
-                let rows_out: i64 = output_splits.iter().sum();
-                let rows_in: i64 = input_splits.iter().sum();
-                let (row_out, row_in) = (
-                    output_count / rows_out.max(1) as usize,
-                    input_count / rows_in.max(1) as usize,
-                );
-                let element = bytes_of(kind);
-                comm.grouped(|comm| {
-                    let (mut sent, mut received) = (0_usize, 0_usize);
-                    for peer in 0..size {
-                        let rows_sent = input_splits[peer] as usize * row_in;
-                        let rows_received = output_splits[peer] as usize * row_out;
-                        // SAFETY: disjoint row ranges of live tensors.
-                        unsafe {
-                            if rows_sent > 0 {
-                                comm.send(
-                                    input + (sent * element) as u64,
-                                    rows_sent,
-                                    kind,
-                                    peer as i32,
-                                )?;
-                            }
-                            if rows_received > 0 {
-                                comm.recv(
-                                    output + (received * element) as u64,
-                                    rows_received,
-                                    kind,
-                                    peer as i32,
-                                )?;
-                            }
-                        }
-                        sent += rows_sent;
-                        received += rows_received;
-                    }
-                    Ok(())
-                })?;
-                Ok(Any::default())
-            })),
-        )
-        .with(
-            "gather",
-            function(Box::new(move |comm, args| {
-                let [outputs, value, root] = args else {
-                    return Err(Error::Invalid(
-                        "gather takes outputs, a value and a root".into(),
-                    ));
-                };
-                let root = gather_peer(root)?;
-                let (input, count, kind) = operand(value)?;
-                let outputs: tvm_ffi::Array<Any> = tvm_ffi::Array::try_from(Any::from(*outputs))
-                    .map_err(|error| Error::numerical("collective", &error))?;
-                let outputs = outputs
+    let all_reduce = function(Box::new(|comm, args| {
+        let [value, op] = args else {
+            return Err(Error::Invalid("all_reduce takes a value and an op".into()));
+        };
+        let (data, count, kind) = operand(value)?;
+        let op = match integer(op)? {
+            0 => ReduceOp::Sum,
+            2 => ReduceOp::Max,
+            3 => ReduceOp::Min,
+            other => return Err(Error::Invalid(format!("unknown reduction {other}"))),
+        };
+        // SAFETY: a live device tensor of `count` elements.
+        unsafe { comm.all_reduce(data, count, kind, op) }?;
+        Ok(Any::default())
+    }));
+    let all_gather = function(Box::new(|comm, args| {
+        let [output, value] = args else {
+            return Err(Error::Invalid(
+                "all_gather takes an output and a value".into(),
+            ));
+        };
+        let (output, _, _) = operand(output)?;
+        let (input, count, kind) = operand(value)?;
+        // SAFETY: live device tensors sized for the group.
+        unsafe { comm.all_gather(output, input, count, kind, false) }?;
+        Ok(Any::default())
+    }));
+    let start_all_gather = function(started(false));
+    let start_all_to_all = function(started(true));
+    let wait = function(joined);
+    let all_to_all = function(Box::new(|comm, args| {
+        let [output, value, output_splits, input_splits] = args else {
+            return Err(Error::Invalid(
+                "all_to_all takes an output, a value and two split lists".into(),
+            ));
+        };
+        let (output, output_count, kind) = operand(output)?;
+        let (input, input_count, _) = operand(value)?;
+        let (output_splits, input_splits) = (integers(output_splits)?, integers(input_splits)?);
+        let size = comm_size(comm)?;
+        let equal = output_splits.is_empty()
+            || (output_count == input_count
+                && output_splits
                     .iter()
-                    .map(|output| operand(&AnyView::from(&output)).map(|(address, ..)| address))
-                    .collect::<Result<Vec<_>>>()?;
-                let rank = comm_rank(comm)?;
-                comm.grouped(|comm| {
-                    // SAFETY: live device tensors of `count` elements each.
-                    unsafe {
-                        if rank == root {
-                            for (peer, &output) in outputs.iter().enumerate() {
-                                if peer as i32 == root {
-                                    comm.send(input, count, kind, root)?;
-                                }
-                                comm.recv(output, count, kind, peer as i32)?;
-                            }
-                        } else {
+                    .chain(&input_splits)
+                    .all(|&split| split == output_splits[0]));
+        if equal {
+            // SAFETY: live device tensors of `size` equal blocks.
+            unsafe { comm.all_to_all(output, input, input_count / size, kind, false) }?;
+            return Ok(Any::default());
+        }
+        let rows_out: i64 = output_splits.iter().sum();
+        let rows_in: i64 = input_splits.iter().sum();
+        let (row_out, row_in) = (
+            output_count / rows_out.max(1) as usize,
+            input_count / rows_in.max(1) as usize,
+        );
+        let element = bytes_of(kind);
+        comm.grouped(|comm| {
+            let (mut sent, mut received) = (0_usize, 0_usize);
+            for peer in 0..size {
+                let rows_sent = input_splits[peer] as usize * row_in;
+                let rows_received = output_splits[peer] as usize * row_out;
+                // SAFETY: disjoint row ranges of live tensors.
+                unsafe {
+                    if rows_sent > 0 {
+                        comm.send(
+                            input + (sent * element) as u64,
+                            rows_sent,
+                            kind,
+                            peer as i32,
+                        )?;
+                    }
+                    if rows_received > 0 {
+                        comm.recv(
+                            output + (received * element) as u64,
+                            rows_received,
+                            kind,
+                            peer as i32,
+                        )?;
+                    }
+                }
+                sent += rows_sent;
+                received += rows_received;
+            }
+            Ok(())
+        })?;
+        Ok(Any::default())
+    }));
+    let gather = function(Box::new(move |comm, args| {
+        let [outputs, value, root] = args else {
+            return Err(Error::Invalid(
+                "gather takes outputs, a value and a root".into(),
+            ));
+        };
+        let root = gather_peer(root)?;
+        let (input, count, kind) = operand(value)?;
+        let outputs: tvm_ffi::Array<Any> = tvm_ffi::Array::try_from(Any::from(*outputs))
+            .map_err(|error| Error::numerical("collective", &error))?;
+        let outputs = outputs
+            .iter()
+            .map(|output| operand(&AnyView::from(&output)).map(|(address, ..)| address))
+            .collect::<Result<Vec<_>>>()?;
+        let rank = comm_rank(comm)?;
+        comm.grouped(|comm| {
+            // SAFETY: live device tensors of `count` elements each.
+            unsafe {
+                if rank == root {
+                    for (peer, &output) in outputs.iter().enumerate() {
+                        if peer as i32 == root {
                             comm.send(input, count, kind, root)?;
                         }
+                        comm.recv(output, count, kind, peer as i32)?;
                     }
-                    Ok(())
-                })?;
-                Ok(Any::default())
-            })),
-        )
-        .with(
-            "broadcast",
-            function(Box::new(move |comm, args| {
-                let [value, root] = args else {
-                    return Err(Error::Invalid("broadcast takes a value and a root".into()));
-                };
-                let (data, count, kind) = operand(value)?;
-                // SAFETY: a live device tensor of `count` elements.
-                unsafe { comm.broadcast(data, count, kind, broadcast_peer(root)?) }?;
-                Ok(Any::default())
-            })),
-        )
-        .with(
-            "reduce_scatter",
-            function(Box::new(|comm, args| {
-                let [output, value] = args else {
-                    return Err(Error::Invalid(
-                        "reduce_scatter takes an output and a value".into(),
-                    ));
-                };
-                let (output, count, kind) = operand(output)?;
-                let (input, _, _) = operand(value)?;
-                // SAFETY: live device tensors sized for the group.
-                unsafe { comm.reduce_scatter(output, input, count, kind) }?;
-                Ok(Any::default())
-            })),
-        )
-        .with(
-            "send",
-            function(Box::new(move |comm, args| {
-                let [value, peer] = args else {
-                    return Err(Error::Invalid("send takes a value and a peer".into()));
-                };
-                let (data, count, kind) = operand(value)?;
-                // SAFETY: a live device tensor of `count` elements.
-                unsafe { comm.send(data, count, kind, send_peer(peer)?) }?;
-                Ok(Any::default())
-            })),
-        )
-        .with(
-            "recv",
-            function(Box::new(move |comm, args| {
-                let [value, peer] = args else {
-                    return Err(Error::Invalid("recv takes a value and a peer".into()));
-                };
-                let (data, count, kind) = operand(value)?;
-                // SAFETY: a live device tensor of `count` elements.
-                unsafe { comm.recv(data, count, kind, recv_peer(peer)?) }?;
-                Ok(Any::default())
-            })),
-        )
-        .with(
-            "send_recv",
-            function(Box::new(move |comm, args| {
-                let [output, value, destination, source] = args else {
-                    return Err(Error::Invalid(
-                        "send_recv takes an output, a value, a destination and a source".into(),
-                    ));
-                };
-                let (output, output_count, output_kind) = operand(output)?;
-                let (input, input_count, input_kind) = operand(value)?;
-                let (destination, source) = (pair_peer(destination)?, pair_peer(source)?);
-                comm.grouped(|comm| {
-                    // SAFETY: live device tensors, exchanged as bytes.
-                    unsafe {
-                        comm.send(
-                            input,
-                            input_count * bytes_of(input_kind),
-                            DataType::Uint8,
-                            destination,
-                        )?;
-                        comm.recv(
-                            output,
-                            output_count * bytes_of(output_kind),
-                            DataType::Uint8,
-                            source,
-                        )?;
-                    }
-                    Ok(())
-                })?;
-                Ok(Any::default())
-            })),
-        )
-        .into_any()
+                } else {
+                    comm.send(input, count, kind, root)?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(Any::default())
+    }));
+    let broadcast = function(Box::new(move |comm, args| {
+        let [value, root] = args else {
+            return Err(Error::Invalid("broadcast takes a value and a root".into()));
+        };
+        let (data, count, kind) = operand(value)?;
+        // SAFETY: a live device tensor of `count` elements.
+        unsafe { comm.broadcast(data, count, kind, broadcast_peer(root)?) }?;
+        Ok(Any::default())
+    }));
+    let reduce_scatter = function(Box::new(|comm, args| {
+        let [output, value] = args else {
+            return Err(Error::Invalid(
+                "reduce_scatter takes an output and a value".into(),
+            ));
+        };
+        let (output, count, kind) = operand(output)?;
+        let (input, _, _) = operand(value)?;
+        // SAFETY: live device tensors sized for the group.
+        unsafe { comm.reduce_scatter(output, input, count, kind) }?;
+        Ok(Any::default())
+    }));
+    let send = function(Box::new(move |comm, args| {
+        let [value, peer] = args else {
+            return Err(Error::Invalid("send takes a value and a peer".into()));
+        };
+        let (data, count, kind) = operand(value)?;
+        // SAFETY: a live device tensor of `count` elements.
+        unsafe { comm.send(data, count, kind, send_peer(peer)?) }?;
+        Ok(Any::default())
+    }));
+    let recv = function(Box::new(move |comm, args| {
+        let [value, peer] = args else {
+            return Err(Error::Invalid("recv takes a value and a peer".into()));
+        };
+        let (data, count, kind) = operand(value)?;
+        // SAFETY: a live device tensor of `count` elements.
+        unsafe { comm.recv(data, count, kind, recv_peer(peer)?) }?;
+        Ok(Any::default())
+    }));
+    let send_recv = function(Box::new(move |comm, args| {
+        let [output, value, destination, source] = args else {
+            return Err(Error::Invalid(
+                "send_recv takes an output, a value, a destination and a source".into(),
+            ));
+        };
+        let (output, output_count, output_kind) = operand(output)?;
+        let (input, input_count, input_kind) = operand(value)?;
+        let (destination, source) = (pair_peer(destination)?, pair_peer(source)?);
+        comm.grouped(|comm| {
+            // SAFETY: live device tensors, exchanged as bytes.
+            unsafe {
+                comm.send(
+                    input,
+                    input_count * bytes_of(input_kind),
+                    DataType::Uint8,
+                    destination,
+                )?;
+                comm.recv(
+                    output,
+                    output_count * bytes_of(output_kind),
+                    DataType::Uint8,
+                    source,
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(Any::default())
+    }));
+    CollectiveFunctions {
+        all_reduce,
+        all_gather,
+        start_all_gather,
+        start_all_to_all,
+        wait,
+        all_to_all,
+        gather,
+        broadcast,
+        reduce_scatter,
+        send,
+        recv,
+        send_recv,
+    }
 }

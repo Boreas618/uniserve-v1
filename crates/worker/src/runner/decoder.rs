@@ -55,7 +55,8 @@ use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
 use crate::parallel::joins::GraphFunctions;
-use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_listing};
+use crate::profiling::kernels::KernelRecord;
+use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_records};
 use crate::runner::{ImageSetup, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
@@ -282,11 +283,10 @@ impl DecoderRunner {
         }
     }
 
-    /// The kernel listings (JSON arrays of records) of the decoder's
-    /// Python runners.
-    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
+    /// The kernels the operators of the decoder's Python runners selected.
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
         match &self.family {
-            Family::Image(image) => Ok(vec![kernel_listing(&image.kernels, &image.runner)?]),
+            Family::Image(image) => kernel_records(&image.kernels, &image.runner, DECODER),
             Family::Video(video) => video.kernels(),
             Family::Audio(audio) => audio.kernels(),
         }
@@ -1116,7 +1116,7 @@ impl VideoDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
         self.class
             .kernels(self.runners.iter().map(|(_, runner)| runner))
     }
@@ -1311,7 +1311,7 @@ impl AudioDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
         self.class.kernels(self.runners.values())
     }
 

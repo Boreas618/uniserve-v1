@@ -81,10 +81,10 @@ use crate::executor::forward::batch::{
 };
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{Backing, DType, Function, Handle, integer_list, list};
-use crate::model::bind::TextSize;
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
-use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_listing};
+use crate::profiling::kernels::KernelRecord;
+use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_records};
 use crate::runner::{ImageSetup, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{Metadata, OutputPlacement, ValueRange};
@@ -206,6 +206,13 @@ pub fn prepare_input(
         Any::from(pin),
     ])?;
     PreparedImage::from_value(facts, value)
+}
+
+/// The text workload an encoder's execution context is prepared for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSize {
+    pub tokens: usize,
+    pub rows: usize,
 }
 
 /// A vision patch encoder (`PatchEncoder`).
@@ -1460,10 +1467,10 @@ impl Conditions {
         Ok(())
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
-        let mut listings = self.video.kernels(self.video_runners.values())?;
-        listings.extend(self.audio.kernels(self.audio_runners.values())?);
-        Ok(listings)
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
+        let mut records = self.video.kernels(self.video_runners.values())?;
+        records.extend(self.audio.kernels(self.audio_runners.values())?);
+        Ok(records)
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1638,12 +1645,9 @@ impl EncoderRunner {
 
     /// The kernels the operators of the runner's execution context or of the
     /// condition encoders selected.
-    pub(crate) fn kernels(&self) -> Result<Vec<String>> {
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
         match (&self.context, &self.conditions) {
-            (Some(context), _) => Ok(vec![kernel_listing(
-                &context.kernels,
-                &self.methods.runner,
-            )?]),
+            (Some(context), _) => kernel_records(&context.kernels, &self.methods.runner, ENCODER),
             (_, Some(conditions)) => conditions.kernels(),
             _ => Ok(Vec::new()),
         }

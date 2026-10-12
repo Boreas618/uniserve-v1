@@ -10,7 +10,7 @@ keeping the original type name in the message and the original traceback.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any, TypeVar
 
 import torch
@@ -86,25 +86,3 @@ def translate(function: F) -> F:
             raise translated.with_traceback(error.__traceback__) from error
 
     return wrapper  # type: ignore[return-value]
-
-
-def binding(entries: Mapping[str, Any]) -> dict[str, Any]:
-    """Give the functions of a binding the interface's error kinds.
-
-    A ``*.bind`` entry returns a map of functions the worker calls for the
-    lifetime of the binding. The table wraps only the entry itself, so each
-    binding wraps its map here: a failure inside a bound function then
-    crosses the interface with the same kinds as a failure of a table entry.
-
-    Args:
-        entries: A binding's values by name.
-
-    Returns:
-        The same map with every callable value wrapped by
-        :func:`translate`; other values (constants a binding reports beside
-        its functions) are returned unchanged.
-    """
-    return {
-        name: translate(value) if callable(value) else value
-        for name, value in entries.items()
-    }
