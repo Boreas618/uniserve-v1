@@ -172,7 +172,7 @@ impl Opening {
     /// the batch's order after the text runtime's batches and the read of
     /// every readout's host-gated predicate: the job's completion carries
     /// one byte each.
-    fn open(context: &mut Context<'_>, job: &Job<'_>) -> Result<Self> {
+    fn open(context: &mut Context<'_>, job: &Job) -> Result<Self> {
         let started = Instant::now();
         let Context {
             info,
@@ -260,7 +260,7 @@ impl Opening {
     /// Lease the opened batch's output storage and record its reservation,
     /// forward, outputs and seal in `job`: the batch's last job, or the job
     /// that ends what a failed batch recorded.
-    fn run<'a>(self, context: Context<'_>, job: Job<'a>) -> (Option<Job<'a>>, Pending) {
+    fn run(self, context: Context<'_>, job: Job) -> (Option<Job>, Pending) {
         let Self {
             mut states,
             reports,
@@ -278,7 +278,7 @@ impl Opening {
             ..
         } = context;
         let reserve = Failure::new("batch registration");
-        let ended = |job: Job<'a>, failure: Failure| {
+        let ended = |job: Job, failure: Failure| {
             if job.is_empty() {
                 (None, Pending::Failed(failure))
             } else {
@@ -473,7 +473,7 @@ impl RequestStorage for DiffusionLMRunner {
 }
 
 /// One batch on the runner, recording into its job.
-struct Batch<'a, 'j> {
+struct Batch<'a> {
     runner: &'a DiffusionLMRunner,
     experts: Option<&'a Arc<ExpertUnion>>,
     requests: &'a mut RequestPool,
@@ -482,10 +482,10 @@ struct Batch<'a, 'j> {
     events: &'a Arc<EventPool>,
     plan: &'a BatchPlan,
     stream: Option<&'a Stream>,
-    job: &'a Job<'j>,
+    job: &'a Job,
 }
 
-impl Batch<'_, '_> {
+impl Batch<'_> {
     /// The expert steps of this runner's forwards.
     fn expert(&self) -> Option<Expert<'_>> {
         self.experts.map(|union| Expert {
@@ -956,7 +956,7 @@ pub(crate) fn forward<'a>(
     backend: &'a mut WorkerBackend,
     batch: &'a mut WorkerBatch,
     kind: CallKind,
-) -> std::result::Result<Option<Job<'a>>, WorkerError> {
+) -> std::result::Result<Option<Job>, WorkerError> {
     let experts = backend.experts().cloned();
     let state = match batch.denoising_parts().1.take() {
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),

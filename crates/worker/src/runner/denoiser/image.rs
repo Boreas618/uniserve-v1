@@ -435,7 +435,7 @@ impl ImageDiffusion {
         width: u32,
         seed: u64,
         index: u32,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let runner = Argument::Handle(self.methods.runner.clone());
         let noise = Argument::Tensor(self.noise.clone());
@@ -542,7 +542,7 @@ impl ImageDiffusion {
         rows: &[DenoiseRow],
         tables: &BlockTables,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Predicted> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
@@ -609,7 +609,7 @@ impl ImageDiffusion {
         rows: &[ConditionRow],
         tables: &BlockTables,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
@@ -660,7 +660,7 @@ impl ImageDiffusion {
 
     /// Combine each image's branch predictions and advance its samples by
     /// one solver step, on the sample stream.
-    pub(crate) fn integrate(&self, rows: &[IntegrateRow], job: &Job<'_>) {
+    pub(crate) fn integrate(&self, rows: &[IntegrateRow], job: &Job) {
         if rows.is_empty() {
             return;
         }
@@ -1000,7 +1000,7 @@ impl ImageBatch<'_> {
         stats
     }
 
-    fn record_latents(&mut self, job: &Job<'_>) -> Result<ForwardStats> {
+    fn record_latents(&mut self, job: &Job) -> Result<ForwardStats> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
         let mut trajectories = Vec::new();
@@ -1242,7 +1242,7 @@ impl ImageBatch<'_> {
     /// completed before the step is recorded.
     fn begin_denoise(
         &mut self,
-        job: &Job<'_>,
+        job: &Job,
         text: Option<&mut CausalLMRunners>,
         experts: Option<&Arc<ExpertUnion>>,
     ) -> Result<Progress> {
@@ -1381,7 +1381,7 @@ impl ImageBatch<'_> {
     /// last job evaluated, with that job's completion.
     fn denoise_steps(
         &mut self,
-        job: &Job<'_>,
+        job: &Job,
         state: Denoising,
         mut resumed: Option<(Stepping, Fills, Step, &mut Completion)>,
         mut text: Option<&mut CausalLMRunners>,
@@ -1558,7 +1558,7 @@ impl ImageBatch<'_> {
     /// export.
     fn denoise_step(
         &mut self,
-        job: &Job<'_>,
+        job: &Job,
         trajectories: &[(Trajectory, ImageParams)],
         scratch: &[Scratch],
         stepping: &Stepping,
