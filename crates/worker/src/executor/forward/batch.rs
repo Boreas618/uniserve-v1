@@ -38,7 +38,9 @@ use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
 use crate::storage::OutputLease;
+use crate::storage::ProductExport;
 use crate::storage::Scalar;
+use crate::stream::Issue;
 use crate::transfer::exports::Location;
 use crate::worker::RankStorage;
 use crate::{Error, LatentUpdate, OutputPool, ProductBuffer, Result};
@@ -80,6 +82,9 @@ pub(crate) struct CallState {
     /// point (host products when their task wrote them), so releasing a
     /// product revokes them; revoked when the batch fails before.
     pub(crate) publications: Publications,
+    /// The exports the call's forward issued, located when the batch
+    /// commits: their device work is performed by then.
+    exports: Vec<(ProductBuffer, ProductExport)>,
     pub(crate) latent: Option<LatentUpdate>,
     pub(crate) tasks: Vec<Arc<HostTask<MediaTask>>>,
     pub(crate) publication: Option<Publication>,
@@ -98,6 +103,40 @@ impl CallState {
     ) -> Result<()> {
         self.publications
             .accept(buffer, locations, export, &mut self.pending)
+    }
+
+    /// Issue the export of `write`, the call's output `product`, to
+    /// `stream`, behind the work that produced it.
+    fn export(
+        &mut self,
+        owners: ProductOwners<'_>,
+        call: &Call,
+        product: &TensorRef,
+        write: &ProductBuffer,
+        host: bool,
+        stream: impl Issue,
+    ) -> Result<()> {
+        let export = owners.store.export_buffer(
+            call,
+            product,
+            write,
+            owners.transports,
+            host,
+            None,
+            stream,
+        )?;
+        self.exports.push((write.clone(), export));
+        Ok(())
+    }
+
+    /// Publish the exports the call's forward issued, once their work was
+    /// performed: each joins the call's completion products.
+    fn locate(&mut self, store: &crate::TensorStore) -> Result<()> {
+        for (write, export) in std::mem::take(&mut self.exports) {
+            let (export, locations) = store.located(&write, export)?;
+            self.publish(write.id(), locations, export)?;
+        }
+        Ok(())
     }
 }
 
@@ -194,6 +233,7 @@ impl MediaBatch {
                 writes: Vec::new(),
                 completion: None,
                 publications: Publications::default(),
+                exports: Vec::new(),
                 latent: None,
                 tasks: Vec::new(),
                 publication: None,
@@ -239,7 +279,8 @@ impl MediaBatch {
             .cloned()
             .collect();
         owners.store.validate_writes(&writes)?;
-        for call in &self.calls {
+        for call in &mut self.calls {
+            call.locate(owners.store)?;
             call.publications.validate(owners.store)?;
         }
         let updates: Vec<LatentUpdate> = self
@@ -475,6 +516,9 @@ impl MediaBatch {
                     tracing::warn!(target: "uniserve_worker.media", "withdrawing a host media task failed: {error}");
                 }
             }
+            call.exports
+                .drain(..)
+                .for_each(|(_, export)| export.revoke());
             result = result.and(call.publications.revoke());
         }
         if self.committed {
@@ -821,17 +865,7 @@ pub(crate) fn publish(
     let owners = parts.owners();
     let stream = stream_of(batch)?;
     owners.store.produced(write, shape, Some(&stream), None)?;
-    let (exported, locations) = export(
-        owners,
-        call,
-        &call.outputs[0],
-        write,
-        false,
-        None,
-        Some(&stream),
-    )?;
-    batch.calls[index].publish(write.id(), locations, exported)?;
-    Ok(())
+    batch.calls[index].export(owners, call, &call.outputs[0], write, false, Some(&stream))
 }
 
 /// Publish a call's first output, whose bound view the producer filled, and
@@ -854,15 +888,5 @@ pub(crate) fn publish_bound(
     owners
         .store
         .write(write, &write.view(), Some(&stream), None)?;
-    let (exported, locations) = export(
-        owners,
-        call,
-        &call.outputs[0],
-        write,
-        host,
-        None,
-        Some(&stream),
-    )?;
-    batch.calls[index].publish(write.id(), locations, exported)?;
-    Ok(())
+    batch.calls[index].export(owners, call, &call.outputs[0], write, host, Some(&stream))
 }
