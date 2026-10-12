@@ -1,18 +1,24 @@
 //! Numerical execution of a batch's calls, by capability.
 //!
-//! Every batch carries calls of one kind on one component. [`execute`]
-//! routes it to what serves the kind: text (`runner::causal_lm`), the
-//! diffusion LM runner (`runner::diffusion_lm`), image batches
-//! (`batch::image`), a video model's media batches (`batch`), host media
-//! (`media`), transfers (`transfer`); expert-only ranks participate in
-//! expert steps through `experts`. These modules are the integration seam
-//! of the capabilities: each owns its runners, its own input preparation
-//! and result materialization. Inputs imported
-//! from other ranks and workers are prepared for every runtime alike
-//! (`inputs`), and products are published to them alike (`products`). A
-//! runtime that has not been integrated reports its call kind as
-//! unsupported, which fails the batch with `UnsupportedSetup` and leaves
-//! the rank serving.
+//! Every batch carries calls of one kind on one component, and its forward
+//! is a sequence of jobs of its lane: [`forward`] prepares the next job and
+//! [`complete`] applies its completion. The first job completes the
+//! batch's imported inputs; the others belong to what serves the kind: text
+//! (`runner::causal_lm`), the diffusion LM runner (`runner::diffusion_lm`),
+//! image batches (`batch::image`), a video model's media batches (`batch`),
+//! host media (`media`), transfers (`transfer`); expert-only ranks
+//! participate in expert steps through `experts`. These modules are the
+//! integration seam of the capabilities: each owns its runners, its own
+//! input preparation and result materialization. Inputs imported from other
+//! ranks and workers are prepared for every runtime alike (`inputs`), and
+//! products are published to them alike (`products`). A runtime that has
+//! not been integrated reports its call kind as unsupported, which fails
+//! the batch with `UnsupportedSetup` and leaves the rank serving.
+//!
+//! A text batch's jobs are operations its runner recorded. The forward of
+//! every other capability, and the completion of imported inputs, still
+//! issue their own stream work: each is one job holding that work as
+//! [`Job::forward`], until its capability is converted.
 
 pub(crate) mod batch;
 pub(crate) mod inputs;
@@ -29,7 +35,20 @@ use super::backend::{WorkerBackend, WorkerBatch};
 use crate::Error;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
+use crate::lane::{Completion, Job};
 use crate::model::components::Capability;
+
+/// Where a batch's forward stands between its jobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Its imported inputs are not resident yet.
+    #[default]
+    Inputs,
+    /// Its capability's forward has jobs to run.
+    Forward,
+    /// Nothing is left for its lane.
+    Done,
+}
 
 /// Materialize launched work whose device results are ready.
 pub(crate) fn poll(
@@ -99,8 +118,100 @@ fn kind_name(kind: CallKind) -> &'static str {
     }
 }
 
-/// Execute a batch's calls on the runtime serving their kind.
-pub(crate) fn execute(
+/// The next job of a batch's forward at its stage: the completion of its
+/// imported inputs, then the jobs of the runtime serving `kind`. `None`
+/// when the stage advanced without needing the lane.
+pub(crate) fn forward<'a>(
+    backend: &'a mut WorkerBackend,
+    batch: &'a mut WorkerBatch,
+    kind: CallKind,
+) -> std::result::Result<Option<Job<'a>>, WorkerError> {
+    use CallKind::Forward;
+
+    match batch.stage() {
+        Stage::Inputs if batch.plan().input_products.is_empty() => {
+            // Nothing was imported: what remains is a check of resident
+            // KV descriptors, which issues nothing.
+            let completed = inputs::complete(backend, batch);
+            imported(backend, batch, completed)?;
+            Ok(None)
+        }
+        Stage::Inputs => {
+            let job = Job::new();
+            job.forward(move || {
+                let completed = inputs::complete(backend, batch);
+                batch.set_issued(completed);
+            });
+            Ok(Some(job))
+        }
+        Stage::Forward => match kind {
+            Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
+                crate::runner::causal_lm::forward(backend, batch, kind)
+            }
+            _ => {
+                let job = Job::new();
+                job.forward(move || {
+                    let executed = execute(backend, batch, kind);
+                    batch.set_executed(executed);
+                });
+                Ok(Some(job))
+            }
+        },
+        Stage::Done => Ok(None),
+    }
+}
+
+/// Apply the completion of the job [`forward`] prepared last.
+pub(crate) fn complete(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    kind: CallKind,
+    completion: Completion,
+) -> std::result::Result<(), WorkerError> {
+    use CallKind::Forward;
+
+    if batch.stage() == Stage::Inputs {
+        let completed = batch
+            .take_issued()
+            .unwrap_or(Err(Error::State("the input completion did not run")));
+        return imported(backend, batch, completed);
+    }
+    match kind {
+        Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
+            crate::runner::causal_lm::complete(backend, batch, completion)
+        }
+        _ => {
+            batch.set_stage(Stage::Done);
+            batch.take_executed().unwrap_or_else(|| {
+                Err(WorkerError::classify(
+                    Error::State("the forward did not run"),
+                    None,
+                ))
+            })
+        }
+    }
+}
+
+/// Continue with the forward once the imported inputs are resident; an
+/// import that failed fails the batch's calls.
+fn imported(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    completed: crate::Result<()>,
+) -> std::result::Result<(), WorkerError> {
+    match completed {
+        Ok(()) => batch.set_stage(Stage::Forward),
+        Err(error) => {
+            batch.set_stage(Stage::Done);
+            fail(backend, batch, error, "input import")?;
+        }
+    }
+    Ok(())
+}
+
+/// Execute a batch's calls on the runtime serving their kind, for the
+/// capabilities whose forward issues its own stream work.
+fn execute(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
     kind: CallKind,
@@ -110,7 +221,7 @@ pub(crate) fn execute(
 
     match kind {
         Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
-            crate::runner::causal_lm::execute(backend, batch, kind)
+            Err(unsupported(kind, "text"))
         }
         Forward(ForwardMode::TokenDenoising) => {
             crate::runner::diffusion_lm::execute(backend, batch, kind)

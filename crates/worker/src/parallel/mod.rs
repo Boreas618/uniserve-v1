@@ -13,7 +13,7 @@ pub mod topology;
 mod weight_prefetch;
 pub mod world;
 
-pub use collectives::{CollectiveGroup, StreamCollectives, StreamCommunicator};
+pub use collectives::{CollectiveGroup, PeerGroup, StreamCollectives, StreamCommunicator};
 pub(crate) use expert_union::{ExpertStart, ExpertUnion, ExpertWarmup, join_step};
 pub use experts::{Agreement, ExpertExchange, ExpertParallel, ExpertPlan, ExpertTransport};
 pub(crate) use microbatches::MicrobatchForward;

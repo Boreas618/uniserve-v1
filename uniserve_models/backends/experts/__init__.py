@@ -45,38 +45,59 @@ __all__ = [
 class HostBootstrap:
     """Host collectives over the serving runtime's host group.
 
-    ``host`` is the map of host functions the worker supplies: ``rank``,
-    ``size``, ``all_gather(bytes) -> [bytes]``, ``broadcast(bytes | None,
-    root) -> bytes``, ``barrier()`` and ``split(color, key) -> map``. Objects
-    travel pickled. Every member calls the same collectives in the same
-    order.
+    The worker constructs this over its host functions. Objects travel
+    pickled. Every member calls the same collectives in the same order.
+
+    Args:
+        rank: This member's index in the group.
+        size: The group's member count.
+        all_gather: ``(bytes) -> [bytes]``, every member's bytes in member
+            order.
+        broadcast: ``(bytes | None, root) -> bytes``, the root's bytes.
+        barrier: ``()`` returns once every member has entered it.
+        split: ``(color, key)`` returns the arguments of the
+            ``HostBootstrap`` over the members of equal ``color``, in this
+            order.
     """
 
-    def __init__(self, host: Mapping[str, Any]) -> None:
-        self.host = host
+    def __init__(
+        self,
+        rank: int,
+        size: int,
+        all_gather: Callable[..., Any],
+        broadcast: Callable[..., Any],
+        barrier: Callable[..., Any],
+        split: Callable[..., Any],
+    ) -> None:
+        self._rank = int(rank)
+        self._size = int(size)
+        self._all_gather = all_gather
+        self._broadcast = broadcast
+        self._barrier = barrier
+        self._split = split
 
     def Get_rank(self) -> int:  # noqa: N802 - FlashInfer's CommBackend
-        return int(self.host["rank"])
+        return self._rank
 
     def Get_size(self) -> int:  # noqa: N802 - FlashInfer's CommBackend
-        return int(self.host["size"])
+        return self._size
 
     def allgather(self, data: Any) -> tuple[Any, ...]:
         """Every member's object, in member order."""
-        values = self.host["all_gather"](pickle.dumps(data))
+        values = self._all_gather(pickle.dumps(data))
         return tuple(pickle.loads(bytes(value)) for value in values)
 
     def bcast(self, data: Any, root: int) -> Any:
         """``root``'s object on every member; others' ``data`` is ignored."""
-        payload = pickle.dumps(data) if self.Get_rank() == root else None
-        return pickle.loads(bytes(self.host["broadcast"](payload, int(root))))
+        payload = pickle.dumps(data) if self._rank == root else None
+        return pickle.loads(bytes(self._broadcast(payload, int(root))))
 
     def barrier(self) -> None:
-        self.host["barrier"]()
+        self._barrier()
 
     def Split(self, color: int, key: int) -> HostBootstrap:  # noqa: N802
         """Members of equal ``color`` ordered by ``(key, member)``."""
-        return HostBootstrap(self.host["split"](int(color), int(key)))
+        return HostBootstrap(*self._split(int(color), int(key)))
 
 
 class TorchBootstrap:

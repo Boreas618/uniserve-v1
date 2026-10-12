@@ -16,7 +16,6 @@ configuration alone, so a rank without the decoders' weights asks them too.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, cast
 
@@ -34,7 +33,7 @@ from uniserve_models.model import (
     VideoDecoder,
     VideoPostprocessor,
 )
-from uniserve_models.runner.context import execution_context
+from uniserve_models.runner.context import execution_context, kernel_records
 from uniserve_models.tensors import BufferConfig
 
 __all__ = ["DecoderRunner"]
@@ -493,13 +492,9 @@ class DecoderRunner:
                 raise ValueError("audio units disagree with their output rows")
             torch.cat(outputs, out=out)
 
-    def kernels(self) -> str:
-        """The kernels the runner's operators selected.
-
-        A JSON array of records, one per prepared operator, each with its
-        layer ``path``.
-        """
-        return json.dumps(list(self._context.kernels()))
+    def kernels(self) -> list[str]:
+        """The kernels the runner's operators selected, as JSON objects."""
+        return kernel_records(self._context.kernels())
 
     def close(self, aborted: bool) -> None:
         """Release the runner's operators and workspace.

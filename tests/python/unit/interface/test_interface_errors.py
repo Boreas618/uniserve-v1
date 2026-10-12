@@ -50,15 +50,3 @@ def test_translation_keeps_results_and_the_original_cause():
         errors.translate(raises)()
     assert isinstance(raised.value.__cause__, ValueError)
     assert raised.value.__traceback__ is not None
-
-
-def test_bound_functions_report_failures_with_their_kind():
-    def step():
-        raise torch.OutOfMemoryError("CUDA out of memory")
-
-    # The worker receives a binding as a map of TVM-FFI functions.
-    bound = tvm_ffi.convert(errors.binding({"step": step, "rate": 24}))
-    with pytest.raises(errors.OutOfMemory) as raised:
-        bound["step"]()
-    assert str(raised.value).startswith("OutOfMemoryError: ")
-    assert bound["rate"] == 24

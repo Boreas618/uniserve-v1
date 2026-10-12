@@ -776,7 +776,7 @@ pub(crate) fn execute(
         tensors,
         events,
         text: parts.text.map(|text| text.order()),
-        experts: parts.experts,
+        experts: parts.experts.map(|experts| &**experts),
     };
     let failure = match runner.forward(context, &plan) {
         Ok(launched) => {

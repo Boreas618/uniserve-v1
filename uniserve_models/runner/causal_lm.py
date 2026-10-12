@@ -51,6 +51,7 @@ from uniserve_models.model import (
     EmbeddingReplacement,
     Logits,
     TextInput,
+    TextSize,
     VocabShard,
 )
 from uniserve_models.nn.attention import (
@@ -63,6 +64,7 @@ from uniserve_models.nn.attention.gather import (
     gather_request_decode_inputs,
     gather_request_rows,
 )
+from uniserve_models.runner.context import execution_context, kernel_records
 from uniserve_models.sampling.greedy import greedy
 from uniserve_models.sampling.logprobs import (
     LogprobRequest,
@@ -170,11 +172,21 @@ class CausalLMRunner:
     """The forwards of one causal language model on one stream.
 
     Args:
-        prepared: The prepared component: its module is the ``CausalLM``
-            and its execution context holds the operators and the prefix
-            cache.
+        loaded: The loaded model.
+        path: The ``CausalLM``'s module path in the model; empty for the
+            model itself.
+        device: The CUDA ordinal the forwards compute on, -1 on the host.
         stream: The CUDA stream handle every forward enqueues on (0 on
             CPU).
+        scratch: The transient work areas of the stream, which every
+            execution context serialized on it borrows.
+        cache: The prefix cache view object the attention layers read.
+        experts: The expert exchange routed experts communicate through,
+            or ``None``.
+        weights: The distributed expert weights' prefetch object, or
+            ``None``.
+        collectives: The ``NativeCollectives`` of the model's communicators
+            on the stream, or ``None``.
         rows: The most rows one forward evaluates.
         tokens: The most tokens one forward evaluates.
         width: The most pages one row selects from a block table.
@@ -198,12 +210,22 @@ class CausalLMRunner:
 
     Construction shares the vocabulary descriptor over the pipeline group,
     so the ranks of a group construct their runners in the same order.
+
+    ``context`` is the runner's execution context, through which an idle
+    rank joins expert steps.
     """
 
     def __init__(
         self,
-        prepared,
+        loaded,
+        path: str,
+        device: int,
         stream: int,
+        scratch,
+        cache,
+        experts,
+        weights,
+        collectives,
         rows: int,
         tokens: int,
         width: int,
@@ -220,11 +242,24 @@ class CausalLMRunner:
         penalty_counts: torch.Tensor,
         prompt_logits: torch.Tensor,
     ) -> None:
-        context = prepared.context
-        if context is None:
-            raise ValueError("a runner requires a bound component")
-        self._context = context
-        self._model = prepared.module
+        path = str(path)
+        self._model = (
+            loaded.module.get_submodule(path) if path else loaded.module
+        )
+        context = execution_context(
+            self._model,
+            int(stream),
+            loaded.attention,
+            scratch,
+            device=int(device),
+            cache=cache,
+            experts=experts,
+            weights=weights,
+            collectives=collectives,
+        )
+        # The operators are prepared for the largest forward.
+        context.prepare(TextSize(int(tokens), int(rows)))
+        self.context = self._context = context
         self._page_tokens = tuple(int(value) for value in page_tokens)
         self._windowed = tuple(bool(value) for value in windowed)
 
@@ -239,11 +274,12 @@ class CausalLMRunner:
         self._penalty_counts = penalty_counts
         self._prompt_logits = prompt_logits
 
-        device = unit_tables.device
-        self._device = device
+        # The state tensors live on the device the forwards compute on.
+        placed = unit_tables.device
+        self._device = placed
         self._stream = (
-            torch.cuda.ExternalStream(int(stream), device=device)
-            if device.type == "cuda"
+            torch.cuda.ExternalStream(int(stream), device=placed)
+            if placed.type == "cuda"
             else None
         )
         self._pipeline, self._vocab, self._tensor = _vocabulary(self._model)
@@ -257,7 +293,7 @@ class CausalLMRunner:
         with self._scope():
 
             def zeros(*shape: int) -> torch.Tensor:
-                return torch.zeros(shape, dtype=torch.int32, device=device)
+                return torch.zeros(shape, dtype=torch.int32, device=placed)
 
             self._block_tables = zeros(tables, rows, int(width))
             self._start_pages = zeros(tables, rows)
@@ -266,15 +302,15 @@ class CausalLMRunner:
             self._query_offsets = zeros(rows + 1)
             self._prefix_offsets = zeros(rows + 1)
             self._write_indices = torch.full(
-                (tables, tokens), -1, dtype=torch.int64, device=device
+                (tables, tokens), -1, dtype=torch.int64, device=placed
             )
 
             # The tokens and positions a decode gathers from the slot state.
             self._decode_ids = torch.ones(
-                rows, dtype=torch.int64, device=device
+                rows, dtype=torch.int64, device=placed
             )
             self._decode_positions = torch.zeros(
-                (1, rows), dtype=torch.int64, device=device
+                (1, rows), dtype=torch.int64, device=placed
             )
 
     # Facts.
@@ -305,6 +341,14 @@ class CausalLMRunner:
         :meth:`plan_decode` built the plans its graph reads.
         """
         return self._context.plans_attention()
+
+    def kernels(self) -> list[str]:
+        """The kernels the runner's operators selected, as JSON objects."""
+        return kernel_records(self._context.kernels())
+
+    def close(self) -> None:
+        """Release the execution context after the stream drained."""
+        self._context.close()
 
     # Attention metadata.
 

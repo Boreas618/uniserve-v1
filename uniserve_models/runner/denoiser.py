@@ -67,7 +67,6 @@ too.
 from __future__ import annotations
 
 import functools
-import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,7 +117,7 @@ from uniserve_models.processing import (
     load_tokenizer,
     resolve_prefix,
 )
-from uniserve_models.runner.context import execution_context
+from uniserve_models.runner.context import execution_context, kernel_records
 from uniserve_models.tensors import BufferConfig
 
 __all__ = ["DenoiserRunner", "Outputs"]
@@ -1710,13 +1709,9 @@ class DenoiserRunner:
                     schedule.step(index),
                 )
 
-    def kernels(self) -> str:
-        """The kernels the runner's operators selected.
-
-        A JSON array of records, one per prepared operator, each with its
-        layer ``path``.
-        """
-        return json.dumps(list(self._context.kernels()))
+    def kernels(self) -> list[str]:
+        """The kernels the runner's operators selected, as JSON objects."""
+        return kernel_records(self._context.kernels())
 
     def close(self, aborted: bool) -> None:
         """Release the runner's operators and workspace.
