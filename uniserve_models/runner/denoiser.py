@@ -117,7 +117,11 @@ from uniserve_models.processing import (
     load_tokenizer,
     resolve_prefix,
 )
-from uniserve_models.runner.context import execution_context, kernel_records
+from uniserve_models.runner.context import (
+    execution_context,
+    held_module,
+    kernel_records,
+)
 from uniserve_models.tensors import BufferConfig
 
 __all__ = ["DenoiserRunner", "Outputs"]
@@ -209,13 +213,7 @@ def _called(loaded, entry) -> list[tuple[Any, str]]:
     for point in entry.points:
         prefix, _, method = point.method.rpartition(".")
         path = ".".join(part for part in (entry.component, prefix) if part)
-
-        module = loaded.module
-        for name in path.split(".") if path else ():
-            module = getattr(module, name)
-            if module is None:
-                break
-
+        module = held_module(loaded.module, path)
         if module is not None:
             called.append((module, method))
     return called

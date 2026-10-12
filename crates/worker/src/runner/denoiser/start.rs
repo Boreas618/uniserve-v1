@@ -1,5 +1,6 @@
 //! Startup of a video model's denoiser runner on a rank.
 
+use tvm_ffi::Any;
 use uniserve_ipc::MediaCall;
 
 use super::runners::DenoiserRunners;
@@ -49,9 +50,19 @@ impl DenoiserRunners {
             .ok_or_else(|| Error::Invariant("a denoising rank has no slot state".into()))?;
         let (stream, scratch) = setup.stream(MediaCall::Denoising, device)?;
         let graph_pool = setup.graph_pool(DENOISER_GRAPHS, &placed.name, device)?;
-        let conditioner = placed.calls.iter().find(|call| {
-            call.method == "encode" && call.is(crate::model::components::Capability::Encoder)
-        });
+        // The conditioner's call runs on one pipeline stage; only a rank of
+        // that stage holds its module and constructs its runners.
+        let holds = interface.import("uniserve_models.runner.encoder.EncoderRunner.holds")?;
+        let mut conditioner = None;
+        for call in &placed.calls {
+            let encodes =
+                call.method == "encode" && call.is(crate::model::components::Capability::Encoder);
+            let path = Any::from(tvm_ffi::String::from(call.path.as_str()));
+            if encodes && holds.call_as::<bool>(&[loaded.view(), (&path).into()])? {
+                conditioner = Some(call);
+                break;
+            }
+        }
         let conditioning = match (conditioner, conditioning) {
             (Some(call), Some((width, dtype))) => Some(Conditioning {
                 path: call.path.clone(),

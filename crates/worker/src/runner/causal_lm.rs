@@ -58,7 +58,7 @@ pub(crate) mod warmup;
 pub(crate) use input_buffers::{Dimensions, FINISH_IDS};
 pub(crate) use methods::{Construction, Functions};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
-pub(crate) use runners::{CausalLMRunners, Pending, complete, forward};
+pub(crate) use runners::{CausalLMRunners, Pending, Step, complete, forward};
 
 use std::sync::Arc;
 

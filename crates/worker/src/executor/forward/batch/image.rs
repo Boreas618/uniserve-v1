@@ -26,11 +26,12 @@ use uniserve_ipc::{
 use crate::error::WorkerError;
 use crate::executor::backend::{Parts, WorkerBackend, WorkerBatch};
 use crate::executor::forward::launch::{
-    HostStage, Launched, error_code, failed_output, read_flag, reports_output, seal as seal_lease,
+    HostStage, Launched, error_code, failed_output, flag, reports_output, request_flag,
+    seal as seal_lease,
 };
 use crate::executor::forward::products::Publications;
 use crate::executor::forward::transfer::latents::{self, PendingExport, Pool};
-use crate::executor::forward::unsupported;
+use crate::executor::forward::{Stage, unsupported};
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
 use crate::host::image::ImageResult;
@@ -108,6 +109,73 @@ pub(crate) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocatio
 pub(crate) struct Commit {
     updates: Vec<LatentUpdate>,
     pending: Vec<(RequestKey, uniserve_core::CallId, bool)>,
+}
+
+/// What an image batch owns between two of its jobs: everything of
+/// [`ImageBatch`] but the owners it borrows and its job.
+pub(crate) struct Parked {
+    device: Option<i32>,
+    stream: Option<Stream>,
+    reports: bool,
+    calls: Vec<CallState>,
+    buffer: OutputLease,
+    writes: Vec<ProductBuffer>,
+    reads: Vec<Arc<ProductRead>>,
+    updates: Vec<(usize, LatentUpdate)>,
+    encodings: Vec<Encoding>,
+    publications: Publications,
+    latent_exports: Vec<BufferId>,
+    exports: Vec<(usize, PendingExport)>,
+    features: Vec<(usize, ProductBuffer, ProductExport)>,
+    returns: Vec<Vec<i64>>,
+    retirement: Arc<Retirement>,
+    latents_entered: bool,
+    started: Instant,
+}
+
+/// How far recording a forward got.
+pub(crate) enum Progress {
+    /// The forward is recorded to its end.
+    Done(Box<ForwardStats>),
+    /// The job recorded so far ends here: the forward continues from its
+    /// completion.
+    Boundary(Resume),
+}
+
+impl Progress {
+    /// A forward recorded to its end, with its statistics.
+    pub(crate) fn done(stats: ForwardStats) -> Self {
+        Self::Done(Box::new(stats))
+    }
+}
+
+/// A forward between two of its jobs.
+pub(crate) enum Resume {
+    Encode(crate::runner::encoder::EncodeResume),
+    Denoise(Box<crate::runner::denoiser::image::DenoiseResume>),
+}
+
+/// An image batch between two of its jobs.
+pub(crate) enum Pending {
+    /// The job on the lane reads the batch's host-gated predicates.
+    Predicates(Vec<usize>),
+    /// The predicates are known (these calls are skipped): the batch opens
+    /// and records its forward next.
+    Opened(HashSet<usize>),
+    /// The job on the lane ends inside the batch's forward.
+    Resuming(Box<(Parked, Resume)>),
+    /// That job completed: the forward continues from its completion next.
+    Resumed(Box<(Parked, Resume, Completion)>),
+    /// The job on the lane is the batch's last: the rest of its forward
+    /// and the issued commit.
+    Committing(Box<(Parked, Commit, ForwardStats)>),
+    /// Recording failed, or a job failed before the commit was applied.
+    /// What the batch had recorded is performed; it retires what it
+    /// reserved next.
+    Failing(Box<Parked>, Failure),
+    /// The job on the lane retires what the failed batch reserved, or
+    /// performs what a batch that reserved nothing had recorded.
+    Discarding(Failure),
 }
 
 /// An image batch's borrowed owners and the resources it reserved.
@@ -314,16 +382,65 @@ impl<'a> ImageBatch<'a> {
         Ok(())
     }
 
-    /// Perform, on this thread, what the batch recorded so far.
-    ///
-    /// FIXME: the forwards of an image batch still issue on its stream at
-    /// once, so what the batch records around them is performed here, in
-    /// their order, instead of being a job of the batch's lane.
-    pub(crate) fn perform(&mut self) -> Result<Completion> {
-        std::mem::take(&mut self.job)
-            .perform()
-            .check()
-            .map_err(|failure| failure.error)
+    /// Part the batch from the owners it borrows: its next job and the
+    /// state it owns between two jobs.
+    pub(crate) fn park(self) -> (Job<'static>, Parked) {
+        (
+            self.job,
+            Parked {
+                device: self.device,
+                stream: self.stream,
+                reports: self.reports,
+                calls: self.calls,
+                buffer: self.buffer,
+                writes: self.writes,
+                reads: self.reads,
+                updates: self.updates,
+                encodings: self.encodings,
+                publications: self.publications,
+                latent_exports: self.latent_exports,
+                exports: self.exports,
+                features: self.features,
+                returns: self.returns,
+                retirement: self.retirement,
+                latents_entered: self.latents_entered,
+                started: self.started,
+            },
+        )
+    }
+
+    /// The parked batch on the owners it borrows again, with an empty job.
+    pub(crate) fn resume(
+        parts: ImageParts<'a>,
+        storage: &'a mut RankStorage,
+        requests: &'a mut RequestPool,
+        plan: &'a BatchPlan,
+        parked: Parked,
+    ) -> Self {
+        Self {
+            parts,
+            storage,
+            requests,
+            plan,
+            device: parked.device,
+            stream: parked.stream,
+            job: Job::new(),
+            reports: parked.reports,
+            calls: parked.calls,
+            buffer: parked.buffer,
+            writes: parked.writes,
+            reads: parked.reads,
+            updates: parked.updates,
+            encodings: parked.encodings,
+            publications: parked.publications,
+            latent_exports: parked.latent_exports,
+            exports: parked.exports,
+            features: parked.features,
+            returns: parked.returns,
+            retirement: parked.retirement,
+            latents_entered: parked.latents_entered,
+            started: parked.started,
+        }
     }
 
     /// Validate every owner's update and record the device half of the
@@ -497,19 +614,6 @@ impl<'a> ImageBatch<'a> {
     }
 }
 
-/// End a job of an image forward and start its next: the completion of
-/// what was recorded so far.
-///
-/// FIXME: performed at once on the recording thread, like the batch's own
-/// job ([`ImageBatch::perform`]); as jobs of the lane, the forward resumes
-/// from each completion.
-pub(crate) fn boundary(job: &mut Job<'static>) -> Result<Completion> {
-    std::mem::take(job)
-        .perform()
-        .check()
-        .map_err(|failure| failure.error)
-}
-
 /// The parts of the backend an image batch executes with: the image
 /// model's facts and host policy, the rank's runners, and the storage its
 /// trajectories and products live in.
@@ -578,23 +682,375 @@ impl ImageParts<'_> {
     }
 }
 
-/// Execute a batch of `kind` calls.
-pub(crate) fn execute(
+/// The next job of an image batch: the read of its host-gated predicates
+/// when it has any, then its forward with the issued commit, and after a
+/// failure the retirement of what it reserved. `None` when the batch
+/// failed without needing the lane again.
+pub(crate) fn forward(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
     kind: CallKind,
+) -> std::result::Result<Option<Job<'static>>, WorkerError> {
+    let step = {
+        let (plan, pending, inputs) = batch.image_parts();
+        let step = record(backend.parts(), plan, kind, pending.take(), inputs)?;
+        match step {
+            Step::Job(job, state) => {
+                *pending = Some(state);
+                return Ok(Some(job));
+            }
+            Step::Failed(failure) => failure,
+        }
+    };
+    fail(backend, batch, step).map(|()| None)
+}
+
+/// What recording an image batch's next job leaves.
+enum Step {
+    /// The job to submit, and the batch's state while it is on the lane.
+    Job(Job<'static>, Pending),
+    /// The batch failed and holds nothing.
+    Failed(Failure),
+}
+
+/// The encoder, denoiser or decoder serving a batch of `kind`: its device,
+/// its stream and the payload words the batch reads back.
+fn placement(
+    kind: CallKind,
+    image: &ImageParts<'_>,
+    plan: &BatchPlan,
+) -> Result<(Option<i32>, Option<Stream>, usize)> {
+    match kind {
+        CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
+            crate::runner::encoder::image_placement(image, plan)
+        }
+        CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
+            crate::runner::denoiser::image::image_placement(image)
+        }
+        CallKind::Media(MediaCall::ImageDecoding) => {
+            crate::runner::decoder::image_placement(image, plan)
+        }
+        _ => Err(Error::Unsupported(format!(
+            "{} is served by another runtime",
+            kind.as_str()
+        ))),
+    }
+}
+
+/// Record the batch's next job from its state between jobs.
+fn record(
+    parts: Parts<'_>,
+    plan: &BatchPlan,
+    kind: CallKind,
+    state: Option<Pending>,
+    inputs: &mut Option<Inputs>,
+) -> std::result::Result<Step, WorkerError> {
+    let Parts {
+        info,
+        rank,
+        requests,
+        storage,
+        text,
+        image,
+        experts,
+        ..
+    } = parts;
+    let (Some(image), Some(storage)) = (image, storage) else {
+        return Err(unsupported(kind, "image"));
+    };
+
+    let (skipped, decided) = match state {
+        Some(Pending::Opened(skipped)) => (skipped, true),
+        None => (HashSet::new(), false),
+        Some(Pending::Failing(parked, failure)) => {
+            // What the batch recorded was performed: retire what it
+            // reserved, behind that work.
+            let mut batch = ImageBatch::resume(image, storage, requests, plan, *parked);
+            let discarded = batch.discard();
+            let (job, _) = batch.park();
+            let failure = match discarded {
+                Ok(()) => failure,
+                // Storage the cleanup could not retire stays reserved; the
+                // rank cannot reuse it safely.
+                Err(cleanup) => fatal(cleanup),
+            };
+            return Ok(Step::Job(job, Pending::Discarding(failure)));
+        }
+        Some(Pending::Resumed(resumed)) => {
+            // The forward continues from the completion of its last job.
+            let (parked, resume, mut completion) = *resumed;
+            let mut batch = ImageBatch::resume(image, storage, requests, plan, parked);
+            let progressed = match resume {
+                Resume::Encode(resume) => batch.resume_encode(resume, &mut completion),
+                Resume::Denoise(resume) => {
+                    batch.resume_denoise(*resume, &mut completion, text, experts)
+                }
+            };
+            return Ok(advance(batch, progressed.map_err(Failure::from)));
+        }
+        Some(
+            Pending::Predicates(_)
+            | Pending::Resuming(_)
+            | Pending::Committing(_)
+            | Pending::Discarding(_),
+        ) => {
+            return Err(WorkerError::classify(
+                Error::Invariant(
+                    "an image batch's job was prepared before its last completed".into(),
+                ),
+                Some("image batch"),
+            ));
+        }
+    };
+    let (device, stream, words) = match placement(kind, &image, plan) {
+        Ok(placed) => placed,
+        Err(error) => return Ok(Step::Failed(error.into())),
+    };
+
+    // The batch's first job reads its host-gated predicates: they decide
+    // which calls it reserves for.
+    if !decided {
+        let job = Job::new();
+        let mut predicated = Vec::new();
+        for (index, call) in plan.calls.iter().enumerate() {
+            let Some(predicate) = call
+                .predicate
+                .as_ref()
+                .filter(|predicate| predicate.dtype == DType::U8)
+            else {
+                continue;
+            };
+            let requested = request_flag(
+                &storage.tensors,
+                call,
+                predicate,
+                device,
+                job.on(stream.as_ref()),
+            );
+            if let Err(error) = requested {
+                // The reads recorded so far are performed; the batch
+                // reserved nothing.
+                return Ok(Step::Job(job, Pending::Discarding(error.into())));
+            }
+            predicated.push(index);
+        }
+        if !predicated.is_empty() {
+            return Ok(Step::Job(job, Pending::Predicates(predicated)));
+        }
+    }
+
+    let opened = ImageBatch::open(
+        image,
+        storage,
+        requests,
+        info,
+        rank,
+        plan,
+        device,
+        stream,
+        words,
+        Instant::now(),
+        &skipped,
+    );
+    let mut batch = match opened {
+        Ok(batch) => batch,
+        Err(error) => return Ok(Step::Failed(error.into())),
+    };
+    let progressed = (|| -> std::result::Result<Progress, Failure> {
+        batch.bind_flags()?;
+        Ok(match kind {
+            CallKind::Media(call @ (MediaCall::VisionEncoding | MediaCall::LatentEncoding)) => {
+                let images = inputs
+                    .take()
+                    .map(Inputs::take)
+                    .transpose()?
+                    .unwrap_or_default();
+                batch.encode(call, images)?
+            }
+            CallKind::Media(MediaCall::LatentPreparation) => {
+                Progress::done(batch.prepare_latents()?)
+            }
+            CallKind::Media(MediaCall::Denoising) => batch.denoise(text, experts)?,
+            CallKind::Media(MediaCall::ImageDecoding) => Progress::done(batch.decode()?),
+            _ => Progress::done(ForwardStats::default()),
+        })
+    })();
+    Ok(advance(batch, progressed))
+}
+
+/// Park the batch behind what its forward recorded: its last job with the
+/// issued commit when the forward is recorded to its end, the job that
+/// ends inside the forward otherwise, and what a failed recording had
+/// recorded.
+fn advance(mut batch: ImageBatch<'_>, progressed: std::result::Result<Progress, Failure>) -> Step {
+    // The commit is issued behind a forward recorded to its end.
+    let progressed = progressed.and_then(|progress| match progress {
+        Progress::Done(stats) => batch
+            .issue_commit()
+            .map(|commit| Recorded::Whole(commit, stats)),
+        Progress::Boundary(resume) => Ok(Recorded::Part(resume)),
+    });
+
+    let (job, parked) = batch.park();
+    let state = match progressed {
+        Ok(Recorded::Whole(commit, stats)) => {
+            Pending::Committing(Box::new((parked, commit, *stats)))
+        }
+        Ok(Recorded::Part(resume)) => Pending::Resuming(Box::new((parked, resume))),
+        // What the batch recorded before it failed is performed before its
+        // reservations are retired: the events it queued are due, and its
+        // writes are abandoned only behind its work.
+        Err(failure) => Pending::Failing(Box::new(parked), failure),
+    };
+    Step::Job(job, state)
+}
+
+/// What a batch's job holds of its forward.
+enum Recorded {
+    /// The rest of the forward, with the issued commit.
+    Whole(Commit, Box<ForwardStats>),
+    /// The forward up to a job boundary.
+    Part(Resume),
+}
+
+/// Apply the completion of the job [`forward`] prepared last.
+pub(crate) fn complete(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    kind: CallKind,
+    completion: Completion,
+) -> std::result::Result<(), WorkerError> {
+    /// What the completion leaves to do on the worker batch.
+    enum Done {
+        Next(Pending),
+        Launched(Box<Launched>),
+        Failed(Failure),
+    }
+
+    let done = {
+        let (plan, pending, _) = batch.image_parts();
+        match (pending.take(), completion.check()) {
+            // A predicate that could not be read fails the batch, which
+            // has reserved nothing yet.
+            (Some(Pending::Predicates(_)), Err(failure)) => Done::Failed(failure.error.into()),
+            (Some(Pending::Predicates(predicated)), Ok(mut completion)) => {
+                let mut skipped = HashSet::new();
+                let mut decided = Ok(());
+                for index in predicated {
+                    match flag(&mut completion) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            skipped.insert(index);
+                        }
+                        Err(error) => {
+                            decided = Err(error);
+                            break;
+                        }
+                    }
+                }
+                match decided {
+                    Ok(()) => Done::Next(Pending::Opened(skipped)),
+                    Err(error) => Done::Failed(error.into()),
+                }
+            }
+            // A job that ends inside the forward completed: the forward
+            // continues from its completion in the next job.
+            (Some(Pending::Resuming(resuming)), Ok(completion)) => {
+                let (parked, resume) = *resuming;
+                Done::Next(Pending::Resumed(Box::new((parked, resume, completion))))
+            }
+            (Some(Pending::Resuming(resuming)), Err(failure)) => {
+                let (parked, _) = *resuming;
+                Done::Next(Pending::Failing(Box::new(parked), failure.error.into()))
+            }
+            // The job failed on its lane, which still made its event
+            // records: the batch retires what it reserved.
+            (Some(Pending::Committing(committing)), Err(failure)) => {
+                let (parked, _, _) = *committing;
+                Done::Next(Pending::Failing(Box::new(parked), failure.error.into()))
+            }
+            (Some(Pending::Committing(committing)), Ok(mut completion)) => {
+                let (parked, commit, mut stats) = *committing;
+                let Parts {
+                    requests,
+                    storage,
+                    image,
+                    ..
+                } = backend.parts();
+                let (Some(image), Some(storage)) = (image, storage) else {
+                    return Err(unsupported(kind, "image"));
+                };
+                let mut resumed = ImageBatch::resume(image, storage, requests, plan, parked);
+                match resumed.apply_commit(commit, &mut completion) {
+                    Ok(()) => {
+                        let elapsed = resumed.started.elapsed().as_micros() as u64;
+                        stats.component_us.insert("image_execute".into(), elapsed);
+                        let encodings = std::mem::take(&mut resumed.encodings);
+                        Done::Launched(Box::new(Launched {
+                            outputs: resumed
+                                .calls
+                                .into_iter()
+                                .map(|state| state.output)
+                                .collect(),
+                            host: (!encodings.is_empty()).then(|| {
+                                Box::new(Encodings {
+                                    encodings,
+                                    submitted: false,
+                                }) as Box<dyn HostStage>
+                            }),
+                            buffer: resumed.buffer,
+                            started: resumed.started,
+                            stats,
+                            timer: "image_materialize",
+                        }))
+                    }
+                    Err(failure) if failure.committed => Done::Failed(failure),
+                    Err(failure) => {
+                        let (_, parked) = resumed.park();
+                        Done::Next(Pending::Failing(Box::new(parked), failure))
+                    }
+                }
+            }
+            // The lane performed what the failed batch had recorded;
+            // whether that failed again changes nothing of what follows.
+            (Some(Pending::Failing(parked, failure)), _) => {
+                Done::Next(Pending::Failing(parked, failure))
+            }
+            (Some(Pending::Discarding(failure)), Ok(_)) => Done::Failed(failure),
+            // Fences the retirement recorded were not all made.
+            (Some(Pending::Discarding(_)), Err(cleanup)) => Done::Failed(fatal(cleanup.error)),
+            (Some(Pending::Opened(_) | Pending::Resumed(_)) | None, _) => {
+                return Err(WorkerError::classify(
+                    Error::State("an image batch has no job on its lane"),
+                    Some("image batch"),
+                ));
+            }
+        }
+    };
+    match done {
+        Done::Next(state) => {
+            *batch.image_parts().1 = Some(state);
+            Ok(())
+        }
+        Done::Launched(launched) => {
+            batch.launch(*launched);
+            batch.set_stage(Stage::Done);
+            Ok(())
+        }
+        Done::Failed(failure) => fail(backend, batch, failure),
+    }
+}
+
+/// Report a failed batch that holds nothing: a failure past the commit
+/// point stops the rank, any other completes the batch with its calls
+/// failed.
+fn fail(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    failure: Failure,
 ) -> std::result::Result<(), WorkerError> {
     let plan = Arc::clone(batch.shared_plan());
     let predecessors = batch.predecessors().to_vec();
-    let inputs = batch.take_image_inputs();
-    let failure = match run(backend.parts(), &plan, kind, inputs) {
-        Ok(Some(launched)) => {
-            batch.launch(launched);
-            return Ok(());
-        }
-        Ok(None) => return Err(unsupported(kind, "image")),
-        Err(failure) => failure,
-    };
     let mut error = WorkerError::classify(failure.error, Some("image batch"));
     if failure.committed {
         error.fatal = true;
@@ -621,119 +1077,8 @@ pub(crate) fn execute(
         output,
         media: Vec::new(),
     });
+    batch.set_stage(Stage::Done);
     Ok(())
-}
-
-/// Reserve, compute and commit one batch. `None` on a rank without an
-/// image model.
-fn run(
-    parts: Parts<'_>,
-    plan: &BatchPlan,
-    kind: CallKind,
-    inputs: Option<Inputs>,
-) -> std::result::Result<Option<Launched>, Failure> {
-    let started = Instant::now();
-    let Parts {
-        info,
-        rank,
-        requests,
-        storage,
-        text,
-        image,
-        experts,
-        ..
-    } = parts;
-    let (Some(image), Some(storage)) = (image, storage) else {
-        return Ok(None);
-    };
-    let (device, stream, words) = match kind {
-        CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-            crate::runner::encoder::image_placement(&image, plan)?
-        }
-        CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
-            crate::runner::denoiser::image::image_placement(&image)?
-        }
-        CallKind::Media(MediaCall::ImageDecoding) => {
-            crate::runner::decoder::image_placement(&image, plan)?
-        }
-        _ => {
-            return Err(Error::Unsupported(format!(
-                "{} is served by another runtime",
-                kind.as_str()
-            ))
-            .into());
-        }
-    };
-    let mut skipped = HashSet::new();
-    for (index, call) in plan.calls.iter().enumerate() {
-        if let Some(predicate) = &call.predicate
-            && predicate.dtype == DType::U8
-            && !read_flag(&storage.tensors, call, predicate, device, stream.as_ref())?
-        {
-            skipped.insert(index);
-        }
-    }
-    let mut batch = ImageBatch::open(
-        image, storage, requests, info, rank, plan, device, stream, words, started, &skipped,
-    )?;
-    let result = (|| -> std::result::Result<ForwardStats, Failure> {
-        batch.bind_flags()?;
-        batch.perform()?;
-        let stats = match kind {
-            CallKind::Media(call @ (MediaCall::VisionEncoding | MediaCall::LatentEncoding)) => {
-                let images = inputs.map(Inputs::take).transpose()?.unwrap_or_default();
-                batch.encode(call, images)?
-            }
-            CallKind::Media(MediaCall::LatentPreparation) => batch.prepare_latents()?,
-            CallKind::Media(MediaCall::Denoising) => batch.denoise(text, experts)?,
-            CallKind::Media(MediaCall::ImageDecoding) => batch.decode()?,
-            _ => ForwardStats::default(),
-        };
-        let commit = batch.issue_commit()?;
-        let mut completion = batch.perform()?;
-        batch.apply_commit(commit, &mut completion)?;
-        Ok(stats)
-    })();
-    match result {
-        Ok(mut stats) => {
-            let elapsed = batch.started.elapsed().as_micros() as u64;
-            stats.component_us.insert("image_execute".into(), elapsed);
-            let encodings = std::mem::take(&mut batch.encodings);
-            Ok(Some(Launched {
-                outputs: batch.calls.into_iter().map(|state| state.output).collect(),
-                host: (!encodings.is_empty()).then(|| {
-                    Box::new(Encodings {
-                        encodings,
-                        submitted: false,
-                    }) as Box<dyn HostStage>
-                }),
-                buffer: batch.buffer,
-                started,
-                stats,
-                timer: "image_materialize",
-            }))
-        }
-        Err(failure) if failure.committed => Err(failure),
-        Err(failure) => {
-            // What the batch recorded before it failed is performed before
-            // its reservations are retired: the events it queued are due,
-            // and its writes are abandoned only behind its work.
-            if let Err(error) = batch.perform() {
-                tracing::warn!(
-                    target: "uniserve_worker.execution",
-                    "image batch {} failed again in what it had recorded: {error}",
-                    plan.batch_id
-                );
-            }
-            if let Err(cleanup) = batch.discard().and(batch.perform()) {
-                return Err(Failure {
-                    error: cleanup,
-                    committed: true,
-                });
-            }
-            Err(failure)
-        }
-    }
 }
 
 /// The PNG encodings of a decoding batch's images, run once their pixels
