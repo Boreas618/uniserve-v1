@@ -129,6 +129,13 @@ enum Call<'a> {
     Function(DeferredCall),
     Capture(Capture),
     /// The forward of a capability not yet converted, as it issues itself.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "every capability records its forward; this goes with the job's lifetime"
+        )
+    )]
     Forward(Forward<'a>),
 }
 
@@ -291,6 +298,18 @@ impl<'a> Job<'a> {
         self.operations.borrow_mut().push(operation);
     }
 
+    /// The same job where a shorter borrow is expected: only the forward
+    /// of an unconverted capability borrows, and it may be given less.
+    pub(crate) fn shorten<'b>(self) -> Job<'b>
+    where
+        'a: 'b,
+    {
+        Job {
+            operations: RefCell::new(self.operations.into_inner()),
+            after: self.after,
+        }
+    }
+
     /// Keep of the operations recorded from `start` on only the event
     /// operations, in order: a failed attempt's events are still recorded,
     /// waited on and woken for, so the storage they fence is returned, and
@@ -335,6 +354,13 @@ impl<'a> Job<'a> {
     /// The forward of a capability not yet converted: it issues its own
     /// stream work and Python calls when the execution thread runs it, and
     /// keeps its result where its submitter reads it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "every capability records its forward; this goes with the job's lifetime"
+        )
+    )]
     pub(crate) fn forward(&self, forward: impl FnOnce() + 'a) {
         self.push(Operation::Call(Call::Forward(Forward(Box::new(forward)))));
     }
