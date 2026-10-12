@@ -16,8 +16,8 @@
 //! the batch with `UnsupportedSetup` and leaves the rank serving.
 //!
 //! A text batch's jobs are operations its runner recorded, and so are a
-//! video model's encoder and denoiser batches (`batch::forward`). The
-//! forward of
+//! video model's device batches (`batch::forward`): its encoders, its
+//! denoiser and its decoders. The forward of
 //! every other capability, and the completion of imported inputs, still
 //! issue their own stream work: each is one job holding that work as
 //! [`Job::forward`], until its capability is converted.
@@ -211,14 +211,21 @@ pub(crate) fn complete(
 }
 
 /// Whether the forwards of `kind` on this rank are recorded into jobs
-/// ([`batch::forward`]); the others issue their own stream work.
+/// ([`batch::forward`]): a video model's device calls. The others issue
+/// their own stream work.
 fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
-    use MediaCall::{Denoising, LatentEncoding, LatentPreparation, TextEncoding, VisionEncoding};
+    use MediaCall::*;
 
     matches!(
         kind,
         CallKind::Media(
-            TextEncoding | VisionEncoding | LatentEncoding | LatentPreparation | Denoising
+            TextEncoding
+                | VisionEncoding
+                | LatentEncoding
+                | LatentPreparation
+                | Denoising
+                | VideoDecoding
+                | AudioDecoding
         )
     ) && backend.serves_video()
 }
@@ -264,21 +271,13 @@ fn execute(
             crate::runner::media::execute(&mut parts, plan, borrowed, state)
         }
         Media(ImageDecoding) => batch::image::execute(backend, batch, kind),
-        Media(VideoDecoding | AudioDecoding) => {
-            let (plan, borrowed, state) = batch.media_parts();
-            let mut parts = backend.media_parts()?;
-            batch::execute(&mut parts, plan, borrowed, state)
-        }
-        // Encoders and denoisers serve both image and video models; the
-        // rank's model decides.
+        // A video model's rank records its device calls ([`records`]); no
+        // other rank decodes video or audio.
+        Media(VideoDecoding | AudioDecoding) => Err(unsupported(kind, "video")),
+        // Encoders and denoisers serve both image and video models; these
+        // are an image model's.
         Media(VisionEncoding | TextEncoding | LatentEncoding | LatentPreparation | Denoising) => {
-            if backend.serves_video() {
-                let (plan, borrowed, state) = batch.media_parts();
-                let mut parts = backend.media_parts()?;
-                batch::execute(&mut parts, plan, borrowed, state)
-            } else {
-                batch::image::execute(backend, batch, kind)
-            }
+            batch::image::execute(backend, batch, kind)
         }
     }
 }
