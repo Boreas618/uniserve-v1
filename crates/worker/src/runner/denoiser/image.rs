@@ -50,6 +50,7 @@ use crate::executor::forward::batch::image::ImageBatch;
 use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, integer_list};
+use crate::lane::Job;
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
@@ -59,11 +60,12 @@ use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
-use crate::runner::methods::kernel_records;
+use crate::runner::methods::{Argument, MethodCall, kernel_records};
 use crate::storage::LatentUpdate;
 use crate::storage::Scratch;
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// The geometry of a captured denoising step: its rows of one image size,
@@ -420,7 +422,7 @@ impl ImageDiffusion {
     /// then zero `padded` sample rows from `sample` and write the image's
     /// initial latent into the first `units` of them, on the sample stream.
     #[expect(clippy::too_many_arguments, reason = "the trajectory's coordinates")]
-    pub fn initial_latent(
+    pub(crate) fn initial_latent(
         &self,
         sample: u32,
         units: u32,
@@ -429,26 +431,34 @@ impl ImageDiffusion {
         width: u32,
         seed: u64,
         index: u32,
+        job: &Job<'_>,
     ) -> Result<()> {
-        let noise = Any::from(self.noise.to_tensor()?);
-        self.methods.draw_noise.call_values(&[
-            self.methods.runner.to_any(),
-            // The seed's bits; the Python half reads them as unsigned.
-            Any::from(seed as i64),
-            Any::from(i64::from(index)),
-            Any::from(i64::from(height)),
-            Any::from(i64::from(width)),
-            noise.clone(),
-        ])?;
-        self.methods.prepare_latents.call_values(&[
-            self.methods.runner.to_any(),
-            noise,
-            Any::from(i64::from(sample)),
-            Any::from(i64::from(units)),
-            Any::from(i64::from(padded)),
-            Any::from(i64::from(height)),
-            Any::from(i64::from(width)),
-        ])?;
+        let runner = Argument::Handle(self.methods.runner.clone());
+        let noise = Argument::Tensor(self.noise.clone());
+        job.call(MethodCall::new(
+            &self.methods.draw_noise,
+            vec![
+                runner.clone(),
+                // The seed's bits; the Python half reads them as unsigned.
+                Argument::Integer(seed as i64),
+                Argument::Integer(i64::from(index)),
+                Argument::Integer(i64::from(height)),
+                Argument::Integer(i64::from(width)),
+                noise.clone(),
+            ],
+        ));
+        job.call(MethodCall::new(
+            &self.methods.prepare_latents,
+            vec![
+                runner,
+                noise,
+                Argument::Integer(i64::from(sample)),
+                Argument::Integer(i64::from(units)),
+                Argument::Integer(i64::from(padded)),
+                Argument::Integer(i64::from(height)),
+                Argument::Integer(i64::from(width)),
+            ],
+        ));
         Ok(())
     }
 
@@ -885,7 +895,7 @@ impl ImageBatch<'_> {
         bank: u8,
         step: u32,
         params: &LatentParams,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         let call = &self.plan.calls[index];
         let Some(product) = &call.latent_output else {
@@ -913,10 +923,11 @@ impl ImageBatch<'_> {
         Ok(())
     }
 
-    /// Open the batch's use of the latent pool and place its trajectories.
-    fn place(&mut self, trajectories: &[Trajectory]) -> Result<Vec<Scratch>> {
+    /// Open the batch's use of the latent pool, behind its previous user
+    /// in what `stream` issues, and place its trajectories.
+    fn place(&mut self, trajectories: &[Trajectory], stream: impl Issue) -> Result<Vec<Scratch>> {
         let latents = self.parts.latents()?;
-        latents.enter(self.stream.as_ref())?;
+        latents.enter(stream)?;
         self.latents_entered = true;
         let params: Vec<&LatentParams> = trajectories.iter().map(|value| &value.params).collect();
         latents.place(&params)
@@ -925,6 +936,17 @@ impl ImageBatch<'_> {
     /// Draw each trajectory's seeded initial latent and stage it as its
     /// first committed version.
     pub(crate) fn prepare_latents(&mut self) -> Result<ForwardStats> {
+        // The forward records into the batch's job, taken for its length so
+        // that the batch's owners stay borrowable beside it.
+        let job = std::mem::take(&mut self.job);
+        let stats = self.record_latents(&job);
+        self.job = job;
+        stats
+    }
+
+    fn record_latents(&mut self, job: &Job<'_>) -> Result<ForwardStats> {
+        let stream = self.stream.clone();
+        let issue = job.on(stream.as_ref());
         let mut trajectories = Vec::new();
         for index in self.active() {
             let call = &self.plan.calls[index];
@@ -975,10 +997,9 @@ impl ImageBatch<'_> {
                     steps: value.steps,
                 })
                 .collect();
-            self.place(&values)?
+            self.place(&values, issue)?
         };
 
-        let stream = self.stream.clone();
         for ((trajectory, image, rng), scratch) in trajectories.iter().zip(&scratch) {
             let call = &self.plan.calls[trajectory.index];
             let diffusion = self.parts.diffusion().ok_or_else(|| {
@@ -1000,9 +1021,10 @@ impl ImageBatch<'_> {
                 trajectory.params.width,
                 rng.seed,
                 semantic,
+                job,
             )?;
-            latents.scatter(1, scratch, stream.as_ref())?;
-            self.publish_latent(trajectory.index, 1, 0, &trajectory.params, stream.as_ref())?;
+            latents.scatter(1, scratch, issue)?;
+            self.publish_latent(trajectory.index, 1, 0, &trajectory.params, issue)?;
             self.parts.trajectories.open(
                 trajectory.slot,
                 ImageTrajectory::new(
@@ -1192,7 +1214,7 @@ impl ImageBatch<'_> {
                     steps: value.steps,
                 })
                 .collect();
-            self.place(&values)?
+            self.place(&values, self.stream.clone().as_ref())?
         };
 
         // Gather each committed version into the step workspace.

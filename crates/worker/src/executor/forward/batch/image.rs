@@ -431,8 +431,11 @@ impl<'a> ImageBatch<'a> {
 
     /// Retire every reservation after a failure before the commit point,
     /// recording the fences that end them; storage returns once those
-    /// fences were performed and complete.
+    /// fences were performed and complete. What the batch recorded and did
+    /// not perform is reduced to its event operations: the failed forward's
+    /// remaining work addresses storage this releases.
     pub(crate) fn discard(&mut self) -> Result<()> {
+        self.job = std::mem::take(&mut self.job).orders_only();
         let left = self.leave_latents();
         self.exports
             .drain(..)
