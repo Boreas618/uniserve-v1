@@ -74,6 +74,21 @@ def execution_context(
     )
 
 
+def held_module(root: Any, path: str) -> Any | None:
+    """The module at ``path`` below ``root``, or ``None`` when absent here.
+
+    A rank's share of a partitioned component keeps a submodule it does not
+    hold as ``None``: a pipeline stage without the denoiser's conditioner.
+    A path naming an attribute the model does not declare raises.
+    """
+    module = root
+    for name in str(path).split(".") if path else ():
+        module = getattr(module, name)
+        if module is None:
+            return None
+    return module
+
+
 def kernel_records(records: Iterable[Mapping[str, Any]]) -> list[str]:
     """Kernel records as a runner reports them to the rank.
 
