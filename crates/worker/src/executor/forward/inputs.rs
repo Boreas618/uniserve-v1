@@ -11,7 +11,8 @@
 //! like values its own rank produced.
 //!
 //! Preparation runs on the executor thread in phases, each resumed by the
-//! readiness notice of what blocked it ([`prepare`], [`subscribe`]):
+//! readiness notice of what blocked it ([`admit`], [`prepare`],
+//! [`subscribe`]):
 //!
 //! 1. **Storage hazards.** A batch that writes KV storage (newly assigned
 //!    units, forward rows, install destinations) first waits for every
@@ -19,10 +20,15 @@
 //!    imports, and exports other ranks are reading; one that writes a
 //!    latent bank waits for the exports of versions in it. A failed access
 //!    keeps its storage forever, so the batch then fails instead.
-//! 2. **Admission.** Product imports are admitted in descriptor order. A
-//!    refusal for read credits resumes at the refused product once credits
-//!    return; accepted imports keep their destinations meanwhile. KV imports
-//!    follow, after which nothing is repeatable.
+//! 2. **Admission.** Product imports are admitted in descriptor order
+//!    ([`admit`]). What an import needs on its consumers' stream, the
+//!    handoff fence each of its reads waits on, is recorded into one job
+//!    of the batch's lane; the reads are handed to their transport threads
+//!    from that job's completion ([`admitted`]), when the fences' records
+//!    are made. A refusal for read credits resumes at the refused product
+//!    once credits return; accepted imports keep their destinations
+//!    meanwhile. KV imports follow ([`prepare`]), after which nothing is
+//!    repeatable.
 //! 3. **Readiness.** The batch launches once every read and KV copy is
 //!    consumable.
 //!
@@ -108,6 +114,11 @@ pub(crate) struct Inputs {
     backpressure: Option<u64>,
     /// Preparation stopped on these inputs (not on another runtime's).
     waiting: bool,
+    /// A product import was refused for read credits while the admission
+    /// job held work: the batch's start from that job's completion admits
+    /// nothing, and the refused product is admitted again from the notice
+    /// of returned credits.
+    refused: bool,
     /// Where the completion of the imports stands between its jobs.
     completing: Completing,
 }
@@ -160,30 +171,75 @@ pub(crate) fn component_device(backend: &WorkerBackend, component: &str) -> Resu
     Ok(placed.device.cuda_index().map_or(Device::Cpu, Device::Cuda))
 }
 
-/// Advance a batch's input preparation; whether its imports are ready.
+/// Admit the batch's product imports that can be admitted now, recording
+/// what they issue on their consumers' stream into the returned job. The
+/// caller submits a job that holds work to the batch's lane, whatever the
+/// result, and hands its completion to [`admitted`]: fences recorded by an
+/// import that was refused or failed afterwards are still due. With an
+/// empty job nothing waits for the lane.
+pub(crate) fn admit(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+) -> (Job<'static>, std::result::Result<(), WorkerError>) {
+    let plan = Arc::clone(batch.shared_plan());
+    let job = Job::new();
+    let admitted = admit_products(backend, batch, &plan, &job).and_then(|()| {
+        if job.is_empty() {
+            // No fence is pending: the reads start at once.
+            start_reads(batch)
+        } else {
+            Ok(())
+        }
+    });
+    let admitted = admitted.map_err(|error| failed(backend, batch, error));
+    (job, admitted)
+}
+
+/// Hand the admitted imports' reads to their transport threads: the job
+/// [`admit`] returned completed, so the handoff fences they wait on are
+/// recorded.
+pub(crate) fn admitted(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    completion: Completion,
+) -> std::result::Result<(), WorkerError> {
+    let started = completion
+        .check()
+        .map_err(|failure| failure.error)
+        .and_then(|_| start_reads(batch));
+    started.map_err(|error| failed(backend, batch, error))
+}
+
+/// Advance a batch's input preparation behind its admission; whether its
+/// imports are ready.
 pub(crate) fn prepare(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
 ) -> std::result::Result<bool, WorkerError> {
     let plan = Arc::clone(batch.shared_plan());
-    let prepared = advance(backend, batch, &plan);
-    let ready = match prepared {
-        Ok(ready) => ready,
-        Err(error) => {
-            // Accepted imports retire through their owners; the executor
-            // reports the batch failed.
-            let mut error = WorkerError::classify(error, Some("input preparation"));
-            if let Err(cleanup) = close(backend, batch) {
-                error.note(&WorkerError::classify(cleanup, None));
-            }
-            return Err(error);
-        }
-    };
+    let ready = advance(backend, batch, &plan).map_err(|error| failed(backend, batch, error))?;
     batch.inputs_mut().waiting = !ready;
     Ok(ready)
 }
 
-fn advance(backend: &mut WorkerBackend, batch: &mut WorkerBatch, plan: &BatchPlan) -> Result<bool> {
+/// The failure of a batch's input preparation: accepted imports retire
+/// through their owners, and the executor reports the batch failed.
+fn failed(backend: &mut WorkerBackend, batch: &mut WorkerBatch, error: Error) -> WorkerError {
+    let mut error = WorkerError::classify(error, Some("input preparation"));
+    if let Err(cleanup) = close(backend, batch) {
+        error.note(&WorkerError::classify(cleanup, None));
+    }
+    error
+}
+
+/// Resolve the batch's storage hazards and, once they retired, admit its
+/// product imports from the first one not yet admitted.
+fn admit_products(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    plan: &BatchPlan,
+    job: &Job<'static>,
+) -> Result<()> {
     if batch.inputs().state.closed() {
         return Err(Error::State("batch inputs were already consumed"));
     }
@@ -198,12 +254,43 @@ fn advance(backend: &mut WorkerBackend, batch: &mut WorkerBatch, plan: &BatchPla
         inputs.state.dependencies = hazards.into_iter().map(Hazard).collect();
         inputs.resolved = true;
     }
-    if !batch.inputs().state.submitted {
-        if !batch.inputs().state.storage_ready()? {
-            return Ok(false);
+    // A refusal waits for the notice of returned credits, which starts the
+    // batch again; this start follows the admission job's completion.
+    if std::mem::take(&mut batch.inputs_mut().refused) {
+        return Ok(());
+    }
+    if batch.inputs().state.submitted || !batch.inputs().state.storage_ready()? {
+        return Ok(());
+    }
+    require_storage(&batch.inputs().state)?;
+    if !import_products(backend, batch, plan, job)? {
+        batch.inputs_mut().refused = !job.is_empty();
+    }
+    Ok(())
+}
+
+/// Start the reads of every product import the batch admitted. A read that
+/// was started before stays as it is.
+fn start_reads(batch: &WorkerBatch) -> Result<()> {
+    for input in batch.inputs().state.inputs.values() {
+        match input {
+            Input::Tensor { read, .. } => fetch::start(&read.reads())?,
+            Input::Latent { input, .. } => fetch::start(input.reads())?,
+            Input::Cache(_) | Input::Borrowed => {}
         }
-        require_storage(&batch.inputs().state)?;
-        if !import_products(backend, batch, plan)? {
+    }
+    Ok(())
+}
+
+fn advance(backend: &mut WorkerBackend, batch: &mut WorkerBatch, plan: &BatchPlan) -> Result<bool> {
+    if batch.inputs().state.closed() {
+        return Err(Error::State("batch inputs were already consumed"));
+    }
+    if !batch.inputs().state.submitted {
+        // The hazards were resolved and the products admitted by `admit`,
+        // unless a hazard or a refused import still holds them up.
+        let inputs = batch.inputs();
+        if !inputs.state.storage_ready()? || inputs.state.started < plan.input_products.len() {
             return Ok(false);
         }
         import_cache(backend, batch, plan)?;
@@ -476,12 +563,14 @@ fn metadata(handle: &TransferHandle) -> Result<Option<Metadata>> {
     })
 }
 
-/// Admit product imports from the first one not yet admitted. Returns
-/// false while a refused import waits for read credits.
+/// Admit product imports from the first one not yet admitted, recording
+/// their reads' handoff fences into `job`. Returns false while a refused
+/// import waits for read credits.
 fn import_products(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
     plan: &BatchPlan,
+    job: &Job<'static>,
 ) -> Result<bool> {
     let start = batch.inputs().state.started;
     if start >= plan.input_products.len() {
@@ -509,7 +598,7 @@ fn import_products(
             continue;
         }
         if matches!(export.value, TransferHandle::Latent { .. }) {
-            match import_latent(backend, plan, export, indices) {
+            match import_latent(backend, plan, export, indices, job) {
                 Ok(input) => {
                     batch
                         .inputs_mut()
@@ -559,10 +648,8 @@ fn import_products(
                 "cross-call input requires a configured transport".into(),
             ));
         }
-        // The reads' handoff fences are recorded into a job of the lane
+        // The reads' handoff fences are recorded into the job of the lane
         // that owns the consumers' stream; the reads start once it ran.
-        let kind = plan.calls[indices[0]].code;
-        let fences = Job::new();
         let imported = storage.tensors.import_tensor(
             product,
             tensor,
@@ -574,20 +661,15 @@ fn import_products(
                 ..OutputPlacement::default()
             },
             metadata,
-            fences.on(stream.as_ref()),
+            job.on(stream.as_ref()),
         );
-        // A refused import may have issued fences before it failed: their
-        // records are made either way.
-        record_fences(backend, kind, fences)?;
         match imported {
             Ok(read) => {
-                let reads = read.reads();
                 batch
                     .inputs_mut()
                     .state
                     .inputs
                     .insert(product.buffer_id(), Input::Tensor { read, device });
-                fetch::start(&reads)?;
             }
             Err(Error::ReadBackpressure { returns }) => {
                 // The refusal started no read; the same product is admitted
@@ -608,12 +690,14 @@ fn import_products(
 }
 
 /// Read a latent trajectory version into the slot of its one consumer,
-/// whose scheduler parameters name the pages and the version.
+/// whose scheduler parameters name the pages and the version. The reads'
+/// handoff fences are recorded into `job`.
 fn import_latent(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
     export: &TensorExport,
     readers: &[usize],
+    job: &Job<'static>,
 ) -> Result<Input> {
     let [index] = readers else {
         return Err(Error::Invalid(
@@ -642,7 +726,6 @@ fn import_latent(
         .image
         .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?;
     let (pool, latent) = image.latent_pool()?;
-    let fences = Job::new();
     let input = latents::import(
         pool,
         latent,
@@ -650,30 +733,9 @@ fn import_latent(
         export,
         params,
         slot,
-        fences.on(stream.as_ref()),
-    );
-    record_fences(backend, call.code, fences)?;
-    let input = input?;
-    fetch::start(input.reads())?;
+        job.on(stream.as_ref()),
+    )?;
     Ok(Input::Latent { input, device })
-}
-
-/// Perform `fences`, the job an import recorded its reads' handoff fences
-/// into, on the lane serving `kind`: the reads are started only behind it,
-/// so each fence's record is made when its read reaches its transport
-/// thread.
-///
-/// FIXME: admission waits for this job. Its completion is to arrive through
-/// the executor, which starts the reads from there.
-fn record_fences(backend: &WorkerBackend, kind: CallKind, fences: Job<'_>) -> Result<()> {
-    if fences.is_empty() {
-        return Ok(());
-    }
-    let (_, completion) = backend.job_queues().submit(kind, fences)?;
-    completion
-        .check()
-        .map(drop)
-        .map_err(|failure| failure.error)
 }
 
 /// Reserve every KV import: each supplied or resident transfer is copied
