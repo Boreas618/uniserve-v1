@@ -619,7 +619,9 @@ pub struct JobId(pub(super) u64);
 
 /// What a lane's execution thread receives.
 enum Message {
-    Job(JobId, Job<'static>),
+    /// A job, and whether its submitter waits for its completion: a
+    /// submitter that waits takes the completion itself and needs no wake.
+    Job(JobId, Job<'static>, bool),
     /// The wake of the control thread, fired behind every completion from
     /// now on; `None` stops it.
     Wake(Option<Wake>),
@@ -674,9 +676,11 @@ impl JobQueue {
     }
 
     /// Queue `job` as `id` on the lane's execution thread, which posts its
-    /// completion under that name.
-    pub(super) fn start(&self, id: JobId, job: Job<'static>) -> Result<()> {
-        self.send(Message::Job(id, job))
+    /// completion under that name, and fires the control thread's wake
+    /// behind it unless the submitter is `awaited`: blocked on that
+    /// completion.
+    pub(super) fn start(&self, id: JobId, job: Job<'static>, awaited: bool) -> Result<()> {
+        self.send(Message::Job(id, job, awaited))
     }
 
     pub(super) fn set_wake(&self, wake: Option<Wake>) -> Result<()> {
@@ -702,8 +706,8 @@ impl Jobs {
         // completed events.
         let mut notifications: HashMap<DeviceId, Stream> = HashMap::new();
         while let Ok(message) = self.messages.recv() {
-            let (id, job) = match message {
-                Message::Job(id, job) => (id, job),
+            let (id, job, awaited) = match message {
+                Message::Job(id, job, awaited) => (id, job, awaited),
                 Message::Wake(installed) => {
                     wake = installed;
                     continue;
@@ -721,7 +725,7 @@ impl Jobs {
             let post = Post {
                 id,
                 completions: self.completions.clone(),
-                wake: wake.clone(),
+                wake: wake.clone().filter(|_| !awaited),
             };
             match after {
                 Some((device, events)) if completion.failure.is_none() => {
