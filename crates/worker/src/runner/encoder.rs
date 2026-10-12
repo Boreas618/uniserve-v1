@@ -1491,6 +1491,11 @@ fn grid_bytes(layout: &[[i64; 2]]) -> Vec<u8> {
         .collect()
 }
 
+/// A condition encoding was recorded before the job that constructs its
+/// encoder completed.
+const MISSING_ENCODER: Error =
+    Error::State("a condition encoding was recorded before its encoder was constructed");
+
 /// The condition latent encoders of a video model: the Python runners of
 /// its video encoder and of its audio encoder, one per input shapes.
 struct Conditions {
@@ -1499,9 +1504,41 @@ struct Conditions {
     loaded: Handle,
     /// Frames of each visual unit of a condition of some frame count.
     unit_frames: Function,
-    /// The runner of each call's input shapes, created at its first call.
+    /// What `unit_frames` answered, by frame count.
+    frames: HashMap<i64, Vec<i64>>,
+    /// The runner of each call's input shapes, constructed by the job
+    /// before the first call's ([`Self::setup`]).
     video_runners: HashMap<Vec<i64>, Methods>,
     audio_runners: HashMap<Vec<i64>, Methods>,
+}
+
+/// The encoder of a condition's medium.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConditionMedium {
+    Video,
+    Audio,
+}
+
+/// What a condition encoding call encodes on this rank.
+pub(crate) enum ConditionInput {
+    /// Visual units, each `[pixel_offset, frames, width, height, unit]`,
+    /// written to rows `region` of the round's `rows`.
+    Units {
+        units: Vec<[i64; 5]>,
+        rows: u64,
+        region: std::ops::Range<u64>,
+    },
+    /// Audio tracks of these sample counts, written to `rows` rows.
+    Tracks { lengths: Vec<u64>, rows: u64 },
+}
+
+/// What the job on the lane asks the library for before a batch's
+/// condition encodings are recorded.
+pub(crate) enum ConditionSetup {
+    /// The frames of each visual unit of conditions of these frame counts.
+    Frames(Vec<i64>),
+    /// The encoders of these input shapes.
+    Runners(Vec<(ConditionMedium, Vec<i64>)>),
 }
 
 impl Conditions {
@@ -1511,9 +1548,123 @@ impl Conditions {
             loaded: video.loaded.clone(),
             video: RunnerClass::new(video.interface, ENCODER, "encode", video.arguments())?,
             audio: RunnerClass::new(audio.interface, ENCODER, "encode", audio.arguments())?,
+            frames: HashMap::new(),
             video_runners: HashMap::new(),
             audio_runners: HashMap::new(),
         })
+    }
+
+    /// The input shapes of a call encoding `units`: each unit's frames at
+    /// its raster. `None` while the unit frames of one of the conditions
+    /// were not asked for.
+    fn unit_shapes(&self, units: &[[i64; 5]]) -> Result<Option<Vec<i64>>> {
+        let mut shapes = Vec::with_capacity(units.len() * 4);
+        for &[_, frames, width, height, unit] in units {
+            let Some(lengths) = self.frames.get(&frames) else {
+                return Ok(None);
+            };
+            let length = lengths.get(unit as usize).copied().ok_or_else(|| {
+                Error::Invalid("a condition unit lies outside its condition".into())
+            })?;
+            shapes.extend([length, height, width, 3]);
+        }
+        Ok(Some(shapes))
+    }
+
+    /// The input shapes of a call encoding tracks of `lengths` samples.
+    fn track_shapes(lengths: &[u64]) -> Vec<i64> {
+        lengths
+            .iter()
+            .flat_map(|&length| [length as i64, 2])
+            .collect()
+    }
+
+    /// Record into `job` what the encodings of `inputs` lack: the unit
+    /// frames of conditions whose frame count is new, and once those are
+    /// known the construction of the encoders of new input shapes. `None`
+    /// when the encodings can be recorded.
+    ///
+    /// Both are calls of the library, so the job makes them; a constructed
+    /// encoder is an argument of its forward, which is why the forward is
+    /// recorded only from the job's completion ([`Self::accept`]).
+    fn setup(&self, inputs: &[ConditionInput], job: &Job) -> Result<Option<ConditionSetup>> {
+        let mut frames: Vec<i64> = inputs
+            .iter()
+            .filter_map(|input| match input {
+                ConditionInput::Units { units, .. } => Some(units),
+                ConditionInput::Tracks { .. } => None,
+            })
+            .flatten()
+            .map(|unit| unit[1])
+            .filter(|count| !self.frames.contains_key(count))
+            .collect();
+        frames.sort_unstable();
+        frames.dedup();
+        if !frames.is_empty() {
+            for &count in &frames {
+                job.call_returning(MethodCall::new(
+                    &self.unit_frames,
+                    vec![
+                        Argument::Handle(self.loaded.clone()),
+                        Argument::Integer(count),
+                    ],
+                ));
+            }
+            return Ok(Some(ConditionSetup::Frames(frames)));
+        }
+
+        let mut runners: Vec<(ConditionMedium, Vec<i64>)> = Vec::new();
+        for input in inputs {
+            let (medium, shapes) = match input {
+                ConditionInput::Units { units, .. } => {
+                    let shapes = self.unit_shapes(units)?.ok_or_else(|| {
+                        Error::Invariant("a condition's unit frames were not asked for".into())
+                    })?;
+                    (ConditionMedium::Video, shapes)
+                }
+                ConditionInput::Tracks { lengths, .. } => {
+                    (ConditionMedium::Audio, Self::track_shapes(lengths))
+                }
+            };
+            let (class, constructed) = match medium {
+                ConditionMedium::Video => (&self.video, &self.video_runners),
+                ConditionMedium::Audio => (&self.audio, &self.audio_runners),
+            };
+            let recorded = runners
+                .iter()
+                .any(|(other, known)| *other == medium && *known == shapes);
+            if constructed.contains_key(&shapes) || recorded {
+                continue;
+            }
+            job.call_handle(class.construction(vec![Argument::Integers(shapes.clone())]));
+            runners.push((medium, shapes));
+        }
+        Ok((!runners.is_empty()).then_some(ConditionSetup::Runners(runners)))
+    }
+
+    /// Keep what the job of `setup` returned.
+    fn accept(&mut self, setup: ConditionSetup, completion: &mut Completion) -> Result<()> {
+        match setup {
+            ConditionSetup::Frames(frames) => {
+                for count in frames {
+                    self.frames.insert(count, completion.returned()?);
+                }
+            }
+            ConditionSetup::Runners(runners) => {
+                for (medium, shapes) in runners {
+                    let runner = completion.handle()?;
+                    match medium {
+                        ConditionMedium::Video => self
+                            .video_runners
+                            .insert(shapes, self.video.constructed(runner)),
+                        ConditionMedium::Audio => self
+                            .audio_runners
+                            .insert(shapes, self.audio.constructed(runner)),
+                    };
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Encode visual units, each `[pixel_offset, frames, width, height,
@@ -1525,29 +1676,10 @@ impl Conditions {
         out: &StorageView,
         job: &Job,
     ) -> Result<()> {
-        // The call's input shapes: each unit's frames at its raster.
-        let mut shapes = Vec::with_capacity(units.len() * 4);
-        for &[_, frames, width, height, unit] in units {
-            let value = self
-                .unit_frames
-                .call_values(&[self.loaded.to_any(), Any::from(frames)])?;
-            let lengths = crate::ffi::integers(value)
-                .map_err(|error| Error::numerical(self.unit_frames.name(), &error))?;
-            let length = lengths.get(unit as usize).copied().ok_or_else(|| {
-                Error::Invalid("a condition unit lies outside its condition".into())
-            })?;
-            shapes.extend([length, height, width, 3]);
-        }
-        // FIXME: the runner of shapes seen for the first time is constructed
-        // here, where the forward is recorded, not by the job: the recorded
-        // call takes the runner the construction returns.
-        if !self.video_runners.contains_key(&shapes) {
-            let runner = self
-                .video
-                .construct(vec![Argument::Integers(shapes.clone())])?;
-            self.video_runners.insert(shapes.clone(), runner);
-        }
-        let runner = &self.video_runners[&shapes];
+        let runner = self
+            .unit_shapes(units)?
+            .and_then(|shapes| self.video_runners.get(&shapes))
+            .ok_or(MISSING_ENCODER)?;
         job.call(MethodCall::new(
             &self.video.forward,
             vec![
@@ -1569,19 +1701,10 @@ impl Conditions {
         out: &StorageView,
         job: &Job,
     ) -> Result<()> {
-        let shapes: Vec<i64> = lengths
-            .iter()
-            .flat_map(|&length| [length as i64, 2])
-            .collect();
-        // FIXME: as for a video runner, a runner of new shapes is
-        // constructed where the forward is recorded.
-        if !self.audio_runners.contains_key(&shapes) {
-            let runner = self
-                .audio
-                .construct(vec![Argument::Integers(shapes.clone())])?;
-            self.audio_runners.insert(shapes.clone(), runner);
-        }
-        let runner = &self.audio_runners[&shapes];
+        let runner = self
+            .audio_runners
+            .get(&Self::track_shapes(lengths))
+            .ok_or(MISSING_ENCODER)?;
         job.call(MethodCall::new(
             &self.audio.forward,
             vec![
@@ -1745,6 +1868,21 @@ impl EncoderRunner {
         self.conditions
             .as_deref_mut()
             .ok_or_else(|| Error::Invalid(format!("{} encodes no conditions", self.owner)))
+    }
+
+    /// Record into `job` what the condition encodings of `inputs` lack
+    /// before they can be recorded; see [`Conditions::setup`].
+    fn condition_setup(
+        &mut self,
+        inputs: &[ConditionInput],
+        job: &Job,
+    ) -> Result<Option<ConditionSetup>> {
+        self.condition_encoders()?.setup(inputs, job)
+    }
+
+    /// Keep what the job of `setup` returned.
+    fn accept_setup(&mut self, setup: ConditionSetup, completion: &mut Completion) -> Result<()> {
+        self.condition_encoders()?.accept(setup, completion)
     }
 
     /// Encode a condition's visual units, each `[pixel_offset, frames,
@@ -1950,41 +2088,33 @@ pub(crate) fn encode_vision(
     publish(parts, batch, call, index, &write, &[tokens, width], issue)
 }
 
-/// Encode a request's conditions into denoiser rows: a round of visual
-/// units, this rank's of them, or every audio track.
-pub(crate) fn encode_conditions(
-    parts: &mut Parts<'_>,
+/// What condition encoding `call` encodes on this rank: a round of visual
+/// units, this rank's of them, or every audio track. `None` for an audio
+/// call on a rank that is not the component's first.
+fn condition_input(
+    parts: &Parts<'_>,
     plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
+    call: &uniserve_ipc::Call,
     slot: usize,
-    placement: &Placement<'_>,
-    job: &Job,
-) -> Result<()> {
-    let call = &plan.calls[index];
+) -> Result<Option<ConditionInput>> {
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
         return Err(Error::Invalid(
             "condition encoding requires one input and one output".into(),
         ));
     }
-    let name = product_name(parts.info, call, &call.outputs[0])?.to_owned();
-    let conditions = Arc::clone(&parts.video.request(slot, call.request_key)?.conditions);
+    let name = product_name(parts.info, call, &call.outputs[0])?;
+    let conditions = &parts.video.request(slot, call.request_key)?.conditions;
     if conditions.is_empty() {
         return Err(Error::Invalid(
             "condition encoding requires admitted conditions".into(),
         ));
     }
-    let rank = parts.rank;
-    let owners = parts.owners();
     let latent = parts
         .encoders
         .latent
-        .as_mut()
+        .as_ref()
         .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
-    let stream = stream_of(batch)?;
-    let issue = job.on(Some(&stream));
-    let width = row_width(&call.outputs[0])?;
-    match name.as_str() {
+    match name {
         "condition_video_latents" => {
             let range = decode_range(plan, call)?;
             // Every visual unit as (condition, unit, rows), in encoding order.
@@ -2006,7 +2136,7 @@ pub(crate) fn encode_conditions(
                 ));
             }
             let round = &all[cursor..cursor + count];
-            let run = latent.units(rank, 0, count as u32)?;
+            let run = latent.units(parts.rank, 0, count as u32)?;
             if run.is_empty() {
                 return Err(Error::Invalid(
                     "condition encoding assigns this rank no unit".into(),
@@ -2015,13 +2145,6 @@ pub(crate) fn encode_conditions(
             let rows: u64 = round.iter().map(|unit| unit.2).sum();
             let first: u64 = round[..run.start as usize].iter().map(|unit| unit.2).sum();
             let last: u64 = round[..run.end as usize].iter().map(|unit| unit.2).sum();
-            let pixels = batch.inputs.read(
-                owners.store,
-                &call.inputs[0],
-                call.call_id,
-                batch.device,
-                issue,
-            )?;
             let mut offsets = Vec::new();
             let mut cursor_pixels = 0u64;
             for condition in conditions.iter() {
@@ -2047,30 +2170,16 @@ pub(crate) fn encode_conditions(
                     ]
                 })
                 .collect();
-            let write = bind_outputs(
-                owners.store,
-                &[OutputShape {
-                    product: call.outputs[0].clone(),
-                    shape: vec![rows, width],
-                    region: Some(vec![first..last, 0..width]),
-                }],
-                batch.device,
-                placement,
-            )?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
-            batch.calls[index].writes.push(write.clone());
-            latent
-                .runner
-                .encode_condition_units(pixels.value(), &units, &write.view(), job)?;
-            publish_bound(parts, batch, call, index, &write, false, issue)?;
+            Ok(Some(ConditionInput::Units {
+                units,
+                rows,
+                region: first..last,
+            }))
         }
         "condition_audio_latents" => {
             // The audio call is one unit, the component's first rank's.
-            let run = latent.units(rank, 0, 1)?;
-            if run.is_empty() {
-                return Ok(());
+            if latent.units(parts.rank, 0, 1)?.is_empty() {
+                return Ok(None);
             }
             let lengths: Vec<u64> = conditions
                 .iter()
@@ -2080,39 +2189,127 @@ pub(crate) fn encode_conditions(
                 .iter()
                 .map(|condition| u64::from(condition.audio_rows))
                 .sum();
-            let samples = batch.inputs.read(
-                owners.store,
-                &call.inputs[0],
-                call.call_id,
-                batch.device,
-                issue,
-            )?;
-            let write = bind_outputs(
-                owners.store,
-                &[OutputShape {
-                    product: call.outputs[0].clone(),
-                    shape: vec![rows, width],
-                    region: None,
-                }],
-                batch.device,
-                placement,
-            )?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
-            batch.calls[index].writes.push(write.clone());
+            Ok(Some(ConditionInput::Tracks { lengths, rows }))
+        }
+        other => Err(Error::Invalid(format!(
+            "latent encoding does not produce {other}"
+        ))),
+    }
+}
+
+/// Record into `job` what the batch's condition encodings lack before
+/// their forwards can be recorded: answers and encoders the library gives
+/// for input shapes this rank has not encoded before. `None` when the
+/// batch's forwards can be recorded; otherwise the job ends here and
+/// [`accept_conditions`] takes its completion.
+pub(crate) fn setup_conditions(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    batch: &MediaBatch,
+    slots: &HashMap<uniserve_ipc::RequestKey, usize>,
+    job: &Job,
+) -> Result<Option<ConditionSetup>> {
+    let mut inputs = Vec::new();
+    for (index, call) in plan.calls.iter().enumerate() {
+        if call.code != CallKind::Media(MediaCall::LatentEncoding) || batch.calls[index].skipped {
+            continue;
+        }
+        inputs.extend(condition_input(
+            parts,
+            plan,
+            call,
+            slots[&call.request_key],
+        )?);
+    }
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    let latent = parts
+        .encoders
+        .latent
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
+    latent.runner.condition_setup(&inputs, job)
+}
+
+/// Keep what the job of `setup` returned for the batch's condition
+/// encodings.
+pub(crate) fn accept_conditions(
+    parts: &mut Parts<'_>,
+    setup: ConditionSetup,
+    completion: &mut Completion,
+) -> Result<()> {
+    let latent = parts
+        .encoders
+        .latent
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
+    latent.runner.accept_setup(setup, completion)
+}
+
+/// Encode a request's conditions into denoiser rows: a round of visual
+/// units, this rank's of them, or every audio track.
+pub(crate) fn encode_conditions(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    batch: &mut MediaBatch,
+    index: usize,
+    slot: usize,
+    placement: &Placement<'_>,
+    job: &Job,
+) -> Result<()> {
+    let call = &plan.calls[index];
+    let Some(input) = condition_input(parts, plan, call, slot)? else {
+        return Ok(());
+    };
+    let owners = parts.owners();
+    let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
+    let width = row_width(&call.outputs[0])?;
+    let (rows, region) = match &input {
+        ConditionInput::Units { rows, region, .. } => (*rows, Some(vec![region.clone(), 0..width])),
+        ConditionInput::Tracks { rows, .. } => (*rows, None),
+    };
+    let read = batch.inputs.read(
+        owners.store,
+        &call.inputs[0],
+        call.call_id,
+        batch.device,
+        issue,
+    )?;
+    let write = bind_outputs(
+        owners.store,
+        &[OutputShape {
+            product: call.outputs[0].clone(),
+            shape: vec![rows, width],
+            region,
+        }],
+        batch.device,
+        placement,
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
+    batch.calls[index].writes.push(write.clone());
+
+    let latent = parts
+        .encoders
+        .latent
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
+    match &input {
+        ConditionInput::Units { units, .. } => {
             latent
                 .runner
-                .encode_condition_tracks(samples.value(), &lengths, &write.view(), job)?;
-            publish_bound(parts, batch, call, index, &write, false, issue)?;
+                .encode_condition_units(read.value(), units, &write.view(), job)?;
         }
-        other => {
-            return Err(Error::Invalid(format!(
-                "latent encoding does not produce {other}"
-            )));
+        ConditionInput::Tracks { lengths, .. } => {
+            latent
+                .runner
+                .encode_condition_tracks(read.value(), lengths, &write.view(), job)?;
         }
     }
-    Ok(())
+    publish_bound(parts, batch, call, index, &write, false, issue)
 }
 
 // Image vision and latent encoding batches (`VisionEncoding`,
