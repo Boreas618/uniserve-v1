@@ -311,7 +311,7 @@ fn shard_exports_carry_their_logical_origin_and_failures_return_bytes() -> Resul
     )?;
     publish(&store, &buffer, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])?;
 
-    let (export, locations) = store.export_buffer(
+    let export = store.export_buffer(
         &call(vec![]),
         &product,
         &buffer,
@@ -320,6 +320,7 @@ fn shard_exports_carry_their_logical_origin_and_failures_return_bytes() -> Resul
         None,
         None,
     )?;
+    let (export, locations) = store.located(&buffer, export)?;
     let TransferHandle::DeviceProduct { tensor, .. } = &export.value else {
         panic!("a product exports as a device product");
     };
@@ -360,7 +361,7 @@ fn imports_share_pending_reads_and_widen_resident_shards() -> Result<()> {
     let values: Vec<f32> = (0..12).map(|value| value as f32).collect();
     let source = persistent(&producer, &product, allocation(&product, 0, 48), None)?;
     publish(&producer, &source, &values, &[4, 3])?;
-    let (export, _locations) = producer.export_buffer(
+    let export = producer.export_buffer(
         &call(vec![]),
         &product,
         &source,
@@ -369,6 +370,7 @@ fn imports_share_pending_reads_and_widen_resident_shards() -> Result<()> {
         None,
         None,
     )?;
+    let (export, _locations) = producer.located(&source, export)?;
     let TransferHandle::DeviceProduct { tensor, .. } = &export.value else {
         panic!("a product exports as a device product");
     };

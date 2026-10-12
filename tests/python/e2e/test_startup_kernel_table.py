@@ -33,7 +33,13 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("bagel")]
 TAG = "uniserve-kernel-table "
 
 
-def test_bagel_startup_table_names_every_image_kernel(tmp_path):
+@pytest.fixture(scope="module")
+def attention(tmp_path_factory):
+    """The attention call sites of each runner in BAGEL's startup table.
+
+    A runner is named by its component and module path, for example
+    ``model.vision_encoder``.
+    """
     checkpoint = os.environ.get("UNISERVE_BAGEL_MODEL")
     if not checkpoint or not Path(checkpoint).is_dir():
         pytest.fail("UNISERVE_BAGEL_MODEL must name the BAGEL checkpoint")
@@ -45,7 +51,7 @@ def test_bagel_startup_table_names_every_image_kernel(tmp_path):
     python = os.environ.get(
         "UNISERVE_WORKER_PYTHON", str(Path.cwd() / ".venv" / "bin" / "python")
     )
-    log = tmp_path / "server.log"
+    log = tmp_path_factory.mktemp("startup") / "server.log"
     with server_process(
         [
             str(binary),
@@ -72,50 +78,44 @@ def test_bagel_startup_table_names_every_image_kernel(tmp_path):
         if TAG in line
     ]
     (startup,) = (table for table in tables if table["stage"] == "startup")
-    attention = {
+    return {
         runner["runner"]: [
             site for site in runner["call_sites"] if site["op"] == "attention"
         ]
         for runner in startup["runners"]
     }
 
-    def sites(kind):
-        return [
-            site
-            for runner, values in attention.items()
-            if runner.endswith(f"[{kind}]")
-            for site in values
-        ]
 
+def inputs(sites):
+    """The attention inputs the call sites have served."""
+    return {name for site in sites for name in site.get("inputs", {})}
+
+
+def test_bagel_startup_table_names_every_image_kernel(attention):
     # Every SigLIP layer, the autoencoder's encoder mid-block and its
     # decoder mid-block (each runner also holds the other half of the
     # autoencoder, which it never calls) have chosen a kernel.
-    vision = sites("vision_encoding")
+    vision = attention["model.vision_encoder"]
     assert vision and all(site["provider"] is not None for site in vision)
-    for kind, half in (
-        ("latent_encoding", "encoder.middle"),
-        ("image_decoding", "decoder.decoder.middle"),
+    for runner, half in (
+        ("model.latent_encoder", "encoder.middle"),
+        ("model.image_decoder", "decoder.decoder.middle"),
     ):
         called = [
             site
-            for site in sites(kind)
+            for site in attention[runner]
             if any(layer.startswith(half) for layer in site["layers"])
         ]
-        assert called and all(site["provider"] for site in called), kind
+        assert called and all(site["provider"] for site in called), runner
 
-    # Prefill replays graphs for causal text and for non-causal image rows,
-    # and the denoiser writes an input image's latent into the prompt.
-    def inputs(kind):
-        return {
-            name
-            for runner, values in attention.items()
-            if kind in runner
-            for site in values
-            for name in site.get("inputs", {})
-        }
 
+def test_bagel_startup_serves_image_rows_before_the_first_request(attention):
+    # Prefill has served causal text and non-causal image rows, and the
+    # denoiser has written an input image's latent into the prompt.
     assert {
         "paged attention: causal rows",
         "paged attention: non-causal rows",
-    } <= inputs("prefill")
-    assert "paged attention: non-causal rows" in inputs("denoising")
+    } <= inputs(attention["model.text"])
+    assert "paged attention: non-causal rows" in inputs(
+        attention["model.denoiser"]
+    )

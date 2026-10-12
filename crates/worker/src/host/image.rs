@@ -79,6 +79,8 @@ pub(crate) enum ImageWork {
     /// Decode and transform one inline image of a request.
     Prepare {
         function: Function,
+        /// `EncoderRunner.image_facts`.
+        facts: Function,
         loaded: Handle,
         tower: Tower,
         payload: Arc<str>,
@@ -139,13 +141,22 @@ impl HostAction for ImageTask {
         match &*work {
             ImageWork::Prepare {
                 function,
+                facts,
                 loaded,
                 tower,
                 payload,
                 input_images,
                 pin,
-            } => prepare_input(function, loaded, *tower, payload, *input_images, *pin)
-                .map(ImageResult::Prepared),
+            } => prepare_input(
+                function,
+                facts,
+                loaded,
+                *tower,
+                payload,
+                *input_images,
+                *pin,
+            )
+            .map(ImageResult::Prepared),
             ImageWork::Encode {
                 pixels,
                 height,

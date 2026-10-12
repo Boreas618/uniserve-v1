@@ -60,6 +60,12 @@ def test_ordered_bindings_generate_outputs(
         "components": {"model": {"ranks": [1, 0], "parallel_config": parallel}},
         "queue_depth": 2,
     }
+    # A step writes an input image's vision block whole, and a request whose
+    # block exceeds the step budget is refused. BAGEL's block holds 1371
+    # tokens.
+    step_tokens = {"qwen3": "1024", "bagel": "2048", "sensenova": "4096"}[
+        description
+    ]
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -81,7 +87,7 @@ def test_ordered_bindings_generate_outputs(
         "--max-model-len",
         "32768" if description == "sensenova" else "4096",
         "--max-num-batched-tokens",
-        "4096" if description == "sensenova" else "1024",
+        step_tokens,
         "--chunked-prefill-size",
         "512",
         "--max-running-requests",

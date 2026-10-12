@@ -221,10 +221,7 @@ impl DenoiserRunners {
     pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<KernelRecord>)>> {
         let mut kernels = Vec::new();
         if let Some(denoiser) = &self.video {
-            kernels.push((
-                denoiser.name.clone(),
-                denoiser.runner.kernels(&denoiser.name)?,
-            ));
+            kernels.push((denoiser.name.clone(), denoiser.runner.kernels()?));
         }
         Ok(kernels)
     }
