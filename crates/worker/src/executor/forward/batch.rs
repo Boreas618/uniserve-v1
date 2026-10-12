@@ -44,6 +44,7 @@ use crate::request::RequestPool;
 use crate::request::video::VideoRequests;
 use crate::runner::decoder::runners::DecoderRunners;
 use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::encoder::ConditionSetup;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
 use crate::storage::OutputLease;
@@ -166,6 +167,9 @@ enum Phase {
     Predicates(Vec<usize>),
     /// The predicates are known: the calls' forwards are recorded next.
     Opened,
+    /// The job on the lane asks the library for what the batch's condition
+    /// encodings lack; the forwards are recorded from its completion.
+    Setup(ConditionSetup),
     /// The job on the lane holds the calls' forwards and the issued commit.
     Committing(Commit),
     /// The commit was applied: nothing is left for the lane.
@@ -858,6 +862,15 @@ fn record(
         allocations: &allocations,
         slots: &slots,
     };
+
+    // A condition encoding of input shapes this rank has not encoded
+    // before takes an encoder the library constructs. The job makes that
+    // call, so the batch's forwards are recorded from its completion.
+    if let Some(setup) = crate::runner::encoder::setup_conditions(parts, plan, batch, &slots, job)?
+    {
+        batch.phase = Phase::Setup(setup);
+        return Ok(());
+    }
     for index in 0..plan.calls.len() {
         let call = &plan.calls[index];
         let slot = slots[&call.request_key];
@@ -968,6 +981,11 @@ pub(crate) fn complete(
                 }
             }
             batch.skip(&skipped);
+            Ok(false)
+        }
+        Phase::Setup(setup) => {
+            let mut completion = completion.check().map_err(|failure| failure.error)?;
+            crate::runner::encoder::accept_conditions(parts, setup, &mut completion)?;
             Ok(false)
         }
         Phase::Committing(commit) => {

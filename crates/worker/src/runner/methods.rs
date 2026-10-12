@@ -204,18 +204,29 @@ impl RunnerClass {
 
     /// Construct the Python runner `class(*fixed, *arguments)`.
     pub(crate) fn construct(&self, arguments: Vec<Argument>) -> Result<Methods> {
+        let runner = self.construction(arguments).invoke()?;
+        Ok(self.constructed(Handle::new(runner)?))
+    }
+
+    /// The call that constructs the Python runner `class(*fixed,
+    /// *arguments)`, for a job to make ([`crate::lane::Job::call_handle`]);
+    /// [`Self::constructed`] takes the object it returns.
+    pub(crate) fn construction(&self, arguments: Vec<Argument>) -> MethodCall {
         let mut all = self.fixed.clone();
         all.extend(arguments);
-        let runner = MethodCall {
+        MethodCall {
             function: self.constructor.clone(),
             arguments: all,
         }
-        .invoke()?;
-        Ok(Methods {
+    }
+
+    /// The runner whose Python object a construction returned.
+    pub(crate) fn constructed(&self, runner: Handle) -> Methods {
+        Methods {
             class: self.class,
-            runner: Handle::new(runner)?,
+            runner,
             graphs: self.graphs.clone(),
-        })
+        }
     }
 
     /// The calls that list the kernels the operators of `runners` selected.
