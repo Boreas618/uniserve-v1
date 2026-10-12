@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};
 use uniserve_core::{CallId, RequestId, UnitId};
 use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
+use uniserve_ipc::{BlockTable, BufferId, CallKind, ForwardMode, RequestKey, WorkerEndpoint};
 use uniserve_worker::ffi::{Function, Handle, Record};
+use uniserve_worker::lane::JobQueues;
 use uniserve_worker::model::interface::Interface;
 use uniserve_worker::storage::memory::StorageView;
 use uniserve_worker::storage::{KVCache, KVPlan};
@@ -166,11 +167,21 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     let source_views = tensor_map(&source.views()?)?;
     fill.invoke(&[AnyView::from(&source_views)])?;
 
+    // The harness is its own control thread: a lane of its own waits for
+    // the events that deferred releases follow, and the harness hands the
+    // pool that lane's completions while it waits for retirement.
+    let events = EventPool::new();
+    let jobs = JobQueues::single_lane()?;
+    let lane = jobs.clone();
+    events.set_submitter(Some(Box::new(move |device, events| {
+        lane.after(CallKind::Forward(ForwardMode::Decode), device, events)
+    })));
+
     let capacity = Arc::new(Capacity::new(1 << 28, 16, notify)?);
     let transports = Arc::new(Transports::new(
         &[kind],
         Arc::clone(&capacity),
-        EventPool::new(),
+        Arc::clone(&events),
         &TransportOptions {
             source: endpoint(),
             acknowledgment_slot: 0,
@@ -232,6 +243,10 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     uniserve_worker::transfer::exports::release(&locations)?;
     wait(
         || {
+            events.submit_deferred()?;
+            while let Some((job, completion)) = jobs.take() {
+                events.complete(job, completion)?;
+            }
             transports.reap()?;
             destination.reap_imports()?;
             Ok(capacity.used() == 0 && import.retirement().done())

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::ThreadId;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, SourceOrder, Stream, memset_d32};
 use uniserve_ipc::{Locator, TransferTransport};
@@ -23,8 +23,8 @@ use uniserve_ipc::{Locator, TransferTransport};
 use super::endpoint::SourceGrant;
 use super::pool::{ReadBackend, TransferPool, TransferRead};
 use super::{
-    Capacity, DRAIN_LIMIT, Notify, Retirement, SHM_HEADER_BYTES, SharedRead, Spans, TransferTicket,
-    copy_on_host, copy_planner, drain_event, notify, submit_copy,
+    Capacity, Notify, Retirement, SHM_HEADER_BYTES, SharedRead, Spans, TransferTicket,
+    copy_on_host, copy_planner, notify, submit_copy,
 };
 use crate::ffi::{Backing, DType, Device};
 use crate::host::HostTask;
@@ -189,7 +189,6 @@ impl Read {
     /// release the source after those fences complete. Copy destinations
     /// remain owned by their caller and stay readable after close.
     pub fn close(self: &Arc<Self>) -> Result<()> {
-        self.events.reap()?;
         let events = {
             let mut state = self.lock();
             if !state.ticket.close() {
@@ -208,20 +207,15 @@ impl Read {
         for event in &events {
             self.events.wake_after(event)?;
         }
-        self.events.reap()
+        Ok(())
     }
 
-    /// Close a borrowed read and wait on the host for its consumers, at
-    /// most [`DRAIN_LIMIT`] (shutdown only: no executor is left to route a
-    /// completion).
+    /// Close a borrowed read and have the event pool wait on the host for
+    /// its consumers, with the pool's deadline (shutdown only: nobody is
+    /// left to take a completion).
     pub(crate) fn drain(self: &Arc<Self>) -> Result<()> {
         self.close()?;
-        let events = self.lock().ticket.consumer_events().to_vec();
-        let deadline = Instant::now() + DRAIN_LIMIT;
-        for event in events {
-            drain_event(&event, deadline)?;
-        }
-        self.events.reap()
+        self.events.drain()
     }
 
     pub(crate) fn bind_source(&self, source: SourceGrant) -> Result<()> {
@@ -377,7 +371,7 @@ impl Drop for Read {
                 Ok(())
             }),
         );
-        if let Err(error) = deferred.and_then(|()| self.events.reap()) {
+        if let Err(error) = deferred {
             tracing::warn!(target: "uniserve_worker.transfer", "failed to retire transfer read fences: {error}");
         }
     }
@@ -605,7 +599,6 @@ impl NativeRead {
         };
 
         let stream = self.context.stream(device)?;
-        self.context.events.reap()?;
         let copied = (|| -> Result<()> {
             let _device = DeviceGuard::new(DeviceId(device))?;
             if let Some(word) = acknowledgment {

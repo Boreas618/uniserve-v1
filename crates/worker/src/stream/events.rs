@@ -2,11 +2,15 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
+use std::time::Instant;
 
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
 use uniserve_ipc::Wake;
 
 use super::Issue;
+use crate::lane::{Completion, JobId};
+use crate::transfer::{DRAIN_LIMIT, drain_event};
 use crate::{Error, Result};
 
 type PoolKey = (i32, bool, bool);
@@ -23,6 +27,15 @@ pub(crate) struct Deferral {
     pub(crate) owner: Deferred,
 }
 
+/// Starts the job that completes once the events it is given completed
+/// ([`crate::lane::JobQueues::after`]) and names it. The device is the one
+/// whose notification stream waits for the events. It is called with the
+/// pool locked, so it does not use the pool.
+pub type Submitter = Box<dyn Fn(DeviceId, Vec<Arc<Event>>) -> Result<JobId> + Send + Sync>;
+
+/// What starts the job of deferred work a submitted job carried.
+type Start<'a> = dyn Fn(DeviceId, Vec<Arc<Event>>) -> Result<JobId> + 'a;
+
 #[derive(PartialEq)]
 enum Status {
     Open,
@@ -38,32 +51,51 @@ struct ActiveEvent {
     stream: Option<usize>,
 }
 
-struct DeferredRelease {
-    events: Vec<Arc<Event>>,
-    owner: Deferred,
-}
-
 struct State {
     available: HashMap<PoolKey, Vec<Arc<Event>>>,
     active: HashMap<usize, ActiveEvent>,
-    deferred: Vec<DeferredRelease>,
+    /// Deferred work by the job whose completion runs it.
+    deferred: HashMap<JobId, Vec<Deferral>>,
+    /// Deferred work whose job is still to be started: it was deferred on
+    /// another thread than the submitter's, or before a submitter was
+    /// installed.
+    unsubmitted: Vec<Deferral>,
     wake_streams: HashMap<(i32, usize), Arc<Stream>>,
     status: Status,
     wake: Option<Wake>,
+    /// What starts the jobs of deferred work, and the thread that installed
+    /// it: the one thread that submits jobs.
+    submitter: Option<(ThreadId, Submitter)>,
 }
 
 /// Owns pooled events until their references and device accesses retire.
 ///
 /// Storage owners record a fence after the last device access to their
-/// storage, retain a reference to it, and either release it once it is
-/// query-ready or [`defer`](Self::defer) the storage's release until it is.
-/// Deferred work runs on the thread that calls [`reap`](Self::reap) (or
-/// another pool method that reaps), after the pool's lock is released, so it
-/// may use the pool again.
+/// storage, retain a reference to it, and either release it once it
+/// completed or defer the storage's release until it has
+/// ([`Issue::defer`], [`defer`](Self::defer)).
 ///
-/// When a completion wake is installed, [`wake_after`](Self::wake_after)
-/// orders a host function after an event that fires the wake, so the service
-/// loop reaps promptly instead of polling.
+/// The pool asks the driver nothing. Deferred work waits for a job that
+/// holds its events ([`crate::lane::JobQueues::after`]): a lane orders the
+/// job's completion behind the events, and whoever takes the lanes'
+/// completions hands the pool the ones of its jobs
+/// ([`owns`](Self::owns), [`complete`](Self::complete)). The work runs
+/// there, on that thread, after the pool's lock is released, so it may use
+/// the pool again. The job is always submitted behind the job that records
+/// the events, on the same lane: a lane passes a wait on an event that has
+/// no record yet.
+///
+/// - Work deferred while a job is recorded rides with that job, and the
+///   job's submitter starts the waiting job right behind it
+///   ([`defer_submitted`](Self::defer_submitted)).
+/// - Work deferred outside any recording waits on events whose records
+///   were made or are queued in jobs already submitted. On the thread that
+///   installed the [`Submitter`] its job is started at once; from any other
+///   thread it is kept, the installed wake is fired, and the submitter's
+///   thread starts it ([`submit_deferred`](Self::submit_deferred)).
+///
+/// At shutdown nobody takes completions: [`drain`](Self::drain) and
+/// [`close`](Self::close) wait for the events on the host, with a deadline.
 pub struct EventPool {
     state: Mutex<State>,
 }
@@ -74,10 +106,12 @@ impl Default for EventPool {
             state: Mutex::new(State {
                 available: HashMap::new(),
                 active: HashMap::new(),
-                deferred: Vec::new(),
+                deferred: HashMap::new(),
+                unsubmitted: Vec::new(),
                 wake_streams: HashMap::new(),
                 status: Status::Open,
                 wake: None,
+                submitter: None,
             }),
         }
     }
@@ -89,14 +123,25 @@ impl EventPool {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        // No user code runs under the lock: deferred work runs after unlock.
+        // No owner's work runs under the lock: deferred work runs after
+        // unlock.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Install or clear the wake fired after events passed to
-    /// [`wake_after`](Self::wake_after).
+    /// [`wake_after`](Self::wake_after), and when work is deferred on
+    /// another thread than the submitter's.
     pub fn set_wake(&self, wake: Option<Wake>) {
         let previous = std::mem::replace(&mut self.lock().wake, wake);
+        drop(previous);
+    }
+
+    /// Install or clear what starts the jobs of deferred work. The calling
+    /// thread becomes the one that starts them: the thread that submits the
+    /// lanes' jobs and takes their completions.
+    pub fn set_submitter(&self, submitter: Option<Submitter>) {
+        let submitter = submitter.map(|submitter| (std::thread::current().id(), submitter));
+        let previous = std::mem::replace(&mut self.lock().submitter, submitter);
         drop(previous);
     }
 
@@ -198,41 +243,105 @@ impl EventPool {
     }
 
     /// Transfers one retained reference of each event, and the release work
-    /// `owner`, to deferred release. `owner` runs once every event completed.
-    /// With no events, or after shutdown drained the pool, it runs now.
+    /// `owner`, to deferred release, outside the recording of any job: the
+    /// events' records were made, or are queued in jobs already submitted.
+    /// `owner` runs once every event completed. With no events, or after
+    /// shutdown drained the pool, it runs now.
+    ///
+    /// Work deferred while a job is recorded goes through the job's
+    /// recorder instead ([`Issue::defer`]).
     pub fn defer(&self, events: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {
-        let immediate = {
-            let mut state = self.lock();
-            if state.status == Status::Closed || events.is_empty() {
-                Some(owner)
-            } else {
-                require_references(&state, &events)?;
-                state.deferred.push(DeferredRelease { events, owner });
-                None
-            }
-        };
-        match immediate {
-            Some(owner) => owner(),
-            None => Ok(()),
+        let mut state = self.lock();
+        if state.status == Status::Closed || events.is_empty() {
+            drop(state);
+            return owner();
         }
+        require_references(&state, &events)?;
+        let deferral = Deferral { events, owner };
+
+        let here = std::thread::current().id();
+        if matches!(&state.submitter, Some((thread, _)) if *thread == here) {
+            return submit(&mut state, vec![deferral], None);
+        }
+        state.unsubmitted.push(deferral);
+        let wake = state.wake.clone();
+        drop(state);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+        Ok(())
     }
 
-    /// Runs deferred work whose events completed and returns the first
-    /// failure. Failed queries retain their owners; independent completed
-    /// owners still run after a failure.
-    pub fn reap(&self) -> Result<()> {
-        let (completed, mut failure) = {
-            let mut state = self.lock();
-            collect_completed(&mut state)
-        };
-        for owner in completed {
-            if let Err(error) = owner()
-                && failure.is_ok()
-            {
-                failure = Err(error);
-            }
+    /// Takes the deferred work a job carried when that job was submitted.
+    /// `start` starts the job that waits for the work's events on the lane
+    /// the carrying job was submitted to, behind it. After shutdown drained
+    /// the pool the work runs now.
+    pub(crate) fn defer_submitted(
+        &self,
+        deferrals: Vec<Deferral>,
+        start: impl Fn(DeviceId, Vec<Arc<Event>>) -> Result<JobId>,
+    ) -> Result<()> {
+        if deferrals.is_empty() {
+            return Ok(());
         }
-        failure
+        let mut state = self.lock();
+        if state.status == Status::Closed {
+            drop(state);
+            return run(deferrals.into_iter().map(|deferral| deferral.owner));
+        }
+        for deferral in &deferrals {
+            require_references(&state, &deferral.events)?;
+        }
+        submit(&mut state, deferrals, Some(&start))
+    }
+
+    /// Starts the jobs of the work that was deferred on other threads, or
+    /// before the submitter was installed. Does nothing on a thread that is
+    /// not the submitter's.
+    pub fn submit_deferred(&self) -> Result<()> {
+        let mut state = self.lock();
+        let here = std::thread::current().id();
+        if state.unsubmitted.is_empty()
+            || !matches!(&state.submitter, Some((thread, _)) if *thread == here)
+        {
+            return Ok(());
+        }
+        let deferrals = std::mem::take(&mut state.unsubmitted);
+        submit(&mut state, deferrals, None)
+    }
+
+    /// Whether `job` is one that deferred work waits for.
+    pub fn owns(&self, job: JobId) -> bool {
+        self.lock().deferred.contains_key(&job)
+    }
+
+    /// Runs the deferred work that waited for `job`, whose completion says
+    /// that the work's events completed, and returns the first failure;
+    /// independent owners still run after one failed. A job that failed
+    /// established nothing: its work stays deferred until shutdown and the
+    /// job's failure is returned.
+    pub fn complete(&self, job: JobId, completion: Completion) -> Result<()> {
+        completion.check().map_err(|failure| failure.error)?;
+        let owners: Vec<Deferred> = {
+            let mut state = self.lock();
+            let Some(deferrals) = state.deferred.remove(&job) else {
+                return Ok(());
+            };
+            for deferral in &deferrals {
+                if let Err(error) = require_references(&state, &deferral.events) {
+                    state.deferred.insert(job, deferrals);
+                    return Err(error);
+                }
+            }
+            for event in deferrals.iter().flat_map(|deferral| &deferral.events) {
+                release_ready(&mut state, event, 1);
+            }
+            deferrals
+                .into_iter()
+                .map(|deferral| deferral.owner)
+                .collect()
+        };
+        run(owners)
     }
 
     /// The device of an active lease.
@@ -288,6 +397,48 @@ impl EventPool {
         Ok(Some((stream, wake)))
     }
 
+    /// Waits on the host for the events of all deferred work, at most
+    /// [`DRAIN_LIMIT`], and runs that work, until none is left: at
+    /// shutdown, when nobody takes the completions of the jobs it waits
+    /// for. Work whose events did not complete in time stays deferred.
+    pub fn drain(&self) -> Result<()> {
+        let deadline = Instant::now() + DRAIN_LIMIT;
+        loop {
+            let deferrals: Vec<Deferral> = {
+                let mut state = self.lock();
+                let mut deferrals = std::mem::take(&mut state.unsubmitted);
+                deferrals.extend(state.deferred.drain().flat_map(|(_, deferrals)| deferrals));
+                deferrals
+            };
+            if deferrals.is_empty() {
+                return Ok(());
+            }
+
+            let mut failure = Ok(());
+            let mut completed = Vec::new();
+            for deferral in deferrals {
+                let waited = deferral
+                    .events
+                    .iter()
+                    .try_for_each(|event| drain_event(event, deadline));
+                let mut state = self.lock();
+                match waited.and_then(|()| require_references(&state, &deferral.events)) {
+                    Ok(()) => {
+                        for event in &deferral.events {
+                            release_ready(&mut state, event, 1);
+                        }
+                        completed.push(deferral.owner);
+                    }
+                    Err(error) => {
+                        state.unsubmitted.push(deferral);
+                        failure = failure.and(Err(error));
+                    }
+                }
+            }
+            failure.and(run(completed))?;
+        }
+    }
+
     /// Stops new work, waits for every recorded lease on the host and runs
     /// all deferred work. Existing leases may still release afterwards.
     pub fn close(&self) -> Result<()> {
@@ -319,26 +470,21 @@ impl EventPool {
             state.active.clear();
             state.available.clear();
             state.wake = None;
-            state
-                .deferred
-                .drain(..)
-                .map(|release| release.owner)
+            state.submitter = None;
+            let mut deferrals = std::mem::take(&mut state.unsubmitted);
+            deferrals.extend(state.deferred.drain().flat_map(|(_, deferrals)| deferrals));
+            deferrals
+                .into_iter()
+                .map(|deferral| deferral.owner)
                 .collect()
         };
-        let mut result = Ok(());
-        for owner in owners {
-            if let Err(error) = owner()
-                && result.is_ok()
-            {
-                result = Err(error);
-            }
-        }
-        result
+        run(owners)
     }
 
     /// Whether deferred work still waits for device completion.
     pub fn pending(&self) -> bool {
-        !self.lock().deferred.is_empty()
+        let state = self.lock();
+        !state.deferred.is_empty() || !state.unsubmitted.is_empty()
     }
 }
 
@@ -349,64 +495,74 @@ impl Drop for EventPool {
     )]
     fn drop(&mut self) {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        if state.deferred.is_empty() {
+        let mut deferrals = std::mem::take(&mut state.unsubmitted);
+        deferrals.extend(state.deferred.drain().flat_map(|(_, deferrals)| deferrals));
+        if deferrals.is_empty() {
             return;
         }
         // An unclosed pool still owns storage whose release waits on device
         // work. Without a successful drain it cannot be returned.
-        let drained = state.deferred.iter().all(|release| {
-            release
+        let drained = deferrals.iter().all(|deferral| {
+            deferral
                 .events
                 .iter()
                 .all(|event| event.synchronize().is_ok())
         });
-        let deferred = std::mem::take(&mut state.deferred);
         if drained {
-            for release in deferred {
-                let _ = (release.owner)();
+            for deferral in deferrals {
+                let _ = (deferral.owner)();
             }
         } else {
-            std::mem::forget(deferred);
+            std::mem::forget(deferrals);
         }
     }
 }
 
-fn collect_completed(state: &mut State) -> (Vec<Deferred>, Result<()>) {
-    let mut completed = Vec::new();
-    let mut failure = Ok(());
-    let mut index = 0;
+/// Start one job that waits for the events of all of `deferrals` and keep
+/// them under its name. `start` starts it behind the job that carried them;
+/// without one the installed submitter does. Work whose job could not be
+/// started stays unsubmitted, so shutdown still runs it.
+fn submit(state: &mut State, deferrals: Vec<Deferral>, start: Option<&Start<'_>>) -> Result<()> {
+    let events: Vec<Arc<Event>> = deferrals
+        .iter()
+        .flat_map(|deferral| deferral.events.iter().cloned())
+        .collect();
+    // The notification stream of the first event's device waits for all
+    // of them: a stream may wait for another device's event.
+    let device = events
+        .first()
+        .and_then(|event| state.active.get(&key(event)))
+        .map(|active| DeviceId(active.device));
 
-    while index < state.deferred.len() {
-        let release = &state.deferred[index];
-        let ready = release.events.iter().try_fold(true, |ready, event| {
-            event.query().map(|done| ready && done).map_err(Error::Cuda)
-        });
-        let result = ready.and_then(|ready| {
-            if ready {
-                require_references(state, &release.events)?;
-            }
-            Ok(ready)
-        });
-
-        match result {
-            Ok(true) => {
-                let release = state.deferred.swap_remove(index);
-                for event in &release.events {
-                    release_ready(state, event, 1);
-                }
-                completed.push(release.owner);
-            }
-            result => {
-                if let Err(error) = result
-                    && failure.is_ok()
-                {
-                    failure = Err(error);
-                }
-                index += 1;
-            }
+    let started = match (device, start, &state.submitter) {
+        (None, _, _) => Err(invariant("deferred work waits on no active device event")),
+        (Some(device), Some(start), _) => start(device, events),
+        (Some(device), None, Some((_, submitter))) => submitter(device, events),
+        (Some(_), None, None) => Err(invariant("deferred work has no submitter")),
+    };
+    match started {
+        Ok(job) => {
+            state.deferred.entry(job).or_default().extend(deferrals);
+            Ok(())
+        }
+        Err(error) => {
+            state.unsubmitted.extend(deferrals);
+            Err(error)
         }
     }
-    (completed, failure)
+}
+
+/// Run every owner and return the first failure.
+fn run(owners: impl IntoIterator<Item = Deferred>) -> Result<()> {
+    let mut result = Ok(());
+    for owner in owners {
+        if let Err(error) = owner()
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+    }
+    result
 }
 
 /// The device and raw handle of the stream `stream` records on.
@@ -475,4 +631,183 @@ fn key(event: &Arc<Event>) -> usize {
 
 fn invariant(message: &str) -> Error {
     Error::Invariant(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use uniserve_ipc::{CallKind, ForwardMode};
+
+    use super::*;
+    use crate::ffi::{DeferredCall, Function};
+    use crate::lane::{Job, JobQueues};
+
+    const DECODE: CallKind = CallKind::Forward(ForwardMode::Decode);
+
+    /// A pool whose deferred work gets its jobs from `jobs`, started by
+    /// the calling thread. The queues have no lane, so a job completes
+    /// when it is started; what is under test is when the pool runs the
+    /// work.
+    fn served() -> (Arc<EventPool>, JobQueues) {
+        let events = EventPool::new();
+        let jobs = JobQueues::default();
+        let lane = jobs.clone();
+        events.set_submitter(Some(Box::new(move |device, events| {
+            lane.after(DECODE, device, events)
+        })));
+        (events, jobs)
+    }
+
+    /// A retained lease of device 0.
+    fn fence(events: &EventPool) -> Result<Arc<Event>> {
+        let event = events.acquire(0, false, false)?;
+        events.retain(&event, 0, 1)?;
+        Ok(event)
+    }
+
+    /// Deferred work that counts its runs.
+    fn counting(runs: &Arc<AtomicUsize>) -> Deferred {
+        let runs = Arc::clone(runs);
+        Box::new(move || {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn deferred_work_runs_when_its_jobs_completion_is_handed_over() -> Result<()> {
+        let (events, jobs) = served();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let event = fence(&events)?;
+
+        // Without an event there is nothing to wait for.
+        events.defer(Vec::new(), counting(&runs))?;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+        // With one, the work waits for the job the pool started, however
+        // long ago that job completed.
+        events.defer(vec![Arc::clone(&event)], counting(&runs))?;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert!(events.pending());
+        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        assert!(events.owns(job));
+
+        events.complete(job, completion)?;
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert!(!events.pending() && !events.owns(job));
+        // The work's reference went with it: the lease is returned.
+        assert!(events.device(&event).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn work_a_job_carried_waits_for_the_job_started_behind_it() -> Result<()> {
+        let (events, jobs) = served();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let event = fence(&events)?;
+
+        // Recording starts no job: the work rides with the job that
+        // records its event.
+        let carrying = Job::new();
+        carrying
+            .on(None)
+            .defer(&events, vec![event], counting(&runs))?;
+        assert!(jobs.take().is_none() && !events.pending());
+
+        // Its submitter names the job that waits behind it.
+        let carried = carrying.deferrals();
+        events.defer_submitted(carried, |device, fences| jobs.after(DECODE, device, fences))?;
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        events.complete(job, completion)?;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn work_deferred_on_another_thread_gets_its_job_from_the_submitters() -> Result<()> {
+        let (events, jobs) = served();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let fired = Arc::clone(&wakes);
+        events.set_wake(Some(Wake::Local(Arc::new(move || {
+            fired.fetch_add(1, Ordering::Relaxed);
+        }))));
+        let event = fence(&events)?;
+
+        // The other thread starts no job; it wakes the submitter's.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| events.defer(vec![event], counting(&runs)))
+                .join()
+        })
+        .map_err(|_| Error::State("the deferring thread panicked"))??;
+        assert!(jobs.take().is_none());
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(events.pending());
+
+        events.submit_deferred()?;
+        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        events.complete(job, completion)?;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_job_leaves_its_work_deferred_until_the_pool_drains() -> Result<()> {
+        let (events, jobs) = served();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let event = fence(&events)?;
+
+        // The job the work waits for fails at a call.
+        let refused = tvm_ffi::Function::from_packed(|_| {
+            Err(tvm_ffi::Error::new(tvm_ffi::RUNTIME_ERROR, "refused", ""))
+        });
+        let failing = Job::new();
+        failing.on(None).call(DeferredCall::new(
+            Function::new("test.failing", refused),
+            Vec::new(),
+        ))?;
+        let failing = RefCell::new(Some(failing));
+        let carrying = Job::new();
+        carrying
+            .on(None)
+            .defer(&events, vec![event], counting(&runs))?;
+        events.defer_submitted(carrying.deferrals(), |_, _| {
+            let job = failing.take().ok_or(Error::State("started twice"))?;
+            jobs.start(DECODE, job, true)
+        })?;
+
+        // Its failure says nothing about the event: the work does not run.
+        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        assert!(events.complete(job, completion).is_err());
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+        assert!(events.pending());
+
+        // At shutdown the pool waits for the event itself.
+        events.drain()?;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert!(!events.pending());
+        Ok(())
+    }
+
+    #[test]
+    fn work_without_a_submitter_waits_for_one_or_for_shutdown() -> Result<()> {
+        let events = EventPool::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let event = fence(&events)?;
+        events.defer(vec![event], counting(&runs))?;
+        events.submit_deferred()?;
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+
+        events.close()?;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+        // A closed pool has nothing left to wait for.
+        events.defer(Vec::new(), counting(&runs))?;
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
 }

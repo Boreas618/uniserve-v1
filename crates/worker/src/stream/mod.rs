@@ -4,7 +4,7 @@ mod events;
 mod issue;
 
 pub(crate) use events::Deferral;
-pub use events::{Deferred, EventPool};
+pub use events::{Deferred, EventPool, Submitter};
 pub(crate) use issue::HostFunction;
 pub use issue::{Fill, Issue, RowFill};
 
