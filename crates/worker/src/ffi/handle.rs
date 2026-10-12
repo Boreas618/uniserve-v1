@@ -9,19 +9,15 @@ use crate::{Error, Result};
 /// captured graph) that Rust only stores and passes back.
 ///
 /// Dropping the last reference releases the Python object, which runs
-/// Python. A handle dropped on another thread therefore hands its reference
-/// to the Python thread and waits until it is dropped there, so objects are
-/// released in the order their owners drop them.
+/// Python. A handle dropped on another thread therefore submits its
+/// reference to the Python thread, which drops it: objects are released in
+/// the order their owners drop them, and the thread that drops one does not
+/// wait for the release.
 #[derive(Clone)]
 pub struct Handle(Any);
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // FIXME: the control thread parks here too, while it serves, for
-        // every handle it drops (a prepared image, a guidance plan, a video
-        // layout, a clone it made as a call's argument and did not hand
-        // on). A drop no teardown order depends on is to be submitted
-        // ([`super::Interpreter::submit`]) instead of waited for.
         if !is_none(&self.0) {
             interpreter::release(std::mem::take(&mut self.0));
         }
