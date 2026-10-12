@@ -13,8 +13,9 @@
 //! Each step and each commit is one job of the runner's lane: the eager
 //! call, then the capture, whose graph the job's completion carries. The
 //! runner stores it before the next step is prepared, so later steps launch
-//! the graphs of earlier ones. The scratch tables around the steps are
-//! startup work the warmup issues itself, between jobs.
+//! the graphs of earlier ones. A bucket's scratch tables are two more jobs
+//! of the lane: one installs them before the bucket's steps, one clears
+//! them and resets the scratch units after.
 //!
 //! The scenario then admits one request, prefills one token with a token
 //! relay output, decodes from that relay and finishes, through the serving
@@ -37,7 +38,8 @@ use crate::lane::{Job, JobQueues};
 use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
-use crate::storage::KVCache;
+use crate::storage::{KVCache, ScratchUnits};
+use crate::stream::Issue;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
 
@@ -73,14 +75,13 @@ impl WarmupHooks for CausalLMWarmup {
     }
 }
 
-/// Install scratch tables of `lengths` tokens for slots `1..`, run
-/// `operation`, then clear the tables and reset the scratch units.
-pub(crate) fn with_scratch<T>(
+/// Lend scratch units to slots `1..` as block tables of `lengths` tokens,
+/// issued to `stream`: the units are reset, then the tables installed.
+pub(crate) fn install_scratch(
     kv: &mut KVCache,
     lengths: &[usize],
-    stream: Option<&uniserve_cuda::Stream>,
-    operation: impl FnOnce(&mut KVCache) -> Result<T>,
-) -> Result<T> {
+    stream: impl Issue,
+) -> Result<ScratchUnits> {
     let shapes = kv.plan().group_shapes()?;
     let count: usize = lengths
         .iter()
@@ -112,13 +113,38 @@ pub(crate) fn with_scratch<T>(
         }
     }
     kv.install(&tables, stream)?;
-    let result = operation(kv);
-    let slots: Vec<u32> = (1..=lengths.len() as u32).collect();
+    Ok(scratch)
+}
+
+/// Clear the scratch tables of slots `1..=rows` and return their units,
+/// issued to `stream`: the stream waits for what wrote the units, resets
+/// them and waits for the resets.
+pub(crate) fn release_scratch(
+    kv: &mut KVCache,
+    scratch: ScratchUnits,
+    rows: usize,
+    stream: impl Issue,
+) -> Result<()> {
+    let slots: Vec<u32> = (1..=rows as u32).collect();
     let cleared = kv.release_slots(&slots, stream);
     let finished = scratch.finish(kv, stream);
+    cleared.and(finished)
+}
+
+/// Install scratch tables of `lengths` tokens for slots `1..`, run
+/// `operation`, then clear the tables and reset the scratch units, issuing
+/// on `stream` at once: for a capture that issues its own stream work.
+pub(crate) fn with_scratch<T>(
+    kv: &mut KVCache,
+    lengths: &[usize],
+    stream: Option<&uniserve_cuda::Stream>,
+    operation: impl FnOnce(&mut KVCache) -> Result<T>,
+) -> Result<T> {
+    let scratch = install_scratch(kv, lengths, stream)?;
+    let result = operation(kv);
+    let released = release_scratch(kv, scratch, lengths.len(), stream);
     let value = result?;
-    cleared?;
-    finished?;
+    released?;
     Ok(value)
 }
 
@@ -204,12 +230,23 @@ impl CausalLMRunners {
                 .max(1);
             let stream = self.runners[index].stream().cloned();
             let stream = stream.as_ref();
+            let kind = self.kind(group)?;
             let run = |runtime: &mut CausalLMRunners,
                        kv: &mut KVCache,
                        rows: &[TokenRow],
                        decode: bool,
-                       capacity: Option<usize>| {
-                runtime.warmup_step(experts, lanes, (group, peer), kv, rows, decode, capacity)
+                       capacity: Option<usize>,
+                       job: Job<'static>| {
+                runtime.warmup_step(
+                    experts,
+                    lanes,
+                    (group, peer),
+                    kv,
+                    rows,
+                    decode,
+                    capacity,
+                    job,
+                )
             };
             for shape in prefill {
                 let lengths = shape.scratch_lengths(row_tokens, &pages, units);
@@ -219,14 +256,16 @@ impl CausalLMRunners {
                     TokenSelection::Cache
                 };
                 for capacity in variants(shape.token_bucket) {
-                    with_scratch(kv, &lengths, stream, |kv| {
-                        run(self, kv, &rows(1, &lengths, 0, selection), false, capacity)
+                    let rows = rows(1, &lengths, 0, selection);
+                    self.warmup_bucket(lanes, kind, kv, &lengths, stream, |runtime, kv, _| {
+                        run(runtime, kv, &rows, false, capacity, Job::new())
                     })?;
                 }
             }
             for size in decode {
                 let lengths = vec![1; size];
-                with_scratch(kv, &vec![2; size], stream, |kv| {
+                let tables = vec![2; size];
+                self.warmup_bucket(lanes, kind, kv, &tables, stream, |runtime, kv, after| {
                     // One real token per row, prefilled in batches no larger than
                     // the scheduler admits (the largest prefill bucket's live
                     // rows) and committed as each slot's cache; then the decode
@@ -234,11 +273,12 @@ impl CausalLMRunners {
                     for first in (0..size).step_by(prime) {
                         let count = prime.min(size - first);
                         run(
-                            self,
+                            runtime,
                             kv,
                             &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
                             false,
                             None,
+                            Job::new(),
                         )?;
                     }
                     let slots: Vec<usize> = (1..=size).collect();
@@ -246,27 +286,27 @@ impl CausalLMRunners {
                         .iter()
                         .map(|&slot| [slot as i64, COMMIT_CACHE, -1, 1, 0, 0, 0, 0])
                         .collect();
-                    self.warmup_commit(lanes, index, group, &prefilled)?;
-                    self.state.set_predicates(&slots, true, stream)?;
-                    let mut captured = Ok(());
+                    runtime.warmup_commit(lanes, index, group, &prefilled)?;
+
+                    // The flags are set by the job of the first decode step
+                    // and cleared by the job that clears the tables.
+                    let mut job = Job::new();
+                    runtime.state.set_predicates(&slots, true, job.on(stream))?;
+                    runtime
+                        .state
+                        .set_predicates(&slots, false, after.on(stream))?;
                     for capacity in variants(size) {
-                        captured = run(
-                            self,
+                        run(
+                            runtime,
                             kv,
                             &rows(1, &lengths, 1, TokenSelection::LastLogits),
                             true,
                             capacity,
-                        );
-                        if captured.is_err() {
-                            break;
-                        }
+                            std::mem::take(&mut job),
+                        )?;
                     }
-                    self.state.set_predicates(&slots, false, stream)?;
-                    captured
+                    Ok(())
                 })?;
-            }
-            if let Some(stream) = stream {
-                stream.synchronize()?;
             }
             let runner = &self.runners[index];
             tracing::info!(
@@ -280,9 +320,43 @@ impl CausalLMRunners {
         Ok(())
     }
 
+    /// Run a capture bucket's `steps` over scratch tables of `lengths`
+    /// tokens for slots `1..`. One job of `kind`'s lane installs the tables
+    /// before the steps; one clears them and resets the scratch units after
+    /// the steps, whether or not they succeeded. `steps` records into that
+    /// second job what the device undoes before the tables are cleared.
+    fn warmup_bucket(
+        &mut self,
+        lanes: &JobQueues,
+        kind: CallKind,
+        kv: &mut KVCache,
+        lengths: &[usize],
+        stream: Option<&uniserve_cuda::Stream>,
+        steps: impl FnOnce(&mut Self, &mut KVCache, &Job<'static>) -> Result<()>,
+    ) -> Result<()> {
+        let perform = |job: Job<'static>| -> Result<()> {
+            let (_, completion) = lanes.submit(kind, job)?;
+            completion
+                .check()
+                .map(drop)
+                .map_err(|failure| failure.error)
+        };
+
+        let before = Job::new();
+        let scratch = install_scratch(kv, lengths, before.on(stream))?;
+        perform(before)?;
+
+        let after = Job::new();
+        let stepped = steps(self, kv, &after);
+        let released = release_scratch(kv, scratch, lengths.len(), after.on(stream));
+        let performed = perform(after);
+        stepped.and(released).and(performed)
+    }
+
     /// One warmup step of `rows` on microbatch `peer` of `group`, as a job
     /// of the group's lane; the group's other microbatches join. `capacity`
-    /// forces the expert step capacity.
+    /// forces the expert step capacity. The step continues `job`, which
+    /// holds what the device does before it.
     #[expect(
         clippy::too_many_arguments,
         reason = "one warmup step's shape and owners"
@@ -296,6 +370,7 @@ impl CausalLMRunners {
         rows: &[TokenRow],
         decode: bool,
         capacity: Option<usize>,
+        job: Job<'static>,
     ) -> Result<()> {
         let (tables, cache) = kv.split();
         let prompt = PromptChunks::default();
@@ -315,7 +390,6 @@ impl CausalLMRunners {
             (0..self.groups[group].len()).map(|_| None).collect();
         requests[peer] = Some(request);
 
-        let job = Job::new();
         let step = self.forward(
             experts,
             group,

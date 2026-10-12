@@ -528,9 +528,9 @@ impl KVCache {
     }
 
     /// Lend units `1..=count` as warmup scratch: no access may be pending,
-    /// and the units are reset natively on `stream` now and when the
-    /// scratch is returned.
-    pub fn scratch_units(&mut self, count: u32, stream: Option<&Stream>) -> Result<ScratchUnits> {
+    /// and the units are reset natively, issued to `stream`, now and when
+    /// the scratch is returned.
+    pub fn scratch_units(&mut self, count: u32, stream: impl Issue) -> Result<ScratchUnits> {
         if self.manager.has_pending_accesses() {
             return Err(Error::State("KV scratch requires an idle cache"));
         }
@@ -581,15 +581,11 @@ impl ScratchUnits {
         1..=self.count
     }
 
-    /// Wait for the warmup's writes on `stream`, then reset the units again.
-    pub fn finish(self, cache: &KVCache, stream: Option<&Stream>) -> Result<()> {
-        if let Some(stream) = stream {
-            stream.synchronize()?;
-        }
+    /// Wait for the warmup's writes on `stream`, reset the units again and
+    /// wait for the resets, all issued to `stream`.
+    pub fn finish(self, cache: &KVCache, stream: impl Issue) -> Result<()> {
+        Issue::synchronize(&stream)?;
         cache.planes.zero_leading(self.count, stream)?;
-        if let Some(stream) = stream {
-            stream.synchronize()?;
-        }
-        Ok(())
+        Issue::synchronize(&stream)
     }
 }

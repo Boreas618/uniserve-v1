@@ -35,7 +35,7 @@ use crate::ffi::{DeferredCall, Handle};
 use crate::parallel::joins::GraphFunctions;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::runner::methods::MethodCall;
-use crate::stream::{EventPool, Fill, HostFunction, Issue};
+use crate::stream::{EventPool, Fill, HostFunction, Issue, RowFill};
 use crate::{Error, Result};
 
 /// One item of work submitted to a lane.
@@ -70,6 +70,10 @@ enum Operation<'a> {
     Fill {
         stream: Option<Stream>,
         fill: Fill,
+    },
+    RowFill {
+        stream: Option<Stream>,
+        fill: RowFill,
     },
     Record {
         stream: Stream,
@@ -425,6 +429,8 @@ impl Operation<'_> {
             // SAFETY: the recorder's caller keeps the destination valid
             // until the fill ran.
             Self::Fill { stream, fill } => unsafe { stream.as_ref().fill(fill) },
+            // SAFETY: as for a fill.
+            Self::RowFill { stream, fill } => unsafe { stream.as_ref().memset_2d(fill) },
             Self::Record { stream, event } => (&stream).record(&event),
             Self::Wait { stream, event } => (&stream).wait(&event),
             Self::Wake {
@@ -681,6 +687,14 @@ impl Issue for Recorder<'_, '_> {
 
     unsafe fn fill(&self, fill: Fill) -> Result<()> {
         self.job.push(Operation::Fill {
+            stream: self.owned(),
+            fill,
+        });
+        Ok(())
+    }
+
+    unsafe fn memset_2d(&self, fill: RowFill) -> Result<()> {
+        self.job.push(Operation::RowFill {
             stream: self.owned(),
             fill,
         });
@@ -988,6 +1002,44 @@ mod tests {
         assert_eq!(seen.load(Ordering::Relaxed), 0);
         job.perform().check().unwrap();
         assert_eq!(seen.load(Ordering::Relaxed), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_fill_writes_its_rows_when_the_job_is_performed() -> Result<()> {
+        // Three rows of four words; the fill covers two words of each of
+        // the first two rows, from the row's second word.
+        let mut words = [0_u32; 12];
+        let job = Job::new();
+        let fill = RowFill {
+            address: (&raw mut words[1]) as u64,
+            pitch: 16,
+            value: 0x3F80_0000,
+            width: 4,
+            count: 2,
+            height: 2,
+        };
+        // SAFETY: the rows lie inside the test's array.
+        unsafe { job.on(None).memset_2d(fill) }?;
+
+        assert_eq!(words, [0; 12]);
+        job.perform().check().unwrap();
+        let one = 0x3F80_0000;
+        assert_eq!(words, [0, one, one, 0, 0, one, one, 0, 0, 0, 0, 0]);
+
+        // The same fill issued at once, on rows of bytes.
+        let mut bytes = [0_u8; 6];
+        let fill = RowFill {
+            address: bytes.as_mut_ptr() as u64,
+            pitch: 3,
+            value: 7,
+            width: 1,
+            count: 2,
+            height: 2,
+        };
+        // SAFETY: the rows lie inside the test's array.
+        unsafe { None::<&Stream>.memset_2d(fill) }?;
+        assert_eq!(bytes, [7, 7, 0, 7, 7, 0]);
         Ok(())
     }
 
