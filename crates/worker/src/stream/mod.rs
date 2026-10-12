@@ -4,6 +4,7 @@ mod events;
 mod issue;
 
 pub use events::{Deferred, EventPool};
+pub(crate) use issue::HostFunction;
 pub use issue::{Fill, Issue};
 
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};

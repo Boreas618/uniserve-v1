@@ -195,7 +195,8 @@ pub(crate) fn export(
     regions: Option<&[Vec<Range<u64>>]>,
     stream: Option<&Stream>,
 ) -> Result<(TensorExport, Vec<Location>)> {
-    owners.store.export_buffer(
+    // Issued on `stream` at once, so the export is located here.
+    let export = owners.store.export_buffer(
         call,
         product,
         write,
@@ -203,7 +204,8 @@ pub(crate) fn export(
         host,
         regions,
         stream,
-    )
+    )?;
+    owners.store.located(write, export)
 }
 
 /// The tensor descriptor of a supplied input product.
