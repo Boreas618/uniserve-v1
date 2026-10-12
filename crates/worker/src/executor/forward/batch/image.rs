@@ -37,7 +37,7 @@ use crate::ffi::Device;
 use crate::host::image::ImageResult;
 use crate::host::image::ImageTask;
 use crate::host::{HostLane, HostTask};
-use crate::lane::{Completion, Job, JobQueues};
+use crate::lane::{Completion, Job};
 use crate::request::RequestPool;
 use crate::request::diffusion::Trajectories;
 use crate::runner::decoder::DecoderRunner;
@@ -116,8 +116,6 @@ pub(crate) struct Commit {
 pub(crate) struct Parked {
     device: Option<i32>,
     stream: Option<Stream>,
-    lanes: JobQueues,
-    kind: CallKind,
     reports: bool,
     calls: Vec<CallState>,
     buffer: OutputLease,
@@ -135,6 +133,28 @@ pub(crate) struct Parked {
     started: Instant,
 }
 
+/// How far recording a forward got.
+pub(crate) enum Progress {
+    /// The forward is recorded to its end.
+    Done(Box<ForwardStats>),
+    /// The job recorded so far ends here: the forward continues from its
+    /// completion.
+    Boundary(Resume),
+}
+
+impl Progress {
+    /// A forward recorded to its end, with its statistics.
+    pub(crate) fn done(stats: ForwardStats) -> Self {
+        Self::Done(Box::new(stats))
+    }
+}
+
+/// A forward between two of its jobs.
+pub(crate) enum Resume {
+    Encode(crate::runner::encoder::EncodeResume),
+    Denoise(Box<crate::runner::denoiser::image::DenoiseResume>),
+}
+
 /// An image batch between two of its jobs.
 pub(crate) enum Pending {
     /// The job on the lane reads the batch's host-gated predicates.
@@ -142,6 +162,10 @@ pub(crate) enum Pending {
     /// The predicates are known (these calls are skipped): the batch opens
     /// and records its forward next.
     Opened(HashSet<usize>),
+    /// The job on the lane ends inside the batch's forward.
+    Resuming(Box<(Parked, Resume)>),
+    /// That job completed: the forward continues from its completion next.
+    Resumed(Box<(Parked, Resume, Completion)>),
     /// The job on the lane is the batch's last: the rest of its forward
     /// and the issued commit.
     Committing(Box<(Parked, Commit, ForwardStats)>),
@@ -166,10 +190,6 @@ pub(crate) struct ImageBatch<'a> {
     /// What the batch's own steps issue on its stream: the start of its
     /// lease, its flags, its commit and its retirement after a failure.
     pub(crate) job: Job<'static>,
-    /// The lanes a job that ends inside the forward is submitted to, and
-    /// the call kind that names the batch's lane ([`submit`]).
-    pub(crate) lanes: JobQueues,
-    pub(crate) kind: CallKind,
     /// This rank reports the component's host results.
     pub(crate) reports: bool,
     pub(crate) calls: Vec<CallState>,
@@ -223,8 +243,6 @@ impl<'a> ImageBatch<'a> {
         words: usize,
         started: Instant,
         skipped: &HashSet<usize>,
-        lanes: JobQueues,
-        kind: CallKind,
     ) -> Result<Self> {
         let first = plan
             .calls
@@ -282,8 +300,6 @@ impl<'a> ImageBatch<'a> {
             device,
             stream,
             job,
-            lanes,
-            kind,
             reports,
             calls,
             buffer,
@@ -374,8 +390,6 @@ impl<'a> ImageBatch<'a> {
             Parked {
                 device: self.device,
                 stream: self.stream,
-                lanes: self.lanes,
-                kind: self.kind,
                 reports: self.reports,
                 calls: self.calls,
                 buffer: self.buffer,
@@ -411,8 +425,6 @@ impl<'a> ImageBatch<'a> {
             device: parked.device,
             stream: parked.stream,
             job: Job::new(),
-            lanes: parked.lanes,
-            kind: parked.kind,
             reports: parked.reports,
             calls: parked.calls,
             buffer: parked.buffer,
@@ -602,23 +614,6 @@ impl<'a> ImageBatch<'a> {
     }
 }
 
-/// End a job of an image forward inside the forward and start its next:
-/// submit what was recorded so far to the batch's lane and take its
-/// completion.
-///
-/// FIXME: the forward waits here for the lane, on the thread that records
-/// it. A forward resumed from each completion needs its loop state parked
-/// with the batch: an encoding with resident images or an unpacked encoder,
-/// and a denoising whose step misses guidance prefixes.
-pub(crate) fn submit(
-    lanes: &JobQueues,
-    kind: CallKind,
-    job: &mut Job<'static>,
-) -> Result<Completion> {
-    let (_, completion) = lanes.submit(kind, std::mem::take(job))?;
-    completion.check().map_err(|failure| failure.error)
-}
-
 /// The parts of the backend an image batch executes with: the image
 /// model's facts and host policy, the rank's runners, and the storage its
 /// trajectories and products live in.
@@ -696,10 +691,9 @@ pub(crate) fn forward(
     batch: &mut WorkerBatch,
     kind: CallKind,
 ) -> std::result::Result<Option<Job<'static>>, WorkerError> {
-    let lanes = backend.job_queues().clone();
     let step = {
         let (plan, pending, inputs) = batch.image_parts();
-        let step = record(backend.parts(), plan, kind, pending.take(), inputs, &lanes)?;
+        let step = record(backend.parts(), plan, kind, pending.take(), inputs)?;
         match step {
             Step::Job(job, state) => {
                 *pending = Some(state);
@@ -750,7 +744,6 @@ fn record(
     kind: CallKind,
     state: Option<Pending>,
     inputs: &mut Option<Inputs>,
-    lanes: &JobQueues,
 ) -> std::result::Result<Step, WorkerError> {
     let Parts {
         info,
@@ -783,7 +776,24 @@ fn record(
             };
             return Ok(Step::Job(job, Pending::Discarding(failure)));
         }
-        Some(Pending::Predicates(_) | Pending::Committing(_) | Pending::Discarding(_)) => {
+        Some(Pending::Resumed(resumed)) => {
+            // The forward continues from the completion of its last job.
+            let (parked, resume, mut completion) = *resumed;
+            let mut batch = ImageBatch::resume(image, storage, requests, plan, parked);
+            let progressed = match resume {
+                Resume::Encode(resume) => batch.resume_encode(resume, &mut completion),
+                Resume::Denoise(resume) => {
+                    batch.resume_denoise(*resume, &mut completion, text, experts)
+                }
+            };
+            return Ok(advance(batch, progressed.map_err(Failure::from)));
+        }
+        Some(
+            Pending::Predicates(_)
+            | Pending::Resuming(_)
+            | Pending::Committing(_)
+            | Pending::Discarding(_),
+        ) => {
             return Err(WorkerError::classify(
                 Error::Invariant(
                     "an image batch's job was prepared before its last completed".into(),
@@ -841,16 +851,14 @@ fn record(
         words,
         Instant::now(),
         &skipped,
-        lanes.clone(),
-        kind,
     );
     let mut batch = match opened {
         Ok(batch) => batch,
         Err(error) => return Ok(Step::Failed(error.into())),
     };
-    let recorded = (|| -> std::result::Result<(Commit, ForwardStats), Failure> {
+    let progressed = (|| -> std::result::Result<Progress, Failure> {
         batch.bind_flags()?;
-        let stats = match kind {
+        Ok(match kind {
             CallKind::Media(call @ (MediaCall::VisionEncoding | MediaCall::LatentEncoding)) => {
                 let images = inputs
                     .take()
@@ -859,25 +867,50 @@ fn record(
                     .unwrap_or_default();
                 batch.encode(call, images)?
             }
-            CallKind::Media(MediaCall::LatentPreparation) => batch.prepare_latents()?,
+            CallKind::Media(MediaCall::LatentPreparation) => {
+                Progress::done(batch.prepare_latents()?)
+            }
             CallKind::Media(MediaCall::Denoising) => batch.denoise(text, experts)?,
-            CallKind::Media(MediaCall::ImageDecoding) => batch.decode()?,
-            _ => ForwardStats::default(),
-        };
-        let commit = batch.issue_commit()?;
-        Ok((commit, stats))
+            CallKind::Media(MediaCall::ImageDecoding) => Progress::done(batch.decode()?),
+            _ => Progress::done(ForwardStats::default()),
+        })
     })();
+    Ok(advance(batch, progressed))
+}
+
+/// Park the batch behind what its forward recorded: its last job with the
+/// issued commit when the forward is recorded to its end, the job that
+/// ends inside the forward otherwise, and what a failed recording had
+/// recorded.
+fn advance(mut batch: ImageBatch<'_>, progressed: std::result::Result<Progress, Failure>) -> Step {
+    // The commit is issued behind a forward recorded to its end.
+    let progressed = progressed.and_then(|progress| match progress {
+        Progress::Done(stats) => batch
+            .issue_commit()
+            .map(|commit| Recorded::Whole(commit, stats)),
+        Progress::Boundary(resume) => Ok(Recorded::Part(resume)),
+    });
 
     let (job, parked) = batch.park();
-    Ok(match recorded {
-        Ok((commit, stats)) => {
-            Step::Job(job, Pending::Committing(Box::new((parked, commit, stats))))
+    let state = match progressed {
+        Ok(Recorded::Whole(commit, stats)) => {
+            Pending::Committing(Box::new((parked, commit, *stats)))
         }
+        Ok(Recorded::Part(resume)) => Pending::Resuming(Box::new((parked, resume))),
         // What the batch recorded before it failed is performed before its
         // reservations are retired: the events it queued are due, and its
         // writes are abandoned only behind its work.
-        Err(failure) => Step::Job(job, Pending::Failing(Box::new(parked), failure)),
-    })
+        Err(failure) => Pending::Failing(Box::new(parked), failure),
+    };
+    Step::Job(job, state)
+}
+
+/// What a batch's job holds of its forward.
+enum Recorded {
+    /// The rest of the forward, with the issued commit.
+    Whole(Commit, Box<ForwardStats>),
+    /// The forward up to a job boundary.
+    Part(Resume),
 }
 
 /// Apply the completion of the job [`forward`] prepared last.
@@ -919,6 +952,16 @@ pub(crate) fn complete(
                     Ok(()) => Done::Next(Pending::Opened(skipped)),
                     Err(error) => Done::Failed(error.into()),
                 }
+            }
+            // A job that ends inside the forward completed: the forward
+            // continues from its completion in the next job.
+            (Some(Pending::Resuming(resuming)), Ok(completion)) => {
+                let (parked, resume) = *resuming;
+                Done::Next(Pending::Resumed(Box::new((parked, resume, completion))))
+            }
+            (Some(Pending::Resuming(resuming)), Err(failure)) => {
+                let (parked, _) = *resuming;
+                Done::Next(Pending::Failing(Box::new(parked), failure.error.into()))
             }
             // The job failed on its lane, which still made its event
             // records: the batch retires what it reserved.
@@ -976,7 +1019,7 @@ pub(crate) fn complete(
             (Some(Pending::Discarding(failure)), Ok(_)) => Done::Failed(failure),
             // Fences the retirement recorded were not all made.
             (Some(Pending::Discarding(_)), Err(cleanup)) => Done::Failed(fatal(cleanup.error)),
-            (Some(Pending::Opened(_)) | None, _) => {
+            (Some(Pending::Opened(_) | Pending::Resumed(_)) | None, _) => {
                 return Err(WorkerError::classify(
                     Error::State("an image batch has no job on its lane"),
                     Some("image batch"),
