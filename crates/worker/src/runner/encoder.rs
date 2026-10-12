@@ -86,7 +86,9 @@ use crate::lane::{Completion, Job};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass, kernel_records};
+use crate::runner::methods::{
+    Argument, MethodCall, Methods, RunnerClass, kernels_call, list_kernels,
+};
 use crate::runner::{ImageSetup, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{Metadata, OutputPlacement, ProductBuffer, ValueRange};
@@ -912,7 +914,7 @@ impl EncoderRunner {
         image: &StorageView,
         tower: Tower,
         signed_unit: bool,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         if matches!(self.info, EncoderInfo::Text(_)) {
             return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
@@ -932,7 +934,7 @@ impl EncoderRunner {
     /// Record the call that reports the facts of a prepared `image` into
     /// `job`; the job's completion carries them ([`Completion::returned`])
     /// and [`Self::prepared`] reads them.
-    pub(crate) fn image_facts(&self, image: &Handle, job: &Job<'_>) {
+    pub(crate) fn image_facts(&self, image: &Handle, job: &Job) {
         job.call_returning(MethodCall::new(
             &self.methods.image_facts,
             vec![Argument::Handle(image.clone())],
@@ -972,7 +974,7 @@ impl EncoderRunner {
         &mut self,
         images: &[&PreparedImage],
         out: &[StorageView],
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Recorded> {
         if images.len() != out.len() {
             return Err(Error::Invariant(
@@ -1061,7 +1063,7 @@ impl EncoderRunner {
         images: &[&PreparedImage],
         out: &[StorageView],
         result: &mut Encoded,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let (EncoderInfo::Vision(vision), Some(packed)) = (&self.info, &self.packed) else {
             return Err(Error::Invariant("encoder packs no images".into()));
@@ -1163,7 +1165,7 @@ impl EncoderRunner {
         rows: &StorageView,
         grids: &[[u32; 3]],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         if !matches!(self.info, EncoderInfo::Vision(_)) {
             return Err(Error::Invalid(format!(
@@ -1215,7 +1217,7 @@ impl EncoderRunner {
         tokens: &[i64],
         out: &StorageView,
         vision: Option<PromptVision<'_>>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         let (encode, position_ids) = (&self.methods.encode, &self.methods.position_ids);
         let (Some(text), Some(stream)) = (&self.text, &self.stream) else {
@@ -1521,7 +1523,7 @@ impl Conditions {
         pixels: &StorageView,
         units: &[[i64; 5]],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         // The call's input shapes: each unit's frames at its raster.
         let mut shapes = Vec::with_capacity(units.len() * 4);
@@ -1565,7 +1567,7 @@ impl Conditions {
         samples: &StorageView,
         lengths: &[u64],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let shapes: Vec<i64> = lengths
             .iter()
@@ -1592,10 +1594,10 @@ impl Conditions {
         Ok(())
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        let mut records = self.video.kernels(self.video_runners.values())?;
-        records.extend(self.audio.kernels(self.audio_runners.values())?);
-        Ok(records)
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        let mut calls = self.video.kernel_calls(self.video_runners.values());
+        calls.extend(self.audio.kernel_calls(self.audio_runners.values()));
+        calls
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1752,7 +1754,7 @@ impl EncoderRunner {
         pixels: &StorageView,
         units: &[[i64; 5]],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         self.condition_encoders()?
             .encode_video(pixels, units, out, job)
@@ -1765,20 +1767,26 @@ impl EncoderRunner {
         samples: &StorageView,
         lengths: &[u64],
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         self.condition_encoders()?
             .encode_audio(samples, lengths, out, job)
     }
 
+    /// The calls that list the kernels the operators of the runner's
+    /// execution context or of the condition encoders selected.
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        match (&self.context, &self.conditions) {
+            (Some(context), _) => vec![kernels_call(&context.kernels, &self.methods.runner)],
+            (_, Some(conditions)) => conditions.kernel_calls(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The kernels the operators of the runner's execution context or of the
     /// condition encoders selected.
     pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        match (&self.context, &self.conditions) {
-            (Some(context), _) => kernel_records(&context.kernels, &self.methods.runner, ENCODER),
-            (_, Some(conditions)) => conditions.kernels(),
-            _ => Ok(Vec::new()),
-        }
+        list_kernels(self.kernel_calls())
     }
 }
 
@@ -1811,7 +1819,7 @@ pub(crate) fn encode_text(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.outputs.len() != 1 || call.inputs.len() > 1 {
@@ -1887,7 +1895,7 @@ pub(crate) fn encode_vision(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
@@ -1951,7 +1959,7 @@ pub(crate) fn encode_conditions(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
@@ -2205,7 +2213,7 @@ impl ImageBatch<'_> {
 
     fn continue_encode(
         &mut self,
-        job: &Job<'_>,
+        job: &Job,
         resume: EncodeResume,
         completion: &mut Completion,
     ) -> Result<Progress> {
@@ -2274,7 +2282,7 @@ impl ImageBatch<'_> {
     /// to the encode when every image is prepared already.
     fn prepare_images(
         &mut self,
-        job: &Job<'_>,
+        job: &Job,
         call: MediaCall,
         mut prepared: HashMap<usize, PreparedImage>,
     ) -> Result<Progress> {
@@ -2355,7 +2363,7 @@ impl ImageBatch<'_> {
     /// known already.
     fn encode_images(
         &mut self,
-        job: &Job<'_>,
+        job: &Job,
         call: MediaCall,
         images: Vec<Option<PreparedImage>>,
     ) -> Result<Progress> {
@@ -2404,7 +2412,7 @@ impl ImageBatch<'_> {
     /// export; the batch's commit locates the exports.
     fn publish_features(
         &mut self,
-        job: &Job<'_>,
+        job: &Job,
         images: &[PreparedImage],
         writes: &[ProductBuffer],
         encoded: &Encoded,

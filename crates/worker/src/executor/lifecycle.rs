@@ -15,30 +15,107 @@
 //! Request storage (tensor store, KV cache, latent pool, block tables,
 //! decode and diffusion LM state) is owned by the storage and capability runtimes
 //! and takes part through [`RequestStorage`].
+//!
+//! Lifecycle commands run on the control thread, which issues no stream
+//! work itself: what an owner's command needs on a device (a slot's reset,
+//! the clearing of released rows, the wake behind a released buffer's
+//! fences) is recorded into the job of the lane whose stream it belongs to
+//! ([`LaneJobs`]), and the backend submits those jobs after the command.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use uniserve_ipc::{Batch, BatchCommand, BufferId, RequestKey};
+use uniserve_ipc::{Batch, BatchCommand, BufferId, CallKind, RequestKey};
 
-use crate::Result;
+use crate::lane::Job;
 use crate::request::RequestPool;
+use crate::{Error, Result};
+
+/// The jobs a lifecycle command records: one per call kind the rank serves,
+/// performed by the lane serving that kind. An owner records work on a
+/// stream into the job of the kind whose lane owns the stream.
+pub struct LaneJobs {
+    jobs: HashMap<CallKind, Job>,
+    /// The kind whose job takes work that belongs to no lane's stream (a
+    /// wake behind an event): the first the rank serves.
+    any: Option<CallKind>,
+    /// That job on a rank that serves no call kind and so has no lane.
+    unserved: Job,
+}
+
+impl LaneJobs {
+    /// Empty jobs for a rank serving `kinds`.
+    pub(crate) fn new(kinds: &[CallKind]) -> Self {
+        Self {
+            jobs: kinds.iter().map(|&kind| (kind, Job::new())).collect(),
+            any: kinds.first().copied(),
+            unserved: Job::new(),
+        }
+    }
+
+    /// The job of the lane serving `kind`.
+    pub(crate) fn job(&self, kind: CallKind) -> Result<&Job> {
+        self.jobs.get(&kind).ok_or_else(|| {
+            Error::Invariant(format!(
+                "lifecycle work names {}, which this rank does not serve",
+                kind.as_str()
+            ))
+        })
+    }
+
+    /// Record the work no lane's stream carries for the lane serving
+    /// `kind` from now on: the lane of the forward in flight. A wake behind
+    /// an event one of its jobs records is then ordered behind that
+    /// record, since a lane performs its jobs in order.
+    pub(crate) fn follow(&mut self, kind: CallKind) {
+        if self.jobs.contains_key(&kind) {
+            self.any = Some(kind);
+        }
+    }
+
+    /// The job for work no lane's stream carries.
+    pub(crate) fn any(&self) -> &Job {
+        self.any
+            .and_then(|kind| self.jobs.get(&kind))
+            .unwrap_or(&self.unserved)
+    }
+
+    /// The jobs that hold work, leaving every job empty for the next
+    /// command: each with the kind whose lane performs it, or `None` for
+    /// the job of a rank without a lane, which its submitter performs.
+    pub(crate) fn take(&mut self) -> Vec<(Option<CallKind>, Job)> {
+        let mut taken: Vec<_> = self
+            .jobs
+            .iter_mut()
+            .filter(|(_, job)| !job.is_empty())
+            .map(|(&kind, job)| (Some(kind), std::mem::take(job)))
+            .collect();
+        if !self.unserved.is_empty() {
+            taken.push((None, std::mem::take(&mut self.unserved)));
+        }
+        taken
+    }
+}
 
 /// Storage that request epochs and products own, driven by lifecycle
 /// commands. Methods run on the executor thread.
 pub trait RequestStorage {
-    /// Reset per-slot state of newly admitted request slots.
-    fn admit_slots(&mut self, slots: &[usize]) -> Result<()>;
+    /// Reset per-slot state of newly admitted request slots; the resets a
+    /// device makes are recorded into `jobs`.
+    fn admit_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()>;
 
     /// Revoke explicitly freed products and those of finished requests.
-    /// Existing readers keep their physical leases.
-    fn release_buffers(&mut self, buffers: &HashSet<BufferId>) -> Result<()>;
+    /// Existing readers keep their physical leases. The wake behind a
+    /// released product's outstanding fences is recorded into `jobs`.
+    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()>;
 
     /// Begin releasing finished requests' storage, keeping `retained`
-    /// products readable until their own `Free`.
+    /// products readable until their own `Free`. Device work is recorded
+    /// into `jobs` as for [`Self::release_buffers`].
     fn release_requests(
         &mut self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
+        jobs: &LaneJobs,
     ) -> Result<()>;
 
     /// Whether every physical reader of these products and requests has
@@ -50,8 +127,9 @@ pub trait RequestStorage {
         retained: &HashSet<BufferId>,
     ) -> Result<bool>;
 
-    /// Return retired requests' slots for reuse.
-    fn retire_slots(&mut self, slots: &[usize]) -> Result<()>;
+    /// Return retired requests' slots for reuse; what clears them on a
+    /// device is recorded into `jobs`.
+    fn retire_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()>;
 
     /// Progress asynchronous completions (event pools, remote readers).
     fn reap(&mut self) -> Result<()>;
@@ -114,12 +192,12 @@ impl Retirement {
     }
 
     /// Revoke explicitly freed products before the batch waits for storage.
-    pub fn admit(&self, storage: &mut [&mut dyn RequestStorage]) -> Result<()> {
+    pub fn admit(&self, storage: &mut [&mut dyn RequestStorage], jobs: &LaneJobs) -> Result<()> {
         if self.buffers.is_empty() {
             return Ok(());
         }
         for owner in storage.iter_mut() {
-            owner.release_buffers(&self.buffers)?;
+            owner.release_buffers(&self.buffers, jobs)?;
         }
         Ok(())
     }
@@ -129,6 +207,7 @@ impl Retirement {
         &mut self,
         requests: &RequestPool,
         storage: &mut [&mut dyn RequestStorage],
+        jobs: &LaneJobs,
     ) -> Result<()> {
         if self.requests.is_empty() && self.buffers.is_empty() {
             self.complete = true;
@@ -146,8 +225,8 @@ impl Retirement {
             })
             .collect();
         for owner in storage.iter_mut() {
-            owner.release_requests(&self.requests, &self.retained)?;
-            owner.release_buffers(&self.buffers)?;
+            owner.release_requests(&self.requests, &self.retained, jobs)?;
+            owner.release_buffers(&self.buffers, jobs)?;
         }
         Ok(())
     }
@@ -158,6 +237,7 @@ impl Retirement {
         &mut self,
         requests: &mut RequestPool,
         storage: &mut [&mut dyn RequestStorage],
+        jobs: &LaneJobs,
     ) -> Result<bool> {
         if self.complete {
             return Ok(true);
@@ -186,7 +266,7 @@ impl Retirement {
         }
         if !slots.is_empty() {
             for owner in storage.iter_mut() {
-                owner.retire_slots(&slots)?;
+                owner.retire_slots(&slots, jobs)?;
             }
         }
         for request_id in retired {

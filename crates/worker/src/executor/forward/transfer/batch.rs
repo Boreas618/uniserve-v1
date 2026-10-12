@@ -101,7 +101,7 @@ impl Opening {
         rank: usize,
         plan: &BatchPlan,
         device: Option<i32>,
-        job: Recorder<'_, '_>,
+        job: Recorder<'_>,
     ) -> Result<Self> {
         let started = Instant::now();
         let first = plan
@@ -212,7 +212,7 @@ struct Located {
 
 /// A transfer batch recording its last job: its borrowed owners and what it
 /// reserved.
-pub(super) struct TransferBatch<'a, 'j> {
+pub(super) struct TransferBatch<'a> {
     pub(super) storage: &'a mut RankStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
@@ -220,14 +220,14 @@ pub(super) struct TransferBatch<'a, 'j> {
     pub(super) device: Option<i32>,
     stream: Option<&'a Stream>,
     /// The job everything the batch issues is recorded into.
-    job: &'a Job<'j>,
+    job: &'a Job,
     pub(super) reads: Vec<Arc<ProductRead>>,
     /// Signals the physical end of the batch's device work.
     retirement: Arc<Retirement>,
     pub(super) recorded: Recorded,
 }
 
-impl<'a, 'j> TransferBatch<'a, 'j> {
+impl<'a> TransferBatch<'a> {
     /// Lease the opened batch's output storage and record the start of its
     /// device work in `job`.
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
@@ -239,7 +239,7 @@ impl<'a, 'j> TransferBatch<'a, 'j> {
         plan: &'a BatchPlan,
         device: Option<i32>,
         stream: Option<&'a Stream>,
-        job: &'a Job<'j>,
+        job: &'a Job,
     ) -> Result<Self> {
         let Opening {
             calls,
@@ -276,7 +276,7 @@ impl<'a, 'j> TransferBatch<'a, 'j> {
     }
 
     /// Where the batch issues its stream work: its job.
-    pub(super) fn issue(&self) -> Recorder<'a, 'j> {
+    pub(super) fn issue(&self) -> Recorder<'a> {
         self.job.on(self.stream)
     }
 

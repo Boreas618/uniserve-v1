@@ -38,7 +38,7 @@ use super::super::backend::{WorkerBackend, WorkerBatch};
 use super::Stage;
 use super::inputs::{Inputs, component_device};
 use crate::error::WorkerError;
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::Device;
 use crate::lane::{Completion, Job, Lanes};
 use crate::storage::OutputPool;
@@ -112,11 +112,15 @@ impl TransferRuntime {
 }
 
 impl RequestStorage for TransferRuntime {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
-    fn release_buffers(&mut self, _buffers: &std::collections::HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(
+        &mut self,
+        _buffers: &std::collections::HashSet<BufferId>,
+        _jobs: &LaneJobs,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -124,6 +128,7 @@ impl RequestStorage for TransferRuntime {
         &mut self,
         _requests: &std::collections::HashSet<RequestKey>,
         _retained: &std::collections::HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -137,7 +142,7 @@ impl RequestStorage for TransferRuntime {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -195,7 +200,7 @@ fn open(
     kind: CallKind,
     device: Option<i32>,
     stream: Option<&Stream>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<Opening> {
     let parts = backend.parts();
     let Some(storage) = parts.storage else {
@@ -231,7 +236,7 @@ fn record(
     opening: Opening,
     device: Option<i32>,
     stream: Option<&Stream>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Pending {
     let cache = transfers_cache(kind);
     let mut parts = backend.parts();
@@ -295,7 +300,7 @@ pub(crate) fn forward<'a>(
     backend: &'a mut WorkerBackend,
     batch: &'a mut WorkerBatch,
     kind: CallKind,
-) -> std::result::Result<Option<Job<'a>>, WorkerError> {
+) -> std::result::Result<Option<Job>, WorkerError> {
     let state = match batch.transfer_parts().2.take() {
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
         state => state,

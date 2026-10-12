@@ -63,7 +63,9 @@ use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::ffi::Function;
 use crate::ffi::{Backing, DType, Handle};
-use crate::lane::{Capture, Completion, ExpertStep, ExpertVariant, Job, JobQueues};
+use crate::lane::{
+    BLOCK_ON_TIMEOUT, Capture, Completion, ExpertStep, ExpertVariant, Job, JobQueues,
+};
 use crate::model::interface::Interface;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelRecord;
@@ -276,7 +278,7 @@ impl DiffusionLMRunner {
     }
 
     /// Record `writes` to the runner's buffers in `job`.
-    fn submit(&self, writes: ColumnWrites, job: &Job<'_>) -> Result<()> {
+    fn submit(&self, writes: ColumnWrites, job: &Job) -> Result<()> {
         writes.submit(job.on(self.stream.as_ref()))
     }
 
@@ -312,13 +314,13 @@ impl DiffusionLMRunner {
     /// of a method that attends), or the method's eager call; into `then`
     /// the capture that follows an eager call. Without a pool the method
     /// is called.
-    fn method<'j>(
+    fn method(
         &self,
         method: &Method<'_>,
         capacity: Option<usize>,
         arguments: Vec<Argument>,
-        forward: &Job<'j>,
-        then: &Job<'j>,
+        forward: &Job,
+        then: &Job,
     ) -> Result<GraphMode> {
         let Method {
             key,
@@ -379,7 +381,7 @@ impl DiffusionLMRunner {
         completes: Option<&dyn Fn(usize) -> Vec<Argument>>,
         expert: Option<&Expert<'_>>,
         extent: usize,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Vec<(Option<usize>, GraphMode)>> {
         let completing = |capacity: usize| {
             completes.map(|arguments| {
@@ -508,7 +510,7 @@ impl DiffusionLMRunner {
         &self,
         pass: &ReadoutPass<'_>,
         expert: Option<&Expert<'_>>,
-        job: &Job<'_>,
+        job: &Job,
         mut sink: impl FnMut(Range<usize>, &StorageView) -> Result<()>,
     ) -> Result<Recorded> {
         let layout = self.buffers.dimensions.clone();
@@ -752,7 +754,7 @@ impl DiffusionLMRunner {
         rows: &[DenoiseRow],
         pages: &[TablePages],
         expert: Option<&Expert<'_>>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Recorded> {
         let (Some(banks), Some(state)) = (&self.banks, &self.state) else {
             return Err(Error::Invalid(
@@ -935,8 +937,8 @@ impl DiffusionLMRunner {
 
     /// Submit `job`, which recorded `recorded`, to the runner's lane and
     /// apply its completion.
-    fn perform(&mut self, lanes: &JobQueues, job: Job<'_>, recorded: Recorded) -> Result<()> {
-        let (_, completion) = lanes.submit(KIND, job)?;
+    fn perform(&mut self, lanes: &JobQueues, job: Job, recorded: Recorded) -> Result<()> {
+        let completion = lanes.block_on(KIND, job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.complete(recorded, &mut completion).map(drop)
     }
@@ -1076,7 +1078,7 @@ impl DiffusionLMRunner {
             plan: None,
         };
         let mode = self.method(&reading, None, arguments, &job, &job)?;
-        let (_, completion) = lanes.submit(KIND, job)?;
+        let completion = lanes.block_on(KIND, job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         if mode == GraphMode::Capture {
             let graph = completion.captured()?;

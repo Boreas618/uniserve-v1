@@ -9,6 +9,8 @@
 //! One thread of a rank executes Python: the [`Interpreter`]. A [`Function`]
 //! may be called from any thread; the call is handed to the interpreter and
 //! the caller waits for its result, so no thread ever waits for the GIL.
+//! The control thread, which waits for no call while it serves, submits its
+//! calls instead ([`Interpreter::submit`]).
 //! Callers must not hold a lock while calling into Python: a callback may
 //! block on work that needs it.
 

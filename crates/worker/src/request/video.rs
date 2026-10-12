@@ -16,7 +16,7 @@ use tvm_ffi::Any;
 use uniserve_core::{Canvas, ConditionRole, VideoCondition};
 use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::integer_list;
 use crate::host::mux::{MuxConfig, MuxSession};
 use crate::runner::denoiser::VideoModel;
@@ -635,12 +635,12 @@ impl VideoRequests {
 }
 
 impl RequestStorage for VideoRequests {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         // A request's state is created when its admission is installed.
         Ok(())
     }
 
-    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -648,6 +648,7 @@ impl RequestStorage for VideoRequests {
         &mut self,
         _requests: &HashSet<RequestKey>,
         _retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -661,7 +662,7 @@ impl RequestStorage for VideoRequests {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         for slot in slots {
             self.requests.remove(slot);
         }

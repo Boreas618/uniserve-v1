@@ -771,12 +771,12 @@ fn begin<'b>(
 /// The next job of a video batch whose calls' forwards are recorded: the
 /// reads of its host-gated predicates when it has any, then its calls'
 /// forwards with its commit behind them.
-pub(crate) fn forward<'a>(
+pub(crate) fn forward(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
     borrowed: HashSet<BufferId>,
     state: &mut Option<MediaBatch>,
-) -> std::result::Result<Job<'a>, WorkerError> {
+) -> std::result::Result<Job, WorkerError> {
     let batch = match state {
         Some(batch) => batch,
         None => begin(parts, plan, borrowed, state)?,
@@ -813,7 +813,7 @@ fn record(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
     batch: &mut MediaBatch,
-    job: &Job<'_>,
+    job: &Job,
 ) -> std::result::Result<(), WorkerError> {
     let stream = batch.stream.clone();
 
