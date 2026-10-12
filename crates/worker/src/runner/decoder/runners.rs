@@ -184,10 +184,10 @@ impl DecoderRunners {
     pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<KernelRecord>)>> {
         let mut kernels = Vec::new();
         if let Some(decoder) = &self.video {
-            kernels.push((decoder.name.clone(), decoder.runner.kernels(&decoder.name)?));
+            kernels.push((decoder.name.clone(), decoder.runner.kernels()?));
         }
         if let Some(audio) = &self.audio {
-            kernels.push((audio.name.clone(), audio.runner.kernels(&audio.name)?));
+            kernels.push((audio.name.clone(), audio.runner.kernels()?));
         }
         Ok(kernels)
     }

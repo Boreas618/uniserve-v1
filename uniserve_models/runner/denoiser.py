@@ -201,12 +201,23 @@ def _called(loaded, entry) -> list[tuple[Any, str]]:
     """The modules an entry's methods are called on, with each method name.
 
     A method may be nested in the entry's component (``"vision.encode"``).
+    A module this rank does not hold is left out: a rank's share of a
+    partitioned component keeps an absent submodule as ``None`` (a pipeline
+    stage without the denoiser's conditioner).
     """
     called = []
     for point in entry.points:
         prefix, _, method = point.method.rpartition(".")
         path = ".".join(part for part in (entry.component, prefix) if part)
-        called.append((loaded.module.get_submodule(path), method))
+
+        module = loaded.module
+        for name in path.split(".") if path else ():
+            module = getattr(module, name)
+            if module is None:
+                break
+
+        if module is not None:
+            called.append((module, method))
     return called
 
 

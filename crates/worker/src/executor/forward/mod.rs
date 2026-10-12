@@ -15,7 +15,8 @@
 //! not been integrated reports its call kind as unsupported, which fails
 //! the batch with `UnsupportedSetup` and leaves the rank serving.
 //!
-//! A text batch's jobs are operations its runner recorded. The forward of
+//! A text batch's jobs are operations its runner recorded, and so are a
+//! video model's text encoding batches (`batch::forward`). The forward of
 //! every other capability, and the completion of imported inputs, still
 //! issue their own stream work: each is one job holding that work as
 //! [`Job::forward`], until its capability is converted.
@@ -148,6 +149,11 @@ pub(crate) fn forward<'a>(
             Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
                 crate::runner::causal_lm::forward(backend, batch, kind)
             }
+            _ if records(backend, kind) => {
+                let (plan, borrowed, state) = batch.media_parts();
+                let mut parts = backend.media_parts()?;
+                Ok(Some(batch::forward(&mut parts, plan, borrowed, state)?))
+            }
             _ => {
                 let job = Job::new();
                 job.forward(move || {
@@ -180,6 +186,17 @@ pub(crate) fn complete(
         Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
             crate::runner::causal_lm::complete(backend, batch, completion)
         }
+        _ if records(backend, kind) => {
+            let done = {
+                let (_, _, state) = batch.media_parts();
+                let mut parts = backend.media_parts()?;
+                batch::complete(&mut parts, state, completion)?
+            };
+            if done {
+                batch.set_stage(Stage::Done);
+            }
+            Ok(())
+        }
         _ => {
             batch.set_stage(Stage::Done);
             batch.take_executed().unwrap_or_else(|| {
@@ -190,6 +207,12 @@ pub(crate) fn complete(
             })
         }
     }
+}
+
+/// Whether the forwards of `kind` on this rank are recorded into jobs
+/// ([`batch::forward`]); the others issue their own stream work.
+fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
+    kind == CallKind::Media(MediaCall::TextEncoding) && backend.serves_video()
 }
 
 /// Continue with the forward once the imported inputs are resident; an

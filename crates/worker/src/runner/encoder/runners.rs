@@ -112,7 +112,7 @@ impl EncoderRunners {
     pub(crate) fn text_kernels(&self) -> Result<Vec<(String, Vec<KernelRecord>)>> {
         let mut kernels = Vec::new();
         if let Some(text) = &self.text {
-            kernels.push((text.name.clone(), text.runner.kernels(&text.name)?));
+            kernels.push((text.name.clone(), text.runner.kernels()?));
         }
         Ok(kernels)
     }
@@ -121,7 +121,7 @@ impl EncoderRunners {
     pub(crate) fn latent_kernels(&self) -> Result<Vec<(String, Vec<KernelRecord>)>> {
         let mut kernels = Vec::new();
         if let Some(latent) = &self.latent {
-            kernels.push((latent.name.clone(), latent.runner.kernels(&latent.name)?));
+            kernels.push((latent.name.clone(), latent.runner.kernels()?));
         }
         Ok(kernels)
     }

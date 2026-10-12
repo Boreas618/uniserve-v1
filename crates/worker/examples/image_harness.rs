@@ -149,11 +149,13 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         };
         let function =
             interface.import("uniserve_models.runner.encoder.EncoderRunner.prepare_image")?;
+        let facts = interface.import("uniserve_models.runner.encoder.EncoderRunner.image_facts")?;
         let images = payloads
             .iter()
             .map(|payload| {
                 prepare_input(
                     &function,
+                    &facts,
                     &loaded,
                     tower,
                     payload.as_str(),

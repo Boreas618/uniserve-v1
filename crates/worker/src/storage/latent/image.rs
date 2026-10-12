@@ -16,7 +16,7 @@
 //! batch at a time on the device.
 
 use std::collections::HashSet;
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, SourceOrder};
 
 use uniserve_ipc::{BufferId, LatentParams, RequestKey};
 
@@ -25,6 +25,7 @@ use crate::executor::forward::transfer::latents::Pool;
 use crate::executor::lifecycle::RequestStorage;
 use crate::storage::LatentStorage;
 use crate::storage::memory::StorageView;
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// A trajectory's place in the step workspace for one call.
@@ -61,14 +62,14 @@ impl ImageLatents {
         }
     }
 
-    /// Begin a batch's use of the pool on `stream`.
-    pub(crate) fn enter(&self, stream: Option<&Stream>) -> Result<()> {
-        self.order.wait(stream)
+    /// Begin a batch's use of the pool, behind the batch that used it last.
+    pub(crate) fn enter(&self, issue: impl Issue) -> Result<()> {
+        self.order.wait(issue)
     }
 
-    /// End a batch's use of the pool on `stream`.
-    pub(crate) fn leave(&mut self, stream: Option<&Stream>) -> Result<()> {
-        self.order.record(stream)
+    /// End a batch's use of the pool after what `issue` issued for it.
+    pub(crate) fn leave(&mut self, issue: impl Issue) -> Result<()> {
+        self.order.record(issue)
     }
 
     /// The step workspace `[units, width]`.
@@ -106,32 +107,16 @@ impl ImageLatents {
     }
 
     /// Copy `bank`'s pages of `scratch` into its step workspace range.
-    pub(crate) fn gather(
-        &self,
-        bank: u8,
-        scratch: &Scratch,
-        stream: Option<&Stream>,
-    ) -> Result<()> {
-        self.copy(bank, scratch, false, stream)
+    pub(crate) fn gather(&self, bank: u8, scratch: &Scratch, issue: impl Issue) -> Result<()> {
+        self.copy(bank, scratch, false, issue)
     }
 
     /// Copy `scratch`'s step workspace range into `bank`'s pages.
-    pub(crate) fn scatter(
-        &self,
-        bank: u8,
-        scratch: &Scratch,
-        stream: Option<&Stream>,
-    ) -> Result<()> {
-        self.copy(bank, scratch, true, stream)
+    pub(crate) fn scatter(&self, bank: u8, scratch: &Scratch, issue: impl Issue) -> Result<()> {
+        self.copy(bank, scratch, true, issue)
     }
 
-    fn copy(
-        &self,
-        bank: u8,
-        scratch: &Scratch,
-        scatter: bool,
-        stream: Option<&Stream>,
-    ) -> Result<()> {
+    fn copy(&self, bank: u8, scratch: &Scratch, scatter: bool, issue: impl Issue) -> Result<()> {
         let page_units = self.pool.page_units() as i64;
         let workspace = self.workspace()?;
         let mut copies = CopyBatch::new(SourceOrder::Stream);
@@ -149,35 +134,16 @@ impl ImageLatents {
                 copies.push(rows.address(), page.address(), bytes);
             }
         }
-        match stream {
-            // SAFETY: whole pages of this pool and disjoint workspace rows of
-            // the batch, ordered on the batch's stream after their producers
-            // (`enter`).
-            Some(stream) => unsafe { copies.submit(stream) }.map_err(Error::from),
-            None => {
-                for (destination, source, bytes) in copies.iter() {
-                    // SAFETY: host pages and workspace of this pool.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            source as *const u8,
-                            destination as *mut u8,
-                            bytes,
-                        );
-                    }
-                }
-                Ok(())
-            }
-        }
+
+        // SAFETY: whole pages of this pool and disjoint workspace rows of
+        // the batch, which outlive the batch and are ordered behind their
+        // producers (`enter`).
+        unsafe { issue.copy(&copies) }
     }
 
     /// Set slot `slot`'s timestep (the solver update's reference time).
-    pub(crate) fn fill_timestep(
-        &self,
-        slot: u32,
-        value: f32,
-        stream: Option<&Stream>,
-    ) -> Result<()> {
-        self.storage.fill_timestep(slot, value, stream).map(drop)
+    pub(crate) fn fill_timestep(&self, slot: u32, value: f32, issue: impl Issue) -> Result<()> {
+        self.storage.fill_timestep(slot, value, issue).map(drop)
     }
 }
 
