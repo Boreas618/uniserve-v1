@@ -46,7 +46,7 @@ use crate::executor::BatchResult;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::forward::Stage;
 use crate::executor::forward::launch::{Launched, StreamOrder, error_code, failed_output};
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::lane::{Completion, ExpertStep, ExpertVariant, Job};
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelCalls;
@@ -557,16 +557,22 @@ impl CausalLMRunners {
 }
 
 impl RequestStorage for CausalLMRunners {
-    fn admit_slots(&mut self, slots: &[usize]) -> Result<()> {
-        // Reset on the first runner's stream; other streams order after it
-        // before their next batch.
+    fn admit_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()> {
+        // Reset on the first runner's stream, by the lane that owns it;
+        // other streams order after it before their next batch.
         let stream = self.runners.first().and_then(CausalLMRunner::stream);
-        self.order.wait(stream)?;
-        self.state.reset(slots, stream)?;
-        self.order.record(stream)
+        let group = self
+            .groups
+            .iter()
+            .position(|group| group.contains(&0))
+            .ok_or_else(|| Error::Invariant("the first text runner is in no group".into()))?;
+        let issue = jobs.job(self.kind(group)?)?.on(stream);
+        self.order.wait(issue)?;
+        self.state.reset(slots, issue)?;
+        self.order.record(issue)
     }
 
-    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -574,6 +580,7 @@ impl RequestStorage for CausalLMRunners {
         &mut self,
         _requests: &HashSet<RequestKey>,
         _retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -587,7 +594,7 @@ impl RequestStorage for CausalLMRunners {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
