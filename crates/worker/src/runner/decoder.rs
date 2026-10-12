@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::Canvas;
-use uniserve_cuda::{Stream, memcpy_async, memset_d8};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 use uniserve_ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 
 use crate::config::Device;
@@ -54,14 +54,16 @@ use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
+use crate::lane::Job;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_records};
+use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass, kernel_records};
 use crate::runner::{ImageSetup, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
     LatentUpdate, Metadata, OutputPlacement, ProductBuffer, RequestSlots, SlotField, ValueRange,
 };
+use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
 const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
@@ -241,9 +243,11 @@ impl DecoderRunner {
         longest: u32,
         written: u32,
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
-        self.video_decoder()?
-            .decode(slot, latent, frames, unit, shape, longest, written, out)
+        self.video_decoder()?.decode(
+            slot, latent, frames, unit, shape, longest, written, out, job,
+        )
     }
 
     /// Construct an audio decoder's Python runner of tracks of
@@ -270,8 +274,9 @@ impl DecoderRunner {
         latent: &StorageView,
         units: TrackUnits,
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
-        self.audio_decoder()?.decode(latent, units, out)
+        self.audio_decoder()?.decode(latent, units, out, job)
     }
 
     /// Refuse further captures.
@@ -938,7 +943,7 @@ impl VideoDecoder {
     /// The arguments of `DecoderRunner.decode` for a unit of `shape` whose
     /// window reads `rows` latent rows and whose video's longest unit has
     /// `longest` frames.
-    fn arguments(&self, shape: UnitShape, rows: u64, longest: u32) -> Result<Vec<Any>> {
+    fn arguments(&self, shape: UnitShape, rows: u64, longest: u32) -> Result<Vec<Argument>> {
         let canvas = shape.segment.1;
         let runner = self
             .runners
@@ -948,14 +953,14 @@ impl VideoDecoder {
             .ok_or_else(|| Error::Invariant("a video segment has no decoder runner".into()))?;
         let frames = self.unit_frames(canvas, longest)?;
         Ok(vec![
-            runner.runner().to_any(),
-            Any::from(self.latent.to_tensor()?),
-            Any::from(self.rows.prefix(rows as i64)?.to_tensor()?),
-            Any::from(self.retained.to_tensor()?),
-            Any::from(frames.to_tensor()?),
-            Any::from(shape.first),
-            Any::from(shape.last),
-            Any::from(i64::from(shape.count)),
+            Argument::Handle(runner.runner().clone()),
+            Argument::Tensor(self.latent.clone()),
+            Argument::Tensor(self.rows.prefix(rows as i64)?),
+            Argument::Tensor(self.retained.clone()),
+            Argument::Tensor(frames),
+            Argument::Bool(shape.first),
+            Argument::Bool(shape.last),
+            Argument::Integer(i64::from(shape.count)),
         ])
     }
 
@@ -1002,8 +1007,7 @@ impl VideoDecoder {
         self.latent.zero(Some(self.stream()))?;
         self.rows.zero(Some(self.stream()))?;
         self.retained.zero(Some(self.stream()))?;
-        let arguments = self.arguments(shape, rows, longest)?;
-        self.class.forward.call_values(&arguments)?;
+        MethodCall::new(&self.class.forward, self.arguments(shape, rows, longest)?).invoke()?;
         self.stream().synchronize()?;
         Ok(())
     }
@@ -1016,11 +1020,11 @@ impl VideoDecoder {
         if self.graphs.contains(&shape, None) {
             return Ok(());
         }
-        let arguments = self.arguments(shape, rows, longest)?;
+        let forward = MethodCall::new(&self.class.forward, self.arguments(shape, rows, longest)?);
         let graph = self
             .capture
             .capture(&pool.value, self.stream.raw(), self.device, || {
-                self.class.forward.call_values(&arguments).map(drop)
+                forward.invoke().map(drop)
             })?;
         self.graphs.insert(shape, None, graph)?;
         self.graphs.record(GraphMode::Capture);
@@ -1045,9 +1049,11 @@ impl VideoDecoder {
         longest: u32,
         written: u32,
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
         let canvas = shape.segment.1;
         let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
         let latent_bytes = latent.numel() * latent.dtype().bytes() as u64;
         if !latent.is_contiguous()
             || latent.dtype() != DType::F32
@@ -1061,58 +1067,57 @@ impl VideoDecoder {
         let rows = (window.len() / 8) as u64;
         let slot_overlap = self.overlap.slot("video_overlap", slot as u32)?;
         let overlap_bytes = self.retained.numel() * self.retained.dtype().bytes() as u64;
-        self.rows
-            .prefix(rows as i64)?
-            .upload(&window, Some(&stream))?;
+        self.rows.prefix(rows as i64)?.upload(&window, issue)?;
+        // The two copies write disjoint tensors, so they need no order
+        // between them.
+        let mut inputs = CopyBatch::new(SourceOrder::Stream);
+        inputs.push(
+            self.latent.address(),
+            latent.address(),
+            latent_bytes as usize,
+        );
+        inputs.push(
+            self.retained.address(),
+            slot_overlap.address(),
+            overlap_bytes as usize,
+        );
         // SAFETY: the forward's tensors and the slot's overlap row belong to
-        // this runner and the copies stay inside them; the latent was read
+        // this runner and the copies stay inside them, in disjoint ranges;
+        // the latent is leased until the batch commits and was waited for
         // on this stream.
-        unsafe {
-            memcpy_async(
-                self.latent.address(),
-                latent.address(),
-                latent_bytes as usize,
-                &stream,
-            )?;
-            memcpy_async(
-                self.retained.address(),
-                slot_overlap.address(),
-                overlap_bytes as usize,
-                &stream,
-            )?;
-        }
+        unsafe { issue.copy(&inputs) }?;
 
         let mode = match self.graphs.lookup(&shape, None) {
             Ok(Lookup::Replay(graph)) => {
-                graph.launch(&stream)?;
+                issue.launch(graph)?;
                 GraphMode::Replay
             }
             // A shape startup did not capture runs on the Python thread.
             _ => {
-                let arguments = self.arguments(shape, rows, longest)?;
-                self.class.forward.call_values(&arguments)?;
+                job.call(MethodCall::new(
+                    &self.class.forward,
+                    self.arguments(shape, rows, longest)?,
+                ));
                 GraphMode::Eager
             }
         };
         self.graphs.record(mode);
 
         let frame_bytes = u64::from(canvas.height) * u64::from(canvas.width) * 3;
+        let mut outputs = CopyBatch::new(SourceOrder::Stream);
+        outputs.push(
+            slot_overlap.address(),
+            self.retained.address(),
+            overlap_bytes as usize,
+        );
+        outputs.push(
+            out.address(),
+            self.frames.address(),
+            (u64::from(written) * frame_bytes) as usize,
+        );
         // SAFETY: as above; `out` holds the unit's frames and the copies
         // follow the forward on the stream.
-        unsafe {
-            memcpy_async(
-                slot_overlap.address(),
-                self.retained.address(),
-                overlap_bytes as usize,
-                &stream,
-            )?;
-            memcpy_async(
-                out.address(),
-                self.frames.address(),
-                (u64::from(written) * frame_bytes) as usize,
-                &stream,
-            )?;
-        }
+        unsafe { issue.copy(&outputs) }?;
         Ok(mode)
     }
 
@@ -1210,18 +1215,18 @@ impl AudioDecoder {
 
     /// The arguments of `DecoderRunner.decode` for `units` of a track whose
     /// complete latent has `rows` rows.
-    fn arguments(&self, units: TrackUnits, rows: u64) -> Result<Vec<Any>> {
+    fn arguments(&self, units: TrackUnits, rows: u64) -> Result<Vec<Argument>> {
         let runner = self.runners.get(&units.latent_frames).ok_or_else(|| {
             Error::Invalid("the audio track's length has no decoder runner".into())
         })?;
         Ok(vec![
-            runner.runner().to_any(),
-            Any::from(self.latent.prefix(rows as i64)?.to_tensor()?),
-            Any::from(self.samples.prefix(units.span as i64)?.to_tensor()?),
-            Any::from(units.samples as i64),
-            Any::from(i64::from(units.first)),
-            Any::from(i64::from(units.count)),
-            Any::from(i64::from(units.total)),
+            Argument::Handle(runner.runner().clone()),
+            Argument::Tensor(self.latent.prefix(rows as i64)?),
+            Argument::Tensor(self.samples.prefix(units.span as i64)?),
+            Argument::Integer(units.samples as i64),
+            Argument::Integer(i64::from(units.first)),
+            Argument::Integer(i64::from(units.count)),
+            Argument::Integer(i64::from(units.total)),
         ])
     }
 
@@ -1229,8 +1234,7 @@ impl AudioDecoder {
     /// rows, so kernels compile before any capture.
     pub(crate) fn warm(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
         self.latent.zero(Some(self.stream()))?;
-        let arguments = self.arguments(units, rows)?;
-        self.class.forward.call_values(&arguments)?;
+        MethodCall::new(&self.class.forward, self.arguments(units, rows)?).invoke()?;
         self.stream().synchronize()?;
         Ok(())
     }
@@ -1243,11 +1247,11 @@ impl AudioDecoder {
         if self.graphs.contains(&units, None) {
             return Ok(());
         }
-        let arguments = self.arguments(units, rows)?;
+        let forward = MethodCall::new(&self.class.forward, self.arguments(units, rows)?);
         let graph = self
             .capture
             .capture(&pool.value, self.stream.raw(), self.device, || {
-                self.class.forward.call_values(&arguments).map(drop)
+                forward.invoke().map(drop)
             })?;
         self.graphs.insert(units, None, graph)?;
         self.graphs.record(GraphMode::Capture);
@@ -1261,8 +1265,10 @@ impl AudioDecoder {
         latent: &StorageView,
         units: TrackUnits,
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
         let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
         let rows = latent.shape().first().copied().unwrap_or(0).max(0) as u64;
         let latent_bytes = latent.numel() * latent.dtype().bytes() as u64;
         if !latent.is_contiguous()
@@ -1273,41 +1279,42 @@ impl AudioDecoder {
                 "an audio latent exceeds the decoder's latent rows".into(),
             ));
         }
+        let mut input = CopyBatch::new(SourceOrder::Stream);
+        input.push(
+            self.latent.address(),
+            latent.address(),
+            latent_bytes as usize,
+        );
         // SAFETY: the forward's tensors belong to this runner and the copy
-        // stays inside them; the latent was read on this stream.
-        unsafe {
-            memcpy_async(
-                self.latent.address(),
-                latent.address(),
-                latent_bytes as usize,
-                &stream,
-            )?;
-        }
+        // stays inside them; the latent is leased until the batch commits
+        // and was waited for on this stream.
+        unsafe { issue.copy(&input) }?;
 
         let mode = match self.graphs.lookup(&units, None) {
             Ok(Lookup::Replay(graph)) => {
-                graph.launch(&stream)?;
+                issue.launch(graph)?;
                 GraphMode::Replay
             }
             // Units startup did not capture run on the Python thread.
             _ => {
-                let arguments = self.arguments(units, rows)?;
-                self.class.forward.call_values(&arguments)?;
+                job.call(MethodCall::new(
+                    &self.class.forward,
+                    self.arguments(units, rows)?,
+                ));
                 GraphMode::Eager
             }
         };
         self.graphs.record(mode);
 
+        let mut output = CopyBatch::new(SourceOrder::Stream);
+        output.push(
+            out.address(),
+            self.samples.address(),
+            (units.span * 4) as usize,
+        );
         // SAFETY: as above; `out` holds the units' samples and the copy
         // follows the forward on the stream.
-        unsafe {
-            memcpy_async(
-                out.address(),
-                self.samples.address(),
-                (units.span * 4) as usize,
-                &stream,
-            )?;
-        }
+        unsafe { issue.copy(&output) }?;
         Ok(mode)
     }
 
@@ -1330,6 +1337,7 @@ pub(crate) fn decode_video(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let range = decode_range(plan, call)?;
@@ -1373,12 +1381,13 @@ pub(crate) fn decode_video(
     let segment: Segment = parts.video.model.segment(frames, canvas, unit)?;
     let owners = parts.owners();
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let latent = batch.inputs.read(
         owners.store,
         &call.inputs[0],
         call.call_id,
         batch.device,
-        Some(&stream),
+        issue,
     )?;
     let row = u64::from(unit - range.cursor);
     let shape = vec![
@@ -1427,6 +1436,7 @@ pub(crate) fn decode_video(
         longest,
         written,
         &out,
+        job,
     )?;
     batch.record(mode);
     let frame_bytes = u64::from(canvas.height) * u64::from(canvas.width) * 3;
@@ -1436,15 +1446,15 @@ pub(crate) fn decode_video(
         // SAFETY: the padding lies inside the unit's bound product row,
         // written on the decoder's stream after the reconstruction.
         unsafe {
-            memset_d8(
-                out.address() + u64::from(written) * frame_bytes,
-                0,
-                padding as usize,
-                &stream,
-            )?;
+            issue.fill(Fill {
+                address: out.address() + u64::from(written) * frame_bytes,
+                value: 0,
+                width: 1,
+                count: padding as usize,
+            })?;
         }
     }
-    publish_bound(parts, batch, call, index, &write, true)
+    publish_bound(parts, batch, call, index, &write, true, issue)
 }
 
 /// Decode this rank's audio units into its span of the track.
@@ -1455,6 +1465,7 @@ pub(crate) fn decode_audio(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let range = decode_range(plan, call)?;
@@ -1486,12 +1497,13 @@ pub(crate) fn decode_audio(
     let last = spans[run.end as usize - 1].end;
     let owners = parts.owners();
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let latent = batch.inputs.read(
         owners.store,
         &call.inputs[0],
         call.call_id,
         batch.device,
-        Some(&stream),
+        issue,
     )?;
     let write = bind_outputs(
         owners.store,
@@ -1524,7 +1536,8 @@ pub(crate) fn decode_audio(
             span: last - first,
         },
         &write.view(),
+        job,
     )?;
     batch.record(mode);
-    publish_bound(parts, batch, call, index, &write, true)
+    publish_bound(parts, batch, call, index, &write, true, issue)
 }

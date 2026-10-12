@@ -15,11 +15,12 @@
 //! not been integrated reports its call kind as unsupported, which fails
 //! the batch with `UnsupportedSetup` and leaves the rank serving.
 //!
-//! The jobs of a text batch, of a diffusion LM batch, of a transfer batch
-//! and of the completion of imported inputs are operations their owners
-//! recorded. The forward of a media capability still issues its own stream
-//! work: it is one job holding that work as [`Job::forward`], until the
-//! capability is converted.
+//! The jobs of a text batch, of a diffusion LM batch, of a transfer batch,
+//! of a video model's device batches (`batch::forward`: its encoders, its
+//! denoiser and its decoders) and of the completion of imported inputs are
+//! operations their owners recorded. The forward of every other capability
+//! still issues its own stream work: it is one job holding that work as
+//! [`Job::forward`], until the capability is converted.
 
 pub(crate) mod batch;
 pub(crate) mod inputs;
@@ -144,6 +145,11 @@ pub(crate) fn forward<'a>(
                 crate::runner::diffusion_lm::forward(backend, batch, kind)
             }
             CallKind::Transfer(_) => transfer::forward(backend, batch, kind),
+            _ if records(backend, kind) => {
+                let (plan, borrowed, state) = batch.media_parts();
+                let mut parts = backend.media_parts()?;
+                Ok(Some(batch::forward(&mut parts, plan, borrowed, state)?))
+            }
             _ => {
                 let job = Job::new();
                 job.forward(move || {
@@ -182,6 +188,17 @@ pub(crate) fn complete(
             crate::runner::diffusion_lm::complete(backend, batch, completion)
         }
         CallKind::Transfer(_) => transfer::complete(backend, batch, completion),
+        _ if records(backend, kind) => {
+            let done = {
+                let (_, _, state) = batch.media_parts();
+                let mut parts = backend.media_parts()?;
+                batch::complete(&mut parts, state, completion)?
+            };
+            if done {
+                batch.set_stage(Stage::Done);
+            }
+            Ok(())
+        }
         _ => {
             batch.set_stage(Stage::Done);
             batch.take_executed().unwrap_or_else(|| {
@@ -192,6 +209,26 @@ pub(crate) fn complete(
             })
         }
     }
+}
+
+/// Whether the forwards of `kind` on this rank are recorded into jobs
+/// ([`batch::forward`]): a video model's device calls. The others issue
+/// their own stream work.
+fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
+    use MediaCall::*;
+
+    matches!(
+        kind,
+        CallKind::Media(
+            TextEncoding
+                | VisionEncoding
+                | LatentEncoding
+                | LatentPreparation
+                | Denoising
+                | VideoDecoding
+                | AudioDecoding
+        )
+    ) && backend.serves_video()
 }
 
 /// Continue with the forward once the imported inputs are resident; an
@@ -233,21 +270,13 @@ fn execute(
             crate::runner::media::execute(&mut parts, plan, borrowed, state)
         }
         Media(ImageDecoding) => batch::image::execute(backend, batch, kind),
-        Media(VideoDecoding | AudioDecoding) => {
-            let (plan, borrowed, state) = batch.media_parts();
-            let mut parts = backend.media_parts()?;
-            batch::execute(&mut parts, plan, borrowed, state)
-        }
-        // Encoders and denoisers serve both image and video models; the
-        // rank's model decides.
+        // A video model's rank records its device calls ([`records`]); no
+        // other rank decodes video or audio.
+        Media(VideoDecoding | AudioDecoding) => Err(unsupported(kind, "video")),
+        // Encoders and denoisers serve both image and video models; these
+        // are an image model's.
         Media(VisionEncoding | TextEncoding | LatentEncoding | LatentPreparation | Denoising) => {
-            if backend.serves_video() {
-                let (plan, borrowed, state) = batch.media_parts();
-                let mut parts = backend.media_parts()?;
-                batch::execute(&mut parts, plan, borrowed, state)
-            } else {
-                batch::image::execute(backend, batch, kind)
-            }
+            batch::image::execute(backend, batch, kind)
         }
     }
 }

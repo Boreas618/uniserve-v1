@@ -420,8 +420,7 @@ pub struct ProductExport {
 }
 
 impl ProductExport {
-    /// Revoke an export that is not published. As for
-    /// [`TensorStore::located`], only once the issuer performed its work.
+    /// Revoke the locations of an export that is not published.
     pub fn revoke(&self) {
         self.exports.iter().for_each(Exports::revoke);
     }
