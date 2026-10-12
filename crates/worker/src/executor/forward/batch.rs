@@ -33,7 +33,7 @@ use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::forward::launch::{flag, request_flag};
 use crate::executor::forward::placement::{
-    OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export, skipped,
+    OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export,
 };
 use crate::executor::pending::{BatchResult, PendingOutput};
 use crate::ffi::Device;
@@ -288,26 +288,6 @@ impl MediaBatch {
                 call.pending.output.status = CallStatus::Predicated;
             }
         }
-    }
-
-    /// Commit the launched batch on its stream at once: issue the commit
-    /// and apply it.
-    pub(crate) fn commit(
-        &mut self,
-        plan: &BatchPlan,
-        owners: ProductOwners<'_>,
-        requests: &mut RequestPool,
-        trajectories: Option<&mut dyn Trajectories>,
-    ) -> Result<()> {
-        let stream = self.stream.clone();
-        let commit = self.issue_commit(
-            plan,
-            owners,
-            requests,
-            trajectories.as_deref(),
-            stream.as_ref(),
-        )?;
-        self.apply_commit(commit, owners, requests, trajectories)
     }
 
     /// Issue the device half of the batch's commit to `stream`, behind its
@@ -760,25 +740,6 @@ fn media_kind(call: &Call) -> MediaCall {
     }
 }
 
-/// Open a video batch and skip the calls whose predicates, read on its
-/// stream at once, are false.
-pub(crate) fn open<'b>(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    borrowed: HashSet<BufferId>,
-    state: &'b mut Option<MediaBatch>,
-) -> Result<&'b mut MediaBatch> {
-    let batch = begin(parts, plan, borrowed, state)?;
-    let skipped = skipped(
-        &parts.storage.tensors,
-        plan,
-        batch.device,
-        batch.stream.as_ref(),
-    )?;
-    batch.skip(&skipped);
-    Ok(batch)
-}
-
 /// Begin a video batch: its output lease on the stream of its kind and its
 /// calls' pending results. `borrowed` names the inputs host codecs read in
 /// place.
@@ -900,6 +861,31 @@ fn record(
     for index in 0..plan.calls.len() {
         let call = &plan.calls[index];
         let slot = slots[&call.request_key];
+
+        // A host call's work is tasks of the rank's host lane, submitted
+        // here; the batch's job holds only what it writes for the calls.
+        match call.code {
+            CallKind::Media(MediaCall::MediaReading) => {
+                crate::runner::media::read_media(parts, batch, index, call, slot, &placement)?;
+                continue;
+            }
+            CallKind::Media(MediaCall::VideoEncoding) => {
+                crate::runner::media::encode_units(
+                    parts, plan, batch, index, call, slot, &placement,
+                )?;
+                continue;
+            }
+            CallKind::Media(MediaCall::AudioEncoding) => {
+                crate::runner::media::encode_audio(parts, batch, index, call, slot)?;
+                continue;
+            }
+            CallKind::Media(MediaCall::Muxing) => {
+                crate::runner::media::mux(parts, plan, batch, index, call, slot)?;
+                continue;
+            }
+            _ => {}
+        }
+
         let owners = parts.owners();
         let completion = bind_completion(owners.store, call, batch.device, &slots)?;
         batch.calls[index].completion = completion;
@@ -932,7 +918,7 @@ fn record(
             )?,
             kind => {
                 return Err(Error::Unsupported(format!(
-                    "{} is not recorded into a job",
+                    "{} is not a video model's media call",
                     kind.as_str()
                 ))
                 .into());
