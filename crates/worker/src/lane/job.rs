@@ -2,8 +2,8 @@
 //! back.
 //!
 //! A [`Job`] is an ordered list of operations on streams: copies, fills,
-//! event records and waits, a graph launch, an eager call, output reads, an
-//! expert step. The control thread builds it: a runner and the storage
+//! event records and waits, a graph launch, an eager call, output reads, a
+//! host function, a wait for the stream, an expert step. The control thread builds it: a runner and the storage
 //! owners it calls record what they would issue ([`Job::on`], an
 //! [`Issue`]), and do their host bookkeeping as they are called. The lane's
 //! execution thread performs the operations in order ([`Job::perform`]) and
@@ -16,8 +16,9 @@
 //! calls.
 //!
 //! A job is performed completely or it fails at one operation. After a
-//! failure the remaining copies, fills, launches, calls and reads are not
-//! performed, but the remaining event operations are: an event a job
+//! failure the remaining copies, fills, launches, calls, reads, host
+//! functions and waits are not performed, but the remaining event
+//! operations are: an event a job
 //! records fences storage its owner already retains on it, and that
 //! storage is returned only once the record is made.
 
@@ -34,7 +35,7 @@ use crate::ffi::{DeferredCall, Handle};
 use crate::parallel::joins::GraphFunctions;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::runner::methods::MethodCall;
-use crate::stream::{EventPool, Fill, Issue};
+use crate::stream::{EventPool, Fill, HostFunction, Issue};
 use crate::{Error, Result};
 
 /// One item of work submitted to a lane.
@@ -89,6 +90,15 @@ enum Operation<'a> {
         stream: Option<Stream>,
         source: u64,
         bytes: usize,
+    },
+    /// Run `function` on the host behind the stream's work issued before.
+    HostFunction {
+        stream: Option<Stream>,
+        function: HostFunction,
+    },
+    /// Wait for the stream's work issued before.
+    Synchronize {
+        stream: Option<Stream>,
     },
     ExpertStep(ExpertStep),
 }
@@ -372,6 +382,8 @@ impl Operation<'_> {
                 completion.reads.push_back(value);
                 Ok(())
             }
+            Self::HostFunction { stream, function } => stream.as_ref().launch_host_fn(function),
+            Self::Synchronize { stream } => Issue::synchronize(&stream.as_ref()),
             Self::ExpertStep(step) => step.perform(completion),
         }
     }
@@ -587,6 +599,21 @@ impl Issue for Recorder<'_, '_> {
 
     fn call(&self, call: DeferredCall) -> Result<()> {
         self.job.push(Operation::Call(Call::Function(call)));
+        Ok(())
+    }
+
+    fn launch_host_fn(&self, function: HostFunction) -> Result<()> {
+        self.job.push(Operation::HostFunction {
+            stream: self.owned(),
+            function,
+        });
+        Ok(())
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        self.job.push(Operation::Synchronize {
+            stream: self.owned(),
+        });
         Ok(())
     }
 }

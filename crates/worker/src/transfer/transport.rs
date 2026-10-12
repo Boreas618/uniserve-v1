@@ -29,10 +29,11 @@ use super::read::{self, BorrowedReads, NativeRead, Read, ReadCall, ReadContext, 
 use super::source::TransportBuffer;
 use super::{
     Capacity, Notify, ReadReservation, Retirement, SHM_HEADER_BYTES, SharedBuffer, SharedRead,
-    Spans, copy_on_host, copy_planner, notify,
+    Spans, copy_planner, notify,
 };
 use crate::ffi::{Backing, Device};
 use crate::storage::memory::{Memory, StorageView, device_name, dtype_name, parse_dtype};
+use crate::stream::Issue;
 use crate::{Error, EventPool, Result};
 
 /// How long a shared-memory borrower waits for its producer's readiness.
@@ -168,6 +169,44 @@ impl<'a> ExportView<'a> {
     }
 }
 
+/// A channel export whose bytes are staged on the host. The bytes travel in
+/// the location itself, so the location exists once they were copied.
+pub(crate) struct Staged {
+    /// The location without its payload.
+    locator: Locator,
+    staging: Arc<Memory>,
+    bytes: usize,
+}
+
+impl Staged {
+    /// The export's location, carrying the staged bytes.
+    ///
+    /// The caller keeps this value until the export's issuer performed its
+    /// work and calls this only then: at once after a stream, from the
+    /// job's completion on after a recorder.
+    pub(crate) fn locate(self) -> Result<Locator> {
+        // SAFETY: the export's copy and the wait behind it were performed,
+        // so nothing writes the staging any more.
+        let payload = unsafe { self.staging.host_bytes() }
+            .ok_or_else(|| Error::Invariant("channel staging is host memory".into()))?
+            [..self.bytes]
+            .to_vec();
+
+        let mut locator = self.locator;
+        match &mut locator.transport {
+            TransferTransport::Channel {
+                payload: carried, ..
+            } => *carried = payload,
+            _ => {
+                return Err(Error::Invariant(
+                    "a staged export is a channel export".into(),
+                ));
+            }
+        }
+        Ok(locator)
+    }
+}
+
 /// The producer stream a device export is ordered on.
 fn producer<'s>(spans: &Spans, stream: Option<&'s Stream>) -> Result<Option<(i32, &'s Stream)>> {
     let Device::Cuda(device) = spans.device() else {
@@ -291,17 +330,28 @@ impl Transport {
         }
     }
 
-    /// Export `source` (produced on `stream` when it is device memory) at
-    /// `offset` in its logical tensor, for `consumers`' acknowledgment slots.
+    /// Export `source` (produced on `stream`'s stream when it is device
+    /// memory) at `offset` in its logical tensor, for `consumers`'
+    /// acknowledgment slots.
     ///
     /// The export reserves its bytes before preparing backing; a successful
     /// registration holds them until producer and consumer accesses retired.
+    ///
+    /// `stream` is what the export's device work is issued to: its fence,
+    /// its copies into shared or pooled storage with the readiness mark
+    /// behind them, and the wait a mechanism needs before its bytes or
+    /// handle leave the process. A job's recorder defers all of it to the
+    /// job, so a location is published only from the job's completion on,
+    /// and a channel export, whose bytes travel in the location, is
+    /// [`Exported::Staged`] until then. When this fails with a recorder the
+    /// job must not be performed: its copies address storage this call
+    /// released.
     pub(crate) fn export(
         &self,
         source: &Spans,
         offset: Option<&[u64]>,
         consumers: &[usize],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Exported> {
         let view = ExportView::new(source, offset)?;
         match &self.backend {
@@ -324,10 +374,7 @@ impl Transport {
                 .export_shared(&view, endpoint, consumers, stream)
                 .map(|locator| Exported::Located(Box::new(locator))),
             Backend::Cuda(cuda) => {
-                let stream = stream.ok_or_else(|| {
-                    Error::Invalid("a device export requires its producer stream".into())
-                });
-                let exported = stream.and_then(|stream| {
+                let exported = if stream.stream().is_some() {
                     cuda.export(
                         source,
                         stream,
@@ -336,13 +383,17 @@ impl Transport {
                         &self.events,
                         |transport| Ok(view.locator(&self.source, transport)),
                     )
-                });
+                } else {
+                    Err(Error::Invalid(
+                        "a device export requires its producer stream".into(),
+                    ))
+                };
                 match exported {
-                    Ok(Exported::Located(locator)) => Ok(Exported::Located(locator)),
                     Ok(Exported::PoolExhausted) => {
                         self.capacity.release(view.nbytes)?;
                         Ok(Exported::PoolExhausted)
                     }
+                    Ok(exported) => Ok(exported),
                     // A failure retains its bytes only when its backing was
                     // registered (which retires them) or could not drain.
                     Err(error) => Err(error),
@@ -351,7 +402,7 @@ impl Transport {
             Backend::Channel { name, .. } => {
                 let result = self.export_channel(&view, name, stream);
                 self.capacity.release(view.nbytes)?;
-                result.map(|locator| Exported::Located(Box::new(locator)))
+                result.map(|staged| Exported::Staged(Box::new(staged)))
             }
         }
     }
@@ -361,10 +412,10 @@ impl Transport {
         view: &ExportView<'_>,
         endpoint: &Arc<Endpoint>,
         next: &AtomicU64,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Locator> {
-        let event = match producer(view.spans, stream) {
-            Ok(Some((_, stream))) => self.events.fence(stream, false).map(Some),
+        let event = match producer(view.spans, stream.stream()) {
+            Ok(Some(_)) => self.events.fence(stream, false).map(Some),
             Ok(None) => Ok(None),
             Err(error) => Err(error),
         };
@@ -400,15 +451,17 @@ impl Transport {
         view: &ExportView<'_>,
         endpoint: &Arc<Endpoint>,
         consumers: &[usize],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Locator> {
-        let producer = match producer(view.spans, stream) {
+        let producer = match producer(view.spans, stream.stream()) {
             Ok(producer) => producer,
             Err(error) => {
                 self.capacity.release(view.nbytes)?;
                 return Err(error);
             }
         };
+        // The buffer keeps the producer's stream for its own lifetime: it
+        // drains the stream before it unregisters or releases its bytes.
         let shared = producer.as_ref().map(|(_, stream)| (*stream).clone());
         let mut storage = match SharedBuffer::new(view.nbytes as usize, consumers.to_vec(), shared)
         {
@@ -436,7 +489,7 @@ impl Transport {
                 &shape,
             )?)?;
             match &producer {
-                Some((device, stream)) => {
+                Some((device, _)) => {
                     // Mark in-flight storage before the first copy: a failed
                     // copy must drain before unregistration or byte reuse.
                     storage.begin_copy();
@@ -444,16 +497,17 @@ impl Transport {
                     payload.plan_copy(view.spans, &mut plan)?;
                     // SAFETY: the registered mapping stays mapped until the
                     // buffer closes, which drains this stream first.
-                    unsafe { plan.submit(stream) }?;
+                    unsafe { stream.copy_strided(&plan) }?;
                 }
                 None => {
                     let mut plan = copy_planner(None, SourceOrder::Stream)?;
                     payload.plan_copy(view.spans, &mut plan)?;
-                    // SAFETY: host operands; no reader maps the segment yet.
-                    unsafe { copy_on_host(&plan) };
+                    // SAFETY: host operands, written in the producer's
+                    // order; no reader maps the segment yet.
+                    unsafe { stream.host().copy_strided(&plan) }?;
                 }
             }
-            storage.mark_ready()?;
+            storage.mark_ready(stream)?;
             Ok(locator)
         })();
         let locator = match written {
@@ -477,55 +531,50 @@ impl Transport {
         &self,
         view: &ExportView<'_>,
         name: &str,
-        stream: Option<&Stream>,
-    ) -> Result<Locator> {
+        stream: impl Issue,
+    ) -> Result<Staged> {
         let shape: Vec<i64> = view.shape.iter().map(|&extent| extent as i64).collect();
         let bytes = view.nbytes as usize;
-        let staging = match producer(view.spans, stream)? {
-            Some((device, stream)) => {
-                let staging = Memory::pinned(device, bytes.max(1))?;
-                let target = Spans::single(StorageView::contiguous(
-                    Arc::clone(&staging) as Arc<dyn Backing>,
-                    0,
-                    view.spans.dtype(),
-                    &shape,
-                )?)?;
-                let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
-                target.plan_copy(view.spans, &mut plan)?;
-                // SAFETY: the staging stays alive until the stream drains below.
-                unsafe { plan.submit(stream) }?;
+        let producer = producer(view.spans, stream.stream())?.map(|(device, _)| device);
+        let staging = match producer {
+            Some(device) => Memory::pinned(device, bytes.max(1))?,
+            None => Memory::host(bytes.max(1)),
+        };
+        let target = Spans::single(StorageView::contiguous(
+            Arc::clone(&staging) as Arc<dyn Backing>,
+            0,
+            view.spans.dtype(),
+            &shape,
+        )?)?;
+        let mut plan = copy_planner(producer, SourceOrder::Stream)?;
+        target.plan_copy(view.spans, &mut plan)?;
+
+        match producer {
+            Some(_) => {
+                // SAFETY: the staged export keeps the staging alive until
+                // its bytes are read, behind the wait below.
+                unsafe { stream.copy_strided(&plan) }?;
                 // The bytes leave with the result: a downstream reader cannot
                 // wait on this stream.
                 let _range = crate::profiling::range(c"channel_export_synchronize", None);
                 stream.synchronize()?;
-                staging
             }
-            None => {
-                let staging = Memory::host(bytes.max(1));
-                let target = Spans::single(StorageView::contiguous(
-                    Arc::clone(&staging) as Arc<dyn Backing>,
-                    0,
-                    view.spans.dtype(),
-                    &shape,
-                )?)?;
-                let mut plan = copy_planner(None, SourceOrder::Stream)?;
-                target.plan_copy(view.spans, &mut plan)?;
-                // SAFETY: host operands owned by this export.
-                unsafe { copy_on_host(&plan) };
-                staging
-            }
-        };
-        // SAFETY: no copy writes the staging any more.
-        let payload = unsafe { staging.host_bytes() }
-            .ok_or_else(|| Error::Invariant("channel staging is host memory".into()))?[..bytes]
-            .to_vec();
-        Ok(view.locator(
-            &self.source,
-            TransferTransport::Channel {
-                endpoint: name.to_owned(),
-                payload,
-            },
-        ))
+            // SAFETY: host operands owned by this export, written in the
+            // producer's order.
+            None => unsafe { stream.host().copy_strided(&plan) }?,
+        }
+
+        Ok(Staged {
+            locator: view.locator(
+                &self.source,
+                TransferTransport::Channel {
+                    endpoint: name.to_owned(),
+                    payload: Vec::new(),
+                },
+            ),
+            staging,
+            bytes,
+        })
     }
 
     /// Read `region` (in the locator's own coordinates, the whole export by
