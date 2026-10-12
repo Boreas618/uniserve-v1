@@ -1,15 +1,26 @@
 //! The decoder runners of a rank.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+use uniserve_core::Canvas;
 
 use super::{DecodeImage, DecoderRunner, Segment, TrackUnits, UnitShape};
-use crate::Result;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoSize};
 use crate::runner::component::Component;
 use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::storage::ImageLatents;
+use crate::{Error, Result};
+
+/// What the model answers about an admitted audio track decoded in some
+/// number of units.
+struct AdmittedTrack {
+    latent_frames: u32,
+    /// The samples of each audio unit.
+    spans: Vec<Range<u64>>,
+}
 
 /// The decoder runners of a rank.
 #[derive(Default)]
@@ -19,8 +30,14 @@ pub(crate) struct DecoderRunners {
     /// The unit shapes startup warmed, which it then captures: each with
     /// its window's latent rows and its video's longest unit.
     unit_shapes: Vec<(UnitShape, u64, u32)>,
+    /// The segment each media unit of every admitted video decodes to, by
+    /// `(frames, canvas, unit)`, read from the model at startup.
+    segments: HashMap<(u32, Canvas, u32), Segment>,
     /// A video model's audio decoder.
     pub(crate) audio: Option<Component<DecoderRunner>>,
+    /// Every admitted audio track decoded in some number of units, by
+    /// `(samples, units)`, read from the model at startup.
+    tracks: HashMap<(u64, u32), AdmittedTrack>,
     /// The track units startup warmed, which it then captures, each with
     /// its track's latent rows.
     track_units: Vec<(TrackUnits, u64)>,
@@ -97,6 +114,14 @@ impl DecoderRunners {
                     let units = model.unit_frames(frames)?;
                     let total = units.len() as u32;
                     let longest = units.iter().copied().max().unwrap_or(0);
+
+                    // What a decode of each unit takes from the model is
+                    // read now: a serving rank asks the library nothing.
+                    for unit in 0..total {
+                        let segment = model.segment(frames, canvas, unit)?;
+                        self.segments.insert((frames, canvas, unit), segment);
+                        decoder.runner.read_window(frames, canvas, unit)?;
+                    }
                     let mut cursor = 0;
                     while cursor < total {
                         let count = width.min(total - cursor);
@@ -128,9 +153,18 @@ impl DecoderRunners {
             let canvas = plan.canvases[0];
             for &frames in plan.frame_counts.iter().rev() {
                 let samples = model.track_samples(frames)?;
-                audio
-                    .runner
-                    .prepare_track(model.audio_latent_frames(samples)?)?;
+                let latent_frames = model.audio_latent_frames(samples)?;
+                audio.runner.prepare_track(latent_frames)?;
+
+                // A round decodes the track in up to `total` units.
+                for units in 1..=total {
+                    let spans = model.audio_units(samples, units)?;
+                    let track = AdmittedTrack {
+                        latent_frames,
+                        spans,
+                    };
+                    self.tracks.insert((samples, units), track);
+                }
             }
             for &frames in plan.frame_counts.iter().rev() {
                 let samples = model.track_samples(frames)?;
@@ -154,6 +188,24 @@ impl DecoderRunners {
             }
         }
         Ok(())
+    }
+
+    /// The `(frames, canvas)` segment unit `unit` of an admitted
+    /// `frames`-frame video at `canvas` decodes to.
+    pub(crate) fn segment(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<Segment> {
+        self.segments
+            .get(&(frames, canvas, unit))
+            .copied()
+            .ok_or_else(|| Error::Invalid("the rank admits no video with this media unit".into()))
+    }
+
+    /// The latent frames of an admitted `samples`-sample track and the
+    /// samples of each of its `units` audio units.
+    pub(crate) fn track(&self, samples: u64, units: u32) -> Result<(u32, &[Range<u64>])> {
+        self.tracks
+            .get(&(samples, units))
+            .map(|track| (track.latent_frames, track.spans.as_slice()))
+            .ok_or_else(|| Error::Invalid("the rank admits no track of this length".into()))
     }
 
     /// Capture the warmed unit shapes and track units, then refuse further
