@@ -207,7 +207,9 @@ fn vision_row(
     // FIXME: a call of the library made while the batch is recorded: the
     // control thread waits for the Python thread here. The grid of an
     // image's size is a fact of the model, to be read where the image's
-    // features are produced and carried with them.
+    // features are produced and carried with them. It belongs to the
+    // feature product's metadata, a message type that changes with the
+    // channel's integration, so the call stays until then.
     let grid = image
         .policy()
         .patch_grid(
