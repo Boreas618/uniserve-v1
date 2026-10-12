@@ -107,6 +107,13 @@ enum Operation<'a> {
         stream: Option<Stream>,
     },
     ExpertStep(ExpertStep),
+    /// The union's next step for a rank with no forward of its own: one
+    /// round of the agreement and, when a step was agreed, its join.
+    ExpertJoin {
+        union: Arc<ExpertUnion>,
+        /// The rank is shutting down and leaves the union.
+        leaving: bool,
+    },
 }
 
 /// Work the execution thread hands to the Python thread and waits for, or
@@ -114,6 +121,8 @@ enum Operation<'a> {
 enum Call<'a> {
     /// A runner method.
     Method(MethodCall),
+    /// A runner method whose integers the completion carries.
+    Returning(MethodCall),
     /// A library function over values that are no tensors.
     Function(DeferredCall),
     Capture(Capture),
@@ -196,6 +205,11 @@ pub struct Completion {
     reads: VecDeque<Vec<u8>>,
     /// The capacity each expert step was agreed at.
     capacities: VecDeque<usize>,
+    /// For each expert join: whether a step ran, and whether every rank
+    /// has left the union.
+    joins: VecDeque<(bool, bool)>,
+    /// The integers each returning call returned.
+    returned: VecDeque<Vec<i64>>,
     /// Where the job stopped, when it did not run to its end.
     failure: Option<Failure>,
 }
@@ -222,6 +236,18 @@ impl Completion {
     /// The capacity the next expert step was agreed at.
     pub(crate) fn capacity(&mut self) -> Result<usize> {
         self.capacities.pop_front().ok_or(MISSING)
+    }
+
+    /// The next expert join: whether a step ran, and whether every rank
+    /// has left the union.
+    pub(crate) fn joined(&mut self) -> Result<(bool, bool)> {
+        self.joins.pop_front().ok_or(MISSING)
+    }
+
+    /// The integers the next returning call returned
+    /// ([`Job::call_returning`]): one for a call that returns an integer.
+    pub(crate) fn returned(&mut self) -> Result<Vec<i64>> {
+        self.returned.pop_front().ok_or(MISSING)
     }
 }
 
@@ -254,17 +280,14 @@ impl<'a> Job<'a> {
         self.operations.borrow_mut().push(operation);
     }
 
-    /// The job's event operations alone, in order: what its builder submits
-    /// when recording failed part way. The events the job queued are still
-    /// recorded, waited on and woken for, so the storage they fence is
-    /// returned, and none of the work recorded between them is performed.
-    pub(crate) fn orders_only(self) -> Self {
-        let mut operations = self.operations.into_inner();
-        operations.retain(Operation::orders);
-        Self {
-            operations: RefCell::new(operations),
-            after: self.after,
-        }
+    /// Keep of the operations recorded from `start` on only the event
+    /// operations, in order: a failed attempt's events are still recorded,
+    /// waited on and woken for, so the storage they fence is returned, and
+    /// none of the work recorded between them is performed.
+    fn keep_orders(&self, start: usize) {
+        let mut operations = self.operations.borrow_mut();
+        let attempted = operations.split_off(start);
+        operations.extend(attempted.into_iter().filter(Operation::orders));
     }
 
     /// Record what its user issues as operations of this job on `stream`
@@ -276,6 +299,13 @@ impl<'a> Job<'a> {
     /// An eager call of a runner method.
     pub(crate) fn call(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Method(method)));
+    }
+
+    /// An eager call of a runner method that returns an integer or a list
+    /// of integers (the counts of what it wrote, say), which the job's
+    /// completion carries ([`Completion::returned`]).
+    pub(crate) fn call_returning(&self, method: MethodCall) {
+        self.push(Operation::Call(Call::Returning(method)));
     }
 
     /// The capture of a runner method. Its completion carries the graph.
@@ -292,6 +322,13 @@ impl<'a> Job<'a> {
 
     pub(crate) fn expert_step(&self, step: ExpertStep) {
         self.push(Operation::ExpertStep(step));
+    }
+
+    /// The union's next step for a rank with no forward of its own. The
+    /// job's completion says whether a step ran and whether every rank has
+    /// left the union.
+    pub(crate) fn expert_join(&self, union: Arc<ExpertUnion>, leaving: bool) {
+        self.push(Operation::ExpertJoin { union, leaving });
     }
 
     /// Post the job's completion only once `events`, recorded on streams of
@@ -420,6 +457,10 @@ impl Operation<'_> {
             Self::HostFunction { stream, function } => stream.as_ref().launch_host_fn(function),
             Self::Synchronize { stream } => Issue::synchronize(&stream.as_ref()),
             Self::ExpertStep(step) => step.perform(completion),
+            Self::ExpertJoin { union, leaving } => {
+                completion.joins.push_back(union.idle(leaving)?);
+                Ok(())
+            }
         }
     }
 }
@@ -427,8 +468,17 @@ impl Operation<'_> {
 impl Call<'_> {
     fn perform(self, completion: &mut Completion) -> Result<()> {
         match self {
-            // No converted forward reads what its method returns.
             Self::Method(method) => drop(method.invoke()?),
+            Self::Returning(method) => {
+                let name = method.name().to_owned();
+                let value = method.invoke()?;
+                let integers = match i64::try_from(value.clone()) {
+                    Ok(integer) => vec![integer],
+                    Err(_) => crate::ffi::integers(value)
+                        .map_err(|error| Error::numerical(&name, &error))?,
+                };
+                completion.returned.push_back(integers);
+            }
             Self::Function(function) => function.invoke()?,
             Self::Capture(capture) => {
                 let Capture {
@@ -650,6 +700,15 @@ impl Issue for Recorder<'_, '_> {
             stream: self.owned(),
         });
         Ok(())
+    }
+
+    fn attempt<T>(&self, record: impl FnOnce() -> Result<T>) -> Result<T> {
+        let start = self.job.len();
+        let result = record();
+        if result.is_err() {
+            self.job.keep_orders(start);
+        }
+        result
     }
 }
 
@@ -893,19 +952,61 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_recording_performs_none_of_its_work() -> Result<()> {
-        let mut target = 0_u8;
+    fn a_returning_call_hands_its_integers_to_the_completion() -> Result<()> {
+        let count = Function::new(
+            "test.count",
+            tvm_ffi::Function::from_packed(|_| Ok(tvm_ffi::Any::from(48_i64))),
+        );
+        let counts = Function::new(
+            "test.counts",
+            tvm_ffi::Function::from_packed(|_| {
+                Ok(tvm_ffi::Any::from(crate::ffi::integer_list([12, 36])))
+            }),
+        );
         let job = Job::new();
-        // SAFETY: one byte of the test.
-        unsafe { job.on(None).fill(byte(&raw mut target, 5)) }?;
-        job.on(None).read(&raw const target as u64, 1);
+        job.call_returning(MethodCall::new(&count, Vec::new()));
+        job.call(MethodCall::new(&count, Vec::new()));
+        job.call_returning(MethodCall::new(&counts, Vec::new()));
 
-        // Without a stream the job holds no event operation.
-        let job = job.orders_only();
-        assert!(job.is_empty());
+        // Only returning calls are kept, in recording order.
         let mut completion = job.perform().check().unwrap();
-        assert_eq!(target, 0);
-        assert!(completion.read().is_err());
+        assert_eq!(completion.returned()?, vec![48]);
+        assert_eq!(completion.returned()?, vec![12, 36]);
+        assert!(completion.returned().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_attempt_performs_none_of_its_work() -> Result<()> {
+        let mut target = [0_u8; 3];
+        let job = Job::new();
+        let issue = job.on(None);
+        // SAFETY: bytes of the test's array, here and below.
+        unsafe { issue.fill(byte(&raw mut target[0], 5)) }?;
+
+        // An attempt that fails after recording work: its storage is given
+        // back, so its work is dropped from the job.
+        let failed: Result<()> = issue.attempt(|| {
+            unsafe { issue.fill(byte(&raw mut target[1], 6)) }?;
+            Err(Error::State("the attempt failed"))
+        });
+        assert!(failed.is_err());
+
+        // What was recorded before and after it stays, as does an attempt
+        // that succeeds.
+        issue.attempt(|| unsafe { issue.fill(byte(&raw mut target[2], 7)) })?;
+        assert_eq!(job.len(), 2);
+        job.perform().check().unwrap();
+        assert_eq!(target, [5, 0, 7]);
+
+        // A stream issued a failed attempt's work at once.
+        let mut issued = 0_u8;
+        let failed: Result<()> = None::<&Stream>.attempt(|| {
+            unsafe { None::<&Stream>.fill(byte(&raw mut issued, 9)) }?;
+            Err(Error::State("the attempt failed"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(issued, 9);
         Ok(())
     }
 

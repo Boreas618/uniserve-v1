@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use uniserve_cuda::{SourceOrder, Stream};
+use uniserve_cuda::{Event, SourceOrder, Stream};
 use uniserve_ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
 
 use super::cuda_vmm::{CudaExports, CudaRead, Exported};
@@ -169,42 +169,32 @@ impl<'a> ExportView<'a> {
     }
 }
 
-/// A channel export whose bytes are staged on the host. The bytes travel in
-/// the location itself, so the location exists once they were copied.
-pub(crate) struct Staged {
-    /// The location without its payload.
-    locator: Locator,
-    staging: Arc<Memory>,
-    bytes: usize,
-}
-
-impl Staged {
-    /// The export's location, carrying the staged bytes.
-    ///
-    /// The caller keeps this value until the export's issuer performed its
-    /// work and calls this only then: at once after a stream, from the
-    /// job's completion on after a recorder.
-    pub(crate) fn locate(self) -> Result<Locator> {
-        // SAFETY: the export's copy and the wait behind it were performed,
-        // so nothing writes the staging any more.
-        let payload = unsafe { self.staging.host_bytes() }
-            .ok_or_else(|| Error::Invariant("channel staging is host memory".into()))?
-            [..self.bytes]
-            .to_vec();
-
-        let mut locator = self.locator;
-        match &mut locator.transport {
-            TransferTransport::Channel {
-                payload: carried, ..
-            } => *carried = payload,
-            _ => {
-                return Err(Error::Invariant(
-                    "a staged export is a channel export".into(),
-                ));
-            }
-        }
-        Ok(locator)
-    }
+/// An export whose location is complete once the work it issued was
+/// performed. Its transport completes it ([`Transport::locate`]) or gives
+/// it up ([`Transport::discard`]); the caller keeps it until one of them,
+/// called only then: at once after a stream, from the job's completion on
+/// after a recorder.
+pub(crate) enum Staged {
+    /// A channel export whose bytes are staged on the host. They travel in
+    /// the location itself, so it exists once they were copied.
+    Channel {
+        /// The location without its payload.
+        locator: Locator,
+        staging: Arc<Memory>,
+        bytes: usize,
+    },
+    /// A CUDA VMM export fenced by a readiness event. A same-host reader
+    /// waits on the event through its interprocess handle, which exists
+    /// once the event was recorded, and reads the export through its
+    /// endpoint's registration, made with the complete location.
+    Fenced {
+        /// The location without its event handle.
+        locator: Locator,
+        /// The readiness event whose handle the location carries; `None`
+        /// when readers on other hosts do not wait on it.
+        ready: Option<Arc<Event>>,
+        buffer: Arc<TransportBuffer>,
+    },
 }
 
 /// The producer stream a device export is ordered on.
@@ -343,9 +333,10 @@ impl Transport {
     /// handle leave the process. A job's recorder defers all of it to the
     /// job, so a location is published only from the job's completion on,
     /// and a channel export, whose bytes travel in the location, is
-    /// [`Exported::Staged`] until then. When this fails with a recorder the
-    /// job must not be performed: its copies address storage this call
-    /// released.
+    /// [`Exported::Staged`] until then. This releases its storage when it
+    /// fails, so its caller issues it inside an attempt
+    /// ([`Issue::attempt`]), which keeps a job from performing the copies
+    /// a failed export recorded.
     pub(crate) fn export(
         &self,
         source: &Spans,
@@ -527,6 +518,78 @@ impl Transport {
         Ok(locator)
     }
 
+    /// Complete a staged export of this transport: the location with the
+    /// channel bytes its copy staged, or with the handle of the readiness
+    /// event its work recorded, registered with the endpoint.
+    pub(crate) fn locate(&self, staged: Staged) -> Result<Locator> {
+        match staged {
+            Staged::Channel {
+                mut locator,
+                staging,
+                bytes,
+            } => {
+                // SAFETY: the export's copy and the wait behind it were
+                // performed, so nothing writes the staging any more.
+                let payload = unsafe { staging.host_bytes() }
+                    .ok_or_else(|| Error::Invariant("channel staging is host memory".into()))?
+                    [..bytes]
+                    .to_vec();
+                match &mut locator.transport {
+                    TransferTransport::Channel {
+                        payload: carried, ..
+                    } => *carried = payload,
+                    _ => {
+                        return Err(Error::Invariant(
+                            "a staged channel export has a channel location".into(),
+                        ));
+                    }
+                }
+                Ok(locator)
+            }
+            Staged::Fenced {
+                mut locator,
+                ready,
+                buffer,
+            } => {
+                let registered = (|| -> Result<()> {
+                    let Backend::Cuda(cuda) = &self.backend else {
+                        return Err(Error::Invariant(
+                            "a fenced export belongs to a CUDA VMM transport".into(),
+                        ));
+                    };
+                    if let Some(ready) = &ready {
+                        match &mut locator.transport {
+                            TransferTransport::CudaVmm {
+                                ready_event_handle, ..
+                            } => *ready_event_handle = ready.ipc_handle()?.0.to_vec(),
+                            _ => {
+                                return Err(Error::Invariant(
+                                    "a fenced export has a CUDA VMM location".into(),
+                                ));
+                            }
+                        }
+                    }
+                    cuda.endpoint.register(locator.clone(), Arc::clone(&buffer))
+                })();
+                if let Err(error) = registered {
+                    TransportBuffer::reclaim(buffer, &self.events, None)?;
+                    return Err(error);
+                }
+                Ok(locator)
+            }
+        }
+    }
+
+    /// Give up a staged export of this transport that is not published:
+    /// its backing retires through the event pool.
+    pub(crate) fn discard(&self, staged: Staged) -> Result<()> {
+        match staged {
+            // The staging is dropped; its bytes were never sent.
+            Staged::Channel { .. } => Ok(()),
+            Staged::Fenced { buffer, .. } => TransportBuffer::reclaim(buffer, &self.events, None),
+        }
+    }
+
     fn export_channel(
         &self,
         view: &ExportView<'_>,
@@ -564,7 +627,7 @@ impl Transport {
             None => unsafe { stream.host().copy_strided(&plan) }?,
         }
 
-        Ok(Staged {
+        Ok(Staged::Channel {
             locator: view.locator(
                 &self.source,
                 TransferTransport::Channel {

@@ -196,6 +196,10 @@ pub struct WorkerBatch {
     executed: Option<std::result::Result<(), WorkerError>>,
     /// A token batch between its jobs.
     tokens: Option<crate::runner::causal_lm::Pending>,
+    /// A diffusion LM batch between its jobs.
+    denoising: Option<crate::runner::diffusion_lm::Pending>,
+    /// A transfer batch between its jobs.
+    transfer: Option<forward::transfer::Pending>,
     /// The batch's profiler step is open: its forward began and has not
     /// ended.
     stepping: bool,
@@ -221,6 +225,8 @@ impl WorkerBatch {
             issued: None,
             executed: None,
             tokens: None,
+            denoising: None,
+            transfer: None,
             stepping: false,
             running: None,
             image_inputs: None,
@@ -267,15 +273,6 @@ impl WorkerBatch {
         self.stage = stage;
     }
 
-    /// Keep how a forward that issued itself ended, for its submitter.
-    pub(crate) fn set_issued(&mut self, issued: Result<()>) {
-        self.issued = Some(issued);
-    }
-
-    pub(crate) fn take_issued(&mut self) -> Option<Result<()>> {
-        self.issued.take()
-    }
-
     pub(crate) fn set_executed(&mut self, executed: std::result::Result<(), WorkerError>) {
         self.executed = Some(executed);
     }
@@ -294,6 +291,29 @@ impl WorkerBatch {
         &mut Option<Result<()>>,
     ) {
         (&self.plan, &mut self.tokens, &mut self.issued)
+    }
+
+    /// The batch's plan and its diffusion LM batch between jobs, borrowed
+    /// apart.
+    pub(crate) fn denoising_parts(
+        &mut self,
+    ) -> (
+        &BatchPlan,
+        &mut Option<crate::runner::diffusion_lm::Pending>,
+    ) {
+        (&self.plan, &mut self.denoising)
+    }
+
+    /// The batch's plan, its imported inputs and its transfer batch between
+    /// jobs, borrowed apart.
+    pub(crate) fn transfer_parts(
+        &mut self,
+    ) -> (
+        &BatchPlan,
+        &forward::inputs::Inputs,
+        &mut Option<forward::transfer::Pending>,
+    ) {
+        (&self.plan, &self.inputs, &mut self.transfer)
     }
 
     /// Set the batch's result; capability runtimes call this once their
@@ -1424,14 +1444,25 @@ impl ServiceBackend for WorkerBackend {
     }
 
     fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
+        let experts = self.experts().ok_or_else(|| {
+            WorkerError::classify(
+                Error::State("expert-step participation requires an expert union"),
+                None,
+            )
+        })?;
+
         // A join launches on the lane the union's forwards run on.
-        let mut joined = None;
         let job = Job::new();
-        job.forward(|| joined = Some(crate::parallel::join_step(self, leaving)));
-        self.jobs
+        job.expert_join(Arc::clone(experts), leaving);
+        let (_, completion) = self
+            .jobs
             .submit(CallKind::Forward(ForwardMode::Decode), job)
             .map_err(lane_lost)?;
-        joined.unwrap_or_else(|| Err(lane_lost(Error::State("an expert join did not run"))))
+        completion
+            .check()
+            .map_err(|failure| failure.error)
+            .and_then(|mut completion| completion.joined())
+            .map_err(|error| WorkerError::classify(error, Some("expert step")))
     }
 }
 

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use uniserve_cuda::{DeviceGuard, Event, Stream};
 
+use crate::stream::Issue;
 use crate::{Completion, Error, EventPool, Outcome, Result};
 
 mod cuda_vmm;
@@ -493,13 +494,14 @@ impl<V, E, C> TransferTicket<V, E, C> {
 
     /// Order a consuming stream after the producer and, for borrowed reads,
     /// remember it so close can fence its access to the source.
-    pub fn consume(&mut self, stream: &Stream) -> Result<()> {
+    pub fn consume(&mut self, stream: impl Issue) -> Result<()> {
         if let Some(producer) = &self.producer {
-            stream.wait_event(producer)?;
-            if let ReadAccess::Borrowed { streams, .. } = &mut self.access
-                && !streams.iter().any(|known| known.raw() == stream.raw())
+            stream.wait(producer)?;
+            if let (ReadAccess::Borrowed { streams, .. }, Some(consumer)) =
+                (&mut self.access, stream.stream())
+                && !streams.iter().any(|known| known.raw() == consumer.raw())
             {
-                streams.push(stream.clone());
+                streams.push(consumer.clone());
             }
         }
         Ok(())

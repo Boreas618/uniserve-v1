@@ -68,7 +68,10 @@ pub fn export(
 
     let mut locations = Vec::new();
     let mut staged = Vec::new();
-    let result = (|| -> Result<()> {
+    // One attempt: a mechanism that fails gives its storage back, and the
+    // locations accepted before it are revoked, so a job keeps none of the
+    // work a failed export recorded.
+    let result = stream.attempt(|| -> Result<()> {
         for transport in selected {
             match transport.export(source, offset, consumers, stream)? {
                 Exported::Located(locator) => {
@@ -114,10 +117,13 @@ pub fn export(
             }
         }
         Ok(())
-    })();
+    });
 
     if let Err(error) = result {
+        // A failed attempt's work is not performed, so what it staged can
+        // be given up at once.
         revoke(&locations);
+        discard(staged);
         return Err(error);
     }
     Ok(Exports { locations, staged })
@@ -147,20 +153,41 @@ impl Exports {
             mut locations,
             staged,
         } = self;
-        let result = staged.into_iter().try_for_each(|(transport, export)| {
-            accept(&transport, export.locate()?, &mut retain, &mut locations)
+        let mut staged = staged.into_iter();
+        let result = staged.by_ref().try_for_each(|(transport, export)| {
+            accept(
+                &transport,
+                transport.locate(export)?,
+                &mut retain,
+                &mut locations,
+            )
         });
 
         if let Err(error) = result {
             revoke(&locations);
+            discard(staged);
             return Err(error);
         }
         Ok(locations)
     }
 
-    /// Revoke the locations of an export that is not published.
-    pub fn revoke(&self) {
+    /// Revoke the locations of an export that is not published and give up
+    /// what it still stages. As [`Exports::locate`], call this once the
+    /// issuer the export was given performed its work: the work addresses
+    /// what this releases.
+    pub fn revoke(self) {
         revoke(&self.locations);
+        discard(self.staged);
+    }
+}
+
+/// Give up the staged exports of an export that failed or is not
+/// published; a failure is logged, the export's own outcome stands.
+fn discard(staged: impl IntoIterator<Item = (Arc<Transport>, Staged)>) {
+    for (transport, export) in staged {
+        if let Err(cleanup) = transport.discard(export) {
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to give up a staged export: {cleanup}");
+        }
     }
 }
 
@@ -229,6 +256,71 @@ mod tests {
                 vmm_pool_bytes: 1 << 20,
             },
         )
+    }
+
+    /// A same-host reader waits on a CUDA VMM export through the handle of
+    /// its readiness event, which exists once the event was recorded. A
+    /// recorded export therefore receives it where it is located.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_recorded_vmm_export_carries_its_event_once_the_job_recorded_it() -> Result<()> {
+        use uniserve_cuda::{DeviceId, Stream};
+
+        let stream = Stream::new(DeviceId(0))?;
+        let capacity = Arc::new(Capacity::new(1 << 24, 8, notify)?);
+        let transports = Transports::new(
+            &[TransportKind::Local, TransportKind::CudaVmm],
+            capacity,
+            EventPool::new(),
+            &TransportOptions {
+                source: WorkerEndpoint {
+                    worker_id: "worker".into(),
+                    rank: 0,
+                    node: "node".into(),
+                    address_space: "space".into(),
+                    incarnation: "incarnation".into(),
+                },
+                acknowledgment_slot: 0,
+                host_slots: HashSet::from([0, 1]),
+                cross_host_consumers: false,
+                vmm_pool_bytes: 1 << 22,
+            },
+        )?;
+        let source = Spans::single(StorageView::contiguous(
+            Memory::device(0, 512)? as Arc<dyn Backing>,
+            0,
+            DType::F32,
+            &[16, 8],
+        )?)?;
+
+        // Recording queues the readiness event's record; nothing is
+        // recorded yet when the export returns.
+        let job = Job::new();
+        let exports = export(
+            &transports,
+            &source,
+            None,
+            &[1],
+            false,
+            job.on(Some(&stream)),
+            |_| Ok(()),
+        )?;
+        job.perform().check().map_err(|failure| failure.error)?;
+
+        let locations = exports.locate(|_| Ok(()))?;
+        let handles: Vec<usize> = locations
+            .iter()
+            .filter_map(|(_, locator)| match &locator.transport {
+                TransferTransport::CudaVmm {
+                    ready_event_handle, ..
+                } => Some(ready_event_handle.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handles, [64]);
+        release(&locations)?;
+        stream.synchronize()?;
+        Ok(())
     }
 
     #[test]

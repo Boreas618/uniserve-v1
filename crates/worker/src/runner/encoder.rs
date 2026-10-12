@@ -1054,11 +1054,12 @@ impl EncoderRunner {
     /// product is the block's row count. The blocks' features fill `out`'s
     /// rows in block order. Each block is one sample of one numerical call,
     /// so a block's features do not depend on the other blocks.
-    pub fn encode_patches(
+    pub(crate) fn encode_patches(
         &mut self,
         rows: &StorageView,
         grids: &[[u32; 3]],
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<()> {
         if !matches!(self.info, EncoderInfo::Vision(_)) {
             return Err(Error::Invalid(format!(
@@ -1066,14 +1067,21 @@ impl EncoderRunner {
                 self.owner
             )));
         }
-        self.methods.encode.call_values(&[
-            self.methods.runner.to_any(),
-            Any::from(rows.to_tensor()?),
-            Any::from(out.to_tensor()?),
-            Any::from(integer_list(
-                grids.iter().flatten().map(|&extent| i64::from(extent)),
-            )),
-        ])?;
+        job.call(MethodCall::new(
+            &self.methods.encode,
+            vec![
+                Argument::Handle(self.methods.runner.clone()),
+                Argument::Tensor(rows.clone()),
+                Argument::Tensor(out.clone()),
+                Argument::Integers(
+                    grids
+                        .iter()
+                        .flatten()
+                        .map(|&extent| i64::from(extent))
+                        .collect(),
+                ),
+            ],
+        ));
         Ok(())
     }
 
@@ -1224,6 +1232,10 @@ impl EncoderRunner {
     /// a failed check releases that graph. Without a pool the same
     /// forwards run once on the Python thread, so lazy initialization
     /// precedes serving.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub fn capture(
         &mut self,
         pool: Option<&Arc<GraphPool<Handle>>>,
@@ -1430,6 +1442,7 @@ impl Conditions {
         pixels: &StorageView,
         units: &[[i64; 5]],
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<()> {
         // The call's input shapes: each unit's frames at its raster.
         let mut shapes = Vec::with_capacity(units.len() * 4);
@@ -1444,6 +1457,9 @@ impl Conditions {
             })?;
             shapes.extend([length, height, width, 3]);
         }
+        // FIXME: the runner of shapes seen for the first time is constructed
+        // here, where the forward is recorded, not by the job: the recorded
+        // call takes the runner the construction returns.
         if !self.video_runners.contains_key(&shapes) {
             let runner = self
                 .video
@@ -1451,12 +1467,15 @@ impl Conditions {
             self.video_runners.insert(shapes.clone(), runner);
         }
         let runner = &self.video_runners[&shapes];
-        self.video.forward.call_values(&[
-            runner.runner().to_any(),
-            Any::from(pixels.to_tensor()?),
-            Any::from(out.to_tensor()?),
-            Any::from(integer_list(units.iter().flatten().copied())),
-        ])?;
+        job.call(MethodCall::new(
+            &self.video.forward,
+            vec![
+                Argument::Handle(runner.runner().clone()),
+                Argument::Tensor(pixels.clone()),
+                Argument::Tensor(out.clone()),
+                Argument::Integers(units.iter().flatten().copied().collect()),
+            ],
+        ));
         Ok(())
     }
 
@@ -1467,11 +1486,14 @@ impl Conditions {
         samples: &StorageView,
         lengths: &[u64],
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<()> {
         let shapes: Vec<i64> = lengths
             .iter()
             .flat_map(|&length| [length as i64, 2])
             .collect();
+        // FIXME: as for a video runner, a runner of new shapes is
+        // constructed where the forward is recorded.
         if !self.audio_runners.contains_key(&shapes) {
             let runner = self
                 .audio
@@ -1479,12 +1501,15 @@ impl Conditions {
             self.audio_runners.insert(shapes.clone(), runner);
         }
         let runner = &self.audio_runners[&shapes];
-        self.audio.forward.call_values(&[
-            runner.runner().to_any(),
-            Any::from(samples.to_tensor()?),
-            Any::from(out.to_tensor()?),
-            Any::from(integer_list(lengths.iter().map(|&length| length as i64))),
-        ])?;
+        job.call(MethodCall::new(
+            &self.audio.forward,
+            vec![
+                Argument::Handle(runner.runner().clone()),
+                Argument::Tensor(samples.clone()),
+                Argument::Tensor(out.clone()),
+                Argument::Integers(lengths.iter().map(|&length| length as i64).collect()),
+            ],
+        ));
         Ok(())
     }
 
@@ -1648,8 +1673,10 @@ impl EncoderRunner {
         pixels: &StorageView,
         units: &[[i64; 5]],
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<()> {
-        self.condition_encoders()?.encode_video(pixels, units, out)
+        self.condition_encoders()?
+            .encode_video(pixels, units, out, job)
     }
 
     /// Encode condition audio tracks of `lengths` samples into consecutive
@@ -1659,9 +1686,10 @@ impl EncoderRunner {
         samples: &StorageView,
         lengths: &[u64],
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<()> {
         self.condition_encoders()?
-            .encode_audio(samples, lengths, out)
+            .encode_audio(samples, lengths, out, job)
     }
 
     /// The kernels the operators of the runner's execution context or of the
@@ -1780,6 +1808,7 @@ pub(crate) fn encode_vision(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
@@ -1806,12 +1835,13 @@ pub(crate) fn encode_vision(
     let width = row_width(&call.outputs[0])?;
     let tokens: u64 = blocks.iter().map(|block| block.1).sum();
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let patches = batch.inputs.read(
         parts.owners().store,
         &call.inputs[0],
         call.call_id,
         batch.device,
-        Some(&stream),
+        issue,
     )?;
     let write = bind_rows(
         parts,
@@ -1829,16 +1859,8 @@ pub(crate) fn encode_vision(
         .ok_or_else(|| Error::Invalid("this rank's text encoder reads no vision".into()))?;
     // Each block's features are consecutive rows of the product.
     let grids: Vec<[u32; 3]> = blocks.iter().map(|block| block.0).collect();
-    vision.encode_patches(patches.value(), &grids, &write.view())?;
-    publish(
-        parts,
-        batch,
-        call,
-        index,
-        &write,
-        &[tokens, width],
-        Some(&stream_of(batch)?),
-    )
+    vision.encode_patches(patches.value(), &grids, &write.view(), job)?;
+    publish(parts, batch, call, index, &write, &[tokens, width], issue)
 }
 
 /// Encode a request's conditions into denoiser rows: a round of visual
@@ -1850,6 +1872,7 @@ pub(crate) fn encode_conditions(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
@@ -1872,6 +1895,7 @@ pub(crate) fn encode_conditions(
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let width = row_width(&call.outputs[0])?;
     match name.as_str() {
         "condition_video_latents" => {
@@ -1909,7 +1933,7 @@ pub(crate) fn encode_conditions(
                 &call.inputs[0],
                 call.call_id,
                 batch.device,
-                Some(&stream),
+                issue,
             )?;
             let mut offsets = Vec::new();
             let mut cursor_pixels = 0u64;
@@ -1952,8 +1976,8 @@ pub(crate) fn encode_conditions(
             batch.calls[index].writes.push(write.clone());
             latent
                 .runner
-                .encode_condition_units(pixels.value(), &units, &write.view())?;
-            publish_bound(parts, batch, call, index, &write, false)?;
+                .encode_condition_units(pixels.value(), &units, &write.view(), job)?;
+            publish_bound(parts, batch, call, index, &write, false, issue)?;
         }
         "condition_audio_latents" => {
             // The audio call is one unit, the component's first rank's.
@@ -1974,7 +1998,7 @@ pub(crate) fn encode_conditions(
                 &call.inputs[0],
                 call.call_id,
                 batch.device,
-                Some(&stream),
+                issue,
             )?;
             let write = bind_outputs(
                 owners.store,
@@ -1992,8 +2016,8 @@ pub(crate) fn encode_conditions(
             batch.calls[index].writes.push(write.clone());
             latent
                 .runner
-                .encode_condition_tracks(samples.value(), &lengths, &write.view())?;
-            publish_bound(parts, batch, call, index, &write, false)?;
+                .encode_condition_tracks(samples.value(), &lengths, &write.view(), job)?;
+            publish_bound(parts, batch, call, index, &write, false, issue)?;
         }
         other => {
             return Err(Error::Invalid(format!(
