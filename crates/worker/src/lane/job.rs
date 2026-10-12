@@ -22,11 +22,11 @@
 //! storage is returned only once the record is made.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crossbeam_channel::{Receiver, Sender};
-use uniserve_cuda::{CopyBatch, Event, SourceOrder, Stream, StridedCopy};
+use uniserve_cuda::{CopyBatch, DeviceGuard, DeviceId, Event, SourceOrder, Stream, StridedCopy};
 use uniserve_ipc::Wake;
 
 use crate::cuda_graph::{CUDAGraph, GraphBreaks};
@@ -43,7 +43,13 @@ use crate::{Error, Result};
 /// its submitter ([`Job::forward`]); every other operation owns its data.
 pub(crate) struct Job<'a> {
     operations: RefCell<Vec<Operation<'a>>>,
+    /// The events a lane lets complete before it posts the job's
+    /// completion, and the device whose streams recorded them.
+    after: RefCell<Option<After>>,
 }
+
+/// The events a completion waits for and the device of their streams.
+type After = (DeviceId, Vec<Arc<Event>>);
 
 /// The copies of one submission.
 enum Copies {
@@ -173,7 +179,7 @@ pub(crate) struct Failure {
 /// Whoever built the job applies its results in the order it recorded their
 /// operations: each accessor takes the next one of its kind.
 #[derive(Default)]
-pub(crate) struct Completion {
+pub struct Completion {
     /// The graph of each capture.
     captured: VecDeque<CUDAGraph>,
     /// The bytes of each output read.
@@ -215,6 +221,7 @@ impl Default for Job<'_> {
     fn default() -> Self {
         Self {
             operations: RefCell::new(Vec::new()),
+            after: RefCell::new(None),
         }
     }
 }
@@ -264,6 +271,15 @@ impl<'a> Job<'a> {
         self.push(Operation::ExpertStep(step));
     }
 
+    /// Post the job's completion only once `events`, recorded on streams of
+    /// `device`, have completed: the completion then says that the device
+    /// finished what the events fence. The lane does not wait for them; it
+    /// goes on with its next job. A job performed outside a lane completes
+    /// when its operations are performed.
+    pub(crate) fn after(&self, device: DeviceId, events: Vec<Arc<Event>>) {
+        *self.after.borrow_mut() = Some((device, events));
+    }
+
     /// Continue this job with the operations of `other`.
     pub(crate) fn append(&self, other: Job<'a>) {
         self.operations
@@ -275,6 +291,12 @@ impl<'a> Job<'a> {
     /// execution thread, a microbatch thread in its turn of an expert step,
     /// or the submitter itself on a rank without a lane.
     pub(crate) fn perform(self) -> Completion {
+        self.perform_operations().0
+    }
+
+    /// Perform the operations; also return what the completion waits for.
+    fn perform_operations(self) -> (Completion, Option<After>) {
+        let after = self.after.into_inner();
         let mut completion = Completion::default();
         let mut operations = self.operations.into_inner().into_iter().enumerate();
         for (index, operation) in operations.by_ref() {
@@ -295,7 +317,7 @@ impl<'a> Job<'a> {
                 let _ = operation.perform(&mut completion);
             }
         }
-        completion
+        (completion, after)
     }
 }
 
@@ -672,9 +694,13 @@ impl Jobs {
     /// Perform jobs in arrival order on the calling thread, the lane's
     /// execution thread, until every submitting end is gone. Each
     /// completion is posted under its job's name, and the control thread's
-    /// wake fired behind it.
+    /// wake fired behind it; a job that names events ([`Job::after`]) has
+    /// its completion posted by the driver once they completed.
     pub(super) fn run(self) {
         let mut wake = None;
+        // One stream per device that carries nothing but the notices of
+        // completed events.
+        let mut notifications: HashMap<DeviceId, Stream> = HashMap::new();
         while let Ok(message) = self.messages.recv() {
             let (id, job) = match message {
                 Message::Job(id, job) => (id, job),
@@ -689,15 +715,88 @@ impl Jobs {
             };
             // The job and everything it holds is gone before its submitter
             // learns that it completed.
-            let completion = job.perform();
+            let (completion, after) = job.perform_operations();
             performing.job = None;
 
-            if self.completions.send((id, completion)).is_err() {
-                break;
+            let post = Post {
+                id,
+                completions: self.completions.clone(),
+                wake: wake.clone(),
+            };
+            match after {
+                Some((device, events)) if completion.failure.is_none() => {
+                    post.after(completion, device, &events, &mut notifications);
+                }
+                _ => post.now(completion),
             }
-            if let Some(wake) = &wake {
-                wake.wake();
+        }
+    }
+}
+
+/// Posts one job's completion and fires the control thread's wake.
+struct Post {
+    id: JobId,
+    completions: Sender<(JobId, Completion)>,
+    wake: Option<Wake>,
+}
+
+impl Post {
+    fn now(self, completion: Completion) {
+        // Without a receiver the rank is closing and nobody takes it.
+        let _ = self.completions.send((self.id, completion));
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
+    }
+
+    /// Post `completion` from the driver once `events` completed: a host
+    /// function on `device`'s notification stream, ordered behind them. It
+    /// only sends and signals: it never calls CUDA or blocks, as host
+    /// functions must not.
+    fn after(
+        self,
+        completion: Completion,
+        device: DeviceId,
+        events: &[Arc<Event>],
+        notifications: &mut HashMap<DeviceId, Stream>,
+    ) {
+        // The completion stays reachable if the notice cannot be issued.
+        let held = Arc::new(Mutex::new(Some(completion)));
+        let take = |held: &Mutex<Option<Completion>>| {
+            held.lock().unwrap_or_else(PoisonError::into_inner).take()
+        };
+        let issued = (|| -> Result<()> {
+            let notification = match notifications.entry(device) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let _device = DeviceGuard::new(device)?;
+                    entry.insert(Stream::new(device)?)
+                }
+            };
+            for event in events {
+                notification.wait_event(event)?;
             }
+            let (id, completions, wake) = (self.id, self.completions.clone(), self.wake.clone());
+            let posted = Arc::clone(&held);
+            notification.launch_host_fn(move || {
+                if let Some(completion) = take(&posted) {
+                    let _ = completions.send((id, completion));
+                    if let Some(wake) = &wake {
+                        wake.wake();
+                    }
+                }
+            })?;
+            Ok(())
+        })();
+
+        if let Err(error) = issued
+            && let Some(mut completion) = take(&held)
+        {
+            completion.failure = Some(Failure {
+                operation: 0,
+                error,
+            });
+            self.now(completion);
         }
     }
 }

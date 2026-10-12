@@ -161,8 +161,10 @@ pub(crate) fn read_flag(
 }
 
 /// Seal the lease on `stream` and complete `retirement` (the physical end
-/// of the batch's storage accesses) once its fences complete; wake the
-/// service when they do.
+/// of the batch's storage accesses) once its fences complete. The batch's
+/// executor learns of their completion from the job it submits for them
+/// ([`crate::executor::Backend::await_outputs`]), which also wakes the
+/// service.
 pub(crate) fn seal(
     events: &EventPool,
     buffer: &OutputLease,
@@ -176,10 +178,6 @@ pub(crate) fn seal(
         Vec::new()
     };
     let fences = lock(buffer).seal(&streams, events)?.unwrap_or_default();
-    let notify: Vec<_> = lock(buffer).fences().cloned().collect();
-    for event in &notify {
-        stream.wake(events, event)?;
-    }
     let lease = Arc::clone(buffer);
     let retirement = Arc::clone(retirement);
     events.defer(
