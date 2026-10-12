@@ -111,7 +111,7 @@ impl<'a> Scenarios<'a> {
     pub fn run(&mut self, plan: BatchPlan) -> std::result::Result<BatchResult, WorkerError> {
         let plan = Arc::new(plan);
         let batch = Batch::from_plan(&plan, WorkerBatch::new(Arc::clone(&plan)));
-        let submission = self.executor.submit(batch, true)?;
+        let submission = self.executor.admit(batch, true)?;
         loop {
             self.executor.advance()?;
             if let Some(result) = self.executor.poll(&submission)? {
