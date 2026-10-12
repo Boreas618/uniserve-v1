@@ -43,6 +43,7 @@ use uniserve_ipc::{
 };
 
 use super::super::backend::{WorkerBackend, WorkerBatch};
+use super::launch::{flag, request_flag};
 use super::transfer::latents::{self, LatentInput};
 use crate::error::WorkerError;
 use crate::executor::{BatchInputs, InputReady, Submission};
@@ -915,16 +916,7 @@ pub(crate) fn complete(batch: &mut WorkerBatch, completion: Completion) -> Resul
         Completing::Predicates(calls) => {
             let mut skipped = HashMap::with_capacity(calls.len());
             for index in calls {
-                let skip = match completion.read()?[..] {
-                    [0] => true,
-                    [1] => false,
-                    _ => {
-                        return Err(Error::Invalid(
-                            "call predicate is not a canonical boolean".into(),
-                        ));
-                    }
-                };
-                skipped.insert(index, skip);
+                skipped.insert(index, !flag(&mut completion)?);
             }
             batch.inputs_mut().completing = Completing::Decided(skipped);
             Ok(false)
@@ -978,15 +970,13 @@ fn read_predicate(backend: &WorkerBackend, call: &Call, job: &Job<'_>) -> Result
     let storage = backend
         .rank_storage()
         .ok_or_else(|| Error::Unsupported("predicates require rank storage".into()))?;
-    let issue = job.on(stream.as_ref());
-    let read = storage.tensors.consume(
+    request_flag(
+        &storage.tensors,
+        call,
         predicate,
-        call.call_id,
-        device.cuda_index().map(Device::Cuda),
-        issue,
-    )?;
-    issue.read(read.value().address(), 1);
-    storage.tensors.complete_reads(&[read], issue, &[])
+        device.cuda_index(),
+        job.on(stream.as_ref()),
+    )
 }
 
 /// Record in `job` the publication of one imported product on its

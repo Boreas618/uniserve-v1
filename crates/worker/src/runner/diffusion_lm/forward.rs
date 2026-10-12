@@ -47,7 +47,8 @@ use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::forward::Stage;
 use crate::executor::forward::launch::{
-    Launched, StreamOrder, error_code, failed_output, lock, reports_output, seal,
+    Launched, StreamOrder, error_code, failed_output, flag, lock, reports_output, request_flag,
+    seal,
 };
 use crate::executor::lifecycle::RequestStorage;
 use crate::executor::{BatchResult, PendingOutput};
@@ -232,9 +233,7 @@ impl Opening {
             else {
                 continue;
             };
-            let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), issue)?;
-            issue.read(read.value().address(), 1);
-            tensors.complete_reads(&[read], issue, &[])?;
+            request_flag(tensors, call, predicate, device, issue)?;
             predicated.push(index);
         }
         Ok(Self {
@@ -249,16 +248,7 @@ impl Opening {
     /// false is skipped.
     fn predicates(&mut self, completion: &mut Completion) -> Result<()> {
         for index in std::mem::take(&mut self.predicated) {
-            let active = match completion.read()?[..] {
-                [0] => false,
-                [1] => true,
-                _ => {
-                    return Err(Error::Invalid(
-                        "call predicate is not a canonical boolean".into(),
-                    ));
-                }
-            };
-            if !active {
+            if !flag(completion)? {
                 let state = &mut self.states[index];
                 state.active = false;
                 state.output.output.status = CallStatus::Predicated;
