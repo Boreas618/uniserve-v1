@@ -114,6 +114,9 @@ enum Operation<'a> {
         /// The rank is shutting down and leaves the union.
         leaving: bool,
     },
+    /// The end of the union's startup warmup on this rank: the announced
+    /// steps it follows, then the capture of its joins.
+    ExpertWarmup(Arc<ExpertUnion>),
 }
 
 /// Work the execution thread hands to the Python thread and waits for, or
@@ -343,6 +346,12 @@ impl<'a> Job<'a> {
         self.push(Operation::ExpertStep(step));
     }
 
+    /// End the union's startup warmup on this rank
+    /// ([`ExpertUnion::finish_warmup`]).
+    pub(crate) fn expert_warmup(&self, union: Arc<ExpertUnion>) {
+        self.push(Operation::ExpertWarmup(union));
+    }
+
     /// The union's next step for a rank with no forward of its own. The
     /// job's completion says whether a step ran and whether every rank has
     /// left the union.
@@ -480,6 +489,7 @@ impl Operation<'_> {
                 completion.joins.push_back(union.idle(leaving)?);
                 Ok(())
             }
+            Self::ExpertWarmup(union) => union.finish_warmup(),
         }
     }
 }
