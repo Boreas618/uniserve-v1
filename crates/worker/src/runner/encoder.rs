@@ -67,7 +67,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, VideoCondition};
-use uniserve_cuda::{Stream, memcpy_async};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memcpy_async};
 use uniserve_ipc::{Batch as BatchPlan, CallKind, ForwardStats, MediaCall};
 
 use crate::config::Device;
@@ -81,13 +81,15 @@ use crate::executor::forward::batch::{
 };
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::ffi::{Backing, DType, Function, Handle, integer_list, list};
+use crate::lane::Job;
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_records};
+use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass, kernel_records};
 use crate::runner::{ImageSetup, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{Metadata, OutputPlacement, ValueRange};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
@@ -1088,22 +1090,27 @@ impl EncoderRunner {
         ])
     }
 
-    /// Encode one prompt of `tokens` ids into `out`, its `[tokens, hidden]`
-    /// feature rows in the product's dtype.
+    /// Record the encoding of one prompt of `tokens` ids into `out`, its
+    /// `[tokens, hidden]` feature rows in the product's dtype, as operations
+    /// of `job` on the encoder's stream: the token upload, the launch of
+    /// the prompt capacity's graph or the eager call, and the copy of the
+    /// prompt's rows. Returns the mode the forward runs in.
     ///
     /// `vision` carries the prompt's vision tokens, for an encoder that
     /// places them. A pipeline stage that emits no features writes nothing.
-    pub fn encode_text(
+    pub(crate) fn encode_text(
         &mut self,
         tokens: &[i64],
         out: &StorageView,
         vision: Option<PromptVision<'_>>,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
         let (encode, position_ids) = (&self.methods.encode, &self.methods.position_ids);
         let (Some(text), Some(stream)) = (&self.text, &self.stream) else {
             return Err(Error::Invalid(format!("{} encodes no text", self.owner)));
         };
         let (encode, position_ids, stream) = (encode.clone(), position_ids.clone(), stream.clone());
+        let issue = job.on(Some(&stream));
         let capacity = text_capacity(&self.text_capacities, tokens.len())?;
         if capacity as i64 > text.tokens.shape()[0] {
             return Err(Error::Invalid(
@@ -1117,10 +1124,15 @@ impl EncoderRunner {
             .iter()
             .flat_map(|token| token.to_ne_bytes())
             .collect();
-        text.tokens.upload(&bytes, Some(&stream))?;
+        text.tokens.upload(&bytes, issue)?;
         let (features, final_stage) = (text.features.clone(), text.final_stage);
 
-        let mut arguments = self.text_arguments(capacity)?;
+        let runner = Argument::Handle(self.methods.runner.clone());
+        let mut arguments = vec![
+            runner.clone(),
+            Argument::Tensor(text.tokens.prefix(capacity as i64)?),
+            Argument::Tensor(text.features.prefix(capacity as i64)?),
+        ];
         let mode = match vision {
             Some(PromptVision {
                 image_grids,
@@ -1135,35 +1147,42 @@ impl EncoderRunner {
                         Error::Invalid(format!("{} places no vision tokens", self.owner))
                     })?;
                 let grids = |grids: &[[u32; 3]]| {
-                    Any::from(integer_list(
-                        grids.iter().flatten().map(|&extent| i64::from(extent)),
-                    ))
+                    Argument::Integers(
+                        grids
+                            .iter()
+                            .flatten()
+                            .map(|&extent| i64::from(extent))
+                            .collect(),
+                    )
                 };
-                position_ids.call_values(&[
-                    arguments[0].clone(),
-                    Any::from(integer_list(padded.iter().copied())),
-                    grids(image_grids),
-                    grids(video_grids),
-                    Any::from(positions.to_tensor()?),
-                ])?;
-                arguments.push(Any::from(positions.to_tensor()?));
-                arguments.push(Any::from(rows.to_tensor()?));
-                encode.call_values(&arguments)?;
+                job.call(MethodCall::new(
+                    &position_ids,
+                    vec![
+                        runner,
+                        Argument::Integers(padded.clone()),
+                        grids(image_grids),
+                        grids(video_grids),
+                        Argument::Tensor(positions.clone()),
+                    ],
+                ));
+                arguments.push(Argument::Tensor(positions.clone()));
+                arguments.push(Argument::Tensor(rows.clone()));
+                job.call(MethodCall::new(&encode, arguments));
                 GraphMode::Eager
             }
             // Without configured capacities a prompt is encoded at its
             // exact length, which no graph serves.
             None if self.text_capacities.is_empty() => {
-                encode.call_values(&arguments)?;
+                job.call(MethodCall::new(&encode, arguments));
                 GraphMode::Eager
             }
             None => match self.graph(EncoderGraph::Text { capacity })? {
                 Some(graph) => {
-                    graph.launch(&stream)?;
+                    issue.launch(graph)?;
                     GraphMode::Replay
                 }
                 None => {
-                    encode.call_values(&arguments)?;
+                    job.call(MethodCall::new(&encode, arguments));
                     GraphMode::Eager
                 }
             },
@@ -1175,10 +1194,12 @@ impl EncoderRunner {
             // The features and the product share the model dtype, so the
             // prompt's rows are copied as they are.
             let count = out.numel() * out.dtype().bytes() as u64;
+            let mut rows = CopyBatch::new(SourceOrder::Stream);
+            rows.push(out.address(), features.address(), count as usize);
             // SAFETY: the features hold at least the prompt's rows, the
-            // caller bound `out` for them, and the copy follows the encode
-            // on the stream.
-            unsafe { memcpy_async(out.address(), features.address(), count as usize, &stream)? };
+            // caller bound `out` for them, both outlive the batch, and the
+            // copy follows the encode on the stream.
+            unsafe { issue.copy(&rows) }?;
         }
         Ok(mode)
     }
@@ -1683,6 +1704,7 @@ pub(crate) fn encode_text(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.outputs.len() != 1 || call.inputs.len() > 1 {
@@ -1701,6 +1723,7 @@ pub(crate) fn encode_text(
     }
     let width = row_width(&call.outputs[0])?;
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let visual = call
         .inputs
         .first()
@@ -1710,7 +1733,7 @@ pub(crate) fn encode_text(
                 input,
                 call.call_id,
                 batch.device,
-                Some(&stream),
+                issue,
             )
         })
         .transpose()?;
@@ -1735,7 +1758,7 @@ pub(crate) fn encode_text(
         video_grids: &video_grids,
         rows: read.value(),
     });
-    let mode = text.encode_text(&tokens, &write.view(), vision)?;
+    let mode = text.encode_text(&tokens, &write.view(), vision, job)?;
     batch.record(mode);
     publish(
         parts,
@@ -1744,6 +1767,7 @@ pub(crate) fn encode_text(
         index,
         &write,
         &[tokens.len() as u64, width],
+        issue,
     )
 }
 
@@ -1806,7 +1830,15 @@ pub(crate) fn encode_vision(
     // Each block's features are consecutive rows of the product.
     let grids: Vec<[u32; 3]> = blocks.iter().map(|block| block.0).collect();
     vision.encode_patches(patches.value(), &grids, &write.view())?;
-    publish(parts, batch, call, index, &write, &[tokens, width])
+    publish(
+        parts,
+        batch,
+        call,
+        index,
+        &write,
+        &[tokens, width],
+        Some(&stream_of(batch)?),
+    )
 }
 
 /// Encode a request's conditions into denoiser rows: a round of visual
