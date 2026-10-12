@@ -895,7 +895,7 @@ impl ImageBatch<'_> {
             return Ok(());
         }
         let (pool, storage) = self.parts.latent_pool()?;
-        let buffer = latents::export(
+        let export = latents::issue_export(
             pool,
             storage,
             &self.storage.transports,
@@ -906,10 +906,10 @@ impl ImageBatch<'_> {
             bank,
             step,
             stream,
-            &mut self.publications,
-            &mut self.calls[index].output,
         )?;
-        self.latent_exports.push(buffer);
+        // The batch's commit locates it once this work was performed.
+        self.latent_exports.push(export.buffer());
+        self.exports.push((index, export));
         Ok(())
     }
 
