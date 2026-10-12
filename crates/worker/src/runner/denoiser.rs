@@ -2010,16 +2010,6 @@ impl VideoModel {
         narrow(self.integer(method, value)?, "frame count")
     }
 
-    /// A request's condition rows; a size the model rejects is an invalid
-    /// descriptor.
-    pub(crate) fn request_size(&self, size: &VideoSize) -> Result<u32> {
-        let method = &self.methods.condition_rows;
-        let value = self
-            .denoiser(method, size_arguments(size))
-            .map_err(invalid_size)?;
-        narrow(self.integer(method, value)?, "condition row count")
-    }
-
     /// The smallest layout holding `size`.
     pub(crate) fn layout_size(&self, size: &VideoSize) -> Result<VideoLayout> {
         let value = self
@@ -2028,13 +2018,39 @@ impl VideoModel {
         layout_of(value)
     }
 
-    pub(crate) fn holds(&self, layout: &VideoLayout, size: &VideoSize) -> Result<bool> {
-        let mut arguments = vec![layout_arguments(layout)];
-        arguments.extend(size_arguments(size));
-        let value = self
-            .denoiser(&self.methods.holds, arguments)
-            .map_err(invalid_size)?;
-        bool::try_from(value).map_err(|error| Error::numerical(self.methods.holds.name(), &error))
+    /// A sizing method of the denoiser component as a call for a job to
+    /// make.
+    fn asked(&self, method: &Function, arguments: Vec<Argument>) -> MethodCall {
+        let mut all = vec![
+            Argument::Handle(self.loaded.clone()),
+            Argument::Text(self.denoiser.clone()),
+        ];
+        all.extend(arguments);
+        MethodCall::new(method, all)
+    }
+
+    /// Record the call asking a request's condition rows: the job's
+    /// completion carries the count. A size the model rejects fails the
+    /// job with the model's error ([`invalid_size`]).
+    pub(crate) fn ask_request_size(&self, size: &VideoSize, job: &Job) {
+        let arguments = size_values(size).into();
+        job.call_returning(self.asked(&self.methods.condition_rows, arguments));
+    }
+
+    /// Record the call asking the smallest layout holding `size`
+    /// ([`Self::layout_size`] as a call of `job`): its completion carries
+    /// the layout's extents.
+    pub(crate) fn ask_layout_size(&self, size: &VideoSize, job: &Job) {
+        let arguments = size_values(size).into();
+        job.call_returning(self.asked(&self.methods.layout_size, arguments));
+    }
+
+    /// Record the call asking whether `layout` holds `size`: the job's
+    /// completion carries one for a layout that does, zero otherwise.
+    pub(crate) fn ask_holds(&self, layout: &VideoLayout, size: &VideoSize, job: &Job) {
+        let mut arguments = vec![Argument::Integers(layout.values().to_vec())];
+        arguments.extend(size_values(size));
+        job.call_returning(self.asked(&self.methods.holds, arguments));
     }
 
     /// `layout` widened so its condition region holds `rows`.
@@ -2378,7 +2394,7 @@ fn layout_of(value: Any) -> Result<VideoLayout> {
 }
 
 /// A size the model rejects is the request's error, not the worker's.
-fn invalid_size(error: Error) -> Error {
+pub(crate) fn invalid_size(error: Error) -> Error {
     match error {
         Error::Numerical { kind, message, .. } if kind == "InputError" || kind == "ValueError" => {
             Error::Invalid(message)
