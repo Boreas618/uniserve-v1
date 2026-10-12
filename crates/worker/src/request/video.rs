@@ -505,22 +505,48 @@ impl VideoRequest {
     }
 }
 
+/// What the model answers about a video of one admitted frame count.
+struct AdmittedDuration {
+    /// Frames of each media unit.
+    units: Arc<[u32]>,
+    /// Samples of the generated audio track.
+    audio_samples: u64,
+}
+
 /// The video requests admitted on a rank, with the model and the plan that
 /// admit them.
 pub(crate) struct VideoRequests {
     pub(crate) model: VideoModel,
     pub(crate) plan: MediaPlan,
+    /// Every admitted frame count's units and track, read from the model
+    /// when the rank starts: a request is admitted without asking the
+    /// library for them.
+    durations: HashMap<u32, AdmittedDuration>,
     /// Admitted requests by slot.
     requests: HashMap<usize, VideoRequest>,
 }
 
 impl VideoRequests {
-    pub(crate) fn new(model: VideoModel, plan: MediaPlan) -> Self {
-        Self {
+    /// The requests of a rank that admits `plan`. Asks `model` for the
+    /// units and the track of every admitted frame count.
+    pub(crate) fn new(model: VideoModel, plan: MediaPlan) -> Result<Self> {
+        let durations = plan
+            .frame_counts
+            .iter()
+            .map(|&frames| {
+                let duration = AdmittedDuration {
+                    units: model.unit_frames(frames)?.into(),
+                    audio_samples: model.track_samples(frames)?,
+                };
+                Ok((frames, duration))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
             model,
             plan,
+            durations,
             requests: HashMap::new(),
-        }
+        })
     }
 
     /// Admit a started video request: resolve its size and, on a denoising
@@ -543,15 +569,17 @@ impl VideoRequests {
                 "a video request's task disagrees with its conditions".into(),
             ));
         }
-        if !self.plan.frame_counts.contains(&media.num_frames)
-            || !self.plan.canvases.contains(&canvas)
-        {
-            return Err(Error::Invalid(
-                "media input exceeds the worker frame, canvas, conditioning or condition capacity"
-                    .into(),
-            ));
-        }
-        let units: Arc<[u32]> = self.model.unit_frames(media.num_frames)?.into();
+        let duration = self
+            .durations
+            .get(&media.num_frames)
+            .filter(|_| self.plan.canvases.contains(&canvas))
+            .ok_or_else(|| {
+                Error::Invalid(
+                    "media input exceeds the worker frame, canvas, conditioning or condition capacity"
+                        .into(),
+                )
+            })?;
+        let units = Arc::clone(&duration.units);
         if media.video_units as usize != units.len()
             || media.num_inference_steps != self.model.facts.num_steps
         {
@@ -579,7 +607,7 @@ impl VideoRequests {
             conditions,
             admission: None,
             layout: None,
-            audio_samples: self.model.track_samples(media.num_frames)?,
+            audio_samples: duration.audio_samples,
             units,
             seed: media.seed,
             mux: None,
