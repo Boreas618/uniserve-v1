@@ -591,72 +591,112 @@ impl Issue for Recorder<'_, '_> {
     }
 }
 
-/// The submitting end of a lane's job queue.
-///
-/// Only the control thread submits, and it waits for a job's completion
-/// before it submits the next.
+/// Names a job from its submission to its completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JobId(pub(super) u64);
+
+/// What a lane's execution thread receives.
+enum Message {
+    Job(JobId, Job<'static>),
+    /// The wake of the control thread, fired behind every completion from
+    /// now on; `None` stops it.
+    Wake(Option<Wake>),
+}
+
+/// The submitting end of a lane's job queue. Only the control thread
+/// submits.
 #[derive(Clone)]
 pub struct JobQueue {
-    jobs: Sender<Job<'static>>,
-    completions: Receiver<Completion>,
+    messages: Sender<Message>,
 }
 
 /// The execution thread's end of a lane's job queue.
 pub(super) struct Jobs {
-    jobs: Receiver<Job<'static>>,
-    completions: Sender<Completion>,
+    messages: Receiver<Message>,
+    /// Where the lanes of a rank post their completions.
+    completions: Sender<(JobId, Completion)>,
+}
+
+/// Posts the failure of the job a lane is performing if the lane's thread
+/// unwinds, so whoever waits for that job learns that the lane is gone.
+struct Performing<'a> {
+    job: Option<JobId>,
+    completions: &'a Sender<(JobId, Completion)>,
+}
+
+impl Drop for Performing<'_> {
+    fn drop(&mut self) {
+        if let Some(job) = self.job {
+            let completion = Completion {
+                failure: Some(Failure {
+                    operation: 0,
+                    error: Error::State("the lane's execution thread has exited"),
+                }),
+                ..Completion::default()
+            };
+            let _ = self.completions.send((job, completion));
+        }
+    }
 }
 
 impl JobQueue {
-    pub(super) fn new() -> (Self, Jobs) {
-        let (jobs, received) = crossbeam_channel::unbounded();
-        let (completions, completed) = crossbeam_channel::unbounded();
+    pub(super) fn new(completions: Sender<(JobId, Completion)>) -> (Self, Jobs) {
+        let (messages, received) = crossbeam_channel::unbounded();
         (
-            Self {
-                jobs,
-                completions: completed,
-            },
+            Self { messages },
             Jobs {
-                jobs: received,
+                messages: received,
                 completions,
             },
         )
     }
 
-    /// Submit `job` to the lane's execution thread and wait for its
-    /// completion.
-    pub(crate) fn submit(&self, job: Job<'_>) -> Result<Completion> {
-        // SAFETY: the lifetime is erased only for the queue's type. This
-        // call returns once the execution thread has consumed the job and
-        // posted its completion, or with the job dropped where the thread
-        // is gone, so nothing the job borrows is used after it.
-        //
-        // Only `Job::forward` gives a job something to borrow: the erasure
-        // goes with it, and a job that owns its operations is submitted as
-        // it is.
-        let job = unsafe { std::mem::transmute::<Job<'_>, Job<'static>>(job) };
-        const EXITED: Error = Error::State("the lane's execution thread has exited");
-        self.jobs.send(job).map_err(|_| EXITED)?;
+    /// Queue `job` as `id` on the lane's execution thread, which posts its
+    /// completion under that name.
+    pub(super) fn start(&self, id: JobId, job: Job<'static>) -> Result<()> {
+        self.send(Message::Job(id, job))
+    }
 
-        // FIXME: the submitter waits here for as long as the lane takes, as
-        // it waited for a forward before jobs: a lane that stops making
-        // progress stops the control thread with it. The control thread is
-        // to submit and return, and take the completion from its wake
-        // descriptor (specs/planes.md section 3).
-        self.completions.recv().map_err(|_| EXITED)
+    pub(super) fn set_wake(&self, wake: Option<Wake>) -> Result<()> {
+        self.send(Message::Wake(wake))
+    }
+
+    fn send(&self, message: Message) -> Result<()> {
+        self.messages
+            .send(message)
+            .map_err(|_| Error::State("the lane's execution thread has exited"))
     }
 }
 
 impl Jobs {
     /// Perform jobs in arrival order on the calling thread, the lane's
-    /// execution thread, until every submitting end is gone.
+    /// execution thread, until every submitting end is gone. Each
+    /// completion is posted under its job's name, and the control thread's
+    /// wake fired behind it.
     pub(super) fn run(self) {
-        while let Ok(job) = self.jobs.recv() {
+        let mut wake = None;
+        while let Ok(message) = self.messages.recv() {
+            let (id, job) = match message {
+                Message::Job(id, job) => (id, job),
+                Message::Wake(installed) => {
+                    wake = installed;
+                    continue;
+                }
+            };
+            let mut performing = Performing {
+                job: Some(id),
+                completions: &self.completions,
+            };
             // The job and everything it holds is gone before its submitter
             // learns that it completed.
             let completion = job.perform();
-            if self.completions.send(completion).is_err() {
+            performing.job = None;
+
+            if self.completions.send((id, completion)).is_err() {
                 break;
+            }
+            if let Some(wake) = &wake {
+                wake.wake();
             }
         }
     }
@@ -682,36 +722,6 @@ mod tests {
             width: 1,
             count: 1,
         }
-    }
-
-    #[test]
-    fn a_lane_performs_jobs_in_order_on_its_thread_and_a_forward_borrows_its_submitter() {
-        let (queue, jobs) = JobQueue::new();
-        let thread = std::thread::spawn(move || {
-            jobs.run();
-            std::thread::current().id()
-        });
-        let here = std::thread::current().id();
-
-        // A forward mutates state borrowed from its submitter; the next
-        // job runs after it.
-        let mut order = Vec::new();
-        let mut threads = Vec::new();
-        for name in ["first", "second"] {
-            let job = Job::new();
-            job.forward(|| {
-                order.push(name);
-                threads.push(std::thread::current().id());
-            });
-            assert!(queue.submit(job).unwrap().check().is_ok());
-        }
-        assert_eq!(order, ["first", "second"]);
-        assert_ne!(threads[0], here);
-        assert_eq!(threads[1], threads[0]);
-
-        // The thread ends with its last queue.
-        drop(queue);
-        assert_eq!(thread.join().unwrap(), threads[0]);
     }
 
     #[test]
