@@ -198,6 +198,8 @@ pub struct WorkerBatch {
     tokens: Option<crate::runner::causal_lm::Pending>,
     /// A diffusion LM batch between its jobs.
     denoising: Option<crate::runner::diffusion_lm::Pending>,
+    /// A transfer batch between its jobs.
+    transfer: Option<forward::transfer::Pending>,
     /// The batch's profiler step is open: its forward began and has not
     /// ended.
     stepping: bool,
@@ -224,6 +226,7 @@ impl WorkerBatch {
             executed: None,
             tokens: None,
             denoising: None,
+            transfer: None,
             stepping: false,
             running: None,
             image_inputs: None,
@@ -299,6 +302,18 @@ impl WorkerBatch {
         &mut Option<crate::runner::diffusion_lm::Pending>,
     ) {
         (&self.plan, &mut self.denoising)
+    }
+
+    /// The batch's plan, its imported inputs and its transfer batch between
+    /// jobs, borrowed apart.
+    pub(crate) fn transfer_parts(
+        &mut self,
+    ) -> (
+        &BatchPlan,
+        &forward::inputs::Inputs,
+        &mut Option<forward::transfer::Pending>,
+    ) {
+        (&self.plan, &self.inputs, &mut self.transfer)
     }
 
     /// Set the batch's result; capability runtimes call this once their

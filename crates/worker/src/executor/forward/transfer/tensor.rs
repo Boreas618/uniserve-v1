@@ -1,7 +1,8 @@
 //! Tensor product transfers (`TransferMode::Tensor`).
 //!
 //! Each active call copies its one input product into its one output
-//! product on the batch's stream and publishes the copy. The input may be a
+//! product in the batch's job and exports the copy, which is published at
+//! the job's completion. The input may be a
 //! product of this rank or one the batch imported from another rank or
 //! worker; either way it is leased from the tensor store. The output keeps
 //! its kind: a relayed scalar (a sampled token) lands in its request's
@@ -25,6 +26,7 @@ use crate::executor::forward::batch::image::ImageParts;
 use crate::ffi::Device;
 use crate::storage::memory::parse_dtype;
 use crate::storage::{OutputPlacement, ProductBuffer};
+use crate::worker::RankStorage;
 use crate::{Error, Result};
 
 /// How a transfer's output product is stored.
@@ -38,9 +40,9 @@ enum Placement {
     Relay,
 }
 
-impl TransferBatch<'_> {
+impl TransferBatch<'_, '_> {
     /// Copy every active call's input product into its output product and
-    /// publish the copy; export trajectory transfers' versions from the
+    /// export the copy; export trajectory transfers' versions from the
     /// latent pool of `image`.
     pub(super) fn copy_products(&mut self, image: Option<&mut ImageParts<'_>>) -> Result<()> {
         let plan = self.plan;
@@ -87,13 +89,13 @@ impl TransferBatch<'_> {
         }
         let writes = self.bind(&transfers, &allocations, target)?;
 
-        let stream = self.stream.as_ref();
+        let issue = self.issue();
         for ((index, input, output, _), write) in transfers.into_iter().zip(writes) {
             let call = &plan.calls[index];
             let read = self
                 .storage
                 .tensors
-                .consume(input, call.call_id, Some(target), stream)?;
+                .consume(input, call.call_id, Some(target), issue)?;
             self.reads.push(std::sync::Arc::clone(&read));
             if read.value().dtype() != product_dtype(output.dtype)? {
                 return Err(Error::Invalid(
@@ -102,27 +104,27 @@ impl TransferBatch<'_> {
             }
             self.storage
                 .tensors
-                .write(&write, read.value(), stream, read.metadata())?;
-            self.publications.export(
-                &self.storage.tensors,
-                &self.storage.transports,
-                call,
-                output,
-                &write,
-                stream,
-                &mut self.calls[index].output,
-            )?;
+                .write(&write, read.value(), issue, read.metadata())?;
+            let export = self.exporting(|batch, issue| {
+                let RankStorage {
+                    tensors,
+                    transports,
+                    ..
+                } = &*batch.storage;
+                tensors.export_buffer(call, output, &write, transports, false, None, issue)
+            })?;
+            self.recorded.products.push_back((index, write, export));
         }
         Ok(())
     }
 
     /// Export the committed trajectory version each of `calls` names (its
     /// latent input) as its latent output, ordered after the latent pool's
-    /// previous user on the batch's stream.
+    /// previous user in the batch's job.
     fn export_trajectories(&mut self, image: &mut ImageParts<'_>, calls: &[usize]) -> Result<()> {
         let plan = self.plan;
-        let stream = self.stream.as_ref();
-        image.enter_latents(stream)?;
+        let issue = self.issue();
+        image.enter_latents(issue)?;
         let exported = (|| -> Result<()> {
             for &index in calls {
                 let call = &plan.calls[index];
@@ -145,7 +147,7 @@ impl TransferBatch<'_> {
                     .ok_or_else(|| {
                         Error::Invalid("latent transfer has no bound parameters".into())
                     })?;
-                let slot = self.calls[index].slot;
+                let slot = self.recorded.calls[index].slot;
                 let (pool, storage) = image.latent_pool()?;
                 let pages: Vec<usize> = params
                     .page_table
@@ -161,25 +163,25 @@ impl TransferBatch<'_> {
                     i64::from(params.width),
                     &pages,
                 )?;
-                let buffer = latents::export(
-                    pool,
-                    storage,
-                    &self.storage.transports,
-                    call,
-                    output,
-                    slot,
-                    params,
-                    bank,
-                    params.start_step,
-                    stream,
-                    &mut self.publications,
-                    &mut self.calls[index].output,
-                )?;
-                self.latent_exports.push(buffer);
+                let version = self.exporting(|batch, issue| {
+                    latents::export_version(
+                        pool,
+                        storage,
+                        &batch.storage.transports,
+                        call,
+                        output,
+                        slot,
+                        params,
+                        bank,
+                        params.start_step,
+                        issue,
+                    )
+                })?;
+                self.recorded.versions.push_back((index, version));
             }
             Ok(())
         })();
-        exported.and(image.leave_latents(stream))
+        exported.and(image.leave_latents(issue))
     }
 
     /// Bind every transfer's output, in transfer order: features in their
@@ -201,7 +203,7 @@ impl TransferBatch<'_> {
             allocations,
             OutputPlacement::default(),
         )?;
-        self.writes.extend(bound.iter().cloned());
+        self.recorded.writes.extend(bound.iter().cloned());
 
         let mut groups: IndexMap<(Placement, ProductDType, String), Vec<(TensorRef, Device)>> =
             IndexMap::new();
@@ -236,7 +238,7 @@ impl TransferBatch<'_> {
             },
         )?;
         for write in others.into_iter().flatten() {
-            self.writes.push(write.clone());
+            self.recorded.writes.push(write.clone());
             bound.push(write);
         }
 

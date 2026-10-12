@@ -313,6 +313,19 @@ impl<'a> Job<'a> {
         *self.after.borrow_mut() = Some((device, events));
     }
 
+    /// Give up the operations recorded after the first `len`: their
+    /// recorder failed and gave back storage they address. The event
+    /// operations among them stay, since an event queued for a record
+    /// completes only once the record is made.
+    pub(crate) fn truncate(&self, len: usize) {
+        let mut operations = self.operations.borrow_mut();
+        if len >= operations.len() {
+            return;
+        }
+        let kept: Vec<_> = operations.drain(len..).filter(Operation::orders).collect();
+        operations.extend(kept);
+    }
+
     /// Continue this job with the operations of `other`.
     pub(crate) fn append(&self, other: Job<'a>) {
         self.operations
@@ -922,6 +935,28 @@ mod tests {
 
         // The same call issued at once fails its caller.
         assert!(None::<&Stream>.call(failing()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_truncated_job_performs_what_it_kept() -> Result<()> {
+        let mut written = [0_u8; 3];
+        let job = Job::new();
+        // SAFETY: bytes of the test's array.
+        unsafe { job.on(None).fill(byte(&raw mut written[0], 1)) }?;
+        let kept = job.len();
+        // SAFETY: as above.
+        unsafe { job.on(None).fill(byte(&raw mut written[1], 1)) }?;
+        job.on(None).call(failing())?;
+
+        // What a failed recorder added is given up; work recorded after
+        // the truncation is performed.
+        job.truncate(kept);
+        // SAFETY: as above.
+        unsafe { job.on(None).fill(byte(&raw mut written[2], 1)) }?;
+
+        assert!(job.perform().check().is_ok());
+        assert_eq!(written, [1, 0, 1]);
         Ok(())
     }
 }

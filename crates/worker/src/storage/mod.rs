@@ -32,5 +32,6 @@ pub use latent_storage::LatentStorage;
 pub use output::{LogprobLayout, OutputBuffer, OutputLease, OutputPool, OutputStorage};
 pub use request_slots::{RequestSlots, SlotField};
 pub use tensor_store::{
-    Metadata, OutputPlacement, ProductBuffer, ProductRead, Scalar, TensorStore, ValueRange,
+    Metadata, OutputPlacement, ProductBuffer, ProductExport, ProductRead, Scalar, TensorStore,
+    ValueRange,
 };

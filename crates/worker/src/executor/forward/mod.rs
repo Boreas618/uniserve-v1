@@ -15,10 +15,11 @@
 //! not been integrated reports its call kind as unsupported, which fails
 //! the batch with `UnsupportedSetup` and leaves the rank serving.
 //!
-//! A text batch's jobs are operations its runner recorded. The forward of
-//! every other capability, and the completion of imported inputs, still
-//! issue their own stream work: each is one job holding that work as
-//! [`Job::forward`], until its capability is converted.
+//! The jobs of a text batch, of a diffusion LM batch, of a transfer batch
+//! and of the completion of imported inputs are operations their owners
+//! recorded. The forward of a media capability still issues its own stream
+//! work: it is one job holding that work as [`Job::forward`], until the
+//! capability is converted.
 
 pub(crate) mod batch;
 pub(crate) mod inputs;
@@ -142,6 +143,7 @@ pub(crate) fn forward<'a>(
             Forward(ForwardMode::TokenDenoising) => {
                 crate::runner::diffusion_lm::forward(backend, batch, kind)
             }
+            CallKind::Transfer(_) => transfer::forward(backend, batch, kind),
             _ => {
                 let job = Job::new();
                 job.forward(move || {
@@ -179,6 +181,7 @@ pub(crate) fn complete(
         Forward(ForwardMode::TokenDenoising) => {
             crate::runner::diffusion_lm::complete(backend, batch, completion)
         }
+        CallKind::Transfer(_) => transfer::complete(backend, batch, completion),
         _ => {
             batch.set_stage(Stage::Done);
             batch.take_executed().unwrap_or_else(|| {
@@ -223,7 +226,7 @@ fn execute(
             Err(unsupported(kind, "text"))
         }
         Forward(ForwardMode::TokenDenoising) => Err(unsupported(kind, "diffusion LM")),
-        Transfer(_) => transfer::execute(backend, batch, kind),
+        Transfer(_) => Err(unsupported(kind, "transfer")),
         Media(MediaReading | VideoEncoding | AudioEncoding | Muxing) => {
             let (plan, borrowed, state) = batch.media_parts();
             let mut parts = backend.media_parts()?;
