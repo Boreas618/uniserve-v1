@@ -8,16 +8,18 @@ use super::kv;
 use crate::storage::UnitColumn;
 use crate::{Error, Result};
 
-impl TransferBatch<'_> {
+impl TransferBatch<'_, '_> {
     /// Install the active calls' block tables on the batch's stream and
     /// reset the units newly assigned to them on `column` (the stream's
     /// unit column), except those an install's import resets itself.
     pub(super) fn reserve_cache(&mut self, column: &UnitColumn, inputs: &Inputs) -> Result<()> {
         let plan = self.plan;
+        let issue = self.issue();
+        let calls = &self.recorded.calls;
         let active: HashSet<u32> = self
             .active()
             .into_iter()
-            .map(|index| self.calls[index].slot as u32)
+            .map(|index| calls[index].slot as u32)
             .collect();
         let imported: HashSet<u32> = self
             .active()
@@ -27,7 +29,7 @@ impl TransferBatch<'_> {
                     .kv_input
                     .is_some_and(|source| inputs.cache_import(source).is_some())
             })
-            .map(|index| self.calls[index].slot as u32)
+            .map(|index| calls[index].slot as u32)
             .collect();
         let assignments: Vec<_> = plan
             .block_tables
@@ -40,7 +42,7 @@ impl TransferBatch<'_> {
             .kv
             .as_mut()
             .ok_or_else(|| Error::Unsupported("KV transfers require a KV cache".into()))?;
-        kv.install(&assignments, self.stream.as_ref())?;
+        kv.install(&assignments, issue)?;
         let units: Vec<u32> = plan
             .new_cache_units
             .iter()
@@ -51,25 +53,29 @@ impl TransferBatch<'_> {
             .flat_map(|allocation| allocation.unit_ids.iter().map(|unit| unit.0))
             .collect();
         if !units.is_empty() {
-            kv.recycle(&units, column, self.stream.as_ref())?;
+            kv.recycle(&units, column, issue)?;
         }
         Ok(())
     }
 
-    /// Export every active call's visible KV extent.
+    /// Export every active call's visible KV extent. The exports are
+    /// located, and join their calls' outputs, at the job's completion.
     pub(super) fn export_cache(&mut self) -> Result<()> {
         let plan = self.plan;
         for index in self.active() {
-            let export = kv::export(
-                self.storage,
-                index,
-                &plan.calls[index],
-                self.calls[index].slot,
-                self.calls[index].output.progress.kv_visible_len,
-                self.stream.as_ref(),
-            )?;
-            self.calls[index].output.output.kv_output = Some(export.transfer.clone());
-            self.published.push(export);
+            let state = &self.recorded.calls[index];
+            let (slot, visible) = (state.slot, state.output.progress.kv_visible_len);
+            let export = self.exporting(|batch, issue| {
+                kv::export(
+                    batch.storage,
+                    index,
+                    &plan.calls[index],
+                    slot,
+                    visible,
+                    issue,
+                )
+            })?;
+            self.recorded.exports.push_back(export);
         }
         Ok(())
     }
@@ -78,6 +84,7 @@ impl TransferBatch<'_> {
     /// call's KV extent becomes the installed one.
     pub(super) fn install_cache(&mut self, inputs: &Inputs) -> Result<()> {
         let plan = self.plan;
+        let issue = self.issue();
         for index in self.active() {
             let call = &plan.calls[index];
             let source = call
@@ -86,10 +93,9 @@ impl TransferBatch<'_> {
             let import = inputs.cache_import(source).ok_or_else(|| {
                 Error::Invalid("KV installation has no reserved physical input".into())
             })?;
-            let (installation, extent) =
-                kv::install(self.storage, call, import, self.stream.as_ref())?;
-            self.calls[index].output.set_cache_length(extent);
-            self.installations.push(installation);
+            let (installation, extent) = kv::install(self.storage, call, import, issue)?;
+            self.recorded.calls[index].output.set_cache_length(extent);
+            self.recorded.installations.push(installation);
         }
         Ok(())
     }
