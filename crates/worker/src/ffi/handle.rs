@@ -17,6 +17,11 @@ pub struct Handle(Any);
 
 impl Drop for Handle {
     fn drop(&mut self) {
+        // FIXME: the control thread parks here too, while it serves, for
+        // every handle it drops (a prepared image, a guidance plan, a video
+        // layout, a clone it made as a call's argument and did not hand
+        // on). A drop no teardown order depends on is to be submitted
+        // ([`super::Interpreter::submit`]) instead of waited for.
         if !is_none(&self.0) {
             interpreter::release(std::mem::take(&mut self.0));
         }

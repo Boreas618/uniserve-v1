@@ -17,7 +17,7 @@
 //! Capability runtimes contribute phases 2 to 4 through [`WarmupHooks`].
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uniserve_core::{RequestId, SamplingParams};
 use uniserve_ipc::{ArRequestParams, Batch as BatchPlan, BatchCommand, NewRequest, RequestKey};
@@ -25,6 +25,7 @@ use uniserve_ipc::{ArRequestParams, Batch as BatchPlan, BatchCommand, NewRequest
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::{Batch, BatchResult, Executor};
+use crate::lane::BLOCK_ON_TIMEOUT;
 use crate::{Error, Result};
 
 /// Engine identity of warmup requests; no engine uses it.
@@ -107,15 +108,24 @@ impl<'a> Scenarios<'a> {
         key
     }
 
-    /// Submit one batch and drive it to its result.
+    /// Submit one batch and drive it to its result: startup takes the
+    /// completions of the batch's jobs by polling, since no wake is
+    /// installed before the rank serves. A batch that has no result at the
+    /// deadline fails the warmup.
     pub fn run(&mut self, plan: BatchPlan) -> std::result::Result<BatchResult, WorkerError> {
         let plan = Arc::new(plan);
         let batch = Batch::from_plan(&plan, WorkerBatch::new(Arc::clone(&plan)));
         let submission = self.executor.admit(batch, true)?;
+        let deadline = Instant::now() + BLOCK_ON_TIMEOUT;
         loop {
             self.executor.advance()?;
             if let Some(result) = self.executor.poll(&submission)? {
                 return Ok(result);
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    Error::State("a warmup batch did not complete before its deadline").into(),
+                );
             }
             std::thread::sleep(Duration::from_micros(50));
         }

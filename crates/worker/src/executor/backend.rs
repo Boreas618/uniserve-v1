@@ -98,6 +98,13 @@ pub struct WorkerBackend {
     /// What lifecycle commands record for the lanes; submitted after each
     /// command.
     lifecycle: LaneJobs,
+    /// The submitted lifecycle jobs whose completions have not arrived.
+    lifecycle_jobs: HashSet<JobId>,
+    /// The expert union's step this rank joins without a forward of its
+    /// own, while its job is in flight.
+    joining: Option<JobId>,
+    /// How the last such join ended, until the service takes it.
+    joined: Option<std::result::Result<(bool, bool), WorkerError>>,
 }
 
 /// Disjoint borrows of a backend for one batch's execution.
@@ -386,18 +393,26 @@ impl WorkerBackend {
             kernels: None,
             jobs: JobQueues::default(),
             lifecycle,
+            lifecycle_jobs: HashSet::new(),
+            joining: None,
+            joined: None,
         })
     }
 
     /// Submit the jobs the last lifecycle command recorded, each to the
-    /// lane of its kind.
+    /// lane of its kind, without waiting for them: a lane performs them in
+    /// the order of its jobs, so a forward submitted later finds their work
+    /// done. Nothing goes on from their completions, which are taken with
+    /// the next one that arrives ([`Backend::completed`]); a failed one
+    /// stops the rank there.
     fn perform_lifecycle(&mut self) -> Result<()> {
         for (kind, job) in self.lifecycle.take() {
-            let completion = match kind {
-                Some(kind) => self.jobs.submit(kind, job)?.1,
-                None => job.perform(),
+            let submitted = match kind {
+                Some(kind) => self.jobs.start(kind, job, false)?,
+                // A rank that serves no call kind has no lane.
+                None => self.jobs.call(job, false),
             };
-            completion.check().map_err(|failure| failure.error)?;
+            self.lifecycle_jobs.insert(submitted);
         }
         Ok(())
     }
@@ -1107,7 +1122,9 @@ impl Backend for WorkerBackend {
         // when an import failed after it: the fences are due either way.
         let (job, admitted) = forward::inputs::admit(self, batch);
         let submitted = match batch.route() {
-            Some(kind) if !job.is_empty() => Some(self.jobs.start(kind, job).map_err(lane_lost)?),
+            Some(kind) if !job.is_empty() => {
+                Some(self.jobs.start(kind, job, true).map_err(lane_lost)?)
+            }
             _ => None,
         };
         admitted.map(|()| submitted)
@@ -1157,7 +1174,7 @@ impl Backend for WorkerBackend {
     fn forward(
         &mut self,
         batch: &mut WorkerBatch,
-    ) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
+    ) -> std::result::Result<Option<JobId>, WorkerError> {
         let Some(kind) = batch.route() else {
             if batch.output.is_none() {
                 batch.output = Some(BatchResult {
@@ -1201,10 +1218,7 @@ impl Backend for WorkerBackend {
                 && let Some(job) = profiler.next(&lanes, kind)
             {
                 batch.profiling = Some(job);
-                // FIXME: waited for here, like the forward's own jobs
-                // (`Backend::forward`).
-                let completion = lanes.wait(job).map_err(lane_lost)?;
-                return Ok(Some((job, completion)));
+                return Ok(Some(job));
             }
             if stage == forward::Stage::Done {
                 self.release_predecessors(batch, true)?;
@@ -1214,12 +1228,20 @@ impl Backend for WorkerBackend {
             // A stage that needs nothing of the lane advances without a
             // job.
             let submitted = match forward::forward(self, batch, kind) {
-                Ok(Some(job)) => Some(lanes.submit(kind, job).map_err(lane_lost)),
+                Ok(Some(job)) => {
+                    // One forward is in flight at a time (the executor's
+                    // ordering): lifecycle work without a stream follows
+                    // it to its lane.
+                    if lanes.lane(kind).is_some() {
+                        self.lifecycle.follow(kind);
+                    }
+                    Some(lanes.start(kind, job, true).map_err(lane_lost))
+                }
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             };
             match submitted {
-                Some(Ok(completed)) => return Ok(Some(completed)),
+                Some(Ok(job)) => return Ok(Some(job)),
                 Some(Err(error)) => {
                     self.end_forward(batch);
                     return Err(error);
@@ -1275,7 +1297,10 @@ impl Backend for WorkerBackend {
         // lease's fences completed.
         let job = Job::new();
         job.after(device, fences);
-        self.jobs.start(kind, job).map(Some).map_err(lane_lost)
+        self.jobs
+            .start(kind, job, true)
+            .map(Some)
+            .map_err(lane_lost)
     }
 
     fn outputs_ready(
@@ -1294,19 +1319,38 @@ impl Backend for WorkerBackend {
 
     fn completed(&mut self) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
         while let Some((job, completion)) = self.jobs.take() {
-            // The kernel watch's calls belong to no batch.
-            let Some(watch) = self.kernels.as_mut().filter(|watch| watch.owns(job)) else {
+            // What belongs to no batch is applied here: a lifecycle
+            // command's device work, the expert union's step this rank
+            // joined, the kernel watch's calls.
+            if self.lifecycle_jobs.remove(&job) {
+                // The work a command recorded did not reach its storage:
+                // what that storage holds now is unknown.
+                completion.check().map_err(|failure| {
+                    let mut error = WorkerError::classify(failure.error, Some("lifecycle"));
+                    error.fatal = true;
+                    error
+                })?;
+            } else if self.joining == Some(job) {
+                self.joining = None;
+                let joined = completion
+                    .check()
+                    .map_err(|failure| failure.error)
+                    .and_then(|mut completion| completion.joined())
+                    .map_err(|error| WorkerError::classify(error, Some("expert step")));
+                self.joined = Some(joined);
+            } else if let Some(watch) = self.kernels.as_mut().filter(|watch| watch.owns(job)) {
+                watch.complete(job, completion, &self.jobs, || {
+                    kernel_calls(
+                        self.text.as_ref(),
+                        &self.image_order,
+                        &self.encoders,
+                        &self.denoisers,
+                        &self.decoders,
+                    )
+                });
+            } else {
                 return Ok(Some((job, completion)));
-            };
-            watch.complete(job, completion, &self.jobs, || {
-                kernel_calls(
-                    self.text.as_ref(),
-                    &self.image_order,
-                    &self.encoders,
-                    &self.denoisers,
-                    &self.decoders,
-                )
-            });
+            }
         }
         Ok(None)
     }
@@ -1495,7 +1539,16 @@ impl ServiceBackend for WorkerBackend {
                 .any(|owner| owner.awaiting_acknowledgment()))
     }
 
-    fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
+    fn join_expert_step(
+        &mut self,
+        leaving: bool,
+    ) -> std::result::Result<Option<(bool, bool)>, WorkerError> {
+        if let Some(joined) = self.joined.take() {
+            return joined.map(Some);
+        }
+        if self.joining.is_some() {
+            return Ok(None);
+        }
         let experts = self.experts().ok_or_else(|| {
             WorkerError::classify(
                 Error::State("expert-step participation requires an expert union"),
@@ -1503,18 +1556,16 @@ impl ServiceBackend for WorkerBackend {
             )
         })?;
 
-        // A join launches on the lane the union's forwards run on.
+        // A join launches on the lane the union's forwards run on, whose
+        // execution thread takes part in the agreement.
         let job = Job::new();
         job.expert_join(Arc::clone(experts), leaving);
-        let (_, completion) = self
+        let submitted = self
             .jobs
-            .submit(CallKind::Forward(ForwardMode::Decode), job)
+            .start(CallKind::Forward(ForwardMode::Decode), job, true)
             .map_err(lane_lost)?;
-        completion
-            .check()
-            .map_err(|failure| failure.error)
-            .and_then(|mut completion| completion.joined())
-            .map_err(|error| WorkerError::classify(error, Some("expert step")))
+        self.joining = Some(submitted);
+        Ok(None)
     }
 }
 

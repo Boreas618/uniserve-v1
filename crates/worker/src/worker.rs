@@ -47,7 +47,7 @@ use crate::executor::backend::WorkerBackend;
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle};
-use crate::lane::Lanes;
+use crate::lane::{BLOCK_ON_TIMEOUT, Lanes};
 use crate::launch::Endpoint;
 use crate::model::components::Capability;
 use crate::model::interface::Interface;
@@ -684,6 +684,13 @@ impl Worker {
         };
 
         if !aborted {
+            // The lanes first perform what is still queued on them (work
+            // nobody waited for, like a lifecycle command's), so that no
+            // job addresses an owner while it closes.
+            if let Some(executor) = &self.executor {
+                let drained = executor.backend().job_queues().drain(BLOCK_ON_TIMEOUT);
+                record(drained.map_err(WorkerError::from));
+            }
             for stream in self.lanes.streams() {
                 record(stream.synchronize().map_err(WorkerError::from));
             }

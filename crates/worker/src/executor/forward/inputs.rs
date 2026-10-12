@@ -180,7 +180,7 @@ pub(crate) fn component_device(backend: &WorkerBackend, component: &str) -> Resu
 pub(crate) fn admit(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
-) -> (Job<'static>, std::result::Result<(), WorkerError>) {
+) -> (Job, std::result::Result<(), WorkerError>) {
     let plan = Arc::clone(batch.shared_plan());
     let job = Job::new();
     let admitted = admit_products(backend, batch, &plan, &job).and_then(|()| {
@@ -238,7 +238,7 @@ fn admit_products(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
     plan: &BatchPlan,
-    job: &Job<'static>,
+    job: &Job,
 ) -> Result<()> {
     if batch.inputs().state.closed() {
         return Err(Error::State("batch inputs were already consumed"));
@@ -570,7 +570,7 @@ fn import_products(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
     plan: &BatchPlan,
-    job: &Job<'static>,
+    job: &Job,
 ) -> Result<bool> {
     let start = batch.inputs().state.started;
     if start >= plan.input_products.len() {
@@ -697,7 +697,7 @@ fn import_latent(
     plan: &BatchPlan,
     export: &TensorExport,
     readers: &[usize],
-    job: &Job<'static>,
+    job: &Job,
 ) -> Result<Input> {
     let [index] = readers else {
         return Err(Error::Invalid(
@@ -905,10 +905,7 @@ pub(crate) fn subscribe(
 /// The predicates that decide which imports are read are host-gated: the
 /// first job publishes the imported ones and reads them, and its
 /// completion ([`complete`]) decides what the second job publishes.
-pub(crate) fn forward<'a>(
-    backend: &mut WorkerBackend,
-    batch: &mut WorkerBatch,
-) -> Result<Option<Job<'a>>> {
+pub(crate) fn forward(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Result<Option<Job>> {
     let job = Job::new();
     match record(backend, batch, &job) {
         Ok(true) => Ok(Some(job)),
@@ -923,7 +920,7 @@ pub(crate) fn forward<'a>(
 
 /// Record the next job of the imports' completion in `job`; whether the
 /// job is to be performed.
-fn record(backend: &mut WorkerBackend, batch: &mut WorkerBatch, job: &Job<'_>) -> Result<bool> {
+fn record(backend: &mut WorkerBackend, batch: &mut WorkerBatch, job: &Job) -> Result<bool> {
     let plan = Arc::clone(batch.shared_plan());
     let imported: HashSet<&TensorRef> = plan
         .calls
@@ -1053,7 +1050,7 @@ fn check_resident(
 /// Record in `job` the read of `call`'s host-gated (U8) predicate after
 /// its producer's fence, on the stream serving the call; the job's
 /// completion carries its byte.
-fn read_predicate(backend: &WorkerBackend, call: &Call, job: &Job<'_>) -> Result<()> {
+fn read_predicate(backend: &WorkerBackend, call: &Call, job: &Job) -> Result<()> {
     let predicate = call
         .predicate
         .as_ref()
@@ -1079,7 +1076,7 @@ fn publish(
     batch: &WorkerBatch,
     plan: &BatchPlan,
     product: &TensorRef,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let kind = consumer_kind(plan, product)?;
     match batch.inputs().state.inputs.get(&product.buffer_id()) {

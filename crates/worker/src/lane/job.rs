@@ -3,12 +3,13 @@
 //!
 //! A [`Job`] is an ordered list of operations on streams: copies, fills,
 //! event records and waits, a graph launch, an eager call, output reads, a
-//! host function, a wait for the stream, an expert step. The control thread builds it: a runner and the storage
-//! owners it calls record what they would issue ([`Job::on`], an
-//! [`Issue`]), and do their host bookkeeping as they are called. The lane's
-//! execution thread performs the operations in order ([`Job::perform`]) and
+//! host function, a wait for the stream, an expert step. The control thread
+//! builds it: a runner and the storage owners it calls record what they
+//! would issue ([`Job::on`], an [`Issue`]), and do their host bookkeeping
+//! as they are called. Every operation owns its data, so the job moves to
+//! the lane's execution thread, which performs the operations in order and
 //! posts a [`Completion`] with what the eager calls returned and what the
-//! output reads produced.
+//! output reads produced. The control thread does not wait for it.
 //!
 //! An operation names its stream, so one job orders work across the lane's
 //! stream and the streams forked from it (expert microbatches), and a job
@@ -38,12 +39,10 @@ use crate::runner::methods::MethodCall;
 use crate::stream::{EventPool, Fill, HostFunction, Issue, RowFill};
 use crate::{Error, Result};
 
-/// One item of work submitted to a lane.
-///
-/// `'a` is what the forward of a capability not yet converted borrows from
-/// its submitter ([`Job::forward`]); every other operation owns its data.
-pub(crate) struct Job<'a> {
-    operations: RefCell<Vec<Operation<'a>>>,
+/// One item of work submitted to a lane. Every operation owns its data, so
+/// a job moves to the thread that performs it and its submitter goes on.
+pub(crate) struct Job {
+    operations: RefCell<Vec<Operation>>,
     /// The events a lane lets complete before it posts the job's
     /// completion, and the device whose streams recorded them.
     after: RefCell<Option<After>>,
@@ -58,7 +57,7 @@ enum Copies {
     Strided(StridedCopy),
 }
 
-enum Operation<'a> {
+enum Operation {
     /// Copies unordered among themselves. `_sources` holds the host bytes
     /// the copies read when their caller's sources did not outlive the
     /// recording call.
@@ -96,7 +95,7 @@ enum Operation<'a> {
         stream: Stream,
         graph: CUDAGraph,
     },
-    Call(Call<'a>),
+    Call(Call),
     /// Copy `bytes` at `source` to the host and wait for them.
     Read {
         stream: Option<Stream>,
@@ -127,7 +126,7 @@ enum Operation<'a> {
 
 /// Work the execution thread hands to the Python thread and waits for, or
 /// runs itself where it enters Python on its own.
-enum Call<'a> {
+enum Call {
     /// A runner method.
     Method(MethodCall),
     /// A runner method whose integers the completion carries.
@@ -139,15 +138,6 @@ enum Call<'a> {
     /// A library function over values that are no tensors.
     Function(DeferredCall),
     Capture(Capture),
-    /// The forward of a capability not yet converted, as it issues itself.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "every capability records its forward; this goes with the job's lifetime"
-        )
-    )]
-    Forward(Forward<'a>),
 }
 
 /// The capture of one runner method into a graph: `capture_begin`, the
@@ -163,16 +153,6 @@ pub(crate) struct Capture {
     /// Where the method's graph breaks are noted while it is captured.
     pub(crate) breaks: Option<GraphBreaks>,
 }
-
-/// A forward that borrows its submitter, which waits for the job.
-struct Forward<'a>(Box<dyn FnOnce() + 'a>);
-
-// SAFETY: the forward runs on the execution thread while its submitter
-// waits for the job and touches nothing it lent. What it borrows has no
-// thread affinity: the rank's owners hold reference-counted TVM-FFI values
-// with atomic counts, driver handles the driver accepts from any thread,
-// and locks they do not hold across a job.
-unsafe impl Send for Forward<'_> {}
 
 /// One expert step: the union's agreement on the step's capacity, then the
 /// forward of every populated microbatch and the join of every empty one at
@@ -192,7 +172,7 @@ pub(crate) struct ExpertStep {
     pub(crate) variants: Vec<ExpertVariant>,
     /// What each populated microbatch runs behind its forward in the same
     /// turn, whatever the capacity (the selection of rows that sample).
-    pub(crate) after: Vec<Option<Job<'static>>>,
+    pub(crate) after: Vec<Option<Job>>,
 }
 
 /// An expert step at one capacity.
@@ -202,7 +182,7 @@ pub(crate) struct ExpertVariant {
     pub(crate) forwards: Vec<Option<MicrobatchForward>>,
     /// What follows the step on the execution thread at this capacity (the
     /// captures of forwards that ran as their warmup).
-    pub(crate) then: Job<'static>,
+    pub(crate) then: Job,
 }
 
 /// The operation a job failed at.
@@ -290,7 +270,7 @@ impl Completion {
 
 const MISSING: Error = Error::State("a job's completion lacks a result its builder recorded");
 
-impl Default for Job<'_> {
+impl Default for Job {
     fn default() -> Self {
         Self {
             operations: RefCell::new(Vec::new()),
@@ -299,7 +279,7 @@ impl Default for Job<'_> {
     }
 }
 
-impl<'a> Job<'a> {
+impl Job {
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -313,20 +293,8 @@ impl<'a> Job<'a> {
         self.operations.borrow().is_empty()
     }
 
-    fn push(&self, operation: Operation<'a>) {
+    fn push(&self, operation: Operation) {
         self.operations.borrow_mut().push(operation);
-    }
-
-    /// The same job where a shorter borrow is expected: only the forward
-    /// of an unconverted capability borrows, and it may be given less.
-    pub(crate) fn shorten<'b>(self) -> Job<'b>
-    where
-        'a: 'b,
-    {
-        Job {
-            operations: RefCell::new(self.operations.into_inner()),
-            after: self.after,
-        }
     }
 
     /// Keep of the operations recorded from `start` on only the event
@@ -341,7 +309,7 @@ impl<'a> Job<'a> {
 
     /// Record what its user issues as operations of this job on `stream`
     /// (host memory without one).
-    pub(crate) fn on<'r>(&'r self, stream: Option<&'r Stream>) -> Recorder<'r, 'a> {
+    pub(crate) fn on<'r>(&'r self, stream: Option<&'r Stream>) -> Recorder<'r> {
         Recorder { job: self, stream }
     }
 
@@ -377,20 +345,6 @@ impl<'a> Job<'a> {
         self.push(Operation::Call(Call::Capture(capture)));
     }
 
-    /// The forward of a capability not yet converted: it issues its own
-    /// stream work and Python calls when the execution thread runs it, and
-    /// keeps its result where its submitter reads it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "every capability records its forward; this goes with the job's lifetime"
-        )
-    )]
-    pub(crate) fn forward(&self, forward: impl FnOnce() + 'a) {
-        self.push(Operation::Call(Call::Forward(Forward(Box::new(forward)))));
-    }
-
     pub(crate) fn expert_step(&self, step: ExpertStep) {
         self.push(Operation::ExpertStep(step));
     }
@@ -418,7 +372,7 @@ impl<'a> Job<'a> {
     }
 
     /// Continue this job with the operations of `other`.
-    pub(crate) fn append(&self, other: Job<'a>) {
+    pub(crate) fn append(&self, other: Job) {
         self.operations
             .borrow_mut()
             .append(&mut other.operations.into_inner());
@@ -465,7 +419,7 @@ impl<'a> Job<'a> {
     }
 }
 
-impl Operation<'_> {
+impl Operation {
     /// Whether the operation only orders work: an event record, wait or
     /// wake.
     fn orders(&self) -> bool {
@@ -561,7 +515,7 @@ impl Operation<'_> {
     }
 }
 
-impl Call<'_> {
+impl Call {
     fn perform(self, completion: &mut Completion) -> Result<()> {
         match self {
             Self::Method(method) => drop(method.invoke()?),
@@ -605,7 +559,6 @@ impl Call<'_> {
                 let breaks = breaks.as_ref().map_or_else(Vec::new, GraphBreaks::take);
                 completion.captured.push_back(captured?.with_breaks(breaks));
             }
-            Self::Forward(Forward(forward)) => forward(),
         }
         Ok(())
     }
@@ -670,12 +623,12 @@ impl ExpertStep {
 
 /// Records into a job what its user issues on one stream.
 #[derive(Clone, Copy)]
-pub(crate) struct Recorder<'r, 'a> {
-    job: &'r Job<'a>,
+pub(crate) struct Recorder<'r> {
+    job: &'r Job,
     stream: Option<&'r Stream>,
 }
 
-impl Recorder<'_, '_> {
+impl Recorder<'_> {
     fn owned(&self) -> Option<Stream> {
         self.stream.cloned()
     }
@@ -703,7 +656,7 @@ impl Recorder<'_, '_> {
     }
 }
 
-impl Issue for Recorder<'_, '_> {
+impl Issue for Recorder<'_> {
     type Host = Self;
 
     fn stream(&self) -> Option<&Stream> {
@@ -859,9 +812,9 @@ pub struct JobId(pub(super) u64);
 
 /// What a lane's execution thread receives.
 enum Message {
-    /// A job, and whether its submitter waits for its completion: a
-    /// submitter that waits takes the completion itself and needs no wake.
-    Job(JobId, Job<'static>, bool),
+    /// A job, and whether the control thread's wake is fired behind its
+    /// completion.
+    Job(JobId, Job, bool),
     /// The wake of the control thread, fired behind every completion from
     /// now on; `None` stops it.
     Wake(Option<Wake>),
@@ -916,11 +869,10 @@ impl JobQueue {
     }
 
     /// Queue `job` as `id` on the lane's execution thread, which posts its
-    /// completion under that name, and fires the control thread's wake
-    /// behind it unless the submitter is `awaited`: blocked on that
-    /// completion.
-    pub(super) fn start(&self, id: JobId, job: Job<'static>, awaited: bool) -> Result<()> {
-        self.send(Message::Job(id, job, awaited))
+    /// completion under that name and, with `wake`, fires the control
+    /// thread's wake behind it.
+    pub(super) fn start(&self, id: JobId, job: Job, wake: bool) -> Result<()> {
+        self.send(Message::Job(id, job, wake))
     }
 
     pub(super) fn set_wake(&self, wake: Option<Wake>) -> Result<()> {
@@ -944,8 +896,8 @@ impl Jobs {
         let mut wake = None;
         let mut notifications = Notifications::default();
         while let Ok(message) = self.messages.recv() {
-            let (id, job, awaited) = match message {
-                Message::Job(id, job, awaited) => (id, job, awaited),
+            let (id, job, notify) = match message {
+                Message::Job(id, job, notify) => (id, job, notify),
                 Message::Wake(installed) => {
                     wake = installed;
                     continue;
@@ -963,7 +915,7 @@ impl Jobs {
             let post = Post {
                 id,
                 completions: self.completions.clone(),
-                wake: wake.clone().filter(|_| !awaited),
+                wake: wake.clone().filter(|_| notify),
             };
             match after {
                 Some((device, events)) if completion.failure.is_none() => {

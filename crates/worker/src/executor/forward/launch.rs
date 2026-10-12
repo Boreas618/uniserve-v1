@@ -126,7 +126,7 @@ pub(crate) fn request_flag(
     call: &Call,
     predicate: &TensorRef,
     device: Option<i32>,
-    job: Recorder<'_, '_>,
+    job: Recorder<'_>,
 ) -> Result<()> {
     let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), job)?;
     // One byte of a committed product, which the read lease keeps until

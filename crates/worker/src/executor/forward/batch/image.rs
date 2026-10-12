@@ -189,7 +189,7 @@ pub(crate) struct ImageBatch<'a> {
     pub(crate) stream: Option<Stream>,
     /// What the batch's own steps issue on its stream: the start of its
     /// lease, its flags, its commit and its retirement after a failure.
-    pub(crate) job: Job<'static>,
+    pub(crate) job: Job,
     /// This rank reports the component's host results.
     pub(crate) reports: bool,
     pub(crate) calls: Vec<CallState>,
@@ -384,7 +384,7 @@ impl<'a> ImageBatch<'a> {
 
     /// Part the batch from the owners it borrows: its next job and the
     /// state it owns between two jobs.
-    pub(crate) fn park(self) -> (Job<'static>, Parked) {
+    pub(crate) fn park(self) -> (Job, Parked) {
         (
             self.job,
             Parked {
@@ -690,7 +690,7 @@ pub(crate) fn forward(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
     kind: CallKind,
-) -> std::result::Result<Option<Job<'static>>, WorkerError> {
+) -> std::result::Result<Option<Job>, WorkerError> {
     let step = {
         let (plan, pending, inputs) = batch.image_parts();
         let step = record(backend.parts(), plan, kind, pending.take(), inputs)?;
@@ -708,7 +708,7 @@ pub(crate) fn forward(
 /// What recording an image batch's next job leaves.
 enum Step {
     /// The job to submit, and the batch's state while it is on the lane.
-    Job(Job<'static>, Pending),
+    Job(Job, Pending),
     /// The batch failed and holds nothing.
     Failed(Failure),
 }

@@ -123,11 +123,11 @@ fn kind_name(kind: CallKind) -> &'static str {
 /// The next job of a batch's forward at its stage: the completion of its
 /// imported inputs, then the jobs of the runtime serving `kind`. `None`
 /// when the stage advanced without needing the lane.
-pub(crate) fn forward<'a>(
-    backend: &'a mut WorkerBackend,
-    batch: &'a mut WorkerBatch,
+pub(crate) fn forward(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
     kind: CallKind,
-) -> std::result::Result<Option<Job<'a>>, WorkerError> {
+) -> std::result::Result<Option<Job>, WorkerError> {
     use CallKind::Forward;
 
     match batch.stage() {
@@ -162,7 +162,7 @@ pub(crate) fn forward<'a>(
             ) => Err(unsupported(kind, "video")),
             // The remaining kinds are an image model's: its encoders, its
             // denoiser and its decoder.
-            _ => Ok(batch::image::forward(backend, batch, kind)?.map(Job::shorten)),
+            _ => batch::image::forward(backend, batch, kind),
         },
         Stage::Done => Ok(None),
     }

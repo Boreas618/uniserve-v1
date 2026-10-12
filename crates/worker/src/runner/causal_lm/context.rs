@@ -204,6 +204,10 @@ fn vision_row(
             "vision features must have shape [tokens, hidden]".into(),
         ));
     };
+    // FIXME: a call of the library made while the batch is recorded: the
+    // control thread waits for the Python thread here. The grid of an
+    // image's size is a fact of the model, to be read where the image's
+    // features are produced and carried with them.
     let grid = image
         .policy()
         .patch_grid(
