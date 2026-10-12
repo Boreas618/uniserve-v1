@@ -16,7 +16,8 @@ use uniserve_cuda::Stream;
 use uniserve_ipc::{BufferId, Call, TensorExport, TensorRef};
 
 use crate::executor::PendingOutput;
-use crate::storage::{ProductBuffer, TensorStore};
+use crate::storage::{ProductBuffer, ProductExport, TensorStore};
+use crate::stream::Issue;
 use crate::transfer::Transports;
 use crate::transfer::exports::{self, Location};
 use crate::{Error, Result};
@@ -70,26 +71,23 @@ impl Publications {
         output.set_products(products)
     }
 
-    /// Export an encoder feature to other ranks and workers. Readers on this
-    /// rank lease it from the tensor store directly, so a feature is
-    /// exported only when the rank publishes over a mechanism other ranks
-    /// read, and only by the rank that reports its component's results.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one feature export's complete inputs"
-    )]
-    pub(crate) fn export_feature(
-        &mut self,
+    /// Issue the export of an encoder feature to other ranks and workers to
+    /// `stream`, behind the work that produced it. Readers on this rank
+    /// lease it from the tensor store directly, so a feature is exported
+    /// only when the rank publishes over a mechanism other ranks read, and
+    /// only by the rank that reports its component's results: `None`
+    /// otherwise. [`Self::locate`] publishes the export once that work was
+    /// performed.
+    pub(crate) fn issue_feature(
         tensors: &TensorStore,
         transports: &Transports,
         call: &Call,
         write: &ProductBuffer,
         reports: bool,
-        stream: Option<&Stream>,
-        output: &mut PendingOutput,
-    ) -> Result<()> {
+        stream: impl Issue,
+    ) -> Result<Option<ProductExport>> {
         if !reports || !transports.exports_remotely() {
-            return Ok(());
+            return Ok(None);
         }
         let product = call
             .encoder_output
@@ -98,7 +96,23 @@ impl Publications {
             .ok_or_else(|| {
                 Error::Invariant("an exported feature names no encoder output".into())
             })?;
-        self.export(tensors, transports, call, product, write, stream, output)
+        tensors
+            .export_buffer(call, product, write, transports, false, None, stream)
+            .map(Some)
+    }
+
+    /// Publish an issued `export` of `write` once its work was performed:
+    /// its locations register with the batch's products and its descriptor
+    /// joins the call's completion products.
+    pub(crate) fn locate(
+        &mut self,
+        tensors: &TensorStore,
+        write: &ProductBuffer,
+        export: ProductExport,
+        output: &mut PendingOutput,
+    ) -> Result<()> {
+        let (export, locations) = tensors.located(write, export)?;
+        self.accept(write.id(), locations, export, output)
     }
 
     /// Check, before the commit point, that no buffer already registers

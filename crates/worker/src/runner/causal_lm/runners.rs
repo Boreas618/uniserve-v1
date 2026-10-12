@@ -440,9 +440,10 @@ impl CausalLMRunners {
     /// rank of an expert union the evaluation is an expert step whose other
     /// microbatches join.
     ///
-    /// The caller is the image denoiser's forward, which issues its own
-    /// stream work on the execution thread, so the evaluation's job is
-    /// performed where it is called.
+    /// The evaluation is recorded into `job`, the job of the image
+    /// denoiser's forward that needs the prefixes, behind what that forward
+    /// recorded before. [`Self::complete_prefill`] applies the job's
+    /// completion to the returned step.
     pub(crate) fn prefill_cache(
         &mut self,
         experts: Option<&Arc<ExpertUnion>>,
@@ -450,7 +451,8 @@ impl CausalLMRunners {
         prefixes: &[(u32, &[u32])],
         tables: &BlockTables,
         cache: &mut KVCacheManager<Arc<Retirement>>,
-    ) -> Result<Executed> {
+        job: &Job<'_>,
+    ) -> Result<Step> {
         let (lane, group) = self.prefill_lane(component)?;
         let rows: Vec<TokenRow> = prefixes
             .iter()
@@ -472,7 +474,7 @@ impl CausalLMRunners {
             })
             .collect::<Result<_>>()?;
         let stream = self.runners[lane].stream().cloned();
-        self.order.wait(stream.as_ref())?;
+        self.order.wait(job.on(stream.as_ref()))?;
 
         // The lane's runner evaluates every prefix.
         let prompt = PromptChunks::default();
@@ -485,24 +487,30 @@ impl CausalLMRunners {
             embeddings: &[],
         })];
         requests.resize_with(self.groups[group].len(), || None);
-        let job = Job::new();
         let step = self.forward(
             experts,
             group,
             &requests,
             &mut StepParts { tables, cache },
             None,
-            &job,
+            job,
         )?;
-        let mut completion = job.perform().check().map_err(|failure| failure.error)?;
-        let executed = self
-            .complete(step, &mut completion)?
+        self.order.record(job.on(stream.as_ref()))?;
+        Ok(step)
+    }
+
+    /// Apply the completion of the job that performed a prefix evaluation
+    /// ([`Self::prefill_cache`]) to its `step`.
+    pub(crate) fn complete_prefill(
+        &mut self,
+        step: Step,
+        completion: &mut Completion,
+    ) -> Result<Executed> {
+        self.complete(step, completion)?
             .into_iter()
             .next()
             .flatten()
-            .ok_or_else(|| Error::Invariant("the prefix evaluation did not run".into()))?;
-        self.order.record(stream.as_ref())?;
-        Ok(executed)
+            .ok_or_else(|| Error::Invariant("the prefix evaluation did not run".into()))
     }
 
     pub(crate) fn set_wake(&self, _wake: Option<Wake>) {}
