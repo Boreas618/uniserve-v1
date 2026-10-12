@@ -39,7 +39,7 @@ use crate::host::image::ImageTask;
 use crate::host::{HostLane, HostTask};
 use crate::lane::{Completion, Job};
 use crate::request::RequestPool;
-use crate::request::diffusion::{ImageTrajectory, Trajectories};
+use crate::request::diffusion::{BranchSource, Prefix, Trajectories};
 use crate::runner::decoder::DecoderRunner;
 use crate::runner::decoder::runners::DecoderRunners;
 use crate::runner::denoiser::image::ImageDiffusion;
@@ -111,8 +111,8 @@ pub(crate) struct Commit {
     pending: Vec<(RequestKey, uniserve_core::CallId, bool)>,
 }
 
-/// A trajectory one of the batch's latent preparations planned: it opens
-/// when the batch's commit is applied, with the guidance plan the plan call
+/// A trajectory the batch's job asks the library to plan: it opens from
+/// the job's completion, with the guidance plan and the prefixes the calls
 /// recorded for it returned.
 pub(crate) struct Planned {
     pub(crate) slot: usize,
@@ -121,6 +121,10 @@ pub(crate) struct Planned {
     pub(crate) size: (u32, u32),
     /// The solver steps the image was admitted with.
     pub(crate) steps: usize,
+    /// The sources a guidance branch may condition on, each with its
+    /// prefix where the request gives it (admitted negative tokens); the
+    /// others were asked for, in this order.
+    pub(crate) prefixes: Vec<(BranchSource, Option<Prefix>)>,
 }
 
 /// What an image batch owns between two of its jobs: everything of
@@ -538,18 +542,8 @@ impl<'a> ImageBatch<'a> {
             }
         }
         let mut planned = Vec::new();
-        for Planned {
-            slot,
-            key,
-            size,
-            steps,
-        } in std::mem::take(&mut self.plans)
-        {
-            let diffusion = self.parts.diffusion().ok_or_else(|| {
-                Error::Unsupported("image trajectories require a denoiser".into())
-            })?;
-            let plan = diffusion.planned(steps, completion.values()?)?;
-            planned.push((slot, ImageTrajectory::new(key, size, plan)));
+        for plan in std::mem::take(&mut self.plans) {
+            planned.push(self.planned_trajectory(plan, completion)?);
         }
         for (index, export) in std::mem::take(&mut self.exports) {
             let pool = &self.parts.latents()?.pool;
