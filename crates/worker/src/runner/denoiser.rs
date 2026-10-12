@@ -1194,6 +1194,10 @@ impl DenoiserRunner {
     /// Run one placeholder step of a startup layout on slot `slot`, whose
     /// host sources a preparation filled, to prepare its kernels and plans
     /// before any capture. The scratch's values are discarded.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub(crate) fn warm(&mut self, id: usize, slot: usize) -> Result<()> {
         let layout = self.layout(id)?;
         let mut copies = CopyBatch::new(SourceOrder::Stream);
@@ -1273,6 +1277,10 @@ impl DenoiserRunner {
 
     /// Warm the conditioner at every capacity (largest first) on zero
     /// features, then capture each.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub(crate) fn warm_conditioner(&mut self, capture: bool) -> Result<()> {
         let Some(conditioner) = &mut self.conditioner else {
             return Ok(());
