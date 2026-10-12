@@ -30,7 +30,7 @@ use crate::stream::CUDAStream;
 use crate::{Error, Result};
 
 pub use job::JobQueue;
-pub(crate) use job::{Capture, Completion, ExpertStep, ExpertVariant, Job};
+pub(crate) use job::{Capture, Completion, ExpertStep, ExpertVariant, Job, Recorder};
 
 /// One execution lane.
 pub struct Lane {
