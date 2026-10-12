@@ -83,9 +83,11 @@ enum Operation<'a> {
         stream: Stream,
         event: Arc<Event>,
     },
-    /// Fire `wake` from `notification` once `event` completes.
+    /// Fire `wake` once `event`, recorded on a stream of `device`,
+    /// completes: from the notification stream the performing lane keeps
+    /// for the device.
     Wake {
-        notification: Arc<Stream>,
+        device: DeviceId,
         event: Arc<Event>,
         wake: Wake,
     },
@@ -422,20 +424,27 @@ impl<'a> Job<'a> {
             .append(&mut other.operations.into_inner());
     }
 
-    /// Perform every operation in order on the calling thread: the lane's
-    /// execution thread, a microbatch thread in its turn of an expert step,
-    /// or the submitter itself on a rank without a lane.
+    /// Perform every operation in order on the calling thread, outside a
+    /// lane: a microbatch thread in its turn of an expert step, or the
+    /// submitter itself on a rank without a lane. Such a job orders no wake
+    /// behind an event: only a lane has a notification stream to order it
+    /// on.
     pub(crate) fn perform(self) -> Completion {
-        self.perform_operations().0
+        self.perform_operations(None).0
     }
 
-    /// Perform the operations; also return what the completion waits for.
-    fn perform_operations(self) -> (Completion, Option<After>) {
+    /// Perform the operations, with the notification streams of the lane
+    /// whose execution thread this is; also return what the completion
+    /// waits for.
+    fn perform_operations(
+        self,
+        mut notifications: Option<&mut Notifications>,
+    ) -> (Completion, Option<After>) {
         let after = self.after.into_inner();
         let mut completion = Completion::default();
         let mut operations = self.operations.into_inner().into_iter().enumerate();
         for (index, operation) in operations.by_ref() {
-            if let Err(error) = operation.perform(&mut completion) {
+            if let Err(error) = operation.perform(&mut completion, notifications.as_deref_mut()) {
                 completion.failure = Some(Failure {
                     operation: index,
                     error,
@@ -449,7 +458,7 @@ impl<'a> Job<'a> {
         // documentation). The first failure is the job's.
         for (_, operation) in operations {
             if operation.orders() {
-                let _ = operation.perform(&mut completion);
+                let _ = operation.perform(&mut completion, notifications.as_deref_mut());
             }
         }
         (completion, after)
@@ -466,7 +475,11 @@ impl Operation<'_> {
         )
     }
 
-    fn perform(self, completion: &mut Completion) -> Result<()> {
+    fn perform(
+        self,
+        completion: &mut Completion,
+        notifications: Option<&mut Notifications>,
+    ) -> Result<()> {
         match self {
             Self::Copy { stream, copies, .. } => {
                 let stream = stream.as_ref();
@@ -486,10 +499,15 @@ impl Operation<'_> {
             Self::Record { stream, event } => (&stream).record(&event),
             Self::Wait { stream, event } => (&stream).wait(&event),
             Self::Wake {
-                notification,
+                device,
                 event,
                 wake,
             } => {
+                let notification = notifications
+                    .ok_or(Error::State(
+                        "a wake behind an event is ordered by a lane's execution thread",
+                    ))?
+                    .stream(device)?;
                 notification.wait_event(&event)?;
                 // The host function only signals the service's wake: it
                 // never calls CUDA or blocks, as host functions must not.
@@ -533,7 +551,7 @@ impl Operation<'_> {
             }
             Self::HostFunction { stream, function } => stream.as_ref().launch_host_fn(function),
             Self::Synchronize { stream } => Issue::synchronize(&stream.as_ref()),
-            Self::ExpertStep(step) => step.perform(completion),
+            Self::ExpertStep(step) => step.perform(completion, notifications),
             Self::ExpertJoin { union, leaving } => {
                 completion.joins.push_back(union.idle(leaving)?);
                 Ok(())
@@ -615,8 +633,13 @@ fn integers(value: tvm_ffi::Any) -> std::result::Result<Vec<i64>, tvm_ffi::Error
 
 impl ExpertStep {
     /// Agree on the step's capacity over the union's host group, run the
-    /// step's forwards and joins at it, then what follows it.
-    fn perform(self, completion: &mut Completion) -> Result<()> {
+    /// step's forwards and joins at it, then what follows it on the lane's
+    /// execution thread.
+    fn perform(
+        self,
+        completion: &mut Completion,
+        notifications: Option<&mut Notifications>,
+    ) -> Result<()> {
         let capacity = self.union.capacity(self.tokens, self.kind, self.forced)?;
         let variant = self
             .variants
@@ -638,7 +661,7 @@ impl ExpertStep {
         }
         completion.capacities.push_back(capacity);
 
-        let then = variant.then.perform();
+        let (then, _) = variant.then.perform_operations(notifications);
         completion.captured.extend(then.captured);
         completion.reads.extend(then.reads);
         then.failure.map_or(Ok(()), |failure| Err(failure.error))
@@ -790,9 +813,9 @@ impl Issue for Recorder<'_, '_> {
     }
 
     fn wake(&self, events: &EventPool, event: &Arc<Event>) -> Result<()> {
-        if let Some((notification, wake)) = events.notification(event)? {
+        if let Some(wake) = events.wake() {
             self.job.push(Operation::Wake {
-                notification,
+                device: DeviceId(events.device(event)?),
                 event: Arc::clone(event),
                 wake,
             });
@@ -919,9 +942,7 @@ impl Jobs {
     /// its completion posted by the driver once they completed.
     pub(super) fn run(self) {
         let mut wake = None;
-        // One stream per device that carries nothing but the notices of
-        // completed events.
-        let mut notifications: HashMap<DeviceId, Stream> = HashMap::new();
+        let mut notifications = Notifications::default();
         while let Ok(message) = self.messages.recv() {
             let (id, job, awaited) = match message {
                 Message::Job(id, job, awaited) => (id, job, awaited),
@@ -936,7 +957,7 @@ impl Jobs {
             };
             // The job and everything it holds is gone before its submitter
             // learns that it completed.
-            let (completion, after) = job.perform_operations();
+            let (completion, after) = job.perform_operations(Some(&mut notifications));
             performing.job = None;
 
             let post = Post {
@@ -949,6 +970,27 @@ impl Jobs {
                     post.after(completion, device, &events, &mut notifications);
                 }
                 _ => post.now(completion),
+            }
+        }
+    }
+}
+
+/// The notification streams of a lane: one stream per device that carries
+/// nothing but the notices of completed events, created by the lane's
+/// execution thread when it first orders a notice on the device. A notice
+/// waits for its events there and never holds up the lane's own stream.
+#[derive(Default)]
+struct Notifications {
+    streams: HashMap<DeviceId, Stream>,
+}
+
+impl Notifications {
+    fn stream(&mut self, device: DeviceId) -> Result<&Stream> {
+        match self.streams.entry(device) {
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let _device = DeviceGuard::new(device)?;
+                Ok(entry.insert(Stream::new(device)?))
             }
         }
     }
@@ -991,7 +1033,7 @@ impl Post {
         completion: Completion,
         device: DeviceId,
         events: &[Arc<Event>],
-        notifications: &mut HashMap<DeviceId, Stream>,
+        notifications: &mut Notifications,
     ) {
         // The completion stays reachable if the notice cannot be issued.
         let held = Arc::new(Mutex::new(Some(completion)));
@@ -999,13 +1041,7 @@ impl Post {
             held.lock().unwrap_or_else(PoisonError::into_inner).take()
         };
         let issued = (|| -> Result<()> {
-            let notification = match notifications.entry(device) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let _device = DeviceGuard::new(device)?;
-                    entry.insert(Stream::new(device)?)
-                }
-            };
+            let notification = notifications.stream(device)?;
             for event in events {
                 notification.wait_event(event)?;
             }

@@ -243,9 +243,16 @@ impl EventPool {
         None::<&Stream>.wake(self, event)
     }
 
-    /// The stream and wake that notify of `event`'s completion: one
-    /// notification stream per producer stream, created when first asked
-    /// for. `None` without an installed wake.
+    /// The installed completion wake, for an issuer that orders it behind
+    /// an event on a notification stream of its own (a lane's job).
+    pub(crate) fn wake(&self) -> Option<Wake> {
+        self.lock().wake.clone()
+    }
+
+    /// The stream and wake that notify of `event`'s completion for an
+    /// issuer without a lane ([`Self::wake_after`]): one notification
+    /// stream per producer stream, created on the calling thread when
+    /// first asked for. `None` without an installed wake.
     pub(crate) fn notification(&self, event: &Arc<Event>) -> Result<Option<(Arc<Stream>, Wake)>> {
         let mut state = self.lock();
         let Some(wake) = state.wake.clone() else {
