@@ -22,6 +22,28 @@ use uniserve_worker::transfer::{
 };
 use uniserve_worker::{Error, ErrorCode, EventPool, WorkerError};
 
+/// Export on `stream` and take the locations, complete at once.
+fn located(
+    transports: &Transports,
+    source: &Spans,
+    offset: Option<&[u64]>,
+    consumers: &[usize],
+    host: bool,
+    stream: Option<&Stream>,
+    mut retain: impl FnMut(Arc<uniserve_worker::transfer::Retirement>) -> uniserve_worker::Result<()>,
+) -> uniserve_worker::Result<Vec<uniserve_worker::transfer::exports::Location>> {
+    exports::export(
+        transports,
+        source,
+        offset,
+        consumers,
+        host,
+        stream,
+        &mut retain,
+    )?
+    .locate(&mut retain)
+}
+
 const DEVICE: i32 = 0;
 
 /// The child half of the two-process VMM test reads this variable.
@@ -279,7 +301,7 @@ fn device_exports_reach_local_shared_and_channel_readers() {
     let source = counting(&[8, 4], Memory::device(DEVICE, 128).unwrap(), &stream);
     let spans = Spans::single(source).unwrap();
     // Slot 0 is on this host, slot 7 is not: local, shm and channel all apply.
-    let locations = exports::export(
+    let locations = located(
         &transports,
         &spans,
         None,
@@ -346,7 +368,7 @@ fn cancelled_reads_keep_credits_until_their_copy_drains() {
     let (transports, capacity) = transports(&[TransportKind::Local], "space", 0);
     let stream = stream();
     let source = counting(&[256], Memory::device(DEVICE, 1024).unwrap(), &stream);
-    let locations = exports::export(
+    let locations = located(
         &transports,
         &Spans::single(source).unwrap(),
         None,
@@ -426,7 +448,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
         "producer",
         0,
     );
-    let exported = exports::export(
+    let exported = located(
         &device_only,
         &spans,
         None,
@@ -448,7 +470,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
         "producer",
         0,
     );
-    let locations = exports::export(
+    let locations = located(
         &with_shared,
         &spans,
         None,
@@ -503,7 +525,7 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
 
     for source in [kv_page, latent_page] {
         assert_eq!(source.nbytes(), 6 << 20);
-        let locations = exports::export(
+        let locations = located(
             &transports,
             &source,
             None,
@@ -540,7 +562,7 @@ fn vmm_exports_are_imported_by_another_process() {
     );
     let source = counting(&[16, 8], Memory::device(DEVICE, 512).unwrap(), &stream);
     let mut retirements = Vec::new();
-    let locations = exports::export(
+    let locations = located(
         &transports,
         &Spans::single(source).unwrap(),
         None,

@@ -2,8 +2,8 @@
 //! back.
 //!
 //! A [`Job`] is an ordered list of operations on streams: copies, fills,
-//! event records and waits, a graph launch, an eager call, output reads, an
-//! expert step. The control thread builds it: a runner and the storage
+//! event records and waits, a graph launch, an eager call, output reads, a
+//! host function, a wait for the stream, an expert step. The control thread builds it: a runner and the storage
 //! owners it calls record what they would issue ([`Job::on`], an
 //! [`Issue`]), and do their host bookkeeping as they are called. The lane's
 //! execution thread performs the operations in order ([`Job::perform`]) and
@@ -16,8 +16,9 @@
 //! calls.
 //!
 //! A job is performed completely or it fails at one operation. After a
-//! failure the remaining copies, fills, launches, calls and reads are not
-//! performed, but the remaining event operations are: an event a job
+//! failure the remaining copies, fills, launches, calls, reads, host
+//! functions and waits are not performed, but the remaining event
+//! operations are: an event a job
 //! records fences storage its owner already retains on it, and that
 //! storage is returned only once the record is made.
 
@@ -34,7 +35,7 @@ use crate::ffi::{DeferredCall, Handle};
 use crate::parallel::joins::GraphFunctions;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::runner::methods::MethodCall;
-use crate::stream::{EventPool, Fill, Issue};
+use crate::stream::{EventPool, Fill, HostFunction, Issue};
 use crate::{Error, Result};
 
 /// One item of work submitted to a lane.
@@ -95,6 +96,15 @@ enum Operation<'a> {
         stream: Option<Stream>,
         source: u64,
         bytes: usize,
+    },
+    /// Run `function` on the host behind the stream's work issued before.
+    HostFunction {
+        stream: Option<Stream>,
+        function: HostFunction,
+    },
+    /// Wait for the stream's work issued before.
+    Synchronize {
+        stream: Option<Stream>,
     },
     ExpertStep(ExpertStep),
 }
@@ -242,6 +252,19 @@ impl<'a> Job<'a> {
 
     fn push(&self, operation: Operation<'a>) {
         self.operations.borrow_mut().push(operation);
+    }
+
+    /// The job's event operations alone, in order: what its builder submits
+    /// when recording failed part way. The events the job queued are still
+    /// recorded, waited on and woken for, so the storage they fence is
+    /// returned, and none of the work recorded between them is performed.
+    pub(crate) fn orders_only(self) -> Self {
+        let mut operations = self.operations.into_inner();
+        operations.retain(Operation::orders);
+        Self {
+            operations: RefCell::new(operations),
+            after: self.after,
+        }
     }
 
     /// Record what its user issues as operations of this job on `stream`
@@ -394,6 +417,8 @@ impl Operation<'_> {
                 completion.reads.push_back(value);
                 Ok(())
             }
+            Self::HostFunction { stream, function } => stream.as_ref().launch_host_fn(function),
+            Self::Synchronize { stream } => Issue::synchronize(&stream.as_ref()),
             Self::ExpertStep(step) => step.perform(completion),
         }
     }
@@ -611,6 +636,21 @@ impl Issue for Recorder<'_, '_> {
         self.job.push(Operation::Call(Call::Function(call)));
         Ok(())
     }
+
+    fn launch_host_fn(&self, function: HostFunction) -> Result<()> {
+        self.job.push(Operation::HostFunction {
+            stream: self.owned(),
+            function,
+        });
+        Ok(())
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        self.job.push(Operation::Synchronize {
+            stream: self.owned(),
+        });
+        Ok(())
+    }
 }
 
 /// Names a job from its submission to its completion.
@@ -825,6 +865,48 @@ mod tests {
             width: 1,
             count: 1,
         }
+    }
+
+    #[test]
+    fn host_functions_and_waits_run_in_the_jobs_order() -> Result<()> {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let mut target = 0_u8;
+        let seen = Arc::new(AtomicU8::new(0));
+        let job = Job::new();
+        // SAFETY: one byte of the test.
+        unsafe { job.on(None).fill(byte(&raw mut target, 5)) }?;
+        let address = &raw const target as usize;
+        let observed = Arc::clone(&seen);
+        job.on(None).launch_host_fn(Box::new(move || {
+            // SAFETY: the test's byte, read on the thread performing the job.
+            observed.store(unsafe { *(address as *const u8) }, Ordering::Relaxed);
+        }))?;
+        Issue::synchronize(&job.on(None))?;
+
+        // Recording runs nothing; performing runs the function behind the
+        // fill recorded before it.
+        assert_eq!(seen.load(Ordering::Relaxed), 0);
+        job.perform().check().unwrap();
+        assert_eq!(seen.load(Ordering::Relaxed), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_recording_performs_none_of_its_work() -> Result<()> {
+        let mut target = 0_u8;
+        let job = Job::new();
+        // SAFETY: one byte of the test.
+        unsafe { job.on(None).fill(byte(&raw mut target, 5)) }?;
+        job.on(None).read(&raw const target as u64, 1);
+
+        // Without a stream the job holds no event operation.
+        let job = job.orders_only();
+        assert!(job.is_empty());
+        let mut completion = job.perform().check().unwrap();
+        assert_eq!(target, 0);
+        assert!(completion.read().is_err());
+        Ok(())
     }
 
     #[test]
