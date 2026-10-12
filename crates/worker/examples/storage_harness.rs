@@ -181,15 +181,18 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     )?);
 
     let exported = buffer(0);
-    let (transfer, locations) = source.export(
-        1,
-        tokens,
-        "consumer",
-        exported,
-        &transports,
-        &[0],
-        Some(&streams[0]),
-    )?;
+    // Issued on the stream at once, so the export is located here.
+    let (transfer, locations) = source
+        .export(
+            1,
+            tokens,
+            "consumer",
+            exported,
+            &transports,
+            &[0],
+            Some(&streams[0]),
+        )?
+        .locate(source.manager())?;
     source
         .manager()
         .validate_exports(&[(exported, transfer.clone())], &[])?;

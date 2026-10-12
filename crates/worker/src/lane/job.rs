@@ -23,11 +23,11 @@
 //! storage is returned only once the record is made.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crossbeam_channel::{Receiver, Sender};
-use uniserve_cuda::{CopyBatch, Event, SourceOrder, Stream, StridedCopy};
+use uniserve_cuda::{CopyBatch, DeviceGuard, DeviceId, Event, SourceOrder, Stream, StridedCopy};
 use uniserve_ipc::Wake;
 
 use crate::cuda_graph::{CUDAGraph, GraphBreaks};
@@ -44,7 +44,13 @@ use crate::{Error, Result};
 /// its submitter ([`Job::forward`]); every other operation owns its data.
 pub(crate) struct Job<'a> {
     operations: RefCell<Vec<Operation<'a>>>,
+    /// The events a lane lets complete before it posts the job's
+    /// completion, and the device whose streams recorded them.
+    after: RefCell<Option<After>>,
 }
+
+/// The events a completion waits for and the device of their streams.
+type After = (DeviceId, Vec<Arc<Event>>);
 
 /// The copies of one submission.
 enum Copies {
@@ -101,6 +107,13 @@ enum Operation<'a> {
         stream: Option<Stream>,
     },
     ExpertStep(ExpertStep),
+    /// The union's next step for a rank with no forward of its own: one
+    /// round of the agreement and, when a step was agreed, its join.
+    ExpertJoin {
+        union: Arc<ExpertUnion>,
+        /// The rank is shutting down and leaves the union.
+        leaving: bool,
+    },
 }
 
 /// Work the execution thread hands to the Python thread and waits for, or
@@ -187,13 +200,16 @@ pub(crate) struct Failure {
 /// Whoever built the job applies its results in the order it recorded their
 /// operations: each accessor takes the next one of its kind.
 #[derive(Default)]
-pub(crate) struct Completion {
+pub struct Completion {
     /// The graph of each capture.
     captured: VecDeque<CUDAGraph>,
     /// The bytes of each output read.
     reads: VecDeque<Vec<u8>>,
     /// The capacity each expert step was agreed at.
     capacities: VecDeque<usize>,
+    /// For each expert join: whether a step ran, and whether every rank
+    /// has left the union.
+    joins: VecDeque<(bool, bool)>,
     /// The integers each returning call returned.
     returned: VecDeque<Vec<i64>>,
     /// The object each handle call returned.
@@ -226,6 +242,12 @@ impl Completion {
         self.capacities.pop_front().ok_or(MISSING)
     }
 
+    /// The next expert join: whether a step ran, and whether every rank
+    /// has left the union.
+    pub(crate) fn joined(&mut self) -> Result<(bool, bool)> {
+        self.joins.pop_front().ok_or(MISSING)
+    }
+
     /// The integers the next returning call returned
     /// ([`Job::call_returning`]): one for a call that returns an integer,
     /// and for a call that returns lists of integers (shapes) each list's
@@ -246,6 +268,7 @@ impl Default for Job<'_> {
     fn default() -> Self {
         Self {
             operations: RefCell::new(Vec::new()),
+            after: RefCell::new(None),
         }
     }
 }
@@ -320,6 +343,22 @@ impl<'a> Job<'a> {
         self.push(Operation::ExpertStep(step));
     }
 
+    /// The union's next step for a rank with no forward of its own. The
+    /// job's completion says whether a step ran and whether every rank has
+    /// left the union.
+    pub(crate) fn expert_join(&self, union: Arc<ExpertUnion>, leaving: bool) {
+        self.push(Operation::ExpertJoin { union, leaving });
+    }
+
+    /// Post the job's completion only once `events`, recorded on streams of
+    /// `device`, have completed: the completion then says that the device
+    /// finished what the events fence. The lane does not wait for them; it
+    /// goes on with its next job. A job performed outside a lane completes
+    /// when its operations are performed.
+    pub(crate) fn after(&self, device: DeviceId, events: Vec<Arc<Event>>) {
+        *self.after.borrow_mut() = Some((device, events));
+    }
+
     /// Continue this job with the operations of `other`.
     pub(crate) fn append(&self, other: Job<'a>) {
         self.operations
@@ -331,6 +370,12 @@ impl<'a> Job<'a> {
     /// execution thread, a microbatch thread in its turn of an expert step,
     /// or the submitter itself on a rank without a lane.
     pub(crate) fn perform(self) -> Completion {
+        self.perform_operations().0
+    }
+
+    /// Perform the operations; also return what the completion waits for.
+    fn perform_operations(self) -> (Completion, Option<After>) {
+        let after = self.after.into_inner();
         let mut completion = Completion::default();
         let mut operations = self.operations.into_inner().into_iter().enumerate();
         for (index, operation) in operations.by_ref() {
@@ -351,7 +396,7 @@ impl<'a> Job<'a> {
                 let _ = operation.perform(&mut completion);
             }
         }
-        completion
+        (completion, after)
     }
 }
 
@@ -431,6 +476,10 @@ impl Operation<'_> {
             Self::HostFunction { stream, function } => stream.as_ref().launch_host_fn(function),
             Self::Synchronize { stream } => Issue::synchronize(&stream.as_ref()),
             Self::ExpertStep(step) => step.perform(completion),
+            Self::ExpertJoin { union, leaving } => {
+                completion.joins.push_back(union.idle(leaving)?);
+                Ok(())
+            }
         }
     }
 }
@@ -703,73 +752,194 @@ impl Issue for Recorder<'_, '_> {
     }
 }
 
-/// The submitting end of a lane's job queue.
-///
-/// Only the control thread submits, and it waits for a job's completion
-/// before it submits the next.
+/// Names a job from its submission to its completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JobId(pub(super) u64);
+
+/// What a lane's execution thread receives.
+enum Message {
+    /// A job, and whether its submitter waits for its completion: a
+    /// submitter that waits takes the completion itself and needs no wake.
+    Job(JobId, Job<'static>, bool),
+    /// The wake of the control thread, fired behind every completion from
+    /// now on; `None` stops it.
+    Wake(Option<Wake>),
+}
+
+/// The submitting end of a lane's job queue. Only the control thread
+/// submits.
 #[derive(Clone)]
 pub struct JobQueue {
-    jobs: Sender<Job<'static>>,
-    completions: Receiver<Completion>,
+    messages: Sender<Message>,
 }
 
 /// The execution thread's end of a lane's job queue.
 pub(super) struct Jobs {
-    jobs: Receiver<Job<'static>>,
-    completions: Sender<Completion>,
+    messages: Receiver<Message>,
+    /// Where the lanes of a rank post their completions.
+    completions: Sender<(JobId, Completion)>,
+}
+
+/// Posts the failure of the job a lane is performing if the lane's thread
+/// unwinds, so whoever waits for that job learns that the lane is gone.
+struct Performing<'a> {
+    job: Option<JobId>,
+    completions: &'a Sender<(JobId, Completion)>,
+}
+
+impl Drop for Performing<'_> {
+    fn drop(&mut self) {
+        if let Some(job) = self.job {
+            let completion = Completion {
+                failure: Some(Failure {
+                    operation: 0,
+                    error: Error::State("the lane's execution thread has exited"),
+                }),
+                ..Completion::default()
+            };
+            let _ = self.completions.send((job, completion));
+        }
+    }
 }
 
 impl JobQueue {
-    pub(super) fn new() -> (Self, Jobs) {
-        let (jobs, received) = crossbeam_channel::unbounded();
-        let (completions, completed) = crossbeam_channel::unbounded();
+    pub(super) fn new(completions: Sender<(JobId, Completion)>) -> (Self, Jobs) {
+        let (messages, received) = crossbeam_channel::unbounded();
         (
-            Self {
-                jobs,
-                completions: completed,
-            },
+            Self { messages },
             Jobs {
-                jobs: received,
+                messages: received,
                 completions,
             },
         )
     }
 
-    /// Submit `job` to the lane's execution thread and wait for its
+    /// Queue `job` as `id` on the lane's execution thread, which posts its
+    /// completion under that name, and fires the control thread's wake
+    /// behind it unless the submitter is `awaited`: blocked on that
     /// completion.
-    pub(crate) fn submit(&self, job: Job<'_>) -> Result<Completion> {
-        // SAFETY: the lifetime is erased only for the queue's type. This
-        // call returns once the execution thread has consumed the job and
-        // posted its completion, or with the job dropped where the thread
-        // is gone, so nothing the job borrows is used after it.
-        //
-        // Only `Job::forward` gives a job something to borrow: the erasure
-        // goes with it, and a job that owns its operations is submitted as
-        // it is.
-        let job = unsafe { std::mem::transmute::<Job<'_>, Job<'static>>(job) };
-        const EXITED: Error = Error::State("the lane's execution thread has exited");
-        self.jobs.send(job).map_err(|_| EXITED)?;
+    pub(super) fn start(&self, id: JobId, job: Job<'static>, awaited: bool) -> Result<()> {
+        self.send(Message::Job(id, job, awaited))
+    }
 
-        // FIXME: the submitter waits here for as long as the lane takes, as
-        // it waited for a forward before jobs: a lane that stops making
-        // progress stops the control thread with it. The control thread is
-        // to submit and return, and take the completion from its wake
-        // descriptor (specs/planes.md section 3).
-        self.completions.recv().map_err(|_| EXITED)
+    pub(super) fn set_wake(&self, wake: Option<Wake>) -> Result<()> {
+        self.send(Message::Wake(wake))
+    }
+
+    fn send(&self, message: Message) -> Result<()> {
+        self.messages
+            .send(message)
+            .map_err(|_| Error::State("the lane's execution thread has exited"))
     }
 }
 
 impl Jobs {
     /// Perform jobs in arrival order on the calling thread, the lane's
-    /// execution thread, until every submitting end is gone.
+    /// execution thread, until every submitting end is gone. Each
+    /// completion is posted under its job's name, and the control thread's
+    /// wake fired behind it; a job that names events ([`Job::after`]) has
+    /// its completion posted by the driver once they completed.
     pub(super) fn run(self) {
-        while let Ok(job) = self.jobs.recv() {
+        let mut wake = None;
+        // One stream per device that carries nothing but the notices of
+        // completed events.
+        let mut notifications: HashMap<DeviceId, Stream> = HashMap::new();
+        while let Ok(message) = self.messages.recv() {
+            let (id, job, awaited) = match message {
+                Message::Job(id, job, awaited) => (id, job, awaited),
+                Message::Wake(installed) => {
+                    wake = installed;
+                    continue;
+                }
+            };
+            let mut performing = Performing {
+                job: Some(id),
+                completions: &self.completions,
+            };
             // The job and everything it holds is gone before its submitter
             // learns that it completed.
-            let completion = job.perform();
-            if self.completions.send(completion).is_err() {
-                break;
+            let (completion, after) = job.perform_operations();
+            performing.job = None;
+
+            let post = Post {
+                id,
+                completions: self.completions.clone(),
+                wake: wake.clone().filter(|_| !awaited),
+            };
+            match after {
+                Some((device, events)) if completion.failure.is_none() => {
+                    post.after(completion, device, &events, &mut notifications);
+                }
+                _ => post.now(completion),
             }
+        }
+    }
+}
+
+/// Posts one job's completion and fires the control thread's wake.
+struct Post {
+    id: JobId,
+    completions: Sender<(JobId, Completion)>,
+    wake: Option<Wake>,
+}
+
+impl Post {
+    fn now(self, completion: Completion) {
+        // Without a receiver the rank is closing and nobody takes it.
+        let _ = self.completions.send((self.id, completion));
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
+    }
+
+    /// Post `completion` from the driver once `events` completed: a host
+    /// function on `device`'s notification stream, ordered behind them. It
+    /// only sends and signals: it never calls CUDA or blocks, as host
+    /// functions must not.
+    fn after(
+        self,
+        completion: Completion,
+        device: DeviceId,
+        events: &[Arc<Event>],
+        notifications: &mut HashMap<DeviceId, Stream>,
+    ) {
+        // The completion stays reachable if the notice cannot be issued.
+        let held = Arc::new(Mutex::new(Some(completion)));
+        let take = |held: &Mutex<Option<Completion>>| {
+            held.lock().unwrap_or_else(PoisonError::into_inner).take()
+        };
+        let issued = (|| -> Result<()> {
+            let notification = match notifications.entry(device) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let _device = DeviceGuard::new(device)?;
+                    entry.insert(Stream::new(device)?)
+                }
+            };
+            for event in events {
+                notification.wait_event(event)?;
+            }
+            let (id, completions, wake) = (self.id, self.completions.clone(), self.wake.clone());
+            let posted = Arc::clone(&held);
+            notification.launch_host_fn(move || {
+                if let Some(completion) = take(&posted) {
+                    let _ = completions.send((id, completion));
+                    if let Some(wake) = &wake {
+                        wake.wake();
+                    }
+                }
+            })?;
+            Ok(())
+        })();
+
+        if let Err(error) = issued
+            && let Some(mut completion) = take(&held)
+        {
+            completion.failure = Some(Failure {
+                operation: 0,
+                error,
+            });
+            self.now(completion);
         }
     }
 }
@@ -896,36 +1066,6 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(issued, 9);
         Ok(())
-    }
-
-    #[test]
-    fn a_lane_performs_jobs_in_order_on_its_thread_and_a_forward_borrows_its_submitter() {
-        let (queue, jobs) = JobQueue::new();
-        let thread = std::thread::spawn(move || {
-            jobs.run();
-            std::thread::current().id()
-        });
-        let here = std::thread::current().id();
-
-        // A forward mutates state borrowed from its submitter; the next
-        // job runs after it.
-        let mut order = Vec::new();
-        let mut threads = Vec::new();
-        for name in ["first", "second"] {
-            let job = Job::new();
-            job.forward(|| {
-                order.push(name);
-                threads.push(std::thread::current().id());
-            });
-            assert!(queue.submit(job).unwrap().check().is_ok());
-        }
-        assert_eq!(order, ["first", "second"]);
-        assert_ne!(threads[0], here);
-        assert_eq!(threads[1], threads[0]);
-
-        // The thread ends with its last queue.
-        drop(queue);
-        assert_eq!(thread.join().unwrap(), threads[0]);
     }
 
     #[test]

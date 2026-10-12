@@ -167,7 +167,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
                     .executor
                     .backend()
                     .batch(Arc::clone(&batch))
-                    .and_then(|data| self.executor.submit(Batch::from_plan(&batch, data), false));
+                    .and_then(|data| self.executor.admit(Batch::from_plan(&batch, data), false));
                 match admitted {
                     Ok(submission) => PendingResponse::Batch {
                         message_id,

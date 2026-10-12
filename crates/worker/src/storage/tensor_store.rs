@@ -1639,12 +1639,12 @@ impl TensorStore {
 
     /// Order `stream` after an import's reads (which must be ready) and its
     /// buffer's producer, propagating read failures.
-    pub fn wait_import(&self, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    pub fn wait_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
         let state = lock(&self.state);
         Self::wait_imported(&state, read, stream)
     }
 
-    fn wait_imported(state: &State, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    fn wait_imported(state: &State, read: &ProductRead, stream: impl Issue) -> Result<()> {
         let imported = Self::imported(read)?;
         let imported = lock(&imported);
         state.require_buffer(&imported.buffer)?;
@@ -1658,7 +1658,7 @@ impl TensorStore {
     /// Publish an import's materialized value on `stream`: a new product is
     /// produced and committed; a widened shard gets one fence over the
     /// union of its regions and becomes the whole logical tensor.
-    pub fn complete_import(&self, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    pub fn complete_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
         self.events.reap()?;
         let mut state = lock(&self.state);
         Self::wait_imported(&state, read, stream)?;

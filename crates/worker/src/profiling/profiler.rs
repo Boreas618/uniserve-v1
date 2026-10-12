@@ -112,15 +112,8 @@ impl Profiler {
         }
     }
 
-    /// Account one executed batch around `execute`.
-    pub fn step<T>(&mut self, execute: impl FnOnce() -> T) -> T {
-        self.begin();
-        let result = execute();
-        self.end();
-        result
-    }
-
-    fn begin(&mut self) {
+    /// Account the start of one executed batch: its forward begins.
+    pub(crate) fn begin(&mut self) {
         self.seen += 1;
         if self.active || self.finished || self.seen < self.config.start_step {
             return;
@@ -169,7 +162,8 @@ impl Profiler {
         }
     }
 
-    fn end(&mut self) {
+    /// Account the end of the batch [`Self::begin`] started.
+    pub(crate) fn end(&mut self) {
         if self.active {
             self.captured += 1;
             if self.captured >= self.config.num_steps {
