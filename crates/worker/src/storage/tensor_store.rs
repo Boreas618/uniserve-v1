@@ -42,7 +42,7 @@ use super::tensor::{
 use crate::ffi::{DType, Device};
 use crate::stream::{Fill, Issue};
 use crate::transfer::exports::{self, Location};
-use crate::transfer::{ReadRef, Retirement, Spans, Transports, copy_on_host, copy_planner, fetch};
+use crate::transfer::{ReadRef, Retirement, Spans, Transports, copy_planner, fetch};
 use crate::{Error, EventPool, Result};
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -941,12 +941,13 @@ impl TensorStore {
     }
 
     /// Publish a value the producer wrote into the bound view: `shape` is
-    /// the value's actual shape, fenced on the producer `stream`.
+    /// the value's actual shape, fenced behind what the producer `stream`
+    /// issued.
     pub fn produced(
         &self,
         buffer: &ProductBuffer,
         shape: &[u64],
-        stream: Option<&Stream>,
+        stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
         self.events.reap()?;
@@ -962,12 +963,12 @@ impl TensorStore {
     }
 
     /// Copy `value` into the product's bound view (no copy when `value` is
-    /// that view) on the producer `stream`, then fence it.
+    /// that view) in the producer `stream`'s order, then fence it.
     pub fn write(
         &self,
         buffer: &ProductBuffer,
         value: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
         self.events.reap()?;
@@ -980,7 +981,7 @@ impl TensorStore {
         &self,
         buffer: &ProductBuffer,
         value: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
         if let Some(metadata) = metadata {
@@ -1052,20 +1053,23 @@ impl TensorStore {
             let source = Spans::single(value.clone())?;
             match (view.device(), value.device()) {
                 (Device::Cuda(device), _) | (_, Device::Cuda(device)) => {
-                    let stream = stream.ok_or_else(|| {
-                        Error::Invalid("a device product write requires its producer stream".into())
-                    })?;
+                    if stream.stream().is_none() {
+                        return Err(Error::Invalid(
+                            "a device product write requires its producer stream".into(),
+                        ));
+                    }
                     let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
                     destination.plan_copy(&source, &mut plan)?;
                     // SAFETY: the destination is reserved for this product and
                     // the producer keeps its value until its stream passes.
-                    unsafe { plan.submit(stream) }?;
+                    unsafe { stream.copy_strided(&plan) }?;
                 }
                 _ => {
                     let mut plan = copy_planner(None, SourceOrder::Stream)?;
                     destination.plan_copy(&source, &mut plan)?;
-                    // SAFETY: host operands; the destination has no reader yet.
-                    unsafe { copy_on_host(&plan) };
+                    // SAFETY: host operands, written in the producer's order;
+                    // the destination has no reader yet.
+                    unsafe { stream.host().copy_strided(&plan) }?;
                 }
             }
         }
