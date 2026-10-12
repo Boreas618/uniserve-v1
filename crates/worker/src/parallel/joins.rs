@@ -212,14 +212,14 @@ impl ExpertUnion {
     /// joins are captured; until then they run eagerly, in the same rotation
     /// as every rank's joins. Without microbatch threads no turn is held.
     pub(crate) fn replays(&self) -> bool {
-        self.lanes.is_none() || self.joins.is_some()
+        self.lanes.is_none() || self.joins.get().is_some()
     }
 
     /// Join one step of `capacity` with every microbatch: replay the
     /// captured joins, or join eagerly before they exist.
     pub(crate) fn join(&self, capacity: usize) -> Result<()> {
         let _range = range(c"uniserve.expert.join", None);
-        if let (Some(joins), Some(_)) = (&self.joins, &self.graphs) {
+        if let (Some(joins), Some(_)) = (self.joins.get(), &self.graphs) {
             return joins.launch(capacity, &self.microbatches[0].stream);
         }
         self.join_eager(capacity)
@@ -245,7 +245,7 @@ impl ExpertUnion {
     /// graph, or its eager join before capture.
     pub(super) fn peer_join(&self, peer: usize, capacity: usize) -> Result<MicrobatchCall<()>> {
         let state = &self.microbatches[peer];
-        if let Some(joins) = &state.graphs {
+        if let Some(joins) = state.graphs.get() {
             let graph = joins.graph(capacity)?.clone();
             let stream = state.stream.clone();
             return Ok(Box::new(move || graph.launch(&stream)));
@@ -277,7 +277,7 @@ impl ExpertUnion {
     /// warmed eagerly first (a collective step on every rank). Source ranks
     /// with microbatches also capture each microbatch's join alone in its
     /// own pool, which an empty microbatch of a populated step replays.
-    pub(crate) fn capture_joins(&mut self) -> Result<()> {
+    pub(super) fn capture_joins(&self) -> Result<()> {
         let Some(graphs) = self.graphs.clone() else {
             return Ok(());
         };
@@ -297,7 +297,8 @@ impl ExpertUnion {
             &|capacity| self.join_eager(capacity),
             &graphs,
         )?;
-        self.joins = Some(primary);
+        let captured = || Error::State("the expert joins were captured before");
+        self.joins.set(primary).map_err(|_| captured())?;
         if self.microbatches.len() > 1 && !self.dedicated {
             for (peer, pool) in pools.iter().enumerate() {
                 let captured = JoinGraphs::capture(
@@ -309,14 +310,17 @@ impl ExpertUnion {
                     &|capacity| self.eager_join(peer, capacity)?(),
                     &graphs,
                 )?;
-                self.microbatches[peer].graphs = Some(captured);
+                self.microbatches[peer]
+                    .graphs
+                    .set(captured)
+                    .map_err(|_| Error::State("the expert joins were captured before"))?;
             }
         }
-        let captured: usize = self.joins.iter().map(JoinGraphs::len).sum::<usize>()
+        let captured: usize = self.joins.get().map_or(0, JoinGraphs::len)
             + self
                 .microbatches
                 .iter()
-                .filter_map(|peer| peer.graphs.as_ref())
+                .filter_map(|peer| peer.graphs.get())
                 .map(JoinGraphs::len)
                 .sum::<usize>();
         tracing::info!(

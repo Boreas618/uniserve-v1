@@ -45,7 +45,7 @@
 //! first, as a collective step. Steps are agreed from then on.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tvm_ffi::Any;
 use uniserve_cuda::{DeviceId, Stream};
@@ -58,7 +58,7 @@ use crate::config::{Device, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::ffi::{Backing, Function, Handle, integer_list};
-use crate::lane::Lanes;
+use crate::lane::{Job, Lanes};
 use crate::model::LoadedModel;
 use crate::model::interface::Interface;
 use crate::runner::scratch::Scratches;
@@ -117,8 +117,9 @@ pub(super) struct Microbatch {
     /// `ExpertLayers`.
     pub(super) prepared: Option<Handle>,
     /// This microbatch's captured joins, so an empty microbatch of a
-    /// populated step launches them on its own stream.
-    pub(super) graphs: Option<JoinGraphs>,
+    /// populated step launches them on its own stream. Set once, by the
+    /// warmup job.
+    pub(super) graphs: OnceLock<JoinGraphs>,
     /// Peer-mapped storage of split MegaMoE, retained until the exchange
     /// closed.
     symmetric: Option<PeerStorage>,
@@ -135,8 +136,9 @@ pub(crate) struct ExpertUnion {
     pub(super) microbatches: Vec<Microbatch>,
     /// Microbatch threads, with two or more microbatches.
     pub(super) lanes: Option<MicrobatchLanes>,
-    /// Captured joins of every microbatch, on the first stream.
-    pub(super) joins: Option<JoinGraphs>,
+    /// Captured joins of every microbatch, on the first stream. Set once,
+    /// by the warmup job.
+    pub(super) joins: OnceLock<JoinGraphs>,
     /// Startup warmup: source ranks announce each eager expert step
     /// instead of agreeing on it.
     warming: AtomicBool,
@@ -155,11 +157,14 @@ pub(crate) struct ExpertUnion {
 // execution thread performs it. What the two threads reach through it:
 //
 // - facts fixed at startup, which both read: the capacities, the streams
-//   and exchanges of the microbatches, the captured joins and their pools;
+//   and exchanges of the microbatches and their pools;
+// - the captured joins: set once by the warmup job, on the execution
+//   thread, and read by it afterwards;
 // - the step agreement (`ExpertParallel`: its selection state and the host
 //   group, each behind a lock) and the microbatch rotation: used by the
-//   execution thread only once the rank serves, and by the control thread
-//   only during startup and close, when no job is in flight
+//   execution thread only, in jobs (warmup forwards, the end of warmup,
+//   steps and joins). The control thread binds the member before the first
+//   job and closes it after the last, when no job is in flight
 //   (`WorkerBackend::experts_mut` refuses while one is);
 // - the warmup flag: written by the control thread between jobs, read by
 //   both.
@@ -170,10 +175,6 @@ pub(crate) struct ExpertUnion {
 impl ExpertUnion {
     pub(crate) fn parallel(&self) -> &Arc<ExpertParallel> {
         &self.parallel
-    }
-
-    pub(crate) fn dedicated(&self) -> bool {
-        self.dedicated
     }
 
     /// Whether startup still announces warmup steps.
@@ -443,7 +444,7 @@ impl ExpertUnion {
             dedicated,
             microbatches: Vec::with_capacity(microbatches),
             lanes: None,
-            joins: None,
+            joins: OnceLock::new(),
             warming: AtomicBool::new(true),
             layers_owners: Vec::new(),
             pools: Vec::new(),
@@ -504,7 +505,7 @@ impl ExpertUnion {
                 exchange: Handle::new(created)?,
                 stream,
                 prepared: None,
-                graphs: None,
+                graphs: OnceLock::new(),
                 symmetric,
             });
         }
@@ -613,40 +614,64 @@ impl WarmupHooks for ExpertWarmup {
     }
 
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
-        let Some(experts) = backend.experts_mut().map_err(failed("expert warmup"))? else {
+        let Some(experts) = backend.experts().cloned() else {
             return Ok(());
         };
-        follow(experts).map_err(failed("expert warmup"))?;
-        experts.serve();
-        experts
-            .capture_joins()
-            .map_err(failed("expert join capture"))
+
+        // The end of the union's warmup is a job of the lane its forwards
+        // and joins run on: it announces, joins and captures on that
+        // lane's stream.
+        let job = Job::new();
+        job.expert_warmup(experts);
+        let (_, completion) = backend
+            .job_queues()
+            .submit(
+                uniserve_ipc::CallKind::Forward(uniserve_ipc::ForwardMode::Decode),
+                job,
+            )
+            .map_err(failed("expert warmup"))?;
+        completion
+            .check()
+            .map(drop)
+            .map_err(|failure| failed("expert warmup")(failure.error))
     }
 }
 
-/// Dedicated expert ranks execute every announced warmup step; sources end
-/// their announcements with zero.
-fn follow(experts: &mut ExpertUnion) -> Result<()> {
-    let parallel = std::sync::Arc::clone(experts.parallel());
-    if parallel.attention_ranks() == 0 {
-        return Ok(());
+impl ExpertUnion {
+    /// End the union's warmup on this rank: follow the announced warmup
+    /// steps, start serving, and capture the joins every rank replays
+    /// outside its own steps. Performed once, by the warmup job, on the
+    /// lane's execution thread.
+    pub(crate) fn finish_warmup(&self) -> Result<()> {
+        self.follow()?;
+        self.serve();
+        self.capture_joins()
     }
-    if !experts.dedicated() {
-        parallel.warmup(0)?;
-        return Ok(());
-    }
-    let mut steps = 0;
-    loop {
-        let capacity = parallel.warmup(0)?;
-        if capacity == 0 {
-            break;
+
+    /// Dedicated expert ranks execute every announced warmup step; sources
+    /// end their announcements with zero.
+    fn follow(&self) -> Result<()> {
+        let parallel = &self.parallel;
+        if parallel.attention_ranks() == 0 {
+            return Ok(());
         }
-        experts.join_eager(capacity)?;
-        steps += 1;
+        if !self.dedicated {
+            parallel.warmup(0)?;
+            return Ok(());
+        }
+        let mut steps = 0;
+        loop {
+            let capacity = parallel.warmup(0)?;
+            if capacity == 0 {
+                break;
+            }
+            self.join_eager(capacity)?;
+            steps += 1;
+        }
+        tracing::info!(
+            target: "uniserve_worker.warmup",
+            "joined {steps} announced expert warmup steps"
+        );
+        Ok(())
     }
-    tracing::info!(
-        target: "uniserve_worker.warmup",
-        "joined {steps} announced expert warmup steps"
-    );
-    Ok(())
 }
