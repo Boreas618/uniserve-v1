@@ -751,13 +751,18 @@ impl OutputPool {
 }
 
 impl crate::executor::lifecycle::RequestStorage for OutputPool {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(
+        &mut self,
+        _slots: &[usize],
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
         Ok(())
     }
 
     fn release_buffers(
         &mut self,
         _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _jobs: &crate::executor::lifecycle::LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -766,6 +771,7 @@ impl crate::executor::lifecycle::RequestStorage for OutputPool {
         &mut self,
         _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
         _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _jobs: &crate::executor::lifecycle::LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -779,7 +785,11 @@ impl crate::executor::lifecycle::RequestStorage for OutputPool {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn retire_slots(
+        &mut self,
+        _slots: &[usize],
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
         Ok(())
     }
 

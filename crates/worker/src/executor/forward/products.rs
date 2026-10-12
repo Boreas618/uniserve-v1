@@ -12,8 +12,7 @@
 //! hold for every runtime, so this module is the one place that applies
 //! them.
 
-use uniserve_cuda::Stream;
-use uniserve_ipc::{BufferId, Call, TensorExport, TensorRef};
+use uniserve_ipc::{BufferId, Call, TensorExport};
 
 use crate::executor::PendingOutput;
 use crate::storage::{ProductBuffer, ProductExport, TensorStore};
@@ -29,30 +28,6 @@ pub(crate) struct Publications {
 }
 
 impl Publications {
-    /// Export `write`, the produced value of `call`'s output `product`, on
-    /// `stream` (which produced it), and add its descriptor to the call's
-    /// completion products.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one product export's complete inputs"
-    )]
-    pub(crate) fn export(
-        &mut self,
-        tensors: &TensorStore,
-        transports: &Transports,
-        call: &Call,
-        product: &TensorRef,
-        write: &ProductBuffer,
-        stream: Option<&Stream>,
-        output: &mut PendingOutput,
-    ) -> Result<()> {
-        // Issued on `stream` at once, so the export is located here.
-        let export =
-            tensors.export_buffer(call, product, write, transports, false, None, stream)?;
-        let (export, locations) = tensors.located(write, export)?;
-        self.accept(write.id(), locations, export, output)
-    }
-
     /// Accept an export another owner made of `buffer` (a latent version,
     /// say): its `locations` register with the batch's products and its
     /// descriptor joins the call's completion products.
