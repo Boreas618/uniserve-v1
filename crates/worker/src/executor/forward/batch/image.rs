@@ -29,7 +29,7 @@ use crate::executor::forward::launch::{
     HostStage, Launched, error_code, failed_output, read_flag, reports_output, seal as seal_lease,
 };
 use crate::executor::forward::products::Publications;
-use crate::executor::forward::transfer::latents::Pool;
+use crate::executor::forward::transfer::latents::{self, PendingExport, Pool};
 use crate::executor::forward::unsupported;
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
@@ -139,6 +139,9 @@ pub(crate) struct ImageBatch<'a> {
     /// Trajectory versions exported from the latent pool, released from it
     /// if the batch fails before committing.
     pub(crate) latent_exports: Vec<BufferId>,
+    /// The version exports the batch's forwards issued, by call index,
+    /// located when the commit is applied.
+    pub(crate) exports: Vec<(usize, PendingExport)>,
     /// Signals the physical end of the batch's KV accesses.
     pub(crate) retirement: Arc<Retirement>,
     /// The batch uses the latent pool on its stream (see
@@ -231,6 +234,7 @@ impl<'a> ImageBatch<'a> {
             encodings: Vec::new(),
             publications: Publications::default(),
             latent_exports: Vec::new(),
+            exports: Vec::new(),
             retirement: Arc::new(Retirement::default()),
             latents_entered: false,
             started,
@@ -347,7 +351,6 @@ impl<'a> ImageBatch<'a> {
         if !updates.is_empty() {
             self.parts.latents()?.pool.validate_updates(&updates)?;
         }
-        self.publications.validate(&self.storage.tensors)?;
         self.leave_latents()?;
         self.seal()?;
         for state in &mut self.calls {
@@ -366,11 +369,24 @@ impl<'a> ImageBatch<'a> {
         Ok(Commit { updates, pending })
     }
 
-    /// Apply an issued commit once its work was performed: make the writes
-    /// visible, apply the trajectory commits, register the exports and
-    /// record the calls as pending. Any failure here is fatal.
+    /// Apply an issued commit once its work was performed: publish the
+    /// exports the forwards issued, then make the writes visible, apply the
+    /// trajectory commits, register the exports and record the calls as
+    /// pending. A failure after the exports' check is fatal.
     pub(crate) fn apply_commit(&mut self, commit: Commit) -> std::result::Result<(), Failure> {
         let Commit { updates, pending } = commit;
+        for (index, export) in std::mem::take(&mut self.exports) {
+            let pool = &self.parts.latents()?.pool;
+            latents::locate_export(
+                pool,
+                export,
+                &mut self.publications,
+                &mut self.calls[index].output,
+            )?;
+        }
+        self.publications.validate(&self.storage.tensors)?;
+
+        // Every owner accepted its update. Any failure from here is fatal.
         let writes = std::mem::take(&mut self.writes);
         self.storage.tensors.commit_writes(&writes).map_err(fatal)?;
         if !updates.is_empty() {
@@ -418,6 +434,9 @@ impl<'a> ImageBatch<'a> {
     /// fences were performed and complete.
     pub(crate) fn discard(&mut self) -> Result<()> {
         let left = self.leave_latents();
+        self.exports
+            .drain(..)
+            .for_each(|(_, export)| export.revoke());
         let revoked = self.publications.revoke();
         let exported = std::mem::take(&mut self.latent_exports);
         if !exported.is_empty()
