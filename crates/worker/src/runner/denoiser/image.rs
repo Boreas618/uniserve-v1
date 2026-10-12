@@ -47,10 +47,10 @@ use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::batch::image::{ImageBatch, Progress, Resume};
+use crate::executor::forward::batch::image::{ImageBatch, Planned, Progress, Resume};
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, integer_list};
-use crate::lane::{Completion, Job};
+use crate::lane::{Completion, Job, Value};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
@@ -364,43 +364,49 @@ impl ImageDiffusion {
         &self.capacity
     }
 
-    /// The guidance plan of an admitted image's trajectory.
-    ///
-    /// FIXME: a host-only call of the Python half, made where the forward is
-    /// recorded: the plan's object and schedule are needed to record the
-    /// trajectory's steps. As a job it is a boundary of the forward.
-    pub fn plan(&self, image: &ImageParams) -> Result<GuidancePlan> {
-        let value: tvm_ffi::Array<Any> = self.methods.plan.call_as(&[
-            self.methods.runner.view(),
-            (&Any::from(i64::from(image.steps))).into(),
-            (&Any::from(f64::from(image.timestep_shift))).into(),
-            (&Any::from(f64::from(image.cfg_text_scale))).into(),
-            (&Any::from(f64::from(image.cfg_img_scale))).into(),
-            (&Any::from(f64::from(image.cfg_interval.0))).into(),
-            (&Any::from(f64::from(image.cfg_interval.1))).into(),
-            (&Any::from(tvm_ffi::String::from(image.cfg_renorm_type.as_str()))).into(),
-            (&Any::from(f64::from(image.cfg_renorm_min))).into(),
-        ])?;
+    /// Record the call that makes the guidance plan of an admitted image's
+    /// trajectory. The plan is a host computation of the library, so it is
+    /// an operation of the job like the forward's other eager calls; the
+    /// job's completion carries what it returned ([`Self::planned`]).
+    pub(crate) fn plan(&self, image: &ImageParams, job: &Job) {
+        job.call_values(MethodCall::new(
+            &self.methods.plan,
+            vec![
+                Argument::Handle(self.methods.runner.clone()),
+                Argument::Integer(i64::from(image.steps)),
+                Argument::Float(f64::from(image.timestep_shift)),
+                Argument::Float(f64::from(image.cfg_text_scale)),
+                Argument::Float(f64::from(image.cfg_img_scale)),
+                Argument::Float(f64::from(image.cfg_interval.0)),
+                Argument::Float(f64::from(image.cfg_interval.1)),
+                Argument::Text(image.cfg_renorm_type.as_str().to_owned()),
+                Argument::Float(f64::from(image.cfg_renorm_min)),
+            ],
+        ));
+    }
+
+    /// The guidance plan of a `steps`-step image from what its plan call
+    /// returned: the plan object, the model timestep of each solver step
+    /// and the branch mask of each step.
+    pub(crate) fn planned(&self, steps: usize, values: Vec<Value>) -> Result<GuidancePlan> {
         let name = self.methods.plan.name();
-        let item = |index: usize| {
-            value
-                .get(index)
-                .map_err(|error| Error::numerical(name, &error))
-        };
-        if value.len() != 3 {
+        let Ok([Value::Object(handle), timesteps, Value::Integers(masks)]) =
+            <[Value; 3]>::try_from(values)
+        else {
             return Err(Error::Interface(format!(
                 "{name} returns [plan, timesteps, branches]"
             )));
-        }
-        let timesteps: tvm_ffi::Array<Any> =
-            tvm_ffi::Array::try_from(item(1)?).map_err(|error| Error::numerical(name, &error))?;
-        let timesteps = timesteps
-            .iter()
-            .map(|value| f64::try_from(value).map(|value| value as f32))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| Error::numerical(name, &error))?;
-        let branches = crate::ffi::integers(item(2)?)
-            .map_err(|error| Error::numerical(name, &error))?
+        };
+        let timesteps: Vec<f32> = match timesteps {
+            Value::Floats(times) => times.into_iter().map(|time| time as f32).collect(),
+            Value::Integers(times) => times.into_iter().map(|time| time as f32).collect(),
+            Value::Object(_) => {
+                return Err(Error::Interface(format!(
+                    "{name} returns its timesteps as numbers"
+                )));
+            }
+        };
+        let branches = masks
             .into_iter()
             .map(|mask| {
                 u8::try_from(mask)
@@ -408,15 +414,14 @@ impl ImageDiffusion {
                     .and_then(BranchSet::from_mask)
             })
             .collect::<Result<Vec<_>>>()?;
-        if branches.len() != usize::from(image.steps) || timesteps.len() < branches.len() {
+        if branches.len() != steps || timesteps.len() < branches.len() {
             return Err(Error::Interface(format!(
-                "{name} plans {} steps for a {}-step image",
+                "{name} plans {} steps for a {steps}-step image",
                 branches.len(),
-                image.steps
             )));
         }
         Ok(GuidancePlan {
-            handle: Handle::new(item(0)?)?,
+            handle,
             timesteps,
             branches,
         })
@@ -869,6 +874,22 @@ pub(crate) struct DenoiseResume {
     step: Step,
 }
 
+/// A denoising between two of its jobs: the job on the lane ends with the
+/// plan calls of the trajectories the denoising opens (one this rank did
+/// not prepare, or one resumed at another size). Their plans say which
+/// branches each step evaluates, so the steps are recorded once they are
+/// known.
+pub(crate) struct PlanResume {
+    /// Each active call's trajectory, admitted image and conditioning
+    /// coordinates.
+    trajectories: Vec<(Trajectory, ImageParams, Coordinates)>,
+    /// The forward rows of each call, by call index.
+    descriptors: HashMap<usize, Vec<ForwardSlot>>,
+    /// The trajectories to open, in the order their plan calls were
+    /// recorded.
+    plans: Vec<Planned>,
+}
+
 /// One active trajectory call of a batch.
 struct Trajectory {
     index: usize,
@@ -1061,7 +1082,7 @@ impl ImageBatch<'_> {
             let diffusion = self.parts.diffusion().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
             })?;
-            let plan = diffusion.plan(image)?;
+            diffusion.plan(image, job);
             let latents = self.parts.latents()?;
             let page_units = latents.pool.page_units();
             latents
@@ -1081,14 +1102,14 @@ impl ImageBatch<'_> {
             )?;
             latents.scatter(1, scratch, issue)?;
             self.publish_latent(trajectory.index, 1, 0, &trajectory.params, issue)?;
-            self.parts.trajectories.open(
-                trajectory.slot,
-                ImageTrajectory::new(
-                    call.request_key,
-                    (trajectory.params.height, trajectory.params.width),
-                    plan,
-                ),
-            );
+            // The trajectory opens with the batch's commit, once the plan
+            // call was made.
+            self.plans.push(Planned {
+                slot: trajectory.slot,
+                key: call.request_key,
+                size: (trajectory.params.height, trajectory.params.width),
+                steps: usize::from(image.steps),
+            });
             self.updates.push((
                 trajectory.index,
                 LatentUpdate::for_call(trajectory.slot, call, &trajectory.params)?,
@@ -1234,12 +1255,49 @@ impl ImageBatch<'_> {
         progress
     }
 
+    /// Continue the denoising from the `completion` of the job that ended
+    /// with the plan calls of the trajectories it opens.
+    pub(crate) fn resume_planned(
+        &mut self,
+        resume: PlanResume,
+        completion: &mut Completion,
+        text: Option<&mut CausalLMRunners>,
+        experts: Option<&Arc<ExpertUnion>>,
+    ) -> Result<Progress> {
+        let PlanResume {
+            trajectories,
+            descriptors,
+            plans,
+        } = resume;
+        for Planned {
+            slot,
+            key,
+            size,
+            steps,
+        } in plans
+        {
+            let diffusion = self.parts.diffusion().ok_or_else(|| {
+                Error::Unsupported("image trajectories require a denoiser".into())
+            })?;
+            let guidance = diffusion.planned(steps, completion.values()?)?;
+            self.parts
+                .trajectories
+                .open(slot, ImageTrajectory::new(key, size, guidance));
+        }
+
+        let job = std::mem::take(&mut self.job);
+        let progress = self.gather_denoise(&job, trajectories, descriptors, text, experts);
+        self.job = job;
+        progress
+    }
+
     /// Record what precedes the solver steps: the wait on the text
     /// runners' order, the reservation of the rows' slots, the resumption
     /// of each trajectory and the gather of its committed version. The
-    /// denoising is one job unless a step misses guidance prefixes: the job
-    /// then ends with the text runner's evaluation of them, which is
-    /// completed before the step is recorded.
+    /// denoising is one job unless it opens a trajectory, whose plan call
+    /// then ends the job, or a step misses guidance prefixes: the job then
+    /// ends with the text runner's evaluation of them, which is completed
+    /// before the step is recorded.
     fn begin_denoise(
         &mut self,
         job: &Job,
@@ -1259,8 +1317,9 @@ impl ImageBatch<'_> {
         }
         let descriptors = self.reserve_rows(&active, job.on(stream.as_ref()))?;
 
-        // Validate every call and resume its trajectory.
+        // Validate every call and find the trajectories to open.
         let mut trajectories = Vec::with_capacity(active.len());
+        let mut plans = Vec::new();
         for &index in &active {
             let call = &plan.calls[index];
             let (trajectory, image) = self.trajectory(index)?;
@@ -1300,16 +1359,51 @@ impl ImageBatch<'_> {
                 let diffusion = self.parts.diffusion().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a denoiser".into())
                 })?;
-                let guidance = diffusion.plan(&image)?;
-                self.parts
-                    .trajectories
-                    .open(trajectory.slot, ImageTrajectory::new(key, size, guidance));
+                diffusion.plan(&image, job);
+                plans.push(Planned {
+                    slot: trajectory.slot,
+                    key,
+                    size,
+                    steps: usize::from(image.steps),
+                });
             }
-            if let Some(open) = self.parts.trajectories.get(trajectory.slot, key) {
-                open.begin_call(conditioning);
-            }
-            trajectories.push((trajectory, image));
+            trajectories.push((trajectory, image, conditioning));
         }
+
+        // The steps of an opened trajectory are recorded from its plan: the
+        // job ends with the plan calls.
+        if !plans.is_empty() {
+            return Ok(Progress::Boundary(Resume::Plan(Box::new(PlanResume {
+                trajectories,
+                descriptors,
+                plans,
+            }))));
+        }
+        self.gather_denoise(job, trajectories, descriptors, text, experts)
+    }
+
+    /// Record the resumption of each trajectory, whose guidance plan is
+    /// open, the gather of its committed version and the solver steps.
+    fn gather_denoise(
+        &mut self,
+        job: &Job,
+        trajectories: Vec<(Trajectory, ImageParams, Coordinates)>,
+        descriptors: HashMap<usize, Vec<ForwardSlot>>,
+        text: Option<&mut CausalLMRunners>,
+        experts: Option<&Arc<ExpertUnion>>,
+    ) -> Result<Progress> {
+        let plan = self.plan;
+        let stream = self.stream.clone();
+        let trajectories: Vec<(Trajectory, ImageParams)> = trajectories
+            .into_iter()
+            .map(|(trajectory, image, conditioning)| {
+                let key = plan.calls[trajectory.index].request_key;
+                if let Some(open) = self.parts.trajectories.get(trajectory.slot, key) {
+                    open.begin_call(conditioning);
+                }
+                (trajectory, image)
+            })
+            .collect();
         let scratch = {
             let values: Vec<Trajectory> = trajectories
                 .iter()
@@ -1351,7 +1445,10 @@ impl ImageBatch<'_> {
             .diffusion()
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?
             .layout();
-        let component = plan.calls[active[0]].component.clone();
+        let component = trajectories
+            .first()
+            .map(|(trajectory, _)| plan.calls[trajectory.index].component.clone())
+            .unwrap_or_default();
         let intervals = trajectories
             .iter()
             .map(|(trajectory, _)| trajectory.params.step_count)
