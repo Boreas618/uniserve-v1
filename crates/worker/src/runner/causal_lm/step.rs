@@ -600,7 +600,7 @@ pub(super) fn condition_latents(
     storage: &mut RankStorage,
     rows: &[ConditionRow],
     stream: Option<&uniserve_cuda::Stream>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let image = image.as_mut().ok_or_else(|| {
         Error::Unsupported("latent conditioning requires the image runtime".into())

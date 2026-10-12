@@ -204,7 +204,7 @@ impl CausalLMRunners {
         requests: &[Option<StepRequest<'_>>],
         context: &mut StepParts<'_>,
         forced: Option<usize>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Step> {
         let peers = &self.groups[group];
         if requests.len() != peers.len() {
@@ -446,7 +446,7 @@ impl CausalLMRunners {
         prefixes: &[(u32, &[u32])],
         tables: &BlockTables,
         cache: &mut KVCacheManager<Arc<Retirement>>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Step> {
         let (lane, group) = self.prefill_lane(component)?;
         let rows: Vec<TokenRow> = prefixes
@@ -601,11 +601,11 @@ impl RequestStorage for CausalLMRunners {
 
 /// The next job of a token batch on its lane, or `None` when the batch
 /// advanced without one: it failed and its calls are reported.
-pub(crate) fn forward<'a>(
-    backend: &'a mut WorkerBackend,
-    batch: &'a mut WorkerBatch,
+pub(crate) fn forward(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
     kind: CallKind,
-) -> std::result::Result<Option<Job<'a>>, WorkerError> {
+) -> std::result::Result<Option<Job>, WorkerError> {
     let experts = backend.experts().cloned();
     let state = match batch.token_parts().1.take() {
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
@@ -744,7 +744,7 @@ pub(crate) fn complete(
 /// Lease the opened batch's output storage, reserve for its active calls
 /// and record the image denoiser's conditioning of its latent images, its
 /// step and its commit.
-fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job<'a>) -> (Option<Job<'a>>, Pending) {
+fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, Pending) {
     let mut batch = match Batch::lease(owners, opening, job) {
         Ok(batch) => batch,
         // Nothing is reserved yet, and the job was dropped with only the
@@ -793,7 +793,7 @@ fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job<'a>) -> (Option<Jo
 fn commit<'a>(
     batch: Batch<'a>,
     committing: std::result::Result<Commit, Failure>,
-) -> (Option<Job<'a>>, Pending) {
+) -> (Option<Job>, Pending) {
     match committing {
         Ok(commit) => {
             let (job, state, _) = batch.park();
@@ -805,7 +805,7 @@ fn commit<'a>(
 
 /// Retire what a failed batch reserved: the job that records its fences, or
 /// nothing where it holds no stream work.
-fn discard<'a>(mut batch: Batch<'a>, failure: Failure) -> (Option<Job<'a>>, Pending) {
+fn discard<'a>(mut batch: Batch<'a>, failure: Failure) -> (Option<Job>, Pending) {
     if failure.committed {
         return (None, Pending::Failed(failure));
     }
