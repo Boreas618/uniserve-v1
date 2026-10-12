@@ -8,10 +8,12 @@
 //! second device (a generation tower) has a full-device stream that
 //! forwards of that lane also submit to.
 //!
-//! A forward's submission runs as one job on its lane's execution thread
-//! ([`JobQueue::run`]): the thread writes the forward's inputs, launches its
-//! graph or hands its Python call to the Python thread and waits for it, and
-//! enqueues its output reads, so the stream's order is the thread's order.
+//! A forward runs as jobs of its lane ([`JobQueues::submit`]). A [`Job`] is
+//! the ordered list of what the forward puts on the stream; the lane's
+//! execution thread performs it: it writes the forward's inputs, launches
+//! its graph or hands its Python call to the Python thread and waits for
+//! it, and reads its outputs, so the stream's order is the thread's order.
+//! The thread posts a [`Completion`] per job.
 //!
 //! Every device also has a preparation stream for startup work outside any
 //! lane. Capability runtimes fork module and microbatch streams from these
@@ -28,6 +30,7 @@ use crate::stream::CUDAStream;
 use crate::{Error, Result};
 
 pub use job::JobQueue;
+pub(crate) use job::{Capture, Completion, ExpertStep, ExpertVariant, Job};
 
 /// One execution lane.
 pub struct Lane {
@@ -46,7 +49,7 @@ impl Lane {
         // gone.
         std::thread::Builder::new()
             .name(format!("lane-{index}"))
-            .spawn(move || queue.serve())
+            .spawn(move || queue.run())
             .map_err(|error| Error::Transport(format!("execution thread: {error}")))?;
 
         Ok(Self {
@@ -72,17 +75,18 @@ pub struct JobQueues {
 }
 
 impl JobQueues {
-    /// Run a forward of `kind` on the execution thread of the lane serving
-    /// the kind. A forward no lane serves (every forward of a rank without
-    /// a CUDA device) has no stream and runs on the calling thread.
-    pub fn run<T>(&self, kind: CallKind, forward: impl FnOnce() -> T) -> T {
+    /// Submit a job of a forward of `kind` to the lane serving the kind and
+    /// wait for its completion. A forward no lane serves (every forward of
+    /// a rank without a CUDA device) has no stream, and its job is
+    /// performed on the calling thread.
+    pub(crate) fn submit(&self, kind: CallKind, job: Job<'_>) -> Result<Completion> {
         let lane = self
             .queues
             .iter()
             .find(|(kinds, _)| kinds.as_ref().is_none_or(|kinds| kinds.contains(&kind)));
         match lane {
-            Some((_, jobs)) => jobs.run(forward),
-            None => forward(),
+            Some((_, jobs)) => jobs.submit(job),
+            None => Ok(job.perform()),
         }
     }
 }
@@ -263,8 +267,8 @@ impl Lanes {
 
     /// Close the streams in dependency order: preparation, modules,
     /// microbatches, then lanes, each newest first. Attempts every stream
-    /// before returning the first failure. No job is in flight: a
-    /// forward's submitter waits for its job.
+    /// before returning the first failure. No job is in flight: its
+    /// submitter waits for each job.
     pub fn close(&mut self, aborted: bool) -> Result<()> {
         let mut failure = None;
         let mut close = |stream: &mut CUDAStream| {

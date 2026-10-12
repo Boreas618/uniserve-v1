@@ -1,8 +1,10 @@
 //! Execution streams and the events that order work across them.
 
 mod events;
+mod issue;
 
 pub use events::{Deferred, EventPool};
+pub use issue::{Fill, Issue};
 
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
 

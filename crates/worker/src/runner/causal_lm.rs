@@ -2,16 +2,23 @@
 //!
 //! A [`CausalLMRunner`] owns one binding's input and output tensors
 //! ([`InputBuffers`]), its graph shapes and captured graphs, and the Python
-//! runner ([`Methods`]). Per forward it:
+//! runner ([`Methods`]). It runs on the control thread and issues nothing
+//! itself: it records a forward into a [`Job`], which the lane's execution
+//! thread performs. Per forward it:
 //!
 //! 1. resolves the rows' attention pages against the installed block tables
 //!    (checking every write against the cache's live accesses);
 //! 2. selects an eager run, a resident graph or, before the rank is sealed,
 //!    a graph to capture;
-//! 3. writes the forward's inputs on the lane stream in one batched copy;
-//! 4. launches the graph, or calls the runner's forward method;
-//! 5. calls the runner's eager selection for rows that sample, verify
-//!    drafts or score their prompt.
+//! 3. records the writes of the forward's inputs on its stream, one batched
+//!    copy ([`CausalLMRunner::stage`]);
+//! 4. records the graph's launch, or the eager call of the runner's forward
+//!    method ([`CausalLMRunner::forward`]), then the eager selection for
+//!    rows that sample, verify drafts or score their prompt
+//!    ([`CausalLMRunner::select`]), and the capture of a graph the eager
+//!    call warmed;
+//! 5. once the job completed, stores the captured graph and counts how the
+//!    forward ran ([`CausalLMRunner::complete`]).
 //!
 //! A decode forward evaluates one token per row from the slot state: its
 //! inputs are each row's slot, forced-finish flag and finish tokens, and a
@@ -31,9 +38,10 @@
 //! A rank's runners and the request state they share are
 //! [`CausalLMRunners`] ([`runners`]): a batch of token calls reserves its
 //! storage ([`batch`]), turns its calls into rows, sampling tasks and prompt
-//! scoring ([`calls`], [`context`], [`step`]), runs one forward per expert
-//! microbatch and commits its outputs ([`commit`]). [`start`] builds the
-//! runners and [`warmup`] captures their graphs.
+//! scoring ([`calls`], [`context`], [`step`]), records one forward per
+//! expert microbatch and the commit of its outputs ([`commit`]) as the jobs
+//! of its lane. [`start`] builds the runners and [`warmup`] captures their
+//! graphs.
 
 mod batch;
 mod calls;
@@ -50,7 +58,7 @@ pub(crate) mod warmup;
 pub(crate) use input_buffers::{Dimensions, FINISH_IDS};
 pub(crate) use methods::{Construction, Functions};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
-pub(crate) use runners::{CausalLMRunners, execute};
+pub(crate) use runners::{CausalLMRunners, Pending, complete, forward};
 
 use std::sync::Arc;
 
@@ -60,15 +68,16 @@ use uniserve_ipc::ForwardMode;
 use super::TokenSelection;
 use super::input_buffers::InputBuffers;
 use super::methods::{Argument, MethodCall, Methods};
-use crate::cuda_graph::{CUDAGraph, GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
+use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
 use crate::cuda_graph::{ShapeKey, TextShapes};
 use crate::ffi::{DType, Handle};
-use crate::parallel::MicrobatchCall;
+use crate::lane::{Capture, Completion, Job};
 use crate::request::decode_state::DecodeState;
 use crate::sampling::SamplingPath;
 use crate::sampling::plan::{SamplingGroup, padded};
 use crate::storage::memory::StorageView;
 use crate::storage::{AttentionRow, BlockTables, KVCacheManager};
+use crate::stream::{Fill, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
 use runners::{COMPLETION_FIELDS, StepParts};
@@ -171,8 +180,8 @@ enum Choice {
     Graph(ShapeKey),
 }
 
-/// A planned forward whose inputs are written on the runner's stream,
-/// awaiting its expert step capacity.
+/// A planned forward whose input writes its job holds, awaiting its expert
+/// step capacity.
 pub(crate) struct Staged {
     plan: Plan,
     /// The tasks of each sampler; empty when no row samples.
@@ -188,19 +197,6 @@ impl Staged {
     pub(crate) fn expert_tokens(&self) -> usize {
         self.plan.tokens
     }
-}
-
-/// A staged forward's numerical work at its expert capacity.
-pub(crate) struct Launch {
-    pub(crate) mode: GraphMode,
-    /// The forward: a graph launch, or the runner method (also a capture's
-    /// warmup), then `sample` for rows that sample. Run on the lane's
-    /// execution thread, or on a microbatch thread in its turn of an expert
-    /// step.
-    pub(crate) call: MicrobatchCall<()>,
-    /// The call enters Python for the model forward, which passes the host
-    /// turn at its expert dispatch points.
-    pub(crate) yields: bool,
 }
 
 /// One planned forward: its shapes and host columns.
@@ -335,14 +331,16 @@ impl CausalLMRunner {
         self.graphs.seal();
     }
 
-    /// Plan `request` and write its inputs on the runner's stream.
+    /// Plan `request` and record the writes of its inputs on the runner's
+    /// stream in `job`.
     pub(crate) fn stage(
         &self,
         request: &StepRequest<'_>,
         context: &mut StepContext<'_>,
+        job: &Job<'_>,
     ) -> Result<Staged> {
         let plan = self.plan(request, context)?;
-        self.copy_columns(&plan, request, context.state)?;
+        self.copy_columns(&plan, request, context.state, job)?;
         Ok(Staged {
             plan,
             sampling: request
@@ -364,7 +362,7 @@ impl CausalLMRunner {
 
     /// The runner's forward method of a staged forward at `capacity`:
     /// `decode`, or `prefill` for prefill and verification rows.
-    fn forward(&self, staged: &Staged, capacity: Option<usize>) -> Result<MethodCall> {
+    fn method(&self, staged: &Staged, capacity: Option<usize>) -> Result<MethodCall> {
         let plan = &staged.plan;
         let capacity = capacity.unwrap_or(0);
         if plan.mode == ForwardMode::Decode {
@@ -574,109 +572,98 @@ impl CausalLMRunner {
         Ok(calls)
     }
 
-    /// The numerical work of a staged forward at `capacity`: the launch of
-    /// its resident graph, or the eager method (also the warmup of a
-    /// capture [`Self::finish`] then records), followed by the eager
-    /// selection of rows that sample or score. Without `launch`, a resident
-    /// graph's shapes run eagerly instead.
-    pub(crate) fn launch(
+    /// Record a staged forward at `capacity` in `job`: the launch of its
+    /// resident graph, or the eager call of its method. Where the eager
+    /// call is the warmup of a capture, the capture is recorded in `then`,
+    /// which runs behind the forward's selection ([`Self::select`]): at the
+    /// end of the job, or after the forwards of every microbatch of an
+    /// expert step. Without `launch`, a resident graph's shapes run eagerly
+    /// instead.
+    ///
+    /// Returns how the forward runs. An eager forward enters Python for the
+    /// model's forward, which passes the host turn at its expert dispatch
+    /// points; a launched one submits its whole step at once.
+    pub(crate) fn forward(
         &self,
         staged: &Staged,
         capacity: Option<usize>,
         launch: bool,
-    ) -> Result<Launch> {
+        job: &Job<'_>,
+        then: &Job<'_>,
+    ) -> Result<GraphMode> {
         let (mode, graph) = match &staged.plan.choice {
             Choice::Eager => (GraphMode::Eager, None),
             Choice::Graph(key) => match self.graphs.lookup(key, capacity)? {
-                Lookup::Replay(graph) if launch => (GraphMode::Replay, Some(graph.clone())),
+                Lookup::Replay(graph) if launch => (GraphMode::Replay, Some(graph)),
                 Lookup::Replay(_) => (GraphMode::Eager, None),
                 // The eager run is the capture's warmup and produces this
                 // forward's results; capture records without executing.
                 Lookup::Capture => (GraphMode::Capture, None),
             },
         };
-        let selection = self.selection(staged)?;
-        let select = move || {
-            selection
-                .into_iter()
-                .try_for_each(|call| call.invoke().map(drop))
-        };
         match graph {
             Some(graph) => {
-                let stream = self
-                    .stream
-                    .clone()
-                    .ok_or(Error::State("a graph is launched on a CUDA stream"))?;
-                let planned = self
-                    .plans_attention
-                    .then(|| self.plan_attention(&staged.plan))
-                    .transpose()?;
-                Ok(Launch {
-                    mode,
-                    call: Box::new(move || {
-                        if let Some(call) = planned {
-                            call.invoke()?;
-                        }
-                        graph.launch(&stream)?;
-                        select()
-                    }),
-                    yields: false,
-                })
+                if self.plans_attention {
+                    job.call(self.plan_attention(&staged.plan)?);
+                }
+                job.on(self.stream.as_ref()).launch(graph)?;
             }
-            None => {
-                let call = self.forward(staged, capacity)?;
-                Ok(Launch {
-                    mode,
-                    call: Box::new(move || {
-                        call.invoke()?;
-                        select()
-                    }),
-                    yields: true,
-                })
-            }
+            None => job.call(self.method(staged, capacity)?),
         }
+
+        if mode == GraphMode::Capture {
+            // The plans a capture reads are built outside it. Capture
+            // submits no device work and no communication.
+            then.call(self.plan_attention(&staged.plan)?);
+            then.capture(self.capture(self.method(staged, capacity)?)?);
+        }
+        Ok(mode)
     }
 
-    /// Capture whatever `method` enqueues on the runner's stream as one
-    /// graph in the runner's pool.
-    fn capture(&self, method: MethodCall) -> Result<CUDAGraph> {
+    /// Record in `job` the eager selection of a staged forward's rows that
+    /// sample, verify drafts or score their prompt. It reads the logits the
+    /// forward left, at whatever capacity it ran.
+    pub(crate) fn select(&self, staged: &Staged, job: &Job<'_>) -> Result<()> {
+        for call in self.selection(staged)? {
+            job.call(call);
+        }
+        Ok(())
+    }
+
+    /// The capture of whatever `method` enqueues on the runner's stream as
+    /// one graph in the runner's pool.
+    fn capture(&self, method: MethodCall) -> Result<Capture> {
         let (Some(pool), Some(stream), Some(device)) = (&self.pool, &self.stream, self.device)
         else {
             return Err(Error::State(
                 "graph capture requires a graph pool on a CUDA stream",
             ));
         };
-        let captured = self
-            .methods
-            .graphs
-            .capture(pool, stream.raw(), device, || method.invoke().map(drop));
-
-        // The breaks the forward reached belong to this capture, whether or
-        // not it succeeded.
-        let breaks = self
-            .breaks
-            .as_ref()
-            .map_or_else(Vec::new, GraphBreaks::take);
-        Ok(captured?.with_breaks(breaks))
+        Ok(Capture {
+            functions: self.methods.graphs.clone(),
+            pool: pool.clone(),
+            stream: stream.raw(),
+            device,
+            method,
+            breaks: self.breaks.clone(),
+        })
     }
 
-    /// Complete a forward whose call ran: capture its graph after the
-    /// eager warmup when its launch chose capture, and count the mode.
-    /// Capture submits no device work and no communication.
-    pub(crate) fn finish(
+    /// Apply the completion of a forward that ran in `mode` at `capacity`:
+    /// store the graph its job captured, and count the mode.
+    pub(crate) fn complete(
         &mut self,
         staged: Staged,
         capacity: Option<usize>,
         mode: GraphMode,
+        completion: &mut Completion,
     ) -> Result<Executed> {
         let plan = &staged.plan;
         if mode == GraphMode::Capture
             && let Choice::Graph(key) = &plan.choice
         {
-            // The plans a capture reads are built outside it.
-            self.plan_attention(plan)?.invoke()?;
-            let graph = self.capture(self.forward(&staged, capacity)?)?;
-            self.graphs.insert(key.clone(), capacity, graph)?;
+            self.graphs
+                .insert(key.clone(), capacity, completion.captured()?)?;
         }
         self.graphs.record(mode);
         Ok(Executed {
@@ -1007,13 +994,15 @@ impl CausalLMRunner {
         })
     }
 
-    /// Copy the plan's host columns and sampling inputs to the device, then
-    /// relay slot-state tokens, in stream order.
+    /// Record the copies of the plan's host columns and sampling inputs to
+    /// the runner's columns, then the relays of slot-state tokens, in stream
+    /// order.
     fn copy_columns(
         &self,
         plan: &Plan,
         request: &StepRequest<'_>,
         state: &DecodeState,
+        job: &Job<'_>,
     ) -> Result<()> {
         let column = |name: &str| self.buffers.column(name).map(StorageView::address);
         let rows = self.buffers.dimensions.rows as u64;
@@ -1093,66 +1082,58 @@ impl CausalLMRunner {
             ));
         }
 
-        match &self.stream {
-            Some(stream) => {
-                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                for &(destination, source, size) in &entries {
-                    batch.push(destination, source, size);
-                }
-                // SAFETY: destinations are distinct columns of this binding,
-                // ordered on its stream after earlier readers; sources are
-                // host vectors the driver reads during the call.
-                unsafe { batch.submit(stream) }?;
-                let mut device = CopyBatch::new(SourceOrder::Stream);
-                for &(destination, source, size) in &relays {
-                    device.push(destination, source, size);
-                }
-                // SAFETY: each destination is one token or position of this
-                // invocation, written after the host columns above; sources
-                // are slot state committed earlier on this stream.
-                unsafe { device.submit(stream) }?;
-                for &(address, value, count) in &masks {
-                    // SAFETY: bytes of the binding's mask column, ordered on
-                    // its stream.
-                    unsafe { uniserve_cuda::memset_d8(address, value, count, stream) }?;
-                }
-                let mut leased = CopyBatch::new(SourceOrder::Stream);
-                for &(destination, source, size) in &features {
-                    leased.push(destination, source, size);
-                }
-                // SAFETY: rows of the binding's embedding column; the
-                // features are leased products whose producers this stream
-                // waited on.
-                unsafe { leased.submit(stream) }?;
-            }
-            None => {
-                for &(address, value, count) in &masks {
-                    // SAFETY: bytes of a host column of this binding.
-                    unsafe { std::ptr::write_bytes(address as *mut u8, value, count) };
-                }
-                for &(destination, source, size) in entries.iter().chain(&relays).chain(&features) {
-                    // SAFETY: host columns and state owned by this rank; the
-                    // executor thread serializes their writers and readers.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            source as *const u8,
-                            destination as *mut u8,
-                            size,
-                        );
-                    }
-                }
-            }
+        let stream = job.on(self.stream.as_ref());
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        for &(destination, source, size) in &entries {
+            batch.push(destination, source, size);
         }
-        Ok(())
+        // SAFETY: destinations are distinct columns of this binding, ordered
+        // on its stream after earlier readers; sources are host vectors read
+        // during the call.
+        unsafe { stream.copy(&batch) }?;
+
+        let mut device = CopyBatch::new(SourceOrder::Stream);
+        for &(destination, source, size) in &relays {
+            device.push(destination, source, size);
+        }
+        // SAFETY: each destination is one token or position of this
+        // invocation, written after the host columns above; sources are slot
+        // state committed earlier on this stream.
+        unsafe { stream.copy(&device) }?;
+
+        for &(address, value, count) in &masks {
+            // SAFETY: bytes of the binding's mask column, ordered on its
+            // stream.
+            unsafe {
+                stream.fill(Fill {
+                    address,
+                    value: u32::from(value),
+                    width: 1,
+                    count,
+                })
+            }?;
+        }
+
+        let mut leased = CopyBatch::new(SourceOrder::Stream);
+        for &(destination, source, size) in &features {
+            leased.push(destination, source, size);
+        }
+        // SAFETY: rows of the binding's embedding column; the features are
+        // leased products whose producers this stream waited on.
+        unsafe { stream.copy(&leased) }
     }
 
-    /// Install `rows` commit rows (`[slot, mode, task, cache, logical,
-    /// sampling, visible, penalties]` each) into the slot state: the launch
-    /// of the commit graph of the smallest decode bucket holding them, or
-    /// the runner's `commit` where no graph serves.
-    pub(crate) fn commit(&mut self, rows: &[[i64; 8]]) -> Result<()> {
+    /// Record the installation of `rows` commit rows (`[slot, mode, task,
+    /// cache, logical, sampling, visible, penalties]` each) into the slot
+    /// state: the launch of the commit graph of the smallest decode bucket
+    /// holding them, or the runner's `commit` where no graph serves.
+    ///
+    /// Before the runner is sealed, a bucket without a graph commits
+    /// eagerly and captures it: the bucket's key is returned, and the job's
+    /// completion carries the graph for [`Self::complete_commit`].
+    pub(crate) fn commit(&self, rows: &[[i64; 8]], job: &Job<'_>) -> Result<Option<ShapeKey>> {
         if rows.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let capacity = self.buffers.dimensions.rows;
         if rows.len() > capacity {
@@ -1180,34 +1161,19 @@ impl CausalLMRunner {
                     .collect()
             })
             .collect();
-        match &self.stream {
-            Some(stream) => {
-                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                for (field, values) in fields.iter().enumerate() {
-                    let source = bytes(values);
-                    batch.push(
-                        base + (8 * capacity * field) as u64,
-                        source.as_ptr() as u64,
-                        source.len(),
-                    );
-                }
-                // SAFETY: distinct rows of the commit column; sources are
-                // read during the call.
-                unsafe { batch.submit(stream) }?;
-            }
-            None => {
-                for (field, values) in fields.iter().enumerate() {
-                    // SAFETY: a host column of this binding.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            values.as_ptr(),
-                            (base + (8 * capacity * field) as u64) as *mut i64,
-                            values.len(),
-                        );
-                    }
-                }
-            }
+        let stream = job.on(self.stream.as_ref());
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        for (field, values) in fields.iter().enumerate() {
+            let source = bytes(values);
+            batch.push(
+                base + (8 * capacity * field) as u64,
+                source.as_ptr() as u64,
+                source.len(),
+            );
         }
+        // SAFETY: distinct rows of the commit column; sources are read
+        // during the call.
+        unsafe { stream.copy(&batch) }?;
 
         let method = || -> Result<MethodCall> {
             let mut arguments = vec![count.into()];
@@ -1215,20 +1181,28 @@ impl CausalLMRunner {
             Ok(self.methods.call(&self.functions.commit, arguments))
         };
         let Some(key) = key else {
-            return method()?.invoke().map(drop);
+            job.call(method()?);
+            return Ok(None);
         };
         if let Lookup::Replay(graph) = self.graphs.lookup(&key, None)? {
-            let stream = self
-                .stream
-                .as_ref()
-                .ok_or(Error::State("a graph is launched on a CUDA stream"))?;
-            return graph.launch(stream);
+            stream.launch(graph)?;
+            return Ok(None);
         }
         // The eager commit installs these rows and compiles the kernel;
         // the capture records without executing.
-        method()?.invoke()?;
-        let graph = self.capture(method()?)?;
-        self.graphs.insert(key, None, graph)
+        job.call(method()?);
+        job.capture(self.capture(method()?)?);
+        Ok(Some(key))
+    }
+
+    /// Store the commit graph the job of [`Self::commit`] captured for
+    /// `key`.
+    pub(crate) fn complete_commit(
+        &mut self,
+        key: ShapeKey,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        self.graphs.insert(key, None, completion.captured()?)
     }
 
     /// Release the graphs. The caller drained the lane.

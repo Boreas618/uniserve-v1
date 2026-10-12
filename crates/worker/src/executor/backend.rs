@@ -5,9 +5,10 @@
 //! rank. It owns the request pool, the request storage owners (through
 //! [`RequestStorage`]) and the placed components with their bindings, and
 //! dispatches each batch's calls to the capability runtime that serves them
-//! ([`super::forward`]). Lifecycle commands (Start, Finish, Free), batch
-//! admission, dependencies, retirement and result delivery are handled
-//! here for every batch, with or without calls.
+//! ([`super::forward`]), whose forward it runs as jobs of the batch's lane.
+//! Lifecycle commands (Start, Finish, Free), batch admission, dependencies,
+//! retirement and result delivery are handled here for every batch, with or
+//! without calls.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use crate::error::WorkerError;
 use crate::ffi::Function;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
-use crate::lane::JobQueues;
+use crate::lane::{Job, JobQueues};
 use crate::model::registry::Components;
 use crate::profiling::kernels::KernelRecord;
 use crate::profiling::kernels::KernelRecords;
@@ -79,8 +80,10 @@ pub struct WorkerBackend {
     image_order: Vec<(ImageRunner, String)>,
     /// The runner of each diffusion LM component placed on the rank.
     diffusion_lm: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
-    /// The expert-parallel runtime, on ranks of an expert union.
-    experts: Option<crate::parallel::ExpertUnion>,
+    /// This rank's member of its expert union, shared with the jobs that
+    /// run an expert step: the lane's execution thread agrees on the step
+    /// and runs it.
+    experts: Option<Arc<crate::parallel::ExpertUnion>>,
     /// Distributed expert weights, on ranks that prefetch them.
     weights: Option<crate::parallel::DwdpManager>,
     /// The transfer runtime: tensor transfers, KV exports and installs, and
@@ -101,8 +104,7 @@ pub struct WorkerBackend {
     components: Components,
     profiler: Option<Profiler>,
     kernels: Option<KernelWatch>,
-    /// The lanes' job queues: each forward's submission runs on the
-    /// execution thread of its lane.
+    /// The lanes' job queues: each forward runs as jobs of its lane.
     jobs: JobQueues,
 }
 
@@ -115,7 +117,7 @@ pub(crate) struct Parts<'a> {
     pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
     pub image: Option<ImageParts<'a>>,
     pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
-    pub experts: Option<&'a crate::parallel::ExpertUnion>,
+    pub experts: Option<&'a Arc<crate::parallel::ExpertUnion>>,
     pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
 }
 
@@ -184,6 +186,16 @@ pub struct WorkerBatch {
     /// The accepted state call each call follows, by call.
     predecessors: Vec<Option<CallId>>,
     retirement: Retirement,
+    /// Where the batch's forward stands between its jobs.
+    stage: forward::Stage,
+    /// What a forward that issues itself kept for its submitter: how the
+    /// completion of the imported inputs, or a forward inside a converted
+    /// batch, ended.
+    issued: Option<Result<()>>,
+    /// How the forward of a capability not yet converted ended.
+    executed: Option<std::result::Result<(), WorkerError>>,
+    /// A token batch between its jobs.
+    tokens: Option<crate::runner::causal_lm::Pending>,
     /// A capability runtime's launched work awaiting materialization.
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
@@ -202,6 +214,10 @@ impl WorkerBatch {
             plan,
             predecessors: Vec::new(),
             retirement,
+            stage: forward::Stage::default(),
+            issued: None,
+            executed: None,
+            tokens: None,
             running: None,
             image_inputs: None,
             inputs: forward::inputs::Inputs::default(),
@@ -237,6 +253,43 @@ impl WorkerBatch {
                 call_id: call.call_id,
             })
             .collect()
+    }
+
+    pub(crate) fn stage(&self) -> forward::Stage {
+        self.stage
+    }
+
+    pub(crate) fn set_stage(&mut self, stage: forward::Stage) {
+        self.stage = stage;
+    }
+
+    /// Keep how a forward that issued itself ended, for its submitter.
+    pub(crate) fn set_issued(&mut self, issued: Result<()>) {
+        self.issued = Some(issued);
+    }
+
+    pub(crate) fn take_issued(&mut self) -> Option<Result<()>> {
+        self.issued.take()
+    }
+
+    pub(crate) fn set_executed(&mut self, executed: std::result::Result<(), WorkerError>) {
+        self.executed = Some(executed);
+    }
+
+    pub(crate) fn take_executed(&mut self) -> Option<std::result::Result<(), WorkerError>> {
+        self.executed.take()
+    }
+
+    /// The batch's plan, its token batch between jobs and where a forward
+    /// inside it keeps its result, borrowed apart.
+    pub(crate) fn token_parts(
+        &mut self,
+    ) -> (
+        &BatchPlan,
+        &mut Option<crate::runner::causal_lm::Pending>,
+        &mut Option<Result<()>>,
+    ) {
+        (&self.plan, &mut self.tokens, &mut self.issued)
     }
 
     /// Set the batch's result; capability runtimes call this once their
@@ -320,31 +373,25 @@ impl WorkerBackend {
         self.jobs = jobs;
     }
 
-    /// Issue one batch's forward: complete its imported inputs, then run
-    /// its calls on the runtime serving `kind`.
-    fn submit_forward(
+    /// Run the jobs of one stage of a batch's forward on its lane: the
+    /// lane's execution thread issues everything the forward puts on the
+    /// stream. Between two jobs this thread applies a completion and
+    /// prepares the next job; it waits for each.
+    fn forward(
         &mut self,
         batch: &mut WorkerBatch,
         kind: CallKind,
+        stage: forward::Stage,
     ) -> std::result::Result<(), WorkerError> {
-        // Imported values become resident before the runtime consumes them
-        // like local ones; an import that failed fails the batch's calls.
-        if let Err(error) = forward::inputs::complete(self, batch) {
-            forward::fail(self, batch, error, "input import")?;
-            self.release_predecessors(batch, true)?;
-            return Ok(());
+        let lanes = self.jobs.clone();
+        while batch.stage() == stage {
+            // A stage that needs nothing of the lane advances without a job.
+            let Some(job) = forward::forward(self, batch, kind)? else {
+                continue;
+            };
+            let completion = lanes.submit(kind, job).map_err(lane_lost)?;
+            forward::complete(self, batch, kind, completion)?;
         }
-
-        // Each executed batch with calls is one profiler step.
-        let mut profiler = self.profiler.take();
-        let executed = match &mut profiler {
-            Some(profiler) => profiler.step(|| forward::execute(self, batch, kind)),
-            None => forward::execute(self, batch, kind),
-        };
-        self.profiler = profiler;
-        self.report_new_kernels();
-        executed?;
-        self.release_predecessors(batch, true)?;
         Ok(())
     }
 
@@ -491,7 +538,7 @@ impl WorkerBackend {
 
     /// Install the expert-parallel runtime.
     pub(crate) fn set_experts(&mut self, experts: crate::parallel::ExpertUnion) {
-        self.experts = Some(experts);
+        self.experts = Some(Arc::new(experts));
     }
 
     /// Install the distributed expert weights.
@@ -499,20 +546,35 @@ impl WorkerBackend {
         self.weights = Some(weights);
     }
 
-    pub(crate) fn experts(&self) -> Option<&crate::parallel::ExpertUnion> {
+    pub(crate) fn experts(&self) -> Option<&Arc<crate::parallel::ExpertUnion>> {
         self.experts.as_ref()
     }
 
-    pub(crate) fn experts_mut(&mut self) -> Option<&mut crate::parallel::ExpertUnion> {
-        self.experts.as_mut()
+    /// The member, to change it between jobs: a job holds it only until
+    /// its completion is posted, so holding it now is an error, not a
+    /// reason to skip the change.
+    pub(crate) fn experts_mut(&mut self) -> Result<Option<&mut crate::parallel::ExpertUnion>> {
+        match &mut self.experts {
+            Some(experts) => Arc::get_mut(experts)
+                .map(Some)
+                .ok_or(Error::State("the expert union is held by a job")),
+            None => Ok(None),
+        }
+    }
+
+    /// The lanes' job queues, for work that runs as jobs outside a batch
+    /// (warmup captures).
+    pub(crate) fn job_queues(&self) -> &JobQueues {
+        &self.jobs
     }
 
     /// Release the expert runtime after the bindings and graphs using its
     /// transports retired; collective unless `aborted`.
     pub(crate) fn close_experts(&mut self, aborted: bool) -> Result<()> {
-        let experts = match &mut self.experts {
-            Some(experts) => experts.close(aborted),
-            None => Ok(()),
+        let experts = match self.experts_mut() {
+            Ok(Some(experts)) => experts.close(aborted),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
         };
         let weights = match &mut self.weights {
             Some(weights) => weights.close(aborted),
@@ -1079,11 +1141,25 @@ impl Backend for WorkerBackend {
             return Ok(());
         };
 
-        // The forward's submission is one job of its lane: the lane's
-        // execution thread issues everything the forward puts on the
-        // stream, and this thread waits for it.
-        let jobs = self.jobs.clone();
-        jobs.run(kind, || self.submit_forward(batch, kind))
+        // Imported values become resident before the runtime consumes them
+        // like local ones; an import that failed fails the batch's calls.
+        self.forward(batch, kind, forward::Stage::Inputs)?;
+        if batch.stage() == forward::Stage::Done {
+            self.release_predecessors(batch, true)?;
+            return Ok(());
+        }
+
+        // Each executed batch with calls is one profiler step.
+        let mut profiler = self.profiler.take();
+        let executed = match &mut profiler {
+            Some(profiler) => profiler.step(|| self.forward(batch, kind, forward::Stage::Forward)),
+            None => self.forward(batch, kind, forward::Stage::Forward),
+        };
+        self.profiler = profiler;
+        self.report_new_kernels();
+        executed?;
+        self.release_predecessors(batch, true)?;
+        Ok(())
     }
 
     fn begin_retirement(
@@ -1265,8 +1341,19 @@ impl ServiceBackend for WorkerBackend {
 
     fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
         // A join launches on the lane the union's forwards run on.
-        self.jobs.run(CallKind::Forward(ForwardMode::Decode), || {
-            crate::parallel::join_step(self, leaving)
-        })
+        let mut joined = None;
+        let job = Job::new();
+        job.forward(|| joined = Some(crate::parallel::join_step(self, leaving)));
+        self.jobs
+            .submit(CallKind::Forward(ForwardMode::Decode), job)
+            .map_err(lane_lost)?;
+        joined.unwrap_or_else(|| Err(lane_lost(Error::State("an expert join did not run"))))
     }
+}
+
+/// A lane that no longer performs jobs leaves the rank unable to serve.
+fn lane_lost(error: Error) -> WorkerError {
+    let mut error = WorkerError::classify(error, Some("lane"));
+    error.fatal = true;
+    error
 }

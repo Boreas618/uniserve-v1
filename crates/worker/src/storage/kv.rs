@@ -28,6 +28,7 @@ use super::{BlockTableStorage, BlockTables, GroupTable, KVCacheManager};
 use crate::ffi::Handle;
 use crate::host::HostLane;
 use crate::model::interface::Interface;
+use crate::stream::Issue;
 use crate::transfer::exports::Location;
 use crate::transfer::{
     CacheImporter, ImportCopy, ImportEntry, ImportTask, ImportWorkspace, KVImport, KVImportBackend,
@@ -268,7 +269,7 @@ impl KVCache {
 
     /// Install scheduler page assignments: validate them all, write the
     /// changed rows on `stream`, then commit them on the host.
-    pub fn install(&mut self, assignments: &[BlockTable], stream: Option<&Stream>) -> Result<()> {
+    pub fn install(&mut self, assignments: &[BlockTable], stream: impl Issue) -> Result<()> {
         let update = self.tables.prepare(assignments)?;
         self.storage.install(&update, stream)?;
         self.tables.commit(update);
@@ -281,7 +282,7 @@ impl KVCache {
         &mut self,
         units: &[u32],
         column: &UnitColumn,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         if units.iter().collect::<HashSet<_>>().len() != units.len() {
             return Err(Error::Invalid("recycled KV units repeat a unit".into()));
