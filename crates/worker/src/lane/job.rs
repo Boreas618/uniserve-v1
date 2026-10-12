@@ -35,7 +35,7 @@ use crate::ffi::{DeferredCall, Handle};
 use crate::parallel::joins::GraphFunctions;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::runner::methods::MethodCall;
-use crate::stream::{EventPool, Fill, HostFunction, Issue};
+use crate::stream::{EventPool, Fill, HostFunction, Issue, RowFill};
 use crate::{Error, Result};
 
 /// One item of work submitted to a lane.
@@ -70,6 +70,10 @@ enum Operation<'a> {
     Fill {
         stream: Option<Stream>,
         fill: Fill,
+    },
+    RowFill {
+        stream: Option<Stream>,
+        fill: RowFill,
     },
     Record {
         stream: Stream,
@@ -128,6 +132,8 @@ enum Call<'a> {
     Returning(MethodCall),
     /// A runner method whose returned object the completion carries.
     Handle(MethodCall),
+    /// A function whose returned strings the completion carries.
+    Texts(MethodCall),
     /// A library function over values that are no tensors.
     Function(DeferredCall),
     Capture(Capture),
@@ -217,6 +223,8 @@ pub struct Completion {
     returned: VecDeque<Vec<i64>>,
     /// The object each handle call returned.
     handles: VecDeque<Handle>,
+    /// The strings each text call returned.
+    texts: VecDeque<Vec<String>>,
     /// Where the job stopped, when it did not run to its end.
     failure: Option<Failure>,
 }
@@ -262,6 +270,12 @@ impl Completion {
     /// The object the next handle call returned ([`Job::call_handle`]).
     pub(crate) fn handle(&mut self) -> Result<Handle> {
         self.handles.pop_front().ok_or(MISSING)
+    }
+
+    /// The strings the next text call returned ([`Job::call_texts`]): one
+    /// for a call that returns a string, a list's strings in its order.
+    pub(crate) fn texts(&mut self) -> Result<Vec<String>> {
+        self.texts.pop_front().ok_or(MISSING)
     }
 }
 
@@ -328,6 +342,13 @@ impl<'a> Job<'a> {
     /// ([`Completion::handle`]).
     pub(crate) fn call_handle(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Handle(method)));
+    }
+
+    /// An eager call of a function that returns a string or a list of
+    /// strings (a report the rank passes on), which the job's completion
+    /// carries ([`Completion::texts`]).
+    pub(crate) fn call_texts(&self, function: MethodCall) {
+        self.push(Operation::Call(Call::Texts(function)));
     }
 
     /// The capture of a runner method. Its completion carries the graph.
@@ -434,6 +455,8 @@ impl Operation<'_> {
             // SAFETY: the recorder's caller keeps the destination valid
             // until the fill ran.
             Self::Fill { stream, fill } => unsafe { stream.as_ref().fill(fill) },
+            // SAFETY: as for a fill.
+            Self::RowFill { stream, fill } => unsafe { stream.as_ref().memset_2d(fill) },
             Self::Record { stream, event } => (&stream).record(&event),
             Self::Wait { stream, event } => (&stream).wait(&event),
             Self::Wake {
@@ -508,6 +531,17 @@ impl Call<'_> {
             Self::Handle(method) => {
                 let object = Handle::new(method.invoke()?)?;
                 completion.handles.push_back(object);
+            }
+            Self::Texts(function) => {
+                let name = function.name().to_owned();
+                let value = function.invoke()?;
+                let texts = match tvm_ffi::String::try_from(value.clone()) {
+                    Ok(text) => vec![text.as_str().to_owned()],
+                    Err(_) => {
+                        crate::ffi::texts(value).map_err(|error| Error::numerical(&name, &error))?
+                    }
+                };
+                completion.texts.push_back(texts);
             }
             Self::Function(function) => function.invoke()?,
             Self::Capture(capture) => {
@@ -691,6 +725,14 @@ impl Issue for Recorder<'_, '_> {
 
     unsafe fn fill(&self, fill: Fill) -> Result<()> {
         self.job.push(Operation::Fill {
+            stream: self.owned(),
+            fill,
+        });
+        Ok(())
+    }
+
+    unsafe fn memset_2d(&self, fill: RowFill) -> Result<()> {
+        self.job.push(Operation::RowFill {
             stream: self.owned(),
             fill,
         });
@@ -887,14 +929,26 @@ impl Jobs {
 }
 
 /// Posts one job's completion and fires the control thread's wake.
-struct Post {
+pub(super) struct Post {
     id: JobId,
     completions: Sender<(JobId, Completion)>,
     wake: Option<Wake>,
 }
 
 impl Post {
-    fn now(self, completion: Completion) {
+    pub(super) fn new(
+        id: JobId,
+        completions: Sender<(JobId, Completion)>,
+        wake: Option<Wake>,
+    ) -> Self {
+        Self {
+            id,
+            completions,
+            wake,
+        }
+    }
+
+    pub(super) fn now(self, completion: Completion) {
         // Without a receiver the rank is closing and nobody takes it.
         let _ = self.completions.send((self.id, completion));
         if let Some(wake) = &self.wake {
@@ -998,6 +1052,44 @@ mod tests {
         assert_eq!(seen.load(Ordering::Relaxed), 0);
         job.perform().check().unwrap();
         assert_eq!(seen.load(Ordering::Relaxed), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_fill_writes_its_rows_when_the_job_is_performed() -> Result<()> {
+        // Three rows of four words; the fill covers two words of each of
+        // the first two rows, from the row's second word.
+        let mut words = [0_u32; 12];
+        let job = Job::new();
+        let fill = RowFill {
+            address: (&raw mut words[1]) as u64,
+            pitch: 16,
+            value: 0x3F80_0000,
+            width: 4,
+            count: 2,
+            height: 2,
+        };
+        // SAFETY: the rows lie inside the test's array.
+        unsafe { job.on(None).memset_2d(fill) }?;
+
+        assert_eq!(words, [0; 12]);
+        job.perform().check().unwrap();
+        let one = 0x3F80_0000;
+        assert_eq!(words, [0, one, one, 0, 0, one, one, 0, 0, 0, 0, 0]);
+
+        // The same fill issued at once, on rows of bytes.
+        let mut bytes = [0_u8; 6];
+        let fill = RowFill {
+            address: bytes.as_mut_ptr() as u64,
+            pitch: 3,
+            value: 7,
+            width: 1,
+            count: 2,
+            height: 2,
+        };
+        // SAFETY: the rows lie inside the test's array.
+        unsafe { None::<&Stream>.memset_2d(fill) }?;
+        assert_eq!(bytes, [7, 7, 0, 7, 7, 0]);
         Ok(())
     }
 

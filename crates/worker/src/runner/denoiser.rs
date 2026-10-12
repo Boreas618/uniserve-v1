@@ -52,7 +52,7 @@ use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};
-use crate::runner::methods::{Argument, MethodCall, kernel_records};
+use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::storage::{RequestSlots, SlotField};
 use crate::stream::{Fill, Issue};
@@ -1327,13 +1327,13 @@ impl DenoiserRunner {
 
     /// The kernels the denoiser's and the conditioner's operators selected.
     pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        let mut records = kernel_records(&self.methods.kernels, &self.methods.runner, DENOISER)?;
+        let mut calls = vec![kernels_call(&self.methods.kernels, &self.methods.runner)];
         if let Some(conditioner) = &self.conditioner {
             for runner in conditioner.runners.values() {
-                records.extend(kernel_records(&conditioner.kernels, runner, ENCODER)?);
+                calls.push(kernels_call(&conditioner.kernels, runner));
             }
         }
-        Ok(records)
+        list_kernels(calls)
     }
 
     /// Release graphs and the Python half. An aborted close keeps

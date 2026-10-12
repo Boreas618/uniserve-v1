@@ -43,7 +43,7 @@ use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
-use crate::executor::backend::{KernelWatch, WorkerBackend};
+use crate::executor::backend::WorkerBackend;
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle};
@@ -55,7 +55,7 @@ use crate::model::registry::Components;
 use crate::model::{ComponentMesh, Description, ExpertPartition, LoadedModel, sequence_kind};
 use crate::parallel::world::{World, startup_timeout};
 use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, PeerGroup};
-use crate::profiling::kernels::KernelRecords;
+use crate::profiling::kernels::{KernelRecords, KernelWatch};
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
 use crate::request::video::VideoRequests;
@@ -835,16 +835,7 @@ impl Worker {
             .as_mut()
             .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
         let mut records = KernelRecords::new(&self.interface).map_err(phase("warmup"))?;
-        if let Some(text) = executor.backend().text() {
-            for (label, device, kernels) in text.kernels().map_err(phase("warmup"))? {
-                records.add(&label, &device, &kernels);
-            }
-        }
-        for (label, device, kernels) in executor
-            .backend()
-            .image_kernels()
-            .map_err(phase("warmup"))?
-        {
+        for (label, device, kernels) in executor.backend().kernels().map_err(phase("warmup"))? {
             records.add(&label, &device, &kernels);
         }
         if executor.backend().serves_video() {
@@ -882,13 +873,13 @@ impl Worker {
             .kernel_choices
             .call_as(&[])
             .map_err(phase("warmup"))?;
-        executor.backend_mut().watch_kernels(KernelWatch {
-            choices: self.interface.kernel_choices.clone(),
-            last: choices,
+        executor.backend_mut().watch_kernels(KernelWatch::new(
+            self.interface.kernel_choices.clone(),
+            choices,
             records,
-            rank: self.config.rank,
-            device: self.config.device.to_string(),
-        });
+            self.config.rank,
+            self.config.device.to_string(),
+        ));
         self.graphs.seal();
         Ok(())
     }
