@@ -1354,14 +1354,25 @@ impl ServiceBackend for WorkerBackend {
     }
 
     fn join_expert_step(&self, leaving: bool) -> std::result::Result<(bool, bool), WorkerError> {
+        let experts = self.experts().ok_or_else(|| {
+            WorkerError::classify(
+                Error::State("expert-step participation requires an expert union"),
+                None,
+            )
+        })?;
+
         // A join launches on the lane the union's forwards run on.
-        let mut joined = None;
         let job = Job::new();
-        job.forward(|| joined = Some(crate::parallel::join_step(self, leaving)));
-        self.jobs
+        job.expert_join(Arc::clone(experts), leaving);
+        let completion = self
+            .jobs
             .submit(CallKind::Forward(ForwardMode::Decode), job)
             .map_err(lane_lost)?;
-        joined.unwrap_or_else(|| Err(lane_lost(Error::State("an expert join did not run"))))
+        completion
+            .check()
+            .map_err(|failure| failure.error)
+            .and_then(|mut completion| completion.joined())
+            .map_err(|error| WorkerError::classify(error, Some("expert step")))
     }
 }
 

@@ -15,10 +15,11 @@
 //!   expert layers a join runs with no tokens, and their captured graphs
 //!   (`joins.rs`).
 //!
-//! A runner runs its forwards as expert steps through
-//! [`ExpertUnion::capacity`] and [`ExpertUnion::run`]; between its own
-//! steps, and on expert-only ranks always, the service loop joins the
-//! union's steps ([`join_step`]).
+//! A runner's forwards are expert steps of its lane's jobs, which the
+//! execution thread runs through [`ExpertUnion::capacity`] and
+//! [`ExpertUnion::run`]; between its own steps, and on expert-only ranks
+//! always, the service loop submits a job that joins the union's next step
+//! ([`ExpertUnion::idle`]).
 //!
 //! Every member constructs at the same point of its startup, after loading
 //! and before capacity planning, so the exchanges' device workspaces are
@@ -291,23 +292,6 @@ impl Drop for ExpertUnion {
         // may be inside a collective, so nothing waits.
         let _ = self.close(true);
     }
-}
-
-/// Join the union's next step from the service loop. Returns (ran a step,
-/// every member left the union).
-pub(crate) fn join_step(
-    backend: &WorkerBackend,
-    leaving: bool,
-) -> std::result::Result<(bool, bool), WorkerError> {
-    let experts = backend.experts().ok_or_else(|| {
-        WorkerError::classify(
-            Error::State("expert-step participation requires an expert union"),
-            None,
-        )
-    })?;
-    experts
-        .idle(leaving)
-        .map_err(|error| WorkerError::classify(error, Some("expert step")))
 }
 
 /// What constructing the member borrows from the rank.
