@@ -10,6 +10,7 @@ use uniserve_core::SharedMemory;
 use uniserve_cuda::{DeviceGuard, Event, EventFlags, HostRegistration, Stream};
 
 use crate::ffi::{Backing, Device};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 pub const SHM_HEADER_BYTES: usize = 512;
@@ -117,7 +118,7 @@ pub struct SharedBuffer {
     producer: Option<Stream>,
     bytes: usize,
     submitted: bool,
-    completion: Option<Event>,
+    completion: Option<Arc<Event>>,
 }
 
 impl SharedBuffer {
@@ -186,26 +187,27 @@ impl SharedBuffer {
         self.producer.is_some()
     }
 
-    /// Announce bytes after their last write, either immediately for a CPU
-    /// copy or in the producer's CUDA stream. The callback touches only host
-    /// memory; it neither enters Python nor calls CUDA.
-    /// The caller submits exactly one copy sequence per buffer and must not
-    /// modify its payload after announcing readiness.
-    pub fn mark_ready(&mut self) -> Result<()> {
+    /// Announce bytes after their last write: behind the copies `issue`
+    /// issued on the producer's stream, or in the order of its host writes
+    /// for a CPU copy. The callback touches only host memory; it neither
+    /// enters Python nor calls CUDA.
+    /// The caller issues exactly one copy sequence per buffer, to `issue`,
+    /// and must not modify its payload after announcing readiness.
+    pub fn mark_ready(&mut self, issue: impl Issue) -> Result<()> {
         let mapping = self.mapping()?;
+        let ready = Box::new(move || mapping.word(0).store(READY, Ordering::Release));
 
         if let Some(stream) = &self.producer {
             // A default-stream handle resolves against the current context.
             let _device = DeviceGuard::new(stream.device())?;
-            stream.launch_host_fn(move || mapping.word(0).store(READY, Ordering::Release))?;
+            issue.launch_host_fn(ready)?;
 
-            let completion = Event::new(EventFlags::default());
-            completion.record(stream)?;
+            let completion = Arc::new(Event::new(EventFlags::default()));
+            issue.record(&completion)?;
             self.completion = Some(completion);
             Ok(())
         } else {
-            mapping.word(0).store(READY, Ordering::Release);
-            Ok(())
+            issue.host().launch_host_fn(ready)
         }
     }
 

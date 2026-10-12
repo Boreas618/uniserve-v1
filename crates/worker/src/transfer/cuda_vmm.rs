@@ -21,10 +21,12 @@ use uniserve_ipc::{Locator, TransferTransport};
 use super::endpoint::Endpoint;
 use super::read::{ACKNOWLEDGED, CLAIMED, NativeRead};
 use super::source::{CudaSource, SharedPool, TransportBuffer};
+use super::transport::Staged;
 use super::vmm_pool::{ACK_SLOTS, VmmPool};
 use super::{Capacity, DescriptorGrants, Spans, copy_planner, fetch_descriptor};
 use crate::ffi::{Backing, Device};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
+use crate::stream::Issue;
 use crate::{Error, EventPool, Result};
 
 /// Bytes of one reader acknowledgment word in a pooled chunk's header.
@@ -49,6 +51,8 @@ struct FailedExport {
 /// The outcome of one export attempt.
 pub(crate) enum Exported {
     Located(Box<Locator>),
+    /// The export's bytes are staged for its location (the rank channel).
+    Staged(Box<Staged>),
     /// The payload does not fit the device's export pool; another mechanism
     /// that reaches the consumers may carry it.
     PoolExhausted,
@@ -116,12 +120,15 @@ impl CudaExports {
     pub(crate) fn export(
         &self,
         source: &Spans,
-        stream: &Stream,
+        issue: impl Issue,
         consumers: &[usize],
         capacity: &Arc<Capacity>,
         events: &EventPool,
         locate: impl FnOnce(TransferTransport) -> Result<Locator>,
     ) -> Result<Exported> {
+        let stream = issue
+            .stream()
+            .ok_or_else(|| Error::Invalid("a device export requires its producer stream".into()))?;
         let Device::Cuda(device) = source.device() else {
             return Err(Error::Invalid(
                 "cuda_vmm transport requires a CUDA tensor".into(),
@@ -155,7 +162,7 @@ impl CudaExports {
                 }
                 None => {
                     let pool = self.pool(device)?;
-                    let chunk = lock(&pool.pool).reserve(nbytes as usize, stream)?;
+                    let chunk = lock(&pool.pool).reserve(nbytes as usize, issue)?;
                     let Some(chunk) = chunk else {
                         return Ok(None);
                     };
@@ -179,7 +186,7 @@ impl CudaExports {
                     state.submitted = true;
                     // SAFETY: the chunk stays reserved and the producer's spans
                     // stay retained (`copied`) until the export retires.
-                    unsafe { plan.submit(stream) }?;
+                    unsafe { issue.copy_strided(&plan) }?;
                     state.copied = Some(source.clone());
                     (
                         payload,
@@ -194,9 +201,9 @@ impl CudaExports {
             // readiness before sending their allocation handle to readers.
             if self.cross_host {
                 let _range = crate::profiling::range(c"vmm_export_synchronize", None);
-                stream.synchronize()?;
+                issue.synchronize()?;
             }
-            let ready = events.fence(stream, !self.cross_host)?;
+            let ready = events.fence(issue, !self.cross_host)?;
             state.event = Some(Arc::clone(&ready));
             if let Ok(bytes) = <[u8; 4]>::try_from(handle.as_slice()) {
                 let grants = self.grants()?;

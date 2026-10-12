@@ -1195,13 +1195,14 @@ fn plan(
     };
     let capacity = match video {
         Some(video) => {
+            let sampling = launch.components.contains_key(&video.denoiser);
             let denoising = components.get(&video.denoiser).is_some();
             let decoding = components
                 .placed()
                 .iter()
                 .any(|placed| placed.has(Capability::VideoDecoder));
             Some(crate::capacity::video::plan(
-                video, config, denoising, decoding,
+                video, config, sampling, denoising, decoding,
             )?)
         }
         None => None,

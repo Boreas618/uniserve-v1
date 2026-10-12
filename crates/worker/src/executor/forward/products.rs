@@ -45,8 +45,10 @@ impl Publications {
         stream: Option<&Stream>,
         output: &mut PendingOutput,
     ) -> Result<()> {
-        let (export, locations) =
+        // Issued on `stream` at once, so the export is located here.
+        let export =
             tensors.export_buffer(call, product, write, transports, false, None, stream)?;
+        let (export, locations) = tensors.located(write, export)?;
         self.accept(write.id(), locations, export, output)
     }
 

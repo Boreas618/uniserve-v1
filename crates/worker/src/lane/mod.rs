@@ -37,7 +37,7 @@ use crate::config::{Device, WorkerConfig};
 use crate::stream::CUDAStream;
 use crate::{Error, Result};
 
-pub(crate) use job::{Capture, ExpertStep, ExpertVariant, Job};
+pub(crate) use job::{Capture, ExpertStep, ExpertVariant, Job, Recorder};
 pub use job::{Completion, JobId, JobQueue};
 
 /// One execution lane.
