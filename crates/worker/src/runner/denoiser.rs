@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, VideoCondition};
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memcpy_async, memset_d8, memset_d32};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8, memset_d32};
 use uniserve_ipc::{
     Batch as BatchPlan, Call, ConditionTiles, DimBound, LatentParams, OutputInfo, RasterAxes,
     ShapeBound, VideoDenoiserInfo,
@@ -43,17 +43,19 @@ use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::{MediaBatch, Trajectories};
 use crate::executor::forward::batch::{Parts, latent_params, product_name, stream_of};
-use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, export};
+use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::executor::forward::transfer::latents::Pool;
 use crate::ffi::{Backing, DType, Function, Handle, integer_list, integers};
+use crate::lane::Job;
 use crate::model::components::{Capability, Declarations};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};
-use crate::runner::methods::kernel_records;
+use crate::runner::methods::{Argument, MethodCall, kernel_records};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::storage::{RequestSlots, SlotField};
+use crate::stream::{Fill, Issue};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
 
 /// A request's samples occupy at most this many pages, which bounds the
@@ -298,15 +300,15 @@ struct Conditioner {
 
 impl Conditioner {
     /// The arguments of `EncoderRunner.encode` at `capacity`.
-    fn arguments(&self, capacity: u32) -> Result<Vec<Any>> {
+    fn arguments(&self, capacity: u32) -> Result<Vec<Argument>> {
         let runner = self.runners.get(&capacity).ok_or_else(|| {
             Error::Invariant(format!("no text conditioner serves capacity {capacity}"))
         })?;
         Ok(vec![
-            runner.to_any(),
-            Any::from(self.input.prefix(i64::from(capacity))?.to_tensor()?),
-            Any::from(self.lengths.to_tensor()?),
-            Any::from(self.output.prefix(i64::from(capacity))?.to_tensor()?),
+            Argument::Handle(runner.clone()),
+            Argument::Tensor(self.input.prefix(i64::from(capacity))?),
+            Argument::Tensor(self.lengths.clone()),
+            Argument::Tensor(self.output.prefix(i64::from(capacity))?),
         ])
     }
 }
@@ -750,17 +752,19 @@ impl DenoiserRunner {
     /// Draw a request's noise from `seed` and fill its slot's host sources
     /// for its layout: the library's draw fills the slot's pinned noise
     /// rows, and `DenoiserRunner.prepare_latents` turns them into the
-    /// request's initial samples and state tables. Host work only.
+    /// request's initial samples and state tables. Host work only, recorded
+    /// into `job` so that it precedes the copies of the slot's sources.
     pub(crate) fn prepare_latents(
         &self,
         id: usize,
         slot: usize,
         size: &VideoSize,
         seed: u64,
+        job: &Job<'_>,
     ) -> Result<()> {
         let layout = self.layout(id)?;
-        let host = |name: String| -> Result<Any> {
-            Ok(Any::from(self.host.slot(&name, slot as u32)?.to_tensor()?))
+        let host = |name: String| -> Result<Argument> {
+            Ok(Argument::Tensor(self.host.slot(&name, slot as u32)?))
         };
         let noise = layout
             .fields
@@ -770,23 +774,24 @@ impl DenoiserRunner {
             .collect::<Result<Vec<_>>>()?;
 
         // The seed's bits; the Python half reads them as unsigned.
+        let runner = Argument::Handle(self.methods.runner.clone());
         let mut draw = vec![
-            self.methods.runner.to_any(),
-            Any::from(seed as i64),
-            layout.handle.to_any(),
+            runner.clone(),
+            Argument::Integer(seed as i64),
+            Argument::Handle(layout.handle.clone()),
         ];
-        draw.extend(size_arguments(size));
+        draw.extend(size_values(size));
         draw.push(host("condition_noise".into())?);
         draw.extend(noise.iter().cloned());
-        self.methods.draw_noise.call_values(&draw)?;
+        job.call(MethodCall::new(&self.methods.draw_noise, draw));
 
-        let mut prepare = vec![self.methods.runner.to_any(), layout.handle.to_any()];
-        prepare.extend(size_arguments(size));
+        let mut prepare = vec![runner, Argument::Handle(layout.handle.clone())];
+        prepare.extend(size_values(size));
         prepare.extend(noise);
         for field in &layout.fields.state {
             prepare.push(host(format!("{}_source", field.name))?);
         }
-        self.methods.prepare_latents.call_values(&prepare)?;
+        job.call(MethodCall::new(&self.methods.prepare_latents, prepare));
         Ok(())
     }
 
@@ -828,6 +833,7 @@ impl DenoiserRunner {
         slot: usize,
         call: &Call,
         params: &LatentParams,
+        job: &Job<'_>,
     ) -> Result<LatentUpdate> {
         let pages = self.slot_pages(slot, params)?;
         self.pool.require_initial(slot, &pages)?;
@@ -853,7 +859,7 @@ impl DenoiserRunner {
         // SAFETY: every destination lies in this slot's pages or rows, which
         // no other request owns; the pinned sources stay allocated for the
         // runner's lifetime and are rewritten only by the slot's next request.
-        unsafe { copies.submit(&self.stream) }?;
+        unsafe { job.on(Some(&self.stream)).copy(&copies) }?;
         LatentUpdate::for_call(slot, call, params)
     }
 
@@ -866,6 +872,7 @@ impl DenoiserRunner {
         slot: usize,
         features: &StorageView,
         count: u64,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
         let layout = self.layout(id)?;
         let (rows, width) = layout.fields.text_condition;
@@ -900,44 +907,49 @@ impl DenoiserRunner {
             buffers.lengths.address(),
             buffers.output.address(),
         );
+        let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
+        let mut prompt = CopyBatch::new(SourceOrder::Stream);
+        prompt.push(input, features.address(), (count * row_bytes) as usize);
         // SAFETY: the conditioner buffers and the slot's rows are owned by
-        // this runner; every range lies inside them and the stream orders
-        // the copies before and after the conditioner.
+        // this runner and the features are leased until the batch commits;
+        // every range lies inside them and the stream orders the copies
+        // before and after the conditioner.
         unsafe {
-            memcpy_async(
-                input,
-                features.address(),
-                (count * row_bytes) as usize,
-                &self.stream,
-            )?;
-            memset_d8(
-                input + count * row_bytes,
-                0,
-                ((u64::from(capacity) - count) * row_bytes) as usize,
-                &self.stream,
-            )?;
-            memset_d32(lengths, count as u32, 1, &self.stream)?;
+            issue.copy(&prompt)?;
+            issue.fill(Fill {
+                address: input + count * row_bytes,
+                value: 0,
+                width: 1,
+                count: ((u64::from(capacity) - count) * row_bytes) as usize,
+            })?;
+            issue.fill(Fill {
+                address: lengths,
+                value: count as u32,
+                width: 4,
+                count: 1,
+            })?;
         }
-        let mode = self.run_conditioner(capacity)?;
+        let mode = self.run_conditioner(capacity, job)?;
+
+        let mut refined = CopyBatch::new(SourceOrder::Stream);
+        refined.push(target.address(), output, (count * output_row) as usize);
         // SAFETY: as above.
         unsafe {
-            memcpy_async(
-                target.address(),
-                output,
-                (count * output_row) as usize,
-                &self.stream,
-            )?;
-            memset_d8(
-                target.address() + count * output_row,
-                0,
-                ((rows - count) * output_row) as usize,
-                &self.stream,
-            )?;
+            issue.copy(&refined)?;
+            issue.fill(Fill {
+                address: target.address() + count * output_row,
+                value: 0,
+                width: 1,
+                count: ((rows - count) * output_row) as usize,
+            })?;
         }
         Ok(mode)
     }
 
-    fn run_conditioner(&mut self, capacity: u32) -> Result<GraphMode> {
+    /// Record the conditioner's forward at `capacity`: the launch of its
+    /// graph or the eager call.
+    fn run_conditioner(&mut self, capacity: u32, job: &Job<'_>) -> Result<GraphMode> {
         let capturing = self.pool_handle.is_some();
         let conditioner = self
             .conditioner
@@ -951,13 +963,14 @@ impl DenoiserRunner {
         };
         let mode = match lookup {
             Lookup::Replay(graph) => {
-                graph.launch(&self.stream)?;
+                job.on(Some(&self.stream)).launch(graph)?;
                 GraphMode::Replay
             }
             Lookup::Capture => {
-                conditioner
-                    .encode
-                    .call_values(&conditioner.arguments(capacity)?)?;
+                job.call(MethodCall::new(
+                    &conditioner.encode,
+                    conditioner.arguments(capacity)?,
+                ));
                 GraphMode::Eager
             }
         };
@@ -975,30 +988,28 @@ impl DenoiserRunner {
         slot: usize,
         size: &VideoSize,
         latents: &[Vec<StorageView>],
+        job: &Job<'_>,
     ) -> Result<()> {
         let layout = self.layout(id)?;
-        let mut arguments = vec![self.methods.runner.to_any(), layout.handle.to_any()];
-        arguments.extend(size_arguments(size));
-        arguments.push(Any::from(
-            self.host
-                .slot("condition_noise", slot as u32)?
-                .to_tensor()?,
+        let mut arguments = vec![
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Handle(layout.handle.clone()),
+        ];
+        arguments.extend(size_values(size));
+        arguments.push(Argument::Tensor(
+            self.host.slot("condition_noise", slot as u32)?,
         ));
-        arguments.push(Any::from(
-            self.banks
-                .slot("text_condition", slot as u32)?
-                .to_tensor()?,
+        arguments.push(Argument::Tensor(
+            self.banks.slot("text_condition", slot as u32)?,
         ));
-        arguments.push(Any::from(integer_list(
-            latents.iter().map(|parts| parts.len() as i64),
-        )));
+        arguments.push(Argument::Integers(
+            latents.iter().map(|parts| parts.len() as i64).collect(),
+        ));
         for part in latents.iter().flatten() {
-            arguments.push(Any::from(part.to_tensor()?));
+            arguments.push(Argument::Tensor(part.clone()));
         }
-        self.methods
-            .encode_conditions
-            .call_values(&arguments)
-            .map(drop)
+        job.call(MethodCall::new(&self.methods.encode_conditions, arguments));
+        Ok(())
     }
 
     /// Advance a request's trajectory by one solver step and return its
@@ -1010,6 +1021,7 @@ impl DenoiserRunner {
         slot: usize,
         call: &Call,
         params: &LatentParams,
+        job: &Job<'_>,
     ) -> Result<(LatentUpdate, GraphMode)> {
         if params.step_count != 1 {
             return Err(Error::Invalid(
@@ -1050,30 +1062,41 @@ impl DenoiserRunner {
                 bytes as usize,
             );
         }
+        let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
         // SAFETY: the scratch, state buffers, slot rows and pages are owned by
         // this runner; steps of the runner are ordered on its stream.
         unsafe {
-            gather.submit(&self.stream)?;
-            memset_d32(self.step.address(), params.start_step, 1, &self.stream)?;
-            memset_d32(self.step.address() + 4, 0, 1, &self.stream)?;
+            issue.copy(&gather)?;
+            issue.fill(Fill {
+                address: self.step.address(),
+                value: params.start_step,
+                width: 4,
+                count: 1,
+            })?;
+            issue.fill(Fill {
+                address: self.step.address() + 4,
+                value: 0,
+                width: 4,
+                count: 1,
+            })?;
         }
 
-        let mode = self.run_step(id)?;
+        let mode = self.run_step(id, job)?;
 
+        let mut scatter = CopyBatch::new(SourceOrder::Stream);
+        scatter.push(
+            self.bank_address(write, first)?,
+            self.samples.address(),
+            (layout_pages * page_bytes) as usize,
+        );
         // SAFETY: as above; the scatter follows the step on the stream.
-        unsafe {
-            memcpy_async(
-                self.bank_address(write, first)?,
-                self.samples.address(),
-                (layout_pages * page_bytes) as usize,
-                &self.stream,
-            )?;
-        }
+        unsafe { issue.copy(&scatter) }?;
         Ok((LatentUpdate::for_call(slot, call, params)?, mode))
     }
 
     /// The arguments of `DenoiserRunner.denoise` for a layout.
-    fn step_arguments(&self, id: usize) -> Result<Vec<Any>> {
+    fn step_arguments(&self, id: usize) -> Result<Vec<Argument>> {
         let layout = self.layout(id)?;
         let text = self
             .envelope
@@ -1082,28 +1105,29 @@ impl DenoiserRunner {
             .position(|field| field.name == "text_condition")
             .ok_or_else(|| Error::Invariant("the envelope lacks text conditioning".into()))?;
         let mut arguments = vec![
-            self.methods.runner.to_any(),
-            layout.handle.to_any(),
-            Any::from(self.step.to_tensor()?),
-            Any::from(self.state[text].to_tensor()?),
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Handle(layout.handle.clone()),
+            Argument::Tensor(self.step.clone()),
+            Argument::Tensor(self.state[text].clone()),
         ];
-        for tensor in &layout.tensors {
-            arguments.push(Any::from(tensor.to_tensor()?));
-        }
+        arguments.extend(layout.tensors.iter().cloned().map(Argument::Tensor));
         Ok(arguments)
     }
 
-    fn run_step(&mut self, id: usize) -> Result<GraphMode> {
+    /// Record a solver step of layout `id`: the launch of its graph or the
+    /// eager call.
+    fn run_step(&mut self, id: usize, job: &Job<'_>) -> Result<GraphMode> {
         let mode = match self.graphs.lookup(&id, None) {
             Ok(Lookup::Replay(graph)) => {
-                graph.launch(&self.stream)?;
+                job.on(Some(&self.stream)).launch(graph)?;
                 GraphMode::Replay
             }
             // Transient layouts and uncaptured startup layouts run eagerly.
             _ => {
-                self.methods
-                    .denoise
-                    .call_values(&self.step_arguments(id)?)?;
+                job.call(MethodCall::new(
+                    &self.methods.denoise,
+                    self.step_arguments(id)?,
+                ));
                 GraphMode::Eager
             }
         };
@@ -1216,9 +1240,7 @@ impl DenoiserRunner {
             )?;
             memset_d32(self.step.address(), 0, 2, &self.stream)?;
         }
-        self.methods
-            .denoise
-            .call_values(&self.step_arguments(id)?)?;
+        MethodCall::new(&self.methods.denoise, self.step_arguments(id)?).invoke()?;
         self.layout_mut(id)?.phase = Phase::Warmed;
         self.stream.synchronize()?;
         Ok(())
@@ -1238,11 +1260,11 @@ impl DenoiserRunner {
         if self.graphs.contains(&id, None) {
             return Ok(false);
         }
-        let arguments = self.step_arguments(id)?;
+        let step = MethodCall::new(&self.methods.denoise, self.step_arguments(id)?);
         let graph = self
             .capture
             .capture(&pool.value, self.stream.raw(), self.device, || {
-                self.methods.denoise.call_values(&arguments).map(drop)
+                step.invoke().map(drop)
             })?;
         self.graphs.insert(id, None, graph)?;
         self.graphs.record(GraphMode::Capture);
@@ -1269,20 +1291,18 @@ impl DenoiserRunner {
         for &capacity in &capacities {
             // SAFETY: as above.
             unsafe { memset_d32(conditioner.lengths.address(), capacity, 1, &self.stream)? };
-            conditioner
-                .encode
-                .call_values(&conditioner.arguments(capacity)?)?;
+            MethodCall::new(&conditioner.encode, conditioner.arguments(capacity)?).invoke()?;
         }
         self.stream.synchronize()?;
         let (true, Some(pool)) = (capture, &self.pool_handle) else {
             return Ok(());
         };
         for capacity in capacities {
-            let arguments = conditioner.arguments(capacity)?;
+            let encode = MethodCall::new(&conditioner.encode, conditioner.arguments(capacity)?);
             let graph =
                 self.capture
                     .capture(&pool.value, self.stream.raw(), self.device, || {
-                        conditioner.encode.call_values(&arguments).map(drop)
+                        encode.invoke().map(drop)
                     })?;
             conditioner.graphs.insert(capacity, None, graph)?;
         }
@@ -1342,6 +1362,7 @@ pub(crate) fn prepare(
     batch: &mut MediaBatch,
     index: usize,
     slot: usize,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let params = latent_params(plan, call)?;
@@ -1364,18 +1385,14 @@ pub(crate) fn prepare(
     }
     let store = parts.owners().store;
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let device = batch.device;
-    let features =
-        batch
-            .inputs
-            .read(store, &call.inputs[0], call.call_id, device, Some(&stream))?;
+    let features = batch
+        .inputs
+        .read(store, &call.inputs[0], call.call_id, device, issue)?;
     let conditions: Vec<Arc<crate::ProductRead>> = call.inputs[1..]
         .iter()
-        .map(|input| {
-            batch
-                .inputs
-                .read(store, input, call.call_id, device, Some(&stream))
-        })
+        .map(|input| batch.inputs.read(store, input, call.call_id, device, issue))
         .collect::<Result<_>>()?;
     let denoiser = parts
         .denoisers
@@ -1383,8 +1400,10 @@ pub(crate) fn prepare(
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
     // The request's noise and the host sources its slot is initialized from.
-    denoiser.runner.prepare_latents(id, slot, &size, seed)?;
-    let update = denoiser.runner.initialize(id, slot, call, params)?;
+    denoiser
+        .runner
+        .prepare_latents(id, slot, &size, seed, job)?;
+    let update = denoiser.runner.initialize(id, slot, call, params, job)?;
     let value = features.value();
     let count = u64::from(size.tokens);
     if value.shape().first().copied() != Some(count as i64) {
@@ -1392,7 +1411,7 @@ pub(crate) fn prepare(
             "prompt features disagree with the request's prompt".into(),
         ));
     }
-    let mode = denoiser.runner.condition(id, slot, value, count)?;
+    let mode = denoiser.runner.condition(id, slot, value, count, job)?;
     batch.record(mode);
     if conditioned {
         let request = parts.video.request(slot, call.request_key)?;
@@ -1404,7 +1423,7 @@ pub(crate) fn prepare(
             .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
         denoiser
             .runner
-            .encode_conditions(id, slot, &size, &latents)?;
+            .encode_conditions(id, slot, &size, &latents, job)?;
     }
     batch.calls[index].latent = Some(update);
     Ok(())
@@ -1514,6 +1533,7 @@ pub(crate) fn denoise(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let params = latent_params(plan, call)?;
@@ -1533,7 +1553,7 @@ pub(crate) fn denoise(
         .video
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-    let (update, mode) = denoiser.runner.denoise(id, slot, call, params)?;
+    let (update, mode) = denoiser.runner.denoise(id, slot, call, params, job)?;
     batch.record(mode);
     batch.calls[index].latent = Some(update);
     if call.outputs.is_empty() {
@@ -1578,10 +1598,9 @@ pub(crate) fn denoise(
             .next()
             .ok_or_else(|| Error::Invariant("a latent product was not bound".into()))?;
         batch.calls[index].writes.push(write.clone());
-        owners.store.write(&write, sample, Some(&stream), None)?;
-        let (exported, locations) =
-            export(owners, call, output, &write, false, None, Some(&stream))?;
-        batch.calls[index].publish(write.id(), locations, exported)?;
+        let issue = job.on(Some(&stream));
+        owners.store.write(&write, sample, issue, None)?;
+        batch.calls[index].export(owners, call, output, &write, false, issue)?;
     }
     Ok(())
 }
@@ -2332,6 +2351,16 @@ pub(crate) fn size_arguments(size: &VideoSize) -> Vec<Any> {
         size.descriptor(),
         size.conditions_descriptor(),
         size.spans_descriptor(),
+    ]
+}
+
+/// A size as the arguments of a recorded call: what [`size_arguments`]
+/// passes, each list as its integers.
+fn size_values(size: &VideoSize) -> [Argument; 3] {
+    [
+        Argument::Integers(size.values()),
+        Argument::Integers(size.condition_values()),
+        Argument::Integers(size.span_values()),
     ]
 }
 
