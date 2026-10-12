@@ -69,6 +69,15 @@ pub(crate) trait Trajectories {
     fn apply(&mut self, updates: &[LatentUpdate]);
 }
 
+/// What a batch's issued commit leaves to apply once its work was
+/// performed: the writes to make visible, the trajectory commits and the
+/// calls to record as pending.
+pub(crate) struct Commit {
+    writes: Vec<ProductBuffer>,
+    updates: Vec<LatentUpdate>,
+    pending: Vec<(RequestKey, uniserve_core::CallId, bool)>,
+}
+
 /// One call of the batch.
 pub(crate) struct CallState {
     pub(crate) pending: PendingOutput,
@@ -253,25 +262,48 @@ impl MediaBatch {
         }
     }
 
-    /// Commit the launched batch: end its leases, write completion scalars,
-    /// make writes visible, apply trajectory commits to `trajectories` and
-    /// record the calls as pending.
+    /// Commit the launched batch on its stream at once: issue the commit
+    /// and apply it.
     pub(crate) fn commit(
         &mut self,
         plan: &BatchPlan,
         owners: ProductOwners<'_>,
         requests: &mut RequestPool,
-        mut trajectories: Option<&mut dyn Trajectories>,
+        trajectories: Option<&mut dyn Trajectories>,
     ) -> Result<()> {
-        let stream = self.stream.as_ref();
+        let stream = self.stream.clone();
+        let commit = self.issue_commit(
+            plan,
+            owners,
+            requests,
+            trajectories.as_deref(),
+            stream.as_ref(),
+        )?;
+        self.apply_commit(commit, owners, requests, trajectories)
+    }
+
+    /// Issue the device half of the batch's commit to `stream`, behind its
+    /// forwards: end its leases, write completion scalars and seal its
+    /// output. Every owner but the exports checks its update first, so the
+    /// returned commit is applied once that work was performed
+    /// ([`MediaBatch::apply_commit`]).
+    pub(crate) fn issue_commit(
+        &mut self,
+        plan: &BatchPlan,
+        owners: ProductOwners<'_>,
+        requests: &RequestPool,
+        trajectories: Option<&dyn Trajectories>,
+        stream: impl Issue,
+    ) -> Result<Commit> {
         self.inputs.complete(owners.store, stream)?;
-        for call in &mut self.calls {
+        for call in &self.calls {
             if let Some(completion) = &call.completion {
                 // Skipped calls forward a false decision to their successor.
                 let value = Scalar::Int(i64::from(!call.skipped));
                 owners.store.write_scalar(completion, value, stream)?;
             }
         }
+
         let writes: Vec<ProductBuffer> = self
             .calls
             .iter()
@@ -279,16 +311,12 @@ impl MediaBatch {
             .cloned()
             .collect();
         owners.store.validate_writes(&writes)?;
-        for call in &mut self.calls {
-            call.locate(owners.store)?;
-            call.publications.validate(owners.store)?;
-        }
         let updates: Vec<LatentUpdate> = self
             .calls
             .iter()
             .filter_map(|call| call.latent.clone())
             .collect();
-        match &trajectories {
+        match trajectories {
             Some(pool) => pool.validate(&updates)?,
             None if updates.is_empty() => {}
             None => {
@@ -304,6 +332,54 @@ impl MediaBatch {
             .collect();
         requests.validate_pending(&pending)?;
 
+        // A lease of host storage is sealed on no stream.
+        let streams = if stream.stream().is_some() {
+            vec![stream]
+        } else {
+            Vec::new()
+        };
+        let fences = lock(&self.output)
+            .seal(&streams, owners.events)?
+            .unwrap_or_default();
+        for fence in &fences {
+            stream.wake(owners.events, fence)?;
+        }
+        let finished = Arc::clone(&self.output);
+        owners.events.defer(
+            fences,
+            Box::new(move || {
+                lock(&finished).copies_finished();
+                Ok(())
+            }),
+        )?;
+
+        Ok(Commit {
+            writes,
+            updates,
+            pending,
+        })
+    }
+
+    /// Apply an issued commit once its work was performed: publish the
+    /// calls' exports, make writes visible, apply trajectory commits to
+    /// `trajectories` and record the calls as pending.
+    pub(crate) fn apply_commit(
+        &mut self,
+        commit: Commit,
+        owners: ProductOwners<'_>,
+        requests: &mut RequestPool,
+        mut trajectories: Option<&mut dyn Trajectories>,
+    ) -> Result<()> {
+        let Commit {
+            writes,
+            updates,
+            pending,
+        } = commit;
+        for call in &mut self.calls {
+            call.locate(owners.store)?;
+            call.publications.validate(owners.store)?;
+        }
+
         // Every owner accepted its update; failures from here on are fatal.
         self.committed = true;
         owners.store.commit_writes(&writes)?;
@@ -318,26 +394,7 @@ impl MediaBatch {
                 call.pending.apply_latent_update(&update);
             }
         }
-        requests.add_pending(&pending)?;
-
-        let fences = {
-            let mut output = lock(&self.output);
-            let streams: Vec<&Stream> = stream.into_iter().collect();
-            output.seal(&streams, owners.events)?
-        };
-        let fences = fences.unwrap_or_default();
-        for fence in &fences {
-            owners.events.wake_after(fence)?;
-        }
-        let finished = Arc::clone(&self.output);
-        owners.events.defer(
-            fences,
-            Box::new(move || {
-                lock(&finished).copies_finished();
-                Ok(())
-            }),
-        )?;
-        Ok(())
+        requests.add_pending(&pending)
     }
 
     /// Advance completion: publish what finished host tasks wrote, then
