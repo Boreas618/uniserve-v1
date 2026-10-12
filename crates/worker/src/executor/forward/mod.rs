@@ -15,12 +15,12 @@
 //! not been integrated reports its call kind as unsupported, which fails
 //! the batch with `UnsupportedSetup` and leaves the rank serving.
 //!
-//! A text batch's jobs are operations its runner recorded, and so are a
-//! video model's media batches (`batch::forward`): its encoders, its
-//! denoiser, its decoders and its host calls. The forward of
-//! every other capability, and the completion of imported inputs, still
-//! issue their own stream work: each is one job holding that work as
-//! [`Job::forward`], until its capability is converted.
+//! The jobs of a text batch, of a diffusion LM batch, of a transfer batch,
+//! of a video model's media batches (`batch::forward`: its encoders, its
+//! denoiser, its decoders and its host calls) and of the completion of
+//! imported inputs are operations their owners recorded. The forward of
+//! every other capability still issues its own stream work: it is one job
+//! holding that work as [`Job::forward`], until the capability is converted.
 
 pub(crate) mod batch;
 pub(crate) mod inputs;
@@ -131,25 +131,20 @@ pub(crate) fn forward<'a>(
     use CallKind::Forward;
 
     match batch.stage() {
-        Stage::Inputs if batch.plan().input_products.is_empty() => {
-            // Nothing was imported: what remains is a check of resident
-            // KV descriptors, which issues nothing.
-            let completed = inputs::complete(backend, batch);
-            imported(backend, batch, completed)?;
-            Ok(None)
-        }
-        Stage::Inputs => {
-            let job = Job::new();
-            job.forward(move || {
-                let completed = inputs::complete(backend, batch);
-                batch.set_issued(completed);
-            });
-            Ok(Some(job))
-        }
+        Stage::Inputs => match inputs::forward(backend, batch) {
+            Ok(Some(job)) => Ok(Some(job)),
+            // Nothing is left to issue for the imports.
+            Ok(None) => imported(backend, batch, Ok(())).map(|()| None),
+            Err(error) => imported(backend, batch, Err(error)).map(|()| None),
+        },
         Stage::Forward => match kind {
             Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
                 crate::runner::causal_lm::forward(backend, batch, kind)
             }
+            Forward(ForwardMode::TokenDenoising) => {
+                crate::runner::diffusion_lm::forward(backend, batch, kind)
+            }
+            CallKind::Transfer(_) => transfer::forward(backend, batch, kind),
             _ if records(backend, kind) => {
                 let (plan, borrowed, state) = batch.media_parts();
                 let mut parts = backend.media_parts()?;
@@ -178,15 +173,21 @@ pub(crate) fn complete(
     use CallKind::Forward;
 
     if batch.stage() == Stage::Inputs {
-        let completed = batch
-            .take_issued()
-            .unwrap_or(Err(Error::State("the input completion did not run")));
-        return imported(backend, batch, completed);
+        return match inputs::complete(batch, completion) {
+            // The imports' second job follows.
+            Ok(false) => Ok(()),
+            Ok(true) => imported(backend, batch, Ok(())),
+            Err(error) => imported(backend, batch, Err(error)),
+        };
     }
     match kind {
         Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
             crate::runner::causal_lm::complete(backend, batch, completion)
         }
+        Forward(ForwardMode::TokenDenoising) => {
+            crate::runner::diffusion_lm::complete(backend, batch, completion)
+        }
+        CallKind::Transfer(_) => transfer::complete(backend, batch, completion),
         _ if records(backend, kind) => {
             let done = {
                 let (_, _, state) = batch.media_parts();
@@ -265,10 +266,8 @@ fn execute(
         Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
             Err(unsupported(kind, "text"))
         }
-        Forward(ForwardMode::TokenDenoising) => {
-            crate::runner::diffusion_lm::execute(backend, batch, kind)
-        }
-        Transfer(_) => transfer::execute(backend, batch, kind),
+        Forward(ForwardMode::TokenDenoising) => Err(unsupported(kind, "diffusion LM")),
+        Transfer(_) => Err(unsupported(kind, "transfer")),
         Media(ImageDecoding) => batch::image::execute(backend, batch, kind),
         // A video model's rank records its media calls ([`records`]); no
         // other rank serves these kinds.

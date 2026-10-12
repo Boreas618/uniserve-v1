@@ -29,10 +29,10 @@ use crate::ffi::Handle;
 use crate::host::HostLane;
 use crate::model::interface::Interface;
 use crate::stream::Issue;
-use crate::transfer::exports::Location;
+use crate::transfer::kv_export::{self, KvExport};
 use crate::transfer::{
     CacheImporter, ImportCopy, ImportEntry, ImportTask, ImportWorkspace, KVImport, KVImportBackend,
-    Retired, Retirement, Transports, kv_export,
+    Retired, Retirement, Transports,
 };
 use crate::{Error, HostTask, Outcome, Result};
 
@@ -329,7 +329,9 @@ impl KVCache {
         self.release_prefixes(request, &slots, stream)
     }
 
-    /// Export a slot's visible KV extent (see [`kv_export::export`]).
+    /// Export a slot's visible KV extent (see [`kv_export::export`]). Its
+    /// transfer and locations exist once the issuer's work was performed
+    /// ([`KvExport::locate`] with [`Self::manager`]).
     #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
     pub fn export(
         &mut self,
@@ -339,8 +341,8 @@ impl KVCache {
         buffer: BufferId,
         transports: &Transports,
         consumers: &[usize],
-        stream: Option<&Stream>,
-    ) -> Result<(KvTransfer, Vec<Location>)> {
+        stream: impl Issue,
+    ) -> Result<KvExport> {
         kv_export::export(
             &mut self.manager,
             &self.tables,
@@ -450,12 +452,12 @@ impl KVCache {
     /// Accept a finished import as the slot's installed prefix under
     /// `installed`: recheck the accepted base and the slot's tables (another
     /// import may have advanced them while the copy ran), then publish the
-    /// imported length on `stream`.
+    /// imported length in `stream`'s order.
     pub fn adopt_import(
         &mut self,
         import: &PendingImport,
         installed: BufferId,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<KvTransfer>> {
         if installed.owner != import.export.source.owner {
             return Err(Error::Invalid(
