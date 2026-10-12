@@ -110,6 +110,8 @@ enum Call<'a> {
     Method(MethodCall),
     /// A runner method whose integers the completion carries.
     Returning(MethodCall),
+    /// A runner method whose returned object the completion carries.
+    Handle(MethodCall),
     /// A library function over values that are no tensors.
     Function(DeferredCall),
     Capture(Capture),
@@ -194,6 +196,8 @@ pub(crate) struct Completion {
     capacities: VecDeque<usize>,
     /// The integers each returning call returned.
     returned: VecDeque<Vec<i64>>,
+    /// The object each handle call returned.
+    handles: VecDeque<Handle>,
     /// Where the job stopped, when it did not run to its end.
     failure: Option<Failure>,
 }
@@ -223,9 +227,16 @@ impl Completion {
     }
 
     /// The integers the next returning call returned
-    /// ([`Job::call_returning`]): one for a call that returns an integer.
+    /// ([`Job::call_returning`]): one for a call that returns an integer,
+    /// and for a call that returns lists of integers (shapes) each list's
+    /// length followed by its integers.
     pub(crate) fn returned(&mut self) -> Result<Vec<i64>> {
         self.returned.pop_front().ok_or(MISSING)
+    }
+
+    /// The object the next handle call returned ([`Job::call_handle`]).
+    pub(crate) fn handle(&mut self) -> Result<Handle> {
+        self.handles.pop_front().ok_or(MISSING)
     }
 }
 
@@ -278,11 +289,19 @@ impl<'a> Job<'a> {
         self.push(Operation::Call(Call::Method(method)));
     }
 
-    /// An eager call of a runner method that returns an integer or a list
-    /// of integers (the counts of what it wrote, say), which the job's
-    /// completion carries ([`Completion::returned`]).
+    /// An eager call of a runner method that returns an integer, a list of
+    /// integers (the counts of what it wrote, say) or a list of such lists
+    /// (the shapes of what it wrote), which the job's completion carries
+    /// ([`Completion::returned`]).
     pub(crate) fn call_returning(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Returning(method)));
+    }
+
+    /// An eager call of a runner method that returns an object the library
+    /// holds (a prepared image), which the job's completion carries
+    /// ([`Completion::handle`]).
+    pub(crate) fn call_handle(&self, method: MethodCall) {
+        self.push(Operation::Call(Call::Handle(method)));
     }
 
     /// The capture of a runner method. Its completion carries the graph.
@@ -423,12 +442,13 @@ impl Call<'_> {
             Self::Returning(method) => {
                 let name = method.name().to_owned();
                 let value = method.invoke()?;
-                let integers = match i64::try_from(value.clone()) {
-                    Ok(integer) => vec![integer],
-                    Err(_) => crate::ffi::integers(value)
-                        .map_err(|error| Error::numerical(&name, &error))?,
-                };
-                completion.returned.push_back(integers);
+                completion
+                    .returned
+                    .push_back(integers(value).map_err(|error| Error::numerical(&name, &error))?);
+            }
+            Self::Handle(method) => {
+                let object = Handle::new(method.invoke()?)?;
+                completion.handles.push_back(object);
             }
             Self::Function(function) => function.invoke()?,
             Self::Capture(capture) => {
@@ -452,6 +472,26 @@ impl Call<'_> {
         }
         Ok(())
     }
+}
+
+/// The integers a returning call returned: an integer alone, a list of
+/// integers as it is, and a list of lists as each list's length followed by
+/// its integers.
+fn integers(value: tvm_ffi::Any) -> std::result::Result<Vec<i64>, tvm_ffi::Error> {
+    if let Ok(integer) = i64::try_from(value.clone()) {
+        return Ok(vec![integer]);
+    }
+    if let Ok(flat) = crate::ffi::integers(value.clone()) {
+        return Ok(flat);
+    }
+    let lists: tvm_ffi::Array<tvm_ffi::Any> = tvm_ffi::Array::try_from(value)?;
+    let mut flat = Vec::new();
+    for list in lists.iter() {
+        let values = crate::ffi::integers(list)?;
+        flat.push(values.len() as i64);
+        flat.extend(values);
+    }
+    Ok(flat)
 }
 
 impl ExpertStep {
@@ -798,11 +838,29 @@ mod tests {
         job.call(MethodCall::new(&count, Vec::new()));
         job.call_returning(MethodCall::new(&counts, Vec::new()));
 
+        // Lists of integers (shapes) come back as each list's length and
+        // its integers.
+        let shapes = Function::new(
+            "test.shapes",
+            tvm_ffi::Function::from_packed(|_| {
+                Ok(tvm_ffi::Any::from(crate::ffi::list([
+                    tvm_ffi::Any::from(crate::ffi::integer_list([4, 8])),
+                    tvm_ffi::Any::from(crate::ffi::integer_list([2, 16, 3])),
+                ])))
+            }),
+        );
+        job.call_returning(MethodCall::new(&shapes, Vec::new()));
+        // An object the library holds comes back as its handle.
+        job.call_handle(MethodCall::new(&counts, Vec::new()));
+
         // Only returning calls are kept, in recording order.
         let mut completion = job.perform().check().unwrap();
         assert_eq!(completion.returned()?, vec![48]);
         assert_eq!(completion.returned()?, vec![12, 36]);
+        assert_eq!(completion.returned()?, vec![2, 4, 8, 3, 2, 16, 3]);
         assert!(completion.returned().is_err());
+        assert!(completion.handle().is_ok());
+        assert!(completion.handle().is_err());
         Ok(())
     }
 
