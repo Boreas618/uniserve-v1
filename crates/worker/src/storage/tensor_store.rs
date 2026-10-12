@@ -1443,7 +1443,7 @@ impl TensorStore {
         transports: &Transports,
         placement: OutputPlacement<'_>,
         metadata: Option<Metadata>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<ProductRead>> {
         let id = reference.buffer_id();
         let key = buffer_key(id);

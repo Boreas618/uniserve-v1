@@ -401,6 +401,7 @@ fn imports_share_pending_reads_and_widen_resident_shards() -> Result<()> {
     // Only the missing rows are read.
     assert_eq!(first.reads().len(), 1);
     for read in first.reads() {
+        read.start()?;
         read.wait_ready();
     }
     consumer.complete_import(&first, None)?;

@@ -52,7 +52,7 @@ use crate::lane::{Completion, Job};
 use crate::storage::{
     KVCache, Metadata, OutputPlacement, PendingImport, ProductRead, TensorStore, ValueRange,
 };
-use crate::transfer::{Notify, Retirement};
+use crate::transfer::{Notify, Retirement, fetch};
 use crate::{Error, Outcome, Result};
 
 /// One imported input of a batch.
@@ -559,6 +559,10 @@ fn import_products(
                 "cross-call input requires a configured transport".into(),
             ));
         }
+        // The reads' handoff fences are recorded into a job of the lane
+        // that owns the consumers' stream; the reads start once it ran.
+        let kind = plan.calls[indices[0]].code;
+        let fences = Job::new();
         let imported = storage.tensors.import_tensor(
             product,
             tensor,
@@ -570,15 +574,20 @@ fn import_products(
                 ..OutputPlacement::default()
             },
             metadata,
-            stream.as_ref(),
+            fences.on(stream.as_ref()),
         );
+        // A refused import may have issued fences before it failed: their
+        // records are made either way.
+        record_fences(backend, kind, fences)?;
         match imported {
             Ok(read) => {
+                let reads = read.reads();
                 batch
                     .inputs_mut()
                     .state
                     .inputs
                     .insert(product.buffer_id(), Input::Tensor { read, device });
+                fetch::start(&reads)?;
             }
             Err(Error::ReadBackpressure { returns }) => {
                 // The refusal started no read; the same product is admitted
@@ -633,6 +642,7 @@ fn import_latent(
         .image
         .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?;
     let (pool, latent) = image.latent_pool()?;
+    let fences = Job::new();
     let input = latents::import(
         pool,
         latent,
@@ -640,9 +650,30 @@ fn import_latent(
         export,
         params,
         slot,
-        stream.as_ref(),
-    )?;
+        fences.on(stream.as_ref()),
+    );
+    record_fences(backend, call.code, fences)?;
+    let input = input?;
+    fetch::start(input.reads())?;
     Ok(Input::Latent { input, device })
+}
+
+/// Perform `fences`, the job an import recorded its reads' handoff fences
+/// into, on the lane serving `kind`: the reads are started only behind it,
+/// so each fence's record is made when its read reaches its transport
+/// thread.
+///
+/// FIXME: admission waits for this job. Its completion is to arrive through
+/// the executor, which starts the reads from there.
+fn record_fences(backend: &WorkerBackend, kind: CallKind, fences: Job<'_>) -> Result<()> {
+    if fences.is_empty() {
+        return Ok(());
+    }
+    let (_, completion) = backend.job_queues().submit(kind, fences)?;
+    completion
+        .check()
+        .map(drop)
+        .map_err(|failure| failure.error)
 }
 
 /// Reserve every KV import: each supplied or resident transfer is copied
