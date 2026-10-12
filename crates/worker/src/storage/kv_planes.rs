@@ -22,13 +22,14 @@
 
 use std::sync::Arc;
 
-use tvm_ffi::{Any, AnyView};
+use tvm_ffi::Any;
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_2d_d8, memset_2d_d32};
 
 use super::kv_plan::KVPlan;
 use super::memory::{Memory, StorageView};
-use crate::ffi::{Backing, DType, Device, Function, Handle, strings};
+use crate::ffi::{Backing, DType, DeferredCall, Device, Function, Handle, strings};
 use crate::model::interface::Interface;
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// The two K/V fields, in storage order.
@@ -540,8 +541,8 @@ impl UnitColumn {
     }
 
     /// Write `units` into the column prefix in `stream` order.
-    fn upload(&self, planes: &KVPlanes, units: &[u32], stream: Option<&Stream>) -> Result<i64> {
-        if stream.map(Stream::raw) != self.stream {
+    fn upload(&self, planes: &KVPlanes, units: &[u32], stream: impl Issue) -> Result<i64> {
+        if stream.stream().map(Stream::raw) != self.stream {
             return Err(Error::Invariant(
                 "a unit column is used on the stream it was bound to".into(),
             ));
@@ -554,46 +555,41 @@ impl UnitColumn {
             .map(|&unit| planes.require_unit(unit).map(|()| i64::from(unit)))
             .collect::<Result<Vec<_>>>()?;
         let bytes = ids.len() * size_of::<i64>();
-        match (self.units.device(), stream) {
-            (Device::Cuda(_), Some(stream)) => {
-                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                batch.push(self.units.address(), ids.as_ptr() as u64, bytes);
-                // SAFETY: the driver reads the pageable ids during the call;
-                // the column write is ordered on the stream after the
-                // previous operation that read it.
-                unsafe { batch.submit(stream) }?;
-            }
-            _ => {
-                // SAFETY: a host column is written only by its owning thread,
-                // after the previous synchronous operation returned.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        ids.as_ptr(),
-                        self.units.address() as *mut i64,
-                        ids.len(),
-                    );
-                }
-            }
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        batch.push(self.units.address(), ids.as_ptr() as u64, bytes);
+        match self.units.device() {
+            // SAFETY: the ids are read during the call; the column write is
+            // ordered on the stream after the previous operation that read
+            // it.
+            Device::Cuda(_) if stream.stream().is_some() => unsafe { stream.copy(&batch) }?,
+            // SAFETY: a host column is written in its issuer's order, after
+            // the previous operation that read it.
+            _ => unsafe { stream.host().copy(&batch) }?,
         }
         Ok(ids.len() as i64)
     }
 
+    /// Upload `units` and run `function` over the column's prefix, in
+    /// `stream` order.
     fn apply(
         &self,
         function: &Function,
         planes: &KVPlanes,
         units: &[u32],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         if units.is_empty() {
             return Ok(());
         }
         let count = self.upload(planes, units, stream)?;
-        function.invoke(&[self.resets.view(), AnyView::from(&count)])
+        stream.call(DeferredCall::new(
+            function.clone(),
+            vec![self.resets.to_any(), Any::from(count)],
+        ))
     }
 
     /// Reset `units` completely: values zero, flags clear, scales one.
-    pub fn zero(&self, planes: &KVPlanes, units: &[u32], stream: Option<&Stream>) -> Result<()> {
+    pub fn zero(&self, planes: &KVPlanes, units: &[u32], stream: impl Issue) -> Result<()> {
         self.apply(&self.zero, planes, units, stream)
     }
 
@@ -602,7 +598,7 @@ impl UnitColumn {
     /// single-dtype unquantized pool needs no device work, a quantized one
     /// resets flags and scales, and a mixed-dtype pool is zeroed because
     /// stale bytes of one type need not decode as finite values of another.
-    pub fn recycle(&self, planes: &KVPlanes, units: &[u32], stream: Option<&Stream>) -> Result<()> {
+    pub fn recycle(&self, planes: &KVPlanes, units: &[u32], stream: impl Issue) -> Result<()> {
         if planes.plan.mixed_types() {
             self.zero(planes, units, stream)
         } else if planes.plan.quantized {
@@ -618,7 +614,7 @@ impl UnitColumn {
         &self,
         planes: &KVPlanes,
         units: &[u32],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         self.apply(&self.mark_initialized, planes, units, stream)
     }

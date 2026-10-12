@@ -879,10 +879,12 @@ impl WarmupHooks for DiffusionLMWarmup {
                 .kv
                 .as_mut()
                 .ok_or(Error::State("diffusion LM warmup requires a KV cache"))?;
-            runner.warm(kv, parts.experts).map_err(|error| {
-                WorkerError::classify(error, Some("diffusion LM graph capture"))
-                    .with_phase("warmup")
-            })?;
+            runner
+                .warm(kv, parts.experts.map(|experts| &**experts))
+                .map_err(|error| {
+                    WorkerError::classify(error, Some("diffusion LM graph capture"))
+                        .with_phase("warmup")
+                })?;
         }
         Ok(())
     }

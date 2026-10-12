@@ -1,26 +1,61 @@
 //! A token batch's output captures, relays and commit.
 //!
-//! After the step, each call advances its progress and contributes one
-//! slot-state commit row. The batch then copies its completion section, its
-//! logprob words and its prompt scores into the output lease, relays sampled
-//! tokens and transition decisions into their products, and commits:
-//! every owner validates its proposed update first; past the commit point,
-//! products become visible, the slot state advances and the calls become
-//! pending, and any failure is fatal.
+//! Behind the step in the batch's last job ([`Batch::finish`]), each call
+//! advances its progress and contributes one slot-state commit row. The job
+//! then copies the batch's completion section, its logprob words and its
+//! prompt scores into the output lease, relays sampled tokens and
+//! transition decisions into their products, and commits: every owner
+//! validates its proposed update first, and the operations past the commit
+//! point advance the slot state on the device.
+//!
+//! Once that job completed ([`Batch::complete`]), the host follows: products
+//! become visible, captured graphs are stored and the calls become pending.
+//! A job that failed before its commit point retires what the batch
+//! reserved and reports every call as failed; a failure at or past it is
+//! fatal, because slot state on the device may have advanced.
 
+use uniserve_core::CallId;
 use uniserve_cuda::{CopyBatch, SourceOrder};
+use uniserve_ipc::RequestKey;
 
 use super::batch::{Batch, CallState};
 use super::calls;
 use super::step::{Invoked, Stepped};
+use crate::cuda_graph::{GraphMode, ShapeKey};
 use crate::executor::forward::launch::lock;
+use crate::lane::Completion;
+use crate::runner::causal_lm::Executed;
 use crate::storage::{LogprobLayout, ProductBuffer, Scalar};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// A failure, and whether it happened past the commit point.
-pub(super) struct Failure {
+pub(crate) struct Failure {
     pub(super) error: Error,
     pub(super) committed: bool,
+}
+
+/// What a batch's last job leaves for its completion.
+pub(crate) struct Commit {
+    /// The step's forwards (none when no call has a text row) and what its
+    /// statistics count: its rows and draft tokens. `None` when every call
+    /// was skipped.
+    step: Option<(Option<super::runners::Step>, usize, u64)>,
+    /// The job's first operation past the commit point.
+    point: usize,
+    /// The commit graphs the job captures: each runner's bucket.
+    captures: Vec<(usize, ShapeKey)>,
+    /// The calls that become pending.
+    pending: Vec<(RequestKey, CallId, bool)>,
+}
+
+/// How a committed batch's step ran, for its statistics.
+pub(super) struct Committed {
+    /// The populated invocations' tokens summed, and their mode (any
+    /// capture, else any replay, else eager).
+    pub(super) executed: Executed,
+    pub(super) rows: usize,
+    pub(super) drafts: u64,
 }
 
 impl From<Error> for Failure {
@@ -40,12 +75,78 @@ fn fatal(error: Error) -> Failure {
 }
 
 impl Batch<'_> {
-    /// Advance progress, capture outputs, relay products and commit.
-    pub(super) fn finish(&mut self, stepped: &Stepped) -> std::result::Result<(), Failure> {
-        let commits = self.advance(stepped)?;
-        self.capture(stepped)?;
-        self.relay(stepped)?;
-        self.commit(&commits)
+    /// Advance progress, then record the capture of outputs, the relay of
+    /// products and the commit behind `stepped` in the batch's job. A batch
+    /// whose calls were all skipped has no step: only their false flags
+    /// were published.
+    pub(super) fn finish(
+        &mut self,
+        stepped: Option<Stepped>,
+    ) -> std::result::Result<Commit, Failure> {
+        let skipped = Stepped::skipped();
+        let invoked = stepped.as_ref().unwrap_or(&skipped);
+        let commits = self.advance(invoked)?;
+        self.capture(invoked)?;
+        self.relay(invoked)?;
+        let mut commit = self.commit(&commits)?;
+        commit.step = stepped.map(|stepped| (stepped.step, stepped.rows, stepped.drafts));
+        Ok(commit)
+    }
+
+    /// Apply the completion of the batch's last job: store the graphs it
+    /// captured, make the products visible and the calls pending. Every
+    /// failure here is past the commit point.
+    pub(super) fn complete(
+        &mut self,
+        commit: Commit,
+        completion: &mut Completion,
+    ) -> std::result::Result<Option<Committed>, Failure> {
+        let committed = match commit.step {
+            Some((step, rows, drafts)) => {
+                let mut summary = Executed {
+                    mode: GraphMode::Eager,
+                    live_tokens: 0,
+                    padded_tokens: 0,
+                };
+                let executed = match step {
+                    Some(step) => self.runtime.complete(step, completion).map_err(fatal)?,
+                    // Only latent conditionings, which the image denoiser
+                    // wrote.
+                    None => Vec::new(),
+                };
+                for executed in executed.into_iter().flatten() {
+                    summary.live_tokens += executed.live_tokens;
+                    summary.padded_tokens += executed.padded_tokens;
+                    summary.mode = match (summary.mode, executed.mode) {
+                        (GraphMode::Capture, _) | (_, GraphMode::Capture) => GraphMode::Capture,
+                        (GraphMode::Replay, _) | (_, GraphMode::Replay) => GraphMode::Replay,
+                        _ => GraphMode::Eager,
+                    };
+                }
+                Some(Committed {
+                    executed: summary,
+                    rows,
+                    drafts,
+                })
+            }
+            None => None,
+        };
+        for (runner, key) in commit.captures {
+            self.runtime.runners[runner]
+                .complete_commit(key, completion)
+                .map_err(fatal)?;
+        }
+
+        let writes = std::mem::take(&mut self.writes);
+        self.storage.tensors.commit_writes(&writes).map_err(fatal)?;
+        self.requests.add_pending(&commit.pending).map_err(fatal)?;
+        Ok(committed)
+    }
+
+    /// Whether `operation` of the batch's last job lies past its commit
+    /// point.
+    pub(super) fn committed(commit: &Commit, operation: usize) -> bool {
+        operation >= commit.point
     }
 
     /// Each active call's progress and slot-state commit row, by the
@@ -115,7 +216,7 @@ impl Batch<'_> {
     /// Capture one microbatch invocation's outputs from its runner's
     /// columns. The lane stream already waits on the microbatch's stream.
     fn capture_invocation(&mut self, invoked: &Invoked) -> Result<()> {
-        let stream = self.stream.as_ref();
+        let stream = self.job.on(self.stream.as_ref());
         let runner = &self.runtime.runners[invoked.runner];
         let events = &self.storage.events;
         let mut output = lock(&self.buffer);
@@ -228,18 +329,24 @@ impl Batch<'_> {
                     .iter()
                     .map(|(_, write)| write.clone())
                     .collect();
-                self.storage
-                    .tensors
-                    .write_scalars(&run, &values, self.stream.as_ref())?;
+                self.storage.tensors.write_scalars(
+                    &run,
+                    &values,
+                    self.job.on(self.stream.as_ref()),
+                )?;
                 start = end;
             }
         }
         Ok(())
     }
 
-    /// Validate every owner's update, then commit them together.
-    fn commit(&mut self, commits: &[(usize, Vec<[i64; 8]>)]) -> std::result::Result<(), Failure> {
-        let stream = self.stream.as_ref();
+    /// Validate every owner's update, then record their commit on the
+    /// device. The host commits once the job completed.
+    fn commit(
+        &mut self,
+        commits: &[(usize, Vec<[i64; 8]>)],
+    ) -> std::result::Result<Commit, Failure> {
+        let stream = self.job.on(self.stream.as_ref());
         let plan = self.plan;
 
         // Readers end on the consuming stream, after this batch's writes when
@@ -285,24 +392,33 @@ impl Batch<'_> {
             .collect();
         self.requests.validate_pending(&pending)?;
 
-        // Every owner accepted its update. Any failure from here is fatal.
-        let writes = std::mem::take(&mut self.writes);
-        self.storage.tensors.commit_writes(&writes).map_err(fatal)?;
+        // Every owner accepted its update. The job's operations from here
+        // on change slot state, and any failure from here is fatal.
+        let point = self.job.len();
         // Each microbatch runner commits its calls' slot state on its own
         // stream; the lane stream then orders after all of them.
+        let mut captures = Vec::new();
         for (runner, rows) in commits {
-            self.runtime.runners[*runner].commit(rows).map_err(fatal)?;
+            let captured = self.runtime.runners[*runner]
+                .commit(rows, &self.job)
+                .map_err(fatal)?;
+            captures.extend(captured.map(|key| (*runner, key)));
         }
         self.install_prompt_tails().map_err(fatal)?;
-        if let (Some(experts), Some(stream)) = (self.experts, stream) {
-            experts.join_streams(stream).map_err(fatal)?;
+        if let (Some(experts), Some(lane)) = (&self.experts, &self.stream) {
+            experts.join_streams(&self.job, lane).map_err(fatal)?;
         }
         self.runtime.order.record(stream).map_err(fatal)?;
-        self.requests.add_pending(&pending).map_err(fatal)
+        Ok(Commit {
+            step: None,
+            point,
+            captures,
+            pending,
+        })
     }
 
-    /// Copy scored chunks' last logits rows into their slots' retained
-    /// prompt logits.
+    /// Record the copies of scored chunks' last logits rows into their
+    /// slots' retained prompt logits.
     fn install_prompt_tails(&self) -> Result<()> {
         let tails: Vec<(usize, usize, usize)> = self
             .calls
@@ -322,23 +438,8 @@ impl Batch<'_> {
                 row_bytes as usize,
             );
         }
-        match self.stream.as_ref() {
-            // SAFETY: rows of the binding's tail column, written by this
-            // batch's step, into distinct slots' retained logits.
-            Some(stream) => unsafe { copies.submit(stream) }.map_err(Error::from),
-            None => {
-                for (destination, source, bytes) in copies.iter() {
-                    // SAFETY: host columns and state of this rank.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            source as *const u8,
-                            destination as *mut u8,
-                            bytes,
-                        );
-                    }
-                }
-                Ok(())
-            }
-        }
+        // SAFETY: rows of the binding's tail column, written by this
+        // batch's step, into distinct slots' retained logits.
+        unsafe { self.job.on(self.stream.as_ref()).copy(&copies) }
     }
 }
