@@ -348,7 +348,9 @@ impl GroupCopy<'_> {
     fn submit(&self, reads: &[fetch::PlannedRead]) -> Result<Vec<Arc<Read>>> {
         let backend = self.backend;
         let retired = Arc::downgrade(&backend.retired);
-        fetch::submit(reads, self.workspace.stream(), |read| {
+        // Issued on the workspace's stream at once, so the reads start
+        // here.
+        let reads = fetch::submit(reads, self.workspace.stream(), |read| {
             let cancelled = backend.write.retain(Arc::new(ReadRef::new(read)));
             // Retired reads may let a finished import retire.
             let retired = Weak::clone(&retired);
@@ -363,7 +365,9 @@ impl GroupCopy<'_> {
                 read.cancel()?;
             }
             Ok(())
-        })
+        })?;
+        fetch::start(&reads)?;
+        Ok(reads)
     }
 
     /// Block until read credits returned after the refused submission

@@ -51,6 +51,8 @@ struct ReadState {
     /// Storage an undrained copy may still address.
     retained: Vec<Box<dyn Any + Send>>,
     work: Option<Weak<HostTask<TransferRead<NativeRead>>>>,
+    /// The read's task was handed to its transport thread.
+    started: bool,
 }
 
 /// One read's consumable result and physical retirement. Cancellation
@@ -73,6 +75,7 @@ impl Read {
                 credit: None,
                 retained: Vec::new(),
                 work: None,
+                started: false,
             }),
             borrower,
         })
@@ -240,8 +243,40 @@ impl Read {
         self.lock().credit = Some(capacity);
     }
 
-    pub(crate) fn prepare_copy(&self, stream: &Stream) -> Result<()> {
+    pub(crate) fn prepare_copy(&self, stream: impl Issue) -> Result<()> {
         self.lock().ticket.prepare_copy(&self.events, stream)
+    }
+
+    /// Hand the read to its transport thread, whose stream waits on the
+    /// destination's handoff fence.
+    ///
+    /// The caller starts a read once the issuer it was submitted with
+    /// ([`submit`]) performed its work, so the fence's record is made: at
+    /// once after a stream, from the job's completion on after a recorder.
+    /// A read that was cancelled or already started stays as it is. When
+    /// the task cannot be queued it is withdrawn.
+    pub fn start(&self) -> Result<()> {
+        let work = {
+            let mut state = self.lock();
+            if std::mem::replace(&mut state.started, true) {
+                return Ok(());
+            }
+            state.work.as_ref().and_then(Weak::upgrade)
+        };
+        let Some(task) = work else {
+            return Ok(());
+        };
+        if task.completion.done() {
+            return Ok(());
+        }
+
+        let queued = task.submit();
+        if queued.is_err()
+            && let Err(cleanup) = task.cancel(true)
+        {
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to withdraw a transfer read: {cleanup}");
+        }
+        queued
     }
 
     /// Expose a completed value. `event` fences a device copy; the read
@@ -749,13 +784,15 @@ impl Backing for ChannelPayload {
     }
 }
 
-/// Reserve a read's credits and task, record its destination handoff on
-/// `stream` and submit it. On failure the task is withdrawn.
+/// Reserve a read's credits and task and issue its destination handoff
+/// fence to `stream`. The read is handed to its transport thread by
+/// [`Read::start`], once that fence's record is made. On failure the task
+/// is withdrawn.
 pub(crate) fn submit(
     pool: &Arc<ReadPool>,
     backend: NativeRead,
     nbytes: u64,
-    stream: Option<&Stream>,
+    stream: impl Issue,
     reservation: Option<&super::ReadReservation<Notify>>,
 ) -> Result<Arc<Read>> {
     if let Some(error) = pool.error() {
@@ -773,10 +810,10 @@ pub(crate) fn submit(
     let submitted = (|| -> Result<()> {
         read.set_work(&task);
         if let Device::Cuda(device) = destination_device {
-            let stream = stream.ok_or_else(|| {
+            let submitting = stream.stream().ok_or_else(|| {
                 Error::Invalid("a device read destination requires its submitting stream".into())
             })?;
-            if stream.device().0 != device {
+            if submitting.device().0 != device {
                 return Err(Error::Invalid(
                     "a read's submitting stream is on another device".into(),
                 ));
@@ -788,7 +825,7 @@ pub(crate) fn submit(
             read.add_done_callback(Arc::clone(&wake));
             read.add_retirement_callback(wake);
         }
-        task.submit()
+        Ok(())
     })();
     if let Err(error) = submitted {
         if let Err(cleanup) = task.cancel(true) {
