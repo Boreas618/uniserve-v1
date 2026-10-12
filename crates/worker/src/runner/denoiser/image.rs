@@ -1123,7 +1123,7 @@ impl ImageBatch<'_> {
     pub(crate) fn denoise(
         &mut self,
         mut text: Option<&mut CausalLMRunners>,
-        experts: Option<&ExpertUnion>,
+        experts: Option<&Arc<ExpertUnion>>,
     ) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();

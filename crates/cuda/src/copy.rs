@@ -262,6 +262,11 @@ impl CopyBatch {
         self.sizes.push(bytes);
     }
 
+    /// When the batch's sources are read.
+    pub fn order(&self) -> SourceOrder {
+        self.order
+    }
+
     pub fn len(&self) -> usize {
         self.sizes.len()
     }

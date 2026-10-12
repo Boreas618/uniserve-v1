@@ -25,7 +25,8 @@ fn buffer(words: Vec<i64>) -> Result<OutputBuffer> {
 }
 
 fn complete(buffer: &mut OutputBuffer) -> Result<()> {
-    buffer.seal(&[], &EventPool::default())?;
+    // Host captures are sealed on no stream.
+    buffer.seal::<&uniserve_cuda::Stream>(&[], &EventPool::default())?;
     buffer.copies_finished();
     buffer.readback()
 }

@@ -156,6 +156,13 @@ pub(crate) struct ExpertUnion {
 // microbatch threads only receive owned calls.
 unsafe impl Send for ExpertUnion {}
 
+// SAFETY: a job shares the member with its lane's execution thread, which
+// runs an expert step through `&self` while the control thread waits for
+// the job. Through `&self` the member only reads its fields, apart from
+// the atomic warmup flag and the step agreement, which locks its host
+// group; the retained hook is never called or cloned through it.
+unsafe impl Sync for ExpertUnion {}
+
 impl ExpertUnion {
     pub(crate) fn parallel(&self) -> &Arc<ExpertParallel> {
         &self.parallel
@@ -619,7 +626,7 @@ impl WarmupHooks for ExpertWarmup {
     }
 
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
-        let Some(experts) = backend.experts_mut() else {
+        let Some(experts) = backend.experts_mut().map_err(failed("expert warmup"))? else {
             return Ok(());
         };
         follow(experts).map_err(failed("expert warmup"))?;

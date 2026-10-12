@@ -591,7 +591,7 @@ impl NativeRead {
                 unsafe { memset_d32(word, ACKNOWLEDGED, 1, &stream) }?;
             }
             let completed = self.context.events.acquire(device, false, false)?;
-            self.context.events.record(&completed, &stream)?;
+            self.context.events.record(&completed, stream.as_ref())?;
             self.read.complete(destination.clone(), Some(completed))
         })();
         // The read's waiters and this call's caller observe one failure.

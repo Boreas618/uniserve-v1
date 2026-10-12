@@ -34,7 +34,9 @@ impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
     ///
     /// Rejects with `RejectionKind::Invalid` when the runtime has no KV cache,
-    /// the request fails validation, the worker lacks a required generation
+    /// the request fails validation, a unit the scheduler never splits (a
+    /// readout row, a generation canvas, an input image's vision block)
+    /// exceeds the step token budget, the worker lacks a required generation
     /// feature, or `validate_resources` or `max_kv_tokens` fails against
     /// `generation_limits`; rejects with `RejectionKind::Overloaded` when the
     /// waiting bound is reached. A rejection is sent on `event_tx` and its
@@ -83,6 +85,27 @@ impl Scheduler {
                 message: format!(
                     "a {}-token generation canvas exceeds the {}-token step budget",
                     canvas.canvas_length, self.config.max_num_batched_tokens
+                ),
+            });
+            return;
+        }
+        // A context prefill writes an input image's vision block whole, as
+        // one attention block of one call, so the block's exact KV length
+        // must fit one scheduling step's token budget.
+        if let Some(tokens) = req
+            .multimodal_inputs
+            .images
+            .iter()
+            .flat_map(|image| &image.encoders)
+            .filter(|input| input.encoder == ImageIngestStep::VitEncode)
+            .filter_map(|input| input.num_kv_tokens)
+            .find(|&tokens| tokens as usize > self.config.max_num_batched_tokens)
+        {
+            let _ = event_tx.send(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                message: format!(
+                    "a {}-token input image vision block exceeds the {}-token step budget",
+                    tokens, self.config.max_num_batched_tokens
                 ),
             });
             return;
