@@ -29,14 +29,14 @@ use crate::executor::forward::launch::{
     HostStage, Launched, error_code, failed_output, read_flag, reports_output, seal as seal_lease,
 };
 use crate::executor::forward::products::Publications;
-use crate::executor::forward::transfer::latents::Pool;
+use crate::executor::forward::transfer::latents::{self, PendingExport, Pool};
 use crate::executor::forward::unsupported;
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
 use crate::host::image::ImageResult;
 use crate::host::image::ImageTask;
 use crate::host::{HostLane, HostTask};
-use crate::lane::Job;
+use crate::lane::{Completion, Job};
 use crate::request::RequestPool;
 use crate::request::diffusion::Trajectories;
 use crate::runner::decoder::DecoderRunner;
@@ -139,6 +139,13 @@ pub(crate) struct ImageBatch<'a> {
     /// Trajectory versions exported from the latent pool, released from it
     /// if the batch fails before committing.
     pub(crate) latent_exports: Vec<BufferId>,
+    /// The version exports the batch's forwards issued, by call index,
+    /// located when the commit is applied.
+    pub(crate) exports: Vec<(usize, PendingExport)>,
+    /// What each returning call the batch recorded must return, in order
+    /// (the byte counts a decoder stages), checked when the commit is
+    /// applied.
+    pub(crate) returns: Vec<Vec<i64>>,
     /// Signals the physical end of the batch's KV accesses.
     pub(crate) retirement: Arc<Retirement>,
     /// The batch uses the latent pool on its stream (see
@@ -231,6 +238,8 @@ impl<'a> ImageBatch<'a> {
             encodings: Vec::new(),
             publications: Publications::default(),
             latent_exports: Vec::new(),
+            exports: Vec::new(),
+            returns: Vec::new(),
             retirement: Arc::new(Retirement::default()),
             latents_entered: false,
             started,
@@ -306,11 +315,10 @@ impl<'a> ImageBatch<'a> {
     /// FIXME: the forwards of an image batch still issue on its stream at
     /// once, so what the batch records around them is performed here, in
     /// their order, instead of being a job of the batch's lane.
-    pub(crate) fn perform(&mut self) -> Result<()> {
+    pub(crate) fn perform(&mut self) -> Result<Completion> {
         std::mem::take(&mut self.job)
             .perform()
             .check()
-            .map(drop)
             .map_err(|failure| failure.error)
     }
 
@@ -347,7 +355,6 @@ impl<'a> ImageBatch<'a> {
         if !updates.is_empty() {
             self.parts.latents()?.pool.validate_updates(&updates)?;
         }
-        self.publications.validate(&self.storage.tensors)?;
         self.leave_latents()?;
         self.seal()?;
         for state in &mut self.calls {
@@ -366,11 +373,38 @@ impl<'a> ImageBatch<'a> {
         Ok(Commit { updates, pending })
     }
 
-    /// Apply an issued commit once its work was performed: make the writes
-    /// visible, apply the trajectory commits, register the exports and
-    /// record the calls as pending. Any failure here is fatal.
-    pub(crate) fn apply_commit(&mut self, commit: Commit) -> std::result::Result<(), Failure> {
+    /// Apply an issued commit from the `completion` of the job that
+    /// performed it: check what the forwards' calls returned, publish the
+    /// exports they issued, then make the writes visible, apply the
+    /// trajectory commits, register the exports and record the calls as
+    /// pending. A failure after the exports' check is fatal.
+    pub(crate) fn apply_commit(
+        &mut self,
+        commit: Commit,
+        completion: &mut Completion,
+    ) -> std::result::Result<(), Failure> {
         let Commit { updates, pending } = commit;
+        for expected in std::mem::take(&mut self.returns) {
+            let returned = completion.returned()?;
+            if returned != expected {
+                return Err(Error::Interface(format!(
+                    "a decoding call staged {returned:?} bytes of images of {expected:?} bytes"
+                ))
+                .into());
+            }
+        }
+        for (index, export) in std::mem::take(&mut self.exports) {
+            let pool = &self.parts.latents()?.pool;
+            latents::locate_export(
+                pool,
+                export,
+                &mut self.publications,
+                &mut self.calls[index].output,
+            )?;
+        }
+        self.publications.validate(&self.storage.tensors)?;
+
+        // Every owner accepted its update. Any failure from here is fatal.
         let writes = std::mem::take(&mut self.writes);
         self.storage.tensors.commit_writes(&writes).map_err(fatal)?;
         if !updates.is_empty() {
@@ -418,6 +452,9 @@ impl<'a> ImageBatch<'a> {
     /// fences were performed and complete.
     pub(crate) fn discard(&mut self) -> Result<()> {
         let left = self.leave_latents();
+        self.exports
+            .drain(..)
+            .for_each(|(_, export)| export.revoke());
         let revoked = self.publications.revoke();
         let exported = std::mem::take(&mut self.latent_exports);
         if !exported.is_empty()
@@ -625,8 +662,8 @@ fn run(
             _ => ForwardStats::default(),
         };
         let commit = batch.issue_commit()?;
-        batch.perform()?;
-        batch.apply_commit(commit)?;
+        let mut completion = batch.perform()?;
+        batch.apply_commit(commit, &mut completion)?;
         Ok(stats)
     })();
     match result {
@@ -650,6 +687,16 @@ fn run(
         }
         Err(failure) if failure.committed => Err(failure),
         Err(failure) => {
+            // What the batch recorded before it failed is performed before
+            // its reservations are retired: the events it queued are due,
+            // and its writes are abandoned only behind its work.
+            if let Err(error) = batch.perform() {
+                tracing::warn!(
+                    target: "uniserve_worker.execution",
+                    "image batch {} failed again in what it had recorded: {error}",
+                    plan.batch_id
+                );
+            }
             if let Err(cleanup) = batch.discard().and(batch.perform()) {
                 return Err(Failure {
                     error: cleanup,

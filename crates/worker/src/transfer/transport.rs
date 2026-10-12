@@ -343,9 +343,10 @@ impl Transport {
     /// handle leave the process. A job's recorder defers all of it to the
     /// job, so a location is published only from the job's completion on,
     /// and a channel export, whose bytes travel in the location, is
-    /// [`Exported::Staged`] until then. When this fails with a recorder the
-    /// job must not be performed: its copies address storage this call
-    /// released.
+    /// [`Exported::Staged`] until then. This releases its storage when it
+    /// fails, so its caller issues it inside an attempt
+    /// ([`Issue::attempt`]), which keeps a job from performing the copies
+    /// a failed export recorded.
     pub(crate) fn export(
         &self,
         source: &Spans,

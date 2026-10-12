@@ -105,14 +105,13 @@ impl TransferBatch<'_, '_> {
             self.storage
                 .tensors
                 .write(&write, read.value(), issue, read.metadata())?;
-            let export = self.exporting(|batch, issue| {
-                let RankStorage {
-                    tensors,
-                    transports,
-                    ..
-                } = &*batch.storage;
-                tensors.export_buffer(call, output, &write, transports, false, None, issue)
-            })?;
+            let RankStorage {
+                tensors,
+                transports,
+                ..
+            } = &*self.storage;
+            let export =
+                tensors.export_buffer(call, output, &write, transports, false, None, issue)?;
             self.recorded.products.push_back((index, write, export));
         }
         Ok(())
@@ -163,20 +162,18 @@ impl TransferBatch<'_, '_> {
                     i64::from(params.width),
                     &pages,
                 )?;
-                let version = self.exporting(|batch, issue| {
-                    latents::export_version(
-                        pool,
-                        storage,
-                        &batch.storage.transports,
-                        call,
-                        output,
-                        slot,
-                        params,
-                        bank,
-                        params.start_step,
-                        issue,
-                    )
-                })?;
+                let version = latents::issue_export(
+                    pool,
+                    storage,
+                    &self.storage.transports,
+                    call,
+                    output,
+                    slot,
+                    params,
+                    bank,
+                    params.start_step,
+                    issue,
+                )?;
                 self.recorded.versions.push_back((index, version));
             }
             Ok(())

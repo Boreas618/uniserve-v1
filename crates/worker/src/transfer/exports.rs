@@ -68,7 +68,10 @@ pub fn export(
 
     let mut locations = Vec::new();
     let mut staged = Vec::new();
-    let result = (|| -> Result<()> {
+    // One attempt: a mechanism that fails gives its storage back, and the
+    // locations accepted before it are revoked, so a job keeps none of the
+    // work a failed export recorded.
+    let result = stream.attempt(|| -> Result<()> {
         for transport in selected {
             match transport.export(source, offset, consumers, stream)? {
                 Exported::Located(locator) => {
@@ -114,7 +117,7 @@ pub fn export(
             }
         }
         Ok(())
-    })();
+    });
 
     if let Err(error) = result {
         revoke(&locations);

@@ -65,16 +65,14 @@ impl TransferBatch<'_, '_> {
         for index in self.active() {
             let state = &self.recorded.calls[index];
             let (slot, visible) = (state.slot, state.output.progress.kv_visible_len);
-            let export = self.exporting(|batch, issue| {
-                kv::export(
-                    batch.storage,
-                    index,
-                    &plan.calls[index],
-                    slot,
-                    visible,
-                    issue,
-                )
-            })?;
+            let export = kv::export(
+                self.storage,
+                index,
+                &plan.calls[index],
+                slot,
+                visible,
+                self.issue(),
+            )?;
             self.recorded.exports.push_back(export);
         }
         Ok(())

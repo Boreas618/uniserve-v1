@@ -17,7 +17,9 @@
 //! job still carries what the batch recorded before it failed (KV table
 //! installs and unit resets do their host bookkeeping when recorded, so
 //! their device work follows), and an export is revoked only after the
-//! copies into it ran. A failure after the commit point is fatal.
+//! copies into it ran. Of an export that failed itself the job keeps only
+//! the event operations ([`crate::stream::Issue::attempt`]). A failure
+//! after the commit point is fatal.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -31,7 +33,7 @@ use uniserve_ipc::{
 use super::super::launch::{Launched, flag, lock, reports_output, request_flag, seal};
 use super::super::products::Publications;
 use super::kv::{self, Exporting, Installation, Published};
-use super::latents::VersionExport;
+use super::latents::{self, PendingExport};
 use crate::executor::PendingOutput;
 use crate::executor::forward::batch::image::ImageParts;
 use crate::ffi::Device;
@@ -190,7 +192,7 @@ pub(crate) struct Recorded {
     /// Product exports, each with its call and the write it publishes.
     pub(super) products: VecDeque<(usize, ProductBuffer, ProductExport)>,
     /// Trajectory versions exported from the latent pool, with their calls.
-    pub(super) versions: VecDeque<(usize, VersionExport)>,
+    pub(super) versions: VecDeque<(usize, PendingExport)>,
     /// KV exports, and the installs resident once the batch commits.
     pub(super) exports: VecDeque<Exporting>,
     pub(super) installations: Vec<Installation>,
@@ -276,23 +278,6 @@ impl<'a, 'j> TransferBatch<'a, 'j> {
     /// Where the batch issues its stream work: its job.
     pub(super) fn issue(&self) -> Recorder<'a, 'j> {
         self.job.on(self.stream)
-    }
-
-    /// Record an export with `export`, which issues to the recorder it is
-    /// given. When it fails, the work it recorded is given up, since its
-    /// copies address storage the failed export gave back; its event
-    /// operations stay with the batch's job.
-    pub(super) fn exporting<T>(
-        &mut self,
-        export: impl FnOnce(&mut Self, Recorder<'_, 'j>) -> Result<T>,
-    ) -> Result<T> {
-        let exported = Job::new();
-        let result = export(self, exported.on(self.stream));
-        self.job.append(match result {
-            Ok(_) => exported,
-            Err(_) => exported.orders_only(),
-        });
-        result
     }
 
     /// The batch's product device.
@@ -539,8 +524,9 @@ impl Recorded {
             while let Some((index, version)) = self.versions.pop_front() {
                 // The version stays the pool's until the batch commits.
                 located.versions.push(version.buffer());
-                version.publish(
+                latents::locate_export(
                     pool,
+                    version,
                     &mut located.publications,
                     &mut self.calls[index].output,
                 )?;
