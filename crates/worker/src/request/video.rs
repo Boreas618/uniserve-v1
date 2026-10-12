@@ -20,8 +20,8 @@ use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::integer_list;
 use crate::host::mux::{MuxConfig, MuxSession};
 use crate::lane::{Completion, Job};
-use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::denoiser::{Evicted, VideoModel};
 use crate::runner::media::MediaRunner;
 use crate::{Error, Result};
 
@@ -542,6 +542,19 @@ struct Unsized {
     /// The layout of each prompt capacity of the plan, in its order: a
     /// startup layout for a size without conditions, otherwise asked for.
     layouts: Vec<Option<VideoLayout>>,
+    /// The request's admission once its layout is selected; it waits here
+    /// while the denoiser prepares a layout it does not hold.
+    admitted: Option<Admission>,
+}
+
+/// What the job a sizing submitted last was asked.
+enum Asked {
+    /// The layouts of sizes with conditions.
+    Layouts,
+    /// Each request's condition rows and which of its layouts hold it.
+    Holds,
+    /// The preparation of these layouts, which displaced the held ones.
+    Preparation(Vec<VideoLayout>, Vec<Evicted>),
 }
 
 /// The admission of the video requests a batch started, between the jobs
@@ -552,12 +565,16 @@ struct Unsized {
 /// the request's own size, so no table answers them: every request is asked
 /// for, in jobs of the Python thread. A request without conditions takes
 /// one job (its layouts are startup layouts); a conditioned one takes a job
-/// for its layouts first.
+/// for its layouts first. A request whose layout the denoiser does not
+/// hold (one prepared at startup or for an earlier request) takes a
+/// further job, on the denoiser's lane, that prepares the layout.
+///
+/// The requests a batch started are sized together: a size the model
+/// rejects fails the batch, and with it every request of the sizing that
+/// was not admitted yet.
 pub(crate) struct Sizing {
     requests: Vec<Unsized>,
-    /// The job on the Python thread asks for layouts; otherwise for the
-    /// condition rows and which layouts hold each request.
-    layouts: bool,
+    asked: Asked,
 }
 
 /// What the model answers about a video of one admitted frame count.
@@ -687,6 +704,7 @@ impl VideoRequests {
                     })
                     .collect(),
                 size,
+                admitted: None,
             });
         }
         self.requests.insert(slot, request);
@@ -699,21 +717,50 @@ impl VideoRequests {
         let requests = std::mem::take(&mut self.waiting);
         (!requests.is_empty()).then_some(Sizing {
             requests,
-            layouts: false,
+            asked: Asked::Holds,
         })
     }
 
-    /// Record into `job` the next questions of `sizing`: the layouts not
-    /// yet known, or, once every layout is known, each request's condition
-    /// rows and whether each of its layouts holds it.
-    pub(crate) fn ask(&self, sizing: &mut Sizing, job: &Job) {
+    /// Record into `job` the next step of `sizing`: the layouts not yet
+    /// known; once every layout is known, each request's condition rows and
+    /// whether each of its layouts holds it; and for requests whose
+    /// selected layout `denoisers` does not hold, that layout's
+    /// preparation. Returns whether the job belongs on the denoiser's lane
+    /// (a preparation works on its stream) rather than on the Python thread
+    /// alone.
+    pub(crate) fn ask(
+        &self,
+        sizing: &mut Sizing,
+        denoisers: &mut DenoiserRunners,
+        job: &Job,
+    ) -> Result<bool> {
+        // Selected requests wait for layouts the denoiser lacks.
+        let mut lacking: Vec<VideoLayout> = Vec::new();
+        for admitted in sizing
+            .requests
+            .iter()
+            .filter_map(|request| request.admitted.as_ref())
+        {
+            if denoisers.lacks(&admitted.layout) && !lacking.contains(&admitted.layout) {
+                lacking.push(admitted.layout);
+            }
+        }
+        if !lacking.is_empty() {
+            let evicted = lacking
+                .iter()
+                .map(|&layout| denoisers.ask_layout(&self.model, layout, job))
+                .collect::<Result<Vec<_>>>()?;
+            sizing.asked = Asked::Preparation(lacking, evicted);
+            return Ok(true);
+        }
+
         let capacities = &self.plan.text_capacities;
-        sizing.layouts = sizing
+        let layouts = sizing
             .requests
             .iter()
             .any(|request| request.layouts.contains(&None));
         for request in &sizing.requests {
-            if sizing.layouts {
+            if layouts {
                 // The layout of the request's size at each prompt capacity,
                 // without its vision blocks.
                 for (&capacity, _) in capacities
@@ -735,12 +782,18 @@ impl VideoRequests {
                 self.model.ask_holds(layout, &request.size, job);
             }
         }
+        sizing.asked = if layouts {
+            Asked::Layouts
+        } else {
+            Asked::Holds
+        };
+        Ok(false)
     }
 
     /// Take the answers to what [`Self::ask`] recorded from the job's
-    /// `completion`. Once the requests' layouts are selected, each is held
-    /// in `denoisers` and the request is admitted with it; returns whether
-    /// that is done (otherwise `sizing` has more to ask).
+    /// `completion`. A request whose layout is selected and held in
+    /// `denoisers` is admitted with it and leaves the sizing; returns
+    /// whether every request has (otherwise `sizing` has more to ask).
     ///
     /// A request that ended or was restarted while it was sized is left
     /// out.
@@ -750,52 +803,94 @@ impl VideoRequests {
         completion: &mut Completion,
         denoisers: &mut DenoiserRunners,
     ) -> Result<bool> {
-        if sizing.layouts {
-            for request in &mut sizing.requests {
-                for layout in request.layouts.iter_mut().filter(|layout| layout.is_none()) {
-                    *layout = Some(VideoLayout::from_values(&completion.returned()?)?);
+        match std::mem::replace(&mut sizing.asked, Asked::Holds) {
+            Asked::Layouts => {
+                for request in &mut sizing.requests {
+                    for layout in request.layouts.iter_mut().filter(|layout| layout.is_none()) {
+                        *layout = Some(VideoLayout::from_values(&completion.returned()?)?);
+                    }
+                }
+                return Ok(false);
+            }
+            Asked::Holds => {
+                let integer = |values: Vec<i64>| {
+                    values.first().copied().ok_or_else(|| {
+                        Error::Interface("a sizing function returned no value".into())
+                    })
+                };
+                for waiting in &mut sizing.requests {
+                    let rows = integer(completion.returned()?)?;
+                    let condition_rows = u32::try_from(rows).map_err(|_| {
+                        Error::Interface(
+                            "the video model reports an invalid condition row count".into(),
+                        )
+                    })?;
+                    let layouts: Vec<VideoLayout> =
+                        waiting.layouts.iter().flatten().copied().collect();
+                    let holds = layouts
+                        .iter()
+                        .map(|_| Ok(integer(completion.returned()?)? != 0))
+                        .collect::<Result<Vec<bool>>>()?;
+                    waiting.admitted = Some(self.plan.select(
+                        waiting.size.clone(),
+                        condition_rows,
+                        &layouts,
+                        &holds,
+                    )?);
                 }
             }
-            return Ok(false);
-        }
-
-        // A request leaves the sizing once it is admitted, so one that
-        // fails is still there for [`Self::abandon`], with those behind it.
-        while let Some(waiting) = sizing.requests.first() {
-            let integer = |values: Vec<i64>| {
-                values
-                    .first()
-                    .copied()
-                    .ok_or_else(|| Error::Interface("a sizing function returned no value".into()))
-            };
-            let rows = integer(completion.returned()?)?;
-            let condition_rows = u32::try_from(rows).map_err(|_| {
-                Error::Interface("the video model reports an invalid condition row count".into())
-            })?;
-            let layouts: Vec<VideoLayout> = waiting.layouts.iter().flatten().copied().collect();
-            let holds = layouts
-                .iter()
-                .map(|_| Ok(integer(completion.returned()?)? != 0))
-                .collect::<Result<Vec<bool>>>()?;
-            let admitted =
-                self.plan
-                    .select(waiting.size.clone(), condition_rows, &layouts, &holds)?;
-
-            let (slot, key) = (waiting.slot, waiting.key);
-            let live = self
-                .requests
-                .get(&slot)
-                .is_some_and(|request| request.key == key && request.admission.is_none());
-            if live {
-                let layout = denoisers.admit(slot, &self.model, admitted.layout)?;
-                if let Some(request) = self.requests.get_mut(&slot) {
-                    request.layout = layout;
-                    request.admission = Some(admitted);
+            Asked::Preparation(layouts, evicted) => {
+                for layout in layouts {
+                    denoisers.accept_layout(&self.model, layout, completion)?;
                 }
+                // The job drained the stream the displaced layouts' last
+                // steps ran on.
+                drop(evicted);
             }
-            sizing.requests.remove(0);
         }
-        Ok(true)
+
+        // Admit every selected request whose layout is held. A request
+        // leaves the sizing once it is admitted, so one that fails is still
+        // there for [`Self::abandon`], with those behind it.
+        let mut waiting = Vec::new();
+        for request in std::mem::take(&mut sizing.requests) {
+            let held = request
+                .admitted
+                .as_ref()
+                .is_some_and(|admitted| !denoisers.lacks(&admitted.layout));
+            if !held || !waiting.is_empty() {
+                waiting.push(request);
+                continue;
+            }
+            if let Err(error) = self.admit_sized(&request, denoisers) {
+                waiting.push(request);
+                sizing.requests = waiting;
+                return Err(error);
+            }
+        }
+        sizing.requests = waiting;
+        Ok(sizing.requests.is_empty())
+    }
+
+    /// Hold the selected layout of `sized` in `denoisers` and admit its
+    /// request with it, unless the request ended or was restarted.
+    fn admit_sized(&mut self, sized: &Unsized, denoisers: &mut DenoiserRunners) -> Result<()> {
+        let Some(admitted) = &sized.admitted else {
+            return Ok(());
+        };
+        let live = self
+            .requests
+            .get(&sized.slot)
+            .is_some_and(|request| request.key == sized.key && request.admission.is_none());
+        if !live {
+            return Ok(());
+        }
+        let layout = denoisers.admit(sized.slot, admitted.layout)?;
+        if let Some(request) = self.requests.get_mut(&sized.slot) {
+            request.layout = layout;
+            request.admission = Some(admitted.clone());
+        }
+        Ok(())
     }
 
     /// Forget the requests of a sizing that failed and were not admitted:

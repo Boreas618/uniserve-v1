@@ -1131,8 +1131,25 @@ impl Backend for WorkerBackend {
             }
             if let Some(sizing) = &mut batch.sizing {
                 let job = Job::new();
-                video.ask(sizing, &job);
-                return Ok(Some(self.jobs.call(job, true)));
+                let on_lane = match video.ask(sizing, &mut self.denoisers, &job) {
+                    Ok(on_lane) => on_lane,
+                    Err(error) => {
+                        if let Some(sizing) = batch.sizing.take() {
+                            video.abandon(sizing);
+                        }
+                        return Err(error.into());
+                    }
+                };
+                // A layout's preparation works on the denoiser's stream,
+                // so it is a job of that lane; the model's arithmetic is a
+                // job of the Python thread alone.
+                let submitted = if on_lane {
+                    let kind = CallKind::Media(uniserve_ipc::MediaCall::LatentPreparation);
+                    self.jobs.start(kind, job, true).map_err(lane_lost)?
+                } else {
+                    self.jobs.call(job, true)
+                };
+                return Ok(Some(submitted));
             }
         }
 

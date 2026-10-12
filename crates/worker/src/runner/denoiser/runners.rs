@@ -6,17 +6,17 @@ use std::sync::Arc;
 use uniserve_ipc::{BufferId, RequestKey};
 
 use super::image::{DenoiseRow, ImageDiffusion};
-use super::{DenoiserRunner, VideoModel};
-use crate::Result;
+use super::{DenoiserRunner, Evicted, VideoModel};
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::Handle;
-use crate::lane::Job;
+use crate::lane::{Completion, Job};
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
 use crate::runner::causal_lm::warmup::with_scratch;
 use crate::runner::component::Component;
 use crate::storage::{ImageLatents, KVCache, UnitColumn};
+use crate::{Error, Result};
 
 /// Prefix tokens of each scratch slot a captured denoising step reads; host
 /// prefix lengths are rebound when the step replays.
@@ -150,19 +150,55 @@ impl DenoiserRunners {
         }
     }
 
-    /// Hold `layout` for the request admitted in `slot` and return its id,
-    /// releasing the layout of the request the slot held before. `None` on
-    /// a rank without a video denoiser.
-    pub(crate) fn admit(
+    /// Whether `layout` needs preparing before a request is admitted with
+    /// it: the rank's video denoiser does not hold it yet.
+    pub(crate) fn lacks(&self, layout: &VideoLayout) -> bool {
+        self.video
+            .as_ref()
+            .is_some_and(|denoiser| !denoiser.runner.prepared(layout))
+    }
+
+    /// Record into `job`, a job of the video denoiser's lane, the
+    /// preparation of transient layout `layout`
+    /// ([`super::DenoiserRunner::ask_layout`]).
+    pub(crate) fn ask_layout(
         &mut self,
-        slot: usize,
         model: &VideoModel,
         layout: VideoLayout,
-    ) -> Result<Option<usize>> {
+        job: &Job,
+    ) -> Result<Evicted> {
+        self.video
+            .as_mut()
+            .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?
+            .runner
+            .ask_layout(model, layout, job)
+    }
+
+    /// Keep transient layout `layout` as the job of [`Self::ask_layout`]
+    /// prepared it.
+    pub(crate) fn accept_layout(
+        &mut self,
+        model: &VideoModel,
+        layout: VideoLayout,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        self.video
+            .as_mut()
+            .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?
+            .runner
+            .accept_layout(model, layout, completion)
+    }
+
+    /// Hold prepared `layout` for the request admitted in `slot` and
+    /// return its id, releasing the layout of the request the slot held
+    /// before. `None` on a rank without a video denoiser.
+    pub(crate) fn admit(&mut self, slot: usize, layout: VideoLayout) -> Result<Option<usize>> {
         let Some(denoiser) = &mut self.video else {
             return Ok(None);
         };
-        let id = denoiser.runner.acquire(model, layout)?;
+        let id = denoiser.runner.acquire(layout)?.ok_or_else(|| {
+            Error::Invariant("a request was admitted with a layout that is not prepared".into())
+        })?;
         if let Some(previous) = self.layouts.insert(slot, id) {
             denoiser.runner.release(previous)?;
         }
