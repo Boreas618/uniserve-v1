@@ -19,10 +19,11 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8, memset_d32};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d32};
 
 use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView};
+use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
 /// Byte alignment of each carved field.
@@ -31,7 +32,6 @@ const ALIGNMENT: usize = 256;
 /// The continuation state of every request slot of a rank.
 pub(crate) struct DecodeState {
     memory: Arc<Memory>,
-    device: Option<i32>,
     rows: usize,
     vocab: usize,
     future_input_tokens: StorageView,
@@ -118,7 +118,6 @@ impl DecodeState {
             prompt_logits: view(5, logits, &[slots, width])?,
             verified_lengths,
             memory,
-            device,
             rows,
             vocab,
         };
@@ -195,77 +194,58 @@ impl DecodeState {
     /// continuation, zero coordinates, cache length and penalty counts.
     /// The retained prompt logits are read only after a scored chunk wrote
     /// them, so they are not reset.
-    pub(crate) fn reset(&self, slots: &[usize], stream: Option<&Stream>) -> Result<()> {
+    pub(crate) fn reset(&self, slots: &[usize], stream: impl Issue) -> Result<()> {
         for &slot in slots {
             self.require_slot(slot)?;
         }
         let word =
             |view: &StorageView, slot: usize, width: u64| view.address() + width * slot as u64;
-        match (self.device, stream) {
-            (Some(_), Some(stream)) => {
-                // Eight-byte fields take one source word per slot; the
-                // driver reads the pageable payload during the call.
-                let ones: Vec<i64> = vec![1; slots.len()];
-                let zeros: Vec<i64> = vec![0; slots.len()];
-                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                for (index, &slot) in slots.iter().enumerate() {
-                    batch.push(
-                        word(&self.future_input_tokens, slot, 8),
-                        ones[index..].as_ptr() as u64,
-                        8,
-                    );
-                    batch.push(
-                        word(&self.logical_lengths, slot, 8),
-                        zeros[index..].as_ptr() as u64,
-                        8,
-                    );
-                    batch.push(
-                        word(&self.sampling_positions, slot, 8),
-                        zeros[index..].as_ptr() as u64,
-                        8,
-                    );
-                }
-                // SAFETY: every destination is one element of this state for
-                // a distinct slot; sources are read during the call.
-                unsafe { batch.submit(stream) }?;
-                for &slot in slots {
-                    // SAFETY: one byte, one word and one row of this state.
-                    unsafe {
-                        memset_d8(word(&self.predicates, slot, 1), 0, 1, stream)?;
-                        memset_d32(word(&self.verified_lengths, slot, 4), 0, 1, stream)?;
-                        memset_d32(
-                            word(&self.penalty_counts, slot, 4 * self.vocab as u64),
-                            0,
-                            self.vocab,
-                            stream,
-                        )?;
-                    }
-                }
-                Ok(())
-            }
-            (None, None) => {
-                for &slot in slots {
-                    // SAFETY: host state owned by this value; the executor
-                    // thread serializes its writers and readers.
-                    unsafe {
-                        (word(&self.future_input_tokens, slot, 8) as *mut i64).write(1);
-                        (word(&self.logical_lengths, slot, 8) as *mut i64).write(0);
-                        (word(&self.sampling_positions, slot, 8) as *mut i64).write(0);
-                        (word(&self.predicates, slot, 1) as *mut u8).write(0);
-                        (word(&self.verified_lengths, slot, 4) as *mut i32).write(0);
-                        std::ptr::write_bytes(
-                            word(&self.penalty_counts, slot, 4 * self.vocab as u64) as *mut u8,
-                            0,
-                            4 * self.vocab,
-                        );
-                    }
-                }
-                Ok(())
-            }
-            _ => Err(Error::Invalid(
-                "decode state writes use a stream exactly for device state".into(),
-            )),
+
+        // Eight-byte fields take one source word per slot; the payload is
+        // read during the call.
+        let ones: Vec<i64> = vec![1; slots.len()];
+        let zeros: Vec<i64> = vec![0; slots.len()];
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        for (index, &slot) in slots.iter().enumerate() {
+            batch.push(
+                word(&self.future_input_tokens, slot, 8),
+                ones[index..].as_ptr() as u64,
+                8,
+            );
+            batch.push(
+                word(&self.logical_lengths, slot, 8),
+                zeros[index..].as_ptr() as u64,
+                8,
+            );
+            batch.push(
+                word(&self.sampling_positions, slot, 8),
+                zeros[index..].as_ptr() as u64,
+                8,
+            );
         }
+        // SAFETY: every destination is one element of this state for a
+        // distinct slot; sources are read during the call.
+        unsafe { stream.copy(&batch) }?;
+
+        for &slot in slots {
+            let zero = |address: u64, width: usize, count: usize| Fill {
+                address,
+                value: 0,
+                width,
+                count,
+            };
+            // SAFETY: one byte, one word and one row of this state.
+            unsafe {
+                stream.fill(zero(word(&self.predicates, slot, 1), 1, 1))?;
+                stream.fill(zero(word(&self.verified_lengths, slot, 4), 4, 1))?;
+                stream.fill(zero(
+                    word(&self.penalty_counts, slot, 4 * self.vocab as u64),
+                    4,
+                    self.vocab,
+                ))?;
+            }
+        }
+        Ok(())
     }
 
     /// Set `slots`' continuation flags to `value` on `stream` (warmup graph
@@ -274,23 +254,18 @@ impl DecodeState {
         &self,
         slots: &[usize],
         value: bool,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         for &slot in slots {
             self.require_slot(slot)?;
-            let address = self.predicates.address() + slot as u64;
-            match (self.device, stream) {
-                // SAFETY: one byte of this state.
-                (Some(_), Some(stream)) => {
-                    unsafe { memset_d8(address, u8::from(value), 1, stream) }?
-                }
-                // SAFETY: host state owned by this value.
-                (None, None) => unsafe { (address as *mut u8).write(u8::from(value)) },
-                _ => {
-                    return Err(Error::Invalid(
-                        "decode state writes use a stream exactly for device state".into(),
-                    ));
-                }
+            // SAFETY: one byte of this state.
+            unsafe {
+                stream.fill(Fill {
+                    address: self.predicates.address() + slot as u64,
+                    value: u32::from(value),
+                    width: 1,
+                    count: 1,
+                })?;
             }
         }
         Ok(())
