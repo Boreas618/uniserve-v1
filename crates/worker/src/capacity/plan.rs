@@ -196,10 +196,21 @@ pub struct MediaFacts {
     pub local_product_bytes: u64,
     /// Product bytes of every component per request (the logical pool).
     pub product_bytes: u64,
-    /// Latent pool of sampled trajectories, when this rank holds samples.
+    /// Latent pool of sampled trajectories, when the worker holds the
+    /// denoiser. Every rank of the worker reports its pages, because the head
+    /// schedules a request's pages by the worker's report.
     pub latent: Option<LatentPlan>,
+    /// Whether this rank stores the latent pool: it holds the denoiser.
+    pub stores_latent: bool,
     /// Artifact regions imported from other codec ranks.
     pub artifact_import_regions: usize,
+}
+
+impl MediaFacts {
+    /// The latent pool this rank stores.
+    fn stored_latent(&self) -> Option<LatentPlan> {
+        self.latent.filter(|_| self.stores_latent)
+    }
 }
 
 /// Inputs of the token layout taken from the loaded model.
@@ -482,7 +493,7 @@ pub fn request_layout(
         info.latent_pages = narrow(plan.num_pages, "latent pages")?;
     }
     let latent_bytes = media
-        .latent
+        .stored_latent()
         .map(|plan| plan.bytes())
         .transpose()?
         .unwrap_or(0);
@@ -506,7 +517,7 @@ pub fn request_layout(
         arena,
         fixed_device_bytes: BTreeMap::new(),
         physical_buffer_pool_bytes: slots as u64 * media.local_product_bytes,
-        latent: media.latent,
+        latent: media.stored_latent(),
         cache: None,
     };
     plan.clamp_lanes(config);
@@ -535,7 +546,7 @@ pub fn slot_requirements(
             0,
             0,
         )?;
-        let latent_bytes = match &media.latent {
+        let latent_bytes = match media.stored_latent() {
             Some(plan) => {
                 let pages = if plan.with_workspace {
                     plan.num_pages
@@ -756,6 +767,7 @@ mod tests {
             local_product_bytes: 4096,
             product_bytes: 8192,
             latent: None,
+            stores_latent: false,
             artifact_import_regions: 0,
         };
         let requirements = slot_requirements(&config, 12, &media, 2, 4).unwrap();
@@ -777,5 +789,49 @@ mod tests {
         assert_eq!(plan.info.buffer_pool_bytes, 3 * 8192);
         assert_eq!(plan.physical_buffer_pool_bytes, 3 * 4096);
         assert_eq!(plan.info.num_inference_steps, 8);
+    }
+
+    #[test]
+    fn every_rank_of_a_sampling_worker_reports_the_latent_pool() {
+        let config = WorkerConfig {
+            max_batch_calls: 2,
+            max_request_pool_size: 2,
+            ..WorkerConfig::default()
+        };
+        // Two slots of eight pages each, and the sentinel page.
+        let pool = LatentPlan {
+            request_pool_size: 2,
+            num_pages: 17,
+            page_units: 1024,
+            latent_width: 1,
+            element_bytes: 4,
+            with_workspace: false,
+        };
+        let facts = |stores_latent| MediaFacts {
+            num_steps: 8,
+            video_denoiser: None,
+            state_bytes: 1000,
+            local_product_bytes: 4096,
+            product_bytes: 8192,
+            latent: Some(pool),
+            stores_latent,
+            artifact_import_regions: 0,
+        };
+        let layout =
+            |stores_latent| request_layout(report(), &config, 12, &facts(stores_latent), false);
+        let denoising = layout(true).unwrap();
+        let other = layout(false).unwrap();
+
+        // The head compares the ranks' reports and schedules pages by them.
+        assert_eq!(other.info, denoising.info);
+        assert_eq!(denoising.info.latent_pages, 17);
+        assert_eq!(denoising.info.latent_page_units, 1024);
+
+        // Only the denoising rank stores the pool.
+        assert_eq!(denoising.latent, Some(pool));
+        assert_eq!(other.latent, None);
+        let requirement =
+            |stores_latent| slot_requirements(&config, 12, &facts(stores_latent), 2, 2).unwrap()[0];
+        assert!(requirement(false) < requirement(true));
     }
 }

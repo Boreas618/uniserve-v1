@@ -1179,6 +1179,7 @@ fn plan(
     };
     let capacity = match video {
         Some(video) => {
+            let sampling = launch.components.contains_key(&video.denoiser);
             let denoising = components.get(&video.denoiser).is_some();
             let decoding = components
                 .placed()
@@ -1188,6 +1189,7 @@ fn plan(
                 video,
                 config,
                 &facts.outputs,
+                sampling,
                 denoising,
                 decoding,
             )?)
