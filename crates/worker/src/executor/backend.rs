@@ -1094,19 +1094,25 @@ impl Backend for WorkerBackend {
 
     fn admit_inputs(
         &mut self,
-        _batch: &mut WorkerBatch,
+        batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
-        // Imports are still submitted where their reads become ready
-        // (`prepare_inputs`), on this thread.
-        Ok(None)
+        // Products other calls published are imported for every runtime
+        // alike. What the imports recorded for the lane is performed even
+        // when an import failed after it: the fences are due either way.
+        let (job, admitted) = forward::inputs::admit(self, batch);
+        let submitted = match batch.route() {
+            Some(kind) if !job.is_empty() => Some(self.jobs.start(kind, job).map_err(lane_lost)?),
+            _ => None,
+        };
+        admitted.map(|()| submitted)
     }
 
     fn inputs_admitted(
         &mut self,
-        _batch: &mut WorkerBatch,
-        _completion: Completion,
+        batch: &mut WorkerBatch,
+        completion: Completion,
     ) -> std::result::Result<(), WorkerError> {
-        Ok(())
+        forward::inputs::admitted(self, batch, completion)
     }
 
     fn prepare_inputs(
@@ -1114,9 +1120,9 @@ impl Backend for WorkerBackend {
         batch: &mut WorkerBatch,
         submission: &Arc<Submission>,
     ) -> std::result::Result<bool, WorkerError> {
-        // Products and KV transfers other calls published are imported
-        // first, for every runtime alike (`await_inputs` subscribes to what
-        // blocks them).
+        // The KV transfers other calls published are imported behind the
+        // admitted products (`admit_inputs`), and the batch waits for both
+        // (`await_inputs` subscribes to what blocks them).
         if !forward::inputs::prepare(self, batch)? {
             return Ok(false);
         }
