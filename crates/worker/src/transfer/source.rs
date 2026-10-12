@@ -165,11 +165,9 @@ impl TransportBuffer {
         let retirement = SourceRetirement { buffer, completion };
         match event {
             Some(event) => {
-                events.defer(
-                    vec![Arc::clone(&event)],
-                    Box::new(move || retirement.finish()),
-                )?;
-                events.wake_after(&event)
+                // The producer's fence was recorded when the buffer was
+                // exported, by a job submitted since or at once.
+                events.defer(vec![event], Box::new(move || retirement.finish()))
             }
             None => retirement.finish(),
         }

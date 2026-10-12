@@ -203,11 +203,7 @@ impl Read {
 
         let read = Arc::clone(self);
         self.events
-            .defer(events.clone(), Box::new(move || read.finish_borrow()))?;
-        for event in &events {
-            self.events.wake_after(event)?;
-        }
-        Ok(())
+            .defer(events, Box::new(move || read.finish_borrow()))
     }
 
     /// Close a borrowed read and have the event pool wait on the host for

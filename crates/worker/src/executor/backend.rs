@@ -469,9 +469,10 @@ impl WorkerBackend {
 
     /// Use the job queues of the rank's lanes for forward submission.
     pub fn set_job_queues(&mut self, jobs: JobQueues) {
-        // Lifecycle work that belongs to no lane's stream (a wake behind an
-        // event) is recorded for the first kind: one a lane serves, where
-        // the rank has lanes, since only a lane orders such a wake.
+        // Lifecycle work that belongs to no lane's stream (deferred work
+        // behind an event) is recorded for the first kind: one a lane
+        // serves, where the rank has lanes, since only a lane waits for an
+        // event.
         let mut kinds = self.info.supported_calls.clone();
         kinds.sort_by_key(|&kind| jobs.lane(kind).is_none());
         self.lifecycle = LaneJobs::new(&kinds);
