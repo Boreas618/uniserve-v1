@@ -36,7 +36,7 @@ use crate::ffi::Device;
 use crate::host::image::ImageResult;
 use crate::host::image::ImageTask;
 use crate::host::{HostLane, HostTask};
-use crate::lane::Job;
+use crate::lane::{Completion, Job};
 use crate::request::RequestPool;
 use crate::request::diffusion::Trajectories;
 use crate::runner::decoder::DecoderRunner;
@@ -142,6 +142,10 @@ pub(crate) struct ImageBatch<'a> {
     /// The version exports the batch's forwards issued, by call index,
     /// located when the commit is applied.
     pub(crate) exports: Vec<(usize, PendingExport)>,
+    /// What each returning call the batch recorded must return, in order
+    /// (the byte counts a decoder stages), checked when the commit is
+    /// applied.
+    pub(crate) returns: Vec<Vec<i64>>,
     /// Signals the physical end of the batch's KV accesses.
     pub(crate) retirement: Arc<Retirement>,
     /// The batch uses the latent pool on its stream (see
@@ -235,6 +239,7 @@ impl<'a> ImageBatch<'a> {
             publications: Publications::default(),
             latent_exports: Vec::new(),
             exports: Vec::new(),
+            returns: Vec::new(),
             retirement: Arc::new(Retirement::default()),
             latents_entered: false,
             started,
@@ -310,11 +315,10 @@ impl<'a> ImageBatch<'a> {
     /// FIXME: the forwards of an image batch still issue on its stream at
     /// once, so what the batch records around them is performed here, in
     /// their order, instead of being a job of the batch's lane.
-    pub(crate) fn perform(&mut self) -> Result<()> {
+    pub(crate) fn perform(&mut self) -> Result<Completion> {
         std::mem::take(&mut self.job)
             .perform()
             .check()
-            .map(drop)
             .map_err(|failure| failure.error)
     }
 
@@ -369,12 +373,26 @@ impl<'a> ImageBatch<'a> {
         Ok(Commit { updates, pending })
     }
 
-    /// Apply an issued commit once its work was performed: publish the
-    /// exports the forwards issued, then make the writes visible, apply the
+    /// Apply an issued commit from the `completion` of the job that
+    /// performed it: check what the forwards' calls returned, publish the
+    /// exports they issued, then make the writes visible, apply the
     /// trajectory commits, register the exports and record the calls as
     /// pending. A failure after the exports' check is fatal.
-    pub(crate) fn apply_commit(&mut self, commit: Commit) -> std::result::Result<(), Failure> {
+    pub(crate) fn apply_commit(
+        &mut self,
+        commit: Commit,
+        completion: &mut Completion,
+    ) -> std::result::Result<(), Failure> {
         let Commit { updates, pending } = commit;
+        for expected in std::mem::take(&mut self.returns) {
+            let returned = completion.returned()?;
+            if returned != expected {
+                return Err(Error::Interface(format!(
+                    "a decoding call staged {returned:?} bytes of images of {expected:?} bytes"
+                ))
+                .into());
+            }
+        }
         for (index, export) in std::mem::take(&mut self.exports) {
             let pool = &self.parts.latents()?.pool;
             latents::locate_export(
@@ -647,8 +665,8 @@ fn run(
             _ => ForwardStats::default(),
         };
         let commit = batch.issue_commit()?;
-        batch.perform()?;
-        batch.apply_commit(commit)?;
+        let mut completion = batch.perform()?;
+        batch.apply_commit(commit, &mut completion)?;
         Ok(stats)
     })();
     match result {
