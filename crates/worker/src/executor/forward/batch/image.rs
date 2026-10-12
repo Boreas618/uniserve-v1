@@ -13,7 +13,7 @@
 //! the batch reserved ([`ImageBatch::discard`]), a failure after it is
 //! fatal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,6 +36,7 @@ use crate::ffi::Device;
 use crate::host::image::ImageResult;
 use crate::host::image::ImageTask;
 use crate::host::{HostLane, HostTask};
+use crate::lane::Job;
 use crate::request::RequestPool;
 use crate::request::diffusion::Trajectories;
 use crate::runner::decoder::DecoderRunner;
@@ -49,6 +50,7 @@ use crate::storage::{
     ImageLatents, LatentStorage, LatentUpdate, OutputLease, OutputPlacement, OutputPool,
     ProductBuffer, ProductRead, Scalar,
 };
+use crate::stream::Issue;
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
 use crate::{Error, Outcome, Result};
@@ -101,6 +103,13 @@ pub(crate) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocatio
         .collect()
 }
 
+/// What an image batch's issued commit leaves to apply once its work was
+/// performed: the trajectory commits and the calls to record as pending.
+pub(crate) struct Commit {
+    updates: Vec<LatentUpdate>,
+    pending: Vec<(RequestKey, uniserve_core::CallId, bool)>,
+}
+
 /// An image batch's borrowed owners and the resources it reserved.
 pub(crate) struct ImageBatch<'a> {
     pub(crate) parts: ImageParts<'a>,
@@ -110,6 +119,9 @@ pub(crate) struct ImageBatch<'a> {
     /// The device and stream the batch's computation runs on.
     pub(crate) device: Option<i32>,
     pub(crate) stream: Option<Stream>,
+    /// What the batch's own steps issue on its stream: the start of its
+    /// lease, its flags, its commit and its retirement after a failure.
+    pub(crate) job: Job<'static>,
     /// This rank reports the component's host results.
     pub(crate) reports: bool,
     pub(crate) calls: Vec<CallState>,
@@ -136,9 +148,10 @@ pub(crate) struct ImageBatch<'a> {
 }
 
 impl<'a> ImageBatch<'a> {
-    /// Bind the batch's outputs, skip calls whose host predicate is false
-    /// and lease its output storage on `stream`. `words` are the payload
-    /// words the batch reads back beside one completion word per call.
+    /// Bind the batch's outputs, skip the `skipped` calls (those whose host
+    /// predicate is false) and lease its output storage on `stream`.
+    /// `words` are the payload words the batch reads back beside one
+    /// completion word per call.
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(crate) fn open(
         parts: ImageParts<'a>,
@@ -151,6 +164,7 @@ impl<'a> ImageBatch<'a> {
         stream: Option<Stream>,
         words: usize,
         started: Instant,
+        skipped: &HashSet<usize>,
     ) -> Result<Self> {
         let first = plan
             .calls
@@ -182,14 +196,12 @@ impl<'a> ImageBatch<'a> {
                 completion_write: None,
             });
         }
-        for (call, state) in plan.calls.iter().zip(&mut calls) {
-            if let Some(predicate) = &call.predicate
-                && predicate.dtype == DType::U8
-                && !read_flag(&storage.tensors, call, predicate, device, stream.as_ref())?
-            {
-                state.active = false;
-                state.output.output.status = CallStatus::Predicated;
-            }
+        for &index in skipped {
+            let state = calls
+                .get_mut(index)
+                .ok_or_else(|| Error::Invariant("a skipped call is outside its batch".into()))?;
+            state.active = false;
+            state.output.output.status = CallStatus::Predicated;
         }
         let devices: Vec<i32> = device.into_iter().collect();
         let buffer = parts.outputs.lease(
@@ -198,8 +210,9 @@ impl<'a> ImageBatch<'a> {
             &devices,
             false,
         )?;
+        let job = Job::new();
         if let Some(stream) = &stream {
-            lock(&buffer).begin_device(device, stream, &storage.events)?;
+            lock(&buffer).begin_device(device, job.on(Some(stream)), &storage.events)?;
         }
         Ok(Self {
             parts,
@@ -208,6 +221,7 @@ impl<'a> ImageBatch<'a> {
             plan,
             device,
             stream,
+            job,
             reports,
             calls,
             buffer,
@@ -276,18 +290,37 @@ impl<'a> ImageBatch<'a> {
                 .ok_or_else(|| Error::Invariant("a completion flag names no call".into()))?;
             let state = &mut self.calls[index];
             if !state.active {
-                self.storage
-                    .tensors
-                    .write_scalar(&write, Scalar::Int(0), self.stream.as_ref())?;
+                self.storage.tensors.write_scalar(
+                    &write,
+                    Scalar::Int(0),
+                    self.job.on(self.stream.as_ref()),
+                )?;
             }
             state.completion_write = Some(write);
         }
         Ok(())
     }
 
-    /// Validate every owner's update, then commit them together.
-    pub(crate) fn commit(&mut self) -> std::result::Result<(), Failure> {
-        let stream = self.stream.as_ref();
+    /// Perform, on this thread, what the batch recorded so far.
+    ///
+    /// FIXME: the forwards of an image batch still issue on its stream at
+    /// once, so what the batch records around them is performed here, in
+    /// their order, instead of being a job of the batch's lane.
+    pub(crate) fn perform(&mut self) -> Result<()> {
+        std::mem::take(&mut self.job)
+            .perform()
+            .check()
+            .map(drop)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Validate every owner's update and record the device half of the
+    /// commit: the end of the read leases, the completion flags, the end of
+    /// the latent pool's use and the seal of the output. The returned
+    /// commit is applied once that work was performed
+    /// ([`Self::apply_commit`]).
+    pub(crate) fn issue_commit(&mut self) -> std::result::Result<Commit, Failure> {
+        let stream = self.job.on(self.stream.as_ref());
         let reads = std::mem::take(&mut self.reads);
         self.storage.tensors.complete_reads(&reads, stream, &[])?;
 
@@ -330,8 +363,14 @@ impl<'a> ImageBatch<'a> {
             .map(|call| (call.request_key, call.call_id, call.advances_state()))
             .collect();
         self.requests.validate_pending(&pending)?;
+        Ok(Commit { updates, pending })
+    }
 
-        // Every owner accepted its update. Any failure from here is fatal.
+    /// Apply an issued commit once its work was performed: make the writes
+    /// visible, apply the trajectory commits, register the exports and
+    /// record the calls as pending. Any failure here is fatal.
+    pub(crate) fn apply_commit(&mut self, commit: Commit) -> std::result::Result<(), Failure> {
+        let Commit { updates, pending } = commit;
         let writes = std::mem::take(&mut self.writes);
         self.storage.tensors.commit_writes(&writes).map_err(fatal)?;
         if !updates.is_empty() {
@@ -359,7 +398,7 @@ impl<'a> ImageBatch<'a> {
         seal_lease(
             &self.storage.events,
             &self.buffer,
-            self.stream.as_ref(),
+            self.job.on(self.stream.as_ref()),
             &self.retirement,
         )
     }
@@ -367,13 +406,16 @@ impl<'a> ImageBatch<'a> {
     /// End the batch's use of the latent pool on its stream.
     fn leave_latents(&mut self) -> Result<()> {
         if std::mem::take(&mut self.latents_entered) {
-            self.parts.latents_mut()?.leave(self.stream.as_ref())?;
+            self.parts
+                .latents_mut()?
+                .leave(self.job.on(self.stream.as_ref()))?;
         }
         Ok(())
     }
 
-    /// Retire every reservation after a failure before the commit point;
-    /// storage returns once the fences recorded here complete.
+    /// Retire every reservation after a failure before the commit point,
+    /// recording the fences that end them; storage returns once those
+    /// fences were performed and complete.
     pub(crate) fn discard(&mut self) -> Result<()> {
         let left = self.leave_latents();
         let revoked = self.publications.revoke();
@@ -384,7 +426,7 @@ impl<'a> ImageBatch<'a> {
             // The versions retire once their transports drop them.
             latents.pool.release_exports(&exported);
         }
-        let stream = self.stream.as_ref();
+        let stream = self.job.on(self.stream.as_ref());
         let reads = std::mem::take(&mut self.reads);
         let completed = self.storage.tensors.complete_reads(&reads, stream, &[]);
         let writes = std::mem::take(&mut self.writes);
@@ -456,12 +498,12 @@ impl ImageParts<'_> {
 
     /// Order work on `stream` that reads the latent pool's pages after the
     /// pool's previous user; [`Self::leave_latents`] ends it.
-    pub(crate) fn enter_latents(&self, stream: Option<&Stream>) -> Result<()> {
+    pub(crate) fn enter_latents(&self, stream: impl Issue) -> Result<()> {
         self.latents()?.enter(stream)
     }
 
     /// End work on `stream` that used the latent pool's pages.
-    pub(crate) fn leave_latents(&mut self, stream: Option<&Stream>) -> Result<()> {
+    pub(crate) fn leave_latents(&mut self, stream: impl Issue) -> Result<()> {
         self.latents_mut()?.leave(stream)
     }
 
@@ -557,11 +599,21 @@ fn run(
             .into());
         }
     };
+    let mut skipped = HashSet::new();
+    for (index, call) in plan.calls.iter().enumerate() {
+        if let Some(predicate) = &call.predicate
+            && predicate.dtype == DType::U8
+            && !read_flag(&storage.tensors, call, predicate, device, stream.as_ref())?
+        {
+            skipped.insert(index);
+        }
+    }
     let mut batch = ImageBatch::open(
-        image, storage, requests, info, rank, plan, device, stream, words, started,
+        image, storage, requests, info, rank, plan, device, stream, words, started, &skipped,
     )?;
     let result = (|| -> std::result::Result<ForwardStats, Failure> {
         batch.bind_flags()?;
+        batch.perform()?;
         let stats = match kind {
             CallKind::Media(call @ (MediaCall::VisionEncoding | MediaCall::LatentEncoding)) => {
                 let images = inputs.map(Inputs::take).transpose()?.unwrap_or_default();
@@ -572,7 +624,9 @@ fn run(
             CallKind::Media(MediaCall::ImageDecoding) => batch.decode()?,
             _ => ForwardStats::default(),
         };
-        batch.commit()?;
+        let commit = batch.issue_commit()?;
+        batch.perform()?;
+        batch.apply_commit(commit)?;
         Ok(stats)
     })();
     match result {
@@ -596,7 +650,7 @@ fn run(
         }
         Err(failure) if failure.committed => Err(failure),
         Err(failure) => {
-            if let Err(cleanup) = batch.discard() {
+            if let Err(cleanup) = batch.discard().and(batch.perform()) {
                 return Err(Failure {
                     error: cleanup,
                     committed: true,
