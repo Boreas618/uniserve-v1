@@ -43,11 +43,11 @@ use uniserve_ipc::{
 };
 
 use super::super::backend::{WorkerBackend, WorkerBatch};
-use super::launch::read_flag;
 use super::transfer::latents::{self, LatentInput};
 use crate::error::WorkerError;
 use crate::executor::{BatchInputs, InputReady, Submission};
 use crate::ffi::Device;
+use crate::lane::{Completion, Job};
 use crate::storage::{
     KVCache, Metadata, OutputPlacement, PendingImport, ProductRead, TensorStore, ValueRange,
 };
@@ -107,6 +107,27 @@ pub(crate) struct Inputs {
     backpressure: Option<u64>,
     /// Preparation stopped on these inputs (not on another runtime's).
     waiting: bool,
+    /// Where the completion of the imports stands between its jobs.
+    completing: Completing,
+}
+
+/// The completion of a batch's imported inputs between its jobs.
+#[derive(Default)]
+enum Completing {
+    #[default]
+    Unstarted,
+    /// The job on the lane publishes the imported predicates and reads the
+    /// host-gated predicates of these calls, in this order: they decide
+    /// which other imports are read.
+    Predicates(Vec<usize>),
+    /// The predicates are known: whether each of those calls is skipped.
+    Decided(HashMap<usize, bool>),
+    /// The job on the lane publishes the imports an executing call reads.
+    Publishing,
+    /// Recording a job failed after it recorded work: the job on the lane
+    /// performs that work, whose fences are still due, and the completion
+    /// fails with this error.
+    Failing(Error),
 }
 
 impl Inputs {
@@ -781,53 +802,138 @@ pub(crate) fn subscribe(
     Ok(())
 }
 
-/// Publish the batch's imported products before its runtime executes:
-/// predicates first, then the imports some call that executes reads (a
-/// call whose host predicate is false reads nothing). Each import is
-/// published on its consumers' stream; consumers order after its fence.
-pub(crate) fn complete(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Result<()> {
-    let plan = Arc::clone(batch.shared_plan());
-    check_resident(backend, batch, &plan)?;
-    if plan.input_products.is_empty() {
-        return Ok(());
+/// The next job publishing the batch's imported products before its
+/// runtime executes, or `None` when nothing is left to issue: predicates
+/// first, then the imports some call that executes reads (a call whose host
+/// predicate is false reads nothing). Each import is published on its
+/// consumers' stream; consumers order after its fence.
+///
+/// The predicates that decide which imports are read are host-gated: the
+/// first job publishes the imported ones and reads them, and its
+/// completion ([`complete`]) decides what the second job publishes.
+pub(crate) fn forward<'a>(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+) -> Result<Option<Job<'a>>> {
+    let job = Job::new();
+    match record(backend, batch, &job) {
+        Ok(true) => Ok(Some(job)),
+        Ok(false) => Ok(None),
+        Err(error) if job.is_empty() => Err(error),
+        Err(error) => {
+            batch.inputs_mut().completing = Completing::Failing(error);
+            Ok(Some(job))
+        }
     }
-    let predicates: HashSet<&TensorRef> = plan
+}
+
+/// Record the next job of the imports' completion in `job`; whether the
+/// job is to be performed.
+fn record(backend: &mut WorkerBackend, batch: &mut WorkerBatch, job: &Job<'_>) -> Result<bool> {
+    let plan = Arc::clone(batch.shared_plan());
+    let imported: HashSet<&TensorRef> = plan
         .calls
         .iter()
         .filter_map(|call| call.predicate.as_ref())
         .collect();
-    let mut published = HashSet::new();
-    for export in &plan.input_products {
-        if predicates.contains(&export.product) {
-            publish(backend, batch, &plan, &export.product)?;
-            published.insert(export.product.buffer_id());
-        }
-    }
-
     let readers = consumers(&plan);
-    let mut skipped: HashMap<usize, bool> = HashMap::new();
+
+    let skipped = match std::mem::take(&mut batch.inputs_mut().completing) {
+        Completing::Unstarted => {
+            check_resident(backend, batch, &plan)?;
+            if plan.input_products.is_empty() {
+                return Ok(false);
+            }
+            for export in &plan.input_products {
+                if imported.contains(&export.product) {
+                    publish(backend, batch, &plan, &export.product, job)?;
+                }
+            }
+
+            // The calls whose host-gated predicate decides whether an
+            // import that is no predicate is read.
+            let mut deciding: Vec<usize> = Vec::new();
+            for export in &plan.input_products {
+                if imported.contains(&export.product) {
+                    continue;
+                }
+                for &index in readers.get(&export.product).into_iter().flatten() {
+                    let gated = plan.calls[index]
+                        .predicate
+                        .as_ref()
+                        .is_some_and(|predicate| predicate.dtype == DType::U8);
+                    if gated && !deciding.contains(&index) {
+                        deciding.push(index);
+                    }
+                }
+            }
+            if !deciding.is_empty() {
+                for &index in &deciding {
+                    read_predicate(backend, &plan.calls[index], job)?;
+                }
+                batch.inputs_mut().completing = Completing::Predicates(deciding);
+                return Ok(true);
+            }
+            HashMap::new()
+        }
+        Completing::Decided(skipped) => skipped,
+        state @ (Completing::Predicates(_) | Completing::Publishing | Completing::Failing(_)) => {
+            batch.inputs_mut().completing = state;
+            return Err(Error::Invariant(
+                "an input completion job was prepared before the last completed".into(),
+            ));
+        }
+    };
+
     for export in &plan.input_products {
         let product = &export.product;
-        if published.contains(&product.buffer_id()) {
+        if imported.contains(product) {
             continue;
         }
-        let mut read = false;
-        for &index in readers.get(product).into_iter().flatten() {
-            let skip = match skipped.get(&index) {
-                Some(&skip) => skip,
-                None => {
-                    let skip = predicated(backend, &plan.calls[index])?;
-                    skipped.insert(index, skip);
-                    skip
-                }
-            };
-            read |= !skip;
-        }
+        let read = readers
+            .get(product)
+            .into_iter()
+            .flatten()
+            .any(|index| !skipped.get(index).copied().unwrap_or(false));
         if read {
-            publish(backend, batch, &plan, product)?;
+            publish(backend, batch, &plan, product, job)?;
         }
     }
-    Ok(())
+    batch.inputs_mut().completing = Completing::Publishing;
+    Ok(!job.is_empty())
+}
+
+/// Apply the completion of the job [`forward`] prepared last; whether the
+/// imports are complete.
+pub(crate) fn complete(batch: &mut WorkerBatch, completion: Completion) -> Result<bool> {
+    let state = std::mem::take(&mut batch.inputs_mut().completing);
+    if let Completing::Failing(error) = state {
+        return Err(error);
+    }
+    let mut completion = completion.check().map_err(|failure| failure.error)?;
+    match state {
+        Completing::Predicates(calls) => {
+            let mut skipped = HashMap::with_capacity(calls.len());
+            for index in calls {
+                let skip = match completion.read()?[..] {
+                    [0] => true,
+                    [1] => false,
+                    _ => {
+                        return Err(Error::Invalid(
+                            "call predicate is not a canonical boolean".into(),
+                        ));
+                    }
+                };
+                skipped.insert(index, skip);
+            }
+            batch.inputs_mut().completing = Completing::Decided(skipped);
+            Ok(false)
+        }
+        Completing::Publishing => Ok(true),
+        Completing::Unstarted | Completing::Decided(_) | Completing::Failing(_) => Err(
+            Error::Invariant("an input completion has no job on its lane".into()),
+        ),
+    }
 }
 
 /// KV descriptors may have become resident since the imports were admitted;
@@ -859,47 +965,50 @@ fn check_resident(
     Ok(())
 }
 
-/// Whether a call's host-gated (U8) predicate is false.
-fn predicated(backend: &WorkerBackend, call: &Call) -> Result<bool> {
-    let Some(predicate) = call
+/// Record in `job` the read of `call`'s host-gated (U8) predicate after
+/// its producer's fence, on the stream serving the call; the job's
+/// completion carries its byte.
+fn read_predicate(backend: &WorkerBackend, call: &Call, job: &Job<'_>) -> Result<()> {
+    let predicate = call
         .predicate
         .as_ref()
-        .filter(|value| value.dtype == DType::U8)
-    else {
-        return Ok(false);
-    };
+        .ok_or(Error::State("a host-gated call has a predicate"))?;
     let device = component_device(backend, &call.component)?;
     let stream = backend.transfer_stream(call.code, device)?;
     let storage = backend
         .rank_storage()
         .ok_or_else(|| Error::Unsupported("predicates require rank storage".into()))?;
-    Ok(!read_flag(
-        &storage.tensors,
-        call,
+    let issue = job.on(stream.as_ref());
+    let read = storage.tensors.consume(
         predicate,
-        device.cuda_index(),
-        stream.as_ref(),
-    )?)
+        call.call_id,
+        device.cuda_index().map(Device::Cuda),
+        issue,
+    )?;
+    issue.read(read.value().address(), 1);
+    storage.tensors.complete_reads(&[read], issue, &[])
 }
 
-/// Publish one imported product on its consumers' stream.
+/// Record in `job` the publication of one imported product on its
+/// consumers' stream.
 fn publish(
     backend: &mut WorkerBackend,
     batch: &WorkerBatch,
     plan: &BatchPlan,
     product: &TensorRef,
+    job: &Job<'_>,
 ) -> Result<()> {
     let kind = consumer_kind(plan, product)?;
     match batch.inputs().state.inputs.get(&product.buffer_id()) {
         Some(Input::Tensor { read, device }) => {
             let stream = backend.transfer_stream(kind, *device)?;
-            tensors(backend)?.complete_import(read, stream.as_ref())
+            tensors(backend)?.complete_import(read, job.on(stream.as_ref()))
         }
         // An imported trajectory version becomes its slot's committed one.
         Some(Input::Latent { input, device }) => {
             let stream = backend.transfer_stream(kind, *device)?;
             let (pool, _) = latent_pool(backend)?;
-            latents::adopt(pool, input, stream.as_ref())
+            latents::adopt(pool, input, job.on(stream.as_ref()))
         }
         // Borrowed inputs stay with their host consumers; KV imports are
         // adopted by their install calls.

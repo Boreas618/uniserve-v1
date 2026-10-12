@@ -26,6 +26,7 @@ use crate::executor::PendingOutput;
 use crate::executor::forward::products::Publications;
 use crate::storage::memory::{dtype_name, parse_dtype};
 use crate::storage::{LatentExport, LatentImport, LatentPool, LatentStorage};
+use crate::stream::Issue;
 use crate::transfer::exports;
 use crate::transfer::{Read, ReadRef, Retirement, Transports, fetch};
 use crate::{Error, Result};
@@ -241,7 +242,7 @@ pub(crate) fn import(
 
 /// Make an imported version the consuming slot's committed trajectory:
 /// order `stream` after every read's copy, then adopt it.
-pub(crate) fn adopt(pool: &mut Pool, input: &LatentInput, stream: Option<&Stream>) -> Result<()> {
+pub(crate) fn adopt(pool: &mut Pool, input: &LatentInput, stream: impl Issue) -> Result<()> {
     let generation = i64::from(input.write.buffer.generation);
     let (step, height, width) = (
         i64::from(input.step),
