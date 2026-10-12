@@ -270,6 +270,19 @@ impl<'a> Job<'a> {
         self.operations.borrow_mut().push(operation);
     }
 
+    /// The job's event operations alone, in order: what its builder submits
+    /// when recording failed part way. The events the job queued are still
+    /// recorded, waited on and woken for, so the storage they fence is
+    /// returned, and none of the work recorded between them is performed.
+    pub(crate) fn orders_only(self) -> Self {
+        let mut operations = self.operations.into_inner();
+        operations.retain(Operation::orders);
+        Self {
+            operations: RefCell::new(operations),
+            after: self.after,
+        }
+    }
+
     /// Record what its user issues as operations of this job on `stream`
     /// (host memory without one).
     pub(crate) fn on<'r>(&'r self, stream: Option<&'r Stream>) -> Recorder<'r, 'a> {
@@ -311,19 +324,6 @@ impl<'a> Job<'a> {
     /// when its operations are performed.
     pub(crate) fn after(&self, device: DeviceId, events: Vec<Arc<Event>>) {
         *self.after.borrow_mut() = Some((device, events));
-    }
-
-    /// Give up the operations recorded after the first `len`: their
-    /// recorder failed and gave back storage they address. The event
-    /// operations among them stay, since an event queued for a record
-    /// completes only once the record is made.
-    pub(crate) fn truncate(&self, len: usize) {
-        let mut operations = self.operations.borrow_mut();
-        if len >= operations.len() {
-            return;
-        }
-        let kept: Vec<_> = operations.drain(len..).filter(Operation::orders).collect();
-        operations.extend(kept);
     }
 
     /// Continue this job with the operations of `other`.
@@ -891,6 +891,48 @@ mod tests {
     }
 
     #[test]
+    fn host_functions_and_waits_run_in_the_jobs_order() -> Result<()> {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let mut target = 0_u8;
+        let seen = Arc::new(AtomicU8::new(0));
+        let job = Job::new();
+        // SAFETY: one byte of the test.
+        unsafe { job.on(None).fill(byte(&raw mut target, 5)) }?;
+        let address = &raw const target as usize;
+        let observed = Arc::clone(&seen);
+        job.on(None).launch_host_fn(Box::new(move || {
+            // SAFETY: the test's byte, read on the thread performing the job.
+            observed.store(unsafe { *(address as *const u8) }, Ordering::Relaxed);
+        }))?;
+        Issue::synchronize(&job.on(None))?;
+
+        // Recording runs nothing; performing runs the function behind the
+        // fill recorded before it.
+        assert_eq!(seen.load(Ordering::Relaxed), 0);
+        job.perform().check().unwrap();
+        assert_eq!(seen.load(Ordering::Relaxed), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_recording_performs_none_of_its_work() -> Result<()> {
+        let mut target = 0_u8;
+        let job = Job::new();
+        // SAFETY: one byte of the test.
+        unsafe { job.on(None).fill(byte(&raw mut target, 5)) }?;
+        job.on(None).read(&raw const target as u64, 1);
+
+        // Without a stream the job holds no event operation.
+        let job = job.orders_only();
+        assert!(job.is_empty());
+        let mut completion = job.perform().check().unwrap();
+        assert_eq!(target, 0);
+        assert!(completion.read().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn host_operations_run_when_the_job_is_performed_and_reads_come_back() -> Result<()> {
         let mut target = [0_u8; 4];
         let state = [7_u8, 8];
@@ -935,28 +977,6 @@ mod tests {
 
         // The same call issued at once fails its caller.
         assert!(None::<&Stream>.call(failing()).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn a_truncated_job_performs_what_it_kept() -> Result<()> {
-        let mut written = [0_u8; 3];
-        let job = Job::new();
-        // SAFETY: bytes of the test's array.
-        unsafe { job.on(None).fill(byte(&raw mut written[0], 1)) }?;
-        let kept = job.len();
-        // SAFETY: as above.
-        unsafe { job.on(None).fill(byte(&raw mut written[1], 1)) }?;
-        job.on(None).call(failing())?;
-
-        // What a failed recorder added is given up; work recorded after
-        // the truncation is performed.
-        job.truncate(kept);
-        // SAFETY: as above.
-        unsafe { job.on(None).fill(byte(&raw mut written[2], 1)) }?;
-
-        assert!(job.perform().check().is_ok());
-        assert_eq!(written, [1, 0, 1]);
         Ok(())
     }
 }
