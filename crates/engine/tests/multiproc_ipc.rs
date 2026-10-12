@@ -2430,6 +2430,76 @@ fn a_kv_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Publishes a prefilled request's KV under a transfer-byte bound the
+/// export exceeds, which fails the call once its locations are known, and
+/// requires the same extent to be exportable afterwards: the refused
+/// export left no reservation or location behind.
+#[test]
+fn a_refused_kv_export_leaves_its_request_exportable() -> anyhow::Result<()> {
+    let mut executor = spawn_rank_group()?;
+    let admission = text_admission(14, 1, 3)?;
+    let request_key = admission.request_key;
+    let mut initial = token_batch(
+        9,
+        5,
+        request_key,
+        Some(admission),
+        CallId::new(9, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7, 8],
+        UnitId(3),
+        0,
+    );
+    initial.calls[0].token_output = None;
+    let tables = initial.block_tables.clone();
+    let first = execute(&mut executor, initial)?;
+    assert_eq!(first.results[0].output.status, CallStatus::Ok);
+
+    let export = |batch: u64, max_transfer_bytes: u64| {
+        let buffer = uniserve_ipc::BufferId {
+            owner: request_key,
+            producer_call_id: CallId::new(batch, 0),
+            output_index: 0,
+            generation: 2,
+        };
+        let mut call = Call::new(
+            request_key,
+            CallId::new(batch, 0),
+            CallKind::Transfer(TransferMode::KvExport),
+        );
+        call.coordinates = coordinates_after(&first.results[0].output);
+        call.kv_output = Some(buffer);
+        call.bounds = Bounds {
+            max_transfer_bytes,
+            ..Bounds::default()
+        };
+        let mut publish = Batch::new(batch, Vec::new(), vec![call]);
+        publish.collective_seq = batch - 4;
+        publish.block_tables = tables.clone();
+        (buffer, publish)
+    };
+
+    // One byte holds no tensor of the extent.
+    let (_, refused) = export(10, 1);
+    let report = execute(&mut executor, refused)?;
+    assert_eq!(report.results[0].output.status, CallStatus::Error);
+    assert!(report.results[0].output.kv_output.is_none());
+
+    let (buffer, accepted) = export(11, 4096);
+    let report = execute(&mut executor, accepted)?;
+    assert_eq!(report.results[0].output.status, CallStatus::Ok);
+    let transfer = report.results[0]
+        .output
+        .kv_output
+        .as_ref()
+        .context("KV export has no physical locations")?;
+    assert_eq!(transfer.source, buffer);
+    assert_eq!(transfer.exported_extent, 2);
+    assert_eq!(transfer.base, None);
+    executor.close()?;
+    Ok(())
+}
+
 /// Blocks a batch on an external shared-storage input that is not yet ready
 /// and requires the group to hold it and the batch behind it, without
 /// resubmission, until the publisher marks the segment ready. Then copies

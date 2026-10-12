@@ -13,8 +13,8 @@
 //! is jobs of its lane instead: one that reads its host-gated predicates,
 //! when it has any, then one holding its calls' forwards with the device
 //! half of its commit. Its commit is applied from that job's completion.
-//! When recording fails part way, the event operations already recorded
-//! are still submitted, alone, and the batch fails from their completion.
+//! When recording fails part way, what was recorded before is still
+//! submitted and the batch fails from its completion.
 
 pub(crate) mod image;
 
@@ -33,7 +33,7 @@ use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::forward::launch::{flag, request_flag};
 use crate::executor::forward::placement::{
-    OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export, skipped,
+    OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export,
 };
 use crate::executor::pending::{BatchResult, PendingOutput};
 use crate::ffi::Device;
@@ -125,7 +125,7 @@ impl CallState {
 
     /// Issue the export of `write`, the call's output `product`, to
     /// `stream`, behind the work that produced it.
-    fn export(
+    pub(crate) fn export(
         &mut self,
         owners: ProductOwners<'_>,
         call: &Call,
@@ -170,8 +170,8 @@ enum Phase {
     Committing(Commit),
     /// The commit was applied: nothing is left for the lane.
     Committed,
-    /// Recording failed after the job queued event records: the job on the
-    /// lane makes them, and the batch then fails with this error.
+    /// Recording failed part way: the job on the lane performs what was
+    /// recorded before, and the batch then fails with this error.
     Failed(WorkerError),
 }
 
@@ -288,26 +288,6 @@ impl MediaBatch {
                 call.pending.output.status = CallStatus::Predicated;
             }
         }
-    }
-
-    /// Commit the launched batch on its stream at once: issue the commit
-    /// and apply it.
-    pub(crate) fn commit(
-        &mut self,
-        plan: &BatchPlan,
-        owners: ProductOwners<'_>,
-        requests: &mut RequestPool,
-        trajectories: Option<&mut dyn Trajectories>,
-    ) -> Result<()> {
-        let stream = self.stream.clone();
-        let commit = self.issue_commit(
-            plan,
-            owners,
-            requests,
-            trajectories.as_deref(),
-            stream.as_ref(),
-        )?;
-        self.apply_commit(commit, owners, requests, trajectories)
     }
 
     /// Issue the device half of the batch's commit to `stream`, behind its
@@ -586,6 +566,10 @@ impl MediaBatch {
     /// Release what an undelivered batch holds: before commit, abandon its
     /// writes; after commit, withdraw its pending calls. Exports are revoked
     /// and queued host tasks withdrawn either way.
+    ///
+    /// A batch of recorded forwards has ended its input leases in a job by
+    /// now (its commit, or the job of its failed recording), so this ends
+    /// only the leases of a host batch, whose reads use no stream.
     pub(crate) fn close(
         &mut self,
         owners: ProductOwners<'_>,
@@ -756,25 +740,6 @@ fn media_kind(call: &Call) -> MediaCall {
     }
 }
 
-/// Open a video batch and skip the calls whose predicates, read on its
-/// stream at once, are false.
-pub(crate) fn open<'b>(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    borrowed: HashSet<BufferId>,
-    state: &'b mut Option<MediaBatch>,
-) -> Result<&'b mut MediaBatch> {
-    let batch = begin(parts, plan, borrowed, state)?;
-    let skipped = skipped(
-        &parts.storage.tensors,
-        plan,
-        batch.device,
-        batch.stream.as_ref(),
-    )?;
-    batch.skip(&skipped);
-    Ok(batch)
-}
-
 /// Begin a video batch: its output lease on the stream of its kind and its
 /// calls' pending results. `borrowed` names the inputs host codecs read in
 /// place.
@@ -817,17 +782,30 @@ pub(crate) fn forward<'a>(
         None => begin(parts, plan, borrowed, state)?,
     };
     let job = Job::new();
-    match record(parts, plan, batch, &job) {
-        Ok(()) => Ok(job),
-        Err(error) if job.is_empty() => Err(error),
-        // The events the job queued are still due: storage fenced by them
-        // is returned only once they are recorded. The work between them
-        // is not performed, since what it addresses was released.
-        Err(error) => {
-            batch.phase = Phase::Failed(error);
-            Ok(job.orders_only())
-        }
+    let error = match record(parts, plan, batch, &job) {
+        Ok(()) => return Ok(job),
+        Err(error) => error,
+    };
+
+    // The failed batch ends its input leases in this job, behind the waits
+    // their reads recorded, so closing it issues nothing on its stream.
+    let stream = batch.stream.clone();
+    let ended = batch
+        .inputs
+        .complete(parts.owners().store, job.on(stream.as_ref()));
+    if let Err(cleanup) = ended {
+        tracing::warn!(target: "uniserve_worker.media", "ending a failed batch's input leases failed: {cleanup}");
     }
+    if job.is_empty() {
+        return Err(error);
+    }
+
+    // What the batch recorded before it failed is still performed: the
+    // events it queued are due, and storage the batch gives up is returned
+    // only behind them. An export that failed kept only its event
+    // operations ([`Issue::attempt`]).
+    batch.phase = Phase::Failed(error);
+    Ok(job)
 }
 
 /// Record the next job of `batch` into `job` and advance its phase.
@@ -883,6 +861,31 @@ fn record(
     for index in 0..plan.calls.len() {
         let call = &plan.calls[index];
         let slot = slots[&call.request_key];
+
+        // A host call's work is tasks of the rank's host lane, submitted
+        // here; the batch's job holds only what it writes for the calls.
+        match call.code {
+            CallKind::Media(MediaCall::MediaReading) => {
+                crate::runner::media::read_media(parts, batch, index, call, slot, &placement)?;
+                continue;
+            }
+            CallKind::Media(MediaCall::VideoEncoding) => {
+                crate::runner::media::encode_units(
+                    parts, plan, batch, index, call, slot, &placement,
+                )?;
+                continue;
+            }
+            CallKind::Media(MediaCall::AudioEncoding) => {
+                crate::runner::media::encode_audio(parts, batch, index, call, slot)?;
+                continue;
+            }
+            CallKind::Media(MediaCall::Muxing) => {
+                crate::runner::media::mux(parts, plan, batch, index, call, slot)?;
+                continue;
+            }
+            _ => {}
+        }
+
         let owners = parts.owners();
         let completion = bind_completion(owners.store, call, batch.device, &slots)?;
         batch.calls[index].completion = completion;
@@ -893,9 +896,29 @@ fn record(
             CallKind::Media(MediaCall::TextEncoding) => crate::runner::encoder::encode_text(
                 parts, plan, batch, index, slot, &placement, job,
             )?,
+            CallKind::Media(MediaCall::VisionEncoding) => crate::runner::encoder::encode_vision(
+                parts, plan, batch, index, slot, &placement, job,
+            )?,
+            CallKind::Media(MediaCall::LatentEncoding) => {
+                crate::runner::encoder::encode_conditions(
+                    parts, plan, batch, index, slot, &placement, job,
+                )?
+            }
+            CallKind::Media(MediaCall::LatentPreparation) => {
+                crate::runner::denoiser::prepare(parts, plan, batch, index, slot, job)?
+            }
+            CallKind::Media(MediaCall::Denoising) => {
+                crate::runner::denoiser::denoise(parts, plan, batch, index, slot, &placement, job)?
+            }
+            CallKind::Media(MediaCall::VideoDecoding) => crate::runner::decoder::decode_video(
+                parts, plan, batch, index, slot, &placement, job,
+            )?,
+            CallKind::Media(MediaCall::AudioDecoding) => crate::runner::decoder::decode_audio(
+                parts, plan, batch, index, slot, &placement, job,
+            )?,
             kind => {
                 return Err(Error::Unsupported(format!(
-                    "{} is not recorded into a job",
+                    "{} is not a video model's media call",
                     kind.as_str()
                 ))
                 .into());
@@ -931,7 +954,7 @@ pub(crate) fn complete(
         "a media batch's job completed before it opened",
     ))?;
     match std::mem::replace(&mut batch.phase, Phase::Opened) {
-        // The job made the event records of a recording that failed.
+        // The job performed what a failed recording had recorded.
         Phase::Failed(error) => {
             batch.phase = Phase::Committed;
             Err(error)
@@ -963,74 +986,6 @@ pub(crate) fn complete(
             Err(Error::State("a media batch has no job on its lane").into())
         }
     }
-}
-
-/// Execute a batch of device video calls and commit it.
-pub(crate) fn execute(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    borrowed: HashSet<BufferId>,
-    state: &mut Option<MediaBatch>,
-) -> std::result::Result<(), WorkerError> {
-    let batch = open(parts, plan, borrowed, state)?;
-
-    let slots = request_slots(plan, parts.requests)?;
-    let allocations: HashMap<BufferId, BufferAllocation> = plan
-        .buffer_allocations
-        .iter()
-        .map(|allocation| (allocation.buffer, *allocation))
-        .collect();
-    let placement = Placement {
-        allocations: &allocations,
-        slots: &slots,
-    };
-    for index in 0..plan.calls.len() {
-        let call = &plan.calls[index];
-        let slot = slots[&call.request_key];
-        let owners = parts.owners();
-        let completion = bind_completion(owners.store, call, batch.device, &slots)?;
-        batch.calls[index].completion = completion;
-        if batch.calls[index].skipped {
-            continue;
-        }
-        match call.code {
-            CallKind::Media(MediaCall::VisionEncoding) => {
-                crate::runner::encoder::encode_vision(parts, plan, batch, index, slot, &placement)?
-            }
-            CallKind::Media(MediaCall::LatentPreparation) => {
-                crate::runner::denoiser::prepare(parts, plan, batch, index, slot)?
-            }
-            CallKind::Media(MediaCall::Denoising) => {
-                crate::runner::denoiser::denoise(parts, plan, batch, index, slot, &placement)?
-            }
-            CallKind::Media(MediaCall::VideoDecoding) => {
-                crate::runner::decoder::decode_video(parts, plan, batch, index, slot, &placement)?
-            }
-            CallKind::Media(MediaCall::AudioDecoding) => {
-                crate::runner::decoder::decode_audio(parts, plan, batch, index, slot, &placement)?
-            }
-            CallKind::Media(MediaCall::LatentEncoding) => {
-                crate::runner::encoder::encode_conditions(
-                    parts, plan, batch, index, slot, &placement,
-                )?
-            }
-            kind => {
-                return Err(Error::Unsupported(format!(
-                    "{} is not a device video call",
-                    kind.as_str()
-                ))
-                .into());
-            }
-        }
-    }
-    let owners = parts.owners();
-    let trajectories = parts
-        .denoisers
-        .video
-        .as_mut()
-        .map(|denoiser| &mut denoiser.runner as &mut dyn Trajectories);
-    batch.commit(plan, owners, parts.requests, trajectories)?;
-    Ok(())
 }
 
 pub(crate) fn latent_params<'a>(
@@ -1131,6 +1086,7 @@ pub(crate) fn publish(
 /// other ranks hold the rest, the whole product when the round assigns
 /// this rank all of it. Publishing the view itself is right in both cases;
 /// the store tracks a share that covers the product as a whole product.
+/// The fence and the export follow the work `stream` issued for the value.
 pub(crate) fn publish_bound(
     parts: &Parts<'_>,
     batch: &mut MediaBatch,
@@ -1138,11 +1094,9 @@ pub(crate) fn publish_bound(
     index: usize,
     write: &crate::ProductBuffer,
     host: bool,
+    stream: impl Issue,
 ) -> Result<()> {
     let owners = parts.owners();
-    let stream = stream_of(batch)?;
-    owners
-        .store
-        .write(write, &write.view(), Some(&stream), None)?;
-    batch.calls[index].export(owners, call, &call.outputs[0], write, host, Some(&stream))
+    owners.store.write(write, &write.view(), stream, None)?;
+    batch.calls[index].export(owners, call, &call.outputs[0], write, host, stream)
 }
