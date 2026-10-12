@@ -49,6 +49,7 @@ use crate::storage::{
     ImageLatents, LatentStorage, LatentUpdate, OutputLease, OutputPlacement, OutputPool,
     ProductBuffer, ProductRead, Scalar,
 };
+use crate::stream::Issue;
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
 use crate::{Error, Outcome, Result};
@@ -456,12 +457,12 @@ impl ImageParts<'_> {
 
     /// Order work on `stream` that reads the latent pool's pages after the
     /// pool's previous user; [`Self::leave_latents`] ends it.
-    pub(crate) fn enter_latents(&self, stream: Option<&Stream>) -> Result<()> {
+    pub(crate) fn enter_latents(&self, stream: impl Issue) -> Result<()> {
         self.latents()?.enter(stream)
     }
 
     /// End work on `stream` that used the latent pool's pages.
-    pub(crate) fn leave_latents(&mut self, stream: Option<&Stream>) -> Result<()> {
+    pub(crate) fn leave_latents(&mut self, stream: impl Issue) -> Result<()> {
         self.latents_mut()?.leave(stream)
     }
 
