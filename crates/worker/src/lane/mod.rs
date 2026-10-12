@@ -144,7 +144,7 @@ impl JobQueues {
         // goes with it, and a job that owns its operations is started as
         // it is.
         let job = unsafe { std::mem::transmute::<Job<'_>, Job<'static>>(job) };
-        let id = self.start(kind, job)?;
+        let id = self.queue(kind, job, true)?;
         Ok((id, self.wait(id)?))
     }
 
@@ -158,11 +158,18 @@ impl JobQueues {
     }
 
     /// Queue `job` on the lane serving `kind` without waiting for it. Its
-    /// completion arrives under the returned name.
+    /// completion arrives under the returned name, with the control
+    /// thread's wake behind it.
     pub(crate) fn start(&self, kind: CallKind, job: Job<'static>) -> Result<JobId> {
+        self.queue(kind, job, false)
+    }
+
+    /// Name `job` and queue it on the lane serving `kind`; `awaited` says
+    /// that the caller blocks on its completion.
+    fn queue(&self, kind: CallKind, job: Job<'static>, awaited: bool) -> Result<JobId> {
         let id = JobId(self.shared.next.fetch_add(1, Ordering::Relaxed));
         match self.lane(kind) {
-            Some(lane) => self.shared.queues[lane].1.start(id, job)?,
+            Some(lane) => self.shared.queues[lane].1.start(id, job, awaited)?,
             None => {
                 let completion = job.perform();
                 self.arrived().push_back((id, completion));
