@@ -60,9 +60,13 @@ def test_vision_features_fill_their_products(loaded):
         EncoderRunner.prepare_image(model, "vit", payload(32, 48, seed), 2, 0)
         for seed in (1, 2)
     ]
-    assert [list(image["grid"]) for image in images] == [[2, 3], [2, 3]]
+    # Canvas height and width, then the patch grid.
+    assert [EncoderRunner.image_facts(image)[:4] for image in images] == [
+        [32, 48, 2, 3],
+        [32, 48, 2, 3],
+    ]
     out = [product(4096), product(4096)]
-    shapes = runner.encode([image["image"] for image in images], *out)
+    shapes = runner.encode(images, *out)
 
     processor = model.image_processor
     for index, (image, shape) in enumerate(zip(images, shapes, strict=True)):
@@ -89,11 +93,11 @@ def test_resident_images_encode_like_their_decoded_pixels(loaded):
     pixels = torch.linspace(-1, 1, 3 * 32 * 32).reshape(3, 32, 32)
     image = pixels.to(torch.bfloat16)
     prepared = runner.prepare_resident(image, "vae", 1)
-    assert (prepared["height"], prepared["width"]) == (32, 32)
-    assert prepared["grid"] is None
+    # A latent tower has no patch grid.
+    assert EncoderRunner.image_facts(prepared)[:4] == [32, 32, 0, 0]
 
     out = product(4096)
-    (shape,) = runner.encode([prepared["image"]], out)
+    (shape,) = runner.encode([prepared], out)
     decoded = prepare_tensor_image(
         model.image_processor,
         "vae",
@@ -112,7 +116,7 @@ def test_encodings_larger_than_their_product_are_refused(loaded):
     _, runner = constructed(model, "vision_encoder")
     image = EncoderRunner.prepare_image(model, "vit", payload(32, 48), 1, 0)
     with pytest.raises(Exception, match="exceeds its product bound"):
-        runner.encode([image["image"]], product(8))
+        runner.encode([image], product(8))
 
 
 def test_inline_images_are_validated_on_the_host(loaded):

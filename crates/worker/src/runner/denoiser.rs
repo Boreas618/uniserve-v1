@@ -51,6 +51,7 @@ use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};
+use crate::runner::methods::kernel_records;
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::storage::{RequestSlots, SlotField};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
@@ -490,7 +491,6 @@ impl DenoiserRunner {
 
         let conditioner = match setup.conditioning {
             Some(conditioning) => {
-                const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
                 let Conditioning {
                     path,
                     mut capacities,
@@ -1298,24 +1298,14 @@ impl DenoiserRunner {
     }
 
     /// The kernels the denoiser's and the conditioner's operators selected.
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<KernelRecord>> {
-        let mut values: Vec<Any> = Vec::new();
-        let mut collect = |function: &Function, runner: &Handle| -> Result<()> {
-            let records: tvm_ffi::Array<Any> = function.call_as(&[runner.view()])?;
-            values.extend(records.iter());
-            Ok(())
-        };
-        collect(&self.methods.kernels, &self.methods.runner)?;
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
+        let mut records = kernel_records(&self.methods.kernels, &self.methods.runner, DENOISER)?;
         if let Some(conditioner) = &self.conditioner {
             for runner in conditioner.runners.values() {
-                collect(&conditioner.kernels, runner)?;
+                records.extend(kernel_records(&conditioner.kernels, runner, ENCODER)?);
             }
         }
-        values
-            .into_iter()
-            .enumerate()
-            .map(|(index, record)| KernelRecord::new(format!("{label}.kernels[{index}]"), record))
-            .collect()
+        Ok(records)
     }
 
     /// Release graphs and the Python half. An aborted close keeps
@@ -1402,7 +1392,8 @@ pub(crate) fn prepare(
             "prompt features disagree with the request's prompt".into(),
         ));
     }
-    denoiser.runner.condition(id, slot, value, count)?;
+    let mode = denoiser.runner.condition(id, slot, value, count)?;
+    batch.record(mode);
     if conditioned {
         let request = parts.video.request(slot, call.request_key)?;
         let latents = condition_latents(&request.conditions, &conditions)?;
@@ -1542,7 +1533,8 @@ pub(crate) fn denoise(
         .video
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-    let (update, _) = denoiser.runner.denoise(id, slot, call, params)?;
+    let (update, mode) = denoiser.runner.denoise(id, slot, call, params)?;
+    batch.record(mode);
     batch.calls[index].latent = Some(update);
     if call.outputs.is_empty() {
         return Ok(());
@@ -1606,6 +1598,7 @@ impl Trajectories for DenoiserRunner {
 
 const DENOISER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
 const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
+const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
 const OUTPUTS: &str = "uniserve_models.runner.denoiser.Outputs";
 
 /// What the model reports about its video timeline.

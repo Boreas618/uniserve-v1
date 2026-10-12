@@ -106,7 +106,10 @@ pub(crate) fn export(
         false,
         stream,
         |retirement| pool.retain_export(&source, retirement),
-    );
+    )
+    // The export was issued on `stream` at once, so its locations are
+    // complete.
+    .and_then(|exports| exports.locate(|retirement| pool.retain_export(&source, retirement)));
     let locations = match exported {
         Ok(locations) => locations,
         Err(error) => {
