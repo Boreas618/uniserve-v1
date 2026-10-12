@@ -872,6 +872,7 @@ impl WorkerBackend {
     /// Install (or clear) the service's completion wake on every storage
     /// owner.
     pub fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
+        self.jobs.set_wake(wake.clone());
         if let Some(storage) = &self.rank_storage {
             storage.set_wake(wake.clone());
         }
