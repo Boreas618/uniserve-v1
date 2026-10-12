@@ -586,6 +586,10 @@ impl MediaBatch {
     /// Release what an undelivered batch holds: before commit, abandon its
     /// writes; after commit, withdraw its pending calls. Exports are revoked
     /// and queued host tasks withdrawn either way.
+    ///
+    /// A batch of recorded forwards has ended its input leases in a job by
+    /// now (its commit, or the job of its failed recording), so this ends
+    /// only the leases of a host batch, whose reads use no stream.
     pub(crate) fn close(
         &mut self,
         owners: ProductOwners<'_>,
@@ -817,17 +821,29 @@ pub(crate) fn forward<'a>(
         None => begin(parts, plan, borrowed, state)?,
     };
     let job = Job::new();
-    match record(parts, plan, batch, &job) {
-        Ok(()) => Ok(job),
-        Err(error) if job.is_empty() => Err(error),
-        // The events the job queued are still due: storage fenced by them
-        // is returned only once they are recorded. The work between them
-        // is not performed, since what it addresses was released.
-        Err(error) => {
-            batch.phase = Phase::Failed(error);
-            Ok(job.orders_only())
-        }
+    let error = match record(parts, plan, batch, &job) {
+        Ok(()) => return Ok(job),
+        Err(error) => error,
+    };
+
+    // The failed batch ends its input leases in this job, behind the waits
+    // their reads recorded, so closing it issues nothing on its stream.
+    let stream = batch.stream.clone();
+    let ended = batch
+        .inputs
+        .complete(parts.owners().store, job.on(stream.as_ref()));
+    if let Err(cleanup) = ended {
+        tracing::warn!(target: "uniserve_worker.media", "ending a failed batch's input leases failed: {cleanup}");
     }
+    if job.is_empty() {
+        return Err(error);
+    }
+
+    // The events the job queued are still due: storage fenced by them is
+    // returned only once they are recorded. The work between them is not
+    // performed, since what it addresses was released.
+    batch.phase = Phase::Failed(error);
+    Ok(job.orders_only())
 }
 
 /// Record the next job of `batch` into `job` and advance its phase.
