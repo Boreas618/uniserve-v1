@@ -4,7 +4,8 @@
 //! functions. [`Interface`] resolves the entries startup needs into typed
 //! fields once, failing startup with the name of any missing entry, and
 //! keeps every entry so capability runtimes can resolve their own
-//! (`component.bind`, ...) by name.
+//! (`graphs.pool`, ...) by name. Everything else of the library is reached
+//! by import path ([`Interface::import`]).
 
 use std::collections::BTreeMap;
 
