@@ -9,12 +9,12 @@
 
 use tvm_ffi::Any;
 
-use crate::Result;
 use crate::ffi::{Function, Handle, Shape};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::StorageView;
+use crate::{Error, Result};
 
 /// One argument of a method call.
 #[derive(Clone)]
@@ -25,6 +25,7 @@ pub(crate) enum Argument {
     Integers(Vec<i64>),
     Floats(Vec<f64>),
     Text(String),
+    Texts(Vec<String>),
     Tensor(StorageView),
     Handle(Handle),
     /// A list of objects the library holds.
@@ -56,16 +57,18 @@ impl From<&StorageView> for Argument {
     }
 }
 
-/// A method and its owned arguments, called later, possibly on another
-/// thread (a microbatch's forward). Tensors are exported when the call is
-/// made, on the calling thread.
+/// A method or library function and its owned arguments, called later,
+/// possibly on another thread (a microbatch's forward, the Python thread's
+/// own work). Tensors are exported when the call is made, on the calling
+/// thread.
 pub(crate) struct MethodCall {
     function: Function,
     arguments: Vec<Argument>,
 }
 
 impl MethodCall {
-    /// A call of `function` with `arguments`, the Python runner first.
+    /// A call of `function` with `arguments`: for a method, the Python
+    /// runner first.
     pub(crate) fn new(function: &Function, arguments: Vec<Argument>) -> Self {
         Self {
             function: function.clone(),
@@ -94,6 +97,7 @@ impl MethodCall {
                     }
                     Argument::Tensor(view) => Any::from(view.to_tensor()?),
                     Argument::Text(text) => Any::from(tvm_ffi::String::from(text.as_str())),
+                    Argument::Texts(texts) => Any::from(crate::ffi::strings(&texts)),
                     Argument::Handle(handle) => handle.to_any(),
                     Argument::Handles(handles) => {
                         Any::from(crate::ffi::list(handles.iter().map(Handle::to_any)))
@@ -214,17 +218,15 @@ impl RunnerClass {
         })
     }
 
-    /// The kernels the operators of `runners` selected, one record per
-    /// prepared operator.
-    pub(crate) fn kernels<'a>(
+    /// The calls that list the kernels the operators of `runners` selected.
+    pub(crate) fn kernel_calls<'a>(
         &self,
         runners: impl IntoIterator<Item = &'a Methods>,
-    ) -> Result<Vec<KernelRecord>> {
-        let mut records = Vec::new();
-        for runner in runners {
-            records.extend(kernel_records(&self.kernels, runner.runner(), self.class)?);
-        }
-        Ok(records)
+    ) -> Vec<MethodCall> {
+        runners
+            .into_iter()
+            .map(|runner| kernels_call(&self.kernels, runner.runner()))
+            .collect()
     }
 
     /// Close `runners`; an aborted close keeps what device work may still
@@ -243,17 +245,23 @@ impl RunnerClass {
     }
 }
 
-/// The kernel records of the Python runner of `class`: what its `kernels`
-/// method returns, one JSON object text per prepared operator.
-pub(crate) fn kernel_records(
-    kernels: &Function,
-    runner: &Handle,
-    class: &str,
-) -> Result<Vec<KernelRecord>> {
-    let records: tvm_ffi::Array<Any> = kernels.call_as(&[runner.view()])?;
-    records
-        .iter()
-        .enumerate()
-        .map(|(index, record)| KernelRecord::new(format!("{class}.kernels[{index}]"), record))
-        .collect()
+/// The call of `kernels`, the `kernels` method of a Python runner's class,
+/// on `runner`: it returns one JSON object text per prepared operator.
+pub(crate) fn kernels_call(kernels: &Function, runner: &Handle) -> MethodCall {
+    MethodCall::new(kernels, vec![Argument::Handle(runner.clone())])
+}
+
+/// The kernel records `calls` list, each call made now: its caller waits
+/// for them (startup's listing).
+pub(crate) fn list_kernels(calls: Vec<MethodCall>) -> Result<Vec<KernelRecord>> {
+    let mut listed = Vec::new();
+    for call in calls {
+        let name = call.name().to_owned();
+        let records = tvm_ffi::Array::<Any>::try_from(call.invoke()?)
+            .map_err(|error| Error::numerical(&name, &error))?;
+        for (index, record) in records.iter().enumerate() {
+            listed.push(KernelRecord::new(format!("{name}[{index}]"), record)?);
+        }
+    }
+    Ok(listed)
 }

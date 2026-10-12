@@ -18,6 +18,11 @@
 //! control thread's wake behind it. Several jobs of a lane may be queued:
 //! their completions arrive in the lane's order.
 //!
+//! Work for the resource plane takes the same way to the Python thread
+//! ([`JobQueues::call`]): calls that issue nothing on a stream are submitted
+//! to it under a [`JobId`], and their [`Completion`] is posted to the same
+//! place.
+//!
 //! Every device also has a preparation stream for startup work outside any
 //! lane. Capability runtimes fork module and microbatch streams from these
 //! and register them here so they close in dependency order: preparation,
@@ -34,6 +39,7 @@ use uniserve_cuda::DeviceId;
 use uniserve_ipc::{CallKind, LaneConfig, Wake};
 
 use crate::config::{Device, WorkerConfig};
+use crate::ffi::Interpreter;
 use crate::stream::CUDAStream;
 use crate::{Error, Result};
 
@@ -80,8 +86,9 @@ impl Lane {
     }
 }
 
-/// The job queues of a rank's lanes and the completions of their jobs: the
-/// control thread's side of the lanes.
+/// The job queues of a rank's lanes, the way to its Python thread and the
+/// completions of what was submitted to either: the control thread's side
+/// of the execution and resource planes.
 #[derive(Clone)]
 pub struct JobQueues {
     shared: Arc<Shared>,
@@ -90,8 +97,13 @@ pub struct JobQueues {
 struct Shared {
     /// Each lane's served call kinds (`None` serves every kind) and queue.
     queues: Vec<(Option<Vec<CallKind>>, JobQueue)>,
-    /// Where every lane posts its completions.
+    /// Where every lane and the Python thread post their completions.
     completions: Receiver<(JobId, Completion)>,
+    /// The posting end the Python thread's work is given.
+    posted: Sender<(JobId, Completion)>,
+    /// The control thread's wake, fired behind a completion the Python
+    /// thread posts. Set and read on the control thread.
+    wake: Mutex<Option<Wake>>,
     /// The name of the next job.
     next: AtomicU64,
     /// Completions taken while another job was waited for, and those of
@@ -103,20 +115,23 @@ impl Default for JobQueues {
     /// The queues of a rank without lanes: every job is performed on the
     /// thread that submits it.
     fn default() -> Self {
-        let (_, completions) = crossbeam_channel::unbounded();
-        Self::new(Vec::new(), completions)
+        let (posted, completions) = crossbeam_channel::unbounded();
+        Self::new(Vec::new(), posted, completions)
     }
 }
 
 impl JobQueues {
     fn new(
         queues: Vec<(Option<Vec<CallKind>>, JobQueue)>,
+        posted: Sender<(JobId, Completion)>,
         completions: Receiver<(JobId, Completion)>,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 queues,
                 completions,
+                posted,
+                wake: Mutex::new(None),
                 next: AtomicU64::new(0),
                 arrived: Mutex::new(VecDeque::new()),
             }),
@@ -164,10 +179,36 @@ impl JobQueues {
         self.queue(kind, job, false)
     }
 
+    /// Submit `calls`, a job of Python calls that issue nothing on a
+    /// stream, to the Python thread without waiting for it. Its completion
+    /// arrives under the returned name where the lanes' completions arrive;
+    /// `wake` says whether the control thread's wake is fired behind it, or
+    /// the completion is left to be taken when the control thread next
+    /// takes one.
+    pub(crate) fn call(&self, calls: Job<'static>, wake: bool) -> JobId {
+        let id = self.name();
+        let wake = if wake { self.wake().clone() } else { None };
+        let post = job::Post::new(id, self.shared.posted.clone(), wake);
+        Interpreter::submit(move || post.now(calls.perform()));
+        id
+    }
+
+    fn wake(&self) -> std::sync::MutexGuard<'_, Option<Wake>> {
+        self.shared
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The name of the next job.
+    fn name(&self) -> JobId {
+        JobId(self.shared.next.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// Name `job` and queue it on the lane serving `kind`; `awaited` says
     /// that the caller blocks on its completion.
     fn queue(&self, kind: CallKind, job: Job<'static>, awaited: bool) -> Result<JobId> {
-        let id = JobId(self.shared.next.fetch_add(1, Ordering::Relaxed));
+        let id = self.name();
         match self.lane(kind) {
             Some(lane) => self.shared.queues[lane].1.start(id, job, awaited)?,
             None => {
@@ -186,7 +227,7 @@ impl JobQueues {
     }
 
     /// The completion of job `id`, waited for.
-    fn wait(&self, id: JobId) -> Result<Completion> {
+    pub(crate) fn wait(&self, id: JobId) -> Result<Completion> {
         loop {
             let mut arrived = self.arrived();
             if let Some(position) = arrived.iter().position(|(job, _)| *job == id) {
@@ -210,6 +251,7 @@ impl JobQueues {
     /// thread, which blocks on its socket and its wake descriptor, learns
     /// of a completion it does not wait for.
     pub(crate) fn set_wake(&self, wake: Option<Wake>) {
+        (*self.wake()).clone_from(&wake);
         for (_, jobs) in &self.shared.queues {
             // A lane that is gone posts nothing to be woken for; its next
             // job reports it.
@@ -225,7 +267,9 @@ pub struct Lanes {
     /// The configured lanes, or the one lane of a rank without them.
     lanes: Vec<Lane>,
     /// Where the lanes post their completions; the rank's job queues take
-    /// them from here.
+    /// them from here, and give the posting end to the Python thread's
+    /// work.
+    posted: Sender<(JobId, Completion)>,
     completions: Receiver<(JobId, Completion)>,
     /// The full-device streams of the other CUDA devices of a rank without
     /// configured lanes.
@@ -242,11 +286,10 @@ impl Lanes {
             .iter()
             .filter_map(|device| device.cuda_index().map(DeviceId))
             .collect();
-        // Each lane's thread holds a sender, and nothing else does: when
-        // the last lane is gone, whoever waits for a completion learns it.
         let (posted, completions) = crossbeam_channel::unbounded();
         let mut lanes = Self {
             lanes: Vec::new(),
+            posted: posted.clone(),
             completions,
             devices: Vec::new(),
             preparation: Vec::new(),
@@ -318,7 +361,7 @@ impl Lanes {
                 (kinds, lane.jobs.clone())
             })
             .collect();
-        JobQueues::new(queues, self.completions.clone())
+        JobQueues::new(queues, self.posted.clone(), self.completions.clone())
     }
 
     /// The stream of the lane serving `kind`, or `device`'s full-device
@@ -443,12 +486,13 @@ mod tests {
     /// The queues of one lane that serves every kind, and its thread.
     fn lane() -> (JobQueues, std::thread::JoinHandle<std::thread::ThreadId>) {
         let (posted, completions) = crossbeam_channel::unbounded();
-        let (queue, jobs) = JobQueue::new(posted);
+        let (queue, jobs) = JobQueue::new(posted.clone());
         let thread = std::thread::spawn(move || {
             jobs.run();
             std::thread::current().id()
         });
-        (JobQueues::new(vec![(None, queue)], completions), thread)
+        let queues = JobQueues::new(vec![(None, queue)], posted, completions);
+        (queues, thread)
     }
 
     #[test]
