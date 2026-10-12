@@ -497,6 +497,19 @@ impl<'a> ImageBatch<'a> {
     }
 }
 
+/// End a job of an image forward and start its next: the completion of
+/// what was recorded so far.
+///
+/// FIXME: performed at once on the recording thread, like the batch's own
+/// job ([`ImageBatch::perform`]); as jobs of the lane, the forward resumes
+/// from each completion.
+pub(crate) fn boundary(job: &mut Job<'static>) -> Result<Completion> {
+    std::mem::take(job)
+        .perform()
+        .check()
+        .map_err(|failure| failure.error)
+}
+
 /// The parts of the backend an image batch executes with: the image
 /// model's facts and host policy, the rank's runners, and the storage its
 /// trajectories and products live in.
