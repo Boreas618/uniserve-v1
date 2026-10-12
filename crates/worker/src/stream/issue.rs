@@ -37,6 +37,18 @@ pub struct Fill {
     pub count: usize,
 }
 
+/// A fill of `height` rows, `pitch` bytes apart, of `count` elements of
+/// `width` bytes (1 or 4) each, with the low bytes of `value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowFill {
+    pub address: u64,
+    pub pitch: usize,
+    pub value: u32,
+    pub width: usize,
+    pub count: usize,
+    pub height: usize,
+}
+
 /// What a function issues stream work to. See the module documentation.
 pub trait Issue: Copy {
     /// What issues writes of host memory in this issuer's order.
@@ -70,6 +82,15 @@ pub trait Issue: Copy {
     /// The destination holds `fill.count` aligned elements and stays valid
     /// until the fill ran.
     unsafe fn fill(&self, fill: Fill) -> Result<()>;
+
+    /// A fill of equally spaced rows (`cuMemsetD2D8Async`,
+    /// `cuMemsetD2D32Async`).
+    ///
+    /// # Safety
+    /// Every row holds `fill.count` aligned elements in the memory of the
+    /// stream's device (host memory without a stream) and stays valid until
+    /// the fill ran.
+    unsafe fn memset_2d(&self, fill: RowFill) -> Result<()>;
 
     /// Record `event` after the work issued before it.
     fn record(&self, event: &Arc<Event>) -> Result<()>;
@@ -128,6 +149,12 @@ unsafe fn copy_host(copies: &CopyBatch) {
 /// # Safety
 /// The destination is valid host memory of `fill.count` elements.
 unsafe fn fill_host(fill: Fill) {
+    if fill.width == 1 {
+        // SAFETY: forwarded from the caller.
+        unsafe { std::ptr::write_bytes(fill.address as *mut u8, fill.value as u8, fill.count) };
+        return;
+    }
+
     let bytes = fill.value.to_le_bytes();
     for index in 0..fill.count {
         // SAFETY: forwarded from the caller.
@@ -161,6 +188,52 @@ unsafe fn fill_device(fill: Fill, stream: &Stream) -> Result<()> {
             _ => {
                 return Err(Error::Invariant(format!(
                     "a fill writes elements of 1, 2 or 4 bytes, not {width}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write the rows of `fill` into host memory.
+///
+/// # Safety
+/// Every row is valid host memory of `fill.count` elements.
+unsafe fn fill_host_rows(fill: RowFill) {
+    for row in 0..fill.height {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            fill_host(Fill {
+                address: fill.address + (row * fill.pitch) as u64,
+                value: fill.value,
+                width: fill.width,
+                count: fill.count,
+            });
+        }
+    }
+}
+
+/// Issue the rows of `fill` on `stream`.
+///
+/// # Safety
+/// As for [`Issue::memset_2d`].
+unsafe fn fill_device_rows(fill: RowFill, stream: &Stream) -> Result<()> {
+    let RowFill {
+        address,
+        pitch,
+        value,
+        width,
+        count,
+        height,
+    } = fill;
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        match width {
+            1 => uniserve_cuda::memset_2d_d8(address, pitch, value as u8, count, height, stream)?,
+            4 => uniserve_cuda::memset_2d_d32(address, pitch, value, count, height, stream)?,
+            _ => {
+                return Err(Error::Invariant(format!(
+                    "a row fill writes elements of 1 or 4 bytes, not {width}"
                 )));
             }
         }
@@ -208,6 +281,18 @@ impl Issue for Option<&Stream> {
             None => {
                 // SAFETY: forwarded from the caller.
                 unsafe { fill_host(fill) };
+                Ok(())
+            }
+        }
+    }
+
+    unsafe fn memset_2d(&self, fill: RowFill) -> Result<()> {
+        match self {
+            // SAFETY: forwarded from the caller.
+            Some(stream) => unsafe { fill_device_rows(fill, stream) },
+            None => {
+                // SAFETY: forwarded from the caller.
+                unsafe { fill_host_rows(fill) };
                 Ok(())
             }
         }
@@ -283,6 +368,11 @@ impl<'a> Issue for &'a Stream {
     unsafe fn fill(&self, fill: Fill) -> Result<()> {
         // SAFETY: forwarded from the caller.
         unsafe { Some(*self).fill(fill) }
+    }
+
+    unsafe fn memset_2d(&self, fill: RowFill) -> Result<()> {
+        // SAFETY: forwarded from the caller.
+        unsafe { Some(*self).memset_2d(fill) }
     }
 
     fn record(&self, event: &Arc<Event>) -> Result<()> {
