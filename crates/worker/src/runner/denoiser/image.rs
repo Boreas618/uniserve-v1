@@ -879,6 +879,11 @@ pub(crate) struct DenoiseResume {
 /// not prepare, or one resumed at another size). Their plans say which
 /// branches each step evaluates, so the steps are recorded once they are
 /// known.
+///
+/// FIXME: no test and no reference request reaches this boundary. A rank
+/// opens the trajectories it denoises when it prepares their latents; one
+/// it did not prepare arrives only as a transferred trajectory, which the
+/// stub rank's tests and the image harness do not build.
 pub(crate) struct PlanResume {
     /// Each active call's trajectory, admitted image and conditioning
     /// coordinates.
