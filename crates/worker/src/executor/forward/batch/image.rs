@@ -48,7 +48,7 @@ use crate::runner::encoder::inputs::Inputs;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::storage::{
     ImageLatents, LatentStorage, LatentUpdate, OutputLease, OutputPlacement, OutputPool,
-    ProductBuffer, ProductRead, Scalar,
+    ProductBuffer, ProductExport, ProductRead, Scalar,
 };
 use crate::stream::Issue;
 use crate::transfer::Retirement;
@@ -142,6 +142,9 @@ pub(crate) struct ImageBatch<'a> {
     /// The version exports the batch's forwards issued, by call index,
     /// located when the commit is applied.
     pub(crate) exports: Vec<(usize, PendingExport)>,
+    /// The feature exports the batch's forward issued, by call index, with
+    /// the product each exports; located when the commit is applied.
+    pub(crate) features: Vec<(usize, ProductBuffer, ProductExport)>,
     /// What each returning call the batch recorded must return, in order
     /// (the byte counts a decoder stages), checked when the commit is
     /// applied.
@@ -239,6 +242,7 @@ impl<'a> ImageBatch<'a> {
             publications: Publications::default(),
             latent_exports: Vec::new(),
             exports: Vec::new(),
+            features: Vec::new(),
             returns: Vec::new(),
             retirement: Arc::new(Retirement::default()),
             latents_entered: false,
@@ -402,6 +406,14 @@ impl<'a> ImageBatch<'a> {
                 &mut self.calls[index].output,
             )?;
         }
+        for (index, write, export) in std::mem::take(&mut self.features) {
+            self.publications.locate(
+                &self.storage.tensors,
+                &write,
+                export,
+                &mut self.calls[index].output,
+            )?;
+        }
         self.publications.validate(&self.storage.tensors)?;
 
         // Every owner accepted its update. Any failure from here is fatal.
@@ -455,6 +467,9 @@ impl<'a> ImageBatch<'a> {
         self.exports
             .drain(..)
             .for_each(|(_, export)| export.revoke());
+        self.features
+            .drain(..)
+            .for_each(|(_, _, export)| export.revoke());
         let revoked = self.publications.revoke();
         let exported = std::mem::take(&mut self.latent_exports);
         if !exported.is_empty()
@@ -480,6 +495,19 @@ impl<'a> ImageBatch<'a> {
         lock(&self.buffer).abandon();
         left.and(revoked).and(completed).and(abandoned).and(sealed)
     }
+}
+
+/// End a job of an image forward and start its next: the completion of
+/// what was recorded so far.
+///
+/// FIXME: performed at once on the recording thread, like the batch's own
+/// job ([`ImageBatch::perform`]); as jobs of the lane, the forward resumes
+/// from each completion.
+pub(crate) fn boundary(job: &mut Job<'static>) -> Result<Completion> {
+    std::mem::take(job)
+        .perform()
+        .check()
+        .map_err(|failure| failure.error)
 }
 
 /// The parts of the backend an image batch executes with: the image

@@ -21,6 +21,7 @@ use super::context::{self, Sources};
 use super::runners::Step;
 use super::{CausalLMRunners, StepParts};
 use crate::executor::forward::batch::image::ImageParts;
+use crate::lane::Job;
 use crate::runner::causal_lm::{
     Embeddings, FINISH_IDS, PromptChunks, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };
@@ -616,9 +617,21 @@ pub(super) fn condition_latents(
         .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
     let (tables, cache) = kv.split();
     runtime.order().wait(denoiser.as_ref())?;
-    diffusion.condition(rows, tables, |table, prefix, query| {
-        cache.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
-    })?;
+    // The denoiser records its conditioning; this caller is the last
+    // operation of a job, so it performs the record where it runs.
+    let conditioning = Job::new();
+    diffusion.condition(
+        rows,
+        tables,
+        |table, prefix, query| {
+            cache.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
+        },
+        &conditioning,
+    )?;
+    conditioning
+        .perform()
+        .check()
+        .map_err(|failure| failure.error)?;
     runtime.order_mut().record(denoiser.as_ref())?;
     runtime.order().wait(stream)
 }
