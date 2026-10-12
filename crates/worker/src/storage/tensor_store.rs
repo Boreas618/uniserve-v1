@@ -420,9 +420,10 @@ pub struct ProductExport {
 }
 
 impl ProductExport {
-    /// Revoke the locations of an export that is not published.
-    pub fn revoke(&self) {
-        self.exports.iter().for_each(Exports::revoke);
+    /// Revoke the locations of an export that is not published, once the
+    /// issuer it was made with performed its work.
+    pub fn revoke(self) {
+        self.exports.into_iter().for_each(Exports::revoke);
     }
 }
 
@@ -1638,12 +1639,12 @@ impl TensorStore {
 
     /// Order `stream` after an import's reads (which must be ready) and its
     /// buffer's producer, propagating read failures.
-    pub fn wait_import(&self, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    pub fn wait_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
         let state = lock(&self.state);
         Self::wait_imported(&state, read, stream)
     }
 
-    fn wait_imported(state: &State, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    fn wait_imported(state: &State, read: &ProductRead, stream: impl Issue) -> Result<()> {
         let imported = Self::imported(read)?;
         let imported = lock(&imported);
         state.require_buffer(&imported.buffer)?;
@@ -1657,7 +1658,7 @@ impl TensorStore {
     /// Publish an import's materialized value on `stream`: a new product is
     /// produced and committed; a widened shard gets one fence over the
     /// union of its regions and becomes the whole logical tensor.
-    pub fn complete_import(&self, read: &ProductRead, stream: Option<&Stream>) -> Result<()> {
+    pub fn complete_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
         self.events.reap()?;
         let mut state = lock(&self.state);
         Self::wait_imported(&state, read, stream)?;
@@ -2018,7 +2019,7 @@ impl TensorStore {
             Ok(())
         })();
         if let Err(error) = result {
-            exports.iter().for_each(Exports::revoke);
+            exports.into_iter().for_each(Exports::revoke);
             return Err(error);
         }
 

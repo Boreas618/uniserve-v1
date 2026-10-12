@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::Canvas;
-use uniserve_cuda::{Stream, memcpy_async, memset_d8};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 use uniserve_ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 
 use crate::config::Device;
@@ -51,17 +51,19 @@ use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::batch::image::{Encoding, ImageBatch, allocations, lock};
 use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::ffi::{DType, Function, Handle, integer_list};
+use crate::ffi::{DType, Function, Handle};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
+use crate::lane::Job;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::runner::methods::{Argument, Methods, RunnerClass, kernel_records};
+use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass, kernel_records};
 use crate::runner::{ImageSetup, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
     LatentUpdate, Metadata, OutputPlacement, ProductBuffer, RequestSlots, SlotField, ValueRange,
 };
+use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
 const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
@@ -193,15 +195,33 @@ impl DecoderRunner {
         self.image_decoder()?.decode(images, stage)
     }
 
-    /// Quantize a resident image product holding values in `range` and
-    /// hand its staged pixels to `stage`.
-    pub fn quantize(
+    /// Record the decoding of `images` into `job`: each sub-batch's call
+    /// and what `stage` issues for each image's staged pixels. `returns`
+    /// receives the byte counts each call must return.
+    pub(crate) fn record_decode(
+        &self,
+        images: &[DecodeImage],
+        stage: impl FnMut(usize, StorageView) -> Result<()>,
+        job: &Job<'_>,
+        returns: &mut Vec<Vec<i64>>,
+    ) -> Result<()> {
+        self.image_decoder()?
+            .record_decode(images, stage, job, returns)
+    }
+
+    /// Record the quantization of a resident image product holding values
+    /// in `range` into `job` and what `stage` issues for its staged pixels.
+    /// `returns` receives the byte count the call must return.
+    pub(crate) fn quantize(
         &self,
         image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
+        job: &Job<'_>,
+        returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
-        self.image_decoder()?.quantize(image, range, stage)
+        self.image_decoder()?
+            .quantize(image, range, stage, job, returns)
     }
 
     /// Construct a video decoder's Python runner of every segment, the
@@ -241,9 +261,11 @@ impl DecoderRunner {
         longest: u32,
         written: u32,
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
-        self.video_decoder()?
-            .decode(slot, latent, frames, unit, shape, longest, written, out)
+        self.video_decoder()?.decode(
+            slot, latent, frames, unit, shape, longest, written, out, job,
+        )
     }
 
     /// Construct an audio decoder's Python runner of tracks of
@@ -270,8 +292,9 @@ impl DecoderRunner {
         latent: &StorageView,
         units: TrackUnits,
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
-        self.audio_decoder()?.decode(latent, units, out)
+        self.audio_decoder()?.decode(latent, units, out, job)
     }
 
     /// Refuse further captures.
@@ -362,25 +385,19 @@ impl ImageDecoder {
         })
     }
 
-    /// Decode `images`, handing each image's staged pixels (in input
-    /// order) to `stage`, which must enqueue their consumption on the
-    /// runner's stream before it returns: the next sub-batch reuses the
-    /// staging bytes.
+    /// The numerical calls that decode `images`: each decodes the longest
+    /// prefix of the remaining images that fits the staging bytes.
     ///
     /// FIXME: every sub-batch is one eager Python call. A graph per (size,
     /// count) needs fixed latent rows, a runner-owned buffer of decoded
     /// values with native copies to the product regions, and a bound on
     /// the activations each captured size retains; a decoder on a
     /// generation tower returns its pixels through a delivery stream.
-    fn decode(
-        &self,
-        images: &[DecodeImage],
-        mut stage: impl FnMut(usize, StorageView) -> Result<()>,
-    ) -> Result<()> {
+    fn chunks(&self, images: &[DecodeImage]) -> Result<Vec<Chunk>> {
         let capacity = self.staging.numel() as usize;
+        let mut chunks = Vec::new();
         let mut first = 0;
         while first < images.len() {
-            // The longest prefix of the remaining images that fits staging.
             let mut bytes = 0;
             let mut end = first;
             while end < images.len() && bytes + images[end].pixel_bytes() <= capacity {
@@ -393,79 +410,150 @@ impl ImageDecoder {
                     self.owner, images[first].height, images[first].width
                 )));
             }
+
             let mut offsets = Vec::with_capacity(end - first);
             let mut offset = 0;
-            let rows = integer_list(images[first..end].iter().flat_map(|image| {
+            let mut rows = Vec::with_capacity((end - first) * 5);
+            for image in &images[first..end] {
                 offsets.push(offset);
-                let row = [
+                rows.extend([
                     i64::from(image.sample),
                     i64::from(image.units),
                     i64::from(image.height),
                     i64::from(image.width),
                     offset as i64,
-                ];
+                ]);
                 offset += image.pixel_bytes();
-                row
-            }));
+            }
             // Each image's product follows the rows: a tensor, or none
             // for an image that publishes no product.
-            let mut arguments = vec![self.runner.to_any(), Any::from(rows)];
+            let mut arguments = vec![
+                Argument::Handle(self.runner.clone()),
+                Argument::Integers(rows),
+            ];
             for image in &images[first..end] {
                 arguments.push(match &image.product {
-                    Some(product) => Any::from(product.to_tensor()?),
-                    None => Any::default(),
+                    Some(product) => Argument::Tensor(product.clone()),
+                    None => Argument::None,
                 });
             }
-            let counts = crate::ffi::integers(self.decode.call_values(&arguments)?)
-                .map_err(|error| Error::numerical(self.decode.name(), &error))?;
-            if counts.len() != end - first {
+            chunks.push(Chunk {
+                images: first..end,
+                arguments,
+                offsets,
+            });
+            first = end;
+        }
+        Ok(chunks)
+    }
+
+    /// Decode `images` at once, handing each image's staged pixels (in
+    /// input order) to `stage`, which must enqueue their consumption on
+    /// the runner's stream before it returns: the next sub-batch reuses
+    /// the staging bytes.
+    fn decode(
+        &self,
+        images: &[DecodeImage],
+        mut stage: impl FnMut(usize, StorageView) -> Result<()>,
+    ) -> Result<()> {
+        for chunk in self.chunks(images)? {
+            let counts =
+                crate::ffi::integers(MethodCall::new(&self.decode, chunk.arguments).invoke()?)
+                    .map_err(|error| Error::numerical(self.decode.name(), &error))?;
+            let decoded = &images[chunk.images.clone()];
+            if counts != pixel_counts(decoded) {
                 return Err(Error::Interface(format!(
-                    "{} returns one byte count per image",
-                    self.decode.name()
+                    "{} staged {counts:?} bytes of images of {:?} bytes",
+                    self.decode.name(),
+                    pixel_counts(decoded)
                 )));
             }
-            for ((index, image), (&count, &offset)) in (first..end)
-                .zip(&images[first..end])
-                .zip(counts.iter().zip(&offsets))
-            {
-                if count as usize != image.pixel_bytes() {
-                    return Err(Error::Interface(format!(
-                        "{} staged {count} bytes of a {}x{} image",
-                        self.decode.name(),
-                        image.height,
-                        image.width
-                    )));
-                }
-                stage(index, self.staging.narrow(0, offset as i64, count)?)?;
+            for ((index, image), &offset) in chunk.images.zip(decoded).zip(&chunk.offsets) {
+                stage(
+                    index,
+                    self.staging
+                        .narrow(0, offset as i64, image.pixel_bytes() as i64)?,
+                )?;
             }
-            first = end;
         }
         Ok(())
     }
 
-    /// Quantize a resident image product holding values in `range` and
-    /// hand its staged pixels to `stage` (see [`Self::decode`]).
+    /// Record the decoding of `images` into `job`: each sub-batch's call,
+    /// then what `stage` issues for each image's staged pixels (in input
+    /// order), which must precede the next sub-batch because it reuses the
+    /// staging bytes. `returns` receives the byte counts each call must
+    /// return, for the job's completion to check.
+    fn record_decode(
+        &self,
+        images: &[DecodeImage],
+        mut stage: impl FnMut(usize, StorageView) -> Result<()>,
+        job: &Job<'_>,
+        returns: &mut Vec<Vec<i64>>,
+    ) -> Result<()> {
+        for chunk in self.chunks(images)? {
+            job.call_returning(MethodCall::new(&self.decode, chunk.arguments));
+            let decoded = &images[chunk.images.clone()];
+            returns.push(pixel_counts(decoded));
+            for ((index, image), &offset) in chunk.images.zip(decoded).zip(&chunk.offsets) {
+                stage(
+                    index,
+                    self.staging
+                        .narrow(0, offset as i64, image.pixel_bytes() as i64)?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the quantization of a resident image product holding values
+    /// in `range` into `job`, then what `stage` issues for its staged
+    /// pixels (see [`Self::record_decode`]).
     fn quantize(
         &self,
         image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
+        job: &Job<'_>,
+        returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
-        let count: i64 = self.quantize.call_as(&[
-            self.runner.view(),
-            (&Any::from(image.to_tensor()?)).into(),
-            (&Any::from(f64::from(range.0))).into(),
-            (&Any::from(f64::from(range.1))).into(),
-            (&Any::from(0_i64)).into(),
-        ])?;
-        if count <= 0 || count as u64 > self.staging.numel() {
-            return Err(Error::Interface(format!(
-                "{} staged {count} bytes",
-                self.quantize.name()
+        // The quantized pixels are one byte per element of the image.
+        let count = image.numel();
+        if count == 0 || count > self.staging.numel() {
+            return Err(Error::Invalid(format!(
+                "{}: an image of {count} pixel bytes does not fit the decoder staging",
+                self.owner
             )));
         }
-        stage(self.staging.narrow(0, 0, count)?)
+        job.call_returning(MethodCall::new(
+            &self.quantize,
+            vec![
+                Argument::Handle(self.runner.clone()),
+                Argument::Tensor(image.clone()),
+                Argument::Float(f64::from(range.0)),
+                Argument::Float(f64::from(range.1)),
+                Argument::Integer(0),
+            ],
+        ));
+        returns.push(vec![count as i64]);
+        stage(self.staging.narrow(0, 0, count as i64)?)
     }
+}
+
+/// One numerical call of an image decode: the images it decodes, its
+/// arguments and each image's offset in the staging bytes.
+struct Chunk {
+    images: Range<usize>,
+    arguments: Vec<Argument>,
+    offsets: Vec<usize>,
+}
+
+/// The staged byte count of each of `images`.
+fn pixel_counts(images: &[DecodeImage]) -> Vec<i64> {
+    images
+        .iter()
+        .map(|image| image.pixel_bytes() as i64)
+        .collect()
 }
 
 // Image decoding batches (`ImageDecoding`) and their PNG outputs: a call
@@ -524,6 +612,15 @@ impl ImageBatch<'_> {
     /// Decode every active call's image and stage its pixels for PNG
     /// encoding.
     pub(crate) fn decode(&mut self) -> Result<ForwardStats> {
+        // The forward records into the batch's job, taken for its length so
+        // that the batch's owners stay borrowable beside it.
+        let job = std::mem::take(&mut self.job);
+        let stats = self.record_decode(&job);
+        self.job = job;
+        stats
+    }
+
+    fn record_decode(&mut self, job: &Job<'_>) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();
         if active.is_empty() {
@@ -531,6 +628,7 @@ impl ImageBatch<'_> {
         }
         let target = self.target();
         let stream = self.stream.clone();
+        let issue = job.on(stream.as_ref());
         let decoder_range = self
             .parts
             .decoder()
@@ -604,12 +702,10 @@ impl ImageBatch<'_> {
             let reference = call.image_input.as_ref().ok_or_else(|| {
                 Error::Invalid("image decoding requires a trajectory or a resident image".into())
             })?;
-            let read = self.storage.tensors.consume(
-                reference,
-                call.call_id,
-                Some(target),
-                stream.as_ref(),
-            )?;
+            let read =
+                self.storage
+                    .tensors
+                    .consume(reference, call.call_id, Some(target), issue)?;
             let (height, width, range) = match read.metadata() {
                 Some(Metadata::Image {
                     height,
@@ -668,7 +764,7 @@ impl ImageBatch<'_> {
                 trajectories.push((index, params));
             }
             let latents = self.parts.latents()?;
-            latents.enter(stream.as_ref())?;
+            latents.enter(issue)?;
             self.latents_entered = true;
             let params: Vec<_> = trajectories.iter().map(|(_, params)| params).collect();
             let scratch = latents.place(&params)?;
@@ -688,7 +784,7 @@ impl ImageBatch<'_> {
                     i64::from(params.width),
                     &scratch.pages,
                 )?;
-                latents.gather(bank, scratch, stream.as_ref())?;
+                latents.gather(bank, scratch, issue)?;
                 let product = call
                     .image_output
                     .as_ref()
@@ -710,7 +806,9 @@ impl ImageBatch<'_> {
             }
         }
 
-        // Decode, then copy each image's staged pixels to the host.
+        // Decode, then copy each image's staged pixels to the host. The
+        // job's completion checks the byte counts the calls return.
+        let mut returns = Vec::new();
         let mut decoded = Vec::new();
         let mut staged: Vec<(usize, StorageView, u32, u32)> = Vec::new();
         let mut stage =
@@ -722,7 +820,7 @@ impl ImageBatch<'_> {
                     ));
                 }
                 let mut buffer = lock(&self.buffer);
-                let host = buffer.capture_bytes(&pixels, stream.as_ref(), &self.storage.events)?;
+                let host = buffer.capture_bytes(&pixels, issue, &self.storage.events)?;
                 if self.reports {
                     buffer.retain_reader()?;
                 }
@@ -739,20 +837,30 @@ impl ImageBatch<'_> {
         for (&index, source) in active.iter().zip(&sources) {
             match source {
                 Some(Source::Resident(region, range, height, width)) => {
-                    runner.quantize(region, *range, |pixels| {
-                        stage(index, pixels, *height, *width)
-                    })?;
+                    runner.quantize(
+                        region,
+                        *range,
+                        |pixels| stage(index, pixels, *height, *width),
+                        job,
+                        &mut returns,
+                    )?;
                 }
                 Some(Source::Latent(image)) => decoded.push((index, image.clone())),
                 None => return Err(Error::Invariant("a decoding call has no source".into())),
             }
         }
         let images: Vec<DecodeImage> = decoded.iter().map(|(_, image)| image.clone()).collect();
-        runner.decode(&images, |position, pixels| {
-            let (index, image) = &decoded[position];
-            stage(*index, pixels, image.height, image.width)
-        })?;
+        runner.record_decode(
+            &images,
+            |position, pixels| {
+                let (index, image) = &decoded[position];
+                stage(*index, pixels, image.height, image.width)
+            },
+            job,
+            &mut returns,
+        )?;
         drop(stage);
+        self.returns.append(&mut returns);
 
         // Feedback products hold the decoded values.
         for (index, image) in &decoded {
@@ -761,7 +869,7 @@ impl ImageBatch<'_> {
                 self.storage.tensors.produced(
                     &write,
                     &[3, u64::from(image.height), u64::from(image.width)],
-                    stream.as_ref(),
+                    issue,
                     Some(Metadata::Image {
                         height: image.height,
                         width: image.width,
@@ -938,7 +1046,7 @@ impl VideoDecoder {
     /// The arguments of `DecoderRunner.decode` for a unit of `shape` whose
     /// window reads `rows` latent rows and whose video's longest unit has
     /// `longest` frames.
-    fn arguments(&self, shape: UnitShape, rows: u64, longest: u32) -> Result<Vec<Any>> {
+    fn arguments(&self, shape: UnitShape, rows: u64, longest: u32) -> Result<Vec<Argument>> {
         let canvas = shape.segment.1;
         let runner = self
             .runners
@@ -948,14 +1056,14 @@ impl VideoDecoder {
             .ok_or_else(|| Error::Invariant("a video segment has no decoder runner".into()))?;
         let frames = self.unit_frames(canvas, longest)?;
         Ok(vec![
-            runner.runner().to_any(),
-            Any::from(self.latent.to_tensor()?),
-            Any::from(self.rows.prefix(rows as i64)?.to_tensor()?),
-            Any::from(self.retained.to_tensor()?),
-            Any::from(frames.to_tensor()?),
-            Any::from(shape.first),
-            Any::from(shape.last),
-            Any::from(i64::from(shape.count)),
+            Argument::Handle(runner.runner().clone()),
+            Argument::Tensor(self.latent.clone()),
+            Argument::Tensor(self.rows.prefix(rows as i64)?),
+            Argument::Tensor(self.retained.clone()),
+            Argument::Tensor(frames),
+            Argument::Bool(shape.first),
+            Argument::Bool(shape.last),
+            Argument::Integer(i64::from(shape.count)),
         ])
     }
 
@@ -998,12 +1106,15 @@ impl VideoDecoder {
     /// runner captures. Every member holding a unit of the round calls it,
     /// in the same order. The padding slot's overlap serves as the retained
     /// overlap.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub(crate) fn warm(&mut self, shape: UnitShape, rows: u64, longest: u32) -> Result<()> {
         self.latent.zero(Some(self.stream()))?;
         self.rows.zero(Some(self.stream()))?;
         self.retained.zero(Some(self.stream()))?;
-        let arguments = self.arguments(shape, rows, longest)?;
-        self.class.forward.call_values(&arguments)?;
+        MethodCall::new(&self.class.forward, self.arguments(shape, rows, longest)?).invoke()?;
         self.stream().synchronize()?;
         Ok(())
     }
@@ -1016,11 +1127,11 @@ impl VideoDecoder {
         if self.graphs.contains(&shape, None) {
             return Ok(());
         }
-        let arguments = self.arguments(shape, rows, longest)?;
+        let forward = MethodCall::new(&self.class.forward, self.arguments(shape, rows, longest)?);
         let graph = self
             .capture
             .capture(&pool.value, self.stream.raw(), self.device, || {
-                self.class.forward.call_values(&arguments).map(drop)
+                forward.invoke().map(drop)
             })?;
         self.graphs.insert(shape, None, graph)?;
         self.graphs.record(GraphMode::Capture);
@@ -1045,9 +1156,11 @@ impl VideoDecoder {
         longest: u32,
         written: u32,
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
         let canvas = shape.segment.1;
         let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
         let latent_bytes = latent.numel() * latent.dtype().bytes() as u64;
         if !latent.is_contiguous()
             || latent.dtype() != DType::F32
@@ -1061,58 +1174,57 @@ impl VideoDecoder {
         let rows = (window.len() / 8) as u64;
         let slot_overlap = self.overlap.slot("video_overlap", slot as u32)?;
         let overlap_bytes = self.retained.numel() * self.retained.dtype().bytes() as u64;
-        self.rows
-            .prefix(rows as i64)?
-            .upload(&window, Some(&stream))?;
+        self.rows.prefix(rows as i64)?.upload(&window, issue)?;
+        // The two copies write disjoint tensors, so they need no order
+        // between them.
+        let mut inputs = CopyBatch::new(SourceOrder::Stream);
+        inputs.push(
+            self.latent.address(),
+            latent.address(),
+            latent_bytes as usize,
+        );
+        inputs.push(
+            self.retained.address(),
+            slot_overlap.address(),
+            overlap_bytes as usize,
+        );
         // SAFETY: the forward's tensors and the slot's overlap row belong to
-        // this runner and the copies stay inside them; the latent was read
+        // this runner and the copies stay inside them, in disjoint ranges;
+        // the latent is leased until the batch commits and was waited for
         // on this stream.
-        unsafe {
-            memcpy_async(
-                self.latent.address(),
-                latent.address(),
-                latent_bytes as usize,
-                &stream,
-            )?;
-            memcpy_async(
-                self.retained.address(),
-                slot_overlap.address(),
-                overlap_bytes as usize,
-                &stream,
-            )?;
-        }
+        unsafe { issue.copy(&inputs) }?;
 
         let mode = match self.graphs.lookup(&shape, None) {
             Ok(Lookup::Replay(graph)) => {
-                graph.launch(&stream)?;
+                issue.launch(graph)?;
                 GraphMode::Replay
             }
             // A shape startup did not capture runs on the Python thread.
             _ => {
-                let arguments = self.arguments(shape, rows, longest)?;
-                self.class.forward.call_values(&arguments)?;
+                job.call(MethodCall::new(
+                    &self.class.forward,
+                    self.arguments(shape, rows, longest)?,
+                ));
                 GraphMode::Eager
             }
         };
         self.graphs.record(mode);
 
         let frame_bytes = u64::from(canvas.height) * u64::from(canvas.width) * 3;
+        let mut outputs = CopyBatch::new(SourceOrder::Stream);
+        outputs.push(
+            slot_overlap.address(),
+            self.retained.address(),
+            overlap_bytes as usize,
+        );
+        outputs.push(
+            out.address(),
+            self.frames.address(),
+            (u64::from(written) * frame_bytes) as usize,
+        );
         // SAFETY: as above; `out` holds the unit's frames and the copies
         // follow the forward on the stream.
-        unsafe {
-            memcpy_async(
-                slot_overlap.address(),
-                self.retained.address(),
-                overlap_bytes as usize,
-                &stream,
-            )?;
-            memcpy_async(
-                out.address(),
-                self.frames.address(),
-                (u64::from(written) * frame_bytes) as usize,
-                &stream,
-            )?;
-        }
+        unsafe { issue.copy(&outputs) }?;
         Ok(mode)
     }
 
@@ -1210,27 +1322,30 @@ impl AudioDecoder {
 
     /// The arguments of `DecoderRunner.decode` for `units` of a track whose
     /// complete latent has `rows` rows.
-    fn arguments(&self, units: TrackUnits, rows: u64) -> Result<Vec<Any>> {
+    fn arguments(&self, units: TrackUnits, rows: u64) -> Result<Vec<Argument>> {
         let runner = self.runners.get(&units.latent_frames).ok_or_else(|| {
             Error::Invalid("the audio track's length has no decoder runner".into())
         })?;
         Ok(vec![
-            runner.runner().to_any(),
-            Any::from(self.latent.prefix(rows as i64)?.to_tensor()?),
-            Any::from(self.samples.prefix(units.span as i64)?.to_tensor()?),
-            Any::from(units.samples as i64),
-            Any::from(i64::from(units.first)),
-            Any::from(i64::from(units.count)),
-            Any::from(i64::from(units.total)),
+            Argument::Handle(runner.runner().clone()),
+            Argument::Tensor(self.latent.prefix(rows as i64)?),
+            Argument::Tensor(self.samples.prefix(units.span as i64)?),
+            Argument::Integer(units.samples as i64),
+            Argument::Integer(i64::from(units.first)),
+            Argument::Integer(i64::from(units.count)),
+            Argument::Integer(i64::from(units.total)),
         ])
     }
 
     /// Decode `units` of a zero track whose complete latent has `rows`
     /// rows, so kernels compile before any capture.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub(crate) fn warm(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
         self.latent.zero(Some(self.stream()))?;
-        let arguments = self.arguments(units, rows)?;
-        self.class.forward.call_values(&arguments)?;
+        MethodCall::new(&self.class.forward, self.arguments(units, rows)?).invoke()?;
         self.stream().synchronize()?;
         Ok(())
     }
@@ -1243,11 +1358,11 @@ impl AudioDecoder {
         if self.graphs.contains(&units, None) {
             return Ok(());
         }
-        let arguments = self.arguments(units, rows)?;
+        let forward = MethodCall::new(&self.class.forward, self.arguments(units, rows)?);
         let graph = self
             .capture
             .capture(&pool.value, self.stream.raw(), self.device, || {
-                self.class.forward.call_values(&arguments).map(drop)
+                forward.invoke().map(drop)
             })?;
         self.graphs.insert(units, None, graph)?;
         self.graphs.record(GraphMode::Capture);
@@ -1261,8 +1376,10 @@ impl AudioDecoder {
         latent: &StorageView,
         units: TrackUnits,
         out: &StorageView,
+        job: &Job<'_>,
     ) -> Result<GraphMode> {
         let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
         let rows = latent.shape().first().copied().unwrap_or(0).max(0) as u64;
         let latent_bytes = latent.numel() * latent.dtype().bytes() as u64;
         if !latent.is_contiguous()
@@ -1273,41 +1390,42 @@ impl AudioDecoder {
                 "an audio latent exceeds the decoder's latent rows".into(),
             ));
         }
+        let mut input = CopyBatch::new(SourceOrder::Stream);
+        input.push(
+            self.latent.address(),
+            latent.address(),
+            latent_bytes as usize,
+        );
         // SAFETY: the forward's tensors belong to this runner and the copy
-        // stays inside them; the latent was read on this stream.
-        unsafe {
-            memcpy_async(
-                self.latent.address(),
-                latent.address(),
-                latent_bytes as usize,
-                &stream,
-            )?;
-        }
+        // stays inside them; the latent is leased until the batch commits
+        // and was waited for on this stream.
+        unsafe { issue.copy(&input) }?;
 
         let mode = match self.graphs.lookup(&units, None) {
             Ok(Lookup::Replay(graph)) => {
-                graph.launch(&stream)?;
+                issue.launch(graph)?;
                 GraphMode::Replay
             }
             // Units startup did not capture run on the Python thread.
             _ => {
-                let arguments = self.arguments(units, rows)?;
-                self.class.forward.call_values(&arguments)?;
+                job.call(MethodCall::new(
+                    &self.class.forward,
+                    self.arguments(units, rows)?,
+                ));
                 GraphMode::Eager
             }
         };
         self.graphs.record(mode);
 
+        let mut output = CopyBatch::new(SourceOrder::Stream);
+        output.push(
+            out.address(),
+            self.samples.address(),
+            (units.span * 4) as usize,
+        );
         // SAFETY: as above; `out` holds the units' samples and the copy
         // follows the forward on the stream.
-        unsafe {
-            memcpy_async(
-                out.address(),
-                self.samples.address(),
-                (units.span * 4) as usize,
-                &stream,
-            )?;
-        }
+        unsafe { issue.copy(&output) }?;
         Ok(mode)
     }
 
@@ -1330,6 +1448,7 @@ pub(crate) fn decode_video(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let range = decode_range(plan, call)?;
@@ -1373,12 +1492,13 @@ pub(crate) fn decode_video(
     let segment: Segment = parts.video.model.segment(frames, canvas, unit)?;
     let owners = parts.owners();
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let latent = batch.inputs.read(
         owners.store,
         &call.inputs[0],
         call.call_id,
         batch.device,
-        Some(&stream),
+        issue,
     )?;
     let row = u64::from(unit - range.cursor);
     let shape = vec![
@@ -1427,6 +1547,7 @@ pub(crate) fn decode_video(
         longest,
         written,
         &out,
+        job,
     )?;
     batch.record(mode);
     let frame_bytes = u64::from(canvas.height) * u64::from(canvas.width) * 3;
@@ -1436,15 +1557,15 @@ pub(crate) fn decode_video(
         // SAFETY: the padding lies inside the unit's bound product row,
         // written on the decoder's stream after the reconstruction.
         unsafe {
-            memset_d8(
-                out.address() + u64::from(written) * frame_bytes,
-                0,
-                padding as usize,
-                &stream,
-            )?;
+            issue.fill(Fill {
+                address: out.address() + u64::from(written) * frame_bytes,
+                value: 0,
+                width: 1,
+                count: padding as usize,
+            })?;
         }
     }
-    publish_bound(parts, batch, call, index, &write, true)
+    publish_bound(parts, batch, call, index, &write, true, issue)
 }
 
 /// Decode this rank's audio units into its span of the track.
@@ -1455,6 +1576,7 @@ pub(crate) fn decode_audio(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let range = decode_range(plan, call)?;
@@ -1486,12 +1608,13 @@ pub(crate) fn decode_audio(
     let last = spans[run.end as usize - 1].end;
     let owners = parts.owners();
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let latent = batch.inputs.read(
         owners.store,
         &call.inputs[0],
         call.call_id,
         batch.device,
-        Some(&stream),
+        issue,
     )?;
     let write = bind_outputs(
         owners.store,
@@ -1524,7 +1647,8 @@ pub(crate) fn decode_audio(
             span: last - first,
         },
         &write.view(),
+        job,
     )?;
     batch.record(mode);
-    publish_bound(parts, batch, call, index, &write, true)
+    publish_bound(parts, batch, call, index, &write, true, issue)
 }

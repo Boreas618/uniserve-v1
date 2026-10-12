@@ -17,16 +17,60 @@
 //! The installed buffer becomes resident beside its source at the commit
 //! point, which also accepts the extent as the destination's base.
 
-use uniserve_cuda::Stream;
+use std::sync::Arc;
+
 use uniserve_ipc::{BufferId, Call, KvTransfer};
 
-use crate::storage::PendingImport;
+use crate::storage::{KVCache, KVCacheManager, PendingImport};
+use crate::stream::Issue;
+use crate::transfer::Retirement;
 use crate::transfer::exports::{self, Location};
+use crate::transfer::kv_export::KvExport;
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
 /// The KV transfer destination of image generation conditioning.
 pub(crate) const DESTINATION: &str = "gen";
+
+/// One call's export while the work `stream` was given for it is
+/// outstanding ([`export`]).
+pub(crate) struct Exporting {
+    /// The call's index in its batch.
+    call: usize,
+    buffer: BufferId,
+    export: KvExport,
+}
+
+impl Exporting {
+    /// The export with its transfer and locations, once the issuer's work
+    /// was performed: at once after a stream, from the job's completion on
+    /// after a recorder.
+    pub(crate) fn locate(self, storage: &mut RankStorage) -> Result<Published> {
+        let (transfer, locations) = self.export.locate(manager(storage)?)?;
+        Ok(Published {
+            call: self.call,
+            buffer: self.buffer,
+            transfer,
+            locations,
+        })
+    }
+
+    /// Revoke an export that is not published, under the same condition as
+    /// [`Self::locate`].
+    pub(crate) fn revoke(self, storage: &mut RankStorage) -> Result<()> {
+        self.export.revoke(manager(storage)?);
+        Ok(())
+    }
+}
+
+/// The KV manager of a rank that transfers KV.
+fn manager(storage: &mut RankStorage) -> Result<&mut KVCacheManager<Arc<Retirement>>> {
+    storage
+        .kv
+        .as_mut()
+        .map(KVCache::manager)
+        .ok_or_else(|| Error::Unsupported("KV transfers require a KV cache".into()))
+}
 
 /// One call's export, committed with its batch.
 pub(crate) struct Published {
@@ -41,16 +85,16 @@ pub(crate) struct Published {
 /// buffer and the transfer, resident once the batch commits.
 pub(crate) type Installation = (BufferId, BufferId, KvTransfer);
 
-/// Export call `index`'s visible KV extent (`visible` tokens of `slot`) on
-/// `stream`, which orders after the batches that wrote it.
+/// Export call `index`'s visible KV extent (`visible` tokens of `slot`) in
+/// the order of `stream`, which orders after the batches that wrote it.
 pub(crate) fn export(
     storage: &mut RankStorage,
     index: usize,
     call: &Call,
     slot: usize,
     visible: u64,
-    stream: Option<&Stream>,
-) -> Result<Published> {
+    stream: impl Issue,
+) -> Result<Exporting> {
     let buffer = call
         .kv_output
         .ok_or_else(|| Error::Invalid("KV transfer requires an output buffer".into()))?;
@@ -71,7 +115,7 @@ pub(crate) fn export(
         .kv
         .as_mut()
         .ok_or_else(|| Error::Unsupported("KV export requires a KV cache".into()))?;
-    let (transfer, locations) = kv.export(
+    let export = kv.export(
         slot,
         visible,
         DESTINATION,
@@ -80,21 +124,20 @@ pub(crate) fn export(
         &consumers,
         stream,
     )?;
-    Ok(Published {
+    Ok(Exporting {
         call: index,
         buffer,
-        transfer,
-        locations,
+        export,
     })
 }
 
-/// Adopt `import` of `call`'s source export into its slot on `stream`;
-/// returns the installation and the installed extent.
+/// Adopt `import` of `call`'s source export into its slot in `stream`'s
+/// order; returns the installation and the installed extent.
 pub(crate) fn install(
     storage: &mut RankStorage,
     call: &Call,
     import: &PendingImport,
-    stream: Option<&Stream>,
+    stream: impl Issue,
 ) -> Result<(Installation, u64)> {
     let source = call
         .kv_input

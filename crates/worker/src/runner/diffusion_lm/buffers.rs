@@ -15,13 +15,14 @@
 //! results. The runner writes host values into them with [`ColumnWrites`]
 //! and gathers bank rows into the state rows natively ([`Banks::gather`]).
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
 use super::calls::Sequence;
 use crate::ffi::DType;
 use crate::runner::input_buffers::{Columns, InputBuffers};
 use crate::storage::memory::StorageView;
 use crate::storage::{RequestSlots, SlotField, TablePages};
+use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
 /// Dimensions of the resident banks.
@@ -76,7 +77,6 @@ impl BankLayout {
 /// The resident per-slot state of generating blocks.
 pub(super) struct Banks {
     layout: BankLayout,
-    device: Option<i32>,
     slots: RequestSlots,
     views: Vec<(String, StorageView)>,
 }
@@ -101,13 +101,12 @@ impl Banks {
         for (_, view) in &views {
             zeros.zero(view, 0, view.numel() as usize)?;
         }
-        zeros.submit(device, stream)?;
+        zeros.submit(stream)?;
         if let Some(stream) = stream {
             stream.synchronize()?;
         }
         Ok(Self {
             layout,
-            device,
             slots,
             views,
         })
@@ -122,14 +121,14 @@ impl Banks {
     /// Copy the rows of `slots` into the leading rows of `step`'s views and
     /// zero its rows `slots.len()..rows`, which then read as slot zero.
     ///
-    /// Device copies are ordered on `stream` after earlier commits to the
-    /// banks; host banks copy immediately (CPU lanes compute synchronously).
+    /// The copies are issued to `issue` after earlier commits to the banks:
+    /// on the lane's stream for device banks, as host writes for host banks.
     pub(super) fn gather(
         &self,
         slots: &[u32],
         rows: usize,
         step: &DenoiseViews,
-        stream: Option<&Stream>,
+        issue: impl Issue,
     ) -> Result<()> {
         if rows < slots.len() || rows > step.rows {
             return Err(Error::Invalid(format!(
@@ -167,47 +166,27 @@ impl Banks {
                 (rows - slots.len()) * bytes,
             ));
         }
-        match (self.device, stream) {
-            (Some(_), Some(stream)) => {
-                let mut batch = CopyBatch::new(SourceOrder::Stream);
-                for &(destination, source, bytes) in &copies {
-                    batch.push(destination, source, bytes);
-                }
-                // SAFETY: sources are bank rows and destinations step rows
-                // inside live allocations; destinations are disjoint, and
-                // the stream orders the copies after earlier commits.
-                unsafe {
-                    batch.submit(stream)?;
-                    for &(address, bytes) in &zeros {
-                        if bytes > 0 {
-                            memset_d8(address, 0, bytes, stream)?;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            (None, None) => {
-                for &(destination, source, bytes) in &copies {
-                    // SAFETY: host banks and views of live allocations;
-                    // CPU lanes serialize their numerical calls.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            source as *const u8,
-                            destination as *mut u8,
-                            bytes,
-                        );
-                    }
-                }
-                for &(address, bytes) in &zeros {
-                    // SAFETY: as above.
-                    unsafe { std::ptr::write_bytes(address as *mut u8, 0, bytes) };
-                }
-                Ok(())
-            }
-            _ => Err(Error::Invalid(
-                "block gathers use a stream exactly for device banks".into(),
-            )),
+        let mut batch = CopyBatch::new(SourceOrder::Stream);
+        for &(destination, source, bytes) in &copies {
+            batch.push(destination, source, bytes);
         }
+        // SAFETY: sources are bank rows and destinations step rows inside
+        // live allocations that outlive the issued work; destinations are
+        // disjoint, and the issuer orders the copies after earlier commits.
+        unsafe {
+            issue.copy(&batch)?;
+            for &(address, bytes) in &zeros {
+                if bytes > 0 {
+                    issue.fill(Fill {
+                        address,
+                        value: 0,
+                        width: 1,
+                        count: bytes,
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -432,48 +411,28 @@ impl ColumnWrites {
         Ok(())
     }
 
-    /// Submit every fill, then every copy, on `stream` for device buffers
-    /// (`device`) or immediately for host buffers.
-    pub(super) fn submit(self, device: Option<i32>, stream: Option<&Stream>) -> Result<()> {
-        match (device, stream) {
-            (Some(_), Some(stream)) => {
-                // SAFETY: every destination lies inside a lane allocation
-                // that outlives the stream's work; fills precede the copies
-                // in stream order; the batch reads its pageable payload
-                // during the call.
-                unsafe {
-                    for &(address, bytes) in &self.fills {
-                        memset_d8(address, 0, bytes, stream)?;
-                    }
-                    let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                    for &(address, first, bytes) in &self.copies {
-                        batch.push(address, self.payload[first..].as_ptr() as u64, bytes);
-                    }
-                    batch.submit(stream)?;
-                }
-                Ok(())
+    /// Issue every fill, then every copy, to `issue`: the lane's stream for
+    /// device buffers, host writes for host buffers.
+    pub(super) fn submit(self, issue: impl Issue) -> Result<()> {
+        // SAFETY: every destination lies inside a lane allocation that
+        // outlives the issued work; fills precede the copies in issue
+        // order; the batch's pageable payload is read during the call.
+        unsafe {
+            for &(address, bytes) in &self.fills {
+                issue.fill(Fill {
+                    address,
+                    value: 0,
+                    width: 1,
+                    count: bytes,
+                })?;
             }
-            (None, None) => {
-                // SAFETY: host buffers of a CPU lane, which serializes its
-                // numerical calls with these writes.
-                unsafe {
-                    for &(address, bytes) in &self.fills {
-                        std::ptr::write_bytes(address as *mut u8, 0, bytes);
-                    }
-                    for &(address, first, bytes) in &self.copies {
-                        std::ptr::copy_nonoverlapping(
-                            self.payload[first..].as_ptr(),
-                            address as *mut u8,
-                            bytes,
-                        );
-                    }
-                }
-                Ok(())
+            let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+            for &(address, first, bytes) in &self.copies {
+                batch.push(address, self.payload[first..].as_ptr() as u64, bytes);
             }
-            _ => Err(Error::Invalid(
-                "block column writes use a stream exactly for device buffers".into(),
-            )),
+            issue.copy(&batch)?;
         }
+        Ok(())
     }
 }
 
@@ -655,7 +614,7 @@ mod tests {
         let tokens = resident.views()[0].1.clone();
         assert_eq!(tokens.shape(), &[4, 4]);
         writes.write(&tokens, 0, &(0..16).collect::<Vec<i64>>())?;
-        writes.submit(None, None)?;
+        writes.submit(None::<&Stream>)?;
 
         let lane = InputBuffers::allocate(
             Dimensions {
@@ -680,7 +639,7 @@ mod tests {
         // Stale contents of the padding row must not survive a gather.
         let mut stale = ColumnWrites::new();
         stale.write(&step.tokens, 8, &[7i64; 4])?;
-        stale.submit(None, None)?;
+        stale.submit(None::<&Stream>)?;
 
         resident.gather(&[2, 1], 3, step, None)?;
         assert_eq!(
@@ -716,7 +675,7 @@ mod tests {
         assert!(writes.write(ids, 0, &[1i32]).is_err());
         writes.write(ids, 1, &[5i64, 6])?;
         writes.zero(ids, 3, 1)?;
-        writes.submit(None, None)?;
+        writes.submit(None::<&Stream>)?;
         assert_eq!(read::<i64>(ids, 4), [0, 5, 6, 0]);
         Ok(())
     }

@@ -95,6 +95,16 @@ pub trait Issue: Copy {
     /// this, so what the wait makes readable is read from the job's
     /// completion on.
     fn synchronize(&self) -> Result<()>;
+
+    /// Issue what `record` issues to this issuer as one attempt that gives
+    /// its storage back when it fails (an export). A job keeps of a failed
+    /// attempt only the event operations: the events it queued are still
+    /// recorded, and the work that addressed the returned storage is not
+    /// performed. A stream issued the attempt's work at once and drains it
+    /// where the attempt releases its storage.
+    fn attempt<T>(&self, record: impl FnOnce() -> Result<T>) -> Result<T> {
+        record()
+    }
 }
 
 /// A function a stream runs on the host between its device work.
@@ -230,7 +240,10 @@ impl Issue for Option<&Stream> {
 
     fn launch_host_fn(&self, function: HostFunction) -> Result<()> {
         match self {
-            Some(stream) => stream.launch_host_fn(function)?,
+            // The stream's own method, by name: `stream` is a `&&Stream`
+            // here, on which a method call resolves to this trait's method
+            // of `&Stream`, which issues through this implementation again.
+            Some(stream) => Stream::launch_host_fn(stream, function)?,
             None => function(),
         }
         Ok(())
@@ -238,7 +251,8 @@ impl Issue for Option<&Stream> {
 
     fn synchronize(&self) -> Result<()> {
         match self {
-            Some(stream) => Ok(stream.synchronize()?),
+            // The stream's own method, by name, as above.
+            Some(stream) => Ok(Stream::synchronize(stream)?),
             None => Ok(()),
         }
     }

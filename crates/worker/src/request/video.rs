@@ -137,28 +137,43 @@ impl VideoSize {
 
     /// The size descriptor `[frames, width, height, tokens]`.
     pub(crate) fn descriptor(&self) -> Any {
-        Any::from(integer_list([
-            i64::from(self.frames),
-            i64::from(self.canvas.width),
-            i64::from(self.canvas.height),
-            i64::from(self.tokens),
-        ]))
+        Any::from(integer_list(self.values()))
     }
 
     /// The flat conditions descriptor, in request order.
     pub(crate) fn conditions_descriptor(&self) -> Any {
-        Any::from(integer_list(
-            self.conditions.iter().flat_map(ConditionShape::descriptor),
-        ))
+        Any::from(integer_list(self.condition_values()))
     }
 
     /// The flat vision spans descriptor.
     pub(crate) fn spans_descriptor(&self) -> Any {
-        Any::from(integer_list(
-            self.spans
-                .iter()
-                .flat_map(|&(start, stop)| [i64::from(start), i64::from(stop)]),
-        ))
+        Any::from(integer_list(self.span_values()))
+    }
+
+    /// The integers of [`VideoSize::descriptor`].
+    pub(crate) fn values(&self) -> Vec<i64> {
+        vec![
+            i64::from(self.frames),
+            i64::from(self.canvas.width),
+            i64::from(self.canvas.height),
+            i64::from(self.tokens),
+        ]
+    }
+
+    /// The integers of [`VideoSize::conditions_descriptor`].
+    pub(crate) fn condition_values(&self) -> Vec<i64> {
+        self.conditions
+            .iter()
+            .flat_map(ConditionShape::descriptor)
+            .collect()
+    }
+
+    /// The integers of [`VideoSize::spans_descriptor`].
+    pub(crate) fn span_values(&self) -> Vec<i64> {
+        self.spans
+            .iter()
+            .flat_map(|&(start, stop)| [i64::from(start), i64::from(stop)])
+            .collect()
     }
 }
 
