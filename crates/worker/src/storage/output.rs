@@ -485,6 +485,13 @@ impl OutputBuffer {
         self.devices.iter().filter_map(|events| events.end.as_ref())
     }
 
+    /// Each fence with the device whose stream recorded it.
+    pub fn device_fences(&self) -> impl Iterator<Item = (i32, &Arc<Event>)> {
+        self.devices
+            .iter()
+            .filter_map(|events| Some((events.device, events.end.as_ref()?)))
+    }
+
     /// First observed completion time, or None while device writes are pending.
     pub fn ready_at(&mut self) -> Result<Option<Instant>> {
         if !self.sealed {
@@ -502,6 +509,12 @@ impl OutputBuffer {
 
         self.ready_at = Some(Instant::now());
         Ok(self.ready_at)
+    }
+
+    /// The device finished every copy the fences cover: the words can be
+    /// read without asking the driver.
+    pub fn fences_completed(&mut self) {
+        self.ready_at.get_or_insert_with(Instant::now);
     }
 
     pub fn copies_finished(&mut self) {

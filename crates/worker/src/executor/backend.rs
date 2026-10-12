@@ -27,7 +27,7 @@ use crate::error::WorkerError;
 use crate::ffi::Function;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
-use crate::lane::{Job, JobQueues};
+use crate::lane::{Completion, Job, JobId, JobQueues};
 use crate::model::registry::Components;
 use crate::profiling::kernels::KernelRecord;
 use crate::profiling::kernels::KernelRecords;
@@ -196,6 +196,9 @@ pub struct WorkerBatch {
     executed: Option<std::result::Result<(), WorkerError>>,
     /// A token batch between its jobs.
     tokens: Option<crate::runner::causal_lm::Pending>,
+    /// The batch's profiler step is open: its forward began and has not
+    /// ended.
+    stepping: bool,
     /// A capability runtime's launched work awaiting materialization.
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
@@ -218,6 +221,7 @@ impl WorkerBatch {
             issued: None,
             executed: None,
             tokens: None,
+            stepping: false,
             running: None,
             image_inputs: None,
             inputs: forward::inputs::Inputs::default(),
@@ -373,26 +377,15 @@ impl WorkerBackend {
         self.jobs = jobs;
     }
 
-    /// Run the jobs of one stage of a batch's forward on its lane: the
-    /// lane's execution thread issues everything the forward puts on the
-    /// stream. Between two jobs this thread applies a completion and
-    /// prepares the next job; it waits for each.
-    fn forward(
-        &mut self,
-        batch: &mut WorkerBatch,
-        kind: CallKind,
-        stage: forward::Stage,
-    ) -> std::result::Result<(), WorkerError> {
-        let lanes = self.jobs.clone();
-        while batch.stage() == stage {
-            // A stage that needs nothing of the lane advances without a job.
-            let Some(job) = forward::forward(self, batch, kind)? else {
-                continue;
-            };
-            let completion = lanes.submit(kind, job).map_err(lane_lost)?;
-            forward::complete(self, batch, kind, completion)?;
+    /// End a batch's forward: close its profiler step and report kernels
+    /// its calls selected.
+    fn end_forward(&mut self, batch: &mut WorkerBatch) {
+        if std::mem::take(&mut batch.stepping) {
+            if let Some(profiler) = &mut self.profiler {
+                profiler.end();
+            }
+            self.report_new_kernels();
         }
-        Ok(())
     }
 
     pub fn info(&self) -> &WorkerInfo {
@@ -1048,6 +1041,8 @@ impl Backend for WorkerBackend {
     type Batch = WorkerBatch;
     type Output = BatchResult;
     type Error = WorkerError;
+    type Job = JobId;
+    type Completion = Completion;
 
     fn error(&self, error: Error) -> WorkerError {
         WorkerError::classify(error, None)
@@ -1127,40 +1122,128 @@ impl Backend for WorkerBackend {
         Ok(forward::inputs::subscribe(self, batch, submission)?)
     }
 
-    fn execute(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
+    fn lane(&self, batch: &WorkerBatch) -> Option<usize> {
+        batch.route().and_then(|kind| self.jobs.lane(kind))
+    }
+
+    fn forward(
+        &mut self,
+        batch: &mut WorkerBatch,
+    ) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
         let Some(kind) = batch.route() else {
-            batch.output = Some(BatchResult {
-                output: BatchOutput {
-                    batch_id: batch.plan.batch_id,
-                    completions: Vec::new(),
-                    products: Vec::new(),
-                    worker_exec_us: None,
-                    forward_stats: None,
-                },
-                media: Vec::new(),
-            });
-            return Ok(());
+            if batch.output.is_none() {
+                batch.output = Some(BatchResult {
+                    output: BatchOutput {
+                        batch_id: batch.plan.batch_id,
+                        completions: Vec::new(),
+                        products: Vec::new(),
+                        worker_exec_us: None,
+                        forward_stats: None,
+                    },
+                    media: Vec::new(),
+                });
+            }
+            return Ok(None);
         };
 
-        // Imported values become resident before the runtime consumes them
-        // like local ones; an import that failed fails the batch's calls.
-        self.forward(batch, kind, forward::Stage::Inputs)?;
-        if batch.stage() == forward::Stage::Done {
-            self.release_predecessors(batch, true)?;
-            return Ok(());
+        let lanes = self.jobs.clone();
+        loop {
+            match batch.stage() {
+                // Imported values become resident before the runtime
+                // consumes them like local ones; an import that failed
+                // fails the batch's calls.
+                forward::Stage::Inputs => {}
+                // Each executed batch with calls is one profiler step.
+                forward::Stage::Forward if !batch.stepping => {
+                    batch.stepping = true;
+                    if let Some(profiler) = &mut self.profiler {
+                        profiler.begin();
+                    }
+                }
+                forward::Stage::Forward => {}
+                forward::Stage::Done => {
+                    self.end_forward(batch);
+                    self.release_predecessors(batch, true)?;
+                    return Ok(None);
+                }
+            }
+
+            // A stage that needs nothing of the lane advances without a
+            // job.
+            let submitted = match forward::forward(self, batch, kind) {
+                Ok(Some(job)) => Some(lanes.submit(kind, job).map_err(lane_lost)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            };
+            match submitted {
+                Some(Ok(completed)) => return Ok(Some(completed)),
+                Some(Err(error)) => {
+                    self.end_forward(batch);
+                    return Err(error);
+                }
+                None => {}
+            }
         }
+    }
 
-        // Each executed batch with calls is one profiler step.
-        let mut profiler = self.profiler.take();
-        let executed = match &mut profiler {
-            Some(profiler) => profiler.step(|| self.forward(batch, kind, forward::Stage::Forward)),
-            None => self.forward(batch, kind, forward::Stage::Forward),
+    fn complete(
+        &mut self,
+        batch: &mut WorkerBatch,
+        _job: JobId,
+        completion: Completion,
+    ) -> std::result::Result<(), WorkerError> {
+        let Some(kind) = batch.route() else {
+            return Ok(());
         };
-        self.profiler = profiler;
-        self.report_new_kernels();
-        executed?;
-        self.release_predecessors(batch, true)?;
+        let completed = forward::complete(self, batch, kind, completion);
+        if completed.is_err() {
+            self.end_forward(batch);
+        }
+        completed
+    }
+
+    fn await_outputs(
+        &mut self,
+        batch: &mut WorkerBatch,
+    ) -> std::result::Result<Option<JobId>, WorkerError> {
+        let (Some(kind), Some(running)) = (batch.route(), &batch.running) else {
+            return Ok(None);
+        };
+        // The fences are named by the lease, which holds them whatever the
+        // event pool has reaped since they were recorded.
+        let fences: Vec<_> = forward::launch::lock(&running.buffer)
+            .device_fences()
+            .map(|(device, fence)| (device, Arc::clone(fence)))
+            .collect();
+        let Some(&(device, _)) = fences.first() else {
+            return Ok(None);
+        };
+        let device = uniserve_cuda::DeviceId(device);
+        let fences = fences.into_iter().map(|(_, fence)| fence).collect();
+
+        // The job holds no operation: its completion is posted once the
+        // lease's fences completed.
+        let job = Job::new();
+        job.after(device, fences);
+        self.jobs.start(kind, job).map(Some).map_err(lane_lost)
+    }
+
+    fn outputs_ready(
+        &mut self,
+        batch: &mut WorkerBatch,
+        completion: Completion,
+    ) -> std::result::Result<(), WorkerError> {
+        completion
+            .check()
+            .map_err(|failure| lane_lost(failure.error))?;
+        if let Some(running) = &batch.running {
+            forward::launch::lock(&running.buffer).fences_completed();
+        }
         Ok(())
+    }
+
+    fn completed(&mut self) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
+        Ok(self.jobs.take())
     }
 
     fn begin_retirement(

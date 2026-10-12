@@ -37,8 +37,8 @@ use crate::config::{Device, WorkerConfig};
 use crate::stream::CUDAStream;
 use crate::{Error, Result};
 
-pub(crate) use job::{Capture, Completion, ExpertStep, ExpertVariant, Job};
-pub use job::{JobId, JobQueue};
+pub(crate) use job::{Capture, ExpertStep, ExpertVariant, Job};
+pub use job::{Completion, JobId, JobQueue};
 
 /// One execution lane.
 pub struct Lane {
@@ -134,7 +134,7 @@ impl JobQueues {
     /// wait for its completion. A forward no lane serves (every forward of
     /// a rank without a CUDA device) has no stream, and its job is
     /// performed on the calling thread.
-    pub(crate) fn submit(&self, kind: CallKind, job: Job<'_>) -> Result<Completion> {
+    pub(crate) fn submit(&self, kind: CallKind, job: Job<'_>) -> Result<(JobId, Completion)> {
         // SAFETY: the lifetime is erased only for the queue's type. This
         // call returns once the execution thread has consumed the job and
         // posted its completion, or with the job dropped where the thread
@@ -145,26 +145,37 @@ impl JobQueues {
         // it is.
         let job = unsafe { std::mem::transmute::<Job<'_>, Job<'static>>(job) };
         let id = self.start(kind, job)?;
-        self.wait(id)
+        Ok((id, self.wait(id)?))
+    }
+
+    /// The lane serving `kind`, by its position among the rank's lanes;
+    /// `None` when no lane serves it.
+    pub(crate) fn lane(&self, kind: CallKind) -> Option<usize> {
+        self.shared
+            .queues
+            .iter()
+            .position(|(kinds, _)| kinds.as_ref().is_none_or(|kinds| kinds.contains(&kind)))
     }
 
     /// Queue `job` on the lane serving `kind` without waiting for it. Its
     /// completion arrives under the returned name.
-    fn start(&self, kind: CallKind, job: Job<'static>) -> Result<JobId> {
+    pub(crate) fn start(&self, kind: CallKind, job: Job<'static>) -> Result<JobId> {
         let id = JobId(self.shared.next.fetch_add(1, Ordering::Relaxed));
-        let lane = self
-            .shared
-            .queues
-            .iter()
-            .find(|(kinds, _)| kinds.as_ref().is_none_or(|kinds| kinds.contains(&kind)));
-        match lane {
-            Some((_, jobs)) => jobs.start(id, job)?,
+        match self.lane(kind) {
+            Some(lane) => self.shared.queues[lane].1.start(id, job)?,
             None => {
                 let completion = job.perform();
                 self.arrived().push_back((id, completion));
             }
         }
         Ok(id)
+    }
+
+    /// The next completion that arrived, without waiting: one kept while
+    /// another job was waited for, or one a lane posted since.
+    pub(crate) fn take(&self) -> Option<(JobId, Completion)> {
+        let kept = self.arrived().pop_front();
+        kept.or_else(|| self.shared.completions.try_recv().ok())
     }
 
     /// The completion of job `id`, waited for.
@@ -448,7 +459,7 @@ mod tests {
                 order.push(name);
                 threads.push(std::thread::current().id());
             });
-            assert!(queues.submit(DECODE, job).unwrap().check().is_ok());
+            assert!(queues.submit(DECODE, job).unwrap().1.check().is_ok());
         }
         assert_eq!(order, ["first", "second"]);
         assert_ne!(threads[0], here);
@@ -487,10 +498,8 @@ mod tests {
         let mut ran = None;
         let job = Job::new();
         job.forward(|| ran = Some(std::thread::current().id()));
-        queues
-            .submit(DECODE, job)?
-            .check()
-            .map_err(|failure| failure.error)?;
+        let (_, completion) = queues.submit(DECODE, job)?;
+        completion.check().map_err(|failure| failure.error)?;
         assert_eq!(ran, Some(here));
         Ok(())
     }
