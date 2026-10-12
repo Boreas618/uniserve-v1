@@ -147,22 +147,25 @@ pub(crate) struct ExpertUnion {
     /// The layers that exchange tokens, compared across the union.
     layers: Vec<ExpertLayer>,
     /// The yield hook given to every exchange, retained for its lifetime.
-    _yield_turn: Option<Any>,
+    _yield_turn: Option<Handle>,
     closed: bool,
 }
 
-// SAFETY: the retained hook value is an immutable reference-counted TVM-FFI
-// function object with atomic counts, callable from any thread; every
-// other field is Send. The member is used by the executor thread, and its
-// microbatch threads only receive owned calls.
-unsafe impl Send for ExpertUnion {}
-
-// SAFETY: a job shares the member with its lane's execution thread, which
-// runs an expert step through `&self` while the control thread waits for
-// the job. Through `&self` the member only reads its fields, apart from
-// the atomic warmup flag and the step agreement, which locks its host
-// group; the retained hook is never called or cloned through it.
-unsafe impl Sync for ExpertUnion {}
+// A job that runs an expert step holds the member (`Arc`) while the lane's
+// execution thread performs it. What the two threads reach through it:
+//
+// - facts fixed at startup, which both read: the capacities, the streams
+//   and exchanges of the microbatches, the captured joins and their pools;
+// - the step agreement (`ExpertParallel`: its selection state and the host
+//   group, each behind a lock) and the microbatch rotation: used by the
+//   execution thread only once the rank serves, and by the control thread
+//   only during startup and close, when no job is in flight
+//   (`WorkerBackend::experts_mut` refuses while one is);
+// - the warmup flag: written by the control thread between jobs, read by
+//   both.
+//
+// So the mutable parts have one user at a time, handed over with the job,
+// and the type needs no `unsafe` to be shared.
 
 impl ExpertUnion {
     pub(crate) fn parallel(&self) -> &Arc<ExpertParallel> {
@@ -445,7 +448,7 @@ impl ExpertUnion {
             layers_owners: Vec::new(),
             pools: Vec::new(),
             layers,
-            _yield_turn: yield_turn.clone(),
+            _yield_turn: yield_turn.clone().map(Handle::new).transpose()?,
             closed: false,
         };
         for stream in streams {

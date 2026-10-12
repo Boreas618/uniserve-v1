@@ -324,10 +324,8 @@ impl CausalLMRunners {
             capacity,
             &job,
         )?;
-        let mut completion = lanes
-            .submit(self.kind(group)?, job)?
-            .check()
-            .map_err(|failure| failure.error)?;
+        let (_, completion) = lanes.submit(self.kind(group)?, job)?;
+        let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.complete(step, &mut completion).map(drop)
     }
 
@@ -342,10 +340,8 @@ impl CausalLMRunners {
     ) -> Result<()> {
         let job = Job::new();
         let captured = self.runners[index].commit(rows, &job)?;
-        let mut completion = lanes
-            .submit(self.kind(group)?, job)?
-            .check()
-            .map_err(|failure| failure.error)?;
+        let (_, completion) = lanes.submit(self.kind(group)?, job)?;
+        let mut completion = completion.check().map_err(|failure| failure.error)?;
         match captured {
             Some(key) => self.runners[index].complete_commit(key, &mut completion),
             None => Ok(()),

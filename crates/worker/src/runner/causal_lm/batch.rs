@@ -576,7 +576,7 @@ impl<'a> Batch<'a> {
     }
 
     /// Seal the lease on the batch's stream and retire its KV accesses and
-    /// output storage once the fences complete; wake the service then.
+    /// output storage once the fences complete.
     pub(super) fn seal(&self) -> Result<()> {
         seal(
             &self.storage.events,
