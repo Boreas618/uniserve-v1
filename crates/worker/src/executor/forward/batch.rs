@@ -125,7 +125,7 @@ impl CallState {
 
     /// Issue the export of `write`, the call's output `product`, to
     /// `stream`, behind the work that produced it.
-    fn export(
+    pub(crate) fn export(
         &mut self,
         owners: ProductOwners<'_>,
         call: &Call,
@@ -901,6 +901,12 @@ fn record(
                     parts, plan, batch, index, slot, &placement, job,
                 )?
             }
+            CallKind::Media(MediaCall::LatentPreparation) => {
+                crate::runner::denoiser::prepare(parts, plan, batch, index, slot, job)?
+            }
+            CallKind::Media(MediaCall::Denoising) => {
+                crate::runner::denoiser::denoise(parts, plan, batch, index, slot, &placement, job)?
+            }
             kind => {
                 return Err(Error::Unsupported(format!(
                     "{} is not recorded into a job",
@@ -1002,12 +1008,6 @@ pub(crate) fn execute(
             continue;
         }
         match call.code {
-            CallKind::Media(MediaCall::LatentPreparation) => {
-                crate::runner::denoiser::prepare(parts, plan, batch, index, slot)?
-            }
-            CallKind::Media(MediaCall::Denoising) => {
-                crate::runner::denoiser::denoise(parts, plan, batch, index, slot, &placement)?
-            }
             CallKind::Media(MediaCall::VideoDecoding) => {
                 crate::runner::decoder::decode_video(parts, plan, batch, index, slot, &placement)?
             }
