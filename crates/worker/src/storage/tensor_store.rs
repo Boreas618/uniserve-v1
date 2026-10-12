@@ -419,6 +419,13 @@ pub struct ProductExport {
     exports: Vec<Exports>,
 }
 
+impl ProductExport {
+    /// Revoke the locations of an export that is not published.
+    pub fn revoke(&self) {
+        self.exports.iter().for_each(Exports::revoke);
+    }
+}
+
 impl TensorStore {
     /// A store of at most `capacity` persistent non-feature products per
     /// device and `byte_capacity` bytes of relay arenas, with features of at
