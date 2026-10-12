@@ -129,6 +129,8 @@ enum Call<'a> {
     Returning(MethodCall),
     /// A runner method whose returned object the completion carries.
     Handle(MethodCall),
+    /// A function whose returned strings the completion carries.
+    Texts(MethodCall),
     /// A library function over values that are no tensors.
     Function(DeferredCall),
     Capture(Capture),
@@ -218,6 +220,8 @@ pub struct Completion {
     returned: VecDeque<Vec<i64>>,
     /// The object each handle call returned.
     handles: VecDeque<Handle>,
+    /// The strings each text call returned.
+    texts: VecDeque<Vec<String>>,
     /// Where the job stopped, when it did not run to its end.
     failure: Option<Failure>,
 }
@@ -263,6 +267,12 @@ impl Completion {
     /// The object the next handle call returned ([`Job::call_handle`]).
     pub(crate) fn handle(&mut self) -> Result<Handle> {
         self.handles.pop_front().ok_or(MISSING)
+    }
+
+    /// The strings the next text call returned ([`Job::call_texts`]): one
+    /// for a call that returns a string, a list's strings in its order.
+    pub(crate) fn texts(&mut self) -> Result<Vec<String>> {
+        self.texts.pop_front().ok_or(MISSING)
     }
 }
 
@@ -329,6 +339,13 @@ impl<'a> Job<'a> {
     /// ([`Completion::handle`]).
     pub(crate) fn call_handle(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Handle(method)));
+    }
+
+    /// An eager call of a function that returns a string or a list of
+    /// strings (a report the rank passes on), which the job's completion
+    /// carries ([`Completion::texts`]).
+    pub(crate) fn call_texts(&self, function: MethodCall) {
+        self.push(Operation::Call(Call::Texts(function)));
     }
 
     /// The capture of a runner method. Its completion carries the graph.
@@ -504,6 +521,17 @@ impl Call<'_> {
             Self::Handle(method) => {
                 let object = Handle::new(method.invoke()?)?;
                 completion.handles.push_back(object);
+            }
+            Self::Texts(function) => {
+                let name = function.name().to_owned();
+                let value = function.invoke()?;
+                let texts = match tvm_ffi::String::try_from(value.clone()) {
+                    Ok(text) => vec![text.as_str().to_owned()],
+                    Err(_) => {
+                        crate::ffi::texts(value).map_err(|error| Error::numerical(&name, &error))?
+                    }
+                };
+                completion.texts.push_back(texts);
             }
             Self::Function(function) => function.invoke()?,
             Self::Capture(capture) => {
@@ -891,14 +919,26 @@ impl Jobs {
 }
 
 /// Posts one job's completion and fires the control thread's wake.
-struct Post {
+pub(super) struct Post {
     id: JobId,
     completions: Sender<(JobId, Completion)>,
     wake: Option<Wake>,
 }
 
 impl Post {
-    fn now(self, completion: Completion) {
+    pub(super) fn new(
+        id: JobId,
+        completions: Sender<(JobId, Completion)>,
+        wake: Option<Wake>,
+    ) -> Self {
+        Self {
+            id,
+            completions,
+            wake,
+        }
+    }
+
+    pub(super) fn now(self, completion: Completion) {
         // Without a receiver the rank is closing and nobody takes it.
         let _ = self.completions.send((self.id, completion));
         if let Some(wake) = &self.wake {
