@@ -630,6 +630,10 @@ impl JobQueue {
         // call returns once the execution thread has consumed the job and
         // posted its completion, or with the job dropped where the thread
         // is gone, so nothing the job borrows is used after it.
+        //
+        // Only `Job::forward` gives a job something to borrow: the erasure
+        // goes with it, and a job that owns its operations is submitted as
+        // it is.
         let job = unsafe { std::mem::transmute::<Job<'_>, Job<'static>>(job) };
         const EXITED: Error = Error::State("the lane's execution thread has exited");
         self.jobs.send(job).map_err(|_| EXITED)?;
