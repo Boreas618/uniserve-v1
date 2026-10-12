@@ -15,6 +15,14 @@ type PoolKey = (i32, bool, bool);
 /// of storage that device work addressed, and its completion observers.
 pub type Deferred = Box<dyn FnOnce() -> Result<()> + Send>;
 
+/// Deferred work on its way to the pool: a job carries it from the call
+/// that recorded its events to the job's submission ([`Issue::defer`]).
+pub(crate) struct Deferral {
+    /// The events `owner` waits on, one retained reference of each.
+    pub(crate) events: Vec<Arc<Event>>,
+    pub(crate) owner: Deferred,
+}
+
 #[derive(PartialEq)]
 enum Status {
     Open,

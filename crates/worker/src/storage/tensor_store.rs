@@ -1685,7 +1685,8 @@ impl TensorStore {
                 .map(|fence| Arc::clone(&fence.event));
             if let Some(previous) = previous {
                 let owner = buffer.clone();
-                self.events.defer(
+                stream.defer(
+                    &self.events,
                     vec![previous],
                     Box::new(move || {
                         drop(owner);

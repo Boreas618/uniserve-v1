@@ -353,7 +353,8 @@ impl MediaBatch {
             stream.wake(owners.events, fence)?;
         }
         let finished = Arc::clone(&self.output);
-        owners.events.defer(
+        stream.defer(
+            owners.events,
             fences,
             Box::new(move || {
                 lock(&finished).copies_finished();

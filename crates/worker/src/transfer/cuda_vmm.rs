@@ -297,7 +297,8 @@ impl CudaExports {
             }
             if let Some(event) = state.event.take() {
                 let copied = state.copied.take();
-                events.defer(
+                issue.defer(
+                    events,
                     vec![event],
                     Box::new(move || {
                         drop(copied);

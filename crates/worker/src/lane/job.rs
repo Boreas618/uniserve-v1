@@ -36,7 +36,7 @@ use crate::ffi::{DeferredCall, Handle};
 use crate::parallel::joins::GraphFunctions;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::runner::methods::MethodCall;
-use crate::stream::{EventPool, Fill, HostFunction, Issue, RowFill};
+use crate::stream::{Deferral, Deferred, EventPool, Fill, HostFunction, Issue, RowFill};
 use crate::{Error, Result};
 
 /// One item of work submitted to a lane. Every operation owns its data, so
@@ -46,6 +46,10 @@ pub(crate) struct Job {
     /// The events a lane lets complete before it posts the job's
     /// completion, and the device whose streams recorded them.
     after: RefCell<Option<After>>,
+    /// The deferred work whose events the operations record, or whose
+    /// events were recorded before: whoever submits the job hands it on
+    /// ([`Job::deferrals`]).
+    deferrals: RefCell<Vec<Deferral>>,
 }
 
 /// The events a completion waits for and the device of their streams.
@@ -275,6 +279,7 @@ impl Default for Job {
         Self {
             operations: RefCell::new(Vec::new()),
             after: RefCell::new(None),
+            deferrals: RefCell::new(Vec::new()),
         }
     }
 }
@@ -289,8 +294,16 @@ impl Job {
         self.operations.borrow().len()
     }
 
+    /// Whether the job holds nothing for its submitter: no operation and
+    /// no deferred work.
     pub(crate) fn is_empty(&self) -> bool {
-        self.operations.borrow().is_empty()
+        self.operations.borrow().is_empty() && self.deferrals.borrow().is_empty()
+    }
+
+    /// Take the deferred work recorded so far. The job's submitter hands
+    /// it to the event pool where it submits the job.
+    pub(crate) fn deferrals(&self) -> Vec<Deferral> {
+        std::mem::take(&mut self.deferrals.borrow_mut())
     }
 
     fn push(&self, operation: Operation) {
@@ -371,11 +384,15 @@ impl Job {
         *self.after.borrow_mut() = Some((device, events));
     }
 
-    /// Continue this job with the operations of `other`.
+    /// Continue this job with the operations and the deferred work of
+    /// `other`.
     pub(crate) fn append(&self, other: Job) {
         self.operations
             .borrow_mut()
             .append(&mut other.operations.into_inner());
+        self.deferrals
+            .borrow_mut()
+            .append(&mut other.deferrals.into_inner());
     }
 
     /// Perform every operation in order on the calling thread, outside a
@@ -773,6 +790,18 @@ impl Issue for Recorder<'_> {
                 wake,
             });
         }
+        Ok(())
+    }
+
+    fn defer(&self, _events: &EventPool, fences: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {
+        // Nothing to wait for: the work runs now, as the pool runs it.
+        if fences.is_empty() {
+            return owner();
+        }
+        self.job.deferrals.borrow_mut().push(Deferral {
+            events: fences,
+            owner,
+        });
         Ok(())
     }
 

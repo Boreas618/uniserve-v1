@@ -167,7 +167,8 @@ pub(crate) fn seal(
     let fences = lock(buffer).seal(&streams, events)?.unwrap_or_default();
     let lease = Arc::clone(buffer);
     let retirement = Arc::clone(retirement);
-    events.defer(
+    stream.defer(
+        events,
         fences,
         Box::new(move || {
             lock(&lease).copies_finished();

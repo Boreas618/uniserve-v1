@@ -407,14 +407,27 @@ impl WorkerBackend {
     /// stops the rank there.
     fn perform_lifecycle(&mut self) -> Result<()> {
         for (kind, job) in self.lifecycle.take() {
-            let submitted = match kind {
-                Some(kind) => self.jobs.start(kind, job, false)?,
-                // A rank that serves no call kind has no lane.
-                None => self.jobs.call(job, false),
-            };
+            let submitted = self.start(kind, job, false)?;
             self.lifecycle_jobs.insert(submitted);
         }
         Ok(())
+    }
+
+    /// Submit `job` to the lane serving `kind` (the Python thread for a
+    /// rank that serves no call kind and so has no lane) and hand the
+    /// deferred work it carries to the event pool. `wake` is as for
+    /// [`JobQueues::start`].
+    fn start(&self, kind: Option<CallKind>, job: Job, wake: bool) -> Result<JobId> {
+        for deferral in job.deferrals() {
+            let storage = self.rank_storage.as_ref().ok_or(Error::State(
+                "a job defers work on a rank without an event pool",
+            ))?;
+            storage.events.defer(deferral.events, deferral.owner)?;
+        }
+        match kind {
+            Some(kind) => self.jobs.start(kind, job, wake),
+            None => Ok(self.jobs.call(job, wake)),
+        }
     }
 
     /// Use the job queues of the rank's lanes for forward submission.
@@ -1123,7 +1136,7 @@ impl Backend for WorkerBackend {
         let (job, admitted) = forward::inputs::admit(self, batch);
         let submitted = match batch.route() {
             Some(kind) if !job.is_empty() => {
-                Some(self.jobs.start(kind, job, true).map_err(lane_lost)?)
+                Some(self.start(Some(kind), job, true).map_err(lane_lost)?)
             }
             _ => None,
         };
@@ -1235,7 +1248,7 @@ impl Backend for WorkerBackend {
                     if lanes.lane(kind).is_some() {
                         self.lifecycle.follow(kind);
                     }
-                    Some(lanes.start(kind, job, true).map_err(lane_lost))
+                    Some(self.start(Some(kind), job, true).map_err(lane_lost))
                 }
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
