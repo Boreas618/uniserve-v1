@@ -51,7 +51,7 @@ use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::batch::image::{Encoding, ImageBatch, allocations, lock};
 use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::ffi::{DType, Function, Handle, integer_list};
+use crate::ffi::{DType, Function, Handle};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
 use crate::lane::Job;
@@ -195,15 +195,33 @@ impl DecoderRunner {
         self.image_decoder()?.decode(images, stage)
     }
 
-    /// Quantize a resident image product holding values in `range` and
-    /// hand its staged pixels to `stage`.
-    pub fn quantize(
+    /// Record the decoding of `images` into `job`: each sub-batch's call
+    /// and what `stage` issues for each image's staged pixels. `returns`
+    /// receives the byte counts each call must return.
+    pub(crate) fn record_decode(
+        &self,
+        images: &[DecodeImage],
+        stage: impl FnMut(usize, StorageView) -> Result<()>,
+        job: &Job<'_>,
+        returns: &mut Vec<Vec<i64>>,
+    ) -> Result<()> {
+        self.image_decoder()?
+            .record_decode(images, stage, job, returns)
+    }
+
+    /// Record the quantization of a resident image product holding values
+    /// in `range` into `job` and what `stage` issues for its staged pixels.
+    /// `returns` receives the byte count the call must return.
+    pub(crate) fn quantize(
         &self,
         image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
+        job: &Job<'_>,
+        returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
-        self.image_decoder()?.quantize(image, range, stage)
+        self.image_decoder()?
+            .quantize(image, range, stage, job, returns)
     }
 
     /// Construct a video decoder's Python runner of every segment, the
@@ -367,25 +385,19 @@ impl ImageDecoder {
         })
     }
 
-    /// Decode `images`, handing each image's staged pixels (in input
-    /// order) to `stage`, which must enqueue their consumption on the
-    /// runner's stream before it returns: the next sub-batch reuses the
-    /// staging bytes.
+    /// The numerical calls that decode `images`: each decodes the longest
+    /// prefix of the remaining images that fits the staging bytes.
     ///
     /// FIXME: every sub-batch is one eager Python call. A graph per (size,
     /// count) needs fixed latent rows, a runner-owned buffer of decoded
     /// values with native copies to the product regions, and a bound on
     /// the activations each captured size retains; a decoder on a
     /// generation tower returns its pixels through a delivery stream.
-    fn decode(
-        &self,
-        images: &[DecodeImage],
-        mut stage: impl FnMut(usize, StorageView) -> Result<()>,
-    ) -> Result<()> {
+    fn chunks(&self, images: &[DecodeImage]) -> Result<Vec<Chunk>> {
         let capacity = self.staging.numel() as usize;
+        let mut chunks = Vec::new();
         let mut first = 0;
         while first < images.len() {
-            // The longest prefix of the remaining images that fits staging.
             let mut bytes = 0;
             let mut end = first;
             while end < images.len() && bytes + images[end].pixel_bytes() <= capacity {
@@ -398,79 +410,150 @@ impl ImageDecoder {
                     self.owner, images[first].height, images[first].width
                 )));
             }
+
             let mut offsets = Vec::with_capacity(end - first);
             let mut offset = 0;
-            let rows = integer_list(images[first..end].iter().flat_map(|image| {
+            let mut rows = Vec::with_capacity((end - first) * 5);
+            for image in &images[first..end] {
                 offsets.push(offset);
-                let row = [
+                rows.extend([
                     i64::from(image.sample),
                     i64::from(image.units),
                     i64::from(image.height),
                     i64::from(image.width),
                     offset as i64,
-                ];
+                ]);
                 offset += image.pixel_bytes();
-                row
-            }));
+            }
             // Each image's product follows the rows: a tensor, or none
             // for an image that publishes no product.
-            let mut arguments = vec![self.runner.to_any(), Any::from(rows)];
+            let mut arguments = vec![
+                Argument::Handle(self.runner.clone()),
+                Argument::Integers(rows),
+            ];
             for image in &images[first..end] {
                 arguments.push(match &image.product {
-                    Some(product) => Any::from(product.to_tensor()?),
-                    None => Any::default(),
+                    Some(product) => Argument::Tensor(product.clone()),
+                    None => Argument::None,
                 });
             }
-            let counts = crate::ffi::integers(self.decode.call_values(&arguments)?)
-                .map_err(|error| Error::numerical(self.decode.name(), &error))?;
-            if counts.len() != end - first {
+            chunks.push(Chunk {
+                images: first..end,
+                arguments,
+                offsets,
+            });
+            first = end;
+        }
+        Ok(chunks)
+    }
+
+    /// Decode `images` at once, handing each image's staged pixels (in
+    /// input order) to `stage`, which must enqueue their consumption on
+    /// the runner's stream before it returns: the next sub-batch reuses
+    /// the staging bytes.
+    fn decode(
+        &self,
+        images: &[DecodeImage],
+        mut stage: impl FnMut(usize, StorageView) -> Result<()>,
+    ) -> Result<()> {
+        for chunk in self.chunks(images)? {
+            let counts =
+                crate::ffi::integers(MethodCall::new(&self.decode, chunk.arguments).invoke()?)
+                    .map_err(|error| Error::numerical(self.decode.name(), &error))?;
+            let decoded = &images[chunk.images.clone()];
+            if counts != pixel_counts(decoded) {
                 return Err(Error::Interface(format!(
-                    "{} returns one byte count per image",
-                    self.decode.name()
+                    "{} staged {counts:?} bytes of images of {:?} bytes",
+                    self.decode.name(),
+                    pixel_counts(decoded)
                 )));
             }
-            for ((index, image), (&count, &offset)) in (first..end)
-                .zip(&images[first..end])
-                .zip(counts.iter().zip(&offsets))
-            {
-                if count as usize != image.pixel_bytes() {
-                    return Err(Error::Interface(format!(
-                        "{} staged {count} bytes of a {}x{} image",
-                        self.decode.name(),
-                        image.height,
-                        image.width
-                    )));
-                }
-                stage(index, self.staging.narrow(0, offset as i64, count)?)?;
+            for ((index, image), &offset) in chunk.images.zip(decoded).zip(&chunk.offsets) {
+                stage(
+                    index,
+                    self.staging
+                        .narrow(0, offset as i64, image.pixel_bytes() as i64)?,
+                )?;
             }
-            first = end;
         }
         Ok(())
     }
 
-    /// Quantize a resident image product holding values in `range` and
-    /// hand its staged pixels to `stage` (see [`Self::decode`]).
+    /// Record the decoding of `images` into `job`: each sub-batch's call,
+    /// then what `stage` issues for each image's staged pixels (in input
+    /// order), which must precede the next sub-batch because it reuses the
+    /// staging bytes. `returns` receives the byte counts each call must
+    /// return, for the job's completion to check.
+    fn record_decode(
+        &self,
+        images: &[DecodeImage],
+        mut stage: impl FnMut(usize, StorageView) -> Result<()>,
+        job: &Job<'_>,
+        returns: &mut Vec<Vec<i64>>,
+    ) -> Result<()> {
+        for chunk in self.chunks(images)? {
+            job.call_returning(MethodCall::new(&self.decode, chunk.arguments));
+            let decoded = &images[chunk.images.clone()];
+            returns.push(pixel_counts(decoded));
+            for ((index, image), &offset) in chunk.images.zip(decoded).zip(&chunk.offsets) {
+                stage(
+                    index,
+                    self.staging
+                        .narrow(0, offset as i64, image.pixel_bytes() as i64)?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the quantization of a resident image product holding values
+    /// in `range` into `job`, then what `stage` issues for its staged
+    /// pixels (see [`Self::record_decode`]).
     fn quantize(
         &self,
         image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
+        job: &Job<'_>,
+        returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
-        let count: i64 = self.quantize.call_as(&[
-            self.runner.view(),
-            (&Any::from(image.to_tensor()?)).into(),
-            (&Any::from(f64::from(range.0))).into(),
-            (&Any::from(f64::from(range.1))).into(),
-            (&Any::from(0_i64)).into(),
-        ])?;
-        if count <= 0 || count as u64 > self.staging.numel() {
-            return Err(Error::Interface(format!(
-                "{} staged {count} bytes",
-                self.quantize.name()
+        // The quantized pixels are one byte per element of the image.
+        let count = image.numel();
+        if count == 0 || count > self.staging.numel() {
+            return Err(Error::Invalid(format!(
+                "{}: an image of {count} pixel bytes does not fit the decoder staging",
+                self.owner
             )));
         }
-        stage(self.staging.narrow(0, 0, count)?)
+        job.call_returning(MethodCall::new(
+            &self.quantize,
+            vec![
+                Argument::Handle(self.runner.clone()),
+                Argument::Tensor(image.clone()),
+                Argument::Float(f64::from(range.0)),
+                Argument::Float(f64::from(range.1)),
+                Argument::Integer(0),
+            ],
+        ));
+        returns.push(vec![count as i64]);
+        stage(self.staging.narrow(0, 0, count as i64)?)
     }
+}
+
+/// One numerical call of an image decode: the images it decodes, its
+/// arguments and each image's offset in the staging bytes.
+struct Chunk {
+    images: Range<usize>,
+    arguments: Vec<Argument>,
+    offsets: Vec<usize>,
+}
+
+/// The staged byte count of each of `images`.
+fn pixel_counts(images: &[DecodeImage]) -> Vec<i64> {
+    images
+        .iter()
+        .map(|image| image.pixel_bytes() as i64)
+        .collect()
 }
 
 // Image decoding batches (`ImageDecoding`) and their PNG outputs: a call
@@ -529,6 +612,15 @@ impl ImageBatch<'_> {
     /// Decode every active call's image and stage its pixels for PNG
     /// encoding.
     pub(crate) fn decode(&mut self) -> Result<ForwardStats> {
+        // The forward records into the batch's job, taken for its length so
+        // that the batch's owners stay borrowable beside it.
+        let job = std::mem::take(&mut self.job);
+        let stats = self.record_decode(&job);
+        self.job = job;
+        stats
+    }
+
+    fn record_decode(&mut self, job: &Job<'_>) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();
         if active.is_empty() {
@@ -536,6 +628,7 @@ impl ImageBatch<'_> {
         }
         let target = self.target();
         let stream = self.stream.clone();
+        let issue = job.on(stream.as_ref());
         let decoder_range = self
             .parts
             .decoder()
@@ -609,12 +702,10 @@ impl ImageBatch<'_> {
             let reference = call.image_input.as_ref().ok_or_else(|| {
                 Error::Invalid("image decoding requires a trajectory or a resident image".into())
             })?;
-            let read = self.storage.tensors.consume(
-                reference,
-                call.call_id,
-                Some(target),
-                stream.as_ref(),
-            )?;
+            let read =
+                self.storage
+                    .tensors
+                    .consume(reference, call.call_id, Some(target), issue)?;
             let (height, width, range) = match read.metadata() {
                 Some(Metadata::Image {
                     height,
@@ -673,7 +764,7 @@ impl ImageBatch<'_> {
                 trajectories.push((index, params));
             }
             let latents = self.parts.latents()?;
-            latents.enter(stream.as_ref())?;
+            latents.enter(issue)?;
             self.latents_entered = true;
             let params: Vec<_> = trajectories.iter().map(|(_, params)| params).collect();
             let scratch = latents.place(&params)?;
@@ -693,7 +784,7 @@ impl ImageBatch<'_> {
                     i64::from(params.width),
                     &scratch.pages,
                 )?;
-                latents.gather(bank, scratch, stream.as_ref())?;
+                latents.gather(bank, scratch, issue)?;
                 let product = call
                     .image_output
                     .as_ref()
@@ -715,7 +806,9 @@ impl ImageBatch<'_> {
             }
         }
 
-        // Decode, then copy each image's staged pixels to the host.
+        // Decode, then copy each image's staged pixels to the host. The
+        // job's completion checks the byte counts the calls return.
+        let mut returns = Vec::new();
         let mut decoded = Vec::new();
         let mut staged: Vec<(usize, StorageView, u32, u32)> = Vec::new();
         let mut stage =
@@ -727,7 +820,7 @@ impl ImageBatch<'_> {
                     ));
                 }
                 let mut buffer = lock(&self.buffer);
-                let host = buffer.capture_bytes(&pixels, stream.as_ref(), &self.storage.events)?;
+                let host = buffer.capture_bytes(&pixels, issue, &self.storage.events)?;
                 if self.reports {
                     buffer.retain_reader()?;
                 }
@@ -744,20 +837,30 @@ impl ImageBatch<'_> {
         for (&index, source) in active.iter().zip(&sources) {
             match source {
                 Some(Source::Resident(region, range, height, width)) => {
-                    runner.quantize(region, *range, |pixels| {
-                        stage(index, pixels, *height, *width)
-                    })?;
+                    runner.quantize(
+                        region,
+                        *range,
+                        |pixels| stage(index, pixels, *height, *width),
+                        job,
+                        &mut returns,
+                    )?;
                 }
                 Some(Source::Latent(image)) => decoded.push((index, image.clone())),
                 None => return Err(Error::Invariant("a decoding call has no source".into())),
             }
         }
         let images: Vec<DecodeImage> = decoded.iter().map(|(_, image)| image.clone()).collect();
-        runner.decode(&images, |position, pixels| {
-            let (index, image) = &decoded[position];
-            stage(*index, pixels, image.height, image.width)
-        })?;
+        runner.record_decode(
+            &images,
+            |position, pixels| {
+                let (index, image) = &decoded[position];
+                stage(*index, pixels, image.height, image.width)
+            },
+            job,
+            &mut returns,
+        )?;
         drop(stage);
+        self.returns.append(&mut returns);
 
         // Feedback products hold the decoded values.
         for (index, image) in &decoded {
@@ -766,7 +869,7 @@ impl ImageBatch<'_> {
                 self.storage.tensors.produced(
                     &write,
                     &[3, u64::from(image.height), u64::from(image.width)],
-                    stream.as_ref(),
+                    issue,
                     Some(Metadata::Image {
                         height: image.height,
                         width: image.width,

@@ -95,6 +95,16 @@ pub trait Issue: Copy {
     /// this, so what the wait makes readable is read from the job's
     /// completion on.
     fn synchronize(&self) -> Result<()>;
+
+    /// Issue what `record` issues to this issuer as one attempt that gives
+    /// its storage back when it fails (an export). A job keeps of a failed
+    /// attempt only the event operations: the events it queued are still
+    /// recorded, and the work that addressed the returned storage is not
+    /// performed. A stream issued the attempt's work at once and drains it
+    /// where the attempt releases its storage.
+    fn attempt<T>(&self, record: impl FnOnce() -> Result<T>) -> Result<T> {
+        record()
+    }
 }
 
 /// A function a stream runs on the host between its device work.

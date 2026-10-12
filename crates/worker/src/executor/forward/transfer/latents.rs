@@ -45,128 +45,37 @@ fn shape(storage: &LatentStorage, params: &LatentParams) -> [u64; 2] {
     [u64::from(params.latent_units), u64::from(storage.width())]
 }
 
-/// Export the version of `slot`'s trajectory in `bank` (at solver `step`,
-/// with `params`' pages and image size) as `call`'s output `product`, on
-/// `stream`, which produced or last wrote it, and publish it at once: its
-/// locations join `publications` and its descriptor the call's completion
-/// products. Returns the export's buffer, which the batch releases from the
-/// pool if it fails before committing.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one latent export's complete inputs"
-)]
-pub(crate) fn export(
-    pool: &mut Pool,
-    storage: &LatentStorage,
-    transports: &Transports,
-    call: &Call,
-    product: &TensorRef,
-    slot: usize,
-    params: &LatentParams,
-    bank: u8,
-    step: u32,
-    stream: Option<&Stream>,
-    publications: &mut Publications,
-    output: &mut PendingOutput,
-) -> Result<BufferId> {
-    let version = export_version(
-        pool, storage, transports, call, product, slot, params, bank, step, stream,
-    )?;
-    let buffer = version.buffer();
-    version.publish(pool, publications, output)?;
-    Ok(buffer)
-}
-
-/// A trajectory version's export while its issuer's work is outstanding
-/// ([`export_version`]).
-pub(crate) struct VersionExport {
-    product: TensorRef,
-    /// The pool's record of the export, which retains its locations'
-    /// retirements.
+/// A latent version's export while the work it issued is outstanding.
+pub(crate) struct PendingExport {
     source: Arc<LatentExport<Arc<Retirement>>>,
-    shape: [u64; 2],
-    height: u32,
-    width: u32,
-    latent_units: u32,
-    step: u32,
     exports: exports::Exports,
+    export: TensorExport,
 }
 
-impl VersionExport {
-    /// The exported version's buffer.
+impl PendingExport {
+    /// The buffer of the exported version, which the batch releases from
+    /// the pool if it fails before committing.
     pub(crate) fn buffer(&self) -> BufferId {
-        self.product.buffer_id()
+        self.source.buffer
     }
 
-    /// Publish the version: its locations join `publications` and its
-    /// descriptor `output`'s completion products.
-    ///
-    /// The caller keeps this value until the issuer the export was given
-    /// performed its work and calls this only then: at once after a stream,
-    /// from the job's completion on after a recorder. When the locations
-    /// cannot be made, they are revoked and the pool forgets the export.
-    pub(crate) fn publish(
-        self,
-        pool: &mut Pool,
-        publications: &mut Publications,
-        output: &mut PendingOutput,
-    ) -> Result<()> {
-        let buffer = self.buffer();
-        let Self {
-            product,
-            source,
-            shape,
-            height,
-            width,
-            latent_units,
-            step,
-            exports,
-        } = self;
-        let locations = match exports.locate(|retirement| pool.retain_export(&source, retirement)) {
-            Ok(locations) => locations,
-            Err(error) => {
-                pool.release_exports(&[buffer]);
-                return Err(error);
-            }
-        };
-        let export = TensorExport {
-            product,
-            value: TransferHandle::Latent {
-                height,
-                width,
-                latent_units,
-                step,
-                tensor: TensorTransfer {
-                    shape: shape.to_vec(),
-                    locations: locations
-                        .iter()
-                        .map(|(_, locator)| locator.clone())
-                        .collect(),
-                },
-            },
-        };
-        publications.accept(buffer, locations, export, output)
-    }
-
-    /// Revoke the locations of a version that is not published, under the
-    /// same condition as [`Self::publish`]. The pool still holds the
-    /// export, which its batch releases from it.
-    pub(crate) fn revoke(self) {
+    /// Revoke the locations of an export that is not published.
+    pub(crate) fn revoke(&self) {
         self.exports.revoke();
     }
 }
 
-/// Export the version of `slot`'s trajectory in `bank` (at solver `step`,
-/// with `params`' pages and image size) as `call`'s output `product`, in
-/// the order of `stream`, which produced or last wrote it. The export is
-/// registered with the pool at once; [`VersionExport::publish`] publishes
-/// it once the issuer's work was performed. When this fails with a job's
-/// recorder, that job must not perform what this call recorded.
+/// Issue the export of the version of `slot`'s trajectory in `bank` (at
+/// solver `step`, with `params`' pages and image size) as `call`'s output
+/// `product` to `stream`, behind the work that wrote it. The export is
+/// registered with the pool at once, and its batch releases it from the
+/// pool if it fails before committing. [`locate_export`] publishes it once
+/// the issued work was performed.
 #[expect(
     clippy::too_many_arguments,
     reason = "one latent export's complete inputs"
 )]
-pub(crate) fn export_version(
+pub(crate) fn issue_export(
     pool: &mut Pool,
     storage: &LatentStorage,
     transports: &Transports,
@@ -177,7 +86,7 @@ pub(crate) fn export_version(
     bank: u8,
     step: u32,
     stream: impl Issue,
-) -> Result<VersionExport> {
+) -> Result<PendingExport> {
     let shape = shape(storage, params);
     if !product.shape_bound.contains_shape(&shape)
         || parse_dtype(product.dtype.storage_name())? != storage.dtype()
@@ -223,16 +132,59 @@ pub(crate) fn export_version(
             return Err(error);
         }
     };
-    Ok(VersionExport {
+
+    // The transfer record is complete but for its locations.
+    let export = TensorExport {
         product: product.clone(),
+        value: TransferHandle::Latent {
+            height: params.height,
+            width: params.width,
+            latent_units: params.latent_units,
+            step,
+            tensor: TensorTransfer {
+                shape: shape.to_vec(),
+                locations: Vec::new(),
+            },
+        },
+    };
+    Ok(PendingExport {
         source,
-        shape,
-        height: params.height,
-        width: params.width,
-        latent_units: params.latent_units,
-        step,
         exports,
+        export,
     })
+}
+
+/// Publish an issued export once its work was performed: its locations
+/// register with the batch's `publications` and its descriptor joins the
+/// call's completion products. Returns the exported version's buffer. On
+/// failure the version is released from the pool.
+pub(crate) fn locate_export(
+    pool: &Pool,
+    export: PendingExport,
+    publications: &mut Publications,
+    output: &mut PendingOutput,
+) -> Result<BufferId> {
+    let PendingExport {
+        source,
+        exports,
+        mut export,
+    } = export;
+    let buffer = source.buffer;
+    let locations = match exports.locate(|retirement| pool.retain_export(&source, retirement)) {
+        Ok(locations) => locations,
+        Err(error) => {
+            pool.release_exports(&[buffer]);
+            return Err(error);
+        }
+    };
+    if let TransferHandle::Latent { tensor, .. } = &mut export.value {
+        tensor.locations = locations
+            .iter()
+            .map(|(_, locator)| locator.clone())
+            .collect();
+    }
+    publications.accept(buffer, locations, export, output)?;
+    Ok(buffer)
 }
 
 /// A latent version being read into a consuming request's slot.
@@ -519,7 +471,8 @@ mod tests {
         call.latent_input = Some(latent(1));
         call.latent_output = Some(latent(2));
         let mut output = PendingOutput::new(&call, RequestProgress::default(), 0)?;
-        export(
+        // Issued on host storage at once, so the export is located here.
+        let export = issue_export(
             pool,
             storage,
             transports,
@@ -529,10 +482,9 @@ mod tests {
             &params(pages, 0),
             bank,
             0,
-            None,
-            publications,
-            &mut output,
+            None::<&Stream>,
         )?;
+        locate_export(pool, export, publications, &mut output)?;
         output
             .products()
             .first()
