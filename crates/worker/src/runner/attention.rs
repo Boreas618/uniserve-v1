@@ -25,6 +25,7 @@ use uniserve_cuda::Stream;
 use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable, TablePages};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// Host sections of `row_columns` before the per-table page counts.
@@ -148,7 +149,7 @@ impl AttentionColumns {
         tables: &BlockTables,
         widths: Option<&[usize]>,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<AttentionGeometry> {
         let capacity = self.capacity;
         let tokens: usize = rows.iter().map(|row| row.query as usize).sum();

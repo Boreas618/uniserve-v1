@@ -75,7 +75,7 @@ use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
 use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::batch::image::{ImageBatch, allocations};
+use crate::executor::forward::batch::image::{ImageBatch, allocations, boundary};
 use crate::executor::forward::batch::{
     Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
 };
@@ -2317,19 +2317,6 @@ impl ImageBatch<'_> {
         }
         Ok(stats)
     }
-}
-
-/// End a job of an image forward and start its next: the completion of
-/// what was recorded so far.
-///
-/// FIXME: performed at once on the recording thread, like the batch's own
-/// job ([`ImageBatch::perform`]); as jobs of the lane, the forward resumes
-/// from each completion.
-fn boundary(job: &mut Job<'static>) -> Result<Completion> {
-    std::mem::take(job)
-        .perform()
-        .check()
-        .map_err(|failure| failure.error)
 }
 
 #[cfg(test)]

@@ -46,8 +46,8 @@ use uniserve_ipc::{DrawLayout, ForwardStats, LatentParams};
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
-use crate::executor::forward::batch::image::ImageBatch;
 use crate::executor::forward::batch::image::ImageParts;
+use crate::executor::forward::batch::image::{ImageBatch, boundary};
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::lane::Job;
@@ -365,6 +365,10 @@ impl ImageDiffusion {
     }
 
     /// The guidance plan of an admitted image's trajectory.
+    ///
+    /// FIXME: a host-only call of the Python half, made where the forward is
+    /// recorded: the plan's object and schedule are needed to record the
+    /// trajectory's steps. As a job it is a boundary of the forward.
     pub fn plan(&self, image: &ImageParams) -> Result<GuidancePlan> {
         let value: tvm_ffi::Array<Any> = self.methods.plan.call_as(&[
             self.methods.runner.view(),
@@ -467,6 +471,7 @@ impl ImageDiffusion {
     fn stage_rows(
         &self,
         rows: impl Iterator<Item = (u32, u32, u32, [Vec<i64>; 3], f32)>,
+        stream: impl Issue,
     ) -> Result<(usize, Vec<u32>, Vec<[i64; 7]>)> {
         let tokens_capacity = self.capacity.tokens;
         let mut axes: [Vec<i64>; 3] = Default::default();
@@ -508,45 +513,49 @@ impl ImageDiffusion {
         for (axis, values) in axes.iter().enumerate() {
             self.positions
                 .select(0, axis as i64)?
-                .upload(bytes(values), self.stream.as_ref())?;
+                .upload(bytes(values), stream)?;
         }
-        self.timesteps.upload(bytes(&times), self.stream.as_ref())?;
+        self.timesteps.upload(bytes(&times), stream)?;
         Ok((tokens, offsets, described))
     }
 
     /// The arguments of the Python half's `denoise`, `plan_denoise` and
     /// `encode_conditions` for staged rows and their attention geometry.
-    fn arguments(&self, rows: &[[i64; 7]], geometry: &AttentionGeometry) -> Result<Vec<Any>> {
-        let integers = |values: &[i64]| Any::from(integer_list(values.iter().copied()));
+    fn arguments(&self, rows: &[[i64; 7]], geometry: &AttentionGeometry) -> Result<Vec<Argument>> {
         Ok(vec![
-            self.methods.runner.to_any(),
-            Any::from(self.attention.column("row_columns")?.to_tensor()?),
-            Any::from(self.positions.to_tensor()?),
-            Any::from(self.timesteps.to_tensor()?),
-            Any::from(integer_list(rows.iter().flatten().copied())),
-            integers(&geometry.queries),
-            integers(&geometry.prefixes),
-            integers(&geometry.starts),
-            integers(&geometry.widths),
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Tensor(self.attention.column("row_columns")?.clone()),
+            Argument::Tensor(self.positions.clone()),
+            Argument::Tensor(self.timesteps.clone()),
+            Argument::Integers(rows.iter().flatten().copied().collect()),
+            Argument::Integers(geometry.queries.clone()),
+            Argument::Integers(geometry.prefixes.clone()),
+            Argument::Integers(geometry.starts.clone()),
+            Argument::Integers(geometry.widths.clone()),
         ])
     }
 
     /// Evaluate the denoising rows of one step. Rows of one image share
     /// samples; `check` validates attention reads against the cache.
-    pub fn predict(
+    pub(crate) fn predict(
         &mut self,
         rows: &[DenoiseRow],
         tables: &BlockTables,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
+        job: &Job<'_>,
     ) -> Result<Predicted> {
+        let stream = self.stream.clone();
+        let issue = job.on(stream.as_ref());
         let positions = rows
             .iter()
             .map(|row| self.layout.positions(row.height, row.width, row.temporal))
             .collect::<Result<Vec<_>>>()?;
-        let (_, offsets, described) =
-            self.stage_rows(rows.iter().zip(positions).map(|(row, positions)| {
+        let (_, offsets, described) = self.stage_rows(
+            rows.iter().zip(positions).map(|(row, positions)| {
                 (row.sample, row.height, row.width, positions, row.timestep)
-            }))?;
+            }),
+            issue,
+        )?;
         let attention: Vec<AttentionRow> = rows
             .iter()
             .zip(&described)
@@ -566,31 +575,27 @@ impl ImageDiffusion {
         let widths = captured
             .as_ref()
             .map(|_| self.capacity.graph_widths.clone());
-        let geometry = self.attention.stage(
-            &attention,
-            tables,
-            widths.as_deref(),
-            check,
-            self.stream.as_ref(),
-        )?;
+        let geometry = self
+            .attention
+            .stage(&attention, tables, widths.as_deref(), check, issue)?;
         let arguments = self.arguments(&described, &geometry)?;
-        let graph = match (&captured, &self.stream) {
-            (Some(shape), Some(stream)) => match self.graphs.lookup(shape, None)? {
-                Lookup::Replay(graph) => Some((graph, stream)),
+        let graph = match (&captured, &stream) {
+            (Some(shape), Some(_)) => match self.graphs.lookup(shape, None)? {
+                Lookup::Replay(graph) => Some(graph),
                 Lookup::Capture => None,
             },
             _ => None,
         };
         let mode = match graph {
-            Some((graph, stream)) => {
+            Some(graph) => {
                 if self.methods.plans_attention {
-                    self.methods.plan_denoise.call_values(&arguments)?;
+                    job.call(MethodCall::new(&self.methods.plan_denoise, arguments));
                 }
-                graph.launch(stream)?;
+                issue.launch(graph)?;
                 GraphMode::Replay
             }
             None => {
-                self.methods.denoise.call_values(&arguments)?;
+                job.call(MethodCall::new(&self.methods.denoise, arguments));
                 GraphMode::Eager
             }
         };
@@ -599,12 +604,15 @@ impl ImageDiffusion {
     }
 
     /// Write the K/V of latent images inserted as conditioning.
-    pub fn condition(
+    pub(crate) fn condition(
         &mut self,
         rows: &[ConditionRow],
         tables: &BlockTables,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
+        job: &Job<'_>,
     ) -> Result<()> {
+        let stream = self.stream.clone();
+        let issue = job.on(stream.as_ref());
         let positions = rows
             .iter()
             .map(|row| {
@@ -624,6 +632,7 @@ impl ImageDiffusion {
             rows.iter()
                 .zip(positions)
                 .map(|(row, positions)| (0, row.height, row.width, positions, 0.0)),
+            issue,
         )?;
         let attention: Vec<AttentionRow> = rows
             .iter()
@@ -635,42 +644,45 @@ impl ImageDiffusion {
                 write: true,
             })
             .collect();
-        let geometry =
-            self.attention
-                .stage(&attention, tables, None, check, self.stream.as_ref())?;
+        let geometry = self
+            .attention
+            .stage(&attention, tables, None, check, issue)?;
         let mut arguments = self.arguments(&described, &geometry)?;
         // Each row's features follow the forward's tensors as a tensor of
         // their own.
-        for row in rows {
-            arguments.push(Any::from(row.features.to_tensor()?));
-        }
-        self.methods
-            .encode_conditions
-            .call_values(&arguments)
-            .map(drop)
+        arguments.extend(
+            rows.iter()
+                .map(|row| Argument::Tensor(row.features.clone())),
+        );
+        job.call(MethodCall::new(&self.methods.encode_conditions, arguments));
+        Ok(())
     }
 
     /// Combine each image's branch predictions and advance its samples by
     /// one solver step, on the sample stream.
-    pub fn integrate(&self, rows: &[IntegrateRow]) -> Result<()> {
+    pub(crate) fn integrate(&self, rows: &[IntegrateRow], job: &Job<'_>) {
         if rows.is_empty() {
-            return Ok(());
+            return;
         }
         let mut arguments = vec![
-            self.methods.runner.to_any(),
-            Any::from(integer_list(rows.iter().flat_map(|row| {
-                [
-                    i64::from(row.sample),
-                    i64::from(row.units),
-                    i64::from(row.slot),
-                    i64::from(row.step),
-                    i64::from(row.prediction),
-                    i64::from(row.branches.mask()),
-                ]
-            }))),
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Integers(
+                rows.iter()
+                    .flat_map(|row| {
+                        [
+                            i64::from(row.sample),
+                            i64::from(row.units),
+                            i64::from(row.slot),
+                            i64::from(row.step),
+                            i64::from(row.prediction),
+                            i64::from(row.branches.mask()),
+                        ]
+                    })
+                    .collect(),
+            ),
         ];
-        arguments.extend(rows.iter().map(|row| row.plan.to_any()));
-        self.methods.step.call_values(&arguments).map(drop)
+        arguments.extend(rows.iter().map(|row| Argument::Handle(row.plan.clone())));
+        job.call(MethodCall::new(&self.methods.step, arguments));
     }
 
     /// Capture the shape of `rows` after an eager evaluation of them (its
@@ -696,10 +708,12 @@ impl ImageDiffusion {
             .iter()
             .map(|row| self.layout.positions(row.height, row.width, row.temporal))
             .collect::<Result<Vec<_>>>()?;
-        let (_, _, described) =
-            self.stage_rows(rows.iter().zip(positions).map(|(row, positions)| {
+        let (_, _, described) = self.stage_rows(
+            rows.iter().zip(positions).map(|(row, positions)| {
                 (row.sample, row.height, row.width, positions, row.timestep)
-            }))?;
+            }),
+            self.stream.as_ref(),
+        )?;
         let attention: Vec<AttentionRow> = rows
             .iter()
             .zip(&described)
@@ -719,7 +733,7 @@ impl ImageDiffusion {
         )?;
         // The warmup evaluation, then the capture of the same forward.
         let arguments = self.arguments(&described, &geometry)?;
-        self.methods.denoise.call_values(&arguments)?;
+        MethodCall::new(&self.methods.denoise, arguments.clone()).invoke()?;
         let (Some(ordinal), Some(stream)) = (self.device.cuda_index(), &self.stream) else {
             return Err(Error::Invariant(
                 "a denoiser captures on its CUDA stream".into(),
@@ -735,9 +749,10 @@ impl ImageDiffusion {
             .map(|pool| (pool.device, pool.value.clone()))
             .collect();
         let capture = &self.methods.capture;
+        let denoise = MethodCall::new(&self.methods.denoise, arguments);
         let graph =
             capture.capture_with_peers(&pool.value, &peers, stream.raw(), ordinal, || {
-                self.methods.denoise.call_values(&arguments).map(drop)
+                denoise.invoke().map(drop)
             })?;
         if let Err(error) = check() {
             if let Err(cleanup) = capture.release.invoke(&[graph.handle().view()]) {
@@ -1045,10 +1060,13 @@ impl ImageBatch<'_> {
     /// rows address, reset their new units and retain the extents the rows
     /// read and write until the batch's device work retires. Rows on slots
     /// other than a call's own hold its guidance prefixes.
-    fn reserve_rows(&mut self, active: &[usize]) -> Result<HashMap<usize, Vec<ForwardSlot>>> {
+    fn reserve_rows(
+        &mut self,
+        active: &[usize],
+        stream: impl Issue,
+    ) -> Result<HashMap<usize, Vec<ForwardSlot>>> {
         let plan = self.plan;
         let forward = &plan.forward;
-        let stream = self.stream.clone();
         let mut descriptors: HashMap<usize, Vec<ForwardSlot>> = HashMap::new();
         for (row, &call) in forward.call_indices.iter().enumerate() {
             let index = call as usize;
@@ -1081,7 +1099,7 @@ impl ImageBatch<'_> {
             .filter(|table| slots.contains(&table.request_pool_idx))
             .cloned()
             .collect();
-        kv.install(&assignments, stream.as_ref())?;
+        kv.install(&assignments, stream)?;
         let new_units: Vec<u32> = plan
             .new_cache_units
             .iter()
@@ -1092,7 +1110,7 @@ impl ImageBatch<'_> {
             let column = units.ok_or_else(|| {
                 Error::Unsupported("image trajectories reset KV units on their stream".into())
             })?;
-            kv.recycle(&new_units, column, stream.as_ref())?;
+            kv.recycle(&new_units, column, stream)?;
         }
 
         for (row, &call) in forward.call_indices.iter().enumerate() {
@@ -1137,6 +1155,22 @@ impl ImageBatch<'_> {
     /// rank with `experts`.
     pub(crate) fn denoise(
         &mut self,
+        text: Option<&mut CausalLMRunners>,
+        experts: Option<&Arc<ExpertUnion>>,
+    ) -> Result<ForwardStats> {
+        // The forward records into the batch's job, taken for its length so
+        // that the batch's owners stay borrowable beside it.
+        let mut job = std::mem::take(&mut self.job);
+        let stats = self.record_denoise(&mut job, text, experts);
+        self.job = job;
+        stats
+    }
+
+    /// Record the denoising. It is one job unless a step misses guidance
+    /// prefixes: the text runner evaluates those between two of its jobs.
+    fn record_denoise(
+        &mut self,
+        job: &mut Job<'static>,
         mut text: Option<&mut CausalLMRunners>,
         experts: Option<&Arc<ExpertUnion>>,
     ) -> Result<ForwardStats> {
@@ -1149,9 +1183,9 @@ impl ImageBatch<'_> {
         if let Some(text) = text.as_deref() {
             // Conditioning K/V and earlier prefixes were written by text
             // batches, possibly on another stream.
-            text.order().wait(stream.as_ref())?;
+            text.order().wait(job.on(stream.as_ref()))?;
         }
-        let descriptors = self.reserve_rows(&active)?;
+        let descriptors = self.reserve_rows(&active, job.on(stream.as_ref()))?;
 
         // Validate every call and resume its trajectory.
         let mut trajectories = Vec::with_capacity(active.len());
@@ -1214,7 +1248,7 @@ impl ImageBatch<'_> {
                     steps: value.steps,
                 })
                 .collect();
-            self.place(&values, self.stream.clone().as_ref())?
+            self.place(&values, job.on(stream.as_ref()))?
         };
 
         // Gather each committed version into the step workspace.
@@ -1236,7 +1270,7 @@ impl ImageBatch<'_> {
                     i64::from(params.width),
                     &scratch.pages,
                 )?;
-                latents.gather(bank, scratch, stream.as_ref())?;
+                latents.gather(bank, scratch, job.on(stream.as_ref()))?;
             }
         }
 
@@ -1306,7 +1340,7 @@ impl ImageBatch<'_> {
                 self.parts.latents()?.fill_timestep(
                     trajectory.slot as u32,
                     time,
-                    stream.as_ref(),
+                    job.on(stream.as_ref()),
                 )?;
                 stepping.push((position, step, set, time));
             }
@@ -1325,8 +1359,12 @@ impl ImageBatch<'_> {
                     .iter()
                     .map(|(_, slot, tokens)| (*slot, &tokens[..]))
                     .collect();
+                // FIXME: the text runner evaluates the prefixes as a job it
+                // performs where it is called, so this forward's job ends
+                // before them: they read the block tables it installed.
+                boundary(job)?;
                 text.prefill_cache(experts, &component, &prefixes, tables, manager)?;
-                text.order().wait(stream.as_ref())?;
+                text.order().wait(job.on(stream.as_ref()))?;
                 for (position, slot, tokens) in &fills {
                     let (trajectory, _) = &trajectories[*position];
                     let key = plan.calls[trajectory.index].request_key;
@@ -1384,7 +1422,7 @@ impl ImageBatch<'_> {
                 let diffusion = self.parts.diffusion_mut().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a denoiser".into())
                 })?;
-                let predicted = diffusion.predict(rows, kv.tables(), |_, _, _| Ok(()))?;
+                let predicted = diffusion.predict(rows, kv.tables(), |_, _, _| Ok(()), job)?;
                 let mode = predicted.mode.as_str();
                 *stats.mode_counts.entry(mode.into()).or_default() += 1;
                 if predicted.mode == GraphMode::Replay {
@@ -1418,7 +1456,7 @@ impl ImageBatch<'_> {
                     .ok_or_else(|| {
                         Error::Unsupported("image trajectories require a denoiser".into())
                     })?
-                    .integrate(&updates)?;
+                    .integrate(&updates, job);
             }
 
             // Intervals ending at this step publish their successor into
@@ -1430,14 +1468,14 @@ impl ImageBatch<'_> {
                 let latents = self.parts.latents()?;
                 let bank = latents.pool.next_bank(trajectory.slot);
                 latents.pool.require_writable(bank, &scratch.pages)?;
-                latents.scatter(bank, scratch, stream.as_ref())?;
+                latents.scatter(bank, scratch, job.on(stream.as_ref()))?;
                 let params = &trajectory.params;
                 self.publish_latent(
                     trajectory.index,
                     bank,
                     params.start_step + params.step_count,
                     params,
-                    stream.as_ref(),
+                    job.on(stream.as_ref()),
                 )?;
                 let call = &plan.calls[trajectory.index];
                 self.updates.push((
@@ -1472,10 +1510,10 @@ impl ImageBatch<'_> {
             let kv = self.storage.kv.as_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a KV cache".into())
             })?;
-            kv.release_prefixes(key, &slots, stream.as_ref())?;
+            kv.release_prefixes(key, &slots, job.on(stream.as_ref()))?;
         }
         if let Some(text) = text {
-            text.order_mut().record(stream.as_ref())?;
+            text.order_mut().record(job.on(stream.as_ref()))?;
         }
         Ok(stats)
     }
