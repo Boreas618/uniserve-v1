@@ -66,6 +66,20 @@ pub trait Backend {
     /// Bind request storage and reserve numerical inputs once per batch.
     fn prepare(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error>;
 
+    /// Submit the job that issues, on the batch's lane, what admitting its
+    /// inputs needs there (the imports of what other calls published).
+    /// `None` when nothing is to be issued now. Called each time the batch
+    /// is started, before [`Self::prepare_inputs`]; the batch goes on once
+    /// the job's completion was applied ([`Self::inputs_admitted`]).
+    fn admit_inputs(&mut self, batch: &mut Self::Batch) -> Result<Option<Self::Job>, Self::Error>;
+
+    /// Apply the completion of the job [`Self::admit_inputs`] submitted.
+    fn inputs_admitted(
+        &mut self,
+        batch: &mut Self::Batch,
+        completion: Self::Completion,
+    ) -> Result<(), Self::Error>;
+
     /// Submit ready reads and report whether all numerical inputs are ready.
     fn prepare_inputs(
         &mut self,
@@ -144,6 +158,8 @@ pub struct Batch<B: Backend> {
     /// Its forward completed: every job ran and its host state is
     /// committed.
     launched: bool,
+    /// The job that admits its inputs on its lane, while it is in flight.
+    inputs: Option<B::Job>,
     /// The job whose completion says its outputs can be read.
     outputs: Option<B::Job>,
     complete: bool,
@@ -204,6 +220,7 @@ impl<B: Backend> Batch<B> {
             prepared: false,
             forwarding: false,
             launched: false,
+            inputs: None,
             outputs: None,
             complete: false,
             error: None,
@@ -227,6 +244,15 @@ impl<B: Backend> Batch<B> {
             let submission = self.submission.as_ref().expect("submitted batch");
             {
                 let _range = range(c"uniserve.worker.inputs", Some(self.id));
+                // What admitting the inputs issues on the lane is a job:
+                // the batch goes on from its completion.
+                if self.inputs.is_some() {
+                    return Ok(());
+                }
+                self.inputs = backend.admit_inputs(&mut self.data)?;
+                if self.inputs.is_some() {
+                    return Ok(());
+                }
                 if !backend.prepare_inputs(&mut self.data, submission)? {
                     return backend.await_inputs(&mut self.data, submission);
                 }
@@ -515,12 +541,30 @@ impl<B: Backend> Executor<B> {
     /// completion of a job whose batch is gone (closed, or failed and
     /// consumed) has nothing left to apply to.
     pub fn complete(&mut self, job: B::Job, completion: B::Completion) {
-        if let Some(batch) = self
+        let Some(batch) = self
             .batches
             .values_mut()
-            .find(|batch| batch.outputs == Some(job))
-        {
+            .find(|batch| batch.outputs == Some(job) || batch.inputs == Some(job))
+        else {
+            return;
+        };
+        if batch.outputs == Some(job) {
             batch.complete_outputs(&mut self.backend, completion);
+            return;
+        }
+
+        // Its inputs are admitted on the lane: the batch starts again from
+        // where it submitted the job.
+        let id = batch.id;
+        batch.inputs = None;
+        if batch.complete {
+            return;
+        }
+        match self.backend.inputs_admitted(&mut batch.data, completion) {
+            Ok(()) => {
+                self.start(id);
+            }
+            Err(error) => batch.fail(&mut self.backend, error, "input admission"),
         }
     }
 
@@ -659,5 +703,147 @@ impl<B: Backend> Executor<B> {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend that submits one input admission job per batch and logs
+    /// what the executor asks of it.
+    #[derive(Default)]
+    struct Admitting {
+        log: Vec<&'static str>,
+        /// The admission job still to submit.
+        admission: Option<u32>,
+    }
+
+    impl Backend for Admitting {
+        type Batch = ();
+        type Output = ();
+        type Error = Error;
+        type Job = u32;
+        type Completion = ();
+
+        fn error(&self, error: Error) -> Error {
+            error
+        }
+
+        fn classify(&self, error: Error, _batch: &(), _context: &str) -> Error {
+            error
+        }
+
+        fn note_cleanup(&self, _error: &mut Error, _cleanup: Error) {}
+
+        fn admit(&mut self, _batch: &mut ()) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn prepare(&mut self, _batch: &mut ()) -> Result<(), Error> {
+            self.log.push("prepare");
+            Ok(())
+        }
+
+        fn admit_inputs(&mut self, _batch: &mut ()) -> Result<Option<u32>, Error> {
+            Ok(self.admission.take())
+        }
+
+        fn inputs_admitted(&mut self, _batch: &mut (), _completion: ()) -> Result<(), Error> {
+            self.log.push("inputs admitted");
+            Ok(())
+        }
+
+        fn prepare_inputs(
+            &mut self,
+            _batch: &mut (),
+            _submission: &Arc<Submission>,
+        ) -> Result<bool, Error> {
+            self.log.push("inputs ready");
+            Ok(true)
+        }
+
+        fn await_inputs(
+            &mut self,
+            _batch: &mut (),
+            _submission: &Arc<Submission>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn lane(&self, _batch: &()) -> Option<usize> {
+            None
+        }
+
+        fn forward(&mut self, _batch: &mut ()) -> Result<Option<Completed<Self>>, Error> {
+            self.log.push("forward");
+            Ok(None)
+        }
+
+        fn complete(&mut self, _batch: &mut (), _job: u32, _completion: ()) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn await_outputs(&mut self, _batch: &mut ()) -> Result<Option<u32>, Error> {
+            Ok(None)
+        }
+
+        fn outputs_ready(&mut self, _batch: &mut (), _completion: ()) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn completed(&mut self) -> Result<Option<Completed<Self>>, Error> {
+            Ok(None)
+        }
+
+        fn begin_retirement(&mut self, _batch: &mut ()) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn poll(&mut self, _batch: &mut ()) -> Result<(bool, bool), Error> {
+            Ok((true, true))
+        }
+
+        fn result(&mut self, _batch: &mut ()) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn close(&mut self, _batch: &mut ()) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn reap(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_batch_goes_on_from_the_completion_of_its_input_admission() -> Result<(), Error> {
+        let backend = Admitting {
+            admission: Some(7),
+            ..Admitting::default()
+        };
+        let mut executor = Executor::new(backend, 4, false, false)?;
+        let batch = Batch::new(1, None, HashSet::new(), HashSet::new(), ());
+        let submission = executor.admit(batch, true)?;
+
+        // The admission job is in flight: the batch has not gone further,
+        // and advancing does not start it again.
+        executor.advance()?;
+        assert_eq!(executor.backend().log, ["prepare"]);
+        assert!(executor.poll(&submission)?.is_none());
+
+        // A completion of no job of the batch changes nothing; the
+        // admission's completion lets the batch run to its result.
+        executor.complete(8, ());
+        assert_eq!(executor.backend().log, ["prepare"]);
+        executor.complete(7, ());
+        assert_eq!(
+            executor.backend().log,
+            ["prepare", "inputs admitted", "inputs ready", "forward"]
+        );
+        executor.advance()?;
+        assert!(executor.poll(&submission)?.is_some());
+        Ok(())
     }
 }
