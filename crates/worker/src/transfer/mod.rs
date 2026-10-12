@@ -473,7 +473,7 @@ impl<V, E, C> TransferTicket<V, E, C> {
 
     /// Capture writes made before submission. Later work on the submitting
     /// stream must not become a dependency of the transport copy.
-    pub fn prepare_copy(&mut self, pool: &EventPool, stream: &Stream) -> Result<()> {
+    pub fn prepare_copy(&mut self, pool: &EventPool, stream: impl Issue) -> Result<()> {
         let ReadAccess::Copy { handoff } = &mut self.access else {
             return Err(Error::State("a borrowed transfer cannot copy into storage"));
         };

@@ -236,9 +236,10 @@ fn fetches_cover_regions_from_shards_and_reject_missing_coverage() -> Result<()>
         &destination,
         &transports,
         &[1..3, 0..2],
-        None,
+        None::<&uniserve_cuda::Stream>,
         |_| Ok(()),
     )?;
+    fetch::start(&reads)?;
     assert_eq!(reads.len(), 2);
     for read in &reads {
         read.wait_ready();

@@ -3,13 +3,13 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
 use uniserve_ipc::{Locator, TensorTransfer};
 
 use super::read::Read;
 use super::transport::{Transport, TransportKind, Transports};
 use super::{ReadReservation, Spans, plan_reads};
 use crate::storage::memory::parse_dtype;
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// One source's read: the region of its locator (in locator coordinates)
@@ -88,14 +88,19 @@ pub fn plan(
         .collect()
 }
 
-/// Submit planned reads under one reservation of their whole fan-out.
-/// `stream` orders the destination's earlier writes before the copies.
-/// `retain` registers each read with its storage owner as it is submitted.
-/// A failure cancels the submitted reads without releasing their physical
-/// accesses; unused credits return when the reservation closes.
+/// Issue planned reads under one reservation of their whole fan-out.
+/// `stream` orders the destination's earlier writes before the copies: each
+/// read's handoff fence is issued to it. `retain` registers each read with
+/// its storage owner as it is issued. A failure cancels the issued reads
+/// without releasing their physical accesses; unused credits return when
+/// the reservation closes.
+///
+/// The caller starts the returned reads ([`start`]) once `stream`
+/// performed its work: at once after a stream, from the job's completion
+/// on after a recorder.
 pub fn submit(
     reads: &[PlannedRead],
-    stream: Option<&Stream>,
+    stream: impl Issue,
     mut retain: impl FnMut(&Arc<Read>) -> Result<()>,
 ) -> Result<Vec<Arc<Read>>> {
     let Some(first) = reads.first() else {
@@ -115,7 +120,7 @@ pub fn submit(
     let mut submitted: Vec<Arc<Read>> = Vec::with_capacity(reads.len());
     let result = (|| -> Result<()> {
         for read in reads {
-            let ticket = read.transport.fetch(
+            let ticket = read.transport.issue_fetch(
                 &read.locator,
                 read.target.device(),
                 Some(&read.target),
@@ -142,13 +147,19 @@ pub fn submit(
     Ok(submitted)
 }
 
-/// Read `region` of `tensor` into `destination`: [`plan`] then [`submit`].
+/// Hand issued reads to their transport threads ([`Read::start`]).
+pub fn start(reads: &[Arc<Read>]) -> Result<()> {
+    reads.iter().try_for_each(|read| read.start())
+}
+
+/// Read `region` of `tensor` into `destination`: [`plan`] then [`submit`],
+/// whose caller starts the reads.
 pub fn fetch_tensor(
     tensor: &TensorTransfer,
     destination: &Spans,
     transports: &Transports,
     region: &[Range<u64>],
-    stream: Option<&Stream>,
+    stream: impl Issue,
     retain: impl FnMut(&Arc<Read>) -> Result<()>,
 ) -> Result<Vec<Arc<Read>>> {
     let mut locators = vec![None; tensor.locations.len()];
