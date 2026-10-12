@@ -159,10 +159,8 @@ impl KvExport {
 /// pool).
 ///
 /// The exported intervals are reserved before any view is exported. On
-/// failure every accepted export is revoked and the reservation released;
-/// when `stream` is a job's recorder, that job must then not perform what
-/// this call recorded, whose copies address storage the failed export gave
-/// back. [`KvExport::locate`] gives the transfer and its locations once the
+/// failure every accepted export is revoked and the reservation released.
+/// [`KvExport::locate`] gives the transfer and its locations once the
 /// issuer's work was performed.
 #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
 pub fn export(
@@ -224,9 +222,11 @@ pub fn export(
     };
 
     // A transport can accept an export before a later group fails: keep
-    // every export so a failure revokes all of them.
+    // every export so a failure revokes all of them. The views are one
+    // attempt: the copies a job recorded for those accepted before the
+    // failure address storage their revocation gives back.
     let mut exports = Vec::new();
-    let result = (|| -> Result<()> {
+    let result = stream.attempt(|| -> Result<()> {
         for (index, (group, table)) in transfer.groups.iter_mut().zip(&selected).enumerate() {
             let export = GroupExport {
                 index,
@@ -247,7 +247,7 @@ pub fn export(
             )?;
         }
         Ok(())
-    })();
+    });
     let export = KvExport {
         buffer,
         transfer,
