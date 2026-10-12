@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::ThreadId;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, SourceOrder, Stream, memset_d32};
 use uniserve_ipc::{Locator, TransferTransport};
@@ -23,8 +23,8 @@ use uniserve_ipc::{Locator, TransferTransport};
 use super::endpoint::SourceGrant;
 use super::pool::{ReadBackend, TransferPool, TransferRead};
 use super::{
-    Capacity, Notify, Retirement, SHM_HEADER_BYTES, SharedRead, Spans, TransferTicket,
-    copy_on_host, copy_planner, notify, submit_copy,
+    Capacity, DRAIN_LIMIT, Notify, Retirement, SHM_HEADER_BYTES, SharedRead, Spans, TransferTicket,
+    copy_on_host, copy_planner, drain_event, notify, submit_copy,
 };
 use crate::ffi::{Backing, DType, Device};
 use crate::host::HostTask;
@@ -211,13 +211,15 @@ impl Read {
         self.events.reap()
     }
 
-    /// Close a borrowed read and wait on the host for its consumers
-    /// (shutdown only).
+    /// Close a borrowed read and wait on the host for its consumers, at
+    /// most [`DRAIN_LIMIT`] (shutdown only: no executor is left to route a
+    /// completion).
     pub(crate) fn drain(self: &Arc<Self>) -> Result<()> {
         self.close()?;
         let events = self.lock().ticket.consumer_events().to_vec();
+        let deadline = Instant::now() + DRAIN_LIMIT;
         for event in events {
-            event.synchronize()?;
+            drain_event(&event, deadline)?;
         }
         self.events.reap()
     }
