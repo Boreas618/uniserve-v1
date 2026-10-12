@@ -274,20 +274,20 @@ impl CausalLMRunners {
         // The capacities the step can run at: the one a warmup step
         // announces, or every capacity an agreement can choose for a rank
         // that sends `tokens` tokens.
-        let capacities = if experts.warming() {
-            vec![match forced {
-                Some(capacity) => capacity,
-                None => experts.parallel().capacity_for(tokens)?,
-            }]
+        let holding = experts.parallel().capacities_for(tokens);
+        let capacities: Vec<usize> = if experts.warming() {
+            match forced {
+                Some(capacity) => vec![capacity],
+                None => holding.take(1).collect(),
+            }
         } else {
-            experts
-                .parallel()
-                .capacities()
-                .iter()
-                .copied()
-                .filter(|&capacity| capacity >= tokens)
-                .collect()
+            holding.collect()
         };
+        if capacities.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{tokens} tokens exceed the expert exchange's tokens per rank"
+            )));
+        }
         let replay = experts.replays();
         let mut after = Vec::with_capacity(peers.len());
         for (&runner, staged) in peers.iter().zip(&staged) {
