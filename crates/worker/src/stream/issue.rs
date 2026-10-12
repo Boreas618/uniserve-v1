@@ -98,11 +98,6 @@ pub trait Issue: Copy {
     /// Order the work issued after this behind `event`'s latest record.
     fn wait(&self, event: &Arc<Event>) -> Result<()>;
 
-    /// Fire the completion wake of `events` once `event` completes.
-    /// `event` is recorded by this issuer or was recorded before, so the
-    /// wake is ordered behind that record wherever it is made.
-    fn wake(&self, events: &EventPool, event: &Arc<Event>) -> Result<()>;
-
     /// Run `owner` once every one of `fences` completed: the release of
     /// storage that the work they fence addressed ([`EventPool::defer`]).
     /// Each fence is recorded by this issuer or was recorded before, and
@@ -317,17 +312,6 @@ impl Issue for Option<&Stream> {
         Ok(stream.wait_event(event)?)
     }
 
-    fn wake(&self, events: &EventPool, event: &Arc<Event>) -> Result<()> {
-        let Some((notification, wake)) = events.notification(event)? else {
-            return Ok(());
-        };
-        notification.wait_event(event)?;
-        // The host function only signals the service's wake: it never calls
-        // CUDA or blocks, as host functions must not.
-        notification.launch_host_fn(move || wake.wake())?;
-        Ok(())
-    }
-
     fn defer(&self, events: &EventPool, fences: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {
         events.defer(fences, owner)
     }
@@ -394,10 +378,6 @@ impl<'a> Issue for &'a Stream {
 
     fn wait(&self, event: &Arc<Event>) -> Result<()> {
         Some(*self).wait(event)
-    }
-
-    fn wake(&self, events: &EventPool, event: &Arc<Event>) -> Result<()> {
-        Some(*self).wake(events, event)
     }
 
     fn defer(&self, events: &EventPool, fences: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {

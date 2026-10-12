@@ -18,7 +18,7 @@
 //!
 //! Lifecycle commands run on the control thread, which issues no stream
 //! work itself: what an owner's command needs on a device (a slot's reset,
-//! the clearing of released rows, the wake behind a released buffer's
+//! the clearing of released rows, what follows a released buffer's
 //! fences) is recorded into the job of the lane whose stream it belongs to
 //! ([`LaneJobs`]), and the backend submits those jobs after the command.
 
@@ -35,8 +35,8 @@ use crate::{Error, Result};
 /// stream into the job of the kind whose lane owns the stream.
 pub struct LaneJobs {
     jobs: HashMap<CallKind, Job>,
-    /// The kind whose job takes work that belongs to no lane's stream (a
-    /// wake behind an event): the first the rank serves.
+    /// The kind whose job takes work that belongs to no lane's stream
+    /// (deferred work behind an event): the first the rank serves.
     any: Option<CallKind>,
     /// That job on a rank that serves no call kind and so has no lane.
     unserved: Job,
@@ -63,9 +63,9 @@ impl LaneJobs {
     }
 
     /// Record the work no lane's stream carries for the lane serving
-    /// `kind` from now on: the lane of the forward in flight. A wake behind
-    /// an event one of its jobs records is then ordered behind that
-    /// record, since a lane performs its jobs in order.
+    /// `kind` from now on: the lane of the forward in flight. The job that
+    /// waits for an event one of its jobs records is then ordered behind
+    /// that record, since a lane performs its jobs in order.
     pub(crate) fn follow(&mut self, kind: CallKind) {
         if self.jobs.contains_key(&kind) {
             self.any = Some(kind);
@@ -104,7 +104,7 @@ pub trait RequestStorage {
     fn admit_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()>;
 
     /// Revoke explicitly freed products and those of finished requests.
-    /// Existing readers keep their physical leases. The wake behind a
+    /// Existing readers keep their physical leases. What follows a
     /// released product's outstanding fences is recorded into `jobs`.
     fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()>;
 

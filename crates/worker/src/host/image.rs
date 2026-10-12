@@ -131,7 +131,7 @@ impl HostAction for ImageTask {
             ImageWork::Encode { lease, .. } => Ok(lease
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .ready_at()?
+                .ready_at()
                 .is_some()),
         }
     }

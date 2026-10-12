@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::Instant;
 
-use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
+use uniserve_cuda::{DeviceId, Event, EventFlags};
 use uniserve_ipc::Wake;
 
 use super::Issue;
@@ -47,8 +47,8 @@ struct ActiveEvent {
     event: Arc<Event>,
     device: i32,
     references: usize,
-    /// The stream the lease was recorded on, which selects its wake stream.
-    stream: Option<usize>,
+    /// Whether the lease was recorded, at once or into a job.
+    recorded: bool,
 }
 
 struct State {
@@ -60,7 +60,6 @@ struct State {
     /// another thread than the submitter's, or before a submitter was
     /// installed.
     unsubmitted: Vec<Deferral>,
-    wake_streams: HashMap<(i32, usize), Arc<Stream>>,
     status: Status,
     wake: Option<Wake>,
     /// What starts the jobs of deferred work, and the thread that installed
@@ -71,8 +70,8 @@ struct State {
 /// Owns pooled events until their references and device accesses retire.
 ///
 /// Storage owners record a fence after the last device access to their
-/// storage, retain a reference to it, and either release it once it
-/// completed or defer the storage's release until it has
+/// storage, retain a reference to it, and either release it once they
+/// know it completed or defer the storage's release until it has
 /// ([`Issue::defer`], [`defer`](Self::defer)).
 ///
 /// The pool asks the driver nothing. Deferred work waits for a job that
@@ -108,7 +107,6 @@ impl Default for EventPool {
                 active: HashMap::new(),
                 deferred: HashMap::new(),
                 unsubmitted: Vec::new(),
-                wake_streams: HashMap::new(),
                 status: Status::Open,
                 wake: None,
                 submitter: None,
@@ -128,9 +126,8 @@ impl EventPool {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Install or clear the wake fired after events passed to
-    /// [`wake_after`](Self::wake_after), and when work is deferred on
-    /// another thread than the submitter's.
+    /// Install or clear the wake fired when work is deferred on another
+    /// thread than the submitter's, which then starts the work's job.
     pub fn set_wake(&self, wake: Option<Wake>) {
         let previous = std::mem::replace(&mut self.lock().wake, wake);
         drop(previous);
@@ -176,7 +173,7 @@ impl EventPool {
                 event: Arc::clone(&event),
                 device,
                 references: 0,
-                stream: None,
+                recorded: false,
             },
         );
         Ok(event)
@@ -186,13 +183,13 @@ impl EventPool {
     pub fn record(&self, event: &Arc<Event>, stream: impl Issue) -> Result<()> {
         let mut state = self.lock();
         require_open(&state)?;
-        let (device, raw) = producer(&stream)?;
+        let device = producer(&stream)?;
         let active = require(&mut state, event, device)?;
-        if active.stream.is_some() {
+        if active.recorded {
             return Err(invariant("device event was recorded more than once"));
         }
         stream.record(event)?;
-        active.stream = Some(raw);
+        active.recorded = true;
         Ok(())
     }
 
@@ -209,15 +206,17 @@ impl EventPool {
     /// Acquire, record on `stream` and retain one reference: the fence of
     /// work just submitted to `stream`.
     pub fn fence(&self, stream: impl Issue, interprocess: bool) -> Result<Arc<Event>> {
-        let (device, _) = producer(&stream)?;
+        let device = producer(&stream)?;
         let event = self.acquire(device, false, interprocess)?;
         self.record(&event, stream)?;
         self.retain(&event, device, 1)?;
         Ok(event)
     }
 
-    /// Returns references after their last device access. A rejected final
-    /// release preserves its references so the caller can defer them instead.
+    /// Returns references after their last device access completed, which
+    /// the caller established: the pool does not ask the driver. It knows
+    /// only whether the lease was recorded, and rejects the final release
+    /// of one that was not, preserving its references.
     pub fn release(&self, event: &Arc<Event>, count: usize) -> Result<()> {
         let mut state = self.lock();
         // Shutdown already drained and released every lease. A completed
@@ -232,9 +231,9 @@ impl EventPool {
         if count == 0 || active.references < count {
             return Err(invariant("device event reference accounting is invalid"));
         }
-        if active.references == count && (active.stream.is_none() || !event.query()?) {
+        if active.references == count && !active.recorded {
             return Err(invariant(
-                "device event was released before it became query-ready",
+                "device event was released before it was recorded",
             ));
         }
 
@@ -353,50 +352,6 @@ impl EventPool {
             .ok_or_else(|| invariant("device event is not an active lease"))
     }
 
-    /// Orders the installed completion wake after `event`, whose record
-    /// was made, on an independent notification stream per producer.
-    /// Without a wake this does nothing.
-    pub fn wake_after(&self, event: &Arc<Event>) -> Result<()> {
-        None::<&Stream>.wake(self, event)
-    }
-
-    /// The installed completion wake, for an issuer that orders it behind
-    /// an event on a notification stream of its own (a lane's job).
-    pub(crate) fn wake(&self) -> Option<Wake> {
-        self.lock().wake.clone()
-    }
-
-    /// The stream and wake that notify of `event`'s completion for an
-    /// issuer without a lane ([`Self::wake_after`]): one notification
-    /// stream per producer stream, created on the calling thread when
-    /// first asked for. `None` without an installed wake.
-    pub(crate) fn notification(&self, event: &Arc<Event>) -> Result<Option<(Arc<Stream>, Wake)>> {
-        let mut state = self.lock();
-        let Some(wake) = state.wake.clone() else {
-            return Ok(None);
-        };
-        require_open(&state)?;
-        let (device, producer) = state
-            .active
-            .get(&key(event))
-            .and_then(|active| Some((active.device, active.stream?)))
-            .ok_or_else(|| {
-                invariant("completion notification requires a recorded producer event")
-            })?;
-        let stream = match state.wake_streams.get(&(device, producer)) {
-            Some(stream) => Arc::clone(stream),
-            None => {
-                let _device = DeviceGuard::new(DeviceId(device))?;
-                let stream = Arc::new(Stream::new(DeviceId(device))?);
-                state
-                    .wake_streams
-                    .insert((device, producer), Arc::clone(&stream));
-                stream
-            }
-        };
-        Ok(Some((stream, wake)))
-    }
-
     /// Waits on the host for the events of all deferred work, at most
     /// [`DRAIN_LIMIT`], and runs that work, until none is left: at
     /// shutdown, when nobody takes the completions of the jobs it waits
@@ -439,34 +394,31 @@ impl EventPool {
         }
     }
 
-    /// Stops new work, waits for every recorded lease on the host and runs
-    /// all deferred work. Existing leases may still release afterwards.
+    /// Stops new work, waits for every recorded lease on the host, at most
+    /// [`DRAIN_LIMIT`], and runs all deferred work. Existing leases may
+    /// still release afterwards. A lease that did not complete in time
+    /// fails the close and keeps the pool's storage.
     pub fn close(&self) -> Result<()> {
-        let (streams, events) = {
+        let events: Vec<_> = {
             let mut state = self.lock();
             if state.status == Status::Open {
                 state.status = Status::Closing;
             }
-            let streams: Vec<_> = state.wake_streams.values().cloned().collect();
-            let events: Vec<_> = state
+            state
                 .active
                 .values()
-                .filter(|active| active.stream.is_some())
+                .filter(|active| active.recorded)
                 .map(|active| Arc::clone(&active.event))
-                .collect();
-            (streams, events)
+                .collect()
         };
-        for stream in streams {
-            stream.synchronize()?;
-        }
+        let deadline = Instant::now() + DRAIN_LIMIT;
         for event in events {
-            event.synchronize()?;
+            drain_event(&event, deadline)?;
         }
 
         let owners: Vec<_> = {
             let mut state = self.lock();
             state.status = Status::Closed;
-            state.wake_streams.clear();
             state.active.clear();
             state.available.clear();
             state.wake = None;
@@ -501,12 +453,14 @@ impl Drop for EventPool {
             return;
         }
         // An unclosed pool still owns storage whose release waits on device
-        // work. Without a successful drain it cannot be returned.
+        // work. Without a successful drain, bounded like every host wait
+        // for device work, it cannot be returned.
+        let deadline = Instant::now() + DRAIN_LIMIT;
         let drained = deferrals.iter().all(|deferral| {
             deferral
                 .events
                 .iter()
-                .all(|event| event.synchronize().is_ok())
+                .all(|event| drain_event(event, deadline).is_ok())
         });
         if drained {
             for deferral in deferrals {
@@ -565,12 +519,12 @@ fn run(owners: impl IntoIterator<Item = Deferred>) -> Result<()> {
     result
 }
 
-/// The device and raw handle of the stream `stream` records on.
-fn producer(stream: &impl Issue) -> Result<(i32, usize)> {
+/// The device of the stream `stream` records on.
+fn producer(stream: &impl Issue) -> Result<i32> {
     let stream = stream
         .stream()
         .ok_or_else(|| invariant("a device event is recorded on a stream"))?;
-    Ok((stream.device().0, stream.raw()))
+    Ok(stream.device().0)
 }
 
 fn require_open(state: &State) -> Result<()> {
