@@ -893,6 +893,14 @@ fn record(
             CallKind::Media(MediaCall::TextEncoding) => crate::runner::encoder::encode_text(
                 parts, plan, batch, index, slot, &placement, job,
             )?,
+            CallKind::Media(MediaCall::VisionEncoding) => crate::runner::encoder::encode_vision(
+                parts, plan, batch, index, slot, &placement, job,
+            )?,
+            CallKind::Media(MediaCall::LatentEncoding) => {
+                crate::runner::encoder::encode_conditions(
+                    parts, plan, batch, index, slot, &placement, job,
+                )?
+            }
             kind => {
                 return Err(Error::Unsupported(format!(
                     "{} is not recorded into a job",
@@ -994,9 +1002,6 @@ pub(crate) fn execute(
             continue;
         }
         match call.code {
-            CallKind::Media(MediaCall::VisionEncoding) => {
-                crate::runner::encoder::encode_vision(parts, plan, batch, index, slot, &placement)?
-            }
             CallKind::Media(MediaCall::LatentPreparation) => {
                 crate::runner::denoiser::prepare(parts, plan, batch, index, slot)?
             }
@@ -1008,11 +1013,6 @@ pub(crate) fn execute(
             }
             CallKind::Media(MediaCall::AudioDecoding) => {
                 crate::runner::decoder::decode_audio(parts, plan, batch, index, slot, &placement)?
-            }
-            CallKind::Media(MediaCall::LatentEncoding) => {
-                crate::runner::encoder::encode_conditions(
-                    parts, plan, batch, index, slot, &placement,
-                )?
             }
             kind => {
                 return Err(Error::Unsupported(format!(
@@ -1131,6 +1131,7 @@ pub(crate) fn publish(
 /// other ranks hold the rest, the whole product when the round assigns
 /// this rank all of it. Publishing the view itself is right in both cases;
 /// the store tracks a share that covers the product as a whole product.
+/// The fence and the export follow the work `stream` issued for the value.
 pub(crate) fn publish_bound(
     parts: &Parts<'_>,
     batch: &mut MediaBatch,
@@ -1138,11 +1139,9 @@ pub(crate) fn publish_bound(
     index: usize,
     write: &crate::ProductBuffer,
     host: bool,
+    stream: impl Issue,
 ) -> Result<()> {
     let owners = parts.owners();
-    let stream = stream_of(batch)?;
-    owners
-        .store
-        .write(write, &write.view(), Some(&stream), None)?;
-    batch.calls[index].export(owners, call, &call.outputs[0], write, host, Some(&stream))
+    owners.store.write(write, &write.view(), stream, None)?;
+    batch.calls[index].export(owners, call, &call.outputs[0], write, host, stream)
 }

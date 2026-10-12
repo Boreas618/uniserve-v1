@@ -1444,7 +1444,7 @@ pub(crate) fn decode_video(
             )?;
         }
     }
-    publish_bound(parts, batch, call, index, &write, true)
+    publish_bound(parts, batch, call, index, &write, true, Some(&stream))
 }
 
 /// Decode this rank's audio units into its span of the track.
@@ -1526,5 +1526,5 @@ pub(crate) fn decode_audio(
         &write.view(),
     )?;
     batch.record(mode);
-    publish_bound(parts, batch, call, index, &write, true)
+    publish_bound(parts, batch, call, index, &write, true, Some(&stream))
 }
