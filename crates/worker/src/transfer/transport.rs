@@ -504,7 +504,12 @@ impl Transport {
         let locator = match written {
             Ok(locator) => locator,
             Err(error) => {
-                storage.close()?;
+                // The attempt failed: a stream issued its copies at once
+                // and drains them here; a job gives up the copies and this
+                // wait with the rest of the failed attempt. Either way no
+                // DMA into the mapping is outstanding when it is released.
+                stream.synchronize()?;
+                storage.release()?;
                 self.capacity.release(view.nbytes)?;
                 return Err(error);
             }
@@ -648,6 +653,9 @@ impl Transport {
     /// that orders the destination's earlier writes; transport copies start
     /// after it. `reservation` supplies the read's credit when the read is
     /// part of a planned fan-out.
+    ///
+    /// The read is issued on `stream` and started at once
+    /// ([`Self::issue_fetch`], [`Read::start`]).
     pub fn fetch(
         &self,
         locator: &Locator,
@@ -656,6 +664,25 @@ impl Transport {
         region: Option<&[Range<u64>]>,
         reservation: Option<&ReadReservation<Notify>>,
         stream: Option<&Stream>,
+    ) -> Result<Arc<Read>> {
+        let read = self.issue_fetch(locator, device, destination, region, reservation, stream)?;
+        read.start()?;
+        Ok(read)
+    }
+
+    /// Issue a read as [`Self::fetch`] describes it, with its handoff fence
+    /// issued to `stream`. The caller starts the read ([`Read::start`])
+    /// once that issuer performed its work, so the fence's record is made
+    /// before the read reaches its transport thread: at once after a
+    /// stream, from the job's completion on after a recorder.
+    pub fn issue_fetch(
+        &self,
+        locator: &Locator,
+        device: Device,
+        destination: Option<&Spans>,
+        region: Option<&[Range<u64>]>,
+        reservation: Option<&ReadReservation<Notify>>,
+        stream: impl Issue,
     ) -> Result<Arc<Read>> {
         if TransportKind::of(locator) != self.kind() {
             return Err(Error::Invalid(format!(
@@ -742,7 +769,7 @@ impl Transport {
         &self,
         call: ReadCall,
         nbytes: u64,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         reservation: Option<&ReadReservation<Notify>>,
     ) -> Result<Arc<Read>> {
         let backend = NativeRead {
@@ -760,7 +787,7 @@ impl Transport {
         destination: Option<&Spans>,
         region: Option<&[Range<u64>]>,
         reservation: Option<&ReadReservation<Notify>>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<Read>> {
         if let Some(error) = self.reads.error() {
             return Err(Error::Shared(error));

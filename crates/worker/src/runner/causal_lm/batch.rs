@@ -122,7 +122,7 @@ pub(super) struct Batch<'a> {
     pub(super) retirement: Arc<Retirement>,
     pub(super) started: Instant,
     /// The batch's next job on its lane.
-    pub(super) job: Job<'a>,
+    pub(super) job: Job,
 }
 
 impl Opening {
@@ -133,7 +133,7 @@ impl Opening {
         owners: &mut Owners<'_>,
         info: &uniserve_ipc::WorkerInfo,
         rank: usize,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Self> {
         let started = Instant::now();
         let plan = owners.plan;
@@ -252,7 +252,7 @@ impl Opening {
 
 impl<'a> Batch<'a> {
     /// Lease the opened batch's output storage and begin its job.
-    pub(super) fn lease(owners: Owners<'a>, opening: Opening, job: Job<'a>) -> Result<Self> {
+    pub(super) fn lease(owners: Owners<'a>, opening: Opening, job: Job) -> Result<Self> {
         let Opening {
             group,
             stream,
@@ -305,7 +305,7 @@ impl<'a> Batch<'a> {
 
     /// Continue a batch with its owners borrowed again, recording into
     /// `job`.
-    pub(super) fn resume(owners: Owners<'a>, batch: TokenBatch, job: Job<'a>) -> Self {
+    pub(super) fn resume(owners: Owners<'a>, batch: TokenBatch, job: Job) -> Self {
         Self {
             runtime: owners.runtime,
             image: owners.image,
@@ -330,7 +330,7 @@ impl<'a> Batch<'a> {
 
     /// Give the owners back: the job to submit, the batch as it waits for
     /// the job's completion, and the owners.
-    pub(super) fn park(self) -> (Job<'a>, TokenBatch, Owners<'a>) {
+    pub(super) fn park(self) -> (Job, TokenBatch, Owners<'a>) {
         (
             self.job,
             TokenBatch {

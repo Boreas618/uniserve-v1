@@ -9,6 +9,7 @@
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use uniserve_cuda::{DeviceGuard, Event, Stream};
 
@@ -58,6 +59,27 @@ pub type Retirement = Completion<Error, Notify>;
 pub type Capacity = TransferCapacity<Notify>;
 
 /// Run observers returned by a completion, after its owner unlocked.
+/// How long a host wait for device work may last where storage is given
+/// up outside a lane's jobs: at shutdown, when no executor is left to route
+/// a completion, and where a buffer closes before it was announced ready.
+pub(crate) const DRAIN_LIMIT: Duration = Duration::from_secs(60);
+
+/// Wait on the host until `event`'s latest record completed, at most until
+/// `deadline`. An event whose record is still queued in a job counts as
+/// incomplete, so a job that is never performed ends this wait at the
+/// deadline instead of holding its thread.
+pub(crate) fn drain_event(event: &Event, deadline: Instant) -> Result<()> {
+    while !event.query()? {
+        if Instant::now() >= deadline {
+            return Err(Error::Resource(
+                "device work did not complete within the drain limit",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
 pub fn notify(callbacks: Vec<Notify>) {
     for callback in callbacks {
         callback();
@@ -473,7 +495,7 @@ impl<V, E, C> TransferTicket<V, E, C> {
 
     /// Capture writes made before submission. Later work on the submitting
     /// stream must not become a dependency of the transport copy.
-    pub fn prepare_copy(&mut self, pool: &EventPool, stream: &Stream) -> Result<()> {
+    pub fn prepare_copy(&mut self, pool: &EventPool, stream: impl Issue) -> Result<()> {
         let ReadAccess::Copy { handoff } = &mut self.access else {
             return Err(Error::State("a borrowed transfer cannot copy into storage"));
         };

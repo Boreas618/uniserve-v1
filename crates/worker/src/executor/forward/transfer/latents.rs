@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
 use uniserve_ipc::{
     BufferId, Call, LatentParams, TensorExport, TensorRef, TensorTransfer, TransferHandle,
 };
@@ -221,7 +220,7 @@ pub(crate) fn import(
     export: &TensorExport,
     params: &LatentParams,
     slot: usize,
-    stream: Option<&Stream>,
+    stream: impl Issue,
 ) -> Result<LatentInput> {
     let TransferHandle::Latent {
         height,
@@ -483,7 +482,7 @@ mod tests {
             &params(pages, 0),
             bank,
             0,
-            None::<&Stream>,
+            None::<&uniserve_cuda::Stream>,
         )?;
         locate_export(pool, export, publications, &mut output)?;
         output
@@ -522,6 +521,7 @@ mod tests {
             SLOT,
             None,
         )?;
+        fetch::start(input.reads())?;
         for read in input.reads() {
             read.wait_ready();
         }

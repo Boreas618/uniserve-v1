@@ -408,7 +408,7 @@ pub(crate) struct MicrobatchForward {
     /// The forward's operations on the microbatch's stream: a graph launch
     /// or a runner method call, and what follows it. Its microbatch thread
     /// performs them in its turn.
-    pub(crate) job: crate::lane::Job<'static>,
+    pub(crate) job: crate::lane::Job,
     /// Whether the forward passes the host turn at its expert dispatch
     /// points: an eager forward does and stays suspended in Python
     /// meanwhile; a captured forward submits its whole step at once.
@@ -452,7 +452,7 @@ impl ExpertUnion {
 
     /// Order every microbatch stream after the work `job` holds for
     /// `parent`, before the job takes the microbatches' inputs.
-    pub(crate) fn fork(&self, job: &crate::lane::Job<'_>, parent: &Stream) -> Result<()> {
+    pub(crate) fn fork(&self, job: &crate::lane::Job, parent: &Stream) -> Result<()> {
         if self.microbatches.len() < 2 {
             return Ok(());
         }
@@ -468,7 +468,7 @@ impl ExpertUnion {
 
     /// Order `parent` after the work `job` holds for every microbatch
     /// stream.
-    pub(crate) fn join_streams(&self, job: &crate::lane::Job<'_>, parent: &Stream) -> Result<()> {
+    pub(crate) fn join_streams(&self, job: &crate::lane::Job, parent: &Stream) -> Result<()> {
         for peer in &self.microbatches[1..] {
             let event = Arc::new(uniserve_cuda::Event::new(
                 uniserve_cuda::EventFlags::default(),
