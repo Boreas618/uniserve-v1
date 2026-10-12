@@ -46,7 +46,7 @@ use crate::executor::forward::batch::{Parts, latent_params, product_name, stream
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::executor::forward::transfer::latents::Pool;
 use crate::ffi::{Backing, DType, Function, Handle, integer_list, integers};
-use crate::lane::Job;
+use crate::lane::{Completion, Job};
 use crate::model::components::{Capability, Declarations};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
@@ -352,6 +352,11 @@ struct Layout {
     references: usize,
 }
 
+/// The transient layouts a new one displaced ([`DenoiserRunner::ask_layout`]):
+/// their constants are released when this is dropped, behind the job that
+/// drained the stream.
+pub(crate) struct Evicted(#[expect(dead_code, reason = "held until it is dropped")] Vec<Layout>);
+
 /// One rank's video denoiser: its bound steps, buffers, latent pool and
 /// layouts.
 pub(crate) struct DenoiserRunner {
@@ -579,9 +584,27 @@ impl DenoiserRunner {
         &self.stream
     }
 
-    /// Prepare `key` under a new id. Startup layouts are never released.
-    fn prepare(&mut self, model: &VideoModel, key: VideoLayout, startup: bool) -> Result<usize> {
+    /// Prepare startup layout `key` under a new id: read its fields and
+    /// prepare its constants, on the calling thread. Startup layouts are
+    /// never released.
+    fn prepare(&mut self, model: &VideoModel, key: VideoLayout) -> Result<usize> {
         let fields = model.layout_fields(&key)?;
+        let handle = Handle::new(
+            self.methods
+                .prepare_layout
+                .call_values(&[self.methods.runner.to_any(), key.descriptor()])?,
+        )?;
+        self.install(key, fields, handle, true)
+    }
+
+    /// Keep layout `key`, whose constants `handle` holds, under a new id.
+    fn install(
+        &mut self,
+        key: VideoLayout,
+        fields: LayoutFields,
+        handle: Handle,
+        startup: bool,
+    ) -> Result<usize> {
         let samples = SampleLayout::new(&fields, self.pages.page_units)?;
         if samples.pages > self.pages.pages {
             return Err(Error::Invalid(
@@ -642,11 +665,6 @@ impl DenoiserRunner {
                 tensors.push(self.state[index].clone());
             }
         }
-        let handle = Handle::new(
-            self.methods
-                .prepare_layout
-                .call_values(&[self.methods.runner.to_any(), key.descriptor()])?,
-        )?;
         self.layouts[id] = Some(Layout {
             key,
             handle,
@@ -671,41 +689,88 @@ impl DenoiserRunner {
     ) -> Result<usize> {
         match self.ids.get(&key) {
             Some(&id) => Ok(id),
-            None => self.prepare(model, key, true),
+            None => self.prepare(model, key),
         }
     }
 
-    /// The id of the layout a request evaluates in, preparing a transient
-    /// layout (and releasing an unused one) when it was not prepared.
-    pub(crate) fn acquire(&mut self, model: &VideoModel, key: VideoLayout) -> Result<usize> {
-        let id = match self.ids.get(&key) {
-            Some(&id) => {
-                if let Some(position) = self.transient.iter().position(|&entry| entry == id) {
-                    self.transient.remove(position);
-                    self.transient.push_back(id);
-                }
-                id
-            }
-            None => {
-                while self.transient.len() >= self.transient_capacity {
-                    let Some(position) = self.transient.iter().position(|&entry| {
-                        self.layout(entry)
-                            .is_ok_and(|layout| layout.references == 0)
-                    }) else {
-                        break;
-                    };
-                    let Some(evicted) = self.transient.remove(position) else {
-                        break;
-                    };
-                    self.release_layout(evicted)?;
-                }
-                let id = self.prepare(model, key, false)?;
-                self.transient.push_back(id);
-                id
-            }
+    /// Whether layout `key` is prepared.
+    pub(crate) fn prepared(&self, key: &VideoLayout) -> bool {
+        self.ids.contains_key(key)
+    }
+
+    /// Hold prepared layout `key` for one more request and return its id;
+    /// `None` when the layout is not prepared ([`Self::ask_layout`]).
+    pub(crate) fn acquire(&mut self, key: VideoLayout) -> Result<Option<usize>> {
+        let Some(&id) = self.ids.get(&key) else {
+            return Ok(None);
         };
+        if let Some(position) = self.transient.iter().position(|&entry| entry == id) {
+            self.transient.remove(position);
+            self.transient.push_back(id);
+        }
         self.layout_mut(id)?.references += 1;
-        Ok(id)
+        Ok(Some(id))
+    }
+
+    /// Record into `job`, a job of the runner's lane, the preparation of
+    /// transient layout `key`: the model's fields of the layout and the
+    /// constants the library prepares for it on the lane's stream.
+    /// [`Self::accept_layout`] keeps the layout from the job's completion.
+    ///
+    /// Unused transient layouts beyond the runner's capacity give way.
+    /// Their constants must outlive their last step, so the job drains
+    /// the stream first; the returned layouts are dropped once it
+    /// completed.
+    pub(crate) fn ask_layout(
+        &mut self,
+        model: &VideoModel,
+        key: VideoLayout,
+        job: &Job,
+    ) -> Result<Evicted> {
+        let mut evicted = Vec::new();
+        while self.transient.len() >= self.transient_capacity {
+            let Some(position) = self.transient.iter().position(|&entry| {
+                self.layout(entry)
+                    .is_ok_and(|layout| layout.references == 0)
+            }) else {
+                break;
+            };
+            let Some(id) = self.transient.remove(position) else {
+                break;
+            };
+            if let Some(layout) = self.layouts.get_mut(id).and_then(Option::take) {
+                self.ids.remove(&layout.key);
+                evicted.push(layout);
+            }
+        }
+        if !evicted.is_empty() {
+            job.on(Some(&self.stream)).synchronize()?;
+        }
+
+        model.ask_layout_fields(&key, job);
+        job.call_handle(MethodCall::new(
+            &self.methods.prepare_layout,
+            vec![
+                Argument::Handle(self.methods.runner.clone()),
+                Argument::Integers(key.values().to_vec()),
+            ],
+        ));
+        Ok(Evicted(evicted))
+    }
+
+    /// Keep transient layout `key` as the job of [`Self::ask_layout`]
+    /// prepared it.
+    pub(crate) fn accept_layout(
+        &mut self,
+        model: &VideoModel,
+        key: VideoLayout,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        let fields = model.read_layout_fields(completion)?;
+        let handle = completion.handle()?;
+        let id = self.install(key, fields, handle, false)?;
+        self.transient.push_back(id);
+        Ok(())
     }
 
     /// End a request's use of its layout.
@@ -715,18 +780,6 @@ impl DenoiserRunner {
             .references
             .checked_sub(1)
             .ok_or_else(|| Error::Invariant("video layout reference underflow".into()))?;
-        Ok(())
-    }
-
-    fn release_layout(&mut self, id: usize) -> Result<()> {
-        let Some(layout) = self.layouts.get_mut(id).and_then(Option::take) else {
-            return Ok(());
-        };
-        // The layout's constants must outlive its last step. Evicting a
-        // transient layout is rare, so the stream drains here; dropping the
-        // layout then releases its handle.
-        self.stream.synchronize()?;
-        self.ids.remove(&layout.key);
         Ok(())
     }
 
@@ -1702,6 +1755,22 @@ impl LayoutFields {
     }
 }
 
+/// What the model's layout functions answer about one layout, as
+/// [`VideoModel::fields`] reads them.
+struct LayoutAnswers {
+    /// The state fields, in state order, and each one's dtype and elements.
+    names: Vec<String>,
+    dtypes: Vec<String>,
+    elements: Vec<i64>,
+    /// Each modality's `[rows, width, start, stop]` sample rows.
+    rows: Vec<i64>,
+    /// Elements of each modality's native draw.
+    draws: Vec<i64>,
+    condition_noise: i64,
+    text_rows: i64,
+    workspace: i64,
+}
+
 /// The sizing methods, each called with the loaded model first.
 struct SizingMethods {
     legal_frame_count: Function,
@@ -2077,24 +2146,82 @@ impl VideoModel {
         Ok(self.latent_shape(modality, layout)?.iter().product())
     }
 
-    /// The request state of `layout` on this rank.
+    /// The request state of `layout` on this rank, asked on the calling
+    /// thread (startup).
     pub(crate) fn layout_fields(&self, layout: &VideoLayout) -> Result<LayoutFields> {
         let methods = &self.methods;
         let of_layout = |method: &Function| self.denoiser(method, vec![layout_arguments(layout)]);
-        let counts = |method: &Function| -> Result<Vec<u64>> {
-            Ok(self
-                .integers(method, of_layout(method)?)?
-                .into_iter()
-                .map(|value| value.max(0) as u64)
-                .collect())
-        };
-        let count = |method: &Function| -> Result<u64> {
-            Ok(self.integer(method, of_layout(method)?)?.max(0) as u64)
-        };
+        let counts =
+            |method: &Function| -> Result<Vec<i64>> { self.integers(method, of_layout(method)?) };
+        let count = |method: &Function| -> Result<i64> { self.integer(method, of_layout(method)?) };
 
-        let names = strings(&methods.state_names, of_layout(&methods.state_names)?)?;
-        let dtypes = strings(&methods.state_dtypes, of_layout(&methods.state_dtypes)?)?;
-        let elements = counts(&methods.state_elements)?;
+        self.fields(LayoutAnswers {
+            names: strings(&methods.state_names, of_layout(&methods.state_names)?)?,
+            dtypes: strings(&methods.state_dtypes, of_layout(&methods.state_dtypes)?)?,
+            elements: counts(&methods.state_elements)?,
+            rows: counts(&methods.sample_rows)?,
+            draws: counts(&methods.noise_elements)?,
+            condition_noise: count(&methods.condition_noise_elements)?,
+            text_rows: count(&methods.text_condition_rows)?,
+            workspace: count(&methods.workspace_elements)?,
+        })
+    }
+
+    /// Record into `job` the calls that ask the request state of `layout`
+    /// on this rank; [`Self::read_layout_fields`] reads the job's
+    /// completion.
+    pub(crate) fn ask_layout_fields(&self, layout: &VideoLayout, job: &Job) {
+        let methods = &self.methods;
+        let of_layout = |method: &Function| {
+            self.asked(method, vec![Argument::Integers(layout.values().to_vec())])
+        };
+        job.call_texts(of_layout(&methods.state_names));
+        job.call_texts(of_layout(&methods.state_dtypes));
+        for method in [
+            &methods.state_elements,
+            &methods.sample_rows,
+            &methods.noise_elements,
+            &methods.condition_noise_elements,
+            &methods.text_condition_rows,
+            &methods.workspace_elements,
+        ] {
+            job.call_returning(of_layout(method));
+        }
+    }
+
+    /// The request state of a layout from the completion of the job that
+    /// asked it ([`Self::ask_layout_fields`]).
+    pub(crate) fn read_layout_fields(&self, completion: &mut Completion) -> Result<LayoutFields> {
+        let count = |values: Vec<i64>| {
+            values.first().copied().ok_or_else(|| {
+                Error::Interface("a layout sizing function returned no value".into())
+            })
+        };
+        self.fields(LayoutAnswers {
+            names: completion.texts()?,
+            dtypes: completion.texts()?,
+            elements: completion.returned()?,
+            rows: completion.returned()?,
+            draws: completion.returned()?,
+            condition_noise: count(completion.returned()?)?,
+            text_rows: count(completion.returned()?)?,
+            workspace: count(completion.returned()?)?,
+        })
+    }
+
+    /// A layout's request state from the model's answers.
+    fn fields(&self, answers: LayoutAnswers) -> Result<LayoutFields> {
+        let extent = |value: i64| value.max(0) as u64;
+        let LayoutAnswers {
+            names,
+            dtypes,
+            elements,
+            rows,
+            draws,
+            condition_noise,
+            text_rows,
+            workspace,
+        } = answers;
         let state = names
             .into_iter()
             .zip(dtypes)
@@ -2104,13 +2231,12 @@ impl VideoModel {
                     sample: self.facts.modalities.contains(&name),
                     name,
                     dtype: parse_dtype(&dtype)?,
-                    elements,
+                    elements: extent(elements),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let rows = counts(&methods.sample_rows)?;
-        let draws = counts(&methods.noise_elements)?;
+        let rows: Vec<u64> = rows.into_iter().map(extent).collect();
         let samples = self
             .facts
             .modalities
@@ -2127,17 +2253,23 @@ impl VideoModel {
                 )
             })
             .collect();
-        let noise = self.facts.modalities.iter().cloned().zip(draws).collect();
+        let noise = self
+            .facts
+            .modalities
+            .iter()
+            .cloned()
+            .zip(draws.into_iter().map(extent))
+            .collect();
         Ok(LayoutFields {
             state,
             samples,
             noise,
-            condition_noise: count(&methods.condition_noise_elements)?,
+            condition_noise: extent(condition_noise),
             text_condition: (
-                count(&methods.text_condition_rows)?,
+                extent(text_rows),
                 u64::from(self.facts.text_condition_width),
             ),
-            workspace: count(&methods.workspace_elements)?,
+            workspace: extent(workspace),
         })
     }
 
