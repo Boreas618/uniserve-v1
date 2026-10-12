@@ -62,6 +62,14 @@ pub(crate) struct MethodCall {
 }
 
 impl MethodCall {
+    /// A call of `function` with `arguments`, the Python runner first.
+    pub(crate) fn new(function: &Function, arguments: Vec<Argument>) -> Self {
+        Self {
+            function: function.clone(),
+            arguments,
+        }
+    }
+
     /// Make the call.
     pub(crate) fn invoke(self) -> Result<Any> {
         let values = self
