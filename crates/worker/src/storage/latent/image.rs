@@ -22,7 +22,7 @@ use uniserve_ipc::{BufferId, LatentParams, RequestKey};
 
 use crate::executor::forward::launch::StreamOrder;
 use crate::executor::forward::transfer::latents::Pool;
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::storage::LatentStorage;
 use crate::storage::memory::StorageView;
 use crate::stream::Issue;
@@ -148,11 +148,11 @@ impl ImageLatents {
 }
 
 impl RequestStorage for ImageLatents {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
-    fn release_buffers(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
         self.pool
             .release_exports(&buffers.iter().copied().collect::<Vec<_>>());
         Ok(())
@@ -162,6 +162,7 @@ impl RequestStorage for ImageLatents {
         &mut self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         let mut result = Ok(());
         // Finished requests' published versions retire once their
@@ -188,7 +189,7 @@ impl RequestStorage for ImageLatents {
         Ok(self.pool.retirement_ready(requests))
     }
 
-    fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         let slots: Vec<i64> = slots.iter().map(|&slot| slot as i64).collect();
         for transfer in self.pool.release_slots(&slots)? {
             transfer.read().cancel()?;

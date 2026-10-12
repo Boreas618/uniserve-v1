@@ -38,7 +38,7 @@ use super::super::backend::{WorkerBackend, WorkerBatch};
 use super::Stage;
 use super::inputs::{Inputs, component_device};
 use crate::error::WorkerError;
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::Device;
 use crate::lane::{Completion, Job, Lanes};
 use crate::storage::OutputPool;
@@ -112,11 +112,15 @@ impl TransferRuntime {
 }
 
 impl RequestStorage for TransferRuntime {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
-    fn release_buffers(&mut self, _buffers: &std::collections::HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(
+        &mut self,
+        _buffers: &std::collections::HashSet<BufferId>,
+        _jobs: &LaneJobs,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -124,6 +128,7 @@ impl RequestStorage for TransferRuntime {
         &mut self,
         _requests: &std::collections::HashSet<RequestKey>,
         _retained: &std::collections::HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -137,7 +142,7 @@ impl RequestStorage for TransferRuntime {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 

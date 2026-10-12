@@ -9,7 +9,7 @@ use super::image::{DenoiseRow, ImageDiffusion};
 use super::{DenoiserRunner, VideoModel};
 use crate::Result;
 use crate::cuda_graph::GraphPool;
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::Handle;
 use crate::lane::Job;
 use crate::profiling::kernels::KernelRecord;
@@ -233,12 +233,12 @@ impl DenoiserRunners {
 }
 
 impl RequestStorage for DenoiserRunners {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         // A slot's layout is held when its request's admission is installed.
         Ok(())
     }
 
-    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -246,6 +246,7 @@ impl RequestStorage for DenoiserRunners {
         &mut self,
         _requests: &HashSet<RequestKey>,
         _retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -259,7 +260,7 @@ impl RequestStorage for DenoiserRunners {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         let Some(denoiser) = &mut self.video else {
             return Ok(());
         };

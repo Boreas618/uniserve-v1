@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use uniserve_core::CallId;
 use uniserve_cuda::Stream;
-use uniserve_ipc::{BufferId, RequestKey, Wake};
+use uniserve_ipc::{BufferId, CallKind, ForwardMode, RequestKey, Wake};
 
 use crate::Result;
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::storage::{KVCache, TensorStore};
 use crate::stream::EventPool;
 use crate::transfer::{Notify, Transports};
@@ -25,6 +25,10 @@ pub(super) fn notify(callbacks: Vec<Notify>) {
         callback();
     }
 }
+
+/// The call kind whose lane owns the stream slot releases are ordered on:
+/// token calls, which read the rows a release clears.
+const RELEASE: CallKind = CallKind::Forward(ForwardMode::Decode);
 
 /// The storage owners of a rank.
 pub struct RankStorage {
@@ -77,13 +81,13 @@ impl RankStorage {
 }
 
 impl RequestStorage for RankStorage {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         // Block tables are installed per batch; a new slot has no state.
         Ok(())
     }
 
-    fn release_buffers(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
-        self.tensors.release_buffers(buffers)?;
+    fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()> {
+        self.tensors.release_buffers(buffers, jobs.any().on(None))?;
         if let Some(kv) = &mut self.kv {
             kv.release_imports(buffers)?;
             kv.manager()
@@ -96,8 +100,10 @@ impl RequestStorage for RankStorage {
         &mut self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
+        jobs: &LaneJobs,
     ) -> Result<()> {
-        self.tensors.release_requests(requests, retained)?;
+        self.tensors
+            .release_requests(requests, retained, jobs.any().on(None))?;
         if let Some(kv) = &mut self.kv {
             kv.cancel_request_imports(requests, retained)?;
             let exports: Vec<BufferId> = kv
@@ -134,12 +140,23 @@ impl RequestStorage for RankStorage {
         Ok(ready)
     }
 
-    fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()> {
         if let Some(kv) = &mut self.kv {
+            // The rows are cleared by the lane that owns the release
+            // stream, behind the batches it already performed.
+            let release = match &self.release_stream {
+                // A rank that does not list the kind has one lane for
+                // every kind, which owns the stream.
+                Some(stream) => jobs
+                    .job(RELEASE)
+                    .unwrap_or_else(|_| jobs.any())
+                    .on(Some(stream)),
+                None => jobs.any().on(None),
+            };
             let slots: Vec<u32> = slots.iter().map(|&slot| slot as u32).collect();
-            kv.release_slots(&slots, self.release_stream.as_ref())?;
+            kv.release_slots(&slots, release)?;
             for request in std::mem::take(&mut self.retired_prefixes) {
-                kv.release_request_prefixes(request, self.release_stream.as_ref())?;
+                kv.release_request_prefixes(request, release)?;
                 // A later epoch of the request id starts without the
                 // retired epoch's resident transfers and accepted bases.
                 kv.manager().drop_request(request);

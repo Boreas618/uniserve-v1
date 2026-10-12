@@ -385,7 +385,11 @@ impl Trajectories {
 }
 
 impl crate::executor::lifecycle::RequestStorage for Trajectories {
-    fn admit_slots(&mut self, slots: &[usize]) -> Result<()> {
+    fn admit_slots(
+        &mut self,
+        slots: &[usize],
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
         // A reused slot never continues an earlier request's trajectory.
         self.release(slots);
         Ok(())
@@ -394,6 +398,7 @@ impl crate::executor::lifecycle::RequestStorage for Trajectories {
     fn release_buffers(
         &mut self,
         _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _jobs: &crate::executor::lifecycle::LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -402,6 +407,7 @@ impl crate::executor::lifecycle::RequestStorage for Trajectories {
         &mut self,
         _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
         _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _jobs: &crate::executor::lifecycle::LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -415,7 +421,11 @@ impl crate::executor::lifecycle::RequestStorage for Trajectories {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, slots: &[usize]) -> Result<()> {
+    fn retire_slots(
+        &mut self,
+        slots: &[usize],
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
         self.release(slots);
         Ok(())
     }
