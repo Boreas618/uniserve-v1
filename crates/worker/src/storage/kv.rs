@@ -295,7 +295,7 @@ impl KVCache {
 
     /// Clear released slots' rows on `stream` (ordered after every batch
     /// that read them) and forget them on the host.
-    pub fn release_slots(&mut self, slots: &[u32], stream: Option<&Stream>) -> Result<()> {
+    pub fn release_slots(&mut self, slots: &[u32], stream: impl Issue) -> Result<()> {
         let slots = self.tables.release_slots(slots)?;
         self.storage.clear(&slots, stream)?;
         self.tables.release(&slots);
@@ -308,7 +308,7 @@ impl KVCache {
         &mut self,
         request: RequestKey,
         slots: &[u32],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         let slots = self.tables.release_slots(slots)?;
         self.storage.clear(&slots, stream)?;
@@ -320,7 +320,7 @@ impl KVCache {
     pub fn release_request_prefixes(
         &mut self,
         request: RequestKey,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         let slots = self.tables.prefix_slots(request);
         if slots.is_empty() {
