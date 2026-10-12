@@ -86,7 +86,9 @@ use crate::lane::{Completion, Job};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass, kernel_records};
+use crate::runner::methods::{
+    Argument, MethodCall, Methods, RunnerClass, kernels_call, list_kernels,
+};
 use crate::runner::{ImageSetup, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{Metadata, OutputPlacement, ValueRange};
@@ -1592,10 +1594,10 @@ impl Conditions {
         Ok(())
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        let mut records = self.video.kernels(self.video_runners.values())?;
-        records.extend(self.audio.kernels(self.audio_runners.values())?);
-        Ok(records)
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        let mut calls = self.video.kernel_calls(self.video_runners.values());
+        calls.extend(self.audio.kernel_calls(self.audio_runners.values()));
+        calls
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1771,14 +1773,20 @@ impl EncoderRunner {
             .encode_audio(samples, lengths, out, job)
     }
 
+    /// The calls that list the kernels the operators of the runner's
+    /// execution context or of the condition encoders selected.
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        match (&self.context, &self.conditions) {
+            (Some(context), _) => vec![kernels_call(&context.kernels, &self.methods.runner)],
+            (_, Some(conditions)) => conditions.kernel_calls(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The kernels the operators of the runner's execution context or of the
     /// condition encoders selected.
     pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        match (&self.context, &self.conditions) {
-            (Some(context), _) => kernel_records(&context.kernels, &self.methods.runner, ENCODER),
-            (_, Some(conditions)) => conditions.kernels(),
-            _ => Ok(Vec::new()),
-        }
+        list_kernels(self.kernel_calls())
     }
 }
 

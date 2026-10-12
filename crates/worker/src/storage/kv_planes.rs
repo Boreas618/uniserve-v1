@@ -23,13 +23,13 @@
 use std::sync::Arc;
 
 use tvm_ffi::Any;
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_2d_d8, memset_2d_d32};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
 use super::kv_plan::KVPlan;
 use super::memory::{Memory, StorageView};
 use crate::ffi::{Backing, DType, DeferredCall, Device, Function, Handle, strings};
 use crate::model::interface::Interface;
-use crate::stream::Issue;
+use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
 
 /// The two K/V fields, in storage order.
@@ -65,66 +65,6 @@ fn allocate_values(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
         Some(device) => Memory::exportable(device, bytes, &Memory::peers(device)?),
         None => Ok(Memory::host(bytes)),
     }
-}
-
-/// Fill `height` rows of `width` bytes, `pitch` bytes apart, with `value`.
-///
-/// # Safety
-/// Every row lies in the memory of `stream`'s device (or host memory when
-/// `stream` is `None`) and stays valid until the fill completes.
-unsafe fn fill_d8(
-    address: u64,
-    pitch: usize,
-    value: u8,
-    width: usize,
-    height: usize,
-    stream: Option<&Stream>,
-) -> Result<()> {
-    match stream {
-        // SAFETY: forwarded from the caller.
-        Some(stream) => unsafe { memset_2d_d8(address, pitch, value, width, height, stream) }?,
-        None => {
-            for row in 0..height {
-                // SAFETY: forwarded from the caller.
-                unsafe {
-                    std::ptr::write_bytes(
-                        (address + (row * pitch) as u64) as *mut u8,
-                        value,
-                        width,
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Fill `height` rows of `width` 32-bit words, `pitch` bytes apart.
-///
-/// # Safety
-/// As for [`fill_d8`], with 4-byte aligned rows.
-unsafe fn fill_d32(
-    address: u64,
-    pitch: usize,
-    value: u32,
-    width: usize,
-    height: usize,
-    stream: Option<&Stream>,
-) -> Result<()> {
-    match stream {
-        // SAFETY: forwarded from the caller.
-        Some(stream) => unsafe { memset_2d_d32(address, pitch, value, width, height, stream) }?,
-        None => {
-            for row in 0..height {
-                let start = (address + (row * pitch) as u64) as *mut u32;
-                for word in 0..width {
-                    // SAFETY: forwarded from the caller.
-                    unsafe { start.add(word).write(value) };
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 impl KVPlanes {
@@ -173,35 +113,23 @@ impl KVPlanes {
             initialized,
         };
 
+        // One row spanning each allocation.
+        let whole = |address: u64, value: u32, width: usize, count: usize| RowFill {
+            address,
+            pitch: count * width,
+            value,
+            width,
+            count,
+            height: 1,
+        };
         for field in 0..2 {
             // SAFETY: each allocation spans exactly the filled bytes and is
             // owned by `planes`; the stream is drained below.
             unsafe {
-                fill_d8(
-                    planes.values[field].address(),
-                    plane_bytes,
-                    0,
-                    plane_bytes,
-                    1,
-                    stream,
-                )?;
-                fill_d8(
-                    planes.initialized[field].address(),
-                    cells,
-                    0,
-                    cells,
-                    1,
-                    stream,
-                )?;
+                stream.memset_2d(whole(planes.values[field].address(), 0, 1, plane_bytes))?;
+                stream.memset_2d(whole(planes.initialized[field].address(), 0, 1, cells))?;
                 if let Some(scales) = &planes.scales {
-                    fill_d32(
-                        scales[field].address(),
-                        cells * 4,
-                        UNIT_SCALE,
-                        cells,
-                        1,
-                        stream,
-                    )?;
+                    stream.memset_2d(whole(scales[field].address(), UNIT_SCALE, 4, cells))?;
                 }
             }
         }
@@ -382,8 +310,8 @@ impl KVPlanes {
     }
 
     /// Reset units `1..=count` (contiguous startup scratch) with native
-    /// fills: values and flags zero, scales one.
-    pub fn zero_leading(&self, count: u32, stream: Option<&Stream>) -> Result<()> {
+    /// fills issued to `stream`: values and flags zero, scales one.
+    pub fn zero_leading(&self, count: u32, stream: impl Issue) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
@@ -391,35 +319,25 @@ impl KVPlanes {
         let units = self.num_units as usize;
         let columns = self.plan.columns as usize;
         let plane = self.plan.plane_bytes as usize;
+        let count = count as usize;
+        // Units `[1, count]` of every column: one row per column, a
+        // column's units apart.
+        let leading = |address: u64, value: u32, width: usize, cell: usize| RowFill {
+            address: address + (cell * width) as u64,
+            pitch: units * cell * width,
+            value,
+            width,
+            count: count * cell,
+            height: columns,
+        };
         for field in 0..2 {
             // SAFETY: rows `[1, count]` of each column lie inside the field
             // allocations owned by this pool; the caller orders the fills.
             unsafe {
-                fill_d8(
-                    self.values[field].address() + plane as u64,
-                    units * plane,
-                    0,
-                    count as usize * plane,
-                    columns,
-                    stream,
-                )?;
-                fill_d8(
-                    self.initialized[field].address() + 1,
-                    units,
-                    0,
-                    count as usize,
-                    columns,
-                    stream,
-                )?;
+                stream.memset_2d(leading(self.values[field].address(), 0, 1, plane))?;
+                stream.memset_2d(leading(self.initialized[field].address(), 0, 1, 1))?;
                 if let Some(scales) = &self.scales {
-                    fill_d32(
-                        scales[field].address() + 4,
-                        units * 4,
-                        UNIT_SCALE,
-                        count as usize,
-                        columns,
-                        stream,
-                    )?;
+                    stream.memset_2d(leading(scales[field].address(), UNIT_SCALE, 4, 1))?;
                 }
             }
         }

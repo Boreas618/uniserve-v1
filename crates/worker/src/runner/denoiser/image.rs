@@ -60,7 +60,7 @@ use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
-use crate::runner::methods::{Argument, MethodCall, kernel_records};
+use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
 use crate::storage::LatentUpdate;
 use crate::storage::Scratch;
 use crate::storage::memory::{Memory, StorageView};
@@ -792,9 +792,14 @@ impl ImageDiffusion {
         )
     }
 
+    /// The calls that list the kernels the denoiser's operators selected.
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        vec![kernels_call(&self.methods.kernels, &self.methods.runner)]
+    }
+
     /// The kernels the denoiser's operators selected.
     pub fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        kernel_records(&self.methods.kernels, &self.methods.runner, RUNNER)
+        list_kernels(self.kernel_calls())
     }
 }
 

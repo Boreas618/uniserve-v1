@@ -24,13 +24,11 @@ use super::forward::{self, launch::Launched};
 use super::lifecycle::{LaneJobs, RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::error::WorkerError;
-use crate::ffi::Function;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::{Completion, Job, JobId, JobQueues};
 use crate::model::registry::Components;
-use crate::profiling::kernels::KernelRecord;
-use crate::profiling::kernels::KernelRecords;
+use crate::profiling::kernels::{KernelCalls, KernelRecord, KernelWatch};
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
 use crate::request::diffusion::Trajectories;
@@ -41,21 +39,12 @@ use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::inputs::Inputs;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
+use crate::runner::methods::list_kernels;
 use crate::runner::start::{ImageOwners, ImageRunner};
 use crate::service::ServiceBackend;
 use crate::storage::ImageLatents;
 use crate::worker::RankStorage;
 use crate::{Error, OutputPool, Result};
-
-/// Serving-time kernel reporting: a cheap counter tells when any provider
-/// choice changed, and only then are the bindings' records gathered.
-pub struct KernelWatch {
-    pub choices: Function,
-    pub last: i64,
-    pub records: KernelRecords,
-    pub rank: usize,
-    pub device: String,
-}
 
 /// The backend of one rank.
 pub struct WorkerBackend {
@@ -206,6 +195,8 @@ pub struct WorkerBatch {
     /// The batch's profiler step is open: its forward began and has not
     /// ended.
     stepping: bool,
+    /// The job of the profiler's window this batch's forward waits for.
+    profiling: Option<JobId>,
     /// A capability runtime's launched work awaiting materialization.
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
@@ -231,6 +222,7 @@ impl WorkerBatch {
             denoising: None,
             transfer: None,
             stepping: false,
+            profiling: None,
             running: None,
             image_inputs: None,
             inputs: forward::inputs::Inputs::default(),
@@ -415,14 +407,17 @@ impl WorkerBackend {
         self.jobs = jobs;
     }
 
-    /// End a batch's forward: close its profiler step and report kernels
-    /// its calls selected.
+    /// End a batch's forward: close its profiler step and ask for the
+    /// count of kernel choices, which tells whether its calls selected new
+    /// kernels.
     fn end_forward(&mut self, batch: &mut WorkerBatch) {
         if std::mem::take(&mut batch.stepping) {
             if let Some(profiler) = &mut self.profiler {
                 profiler.end();
             }
-            self.report_new_kernels();
+            if let Some(watch) = &mut self.kernels {
+                watch.count(&self.jobs);
+            }
         }
     }
 
@@ -464,10 +459,6 @@ impl WorkerBackend {
         self.text = Some(text);
     }
 
-    pub(crate) fn text(&self) -> Option<&crate::runner::causal_lm::CausalLMRunners> {
-        self.text.as_ref()
-    }
-
     pub(crate) fn text_mut(&mut self) -> Option<&mut crate::runner::causal_lm::CausalLMRunners> {
         self.text.as_mut()
     }
@@ -484,15 +475,21 @@ impl WorkerBackend {
         self.image_order = owners.order;
     }
 
-    /// The kernels each image runner's operators selected, as `(name,
-    /// device, kernels)` in construction order.
-    pub(crate) fn image_kernels(&self) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
-        image_kernels(
+    /// The kernels each text and image runner's operators selected, as
+    /// `(label, device, kernels)`: text runners first, then the image
+    /// runners in construction order. Each listing is a call made now,
+    /// which startup waits for.
+    pub(crate) fn kernels(&self) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
+        kernel_calls(
+            self.text.as_ref(),
             &self.image_order,
             &self.encoders,
             &self.denoisers,
             &self.decoders,
         )
+        .into_iter()
+        .map(|(label, device, calls)| Ok((label, device, list_kernels(calls)?)))
+        .collect()
     }
 
     /// Release what serves an image model: its runners, the host lane and
@@ -861,46 +858,6 @@ impl WorkerBackend {
         Ok(())
     }
 
-    fn report_new_kernels(&mut self) {
-        let Some(watch) = &mut self.kernels else {
-            return;
-        };
-        let Ok(choices) = watch.choices.call_as::<i64>(&[]) else {
-            return;
-        };
-        if choices == watch.last {
-            return;
-        }
-        watch.last = choices;
-        let mut current = watch.records.empty();
-        let text = match &self.text {
-            Some(text) => text.kernels(),
-            None => Ok(Vec::new()),
-        };
-        let image = image_kernels(
-            &self.image_order,
-            &self.encoders,
-            &self.denoisers,
-            &self.decoders,
-        );
-        let listed = text.and_then(|mut listed| {
-            listed.extend(image?);
-            Ok(listed)
-        });
-        let logged = listed.and_then(|listed| {
-            for (label, device, records) in &listed {
-                current.add(label, device, records);
-            }
-            if watch.records.merge(current) {
-                watch.records.log("serving", watch.rank, &watch.device)?;
-            }
-            Ok(())
-        });
-        if let Err(error) = logged {
-            tracing::warn!(target: "uniserve_worker.profiling", "kernel report failed: {error}");
-        }
-    }
-
     /// Install (or clear) the service's completion wake on every storage
     /// owner.
     pub fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
@@ -1047,33 +1004,35 @@ impl WorkerBackend {
     }
 }
 
-/// The kernels of an image model's runners, in the order `order` names
-/// them: each runner's name, its device and what its operators selected.
-fn image_kernels(
+/// The kernel listings of the text runners and of an image model's
+/// runners, in the order `order` names those: each with its runner's
+/// label and device.
+fn kernel_calls(
+    text: Option<&crate::runner::causal_lm::CausalLMRunners>,
     order: &[(ImageRunner, String)],
     encoders: &EncoderRunners,
     denoisers: &DenoiserRunners,
     decoders: &DecoderRunners,
-) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
-    let mut listed = Vec::new();
+) -> Vec<KernelCalls> {
+    let mut listed = text.map_or_else(Vec::new, |text| text.kernel_calls());
     for (runner, name) in order {
-        let (device, kernels) = match runner {
+        let (device, calls) = match runner {
             ImageRunner::Encoder(index) => match encoders.image.get(*index) {
-                Some(runner) => (runner.device().to_string(), runner.kernels()?),
+                Some(runner) => (runner.device().to_string(), runner.kernel_calls()),
                 None => continue,
             },
             ImageRunner::Denoiser => match &denoisers.image {
-                Some((_, runner)) => (runner.device().to_string(), runner.kernels()?),
+                Some((_, runner)) => (runner.device().to_string(), runner.kernel_calls()),
                 None => continue,
             },
             ImageRunner::Decoder => match &decoders.image {
-                Some((_, runner)) => (runner.device().to_string(), runner.kernels()?),
+                Some((_, runner)) => (runner.device().to_string(), runner.kernel_calls()),
                 None => continue,
             },
         };
-        listed.push((name.clone(), device, kernels));
+        listed.push((name.clone(), device, calls));
     }
-    Ok(listed)
+    listed
 }
 
 impl Backend for WorkerBackend {
@@ -1205,7 +1164,8 @@ impl Backend for WorkerBackend {
 
         let lanes = self.jobs.clone();
         loop {
-            match batch.stage() {
+            let stage = batch.stage();
+            match stage {
                 // Imported values become resident before the runtime
                 // consumes them like local ones; an import that failed
                 // fails the batch's calls.
@@ -1218,11 +1178,25 @@ impl Backend for WorkerBackend {
                     }
                 }
                 forward::Stage::Forward => {}
-                forward::Stage::Done => {
-                    self.end_forward(batch);
-                    self.release_predecessors(batch, true)?;
-                    return Ok(None);
-                }
+                forward::Stage::Done => self.end_forward(batch),
+            }
+
+            // The profiler's window opens before the first job of its
+            // first step's forward and closes behind the last job of its
+            // last step's: each of its jobs is one the batch waits for.
+            if stage != forward::Stage::Inputs
+                && let Some(profiler) = &mut self.profiler
+                && let Some(job) = profiler.next(&lanes, kind)
+            {
+                batch.profiling = Some(job);
+                // FIXME: waited for here, like the forward's own jobs
+                // (`Backend::forward`).
+                let completion = lanes.wait(job).map_err(lane_lost)?;
+                return Ok(Some((job, completion)));
+            }
+            if stage == forward::Stage::Done {
+                self.release_predecessors(batch, true)?;
+                return Ok(None);
             }
 
             // A stage that needs nothing of the lane advances without a
@@ -1246,12 +1220,19 @@ impl Backend for WorkerBackend {
     fn complete(
         &mut self,
         batch: &mut WorkerBatch,
-        _job: JobId,
+        job: JobId,
         completion: Completion,
     ) -> std::result::Result<(), WorkerError> {
         let Some(kind) = batch.route() else {
             return Ok(());
         };
+        if batch.profiling == Some(job) {
+            batch.profiling = None;
+            if let Some(profiler) = &mut self.profiler {
+                profiler.complete(completion);
+            }
+            return Ok(());
+        }
         let completed = forward::complete(self, batch, kind, completion);
         if completed.is_err() {
             self.end_forward(batch);
@@ -1300,7 +1281,22 @@ impl Backend for WorkerBackend {
     }
 
     fn completed(&mut self) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
-        Ok(self.jobs.take())
+        while let Some((job, completion)) = self.jobs.take() {
+            // The kernel watch's calls belong to no batch.
+            let Some(watch) = self.kernels.as_mut().filter(|watch| watch.owns(job)) else {
+                return Ok(Some((job, completion)));
+            };
+            watch.complete(job, completion, &self.jobs, || {
+                kernel_calls(
+                    self.text.as_ref(),
+                    &self.image_order,
+                    &self.encoders,
+                    &self.denoisers,
+                    &self.decoders,
+                )
+            });
+        }
+        Ok(None)
     }
 
     fn begin_retirement(
