@@ -49,7 +49,7 @@ use crate::executor::forward::launch::{Launched, StreamOrder, error_code, failed
 use crate::executor::lifecycle::RequestStorage;
 use crate::lane::{Completion, ExpertStep, ExpertVariant, Job};
 use crate::parallel::{ExpertUnion, MicrobatchForward};
-use crate::profiling::kernels::KernelRecord;
+use crate::profiling::kernels::KernelCalls;
 use crate::request::decode_state::DecodeState;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{
@@ -515,26 +515,15 @@ impl CausalLMRunners {
 
     pub(crate) fn set_wake(&self, _wake: Option<Wake>) {}
 
-    /// Each runner's kernel-table label, device name and the kernels its
-    /// operators selected, after numerical warmup.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
+    /// Each runner's kernel-table label, device name and the call that
+    /// lists the kernels its operators selected.
+    pub(crate) fn kernel_calls(&self) -> Vec<KernelCalls> {
         self.runners
             .iter()
             .zip(&self.labels)
             .map(|(runner, (label, device))| {
-                let records = runner
-                    .methods
-                    .call(&runner.functions.kernels, Vec::new())
-                    .invoke()?;
-                let records = tvm_ffi::Array::<tvm_ffi::Any>::try_from(records)
-                    .map_err(|error| Error::numerical("kernels", &error))?
-                    .iter()
-                    .enumerate()
-                    .map(|(index, record)| {
-                        KernelRecord::new(format!("{label}.kernels[{index}]"), record)
-                    })
-                    .collect::<Result<_>>()?;
-                Ok((label.clone(), device.clone(), records))
+                let call = runner.methods.call(&runner.functions.kernels, Vec::new());
+                (label.clone(), device.clone(), vec![call])
             })
             .collect()
     }

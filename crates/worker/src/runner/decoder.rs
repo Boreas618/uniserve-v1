@@ -57,7 +57,9 @@ use crate::host::image::{ImageTask, ImageWork};
 use crate::lane::Job;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass, kernel_records};
+use crate::runner::methods::{
+    Argument, MethodCall, Methods, RunnerClass, kernels_call, list_kernels,
+};
 use crate::runner::{ImageSetup, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
@@ -306,13 +308,19 @@ impl DecoderRunner {
         }
     }
 
+    /// The calls that list the kernels the operators of the decoder's
+    /// Python runners selected.
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        match &self.family {
+            Family::Image(image) => vec![kernels_call(&image.kernels, &image.runner)],
+            Family::Video(video) => video.kernel_calls(),
+            Family::Audio(audio) => audio.kernel_calls(),
+        }
+    }
+
     /// The kernels the operators of the decoder's Python runners selected.
     pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        match &self.family {
-            Family::Image(image) => kernel_records(&image.kernels, &image.runner, DECODER),
-            Family::Video(video) => video.kernels(),
-            Family::Audio(audio) => audio.kernels(),
-        }
+        list_kernels(self.kernel_calls())
     }
 
     /// Release the graphs and Python runners of a video or audio decoder;
@@ -1228,9 +1236,9 @@ impl VideoDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
         self.class
-            .kernels(self.runners.iter().map(|(_, runner)| runner))
+            .kernel_calls(self.runners.iter().map(|(_, runner)| runner))
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1429,8 +1437,8 @@ impl AudioDecoder {
         Ok(mode)
     }
 
-    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        self.class.kernels(self.runners.values())
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        self.class.kernel_calls(self.runners.values())
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {

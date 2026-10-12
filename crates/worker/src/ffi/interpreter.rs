@@ -8,6 +8,11 @@
 //! values it passed stay borrowed on its stack. The last use of a Python
 //! object ([`super::Handle`]'s drop) is handed over the same way.
 //!
+//! The control thread does not wait: it submits work that owns what it uses
+//! ([`Interpreter::submit`]) and hears of it through what the work posts
+//! when it ran. Submitted work is served in the same queue, in arrival
+//! order with every other thread's calls.
+//!
 //! Three cases make a call on the calling thread instead:
 //!
 //! - the caller is the interpreter thread itself (a Python function called
@@ -33,13 +38,21 @@ thread_local! {
     static CALLS_HERE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// One entry of the Python thread's queue.
+enum Request {
+    /// Work that borrows its submitter, which is parked until it ran.
+    Handed(Handoff),
+    /// Work that owns what it uses; nobody waits for it.
+    Submitted(Box<dyn FnOnce() + Send>),
+}
+
 /// The queue of the started interpreter. It outlives the interpreter: once
 /// the interpreter has stopped, sends fail and callers call directly.
-static REQUESTS: OnceLock<Sender<Handoff>> = OnceLock::new();
+static REQUESTS: OnceLock<Sender<Request>> = OnceLock::new();
 
 /// The thread that executes Python.
 pub struct Interpreter {
-    requests: Receiver<Handoff>,
+    requests: Receiver<Request>,
 }
 
 impl Interpreter {
@@ -67,10 +80,33 @@ impl Interpreter {
         loop {
             select! {
                 recv(self.requests) -> request => {
-                    request.expect("the request queue is never closed").run();
+                    match request.expect("the request queue is never closed") {
+                        Request::Handed(handoff) => handoff.run(),
+                        Request::Submitted(work) => work(),
+                    }
                 }
                 recv(finished) -> outcome => return outcome.ok(),
             }
+        }
+    }
+
+    /// Submit `work` to the Python thread and return without waiting for
+    /// it. The work owns everything it uses and reports by a message of its
+    /// own (a completion it posts), so its submitter goes on at once. Where
+    /// the calling thread is the one its Python runs on (see the module
+    /// documentation), the work runs before this returns.
+    pub fn submit(work: impl FnOnce() + Send + 'static) {
+        let work: Box<dyn FnOnce() + Send> = Box::new(work);
+        let Some(requests) = REQUESTS.get().filter(|_| !CALLS_HERE.get()) else {
+            work();
+            return;
+        };
+
+        // The interpreter has stopped: the work comes back unsent.
+        if let Err(unsent) = requests.send(Request::Submitted(work))
+            && let Request::Submitted(work) = unsent.into_inner()
+        {
+            work();
         }
     }
 }
@@ -81,7 +117,7 @@ fn on_python_thread(work: &mut dyn FnMut()) {
     let handed = REQUESTS
         .get()
         .filter(|_| !CALLS_HERE.get())
-        .is_some_and(|requests| hand(requests, |handoff| handoff, work));
+        .is_some_and(|requests| hand(requests, Request::Handed, work));
     if !handed {
         work();
     }
