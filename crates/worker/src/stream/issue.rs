@@ -240,7 +240,10 @@ impl Issue for Option<&Stream> {
 
     fn launch_host_fn(&self, function: HostFunction) -> Result<()> {
         match self {
-            Some(stream) => stream.launch_host_fn(function)?,
+            // The stream's own method, named in full: on `&&Stream` a
+            // method call resolves to this trait's method of `&Stream`,
+            // which issues through this one.
+            Some(stream) => Stream::launch_host_fn(stream, function)?,
             None => function(),
         }
         Ok(())
@@ -248,7 +251,8 @@ impl Issue for Option<&Stream> {
 
     fn synchronize(&self) -> Result<()> {
         match self {
-            Some(stream) => Ok(stream.synchronize()?),
+            // The stream's own method, as above.
+            Some(stream) => Ok(Stream::synchronize(stream)?),
             None => Ok(()),
         }
     }
