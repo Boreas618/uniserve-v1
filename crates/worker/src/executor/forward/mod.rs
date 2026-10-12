@@ -16,7 +16,8 @@
 //! the batch with `UnsupportedSetup` and leaves the rank serving.
 //!
 //! A text batch's jobs are operations its runner recorded, and so are a
-//! video model's encoder batches (`batch::forward`). The forward of
+//! video model's encoder and denoiser batches (`batch::forward`). The
+//! forward of
 //! every other capability, and the completion of imported inputs, still
 //! issue their own stream work: each is one job holding that work as
 //! [`Job::forward`], until its capability is converted.
@@ -212,11 +213,13 @@ pub(crate) fn complete(
 /// Whether the forwards of `kind` on this rank are recorded into jobs
 /// ([`batch::forward`]); the others issue their own stream work.
 fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
-    use MediaCall::{LatentEncoding, TextEncoding, VisionEncoding};
+    use MediaCall::{Denoising, LatentEncoding, LatentPreparation, TextEncoding, VisionEncoding};
 
     matches!(
         kind,
-        CallKind::Media(TextEncoding | VisionEncoding | LatentEncoding)
+        CallKind::Media(
+            TextEncoding | VisionEncoding | LatentEncoding | LatentPreparation | Denoising
+        )
     ) && backend.serves_video()
 }
 
