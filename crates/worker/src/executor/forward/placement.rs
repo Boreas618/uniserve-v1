@@ -16,11 +16,10 @@ use std::sync::Arc;
 use uniserve_core::CallId;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
-    Batch as BatchPlan, BufferAllocation, BufferId, Call, DType, RequestKey, TensorExport,
-    TensorRef, TransferHandle,
+    Batch as BatchPlan, BufferAllocation, BufferId, Call, RequestKey, TensorExport, TensorRef,
+    TransferHandle,
 };
 
-use super::launch::read_flag;
 use crate::ffi::Device;
 use crate::storage::OutputPlacement;
 use crate::stream::Issue;
@@ -90,26 +89,6 @@ impl Reads {
         }
         store.complete_reads(&reads, stream, &[])
     }
-}
-
-/// Indices of the calls whose host-gated (U8) predicate is false, read
-/// once each on `stream` after its producer.
-pub(crate) fn skipped(
-    store: &TensorStore,
-    plan: &BatchPlan,
-    device: Device,
-    stream: Option<&Stream>,
-) -> Result<HashSet<usize>> {
-    let mut skipped = HashSet::new();
-    for (index, call) in plan.calls.iter().enumerate() {
-        if let Some(predicate) = &call.predicate
-            && predicate.dtype == DType::U8
-            && !read_flag(store, call, predicate, device.cuda_index(), stream)?
-        {
-            skipped.insert(index);
-        }
-    }
-    Ok(skipped)
 }
 
 /// The scheduler placement of a call's outputs on this rank: buffer-pool
