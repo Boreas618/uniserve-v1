@@ -96,6 +96,7 @@ pub(crate) fn prepare_inputs(
             tasks.push((index, Arc::clone(&task)));
             task.configure(ImageTask::new(ImageWork::Prepare {
                 function: image.policy.prepare_input().clone(),
+                facts: image.policy.image_facts().clone(),
                 loaded: image.policy.loaded().clone(),
                 tower,
                 payload: Arc::clone(payload),

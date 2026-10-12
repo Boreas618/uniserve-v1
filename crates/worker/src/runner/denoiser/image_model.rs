@@ -287,6 +287,7 @@ impl ImageModel {
 pub(crate) struct ImagePolicy {
     loaded: Handle,
     prepare_input: Function,
+    image_facts: Function,
     patch_grid: Function,
     guidance_prefix: Function,
 }
@@ -296,6 +297,7 @@ impl ImagePolicy {
         Ok(Self {
             loaded,
             prepare_input: interface.import(&format!("{ENCODER}.prepare_image"))?,
+            image_facts: interface.import(&format!("{ENCODER}.image_facts"))?,
             patch_grid: interface.import(&format!("{ENCODER}.patch_grid"))?,
             guidance_prefix: interface.import(&format!("{DENOISER}.guidance_prefix"))?,
         })
@@ -308,6 +310,11 @@ impl ImagePolicy {
     /// `EncoderRunner.prepare_image` (called from host lanes).
     pub(crate) fn prepare_input(&self) -> &Function {
         &self.prepare_input
+    }
+
+    /// `EncoderRunner.image_facts` (called with each prepared image).
+    pub(crate) fn image_facts(&self) -> &Function {
+        &self.image_facts
     }
 
     /// The vision tower's patch grid of an image; `input_images` is the

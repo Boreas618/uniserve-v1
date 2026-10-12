@@ -21,6 +21,7 @@ use uniserve_ipc::{
 
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::Device;
+use crate::lane::{Completion, Job, Recorder};
 use crate::request::RequestPool;
 use crate::storage::{OutputBuffer, OutputLease, TensorStore};
 use crate::stream::{EventPool, Issue};
@@ -118,7 +119,8 @@ pub(crate) fn failed_output(
     })
 }
 
-/// Read a host-gated (U8) predicate after its producer's fence.
+/// Read a host-gated (U8) predicate after its producer's fence, on `stream`
+/// at once.
 pub(crate) fn read_flag(
     tensors: &TensorStore,
     call: &Call,
@@ -126,34 +128,34 @@ pub(crate) fn read_flag(
     device: Option<i32>,
     stream: Option<&Stream>,
 ) -> Result<bool> {
-    let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), stream)?;
-    let mut value = [0_u8; 1];
-    let copied = (|| -> Result<()> {
-        match stream {
-            Some(stream) => {
-                // SAFETY: one byte of a committed product, read after the
-                // stream waited on its producer; the host byte outlives the
-                // synchronized copy.
-                unsafe {
-                    uniserve_cuda::memcpy_async(
-                        value.as_mut_ptr() as u64,
-                        read.value().address(),
-                        1,
-                        stream,
-                    )
-                }?;
-                stream.synchronize()?;
-            }
-            // SAFETY: a host product byte.
-            None => value[0] = unsafe { *(read.value().address() as *const u8) },
-        }
-        Ok(())
-    })();
-    tensors.complete_reads(&[read], stream, &[])?;
-    copied?;
-    match value[0] {
-        0 => Ok(false),
-        1 => Ok(true),
+    let job = Job::new();
+    request_flag(tensors, call, predicate, device, job.on(stream))?;
+    let mut completion = job.perform().check().map_err(|failure| failure.error)?;
+    flag(&mut completion)
+}
+
+/// Record the read of a host-gated (U8) predicate after its producer's
+/// fence: the job's completion carries its byte, which [`flag`] decodes.
+pub(crate) fn request_flag(
+    tensors: &TensorStore,
+    call: &Call,
+    predicate: &TensorRef,
+    device: Option<i32>,
+    job: Recorder<'_, '_>,
+) -> Result<()> {
+    let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), job)?;
+    // One byte of a committed product, which the read lease keeps until
+    // the reader's fence that ends it below.
+    job.read(read.value().address(), 1);
+    tensors.complete_reads(&[read], job, &[])
+}
+
+/// The predicate the next read of `completion` carries
+/// ([`request_flag`]).
+pub(crate) fn flag(completion: &mut Completion) -> Result<bool> {
+    match completion.read()?[..] {
+        [0] => Ok(false),
+        [1] => Ok(true),
         _ => Err(Error::Invalid(
             "call predicate is not a canonical boolean".into(),
         )),

@@ -1025,15 +1025,15 @@ fn image_kernels(
     for (runner, name) in order {
         let (device, kernels) = match runner {
             ImageRunner::Encoder(index) => match encoders.image.get(*index) {
-                Some(runner) => (runner.device().to_string(), runner.kernels(name)?),
+                Some(runner) => (runner.device().to_string(), runner.kernels()?),
                 None => continue,
             },
             ImageRunner::Denoiser => match &denoisers.image {
-                Some((_, runner)) => (runner.device().to_string(), runner.kernels(name)?),
+                Some((_, runner)) => (runner.device().to_string(), runner.kernels()?),
                 None => continue,
             },
             ImageRunner::Decoder => match &decoders.image {
-                Some((_, runner)) => (runner.device().to_string(), runner.kernels(name)?),
+                Some((_, runner)) => (runner.device().to_string(), runner.kernels()?),
                 None => continue,
             },
         };

@@ -41,7 +41,7 @@ use super::tensor::{
 };
 use crate::ffi::{DType, Device};
 use crate::stream::{Fill, Issue};
-use crate::transfer::exports::{self, Location};
+use crate::transfer::exports::{self, Exports, Location};
 use crate::transfer::{ReadRef, Retirement, Spans, Transports, copy_planner, fetch};
 use crate::{Error, EventPool, Result};
 
@@ -404,6 +404,19 @@ pub struct TensorStore {
     /// Committed export locations per local product, revoked on release.
     exports: Mutex<HashMap<BufferId, Vec<Location>>>,
     state: Mutex<State>,
+}
+
+/// A product's export while its issuer's work is outstanding: what the
+/// transfer record says about the value, and each exported view's
+/// locations ([`TensorStore::located`]).
+pub struct ProductExport {
+    product: TensorRef,
+    shape: Vec<u64>,
+    height: u32,
+    width: u32,
+    value_range: String,
+    source_kind: Option<FeatureKind>,
+    exports: Vec<Exports>,
 }
 
 impl TensorStore {
@@ -941,12 +954,13 @@ impl TensorStore {
     }
 
     /// Publish a value the producer wrote into the bound view: `shape` is
-    /// the value's actual shape, fenced on the producer `stream`.
+    /// the value's actual shape, fenced behind what the producer `stream`
+    /// issued.
     pub fn produced(
         &self,
         buffer: &ProductBuffer,
         shape: &[u64],
-        stream: Option<&Stream>,
+        stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
         self.events.reap()?;
@@ -962,12 +976,12 @@ impl TensorStore {
     }
 
     /// Copy `value` into the product's bound view (no copy when `value` is
-    /// that view) on the producer `stream`, then fence it.
+    /// that view) in the producer `stream`'s order, then fence it.
     pub fn write(
         &self,
         buffer: &ProductBuffer,
         value: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
         self.events.reap()?;
@@ -1066,8 +1080,8 @@ impl TensorStore {
                 _ => {
                     let mut plan = copy_planner(None, SourceOrder::Stream)?;
                     destination.plan_copy(&source, &mut plan)?;
-                    // SAFETY: host operands, copied in the issuer's order; the
-                    // destination has no reader yet.
+                    // SAFETY: host operands, written in the producer's order;
+                    // the destination has no reader yet.
                     unsafe { stream.host().copy_strided(&plan) }?;
                 }
             }
@@ -1887,8 +1901,8 @@ impl TensorStore {
         transports: &Transports,
         host: bool,
         regions: Option<&[Vec<Range<u64>>]>,
-        stream: Option<&Stream>,
-    ) -> Result<(TensorExport, Vec<Location>)> {
+        stream: impl Issue,
+    ) -> Result<ProductExport> {
         let (feature, logical_shape, value_shape, extent) = {
             let value = lock(write);
             (
@@ -1962,7 +1976,7 @@ impl TensorStore {
             .iter()
             .map(|&slot| slot as usize)
             .collect();
-        let mut locations: Vec<Location> = Vec::new();
+        let mut exports: Vec<Exports> = Vec::new();
         let result = (|| -> Result<()> {
             let views: Vec<(StorageView, Vec<u64>)> = match regions {
                 Some(regions) => regions
@@ -1984,7 +1998,7 @@ impl TensorStore {
                 None => vec![(value.clone(), origin.clone())],
             };
             for (view, offset) in views {
-                let accepted = exports::export(
+                exports.push(exports::export(
                     transports,
                     &Spans::single(view)?,
                     Some(&offset),
@@ -1992,15 +2006,61 @@ impl TensorStore {
                     host,
                     stream,
                     |retirement| self.retain_export(write, retirement),
-                )?;
-                locations.extend(accepted);
+                )?);
             }
             Ok(())
         })();
         if let Err(error) = result {
+            exports.iter().for_each(Exports::revoke);
+            return Err(error);
+        }
+
+        Ok(ProductExport {
+            product: product.clone(),
+            shape,
+            height,
+            width,
+            value_range,
+            source_kind,
+            exports,
+        })
+    }
+
+    /// The transfer record and the locations of `export`, the export of
+    /// `write`'s product.
+    ///
+    /// The caller keeps `export` until the issuer it was made with
+    /// performed its work and calls this only then: at once after a
+    /// stream, from the job's completion on after a recorder. Nothing of
+    /// the export is known to another process before. On failure every
+    /// location of the export is revoked; on success the caller owns
+    /// revocation of the returned locations until commit.
+    pub fn located(
+        &self,
+        write: &ProductBuffer,
+        export: ProductExport,
+    ) -> Result<(TensorExport, Vec<Location>)> {
+        let ProductExport {
+            product,
+            shape,
+            height,
+            width,
+            value_range,
+            source_kind,
+            exports,
+        } = export;
+
+        let mut locations: Vec<Location> = Vec::new();
+        let mut exports = exports.into_iter();
+        let result = exports.by_ref().try_for_each(|export| {
+            locations.extend(export.locate(|retirement| self.retain_export(write, retirement))?);
+            Ok(())
+        });
+        if let Err(error) = result {
             if let Err(cleanup) = exports::release(&locations) {
                 tracing::warn!(target: "uniserve_worker.storage", "failed to revoke a failed product export: {cleanup}");
             }
+            exports.for_each(|export| export.revoke());
             return Err(error);
         }
 
@@ -2025,13 +2085,7 @@ impl TensorStore {
                 tensor,
             },
         };
-        Ok((
-            TensorExport {
-                product: product.clone(),
-                value,
-            },
-            locations,
-        ))
+        Ok((TensorExport { product, value }, locations))
     }
 
     /// Revoke every registered export location (shutdown); the transports

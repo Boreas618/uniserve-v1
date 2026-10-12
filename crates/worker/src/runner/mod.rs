@@ -22,9 +22,8 @@ use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{Call, CallKind};
 
-use crate::ffi::{Backing, DType, Function, Handle, integer_list};
+use crate::ffi::{Backing, DType, Handle};
 use crate::model::interface::Interface;
-use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
 
@@ -236,81 +235,19 @@ impl ImageSetup<'_> {
     }
 }
 
-/// The Python runners of one module: their constructor's fixed arguments
-/// and their methods, each called with a runner first.
-pub(crate) struct Methods {
-    pub(crate) construct: Function,
-    pub(crate) loaded: Handle,
-    pub(crate) path: String,
-    pub(crate) stream: Stream,
-    pub(crate) attention: String,
-    pub(crate) scratch: Handle,
-    pub(crate) forward: Function,
-    pub(crate) kernels: Function,
-    pub(crate) close: Function,
-}
-
-impl Methods {
-    /// The methods of the runner class at import path `class`, whose
-    /// forward method is `forward`.
-    pub(crate) fn new(setup: &RunnerSetup<'_>, class: &str, forward: &str) -> Result<Self> {
-        let method = |name: &str| setup.interface.import(&format!("{class}.{name}"));
-        Ok(Self {
-            construct: setup.interface.import(class)?,
-            loaded: setup.loaded.clone(),
-            path: setup.path.to_owned(),
-            stream: setup.stream.clone(),
-            attention: setup.attention.clone(),
-            scratch: setup.scratch.clone(),
-            forward: method(forward)?,
-            kernels: method("kernels")?,
-            close: method("close")?,
-        })
-    }
-
-    /// Construct the runner of `size`.
-    pub(crate) fn runner(&self, size: impl IntoIterator<Item = i64>) -> Result<Handle> {
-        Handle::new(self.construct.call_values(&[
-            self.loaded.to_any(),
-            Any::from(tvm_ffi::String::from(self.path.as_str())),
-            Any::from(self.stream.raw() as i64),
-            Any::from(tvm_ffi::String::from(self.attention.as_str())),
-            self.scratch.to_any(),
-            Any::from(integer_list(size)),
-        ])?)
-    }
-
-    /// The kernels the operators of `runners` selected.
-    pub(crate) fn kernels<'a>(
-        &self,
-        label: &str,
-        runners: impl IntoIterator<Item = &'a Handle>,
-    ) -> Result<Vec<KernelRecord>> {
-        let mut values: Vec<Any> = Vec::new();
-        for runner in runners {
-            let records: tvm_ffi::Array<Any> = self.kernels.call_as(&[runner.view()])?;
-            values.extend(records.iter());
-        }
-        values
-            .into_iter()
-            .enumerate()
-            .map(|(index, record)| KernelRecord::new(format!("{label}.kernels[{index}]"), record))
-            .collect()
-    }
-
-    /// Close `runners`; an aborted close keeps what device work may still
-    /// address.
-    pub(crate) fn close<'a>(
-        &self,
-        aborted: bool,
-        runners: impl IntoIterator<Item = &'a Handle>,
-    ) -> Result<()> {
-        let flag = Any::from(aborted);
-        let mut result = Ok(());
-        for runner in runners {
-            result = result.and(self.close.invoke(&[runner.view(), (&flag).into()]));
-        }
-        result
+impl RunnerSetup<'_> {
+    /// The arguments every runner of the module is constructed with before
+    /// its size: the loaded model, the module path, the stream handle, the
+    /// attention backend and the stream's scratch.
+    pub(crate) fn arguments(&self) -> Vec<methods::Argument> {
+        use methods::Argument;
+        vec![
+            Argument::Handle(self.loaded.clone()),
+            Argument::Text(self.path.to_owned()),
+            Argument::Integer(self.stream.raw() as i64),
+            Argument::Text(self.attention.clone()),
+            Argument::Handle(self.scratch.clone()),
+        ]
     }
 }
 

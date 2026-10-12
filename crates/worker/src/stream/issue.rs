@@ -84,7 +84,21 @@ pub trait Issue: Copy {
 
     /// A Python call whose device work belongs to the stream, in order.
     fn call(&self, call: DeferredCall) -> Result<()>;
+
+    /// Run `function` once the work issued before it completed. It touches
+    /// host memory only: it neither calls CUDA nor blocks. Without a stream
+    /// it runs in the order of this issuer's host writes.
+    fn launch_host_fn(&self, function: HostFunction) -> Result<()>;
+
+    /// Wait for the work issued before this to complete. A stream waits
+    /// during the call; a job waits where its execution thread performs
+    /// this, so what the wait makes readable is read from the job's
+    /// completion on.
+    fn synchronize(&self) -> Result<()>;
 }
+
+/// A function a stream runs on the host between its device work.
+pub(crate) type HostFunction = Box<dyn FnOnce() + Send>;
 
 /// Copy the entries of `copies` between host ranges.
 ///
@@ -213,6 +227,21 @@ impl Issue for Option<&Stream> {
     fn call(&self, call: DeferredCall) -> Result<()> {
         call.invoke()
     }
+
+    fn launch_host_fn(&self, function: HostFunction) -> Result<()> {
+        match self {
+            Some(stream) => stream.launch_host_fn(function)?,
+            None => function(),
+        }
+        Ok(())
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        match self {
+            Some(stream) => Ok(stream.synchronize()?),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Issue at once on the stream.
@@ -256,5 +285,13 @@ impl<'a> Issue for &'a Stream {
 
     fn call(&self, call: DeferredCall) -> Result<()> {
         Some(*self).call(call)
+    }
+
+    fn launch_host_fn(&self, function: HostFunction) -> Result<()> {
+        Some(*self).launch_host_fn(function)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        Issue::synchronize(&Some(*self))
     }
 }

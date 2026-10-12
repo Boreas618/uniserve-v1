@@ -59,6 +59,7 @@ use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
+use crate::runner::methods::kernel_records;
 use crate::storage::LatentUpdate;
 use crate::storage::Scratch;
 use crate::storage::memory::{Memory, StorageView};
@@ -767,16 +768,8 @@ impl ImageDiffusion {
     }
 
     /// The kernels the denoiser's operators selected.
-    pub fn kernels(&self, label: &str) -> Result<Vec<KernelRecord>> {
-        let records: tvm_ffi::Array<Any> = self
-            .methods
-            .kernels
-            .call_as(&[self.methods.runner.view()])?;
-        records
-            .iter()
-            .enumerate()
-            .map(|(index, record)| KernelRecord::new(format!("{label}.kernels[{index}]"), record))
-            .collect()
+    pub fn kernels(&self) -> Result<Vec<KernelRecord>> {
+        kernel_records(&self.methods.kernels, &self.methods.runner, RUNNER)
     }
 }
 

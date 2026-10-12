@@ -243,7 +243,9 @@ fn export_group(
                 false,
                 stream,
                 &mut retain,
-            )?;
+            )?
+            // Issued on `stream` at once, so the export is located here.
+            .locate(&mut retain)?;
             field_locations.extend(exported.iter().map(|(_, locator)| locator.clone()));
             locations.extend(exported);
         }
@@ -316,7 +318,9 @@ fn export_group(
                     false,
                     stream,
                     &mut retain,
-                )?;
+                )?
+                // Issued on `stream` at once, so the export is located here.
+                .locate(&mut retain)?;
                 scale_locations.extend(exported.iter().map(|(_, locator)| locator.clone()));
                 locations.extend(exported);
             }
