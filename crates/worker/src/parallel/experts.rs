@@ -398,6 +398,16 @@ impl ExpertParallel {
         self.control().exchange.capacity_for(tokens)
     }
 
+    /// The step capacities a forward that sends `tokens` tokens can run at:
+    /// every capacity holding them. Fixed at startup, so the thread that
+    /// prepares a step reads them without the agreement's lock.
+    pub fn capacities_for(&self, tokens: usize) -> impl Iterator<Item = usize> + '_ {
+        self.capacities
+            .iter()
+            .copied()
+            .filter(move |&capacity| capacity >= tokens.max(1))
+    }
+
     /// The union's host group, shared with the transports' bootstrap.
     pub fn host(&self) -> &Arc<Mutex<HostGroup>> {
         &self.host
