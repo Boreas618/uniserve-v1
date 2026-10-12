@@ -972,7 +972,6 @@ impl TensorStore {
         stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
-        self.events.reap()?;
         let state = lock(&self.state);
         state.require_buffer(buffer)?;
         let view = buffer.view();
@@ -993,7 +992,6 @@ impl TensorStore {
         stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
-        self.events.reap()?;
         let state = lock(&self.state);
         state.require_buffer(buffer)?;
         self.write_value(buffer, value, stream, metadata)
@@ -1114,7 +1112,6 @@ impl TensorStore {
         values: &StorageView,
         stream: impl Issue,
     ) -> Result<Vec<StorageView>> {
-        self.events.reap()?;
         let state = lock(&self.state);
         let mut targets = Vec::with_capacity(writes.len());
         let mut seen = HashSet::new();
@@ -1186,7 +1183,6 @@ impl TensorStore {
         value: Scalar,
         stream: impl Issue,
     ) -> Result<StorageView> {
-        self.events.reap()?;
         let state = lock(&self.state);
         state.require_buffer(buffer)?;
         if lock(buffer).state.produced() {
@@ -1319,7 +1315,6 @@ impl TensorStore {
         stream: impl Issue,
         after_writes: &[ProductBuffer],
     ) -> Result<()> {
-        self.events.reap()?;
         let mut state = lock(&self.state);
         let mut seen = HashSet::new();
         let pending: Vec<_> = reads
@@ -1660,7 +1655,6 @@ impl TensorStore {
     /// produced and committed; a widened shard gets one fence over the
     /// union of its regions and becomes the whole logical tensor.
     pub fn complete_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
-        self.events.reap()?;
         let mut state = lock(&self.state);
         Self::wait_imported(&state, read, stream)?;
         let imported = Self::imported(read)?;

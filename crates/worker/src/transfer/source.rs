@@ -169,8 +169,7 @@ impl TransportBuffer {
                     vec![Arc::clone(&event)],
                     Box::new(move || retirement.finish()),
                 )?;
-                events.wake_after(&event)?;
-                events.reap()
+                events.wake_after(&event)
             }
             None => retirement.finish(),
         }
