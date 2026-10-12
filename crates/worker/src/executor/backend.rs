@@ -1113,6 +1113,23 @@ impl Backend for WorkerBackend {
         Ok(())
     }
 
+    fn admit_inputs(
+        &mut self,
+        _batch: &mut WorkerBatch,
+    ) -> std::result::Result<Option<JobId>, WorkerError> {
+        // Imports are still submitted where their reads become ready
+        // (`prepare_inputs`), on this thread.
+        Ok(None)
+    }
+
+    fn inputs_admitted(
+        &mut self,
+        _batch: &mut WorkerBatch,
+        _completion: Completion,
+    ) -> std::result::Result<(), WorkerError> {
+        Ok(())
+    }
+
     fn prepare_inputs(
         &mut self,
         batch: &mut WorkerBatch,
