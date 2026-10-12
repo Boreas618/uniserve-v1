@@ -504,7 +504,12 @@ impl Transport {
         let locator = match written {
             Ok(locator) => locator,
             Err(error) => {
-                storage.close()?;
+                // The attempt failed: a stream issued its copies at once
+                // and drains them here; a job gives up the copies and this
+                // wait with the rest of the failed attempt. Either way no
+                // DMA into the mapping is outstanding when it is released.
+                stream.synchronize()?;
+                storage.release()?;
                 self.capacity.release(view.nbytes)?;
                 return Err(error);
             }

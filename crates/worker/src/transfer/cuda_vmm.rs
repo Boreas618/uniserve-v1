@@ -127,9 +127,11 @@ impl CudaExports {
         events: &EventPool,
         locate: impl FnOnce(TransferTransport) -> Result<Locator>,
     ) -> Result<Exported> {
-        let stream = issue
-            .stream()
-            .ok_or_else(|| Error::Invalid("a device export requires its producer stream".into()))?;
+        if issue.stream().is_none() {
+            return Err(Error::Invalid(
+                "a device export requires its producer stream".into(),
+            ));
+        }
         let Device::Cuda(device) = source.device() else {
             return Err(Error::Invalid(
                 "cuda_vmm transport requires a CUDA tensor".into(),
@@ -266,7 +268,7 @@ impl CudaExports {
             Ok(Some(staged)) => Ok(Exported::Staged(Box::new(staged))),
             Ok(None) => Ok(Exported::PoolExhausted),
             Err(error) => {
-                self.abandon(state, stream, events, &export_id, capacity, nbytes)?;
+                self.abandon(state, issue, events, &export_id, capacity, nbytes)?;
                 Err(error)
             }
         }
@@ -280,19 +282,18 @@ impl CudaExports {
     fn abandon(
         &self,
         mut state: ExportState,
-        stream: &Stream,
+        issue: impl Issue,
         events: &EventPool,
         export_id: &str,
         capacity: &Capacity,
         nbytes: u64,
     ) -> Result<()> {
         let cleanup = (|| -> Result<()> {
-            // FIXME: an export recorded into a job issued nothing yet, and
-            // its failed attempt keeps only its event operations, so this
-            // drain waits for nothing of it; it is still a driver call of
-            // the thread that records.
+            // A stream issued the failed attempt's copies at once and
+            // drains them here; a job gives up the copies and this wait
+            // with the rest of the failed attempt.
             if state.submitted || state.event.is_some() {
-                stream.synchronize()?;
+                issue.synchronize()?;
             }
             if let Some(event) = state.event.take() {
                 let copied = state.copied.take();
