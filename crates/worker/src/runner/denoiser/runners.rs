@@ -11,6 +11,7 @@ use crate::Result;
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::RequestStorage;
 use crate::ffi::Handle;
+use crate::lane::Job;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
 use crate::runner::causal_lm::warmup::with_scratch;
@@ -193,7 +194,11 @@ impl DenoiserRunners {
                     key.canvas,
                     key.text_rows.min(plan.max_text_tokens),
                 );
-                runner.prepare_latents(id, 1, &size, 0)?;
+                // The placeholder's host sources are filled, at once, before
+                // its layout warms.
+                let job = Job::new();
+                runner.prepare_latents(id, 1, &size, 0, &job)?;
+                job.perform().check().map_err(|failure| failure.error)?;
                 runner.warm(id, 1)?;
             }
             runner.warm_conditioner(false)?;

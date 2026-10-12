@@ -14,9 +14,10 @@
 //! exports, KV exports and installs, pending calls) and they become visible
 //! together. A failure before that point retires everything the batch
 //! reserved ([`Recorded::discard`]), also from the job's completion on: the
-//! job still carries what the batch recorded before it failed, and an
-//! export is revoked only after the copies into it ran. A failure after the
-//! commit point is fatal.
+//! job still carries what the batch recorded before it failed (KV table
+//! installs and unit resets do their host bookkeeping when recorded, so
+//! their device work follows), and an export is revoked only after the
+//! copies into it ran. A failure after the commit point is fatal.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -277,15 +278,21 @@ impl<'a, 'j> TransferBatch<'a, 'j> {
         self.job.on(self.stream)
     }
 
-    /// Record an export with `export`. When it fails, what it recorded is
-    /// given up: its copies address storage the failed export released.
+    /// Record an export with `export`, which issues to the recorder it is
+    /// given. When it fails, the work it recorded is given up, since its
+    /// copies address storage the failed export gave back; its event
+    /// operations stay with the batch's job.
     pub(super) fn exporting<T>(
         &mut self,
-        export: impl FnOnce(&mut Self, Recorder<'a, 'j>) -> Result<T>,
+        export: impl FnOnce(&mut Self, Recorder<'_, 'j>) -> Result<T>,
     ) -> Result<T> {
-        let recorded = self.job.len();
-        let issue = self.issue();
-        export(self, issue).inspect_err(|_| self.job.truncate(recorded))
+        let exported = Job::new();
+        let result = export(self, exported.on(self.stream));
+        self.job.append(match result {
+            Ok(_) => exported,
+            Err(_) => exported.orders_only(),
+        });
+        result
     }
 
     /// The batch's product device.

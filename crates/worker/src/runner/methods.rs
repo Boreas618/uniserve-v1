@@ -19,6 +19,7 @@ use crate::storage::memory::StorageView;
 /// One argument of a method call.
 #[derive(Clone)]
 pub(crate) enum Argument {
+    Bool(bool),
     Integer(i64),
     Float(f64),
     Integers(Vec<i64>),
@@ -62,6 +63,14 @@ pub(crate) struct MethodCall {
 }
 
 impl MethodCall {
+    /// A call of `function` with `arguments`, the Python runner first.
+    pub(crate) fn new(function: &Function, arguments: Vec<Argument>) -> Self {
+        Self {
+            function: function.clone(),
+            arguments,
+        }
+    }
+
     /// Make the call.
     pub(crate) fn invoke(self) -> Result<Any> {
         let values = self
@@ -69,6 +78,7 @@ impl MethodCall {
             .into_iter()
             .map(|argument| {
                 Ok(match argument {
+                    Argument::Bool(value) => Any::from(value),
                     Argument::Integer(value) => Any::from(value),
                     Argument::Float(value) => Any::from(value),
                     Argument::Integers(values) => Any::from(Shape::from(values.as_slice())),
