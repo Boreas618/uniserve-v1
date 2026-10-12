@@ -591,18 +591,16 @@ impl Batch<'_> {
     }
 }
 
-/// Write the K/V of latent images inserted as conditioning, through the
-/// image denoiser on its stream, ordered between the text work the batch's
-/// job holds for `stream` before and after it.
-///
-/// This is the image denoiser's forward as it issues itself, so it runs on
-/// the execution thread, as the last operation of one of the batch's jobs.
+/// Record into `job` the write of the K/V of latent images inserted as
+/// conditioning, through the image denoiser on its stream, ordered between
+/// the text work the job holds for `stream` before and after it.
 pub(super) fn condition_latents(
     runtime: &mut CausalLMRunners,
     image: &mut Option<ImageParts<'_>>,
     storage: &mut RankStorage,
     rows: &[ConditionRow],
     stream: Option<&uniserve_cuda::Stream>,
+    job: &Job<'_>,
 ) -> Result<()> {
     let image = image.as_mut().ok_or_else(|| {
         Error::Unsupported("latent conditioning requires the image runtime".into())
@@ -616,22 +614,15 @@ pub(super) fn condition_latents(
         .as_mut()
         .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
     let (tables, cache) = kv.split();
-    runtime.order().wait(denoiser.as_ref())?;
-    // The denoiser records its conditioning; this caller is the last
-    // operation of a job, so it performs the record where it runs.
-    let conditioning = Job::new();
+    runtime.order().wait(job.on(denoiser.as_ref()))?;
     diffusion.condition(
         rows,
         tables,
         |table, prefix, query| {
             cache.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
         },
-        &conditioning,
+        job,
     )?;
-    conditioning
-        .perform()
-        .check()
-        .map_err(|failure| failure.error)?;
-    runtime.order_mut().record(denoiser.as_ref())?;
-    runtime.order().wait(stream)
+    runtime.order_mut().record(job.on(denoiser.as_ref()))?;
+    runtime.order().wait(job.on(stream))
 }

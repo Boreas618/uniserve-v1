@@ -184,8 +184,6 @@ pub struct WorkerBatch {
     /// completion of the imported inputs, or a forward inside a converted
     /// batch, ended.
     issued: Option<Result<()>>,
-    /// How the forward of a capability not yet converted ended.
-    executed: Option<std::result::Result<(), WorkerError>>,
     /// A token batch between its jobs.
     tokens: Option<crate::runner::causal_lm::Pending>,
     /// A diffusion LM batch between its jobs.
@@ -201,6 +199,8 @@ pub struct WorkerBatch {
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
     image_inputs: Option<Inputs>,
+    /// An image batch between two of its jobs.
+    image: Option<forward::batch::image::Pending>,
     /// Products and KV transfers imported from other calls.
     inputs: forward::inputs::Inputs,
     /// A media batch's calls and completion.
@@ -217,7 +217,6 @@ impl WorkerBatch {
             retirement,
             stage: forward::Stage::default(),
             issued: None,
-            executed: None,
             tokens: None,
             denoising: None,
             transfer: None,
@@ -225,6 +224,7 @@ impl WorkerBatch {
             profiling: None,
             running: None,
             image_inputs: None,
+            image: None,
             inputs: forward::inputs::Inputs::default(),
             media: None,
             output: None,
@@ -266,14 +266,6 @@ impl WorkerBatch {
 
     pub(crate) fn set_stage(&mut self, stage: forward::Stage) {
         self.stage = stage;
-    }
-
-    pub(crate) fn set_executed(&mut self, executed: std::result::Result<(), WorkerError>) {
-        self.executed = Some(executed);
-    }
-
-    pub(crate) fn take_executed(&mut self) -> Option<std::result::Result<(), WorkerError>> {
-        self.executed.take()
     }
 
     /// The batch's plan, its token batch between jobs and where a forward
@@ -330,8 +322,16 @@ impl WorkerBatch {
         self.image_inputs = Some(inputs);
     }
 
-    pub(crate) fn take_image_inputs(&mut self) -> Option<Inputs> {
-        self.image_inputs.take()
+    /// The batch's plan, its image batch between jobs and the inline
+    /// images prepared for it, borrowed apart.
+    pub(crate) fn image_parts(
+        &mut self,
+    ) -> (
+        &BatchPlan,
+        &mut Option<forward::batch::image::Pending>,
+        &mut Option<Inputs>,
+    ) {
+        (&self.plan, &mut self.image, &mut self.image_inputs)
     }
 
     /// The batch's plan, the inputs it reads in place and its video batch

@@ -15,12 +15,12 @@
 //! not been integrated reports its call kind as unsupported, which fails
 //! the batch with `UnsupportedSetup` and leaves the rank serving.
 //!
-//! The jobs of a text batch, of a diffusion LM batch, of a transfer batch,
-//! of a video model's media batches (`batch::forward`: its encoders, its
-//! denoiser, its decoders and its host calls) and of the completion of
-//! imported inputs are operations their owners recorded. The forward of
-//! every other capability still issues its own stream work: it is one job
-//! holding that work as [`Job::forward`], until the capability is converted.
+//! The jobs of every batch are operations its owner recorded: a text
+//! batch, a diffusion LM batch, a transfer batch, a video model's media
+//! batches (`batch::forward`: its encoders, its denoiser, its decoders and
+//! its host calls), an image model's batches (`batch::image::forward`: its
+//! encoders, its denoiser and its decoder) and the completion of imported
+//! inputs. No forward issues its own stream work.
 
 pub(crate) mod batch;
 pub(crate) mod inputs;
@@ -150,14 +150,19 @@ pub(crate) fn forward<'a>(
                 let mut parts = backend.media_parts()?;
                 Ok(Some(batch::forward(&mut parts, plan, borrowed, state)?))
             }
-            _ => {
-                let job = Job::new();
-                job.forward(move || {
-                    let executed = execute(backend, batch, kind);
-                    batch.set_executed(executed);
-                });
-                Ok(Some(job))
-            }
+            // A video model's rank records its media calls ([`records`]);
+            // no other rank serves these kinds.
+            CallKind::Media(
+                MediaCall::MediaReading
+                | MediaCall::VideoEncoding
+                | MediaCall::AudioEncoding
+                | MediaCall::Muxing
+                | MediaCall::VideoDecoding
+                | MediaCall::AudioDecoding,
+            ) => Err(unsupported(kind, "video")),
+            // The remaining kinds are an image model's: its encoders, its
+            // denoiser and its decoder.
+            _ => Ok(batch::image::forward(backend, batch, kind)?.map(Job::shorten)),
         },
         Stage::Done => Ok(None),
     }
@@ -199,15 +204,7 @@ pub(crate) fn complete(
             }
             Ok(())
         }
-        _ => {
-            batch.set_stage(Stage::Done);
-            batch.take_executed().unwrap_or_else(|| {
-                Err(WorkerError::classify(
-                    Error::State("the forward did not run"),
-                    None,
-                ))
-            })
-        }
+        _ => batch::image::complete(backend, batch, kind, completion),
     }
 }
 
@@ -250,36 +247,6 @@ fn imported(
         }
     }
     Ok(())
-}
-
-/// Execute a batch's calls on the runtime serving their kind, for the
-/// capabilities whose forward issues its own stream work.
-fn execute(
-    backend: &mut WorkerBackend,
-    batch: &mut WorkerBatch,
-    kind: CallKind,
-) -> std::result::Result<(), WorkerError> {
-    use CallKind::{Forward, Media, Transfer};
-    use MediaCall::*;
-
-    match kind {
-        Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
-            Err(unsupported(kind, "text"))
-        }
-        Forward(ForwardMode::TokenDenoising) => Err(unsupported(kind, "diffusion LM")),
-        Transfer(_) => Err(unsupported(kind, "transfer")),
-        Media(ImageDecoding) => batch::image::execute(backend, batch, kind),
-        // A video model's rank records its media calls ([`records`]); no
-        // other rank serves these kinds.
-        Media(
-            MediaReading | VideoEncoding | AudioEncoding | Muxing | VideoDecoding | AudioDecoding,
-        ) => Err(unsupported(kind, "video")),
-        // Encoders and denoisers serve both image and video models; these
-        // are an image model's.
-        Media(VisionEncoding | TextEncoding | LatentEncoding | LatentPreparation | Denoising) => {
-            batch::image::execute(backend, batch, kind)
-        }
-    }
 }
 
 /// Whether a component's model decodes video.
