@@ -37,7 +37,11 @@ from uniserve_models.model import (
 )
 from uniserve_models.nn.vae import PatchAutoencoder
 from uniserve_models.processing import PatchTransform
-from uniserve_models.runner.context import execution_context, kernel_records
+from uniserve_models.runner.context import (
+    execution_context,
+    held_module,
+    kernel_records,
+)
 
 __all__ = ["EncoderRunner"]
 
@@ -435,6 +439,15 @@ class EncoderRunner:
 
     # Facts of an encoder, answered from the loaded model before a runner
     # of it exists. ``path`` is the encoder's module path in the model.
+
+    @staticmethod
+    def holds(loaded, path: str) -> bool:
+        """Whether this rank holds the encoder at ``path``.
+
+        A pipeline stage that does not run an encoder's call holds no
+        module for it, and constructs no runner of it.
+        """
+        return held_module(loaded.module, str(path)) is not None
 
     @staticmethod
     def kind(loaded, path: str) -> str:

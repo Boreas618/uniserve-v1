@@ -34,12 +34,12 @@ use crate::{Error, Result};
 /// performed by the lane serving that kind. An owner records work on a
 /// stream into the job of the kind whose lane owns the stream.
 pub struct LaneJobs {
-    jobs: HashMap<CallKind, Job<'static>>,
+    jobs: HashMap<CallKind, Job>,
     /// The kind whose job takes work that belongs to no lane's stream (a
     /// wake behind an event): the first the rank serves.
     any: Option<CallKind>,
     /// That job on a rank that serves no call kind and so has no lane.
-    unserved: Job<'static>,
+    unserved: Job,
 }
 
 impl LaneJobs {
@@ -53,7 +53,7 @@ impl LaneJobs {
     }
 
     /// The job of the lane serving `kind`.
-    pub(crate) fn job(&self, kind: CallKind) -> Result<&Job<'static>> {
+    pub(crate) fn job(&self, kind: CallKind) -> Result<&Job> {
         self.jobs.get(&kind).ok_or_else(|| {
             Error::Invariant(format!(
                 "lifecycle work names {}, which this rank does not serve",
@@ -62,8 +62,18 @@ impl LaneJobs {
         })
     }
 
+    /// Record the work no lane's stream carries for the lane serving
+    /// `kind` from now on: the lane of the forward in flight. A wake behind
+    /// an event one of its jobs records is then ordered behind that
+    /// record, since a lane performs its jobs in order.
+    pub(crate) fn follow(&mut self, kind: CallKind) {
+        if self.jobs.contains_key(&kind) {
+            self.any = Some(kind);
+        }
+    }
+
     /// The job for work no lane's stream carries.
-    pub(crate) fn any(&self) -> &Job<'static> {
+    pub(crate) fn any(&self) -> &Job {
         self.any
             .and_then(|kind| self.jobs.get(&kind))
             .unwrap_or(&self.unserved)
@@ -72,7 +82,7 @@ impl LaneJobs {
     /// The jobs that hold work, leaving every job empty for the next
     /// command: each with the kind whose lane performs it, or `None` for
     /// the job of a rank without a lane, which its submitter performs.
-    pub(crate) fn take(&mut self) -> Vec<(Option<CallKind>, Job<'static>)> {
+    pub(crate) fn take(&mut self) -> Vec<(Option<CallKind>, Job)> {
         let mut taken: Vec<_> = self
             .jobs
             .iter_mut()

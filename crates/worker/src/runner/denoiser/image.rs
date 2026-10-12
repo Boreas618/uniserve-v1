@@ -47,10 +47,10 @@ use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::batch::image::{ImageBatch, boundary};
+use crate::executor::forward::batch::image::{ImageBatch, Progress, Resume};
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, integer_list};
-use crate::lane::Job;
+use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
@@ -58,7 +58,7 @@ use crate::request::diffusion::{BranchSet, GuidancePlan};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
-use crate::runner::causal_lm::CausalLMRunners;
+use crate::runner::causal_lm::{CausalLMRunners, Step};
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
 use crate::storage::LatentUpdate;
@@ -435,7 +435,7 @@ impl ImageDiffusion {
         width: u32,
         seed: u64,
         index: u32,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let runner = Argument::Handle(self.methods.runner.clone());
         let noise = Argument::Tensor(self.noise.clone());
@@ -542,7 +542,7 @@ impl ImageDiffusion {
         rows: &[DenoiseRow],
         tables: &BlockTables,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<Predicted> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
@@ -609,7 +609,7 @@ impl ImageDiffusion {
         rows: &[ConditionRow],
         tables: &BlockTables,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<()> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
@@ -660,7 +660,7 @@ impl ImageDiffusion {
 
     /// Combine each image's branch predictions and advance its samples by
     /// one solver step, on the sample stream.
-    pub(crate) fn integrate(&self, rows: &[IntegrateRow], job: &Job<'_>) {
+    pub(crate) fn integrate(&self, rows: &[IntegrateRow], job: &Job) {
         if rows.is_empty() {
             return;
         }
@@ -833,6 +833,42 @@ pub(crate) fn image_placement(
 /// first row.
 type SizeGroup = ((u32, u32), Vec<DenoiseRow>, Vec<(usize, usize)>);
 
+/// The stepping trajectories of one solver step: each one's position among
+/// the batch's trajectories, its step, its guidance branches and its
+/// timestep.
+type Stepping = Vec<(usize, u32, BranchSet, f32)>;
+
+/// The guidance prefixes a step misses: the position of the trajectory, the
+/// slot the prefix is written to and its tokens.
+type Fills = Vec<(usize, u32, Arc<[u32]>)>;
+
+/// What a denoising keeps between its solver steps.
+pub(crate) struct Denoising {
+    /// Each active call's trajectory and admitted image, with its placed
+    /// samples in `scratch`.
+    trajectories: Vec<(Trajectory, ImageParams)>,
+    scratch: Vec<Scratch>,
+    /// The forward rows of each call, by call index.
+    descriptors: HashMap<usize, Vec<ForwardSlot>>,
+    layout: ImageDenoiserLayout,
+    component: String,
+    stats: ForwardStats,
+    /// Solver steps of the longest interval, and the next one to record.
+    intervals: u32,
+    offset: u32,
+}
+
+/// A denoising between two of its jobs: the job on the lane ends with the
+/// text runner's evaluation of the guidance prefixes step `state.offset`
+/// misses.
+pub(crate) struct DenoiseResume {
+    state: Denoising,
+    stepping: Stepping,
+    fills: Fills,
+    /// The evaluation, completed from the job's completion.
+    step: Step,
+}
+
 /// One active trajectory call of a batch.
 struct Trajectory {
     index: usize,
@@ -964,7 +1000,7 @@ impl ImageBatch<'_> {
         stats
     }
 
-    fn record_latents(&mut self, job: &Job<'_>) -> Result<ForwardStats> {
+    fn record_latents(&mut self, job: &Job) -> Result<ForwardStats> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
         let mut trajectories = Vec::new();
@@ -1162,28 +1198,58 @@ impl ImageBatch<'_> {
         &mut self,
         text: Option<&mut CausalLMRunners>,
         experts: Option<&Arc<ExpertUnion>>,
-    ) -> Result<ForwardStats> {
+    ) -> Result<Progress> {
         // The forward records into the batch's job, taken for its length so
         // that the batch's owners stay borrowable beside it.
-        let mut job = std::mem::take(&mut self.job);
-        let stats = self.record_denoise(&mut job, text, experts);
+        let job = std::mem::take(&mut self.job);
+        let progress = self.begin_denoise(&job, text, experts);
         self.job = job;
-        stats
+        progress
     }
 
-    /// Record the denoising. It is one job unless a step misses guidance
-    /// prefixes: the job then ends with the text runner's evaluation of
-    /// them, which is completed before the step is recorded.
-    fn record_denoise(
+    /// Continue the denoising from the `completion` of the job that ended
+    /// with an evaluation of guidance prefixes.
+    pub(crate) fn resume_denoise(
         &mut self,
-        job: &mut Job<'static>,
-        mut text: Option<&mut CausalLMRunners>,
+        resume: DenoiseResume,
+        completion: &mut Completion,
+        text: Option<&mut CausalLMRunners>,
         experts: Option<&Arc<ExpertUnion>>,
-    ) -> Result<ForwardStats> {
+    ) -> Result<Progress> {
+        let job = std::mem::take(&mut self.job);
+        let DenoiseResume {
+            state,
+            stepping,
+            fills,
+            step,
+        } = resume;
+        let progress = self.denoise_steps(
+            &job,
+            state,
+            Some((stepping, fills, step, completion)),
+            text,
+            experts,
+        );
+        self.job = job;
+        progress
+    }
+
+    /// Record what precedes the solver steps: the wait on the text
+    /// runners' order, the reservation of the rows' slots, the resumption
+    /// of each trajectory and the gather of its committed version. The
+    /// denoising is one job unless a step misses guidance prefixes: the job
+    /// then ends with the text runner's evaluation of them, which is
+    /// completed before the step is recorded.
+    fn begin_denoise(
+        &mut self,
+        job: &Job,
+        text: Option<&mut CausalLMRunners>,
+        experts: Option<&Arc<ExpertUnion>>,
+    ) -> Result<Progress> {
         let plan = self.plan;
         let active = self.active();
         if active.is_empty() {
-            return Ok(ForwardStats::default());
+            return Ok(Progress::done(ForwardStats::default()));
         }
         let stream = self.stream.clone();
         if let Some(text) = text.as_deref() {
@@ -1286,16 +1352,75 @@ impl ImageBatch<'_> {
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?
             .layout();
         let component = plan.calls[active[0]].component.clone();
-        let mut stats = ForwardStats::default();
         let intervals = trajectories
             .iter()
             .map(|(trajectory, _)| trajectory.params.step_count)
             .max()
             .unwrap_or(0);
-        for offset in 0..intervals {
+        self.denoise_steps(
+            job,
+            Denoising {
+                trajectories,
+                scratch,
+                descriptors,
+                layout,
+                component,
+                stats: ForwardStats::default(),
+                intervals,
+                offset: 0,
+            },
+            None,
+            text,
+            experts,
+        )
+    }
+
+    /// Record the solver steps from `state.offset` on, then the release of
+    /// finished trajectories' guidance prefixes and the record on the text
+    /// runners' order. `resumed` is the step whose guidance prefixes the
+    /// last job evaluated, with that job's completion.
+    fn denoise_steps(
+        &mut self,
+        job: &Job,
+        state: Denoising,
+        mut resumed: Option<(Stepping, Fills, Step, &mut Completion)>,
+        mut text: Option<&mut CausalLMRunners>,
+        experts: Option<&Arc<ExpertUnion>>,
+    ) -> Result<Progress> {
+        let plan = self.plan;
+        let stream = self.stream.clone();
+        let Denoising {
+            trajectories,
+            scratch,
+            descriptors,
+            layout,
+            component,
+            mut stats,
+            intervals,
+            offset: first,
+        } = state;
+        for offset in first..intervals {
+            if let Some((stepping, fills, step, completion)) = resumed.take() {
+                // The last job evaluated this step's guidance prefixes.
+                let text = text.as_deref_mut().ok_or_else(|| {
+                    Error::Unsupported("guidance prefixes require the text image".into())
+                })?;
+                text.complete_prefill(step, completion)?;
+                text.order().wait(job.on(stream.as_ref()))?;
+                for (position, slot, tokens) in &fills {
+                    let (trajectory, _) = &trajectories[*position];
+                    let key = plan.calls[trajectory.index].request_key;
+                    if let Some(open) = self.parts.trajectories.get(trajectory.slot, key) {
+                        open.prefilled(*slot, tokens.len() as u64);
+                    }
+                }
+                self.denoise_step(job, &trajectories, &scratch, &stepping, &mut stats, offset)?;
+                continue;
+            }
+
             // Timesteps and guidance branches of this step.
-            let mut stepping = Vec::new();
-            let mut fills: Vec<(usize, u32, std::sync::Arc<[u32]>)> = Vec::new();
+            let mut stepping: Stepping = Vec::new();
+            let mut fills: Fills = Vec::new();
             for (position, ((trajectory, image), _)) in
                 trajectories.iter().zip(&scratch).enumerate()
             {
@@ -1368,130 +1493,29 @@ impl ImageBatch<'_> {
                 // The text runner's evaluation of the prefixes is recorded
                 // into this forward's job, behind the block table installs
                 // it reads; the job ends with it, because the evaluation
-                // is completed from the job that performed it.
+                // is completed from the job that performed it, and the
+                // step follows in the next job.
                 let step =
                     text.prefill_cache(experts, &component, &prefixes, tables, manager, job)?;
-                let mut completion = boundary(job)?;
-                text.complete_prefill(step, &mut completion)?;
-                text.order().wait(job.on(stream.as_ref()))?;
-                for (position, slot, tokens) in &fills {
-                    let (trajectory, _) = &trajectories[*position];
-                    let key = plan.calls[trajectory.index].request_key;
-                    if let Some(open) = self.parts.trajectories.get(trajectory.slot, key) {
-                        open.prefilled(*slot, tokens.len() as u64);
-                    }
-                }
-            }
-
-            // One denoising row per branch of every stepping image; images
-            // of one size share a numerical call.
-            let mut groups: Vec<SizeGroup> = Vec::new();
-            for &(position, _, set, time) in &stepping {
-                let (trajectory, _) = &trajectories[position];
-                let key = plan.calls[trajectory.index].request_key;
-                let logical = self.calls[trajectory.index]
-                    .output
-                    .progress
-                    .logical_position;
-                let open = self
-                    .parts
-                    .trajectories
-                    .get(trajectory.slot, key)
-                    .ok_or_else(|| Error::Invariant("an image trajectory closed".into()))?;
-                let rows = open.branch_rows(set, logical)?;
-                let size = (trajectory.params.height, trajectory.params.width);
-                let group = match groups.iter().position(|(value, ..)| *value == size) {
-                    Some(group) => group,
-                    None => {
-                        groups.push((size, Vec::new(), Vec::new()));
-                        groups.len() - 1
-                    }
-                };
-                let (_, values, owners) = &mut groups[group];
-                owners.push((position, values.len()));
-                for (_, coordinates, temporal) in rows {
-                    values.push(DenoiseRow {
-                        sample: scratch[position].sample,
-                        units: scratch[position].units,
-                        height: size.0,
-                        width: size.1,
-                        slot: coordinates.slot,
-                        prefix: u32::try_from(coordinates.visible).map_err(|_| {
-                            Error::Invalid("guidance prefix exceeds the token range".into())
-                        })?,
-                        temporal,
-                        timestep: time,
-                    });
-                }
-            }
-            for (_, rows, owners) in &groups {
-                let kv = self.storage.kv.as_ref().ok_or_else(|| {
-                    Error::Unsupported("image trajectories require a KV cache".into())
-                })?;
-                let diffusion = self.parts.diffusion_mut().ok_or_else(|| {
-                    Error::Unsupported("image trajectories require a denoiser".into())
-                })?;
-                let predicted = diffusion.predict(rows, kv.tables(), |_, _, _| Ok(()), job)?;
-                let mode = predicted.mode.as_str();
-                *stats.mode_counts.entry(mode.into()).or_default() += 1;
-                if predicted.mode == GraphMode::Replay {
-                    stats.cuda_graph_replays += 1;
-                }
-                let mut updates = Vec::with_capacity(owners.len());
-                for &(position, first) in owners {
-                    let (trajectory, _) = &trajectories[position];
-                    let &(_, step, set, _) = stepping
-                        .iter()
-                        .find(|(value, ..)| *value == position)
-                        .ok_or_else(|| Error::Invariant("a stepping image lost its step".into()))?;
-                    let key = plan.calls[trajectory.index].request_key;
-                    let open = self
-                        .parts
-                        .trajectories
-                        .get(trajectory.slot, key)
-                        .ok_or_else(|| Error::Invariant("an image trajectory closed".into()))?;
-                    updates.push(IntegrateRow {
-                        sample: scratch[position].sample,
-                        units: scratch[position].units,
-                        slot: trajectory.slot as u32,
+                return Ok(Progress::Boundary(Resume::Denoise(Box::new(
+                    DenoiseResume {
+                        state: Denoising {
+                            trajectories,
+                            scratch,
+                            descriptors,
+                            layout,
+                            component,
+                            stats,
+                            intervals,
+                            offset,
+                        },
+                        stepping,
+                        fills,
                         step,
-                        prediction: predicted.offsets[first],
-                        branches: set,
-                        plan: open.plan.handle.clone(),
-                    });
-                }
-                self.parts
-                    .diffusion()
-                    .ok_or_else(|| {
-                        Error::Unsupported("image trajectories require a denoiser".into())
-                    })?
-                    .integrate(&updates, job);
+                    },
+                ))));
             }
-
-            // Intervals ending at this step publish their successor into
-            // the other bank.
-            for ((trajectory, _), scratch) in trajectories.iter().zip(&scratch) {
-                if offset + 1 != trajectory.params.step_count {
-                    continue;
-                }
-                let latents = self.parts.latents()?;
-                let bank = latents.pool.next_bank(trajectory.slot);
-                latents.pool.require_writable(bank, &scratch.pages)?;
-                latents.scatter(bank, scratch, job.on(stream.as_ref()))?;
-                let params = &trajectory.params;
-                self.publish_latent(
-                    trajectory.index,
-                    bank,
-                    params.start_step + params.step_count,
-                    params,
-                    job.on(stream.as_ref()),
-                )?;
-                let call = &plan.calls[trajectory.index];
-                self.updates.push((
-                    trajectory.index,
-                    LatentUpdate::for_call(trajectory.slot, call, &trajectory.params)?,
-                ));
-            }
+            self.denoise_step(job, &trajectories, &scratch, &stepping, &mut stats, offset)?;
         }
 
         // A finished trajectory's guidance prefixes retire with it.
@@ -1524,6 +1548,132 @@ impl ImageBatch<'_> {
         if let Some(text) = text {
             text.order_mut().record(job.on(stream.as_ref()))?;
         }
-        Ok(stats)
+        Ok(Progress::done(stats))
+    }
+
+    /// Record one solver step of the stepping trajectories: the rows of
+    /// their guidance branches, grouped by image size, each group's
+    /// prediction and integration, and for an interval that ends at this
+    /// step the scatter of its successor into the other bank with its
+    /// export.
+    fn denoise_step(
+        &mut self,
+        job: &Job,
+        trajectories: &[(Trajectory, ImageParams)],
+        scratch: &[Scratch],
+        stepping: &Stepping,
+        stats: &mut ForwardStats,
+        offset: u32,
+    ) -> Result<()> {
+        let plan = self.plan;
+        let stream = self.stream.clone();
+        // One denoising row per branch of every stepping image; images
+        // of one size share a numerical call.
+        let mut groups: Vec<SizeGroup> = Vec::new();
+        for &(position, _, set, time) in stepping {
+            let (trajectory, _) = &trajectories[position];
+            let key = plan.calls[trajectory.index].request_key;
+            let logical = self.calls[trajectory.index]
+                .output
+                .progress
+                .logical_position;
+            let open = self
+                .parts
+                .trajectories
+                .get(trajectory.slot, key)
+                .ok_or_else(|| Error::Invariant("an image trajectory closed".into()))?;
+            let rows = open.branch_rows(set, logical)?;
+            let size = (trajectory.params.height, trajectory.params.width);
+            let group = match groups.iter().position(|(value, ..)| *value == size) {
+                Some(group) => group,
+                None => {
+                    groups.push((size, Vec::new(), Vec::new()));
+                    groups.len() - 1
+                }
+            };
+            let (_, values, owners) = &mut groups[group];
+            owners.push((position, values.len()));
+            for (_, coordinates, temporal) in rows {
+                values.push(DenoiseRow {
+                    sample: scratch[position].sample,
+                    units: scratch[position].units,
+                    height: size.0,
+                    width: size.1,
+                    slot: coordinates.slot,
+                    prefix: u32::try_from(coordinates.visible).map_err(|_| {
+                        Error::Invalid("guidance prefix exceeds the token range".into())
+                    })?,
+                    temporal,
+                    timestep: time,
+                });
+            }
+        }
+        for (_, rows, owners) in &groups {
+            let kv = self.storage.kv.as_ref().ok_or_else(|| {
+                Error::Unsupported("image trajectories require a KV cache".into())
+            })?;
+            let diffusion = self.parts.diffusion_mut().ok_or_else(|| {
+                Error::Unsupported("image trajectories require a denoiser".into())
+            })?;
+            let predicted = diffusion.predict(rows, kv.tables(), |_, _, _| Ok(()), job)?;
+            let mode = predicted.mode.as_str();
+            *stats.mode_counts.entry(mode.into()).or_default() += 1;
+            if predicted.mode == GraphMode::Replay {
+                stats.cuda_graph_replays += 1;
+            }
+            let mut updates = Vec::with_capacity(owners.len());
+            for &(position, first) in owners {
+                let (trajectory, _) = &trajectories[position];
+                let &(_, step, set, _) = stepping
+                    .iter()
+                    .find(|(value, ..)| *value == position)
+                    .ok_or_else(|| Error::Invariant("a stepping image lost its step".into()))?;
+                let key = plan.calls[trajectory.index].request_key;
+                let open = self
+                    .parts
+                    .trajectories
+                    .get(trajectory.slot, key)
+                    .ok_or_else(|| Error::Invariant("an image trajectory closed".into()))?;
+                updates.push(IntegrateRow {
+                    sample: scratch[position].sample,
+                    units: scratch[position].units,
+                    slot: trajectory.slot as u32,
+                    step,
+                    prediction: predicted.offsets[first],
+                    branches: set,
+                    plan: open.plan.handle.clone(),
+                });
+            }
+            self.parts
+                .diffusion()
+                .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?
+                .integrate(&updates, job);
+        }
+
+        // Intervals ending at this step publish their successor into
+        // the other bank.
+        for ((trajectory, _), scratch) in trajectories.iter().zip(scratch) {
+            if offset + 1 != trajectory.params.step_count {
+                continue;
+            }
+            let latents = self.parts.latents()?;
+            let bank = latents.pool.next_bank(trajectory.slot);
+            latents.pool.require_writable(bank, &scratch.pages)?;
+            latents.scatter(bank, scratch, job.on(stream.as_ref()))?;
+            let params = &trajectory.params;
+            self.publish_latent(
+                trajectory.index,
+                bank,
+                params.start_step + params.step_count,
+                params,
+                job.on(stream.as_ref()),
+            )?;
+            let call = &plan.calls[trajectory.index];
+            self.updates.push((
+                trajectory.index,
+                LatentUpdate::for_call(trajectory.slot, call, &trajectory.params)?,
+            ));
+        }
+        Ok(())
     }
 }

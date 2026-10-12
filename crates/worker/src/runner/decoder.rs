@@ -204,7 +204,7 @@ impl DecoderRunner {
         &self,
         images: &[DecodeImage],
         stage: impl FnMut(usize, StorageView) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
         self.image_decoder()?
@@ -219,7 +219,7 @@ impl DecoderRunner {
         image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
         self.image_decoder()?
@@ -263,7 +263,7 @@ impl DecoderRunner {
         longest: u32,
         written: u32,
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         self.video_decoder()?.decode(
             slot, latent, frames, unit, shape, longest, written, out, job,
@@ -294,7 +294,7 @@ impl DecoderRunner {
         latent: &StorageView,
         units: TrackUnits,
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         self.audio_decoder()?.decode(latent, units, out, job)
     }
@@ -496,7 +496,7 @@ impl ImageDecoder {
         &self,
         images: &[DecodeImage],
         mut stage: impl FnMut(usize, StorageView) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
         for chunk in self.chunks(images)? {
@@ -522,7 +522,7 @@ impl ImageDecoder {
         image: &StorageView,
         range: (f32, f32),
         stage: impl FnOnce(StorageView) -> Result<()>,
-        job: &Job<'_>,
+        job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
         // The quantized pixels are one byte per element of the image.
@@ -628,7 +628,7 @@ impl ImageBatch<'_> {
         stats
     }
 
-    fn record_decode(&mut self, job: &Job<'_>) -> Result<ForwardStats> {
+    fn record_decode(&mut self, job: &Job) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();
         if active.is_empty() {
@@ -1164,7 +1164,7 @@ impl VideoDecoder {
         longest: u32,
         written: u32,
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         let canvas = shape.segment.1;
         let stream = self.stream.clone();
@@ -1384,7 +1384,7 @@ impl AudioDecoder {
         latent: &StorageView,
         units: TrackUnits,
         out: &StorageView,
-        job: &Job<'_>,
+        job: &Job,
     ) -> Result<GraphMode> {
         let stream = self.stream.clone();
         let issue = job.on(Some(&stream));
@@ -1456,7 +1456,7 @@ pub(crate) fn decode_video(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let range = decode_range(plan, call)?;
@@ -1584,7 +1584,7 @@ pub(crate) fn decode_audio(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
-    job: &Job<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let range = decode_range(plan, call)?;

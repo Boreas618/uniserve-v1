@@ -623,11 +623,12 @@ impl WarmupHooks for ExpertWarmup {
         // lane's stream.
         let job = Job::new();
         job.expert_warmup(experts);
-        let (_, completion) = backend
+        let completion = backend
             .job_queues()
-            .submit(
+            .block_on(
                 uniserve_ipc::CallKind::Forward(uniserve_ipc::ForwardMode::Decode),
                 job,
+                crate::lane::BLOCK_ON_TIMEOUT,
             )
             .map_err(failed("expert warmup"))?;
         completion
