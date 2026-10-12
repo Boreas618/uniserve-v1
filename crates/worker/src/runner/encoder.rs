@@ -75,7 +75,7 @@ use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
 use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::batch::image::{ImageBatch, allocations, boundary};
+use crate::executor::forward::batch::image::{ImageBatch, allocations, submit};
 use crate::executor::forward::batch::{
     Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
 };
@@ -2234,7 +2234,7 @@ impl ImageBatch<'_> {
             // The prepared images come back with the job that prepared
             // them; their facts with the job that reads them.
             let runner = &self.parts.encoders.image[route];
-            let mut completion = boundary(job)?;
+            let mut completion = submit(&self.lanes, self.kind, job)?;
             let handles = resident
                 .iter()
                 .map(|_| completion.handle())
@@ -2242,7 +2242,7 @@ impl ImageBatch<'_> {
             for handle in &handles {
                 runner.image_facts(handle, job);
             }
-            let mut completion = boundary(job)?;
+            let mut completion = submit(&self.lanes, self.kind, job)?;
             for (&position, handle) in resident.iter().zip(handles) {
                 images[position] = Some(runner.prepared(handle, &completion.returned()?)?);
             }
@@ -2273,7 +2273,7 @@ impl ImageBatch<'_> {
         // An unpacked encoder's calls return the shapes they wrote, which
         // the features are fenced and exported with: the next job's work.
         let encoded = if recorded.returns() {
-            recorded.finish(&mut boundary(job)?)?
+            recorded.finish(&mut submit(&self.lanes, self.kind, job)?)?
         } else {
             recorded.finish(&mut Completion::default())?
         };

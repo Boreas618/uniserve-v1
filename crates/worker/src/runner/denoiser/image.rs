@@ -47,7 +47,7 @@ use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::batch::image::{ImageBatch, boundary};
+use crate::executor::forward::batch::image::{ImageBatch, submit};
 use crate::executor::forward::transfer::latents;
 use crate::ffi::{DType, Function, Handle, integer_list};
 use crate::lane::Job;
@@ -1366,7 +1366,7 @@ impl ImageBatch<'_> {
                 // is completed from the job that performed it.
                 let step =
                     text.prefill_cache(experts, &component, &prefixes, tables, manager, job)?;
-                let mut completion = boundary(job)?;
+                let mut completion = submit(&self.lanes, self.kind, job)?;
                 text.complete_prefill(step, &mut completion)?;
                 text.order().wait(job.on(stream.as_ref()))?;
                 for (position, slot, tokens) in &fills {
