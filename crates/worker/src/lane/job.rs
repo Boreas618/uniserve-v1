@@ -91,6 +91,13 @@ enum Operation<'a> {
         bytes: usize,
     },
     ExpertStep(ExpertStep),
+    /// The union's next step for a rank with no forward of its own: one
+    /// round of the agreement and, when a step was agreed, its join.
+    ExpertJoin {
+        union: Arc<ExpertUnion>,
+        /// The rank is shutting down and leaves the union.
+        leaving: bool,
+    },
 }
 
 /// Work the execution thread hands to the Python thread and waits for, or
@@ -180,6 +187,9 @@ pub(crate) struct Completion {
     reads: VecDeque<Vec<u8>>,
     /// The capacity each expert step was agreed at.
     capacities: VecDeque<usize>,
+    /// For each expert join: whether a step ran, and whether every rank
+    /// has left the union.
+    joins: VecDeque<(bool, bool)>,
     /// Where the job stopped, when it did not run to its end.
     failure: Option<Failure>,
 }
@@ -206,6 +216,12 @@ impl Completion {
     /// The capacity the next expert step was agreed at.
     pub(crate) fn capacity(&mut self) -> Result<usize> {
         self.capacities.pop_front().ok_or(MISSING)
+    }
+
+    /// The next expert join: whether a step ran, and whether every rank
+    /// has left the union.
+    pub(crate) fn joined(&mut self) -> Result<(bool, bool)> {
+        self.joins.pop_front().ok_or(MISSING)
     }
 }
 
@@ -262,6 +278,13 @@ impl<'a> Job<'a> {
 
     pub(crate) fn expert_step(&self, step: ExpertStep) {
         self.push(Operation::ExpertStep(step));
+    }
+
+    /// The union's next step for a rank with no forward of its own. The
+    /// job's completion says whether a step ran and whether every rank has
+    /// left the union.
+    pub(crate) fn expert_join(&self, union: Arc<ExpertUnion>, leaving: bool) {
+        self.push(Operation::ExpertJoin { union, leaving });
     }
 
     /// Continue this job with the operations of `other`.
@@ -373,6 +396,10 @@ impl Operation<'_> {
                 Ok(())
             }
             Self::ExpertStep(step) => step.perform(completion),
+            Self::ExpertJoin { union, leaving } => {
+                completion.joins.push_back(union.idle(leaving)?);
+                Ok(())
+            }
         }
     }
 }

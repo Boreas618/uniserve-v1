@@ -14,7 +14,7 @@ mod weight_prefetch;
 pub mod world;
 
 pub use collectives::{CollectiveGroup, PeerGroup, StreamCollectives, StreamCommunicator};
-pub(crate) use expert_union::{ExpertStart, ExpertUnion, ExpertWarmup, join_step};
+pub(crate) use expert_union::{ExpertStart, ExpertUnion, ExpertWarmup};
 pub use experts::{Agreement, ExpertExchange, ExpertParallel, ExpertPlan, ExpertTransport};
 pub(crate) use microbatches::MicrobatchForward;
 pub use microbatches::{MicrobatchCall, MicrobatchLanes, Microbatches, yield_microbatch};
