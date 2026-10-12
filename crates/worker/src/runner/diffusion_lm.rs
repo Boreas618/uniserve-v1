@@ -403,20 +403,20 @@ impl DiffusionLMRunner {
         // The capacities the step can run at: the one a warmup step
         // announces, or every capacity an agreement can choose for a rank
         // that sends `extent` tokens.
-        let capacities = if union.warming() {
-            vec![match expert.forced {
-                Some(capacity) => capacity,
-                None => union.parallel().capacity_for(extent)?,
-            }]
+        let holding = union.parallel().capacities_for(extent);
+        let capacities: Vec<usize> = if union.warming() {
+            match expert.forced {
+                Some(capacity) => vec![capacity],
+                None => holding.take(1).collect(),
+            }
         } else {
-            union
-                .parallel()
-                .capacities()
-                .iter()
-                .copied()
-                .filter(|&capacity| capacity >= extent)
-                .collect()
+            holding.collect()
         };
+        if capacities.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{extent} tokens exceed the expert exchange's tokens per rank"
+            )));
+        }
         let mut variants = Vec::with_capacity(capacities.len());
         let mut modes = Vec::with_capacity(capacities.len());
         for capacity in capacities {
