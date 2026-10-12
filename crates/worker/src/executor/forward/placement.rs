@@ -23,6 +23,7 @@ use uniserve_ipc::{
 use super::launch::read_flag;
 use crate::ffi::Device;
 use crate::storage::OutputPlacement;
+use crate::stream::Issue;
 use crate::transfer::Transports;
 use crate::transfer::exports::Location;
 use crate::{Error, EventPool, ProductBuffer, ProductRead, Result, TensorStore};
@@ -61,14 +62,15 @@ impl Reads {
         self.borrowed.contains(&product.buffer_id())
     }
 
-    /// Lease one input for `consumer`, whole; `stream` waits on its writer.
+    /// Lease one input for `consumer`, whole; what `stream` issues next
+    /// waits on its writer.
     pub(crate) fn read(
         &mut self,
         store: &TensorStore,
         product: &TensorRef,
         consumer: CallId,
         device: Device,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<ProductRead>> {
         let read = store.consume(product, consumer, Some(device), stream)?;
         self.leases.push(Arc::clone(&read));
@@ -80,8 +82,8 @@ impl Reads {
         Ok(read)
     }
 
-    /// End every lease after the batch's readers were enqueued on `stream`.
-    pub(crate) fn complete(&mut self, store: &TensorStore, stream: Option<&Stream>) -> Result<()> {
+    /// End every lease behind the batch's readers, which `stream` issued.
+    pub(crate) fn complete(&mut self, store: &TensorStore, stream: impl Issue) -> Result<()> {
         let reads = std::mem::take(&mut self.leases);
         if reads.is_empty() {
             return Ok(());
