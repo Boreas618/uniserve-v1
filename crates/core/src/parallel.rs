@@ -266,9 +266,8 @@ impl ComponentConfig {
     /// and sequence-parallel ranks each publish their own shard. A tensor
     /// replica publishes once, from tensor-parallel coordinate zero, and only
     /// the final pipeline stage publishes, so a component with either degree
-    /// above one leaves some member ranks without a copy. The worker's
-    /// `ComponentBinding.output_ranks` selects the publishing ranks by the
-    /// same rule.
+    /// above one leaves some member ranks without a copy.
+    /// [`Self::output_ranks`] selects the publishing ranks by the same rule.
     pub fn publishes_on_every_rank(&self) -> bool {
         self.distribution.is_some()
             || (self.parallel_config.tensor_parallel_size == 1

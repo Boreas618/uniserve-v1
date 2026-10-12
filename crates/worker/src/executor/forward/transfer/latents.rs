@@ -45,38 +45,6 @@ fn shape(storage: &LatentStorage, params: &LatentParams) -> [u64; 2] {
     [u64::from(params.latent_units), u64::from(storage.width())]
 }
 
-/// Export the version of `slot`'s trajectory in `bank` (at solver `step`,
-/// with `params`' pages and image size) as `call`'s output `product`, on
-/// `stream`, which produced or last wrote it. The export is registered with
-/// the pool at once, its locations join `publications` and its descriptor
-/// the call's completion products. Returns the export's buffer, which the
-/// batch releases from the pool if it fails before committing.
-///
-/// The export is issued on `stream` and located at once.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one latent export's complete inputs"
-)]
-pub(crate) fn export(
-    pool: &mut Pool,
-    storage: &LatentStorage,
-    transports: &Transports,
-    call: &Call,
-    product: &TensorRef,
-    slot: usize,
-    params: &LatentParams,
-    bank: u8,
-    step: u32,
-    stream: Option<&Stream>,
-    publications: &mut Publications,
-    output: &mut PendingOutput,
-) -> Result<BufferId> {
-    let export = issue_export(
-        pool, storage, transports, call, product, slot, params, bank, step, stream,
-    )?;
-    locate_export(pool, export, publications, output)
-}
-
 /// A latent version's export while the work it issued is outstanding.
 pub(crate) struct PendingExport {
     source: Arc<LatentExport<Arc<Retirement>>>,
@@ -98,9 +66,12 @@ impl PendingExport {
     }
 }
 
-/// Issue the export of the version of `slot`'s trajectory in `bank` to
-/// `stream`, behind the work that wrote it. [`locate_export`] publishes it
-/// once that work was performed.
+/// Issue the export of the version of `slot`'s trajectory in `bank` (at
+/// solver `step`, with `params`' pages and image size) as `call`'s output
+/// `product` to `stream`, behind the work that wrote it. The export is
+/// registered with the pool at once, and its batch releases it from the
+/// pool if it fails before committing. [`locate_export`] publishes it once
+/// the issued work was performed.
 #[expect(
     clippy::too_many_arguments,
     reason = "one latent export's complete inputs"
@@ -325,7 +296,7 @@ pub(crate) fn import(
 
 /// Make an imported version the consuming slot's committed trajectory:
 /// order `stream` after every read's copy, then adopt it.
-pub(crate) fn adopt(pool: &mut Pool, input: &LatentInput, stream: Option<&Stream>) -> Result<()> {
+pub(crate) fn adopt(pool: &mut Pool, input: &LatentInput, stream: impl Issue) -> Result<()> {
     let generation = i64::from(input.write.buffer.generation);
     let (step, height, width) = (
         i64::from(input.step),
@@ -501,7 +472,8 @@ mod tests {
         call.latent_input = Some(latent(1));
         call.latent_output = Some(latent(2));
         let mut output = PendingOutput::new(&call, RequestProgress::default(), 0)?;
-        export(
+        // Issued on host storage at once, so the export is located here.
+        let export = issue_export(
             pool,
             storage,
             transports,
@@ -511,10 +483,9 @@ mod tests {
             &params(pages, 0),
             bank,
             0,
-            None,
-            publications,
-            &mut output,
+            None::<&Stream>,
         )?;
+        locate_export(pool, export, publications, &mut output)?;
         output
             .products()
             .first()
