@@ -1167,7 +1167,8 @@ impl ImageBatch<'_> {
     }
 
     /// Record the denoising. It is one job unless a step misses guidance
-    /// prefixes: the text runner evaluates those between two of its jobs.
+    /// prefixes: the job then ends with the text runner's evaluation of
+    /// them, which is completed before the step is recorded.
     fn record_denoise(
         &mut self,
         job: &mut Job<'static>,
@@ -1359,11 +1360,14 @@ impl ImageBatch<'_> {
                     .iter()
                     .map(|(_, slot, tokens)| (*slot, &tokens[..]))
                     .collect();
-                // FIXME: the text runner evaluates the prefixes as a job it
-                // performs where it is called, so this forward's job ends
-                // before them: they read the block tables it installed.
-                boundary(job)?;
-                text.prefill_cache(experts, &component, &prefixes, tables, manager)?;
+                // The text runner's evaluation of the prefixes is recorded
+                // into this forward's job, behind the block table installs
+                // it reads; the job ends with it, because the evaluation
+                // is completed from the job that performed it.
+                let step =
+                    text.prefill_cache(experts, &component, &prefixes, tables, manager, job)?;
+                let mut completion = boundary(job)?;
+                text.complete_prefill(step, &mut completion)?;
                 text.order().wait(job.on(stream.as_ref()))?;
                 for (position, slot, tokens) in &fills {
                     let (trajectory, _) = &trajectories[*position];
