@@ -936,10 +936,8 @@ impl DiffusionLMRunner {
     /// Submit `job`, which recorded `recorded`, to the runner's lane and
     /// apply its completion.
     fn perform(&mut self, lanes: &JobQueues, job: Job<'_>, recorded: Recorded) -> Result<()> {
-        let mut completion = lanes
-            .submit(KIND, job)?
-            .check()
-            .map_err(|failure| failure.error)?;
+        let (_, completion) = lanes.submit(KIND, job)?;
+        let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.complete(recorded, &mut completion).map(drop)
     }
 
@@ -1078,10 +1076,8 @@ impl DiffusionLMRunner {
             plan: None,
         };
         let mode = self.method(&reading, None, arguments, &job, &job)?;
-        let mut completion = lanes
-            .submit(KIND, job)?
-            .check()
-            .map_err(|failure| failure.error)?;
+        let (_, completion) = lanes.submit(KIND, job)?;
+        let mut completion = completion.check().map_err(|failure| failure.error)?;
         if mode == GraphMode::Capture {
             let graph = completion.captured()?;
             self.segments = self.segments.max(graph.segments());
