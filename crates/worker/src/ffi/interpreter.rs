@@ -5,13 +5,17 @@
 //! library's `main` on: it becomes the [`Interpreter`] and serves the calls
 //! every other thread makes through [`super::Function`], one at a time, in
 //! arrival order. A caller waits for its call's result; while it waits, the
-//! values it passed stay borrowed on its stack. The last use of a Python
-//! object ([`super::Handle`]'s drop) is handed over the same way.
+//! values it passed stay borrowed on its stack.
 //!
 //! The control thread does not wait: it submits work that owns what it uses
 //! ([`Interpreter::submit`]) and hears of it through what the work posts
 //! when it ran. Submitted work is served in the same queue, in arrival
-//! order with every other thread's calls.
+//! order with every other thread's calls. Giving up a Python object
+//! ([`super::Handle`]'s drop) is such work on every thread: the reference
+//! is dropped by the Python thread, in the order of the queue, and nobody
+//! waits for it. An owner whose next step needs the releases made (closing
+//! the streams or the context that released objects use) waits for the
+//! queue once ([`Interpreter::synchronize`]).
 //!
 //! Three cases make a call on the calling thread instead:
 //!
@@ -109,6 +113,14 @@ impl Interpreter {
             work();
         }
     }
+
+    /// Wait until the Python thread has run everything submitted or handed
+    /// to it before this call: every released object is released when this
+    /// returns. For an owner about to close what released objects use; not
+    /// for a thread that serves.
+    pub fn synchronize() {
+        on_python_thread(&mut || {});
+    }
 }
 
 /// Run `work` on the Python thread and wait for it, or on the calling
@@ -134,15 +146,32 @@ pub(super) fn call(function: &tvm_ffi::Function, args: &[AnyView<'_>]) -> tvm_ff
     result.expect("a finished call has a result")
 }
 
-/// Give up a reference to a Python object: drop it on the Python thread.
+/// Give up a reference to a Python object: the Python thread drops it, in
+/// the order of its queue, and the caller does not wait.
 ///
-/// The caller waits, so the object is released at this point of the
-/// caller's teardown order. A Python object can own device resources (a
-/// graph pool frees its blocks and synchronizes the streams they were used
-/// on), which must go before the streams they refer to.
+/// A Python object can own device resources (a graph pool frees its blocks
+/// and synchronizes the streams they were used on), which must go before
+/// the streams they refer to: whoever closes those waits for the queue
+/// first ([`Interpreter::synchronize`]). A call made after a release runs
+/// after it.
 pub(super) fn release(value: Any) {
-    let mut value = Some(value);
-    on_python_thread(&mut || drop(value.take()));
+    let released = Released(value);
+    Interpreter::submit(move || released.release());
+}
+
+/// A reference on its way to the Python thread.
+struct Released(Any);
+
+// SAFETY: the value is an immutable reference-counted TVM-FFI object with
+// atomic counts, which Rust never dereferences; it is only moved to the
+// Python thread and dropped there. A handle never holds a tensor.
+unsafe impl Send for Released {}
+
+impl Released {
+    /// Drop the reference, on the thread that executes Python.
+    fn release(self) {
+        drop(self.0);
+    }
 }
 
 /// Run `body` with this thread's Python calls made on this thread.

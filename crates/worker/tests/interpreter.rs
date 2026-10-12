@@ -53,21 +53,31 @@ fn calls_and_releases_from_other_threads_run_on_the_interpreter_thread() {
     assert_eq!(value.unwrap(), 42);
     assert_eq!(*seen.lock().unwrap(), Some(here));
 
-    // A handle dropped here is released by the interpreter before the drop
-    // returns.
+    // A handle dropped here is released by the interpreter thread, in the
+    // order of its queue, without the dropping thread waiting: while the
+    // interpreter is held inside submitted work the drop returns and the
+    // object lives; once the queue was waited for it is released.
+    let limit = std::time::Duration::from_secs(30);
     let released = Arc::new(Mutex::new(None));
     let witness = DropWitness(Arc::clone(&released));
     let holder = tvm_ffi::Function::from_packed(move |_: &[AnyView]| {
         let _ = &witness;
         Ok(Any::from(()))
     });
-    drop(Handle::new(Any::from(holder)).unwrap());
+    let handle = Handle::new(Any::from(holder)).unwrap();
+    let (open, gate) = crossbeam_channel::bounded::<()>(1);
+    Interpreter::submit(move || {
+        let _ = gate.recv_timeout(limit);
+    });
+    drop(handle);
+    assert_eq!(*released.lock().unwrap(), None);
+    open.send(()).unwrap();
+    Interpreter::synchronize();
     assert_eq!(*released.lock().unwrap(), Some(python));
 
     // Submitted work runs on the interpreter thread while its submitter
     // goes on: here the submitter reaches the gate only after `submit`
     // returned, and the work cannot end before the gate opens.
-    let limit = std::time::Duration::from_secs(30);
     let (open, gate) = crossbeam_channel::bounded::<()>(1);
     let (ran, result) = crossbeam_channel::bounded(1);
     Interpreter::submit(move || {

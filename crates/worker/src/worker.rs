@@ -46,7 +46,7 @@ use crate::executor::Executor;
 use crate::executor::backend::WorkerBackend;
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
-use crate::ffi::{DType, Handle};
+use crate::ffi::{DType, Handle, Interpreter};
 use crate::lane::{BLOCK_ON_TIMEOUT, Lanes};
 use crate::launch::Endpoint;
 use crate::model::components::Capability;
@@ -716,6 +716,12 @@ impl Worker {
             }
         }
         self.graphs.close();
+        if !aborted {
+            // The owners above gave up their Python objects without waiting
+            // for the releases; an object may use its stream while it is
+            // released, so the releases are made before the streams close.
+            Interpreter::synchronize();
+        }
         record(self.lanes.close(aborted).map_err(WorkerError::from));
         if let Some(mut world) = self.world.take() {
             record(world.close(aborted).map_err(WorkerError::from));
@@ -726,7 +732,9 @@ impl Worker {
             #[allow(clippy::mem_forget)]
             std::mem::forget(self.context.take());
         } else {
+            // The model is released before the context its tensors live in.
             self.model = None;
+            Interpreter::synchronize();
             self.context = None;
             // Every owner has drained its streams; deferred frees can run.
             record(
