@@ -907,6 +907,12 @@ fn record(
             CallKind::Media(MediaCall::Denoising) => {
                 crate::runner::denoiser::denoise(parts, plan, batch, index, slot, &placement, job)?
             }
+            CallKind::Media(MediaCall::VideoDecoding) => crate::runner::decoder::decode_video(
+                parts, plan, batch, index, slot, &placement, job,
+            )?,
+            CallKind::Media(MediaCall::AudioDecoding) => crate::runner::decoder::decode_audio(
+                parts, plan, batch, index, slot, &placement, job,
+            )?,
             kind => {
                 return Err(Error::Unsupported(format!(
                     "{} is not recorded into a job",
@@ -977,60 +983,6 @@ pub(crate) fn complete(
             Err(Error::State("a media batch has no job on its lane").into())
         }
     }
-}
-
-/// Execute a batch of device video calls and commit it.
-pub(crate) fn execute(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    borrowed: HashSet<BufferId>,
-    state: &mut Option<MediaBatch>,
-) -> std::result::Result<(), WorkerError> {
-    let batch = open(parts, plan, borrowed, state)?;
-
-    let slots = request_slots(plan, parts.requests)?;
-    let allocations: HashMap<BufferId, BufferAllocation> = plan
-        .buffer_allocations
-        .iter()
-        .map(|allocation| (allocation.buffer, *allocation))
-        .collect();
-    let placement = Placement {
-        allocations: &allocations,
-        slots: &slots,
-    };
-    for index in 0..plan.calls.len() {
-        let call = &plan.calls[index];
-        let slot = slots[&call.request_key];
-        let owners = parts.owners();
-        let completion = bind_completion(owners.store, call, batch.device, &slots)?;
-        batch.calls[index].completion = completion;
-        if batch.calls[index].skipped {
-            continue;
-        }
-        match call.code {
-            CallKind::Media(MediaCall::VideoDecoding) => {
-                crate::runner::decoder::decode_video(parts, plan, batch, index, slot, &placement)?
-            }
-            CallKind::Media(MediaCall::AudioDecoding) => {
-                crate::runner::decoder::decode_audio(parts, plan, batch, index, slot, &placement)?
-            }
-            kind => {
-                return Err(Error::Unsupported(format!(
-                    "{} is not a device video call",
-                    kind.as_str()
-                ))
-                .into());
-            }
-        }
-    }
-    let owners = parts.owners();
-    let trajectories = parts
-        .denoisers
-        .video
-        .as_mut()
-        .map(|denoiser| &mut denoiser.runner as &mut dyn Trajectories);
-    batch.commit(plan, owners, parts.requests, trajectories)?;
-    Ok(())
 }
 
 pub(crate) fn latent_params<'a>(
