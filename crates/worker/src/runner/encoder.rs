@@ -1232,6 +1232,10 @@ impl EncoderRunner {
     /// a failed check releases that graph. Without a pool the same
     /// forwards run once on the Python thread, so lazy initialization
     /// precedes serving.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub fn capture(
         &mut self,
         pool: Option<&Arc<GraphPool<Handle>>>,
