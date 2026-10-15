@@ -4,8 +4,7 @@
 mod block_tables;
 mod buffer;
 mod host_buffers;
-mod latent;
-mod latent_storage;
+pub(crate) mod latent;
 pub mod memory;
 mod output;
 mod prefix_cache;
@@ -19,9 +18,8 @@ pub use block_tables::{
 };
 pub use buffer::{BufferBinding, BufferPool};
 pub use host_buffers::HostBuffers;
-pub(crate) use latent::image::{ImageLatents, Scratch};
-pub use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
-pub use latent_storage::LatentStorage;
+pub(crate) use latent::{LatentCache, Scratch};
+pub use latent::{LatentExport, LatentImport, LatentPool, LatentStorage, LatentUpdate};
 pub use output::{LogprobLayout, OutputBuffer, OutputLease, OutputPool, OutputStorage};
 pub use prefix_cache::manager::PrefixCacheManager;
 pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, GroupAxis};

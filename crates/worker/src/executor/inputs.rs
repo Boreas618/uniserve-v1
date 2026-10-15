@@ -1222,7 +1222,10 @@ fn publish(
 /// The latent pool trajectory transfers use.
 fn latent_pool(
     backend: &mut WorkerBackend,
-) -> Result<(&mut latents::Pool, &crate::storage::LatentStorage)> {
+) -> Result<(
+    &mut crate::storage::latent::Pool,
+    &crate::storage::LatentStorage,
+)> {
     let latents = backend
         .parts()
         .image

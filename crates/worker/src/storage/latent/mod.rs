@@ -1,6 +1,6 @@
-//! The latent pool of image trajectories and its native page copies.
+//! The latent cache of image trajectories and its native page copies.
 //!
-//! [`ImageLatents`] pairs the pool's page ownership and trajectory
+//! [`LatentCache`] pairs the pool's page ownership and trajectory
 //! visibility ([`LatentPool`]) with its device storage ([`LatentStorage`]).
 //! A trajectory's committed latents live in pages of one of two banks; a
 //! call that computes on them gathers the committed bank's pages into a
@@ -10,23 +10,33 @@
 //! the batch's stream.
 //!
 //! Every batch touching the pool (latent preparation, denoising, decoding)
-//! runs between [`ImageLatents::enter`] and [`ImageLatents::leave`] on its
+//! runs between [`LatentCache::enter`] and [`LatentCache::leave`] on its
 //! stream, which orders it after the previous such batch on any other
 //! stream: the banks and the shared step workspace are then used by one
 //! batch at a time on the device.
 
+mod memory;
+mod pages;
+
+pub use memory::LatentStorage;
+pub use pages::{LatentExport, LatentImport, LatentPool, LatentUpdate};
+
 use std::collections::HashSet;
+use std::sync::Arc;
 use uniserve_cuda::{CopyBatch, SourceOrder};
 
 use uniserve_ipc::{BufferId, LatentParams, RequestKey};
 
 use crate::executor::batch::StreamOrder;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
-use crate::executor::transfer::latents::Pool;
-use crate::storage::LatentStorage;
 use crate::storage::memory::StorageView;
 use crate::stream::Issue;
+use crate::transfer::{ReadRef, Retirement};
 use crate::{Error, Result};
+
+/// The latent pool of a rank: imports retain their transport reads,
+/// exports their locations' retirements.
+pub(crate) type Pool = LatentPool<Arc<LatentImport<ReadRef>>, Arc<LatentExport<Arc<Retirement>>>>;
 
 /// A trajectory's place in the step workspace for one call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,14 +56,14 @@ impl Scratch {
     }
 }
 
-/// The image latent pool of a rank.
-pub(crate) struct ImageLatents {
+/// The image latent cache of a rank: its pool's pages and their memory.
+pub(crate) struct LatentCache {
     pub(crate) pool: Pool,
     pub(crate) storage: LatentStorage,
     order: StreamOrder,
 }
 
-impl ImageLatents {
+impl LatentCache {
     pub(crate) fn new(pool: Pool, storage: LatentStorage) -> Self {
         Self {
             pool,
@@ -147,7 +157,7 @@ impl ImageLatents {
     }
 }
 
-impl RequestStorage for ImageLatents {
+impl RequestStorage for LatentCache {
     fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }

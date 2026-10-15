@@ -15,7 +15,7 @@ use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
 use crate::runner::causal_lm::warmup::with_scratch;
 use crate::runner::component::Component;
-use crate::storage::{ImageLatents, PrefixCache, UnitColumn};
+use crate::storage::{LatentCache, PrefixCache, UnitColumn};
 use crate::{Error, Result};
 
 /// Prefix tokens of each scratch slot a captured denoising step reads; host
@@ -73,7 +73,7 @@ impl DenoiserRunners {
     /// `prefix_cache`, with their samples in the step workspace of `latents`.
     pub(crate) fn capture_flow(
         &mut self,
-        latents: Option<&ImageLatents>,
+        latents: Option<&LatentCache>,
         prefix_cache: Option<&mut PrefixCache>,
     ) -> Result<()> {
         let (Some(prefix_cache), Some(latents)) = (
@@ -108,7 +108,7 @@ impl DenoiserRunners {
         &mut self,
         shape: &FlowShape,
         pools: &[Arc<GraphPool<Handle>>],
-        latents: &ImageLatents,
+        latents: &LatentCache,
         prefix_cache: &mut PrefixCache,
     ) -> Result<()> {
         let page_units = latents.pool.page_units() as u32;

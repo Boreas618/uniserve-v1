@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8};
 
-use super::memory::{Memory, StorageView};
 use crate::ffi::{Backing, DType, Device};
+use crate::storage::memory::{Memory, StorageView};
 use crate::stream::{Fill, Issue};
 use crate::transfer::Spans;
 use crate::{Error, Result};

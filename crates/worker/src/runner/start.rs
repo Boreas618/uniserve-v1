@@ -30,7 +30,7 @@ use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::media::MediaRunner;
 use crate::runner::scratch::Scratches;
-use crate::storage::{ImageLatents, LatentPool, LatentStorage, OutputPool};
+use crate::storage::{LatentCache, LatentPool, LatentStorage, OutputPool};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::worker::RankStorage;
@@ -171,7 +171,7 @@ pub(crate) struct ImageOwners {
     pub(crate) denoisers: DenoiserRunners,
     pub(crate) decoders: DecoderRunners,
     /// The latent pool of a rank holding an image denoiser.
-    pub(crate) latents: Option<ImageLatents>,
+    pub(crate) latents: Option<LatentCache>,
     /// The runners with their names, in the order startup constructed
     /// them: the order their kernels are listed in; they close in reverse.
     pub(crate) order: Vec<(ImageRunner, String)>,
@@ -305,7 +305,7 @@ impl ImageOwners {
                 )?;
                 let pool =
                     LatentPool::new(plan.request_pool_size, plan.num_pages, plan.page_units)?;
-                Some(ImageLatents::new(pool, storage))
+                Some(LatentCache::new(pool, storage))
             }
             (Some(_), None) => {
                 return Err(Error::Invalid(

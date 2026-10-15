@@ -42,7 +42,7 @@ use crate::runner::media::MediaRunner;
 use crate::runner::methods::list_kernels;
 use crate::runner::start::{ImageOwners, ImageRunner};
 use crate::service::ServiceBackend;
-use crate::storage::ImageLatents;
+use crate::storage::LatentCache;
 use crate::worker::RankStorage;
 use crate::{Error, OutputPool, Result};
 
@@ -60,7 +60,7 @@ pub struct WorkerBackend {
     /// model.
     image: Option<(ImageModel, ImagePolicy)>,
     /// The latent pool of a rank holding an image denoiser.
-    latents: Option<ImageLatents>,
+    latents: Option<LatentCache>,
     /// The open image trajectory of each request slot.
     trajectories: Trajectories,
     /// The lane preparing input images and encoding output images.
@@ -133,7 +133,7 @@ fn owners<'a>(
     text: &'a mut Option<crate::runner::causal_lm::CausalLMRunners>,
     image: bool,
     trajectories: &'a mut Trajectories,
-    latents: &'a mut Option<ImageLatents>,
+    latents: &'a mut Option<LatentCache>,
     diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
     transfer: &'a mut Option<super::transfer::TransferRuntime>,
     video: &'a mut Option<VideoRequests>,

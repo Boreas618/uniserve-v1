@@ -30,7 +30,7 @@ use crate::executor::batch::{
     Batch, Failure, HostStage, Launched, Opening, Stage, fail, unsupported,
 };
 use crate::executor::products::Publications;
-use crate::executor::transfer::latents::{self, PendingExport, Pool};
+use crate::executor::transfer::latents::{self, PendingExport};
 use crate::ffi::Device;
 use crate::host::image::ImageResult;
 use crate::host::image::ImageTask;
@@ -45,8 +45,9 @@ use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::inputs::Inputs;
 use crate::runner::encoder::runners::EncoderRunners;
+use crate::storage::latent::Pool;
 use crate::storage::{
-    ImageLatents, LatentStorage, LatentUpdate, OutputPool, ProductBuffer, ProductExport,
+    LatentCache, LatentStorage, LatentUpdate, OutputPool, ProductBuffer, ProductExport,
 };
 use crate::stream::Issue;
 use crate::worker::RankStorage;
@@ -191,7 +192,7 @@ pub(crate) struct ImageBatch<'a> {
     /// applied.
     pub(crate) plans: Vec<Planned>,
     /// The batch uses the latent pool on its stream (see
-    /// `ImageLatents::enter`).
+    /// `LatentCache::enter`).
     pub(crate) latents_entered: bool,
 }
 
@@ -473,7 +474,7 @@ pub(crate) struct ImageParts<'a> {
     pub(crate) encoders: &'a mut EncoderRunners,
     pub(crate) denoisers: &'a mut DenoiserRunners,
     pub(crate) decoders: &'a mut DecoderRunners,
-    pub(crate) latents: Option<&'a mut ImageLatents>,
+    pub(crate) latents: Option<&'a mut LatentCache>,
     pub(crate) trajectories: &'a mut Trajectories,
     /// The output leases of image batches.
     pub(crate) outputs: &'a mut OutputPool,
@@ -497,13 +498,13 @@ impl ImageParts<'_> {
         self.denoisers.image.as_mut().map(|(_, runner)| runner)
     }
 
-    pub(crate) fn latents(&self) -> Result<&ImageLatents> {
+    pub(crate) fn latents(&self) -> Result<&LatentCache> {
         self.latents
             .as_deref()
             .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))
     }
 
-    fn latents_mut(&mut self) -> Result<&mut ImageLatents> {
+    fn latents_mut(&mut self) -> Result<&mut LatentCache> {
         self.latents
             .as_deref_mut()
             .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))
