@@ -3,7 +3,7 @@
 //! Readout requests on a block-diffusion runtime over the GPU-free simulator.
 //!
 //! A readout prefills its prompt without sampling, denoises its canvas rows
-//! in token-denoising passes that read the prompt's KV without writing it,
+//! in token-denoising passes that read the prompt's prefix cache without writing it,
 //! and answers once with every candidate's log-probability before finishing.
 //! The simulator reports `sim_candidate_logprob(request, token)` for each
 //! candidate, so the expected answer is known exactly. Tests observe calls at
@@ -30,7 +30,7 @@ use uniserve_ipc::{Call, CallKind, ComponentInfo, ForwardMode, MediaCall};
 const MASK: u32 = 4;
 
 /// A block-diffusion worker: prompt prefill, canvas denoising and vision
-/// encoding, no token decode, with 16-token KV pages.
+/// encoding, no token decode, with 16-token cache pages.
 fn readout_worker() -> SimEngine {
     let mut sim = SimEngine::new();
     sim.mut_info_for_test().supported_calls = vec![
@@ -258,7 +258,7 @@ fn a_readout_prefills_without_sampling_and_answers_every_candidate_once() {
     assert_eq!(canvases.len(), 1);
     let (canvas, forward) = &canvases[0];
     assert_eq!(canvas.code, CallKind::Forward(ForwardMode::TokenDenoising));
-    assert_eq!(canvas.coordinates.kv_visible_len, 40);
+    assert_eq!(canvas.coordinates.cache_visible_len, 40);
     assert_eq!(canvas.coordinates.logical_position, 40);
     assert_eq!(
         canvas.input_token_ids,
@@ -270,7 +270,7 @@ fn a_readout_prefills_without_sampling_and_answers_every_candidate_once() {
     );
     assert_eq!(forward.query_lens, vec![32, 32]);
     assert_eq!(forward.seq_lens, vec![72, 72]);
-    assert_eq!(forward.write_kv, vec![false, false]);
+    assert_eq!(forward.write_cache, vec![false, false]);
     let readout = canvas.readout.as_ref().unwrap();
     assert_eq!(readout.slot_tokens, vec![3, 9, 36]);
     assert!(
@@ -420,14 +420,14 @@ fn readouts_of_one_state_reuse_the_shared_prompt_pages() {
         .filter(|(call, _)| call.code == CallKind::Forward(ForwardMode::Prefill))
         .collect();
     assert_eq!(prefills.len(), 1);
-    assert_eq!(prefills[0].0.coordinates.kv_visible_len, 48);
+    assert_eq!(prefills[0].0.coordinates.cache_visible_len, 48);
     assert_eq!(
         prefills[0].0.input_token_ids,
         vec![15, 16, 17, 18, 19, 20, 21]
     );
 }
 
-/// An image in the prompt is encoded and written into KV before the canvas
+/// An image in the prompt is encoded and written into the prefix cache before the canvas
 /// reads the prompt, whose positions then include the image's.
 #[test]
 fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
@@ -440,8 +440,8 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
         num_positions: 9,
         encoders: vec![ImageEncoderInput {
             encoder: ImageIngestStep::VitEncode,
-            num_kv_tokens: Some(9),
-            max_kv_tokens: None,
+            num_cache_tokens: Some(9),
+            max_cache_tokens: None,
         }],
     });
     let answer = events(running.submit(request.clone()));
@@ -459,11 +459,11 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
         .find(|(call, _)| call.readout.is_some())
         .unwrap();
     assert_eq!(canvas.coordinates.logical_position, 25);
-    assert_eq!(canvas.coordinates.kv_visible_len, 25);
+    assert_eq!(canvas.coordinates.cache_visible_len, 25);
     assert_eq!(forward.seq_lens, vec![41]);
 }
 
-/// A vision input image of `tokens` KV tokens and as many positions at
+/// A vision input image of `tokens` cache tokens and as many positions at
 /// prompt position `position`.
 fn vision_image(hash: u64, position: u32, tokens: u32) -> ImageInput {
     ImageInput {
@@ -473,8 +473,8 @@ fn vision_image(hash: u64, position: u32, tokens: u32) -> ImageInput {
         num_positions: tokens,
         encoders: vec![ImageEncoderInput {
             encoder: ImageIngestStep::VitEncode,
-            num_kv_tokens: Some(tokens),
-            max_kv_tokens: None,
+            num_cache_tokens: Some(tokens),
+            max_cache_tokens: None,
         }],
     }
 }
@@ -491,7 +491,7 @@ fn context_prefills(
         .collect()
 }
 
-/// A prompt with an image is written into KV by one context prefill, after
+/// A prompt with an image is written into the prefix cache by one context prefill, after
 /// the image is encoded: the prefill carries the prompt tokens and the image
 /// block at its prompt position, as one forward row per segment, and the
 /// canvas then reads the whole context.
@@ -526,12 +526,12 @@ fn an_image_prompt_is_written_by_one_context_prefill() {
         prefill.vision_inputs[0].feature.buffer_id(),
         feature.buffer_id()
     );
-    assert_eq!(prefill.coordinates.kv_visible_len, 0);
+    assert_eq!(prefill.coordinates.cache_visible_len, 0);
     // Text before the image, the image block, text after it.
     assert_eq!(forward.query_lens, vec![10, 9, 6]);
     assert_eq!(forward.seq_lens, vec![10, 19, 25]);
-    assert_eq!(forward.write_kv, vec![true, true, true]);
-    assert_eq!(calls[2].0.coordinates.kv_visible_len, 25);
+    assert_eq!(forward.write_cache, vec![true, true, true]);
+    assert_eq!(calls[2].0.coordinates.cache_visible_len, 25);
 }
 
 /// Every image a context prefill reaches is encoded before it, and the
@@ -716,8 +716,8 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
                 num_positions: 9,
                 encoders: vec![ImageEncoderInput {
                     encoder: ImageIngestStep::VitEncode,
-                    num_kv_tokens: Some(9),
-                    max_kv_tokens: None,
+                    num_cache_tokens: Some(9),
+                    max_cache_tokens: None,
                 }],
             });
             request
@@ -760,7 +760,7 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
 }
 
 /// A ready canvas pass takes the step before another request's remaining
-/// prefill: completing a readout releases its KV.
+/// prefill: completing a readout releases its prefix cache.
 #[test]
 fn a_ready_canvas_pass_runs_before_waiting_prefill() {
     let mut sim = readout_worker();

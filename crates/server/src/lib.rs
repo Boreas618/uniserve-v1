@@ -167,7 +167,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             _ => None,
         },
         // A DiffusionGemma prompt, image block or committed block only
-        // conditions canvases: its prefill writes the K/V cache alone.
+        // conditions canvases: its prefill writes the prefix cache alone.
         prefill_outputs: !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_)),
         ..config.engine.worker_process.clone()
     };
@@ -179,7 +179,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_num_seqs: config.engine.max_num_seqs,
         long_prefill_threshold: config.engine.long_prefill_threshold,
         mixed_prefill_tokens: config.engine.mixed_prefill_tokens,
-        prefix_cache: config.engine.prefix_cache,
+        prefix_reuse: config.engine.prefix_reuse,
         scheduler_policy: config.engine.scheduler_policy,
         max_model_len: effective_max_model_len,
         workers: config.engine.workers.clone(),

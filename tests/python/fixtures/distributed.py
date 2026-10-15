@@ -3,7 +3,7 @@
 Model code communicates through ``DeviceMesh`` communicators that borrow
 torch process groups. The serving worker plans which groups exist; a test
 rank creates only the groups of the mesh it exercises, through the same
-``uniserve_models.interface.distributed`` functions the worker calls.
+``uniserve.interface.distributed`` functions the worker calls.
 """
 
 import socket
@@ -12,8 +12,8 @@ from contextlib import contextmanager
 
 import torch
 
-from uniserve_models.distributed import DeviceMesh
-from uniserve_models.interface import distributed
+from uniserve.distributed import DeviceMesh
+from uniserve.interface import distributed
 
 
 @contextmanager

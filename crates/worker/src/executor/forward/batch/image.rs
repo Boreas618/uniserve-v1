@@ -240,7 +240,7 @@ pub(crate) struct ImageBatch<'a> {
     /// order their plan calls were recorded; opened when the commit is
     /// applied.
     pub(crate) plans: Vec<Planned>,
-    /// Signals the physical end of the batch's KV accesses.
+    /// Signals the physical end of the batch's cache accesses.
     pub(crate) retirement: Arc<Retirement>,
     /// The batch uses the latent pool on its stream (see
     /// `ImageLatents::enter`).
@@ -589,7 +589,7 @@ impl<'a> ImageBatch<'a> {
         self.requests.add_pending(&pending).map_err(fatal)
     }
 
-    /// Seal the lease on the batch's stream and retire its KV accesses and
+    /// Seal the lease on the batch's stream and retire its cache accesses and
     /// output storage once the fences complete; wake the service then.
     pub(crate) fn seal(&self) -> Result<()> {
         seal_lease(

@@ -43,9 +43,9 @@ fn defaults() -> Value {
         "checksum_manifest": null,
         "model_dtype": "bfloat16",
         "quantization_config": {},
-        "kv_cache_dtype": null,
-        "kv_memory_fraction": 0.70,
-        "kv_token_capacity": null,
+        "prefix_cache_dtype": null,
+        "cache_memory_fraction": 0.70,
+        "cache_token_capacity": null,
         "attention_backend": "auto",
         "block_size": 64,
         "max_batch_calls": 256,
@@ -135,14 +135,14 @@ fn a_malformed_device_names_its_option() {
 #[test]
 fn the_storage_fraction_lies_in_the_unit_interval() {
     assert_eq!(
-        resolved(json!({"kv_memory_fraction": 1.0}))
+        resolved(json!({"cache_memory_fraction": 1.0}))
             .unwrap()
             .execution
-            .kv_storage_fraction,
+            .cache_storage_fraction,
         1.0
     );
     for fraction in [0.0, -0.5, 1.5] {
-        assert!(resolved(json!({"kv_memory_fraction": fraction})).is_err());
+        assert!(resolved(json!({"cache_memory_fraction": fraction})).is_err());
     }
 }
 
@@ -167,13 +167,16 @@ fn engine_capacities_and_precision_reach_the_worker() {
 }
 
 #[test]
-fn a_kv_dtype_selector_overrides_the_launch_dtype() {
+fn a_cache_dtype_selector_overrides_the_launch_dtype() {
     let launch = resolved(json!({
-        "kv_cache_dtype": "bfloat16",
+        "prefix_cache_dtype": "bfloat16",
         "quantization_config": {"kv_cache_dtype": "float16"},
     }))
     .unwrap();
-    assert_eq!(launch.execution.kv_cache_dtype.as_deref(), Some("float16"));
+    assert_eq!(
+        launch.execution.prefix_cache_dtype.as_deref(),
+        Some("float16")
+    );
     assert!(
         launch_error(json!({"quantization_config": {"kv_cache_dtype": 7}})).contains("KV dtype")
     );
@@ -329,7 +332,7 @@ fn attention_options_and_cuda_representations_are_checked() {
     for (overrides, option) in [
         (json!({"model_dtype": "float32"}), "--dtype float32"),
         (
-            json!({"kv_cache_dtype": "float8_e4m3fn"}),
+            json!({"prefix_cache_dtype": "float8_e4m3fn"}),
             "--kv-cache-dtype float8_e4m3fn",
         ),
         (

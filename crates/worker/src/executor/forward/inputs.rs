@@ -4,8 +4,8 @@
 //! store, and its trajectories from the rank's latent pool. Products
 //! another rank or worker published reach this rank as descriptors
 //! (`Batch::input_products`): tensors are read into the tensor store,
-//! latent trajectory versions into the consuming request's pages; KV
-//! transfers its install calls name arrive as `Batch::kv_inputs` or are
+//! latent trajectory versions into the consuming request's pages; cache
+//! transfers its install calls name arrive as `Batch::cache_inputs` or are
 //! resident exports of this rank. This module materializes them while
 //! other batches execute, so a runtime consumes imported values exactly
 //! like values its own rank produced.
@@ -14,7 +14,7 @@
 //! readiness notice of what blocked it ([`admit`], [`prepare`],
 //! [`subscribe`]):
 //!
-//! 1. **Storage hazards.** A batch that writes KV storage (newly assigned
+//! 1. **Storage hazards.** A batch that writes cache storage (newly assigned
 //!    units, forward rows, install destinations) first waits for every
 //!    physical access still overlapping it: executions of earlier batches,
 //!    imports, and exports other ranks are reading; one that writes a
@@ -27,9 +27,9 @@
 //!    from that job's completion ([`admitted`]), when the fences' records
 //!    are made. A refusal for read credits resumes at the refused product
 //!    once credits return; accepted imports keep their destinations
-//!    meanwhile. KV imports follow ([`prepare`]), after which nothing is
+//!    meanwhile. Cache imports follow ([`prepare`]), after which nothing is
 //!    repeatable.
-//! 3. **Readiness.** The batch launches once every read and KV copy is
+//! 3. **Readiness.** The batch launches once every read and cache copy is
 //!    consumable.
 //!
 //! When the batch executes, [`complete`] publishes each imported product on
@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 
 use uniserve_ipc::{
-    Batch as BatchPlan, BufferId, Call, CallKind, DType, KvTransfer, MediaCall, TensorExport,
+    Batch as BatchPlan, BufferId, CacheTransfer, Call, CallKind, DType, MediaCall, TensorExport,
     TensorRef, TransferHandle, TransferMode, TransferTransport,
 };
 
@@ -56,7 +56,7 @@ use crate::executor::{BatchInputs, InputReady, Submission};
 use crate::ffi::Device;
 use crate::lane::{Completion, Job};
 use crate::storage::{
-    KVCache, Metadata, OutputPlacement, PendingImport, ProductRead, TensorStore, ValueRange,
+    Metadata, OutputPlacement, PendingImport, PrefixCache, ProductRead, TensorStore, ValueRange,
 };
 use crate::transfer::{Notify, Retirement, fetch};
 use crate::{Error, Outcome, Result};
@@ -68,7 +68,7 @@ pub(crate) enum Input {
         read: Arc<ProductRead>,
         device: Device,
     },
-    /// A KV transfer copied into its install call's pages.
+    /// A cache transfer copied into its install call's pages.
     Cache(PendingImport),
     /// A latent trajectory version read into the consuming call's slot,
     /// on `device`.
@@ -91,7 +91,7 @@ impl InputReady for Input {
     }
 }
 
-/// A physical access a batch's KV writes wait for.
+/// A physical access a batch's cache writes wait for.
 pub(crate) struct Hazard(Arc<Retirement>);
 
 impl InputReady for Hazard {
@@ -108,8 +108,8 @@ pub(crate) struct Inputs {
     state: BatchInputs<Input, Hazard>,
     /// The storage hazards were resolved.
     resolved: bool,
-    /// Resident KV exports the batch's install calls read.
-    resident: Vec<Arc<KvTransfer>>,
+    /// Resident cache exports the batch's install calls read.
+    resident: Vec<Arc<CacheTransfer>>,
     /// The read-credit return sequence a refused import waits past.
     backpressure: Option<u64>,
     /// Preparation stopped on these inputs (not on another runtime's).
@@ -153,7 +153,7 @@ impl Inputs {
             .collect()
     }
 
-    /// The KV import of an install call's source export.
+    /// The cache import of an install call's source export.
     pub(crate) fn cache_import(&self, source: BufferId) -> Option<&PendingImport> {
         match self.state.inputs.get(&source) {
             Some(Input::Cache(import)) => Some(import),
@@ -299,19 +299,22 @@ fn advance(backend: &mut WorkerBackend, batch: &mut WorkerBatch, plan: &BatchPla
     batch.inputs().state.ready()
 }
 
-/// What a batch's KV transfers and writes depend on.
+/// What a batch's cache transfers and writes depend on.
 struct Resolved {
     /// Resident exports the batch's install calls read.
-    resident: Vec<Arc<KvTransfer>>,
-    /// Physical accesses overlapping the KV storage the batch writes.
+    resident: Vec<Arc<CacheTransfer>>,
+    /// Physical accesses overlapping the cache storage the batch writes.
     hazards: Vec<Arc<Retirement>>,
 }
 
 /// Resolve the resident exports install calls read and the physical
-/// accesses the batch's KV writes overlap. Neither reserves storage.
+/// accesses the batch's cache writes overlap. Neither reserves storage.
 fn resolve(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Resolved> {
     let parts = backend.parts();
-    let Some(kv) = parts.storage.and_then(|storage| storage.kv.as_mut()) else {
+    let Some(prefix_cache) = parts
+        .storage
+        .and_then(|storage| storage.prefix_cache.as_mut())
+    else {
         return Ok(Resolved {
             resident: Vec::new(),
             hazards: Vec::new(),
@@ -321,32 +324,32 @@ fn resolve(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Resolved> {
     // Supplied transfers take precedence; other install sources must be
     // exports resident on this rank.
     let mut supplied: HashSet<BufferId> = plan
-        .kv_inputs
+        .cache_inputs
         .iter()
         .map(|transfer| transfer.source)
         .collect();
     let mut resident = Vec::new();
     for call in installs(plan) {
         let source = call
-            .kv_input
-            .ok_or_else(|| Error::Invalid("KV installation requires a source export".into()))?;
+            .cache_input
+            .ok_or_else(|| Error::Invalid("cache installation requires a source export".into()))?;
         if supplied.insert(source) {
-            let export = kv
+            let export = prefix_cache
                 .manager()
                 .resident(source)
-                .ok_or_else(|| Error::Invalid("KV export buffer is not resident".into()))?;
+                .ok_or_else(|| Error::Invalid("cache export buffer is not resident".into()))?;
             resident.push(Arc::clone(export));
         }
     }
 
-    if !kv.manager().has_pending_accesses() {
+    if !prefix_cache.manager().has_pending_accesses() {
         return Ok(Resolved {
             resident,
             hazards: Vec::new(),
         });
     }
-    let spans = write_spans(kv, parts.requests, plan, &resident)?;
-    let hazards = kv
+    let spans = write_spans(prefix_cache, parts.requests, plan, &resident)?;
+    let hazards = prefix_cache
         .manager()
         .write_dependencies(&spans)
         .into_iter()
@@ -411,20 +414,20 @@ fn latent_hazards(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Vec<A
 fn installs(plan: &BatchPlan) -> impl Iterator<Item = &Call> {
     plan.calls
         .iter()
-        .filter(|call| call.code == CallKind::Transfer(TransferMode::KvInstall))
+        .filter(|call| call.code == CallKind::Transfer(TransferMode::CacheInstall))
 }
 
-/// Every KV span the batch writes: whole newly assigned units (a recycled
+/// Every cache span the batch writes: whole newly assigned units (a recycled
 /// unit may have served another group's page size), forward rows that
 /// write their queries, and the extent each install copies.
 fn write_spans(
-    kv: &mut KVCache,
+    prefix_cache: &mut PrefixCache,
     requests: &crate::request::RequestPool,
     plan: &BatchPlan,
-    resident: &[Arc<KvTransfer>],
+    resident: &[Arc<CacheTransfer>],
 ) -> Result<Vec<(u32, u32, u32)>> {
-    let unit_tokens = kv.plan().unit_tokens();
-    let tables = kv.tables();
+    let unit_tokens = prefix_cache.plan().unit_tokens();
+    let tables = prefix_cache.tables();
     let mut spans = Vec::new();
     for allocation in &plan.new_cache_units {
         spans.extend(
@@ -435,7 +438,7 @@ fn write_spans(
         );
     }
     let forward = &plan.forward;
-    for (row, &write) in forward.write_kv.iter().enumerate() {
+    for (row, &write) in forward.write_cache.iter().enumerate() {
         if !write {
             continue;
         }
@@ -445,14 +448,14 @@ fn write_spans(
             spans.extend(table.spans(start, length)?);
         }
     }
-    let transfers: HashMap<BufferId, &KvTransfer> = plan
-        .kv_inputs
+    let transfers: HashMap<BufferId, &CacheTransfer> = plan
+        .cache_inputs
         .iter()
         .chain(resident.iter().map(AsRef::as_ref))
         .map(|transfer| (transfer.source, transfer))
         .collect();
     for call in installs(plan) {
-        let Some(transfer) = call.kv_input.and_then(|source| transfers.get(&source)) else {
+        let Some(transfer) = call.cache_input.and_then(|source| transfers.get(&source)) else {
             continue;
         };
         let slot = requests.get(call.request_key.request_id.0)?.slot() as u32;
@@ -475,12 +478,12 @@ fn require_storage(state: &BatchInputs<Input, Hazard>) -> Result<()> {
             Some(Outcome::Success(())) => {}
             Some(Outcome::Failed(error)) => {
                 return Err(Error::Transport(format!(
-                    "a KV access the batch overwrites failed to retire: {error}"
+                    "a cache access the batch overwrites failed to retire: {error}"
                 )));
             }
             Some(Outcome::Cancelled) | None => {
                 return Err(Error::Resource(
-                    "a KV access the batch overwrites did not retire",
+                    "a cache access the batch overwrites did not retire",
                 ));
             }
         }
@@ -738,7 +741,7 @@ fn import_latent(
     Ok(Input::Latent { input, device })
 }
 
-/// Reserve every KV import: each supplied or resident transfer is copied
+/// Reserve every cache import: each supplied or resident transfer is copied
 /// into the pages of its one install call's slot. An accepted import is
 /// recorded at once, so a later refusal abandons it with the batch.
 fn import_cache(
@@ -747,17 +750,17 @@ fn import_cache(
     plan: &BatchPlan,
 ) -> Result<()> {
     let resident = batch.inputs().resident.clone();
-    if plan.kv_inputs.is_empty() && resident.is_empty() {
+    if plan.cache_inputs.is_empty() && resident.is_empty() {
         return Ok(());
     }
     let mut consumers: HashMap<BufferId, usize> = HashMap::new();
     for call in installs(plan) {
-        if let Some(source) = call.kv_input {
+        if let Some(source) = call.cache_input {
             *consumers.entry(source).or_default() += 1;
         }
     }
-    let transfers: Vec<Arc<KvTransfer>> = plan
-        .kv_inputs
+    let transfers: Vec<Arc<CacheTransfer>> = plan
+        .cache_inputs
         .iter()
         .cloned()
         .map(Arc::new)
@@ -768,38 +771,43 @@ fn import_cache(
         .any(|transfer| consumers.get(&transfer.source) != Some(&1))
     {
         return Err(Error::Invalid(
-            "KV input requires one installation consumer".into(),
+            "cache input requires one installation consumer".into(),
         ));
     }
 
     let parts = backend.parts();
     let storage = parts
         .storage
-        .ok_or_else(|| Error::Unsupported("KV input requires rank storage".into()))?;
+        .ok_or_else(|| Error::Unsupported("cache input requires rank storage".into()))?;
     if storage.transports.is_empty() {
         return Err(Error::Unsupported(
             "cross-call input requires a configured transport".into(),
         ));
     }
     let transports = Arc::clone(&storage.transports);
-    let kv = storage
-        .kv
+    let prefix_cache = storage
+        .prefix_cache
         .as_mut()
-        .ok_or_else(|| Error::Invalid("KV input requires physical cache storage".into()))?;
+        .ok_or_else(|| Error::Invalid("cache input requires physical cache storage".into()))?;
     for transfer in transfers {
         let source = transfer.source;
         // Starts were installed before preparation; the request pool is the
         // sole source of the consumer's slot.
         let slot = parts.requests.get(source.owner.request_id.0)?.slot() as u32;
-        let tables = kv.tables().for_batch(slot, &plan.block_tables)?;
+        let tables = prefix_cache.tables().for_batch(slot, &plan.block_tables)?;
         let initialized = plan
             .new_cache_units
             .iter()
             .filter(|allocation| allocation.request_pool_idx == slot)
             .flat_map(|allocation| allocation.unit_ids.iter().map(|unit| unit.0))
             .collect();
-        let import =
-            kv.reserve_import(transfer, slot, tables, initialized, Arc::clone(&transports))?;
+        let import = prefix_cache.reserve_import(
+            transfer,
+            slot,
+            tables,
+            initialized,
+            Arc::clone(&transports),
+        )?;
         batch
             .inputs_mut()
             .state
@@ -811,7 +819,7 @@ fn import_cache(
 
 /// Arrange a readiness notice for `submission` once what stopped the
 /// batch's preparation can advance: returned read credits, retired storage
-/// hazards, or finished reads and KV copies. Nothing is subscribed when
+/// hazards, or finished reads and cache copies. Nothing is subscribed when
 /// another runtime's inputs stopped the batch.
 pub(crate) fn subscribe(
     backend: &WorkerBackend,
@@ -1018,29 +1026,32 @@ pub(crate) fn complete(batch: &mut WorkerBatch, completion: Completion) -> Resul
     }
 }
 
-/// KV descriptors may have become resident since the imports were admitted;
+/// Cache descriptors may have become resident since the imports were admitted;
 /// an import must still agree with the resident export it installs.
 fn check_resident(
     backend: &mut WorkerBackend,
     batch: &WorkerBatch,
     plan: &BatchPlan,
 ) -> Result<()> {
-    let sources: Vec<BufferId> = installs(plan).filter_map(|call| call.kv_input).collect();
+    let sources: Vec<BufferId> = installs(plan).filter_map(|call| call.cache_input).collect();
     if sources.is_empty() {
         return Ok(());
     }
     let parts = backend.parts();
-    let Some(kv) = parts.storage.and_then(|storage| storage.kv.as_mut()) else {
+    let Some(prefix_cache) = parts
+        .storage
+        .and_then(|storage| storage.prefix_cache.as_mut())
+    else {
         return Ok(());
     };
     for source in sources {
         if let (Some(import), Some(existing)) = (
             batch.inputs().cache_import(source),
-            kv.manager().resident(source),
+            prefix_cache.manager().resident(source),
         ) && existing.as_ref() != import.export().as_ref()
         {
             return Err(Error::Invalid(
-                "prepared KV import conflicts with its resident export".into(),
+                "prepared cache import conflicts with its resident export".into(),
             ));
         }
     }
@@ -1090,7 +1101,7 @@ fn publish(
             let (pool, _) = latent_pool(backend)?;
             latents::adopt(pool, input, job.on(stream.as_ref()))
         }
-        // Borrowed inputs stay with their host consumers; KV imports are
+        // Borrowed inputs stay with their host consumers; cache imports are
         // adopted by their install calls.
         _ => Ok(()),
     }
@@ -1130,7 +1141,7 @@ fn tensors(backend: &WorkerBackend) -> Result<&TensorStore> {
 }
 
 /// End the batch's import leases and abandon what it did not consume: reads
-/// of unpublished imports are cancelled, unadopted KV imports release their
+/// of unpublished imports are cancelled, unadopted cache imports release their
 /// pages once their physical accesses retire. Attempts every release before
 /// returning the first failure.
 pub(crate) fn close(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Result<()> {
@@ -1163,9 +1174,9 @@ pub(crate) fn close(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Res
                 if !import.adopted() {
                     let abandoned = backend
                         .rank_storage_mut()
-                        .and_then(|storage| storage.kv.as_mut())
-                        .ok_or(Error::Invariant("a KV import outlived its cache".into()))
-                        .and_then(|kv| kv.abandon_import(&import));
+                        .and_then(|storage| storage.prefix_cache.as_mut())
+                        .ok_or(Error::Invariant("a cache import outlived its cache".into()))
+                        .and_then(|prefix_cache| prefix_cache.abandon_import(&import));
                     result = result.and(abandoned);
                 }
             }

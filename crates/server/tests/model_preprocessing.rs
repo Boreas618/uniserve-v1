@@ -531,7 +531,7 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
             .image_generation
             .feedback_encoders
             .iter()
-            .map(|input| input.num_kv_tokens)
+            .map(|input| input.num_cache_tokens)
             .collect::<Vec<_>>(),
         vec![Some(2305)]
     );

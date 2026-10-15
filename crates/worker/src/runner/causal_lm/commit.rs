@@ -155,9 +155,9 @@ impl Batch<'_> {
         let plan = self.plan;
         let tables = self
             .storage
-            .kv
+            .prefix_cache
             .as_ref()
-            .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?
+            .ok_or_else(|| Error::Unsupported("text calls require a prefix cache".into()))?
             .tables();
         let mut commits: Vec<(usize, Vec<[i64; 8]>)> = self.runtime.groups[self.group]
             .iter()

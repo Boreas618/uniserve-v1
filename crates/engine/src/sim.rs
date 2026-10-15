@@ -7,9 +7,9 @@
 //! products for `command_has_capacity`.
 //!
 //! [`SimEngine`] keeps the per-request progress a worker rank tracks:
-//! positions, KV extent, denoising step, and predicate values. It enforces
+//! positions, cache extent, denoising step, and predicate values. It enforces
 //! request identity, lifecycle, call coordinates, and predicate dependencies,
-//! and reports deterministic tokens, KV extents, denoising progress, and
+//! and reports deterministic tokens, cache extents, denoising progress, and
 //! synthetic media published through POSIX shared memory. The module is built
 //! only with the `testing` feature; engine and server tests and the engine's
 //! `control_plane` example drive the scheduler through it in place of GPU
@@ -381,9 +381,9 @@ struct SimRequestState {
     /// advance, which the simulator does not implement, so once a request has
     /// ingested one it takes the position each call states.
     positions_from_model: bool,
-    /// Tokens resident in KV. The simulator reports it as both the visible
+    /// Tokens resident in the prefix cache. The simulator reports it as both the visible
     /// and the computed extent.
-    kv_visible_len: u32,
+    cache_visible_len: u32,
     /// Index of the next synthetic text token, as `synth_logits` takes it.
     emitted: usize,
     /// Denoising steps completed. Image decoding resets it to zero, as it
@@ -428,7 +428,7 @@ impl SimRequestState {
             admission,
             logical_position: prefix_len,
             positions_from_model: false,
-            kv_visible_len: prefix_len,
+            cache_visible_len: prefix_len,
             emitted: 0,
             flow_step: 0,
             predicate_values: HashMap::new(),
@@ -489,7 +489,7 @@ pub struct SimEngine {
 impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
-        // Unset fields, including the KV cache and a queue depth of one, come
+        // Unset fields, including the prefix cache and a queue depth of one, come
         // from `WorkerInfo::default`. One latent page is the reserved sentinel
         // page that `latent_capacity_units` excludes.
         let info = WorkerInfo {
@@ -637,7 +637,7 @@ impl SimEngine {
 
     /// Executes one call against its request and returns its [`RequestOutput`].
     ///
-    /// Advances the request's positions, KV extent, synthetic text index,
+    /// Advances the request's positions, cache extent, synthetic text index,
     /// penalty counts, and denoising step as the call kind requires, and
     /// records the boolean values of the call's products in
     /// `predicate_values`. Errors when a chained call states coordinates other
@@ -664,8 +664,8 @@ impl SimEngine {
             }
             let held = uniserve_ipc::CallCoordinates {
                 logical_position: request.logical_position,
-                kv_visible_len: request.kv_visible_len,
-                kv_computed_len: request.kv_visible_len,
+                cache_visible_len: request.cache_visible_len,
+                cache_computed_len: request.cache_visible_len,
                 flow_step: u32::from(request.flow_step),
             };
             anyhow::ensure!(
@@ -686,44 +686,44 @@ impl SimEngine {
             timing_counters: TimingCounters::default(),
             code: call.code,
             position: 0,
-            kv_visible_len: 0,
-            kv_computed_len: 0,
+            cache_visible_len: 0,
+            cache_computed_len: 0,
             num_completed_steps: 0,
             committed_tokens: Vec::new(),
             candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
-            kv_output: None,
+            cache_output: None,
         };
         record.position = request.logical_position;
-        set_kv_lengths(&mut record, request.kv_visible_len);
+        set_cache_lengths(&mut record, request.cache_visible_len);
 
         match call.code {
             work @ (CallKind::Forward(ForwardMode::Prefill)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)) => {
                 // A call that writes image blocks, alone or among the prompt
-                // tokens of a context prefill, extends KV by its token bound
+                // tokens of a context prefill, extends the prefix cache by its token bound
                 // but leaves logical positions to the model.
                 let visual_state =
                     !call.vision_inputs.is_empty() || call.latent_feature_input.is_some();
                 let samples_token = call.token_output.is_some();
                 if visual_state {
                     request.positions_from_model = true;
-                    request.kv_visible_len = request
-                        .kv_visible_len
+                    request.cache_visible_len = request
+                        .cache_visible_len
                         .saturating_add(call.bounds.max_tokens);
-                    set_kv_lengths(&mut record, request.kv_visible_len);
+                    set_cache_lengths(&mut record, request.cache_visible_len);
                     if call.completion_output.is_some() {
                         request.emitted = 0;
                     }
                 }
                 if !visual_state && !samples_token {
                     // A readout's prompt chunk samples nothing and advances
-                    // positions with its tokens; the `CloseKv` write, which
-                    // declares a completion, only extends KV.
-                    request.kv_visible_len = request
-                        .kv_visible_len
+                    // positions with its tokens; the `CloseCache` write, which
+                    // declares a completion, only extends the prefix cache.
+                    request.cache_visible_len = request
+                        .cache_visible_len
                         .saturating_add(call.bounds.max_tokens);
                     if call.completion_output.is_none() {
                         request.logical_position = request
@@ -731,7 +731,7 @@ impl SimEngine {
                             .saturating_add(call.bounds.max_tokens);
                     }
                     record.position = request.logical_position;
-                    set_kv_lengths(&mut record, request.kv_visible_len);
+                    set_cache_lengths(&mut record, request.cache_visible_len);
                 } else if samples_token {
                     let index = request.emitted;
                     let sampling_state = call.sampling_state.as_ref();
@@ -787,7 +787,7 @@ impl SimEngine {
                             .insert(completion.clone(), transition);
                     }
                     record.position = 1;
-                    // Positions and KV advance by the query length: the whole
+                    // Positions and cache advance by the query length: the whole
                     // bound for a prefill, one token for decode and verify.
                     if !visual_state {
                         let query_tokens = match work {
@@ -798,10 +798,10 @@ impl SimEngine {
                         };
                         request.logical_position =
                             request.logical_position.saturating_add(query_tokens);
-                        request.kv_visible_len =
-                            request.kv_visible_len.saturating_add(query_tokens);
+                        request.cache_visible_len =
+                            request.cache_visible_len.saturating_add(query_tokens);
                         record.position = request.logical_position;
-                        set_kv_lengths(&mut record, request.kv_visible_len);
+                        set_cache_lengths(&mut record, request.cache_visible_len);
                     }
                     match work {
                         CallKind::Forward(ForwardMode::Prefill) => {
@@ -835,7 +835,7 @@ impl SimEngine {
                 }
             }
             CallKind::Forward(ForwardMode::TokenDenoising) => {
-                // A canvas pass reads KV without writing it and reports one
+                // A canvas pass reads the prefix cache without writing it and reports one
                 // deterministic log-probability per readout candidate, or runs
                 // one step of the request's generation canvas.
                 if let Some(step) = call.canvas {
@@ -906,9 +906,9 @@ impl SimEngine {
             | CallKind::Media(MediaCall::VisionEncoding)
             | CallKind::Media(MediaCall::LatentEncoding) => {}
             CallKind::Transfer(TransferMode::Tensor)
-            | CallKind::Transfer(TransferMode::KvExport)
-            | CallKind::Transfer(TransferMode::KvInstall) => {
-                set_kv_lengths(&mut record, request.kv_visible_len);
+            | CallKind::Transfer(TransferMode::CacheExport)
+            | CallKind::Transfer(TransferMode::CacheInstall) => {
+                set_cache_lengths(&mut record, request.cache_visible_len);
             }
             CallKind::Media(MediaCall::LatentPreparation) => {}
             CallKind::Media(MediaCall::Denoising) => {
@@ -995,14 +995,14 @@ impl SimEngine {
             timing_counters: TimingCounters::default(),
             code: call.code,
             position: request.logical_position,
-            kv_visible_len: request.kv_visible_len,
-            kv_computed_len: request.kv_visible_len,
+            cache_visible_len: request.cache_visible_len,
+            cache_computed_len: request.cache_visible_len,
             num_completed_steps: u32::from(request.flow_step),
             committed_tokens: Vec::new(),
             candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
             media_output: None,
-            kv_output: None,
+            cache_output: None,
         }
     }
 
@@ -1043,43 +1043,43 @@ impl SimEngine {
         );
     }
 
-    /// Replaces the simulator's KV cache groups.
+    /// Replaces the simulator's cache groups.
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a KV cache.
-    pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroup>) {
+    /// Panics when the simulated worker does not expose a prefix cache.
+    pub fn set_groups(&mut self, groups: Vec<uniserve_core::CacheGroup>) {
         self.info
-            .kv_cache
+            .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a KV cache")
+            .expect("sim AR worker has a prefix cache")
             .groups = groups;
     }
 
-    /// Sets the simulator's KV unit count, including the unit-zero sentinel.
+    /// Sets the simulator's cache unit count, including the unit-zero sentinel.
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a KV cache.
+    /// Panics when the simulated worker does not expose a prefix cache.
     pub fn set_num_units(&mut self, count: u32) {
         self.info
-            .kv_cache
+            .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a KV cache")
+            .expect("sim AR worker has a prefix cache")
             .num_units = count;
     }
 
-    /// Sets every KV group's page size in tokens.
+    /// Sets every cache group's page size in tokens.
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a KV cache.
+    /// Panics when the simulated worker does not expose a prefix cache.
     pub fn set_page_tokens(&mut self, tokens: u32) {
         for group in &mut self
             .info
-            .kv_cache
+            .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a KV cache")
+            .expect("sim AR worker has a prefix cache")
             .groups
         {
             group.page_tokens = tokens;
@@ -1120,16 +1120,16 @@ pub fn sim_canvas_stop_step(request_id: RequestId, block: u32, max_steps: u32) -
     ((request_id.0 as u32).wrapping_add(block) % 3).min(max_steps.saturating_sub(1))
 }
 
-/// Sets every logical KV frontier to the visible token position.
+/// Sets every logical cache frontier to the visible token position.
 /// Deterministic natural-log probability the simulator reports for readout
 /// candidate `token` of request `request_id`: a value in `[-7, -1]`.
 pub fn sim_candidate_logprob(request_id: RequestId, token: u32) -> f32 {
     -1.0 - ((request_id.0.wrapping_add(u64::from(token))) % 7) as f32
 }
 
-fn set_kv_lengths(lengths: &mut RequestOutput, visible: u32) {
-    lengths.kv_visible_len = visible;
-    lengths.kv_computed_len = visible;
+fn set_cache_lengths(lengths: &mut RequestOutput, visible: u32) {
+    lengths.cache_visible_len = visible;
+    lengths.cache_computed_len = visible;
 }
 
 /// Publishes bytes as an immutable POSIX shared-storage artifact.
@@ -1418,8 +1418,8 @@ mod tests {
             transition_output: None,
 
             input_image: None,
-            kv_input: None,
-            kv_output: None,
+            cache_input: None,
+            cache_output: None,
             input_token_ids: Vec::new(),
             readout: None,
             canvas: None,
@@ -1469,8 +1469,8 @@ mod tests {
         // same batch enters where it left off.
         successor.0.coordinates = uniserve_ipc::CallCoordinates {
             logical_position: 2,
-            kv_visible_len: 2,
-            kv_computed_len: 2,
+            cache_visible_len: 2,
+            cache_computed_len: 2,
             flow_step: 0,
         };
         selected.requests.push(successor);
@@ -1497,7 +1497,7 @@ mod tests {
         // Greedy synthetic tokens are 1000 + request_id * 7 + accepted index.
         assert_eq!(outputs[0].committed_tokens, vec![1063]);
         assert_eq!(outputs[1].committed_tokens, vec![1064]);
-        assert_eq!(outputs[1].kv_visible_len, 4);
+        assert_eq!(outputs[1].cache_visible_len, 4);
         executor.close().expect("close simulator");
     }
 

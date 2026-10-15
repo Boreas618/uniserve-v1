@@ -15,7 +15,7 @@ stored into caller-supplied outputs or operands updated in place.
   operations.
 
 Each module pairs an ``unsupported`` eligibility check with its launches;
-``uniserve_models.nn.functional`` validates inputs, allocates outputs, raises on
+``uniserve.nn.functional`` validates inputs, allocates outputs, raises on
 CUDA with the check's reason, and evaluates the same formulas with tensor
 operations off CUDA.
 """

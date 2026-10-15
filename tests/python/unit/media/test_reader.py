@@ -2,7 +2,7 @@
 
 A caller holds a condition's encoded bytes as bytes or as a uint8 tensor of
 its own storage, and takes the decoded pixels as a returned array or in a
-tensor it supplies (``uniserve_models.media.reader``).
+tensor it supplies (``uniserve.media.reader``).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from uniserve_models.media.reader import read_image
+from uniserve.media.reader import read_image
 
 Image = pytest.importorskip("PIL.Image")
 

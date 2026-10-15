@@ -16,7 +16,7 @@ use crate::sampling::SamplingMetadata;
 use crate::storage::BlockTables;
 use crate::{Error, Result};
 
-/// Commit modes of the slot-state commit (`uniserve_models.sampling.state`).
+/// Commit modes of the slot-state commit (`uniserve.sampling.state`).
 pub(super) const DECODE: i64 = 0;
 pub(super) const EXPLICIT: i64 = 1;
 pub(super) const VERIFY: i64 = 2;
@@ -70,7 +70,7 @@ pub(super) fn prepare(
     let decode = mode == ForwardMode::Decode;
     let verify = mode == ForwardMode::Verify;
     let scores = params.prompt_logprobs_requested();
-    let (_, visible, _) = tables.coordinates(slot, output.progress.kv_visible_len)?;
+    let (_, visible, _) = tables.coordinates(slot, output.progress.cache_visible_len)?;
     let tagged = call
         .predicate
         .as_ref()
@@ -140,7 +140,7 @@ pub(super) fn prepare(
             slot,
             source,
             prefix: u32::try_from(visible)
-                .map_err(|_| Error::Invalid("visible KV exceeds the token range".into()))?,
+                .map_err(|_| Error::Invalid("visible cache exceeds the token range".into()))?,
             query: u32::try_from(query)
                 .map_err(|_| Error::Invalid("query exceeds the token range".into()))?,
             selection,
@@ -159,7 +159,7 @@ pub(super) fn prepare(
 
 /// Whether a call samples, and its semantic sampling positions.
 ///
-/// A prefill without a token output only extends KV. Prefill and decode
+/// A prefill without a token output only extends the prefix cache. Prefill and decode
 /// sample after their last token; a verification samples one position per
 /// draft plus its bonus position.
 pub(super) fn sample_positions(
@@ -195,18 +195,18 @@ pub(super) fn metadata(
     Ok((metadata, draws))
 }
 
-/// Check the KV extent a call writes and return it (prefix plus written
+/// Check the cache extent a call writes and return it (prefix plus written
 /// tokens).
 pub(super) fn written_length(tables: &BlockTables, row: &TokenRow, count: u64) -> Result<u64> {
     if count > u64::from(row.query) {
         return Err(Error::Invariant(
-            "KV commit count is outside the task query span".into(),
+            "cache commit count is outside the task query span".into(),
         ));
     }
     let length = u64::from(row.prefix) + count;
     if length > u64::from(tables.allocated_length(row.slot)) {
         return Err(Error::Invariant(
-            "KV task exceeds its scheduler block table".into(),
+            "cache task exceeds its scheduler block table".into(),
         ));
     }
     Ok(length)
@@ -216,7 +216,7 @@ pub(super) fn written_length(tables: &BlockTables, row: &TokenRow, count: u64) -
 /// `[slot, mode, task, cache, logical, sampling, visible, penalties]`.
 ///
 /// `task` is the call's output position among the invocation's sampled
-/// tasks; `None` for a prefill that only extends KV.
+/// tasks; `None` for a prefill that only extends the prefix cache.
 pub(super) fn finish(
     call: &Call,
     output: &mut PendingOutput,

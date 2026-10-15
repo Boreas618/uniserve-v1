@@ -15,12 +15,12 @@ pub const DEFAULT_NUM_UNITS: u64 = 4096;
 
 /// The physical unit pool that fits beside a rank's fixed allocations.
 #[derive(Clone, Copy, Debug)]
-pub struct KVCapacity {
+pub struct CacheCapacity {
     pub unit_bytes: u64,
     pub num_units: u64,
 }
 
-impl KVCapacity {
+impl CacheCapacity {
     /// Explicit token capacity counts whole pages of every cache group.
     /// Automatic sizing gives the pool the remaining complete units; both
     /// modes must leave room for the sentinel and one page of every group.

@@ -6,9 +6,9 @@
 //!
 //! Scheduling admits from its waiting queue and chunks prefill against sequence
 //! and token budgets. A token request with context images or image generation
-//! reserves its worst-case KV blocks at admission; a text-only request needs
+//! reserves its worst-case cache blocks at admission; a text-only request needs
 //! only the blocks of its first prefill chunk. A request larger than the total
-//! KV capacity is rejected. A resident request is never relocated or
+//! cache capacity is rejected. A resident request is never relocated or
 //! preempted: when capacity is short, admission waits.
 //!
 //! Static worker state crosses the boundary once in [`NewRequest`]; subsequent
@@ -48,7 +48,7 @@ pub use config::{
 pub(crate) use execution::generation_consuming_calls;
 pub(crate) use run::{MAX_FLOW_PREFIX_ROWS, flow_prefix_rows};
 pub use stats::{
-    DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
+    DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, PrefixCacheUsage, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
 };
 pub use stats_report::SchedulerStatsReporter;
@@ -85,9 +85,9 @@ use crate::scheduler::generation::{
 };
 
 use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx};
-use crate::kv::{BlockPool, BlockTable, KvAllocation, KvCacheCoordinator};
+use crate::prefix_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
 use crate::storage::{
-    BufferPool, BufferSpan, KVCacheManager, LatentPages, LatentPool, RequestPool, RequestSlot,
+    BufferPool, BufferSpan, LatentPages, LatentPool, PrefixCacheManager, RequestPool, RequestSlot,
 };
 use crossbeam_channel::Receiver;
 use uniserve_core::{
@@ -221,16 +221,16 @@ impl TerminalIntent {
     }
 }
 
-/// Negative-prompt KV prefix of a token request whose image generation uses
+/// Negative-prompt cache prefix of a token request whose image generation uses
 /// more than one guidance branch (`Scheduler::ensure_flow_prefix`).
 ///
-/// The prefix holds its own request-pool slot and KV allocation, separate
+/// The prefix holds its own request-pool slot and cache allocation, separate
 /// from the request's main `RequestAllocations`, until
 /// `Scheduler::free_flow_prefix` releases them after the last denoising step
 /// or the request finishes.
 struct FlowPrefixState {
     allocations: RequestAllocations,
-    /// Units per KV group, as `(group_id, unit_ids)`, not yet declared to the
+    /// Units per cache group, as `(group_id, unit_ids)`, not yet declared to the
     /// worker; the next denoising call drains them as fresh-unit allocations.
     new_units: Vec<(u32, Vec<UnitId>)>,
     /// Set by the first successful denoising completion. Until then every
@@ -540,22 +540,22 @@ fn batch_kind(call_variant: CallKind) -> BatchKind {
         )
         | CallKind::Media(MediaCall::ImageDecoding)
         | CallKind::Transfer(TransferMode::Tensor)
-        | CallKind::Transfer(TransferMode::KvExport)
-        | CallKind::Transfer(TransferMode::KvInstall) => BatchKind::Media,
+        | CallKind::Transfer(TransferMode::CacheExport)
+        | CallKind::Transfer(TransferMode::CacheInstall) => BatchKind::Media,
     }
 }
 
 /// Returns the order in which ready completions are applied; lower values go
 /// first, and equal values keep arrival order.
 ///
-/// Denoising, image decoding, and KV installation completions precede all
+/// Denoising, image decoding, and cache installation completions precede all
 /// other kinds (`Inflight::take_ready_completions` and the resolution pass in
 /// `execution`).
 fn completion_priority(call_variant: CallKind) -> u8 {
     match call_variant {
         CallKind::Media(MediaCall::Denoising)
         | CallKind::Media(MediaCall::ImageDecoding)
-        | CallKind::Transfer(TransferMode::KvInstall) => 0,
+        | CallKind::Transfer(TransferMode::CacheInstall) => 0,
         _ => 1,
     }
 }
@@ -567,15 +567,15 @@ const OUTPUT_JOURNAL_CAPACITY: usize = EVENT_BUFFER_CAPACITY;
 /// free for the request's terminal events.
 const OUTPUT_TERMINAL_RESERVE: usize = 2;
 
-/// KV extent of one planned generation call, in tokens.
+/// Cache extent of one planned generation call, in tokens.
 #[derive(Debug, Clone, Copy)]
-struct KvLengths {
-    /// Tokens the call's KV-writing forward row appends: the prompt slice
+struct CacheLengths {
+    /// Tokens the call's cache-writing forward row appends: the prompt slice
     /// length, the feature write's token capacity, or one for other prefills,
-    /// decode, and verify. Zero for KV export, latent preparation, and
-    /// denoising, which only read the request's KV.
+    /// decode, and verify. Zero for cache export, latent preparation, and
+    /// denoising, which only read the request's prefix cache.
     input: u32,
-    /// Scheduled visible KV length before the call.
+    /// Scheduled visible cache length before the call.
     visible: u32,
 }
 

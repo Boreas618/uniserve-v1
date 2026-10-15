@@ -15,9 +15,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from uniserve_models.backends.experts import TorchBootstrap
-from uniserve_models.backends.experts.deepep import DeepEP
-from uniserve_models.distributed import Communicator
+from uniserve.backends.experts import TorchBootstrap
+from uniserve.backends.experts.deepep import DeepEP
+from uniserve.distributed import Communicator
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

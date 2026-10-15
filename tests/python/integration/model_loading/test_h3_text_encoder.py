@@ -36,12 +36,12 @@ from transformers import (
     Qwen3VLProcessor,
 )
 
-from uniserve_models import loading, qwen3_vl
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.minimax_h3.config import TEXT_FIELDS
-from uniserve_models.minimax_h3.encoder import TextEncoder, TextEncoderConfig
-from uniserve_models.model import TextSize, VisionInput
+from uniserve import loading
+from uniserve.bindings.context import ExecutionContext
+from uniserve.loading import checkpoint, weights
+from uniserve.models import TextSize, VisionInput, qwen3_vl
+from uniserve.models.minimax_h3.config import TEXT_FIELDS
+from uniserve.models.minimax_h3.encoder import TextEncoder, TextEncoderConfig
 
 pytestmark = [
     pytest.mark.integration,

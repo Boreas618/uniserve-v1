@@ -296,8 +296,8 @@ fn call(consumers: Vec<u32>) -> Call {
         readout: None,
         canvas: None,
         input_image: None,
-        kv_input: None,
-        kv_output: None,
+        cache_input: None,
+        cache_output: None,
     }
 }
 

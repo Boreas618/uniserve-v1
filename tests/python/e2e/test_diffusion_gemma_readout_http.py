@@ -2,7 +2,7 @@
 
 Each precision's checkpoint is served by ``uniserve serve`` on one GPU and
 answers ``POST /v1/systemone`` requests end to end: the server plans the
-readout prompts, the engine prefills them into the paged KV cache (image
+readout prompts, the engine prefills them into the paged prefix cache (image
 features included) and denoises every canvas once, and the answers come
 back in the official shape. The tests check what a client observes:
 
@@ -44,7 +44,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
 )
-from uniserve_models import catalog as models
+from uniserve.models import registry as models
 
 pytestmark = [
     pytest.mark.e2e,

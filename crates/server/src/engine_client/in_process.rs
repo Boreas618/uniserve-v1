@@ -9,7 +9,7 @@
 //! or it is dropped.
 //!
 //! A data-parallel deployment runs one engine core per replica
-//! (`EngineCore::replicas`), each with its own scheduler, KV cache and
+//! (`EngineCore::replicas`), each with its own scheduler, prefix cache and
 //! workers. The client routes each submitted request to the live core with
 //! the fewest requests in flight, scanning from a start that advances after
 //! every pick so ties rotate across the replicas. This is SGLang's
@@ -265,10 +265,10 @@ impl EngineClient {
 
     /// Returns the allocatable paged-KV units the schedulers plan against,
     /// summed over the replicas.
-    pub fn total_kv_units(&self) -> u64 {
+    pub fn total_cache_units(&self) -> u64 {
         self.cores
             .iter()
-            .map(|core| u64::from(core.info().kv_usable_units()))
+            .map(|core| u64::from(core.info().cache_usable_units()))
             .sum()
     }
 
@@ -663,8 +663,8 @@ mod tests {
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
                 encoder: ImageIngestStep::VitEncode,
-                num_kv_tokens: None,
-                max_kv_tokens: None,
+                num_cache_tokens: None,
+                max_cache_tokens: None,
             }],
             sample_feedback_continuation: true,
         };

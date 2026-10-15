@@ -82,9 +82,9 @@ pub struct WorkerProcessArgs {
     /// Largest encoded message, in bytes, a rank's channel carries in either
     /// direction: the bound of one frame.
     pub max_message_bytes: usize,
-    /// Optional KV cache capacity expressed in tokens.
-    pub kv_token_capacity: Option<u64>,
-    /// Tokens per KV page of the cache group with the widest token rows;
+    /// Optional prefix cache capacity expressed in tokens.
+    pub cache_token_capacity: Option<u64>,
+    /// Tokens per cache page of the cache group with the widest token rows;
     /// the worker derives every other group's page size from it. `None`
     /// lets the worker choose it from its cache layers and attention
     /// kernels.
@@ -117,12 +117,12 @@ pub struct WorkerProcessArgs {
     pub model_dtype: uniserve_core::ModelDtype,
     /// WorkerGroup-specific quantization policy.
     pub quantization_config: serde_json::Value,
-    /// Numeric data type used by the KV cache, when explicitly selected.
-    pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
+    /// Numeric data type used by the prefix cache, when explicitly selected.
+    pub prefix_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
     /// Each rank's share of its device's total storage, which bounds the
     /// process's static allocations; `WorkerConfig::validate_storage_fraction`
     /// states its range.
-    pub kv_storage_fraction: f64,
+    pub cache_storage_fraction: f64,
     /// Optional device mesh specification for model components.
     pub mesh: Option<String>,
     /// Optional process-world communication backend.
@@ -137,7 +137,7 @@ pub struct WorkerProcessArgs {
     /// startup; without it prefill runs eagerly, for debugging.
     pub prefill_cuda_graph: bool,
     /// Whether any prefill call of the deployment samples a token or scores
-    /// its prompt. Without it every prefill only writes the K/V cache, and
+    /// its prompt. Without it every prefill only writes the prefix cache, and
     /// the worker's prefill graphs stop at the final layer's cache write.
     pub prefill_outputs: bool,
     /// Optional prefill token counts selected for CUDA graph capture.

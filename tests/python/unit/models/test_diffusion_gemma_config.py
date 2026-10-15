@@ -17,7 +17,7 @@ from tests.python.fixtures.model_metadata import (
     diffusion_gemma_metadata,
     read_diffusion_gemma,
 )
-from uniserve_models import diffusion_gemma
+from uniserve.models import diffusion_gemma
 
 pytestmark = pytest.mark.unit
 

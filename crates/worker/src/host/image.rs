@@ -3,7 +3,7 @@
 //! ([`ImageTask`]).
 //!
 //! A decoded image reaches the host as `height * width * 3` bytes in
-//! row-major HWC order (`uniserve_models.media.pixels.quantize_image_hwc`).
+//! row-major HWC order (`uniserve.media.pixels.quantize_image_hwc`).
 //! Encoding runs on a host lane after the device-to-host copy completes. PNG
 //! is lossless, so the delivered pixels equal the quantized ones whatever
 //! the compression; the fast compression level trades output size for

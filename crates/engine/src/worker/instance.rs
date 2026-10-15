@@ -262,7 +262,7 @@ pub struct WorkerGroup {
     /// remains of a retired batch.
     buffers: Vec<VecDeque<WorkerResult>>,
     /// The group's agreed capabilities: rank 0's report with the group-wide
-    /// product storage and KV byte accounting `from_ranks` derives.
+    /// product storage and cache byte accounting `from_ranks` derives.
     info: WorkerInfo,
     /// Physical runs admitted concurrently, from the ranks' queue depth.
     depth: usize,
@@ -560,7 +560,7 @@ impl WorkerGroup {
     /// Every rank must report valid info naming its launched rank, the group's
     /// world size and worker identity, and must agree with rank 0 apart
     /// from rank-specific fields and numerical settings. The muxer must run on
-    /// the head's host, and the ranks' KV regions must cover every layer's KV
+    /// the head's host, and the ranks' cache regions must cover every layer's KV
     /// heads without a gap. Once all checks pass, no rank's startup may be
     /// cancelled and every rank this process started must still be running.
     fn from_ranks(
@@ -617,13 +617,14 @@ impl WorkerGroup {
             );
             // Rank-specific fields take the reference's values before the
             // comparison: the endpoint, device, transfer backends, product
-            // storage, the unit size, and each KV group's layers and head
+            // storage, the unit size, and each cache group's layers and head
             // offset.
             normalized.endpoint = canonical.endpoint.clone();
             normalized.device = canonical.device.clone();
             normalized.transfer_backends = canonical.transfer_backends.clone();
             normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
-            if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
+            if let (Some(local), Some(reference)) =
+                (&mut normalized.prefix_cache, &canonical.prefix_cache)
             {
                 local.unit_bytes = reference.unit_bytes;
                 if local.groups.len() == reference.groups.len() {
@@ -660,10 +661,10 @@ impl WorkerGroup {
         // allowed; a gap is not. The group reports the union of its ranks'
         // layers, which bounds exports, and the largest unit, because
         // the scheduler reserves units shared by every stage.
-        if let Some(cache) = &mut info.kv_cache {
+        if let Some(cache) = &mut info.prefix_cache {
             let regions: Vec<_> = workers
                 .iter()
-                .filter_map(|worker| worker.info().kv_cache.as_ref())
+                .filter_map(|worker| worker.info().prefix_cache.as_ref())
                 .collect();
             let mut owners = BTreeMap::new();
             for (index, group) in cache.groups.iter_mut().enumerate() {
@@ -680,20 +681,20 @@ impl WorkerGroup {
                 for (layer, mut heads) in layers {
                     anyhow::ensure!(
                         *owners.entry(layer).or_insert(index) == index,
-                        "worker KV layer {layer} belongs to two cache groups"
+                        "worker cache layer {layer} belongs to two cache groups"
                     );
                     heads.sort_unstable();
                     let mut covered = 0;
                     for (start, end) in heads {
                         anyhow::ensure!(
                             start <= covered,
-                            "worker KV regions leave a logical head gap"
+                            "worker cache regions leave a logical head gap"
                         );
                         covered = covered.max(end);
                     }
                     anyhow::ensure!(
                         covered == group.total_kv_heads,
-                        "worker KV regions do not cover the heads of layer {layer}"
+                        "worker cache regions do not cover the heads of layer {layer}"
                     );
                 }
                 group.layer_ids = owners
@@ -704,7 +705,7 @@ impl WorkerGroup {
             }
             anyhow::ensure!(
                 owners.keys().copied().eq(0..owners.len() as u32),
-                "worker KV regions do not cover every logical cache layer"
+                "worker cache regions do not cover every logical cache layer"
             );
             cache.unit_bytes = regions
                 .iter()
@@ -1450,16 +1451,17 @@ fn rank_projection(
             .collect();
         // Forward rows are narrowed to the selected calls, and the batch's
         // side tables to what those calls use: their request pool slots,
-        // identities, inputs, KV sources, and buffers.
+        // identities, inputs, cache sources, and buffers.
         projection.forward = batch.forward.select(&indices);
-        // A KV transfer reads or writes its request's pages without a
+        // A cache transfer reads or writes its request's pages without a
         // forward row; a batch carries one call kind, so every page table
-        // of a KV transfer batch belongs to its calls.
-        let transfers_kv = projection.calls.iter().any(|call| {
+        // of a cache transfer batch belongs to its calls.
+        let transfers_cache = projection.calls.iter().any(|call| {
             matches!(
                 call.code,
                 uniserve_ipc::CallKind::Transfer(
-                    uniserve_ipc::TransferMode::KvExport | uniserve_ipc::TransferMode::KvInstall
+                    uniserve_ipc::TransferMode::CacheExport
+                        | uniserve_ipc::TransferMode::CacheInstall
                 )
             )
         });
@@ -1471,10 +1473,10 @@ fn rank_projection(
             .collect::<HashSet<_>>();
         projection
             .block_tables
-            .retain(|table| transfers_kv || slots.contains(&table.request_pool_idx));
+            .retain(|table| transfers_cache || slots.contains(&table.request_pool_idx));
         projection
             .new_cache_units
-            .retain(|units| transfers_kv || slots.contains(&units.request_pool_idx));
+            .retain(|units| transfers_cache || slots.contains(&units.request_pool_idx));
         let identities = projection
             .calls
             .iter()
@@ -1494,11 +1496,11 @@ fn rank_projection(
         projection
             .input_products
             .retain(|payload| inputs.contains(&payload.product));
-        projection.kv_inputs.retain(|export| {
+        projection.cache_inputs.retain(|export| {
             projection
                 .calls
                 .iter()
-                .any(|call| call.kv_input == Some(export.source))
+                .any(|call| call.cache_input == Some(export.source))
         });
         let buffers = inputs
             .iter()
@@ -1723,24 +1725,24 @@ fn validate_and_order_rank_report(
                 }),
             "predicated call published a tensor"
         );
-        if planned.code == uniserve_ipc::CallKind::Transfer(uniserve_ipc::TransferMode::KvExport)
+        if planned.code == uniserve_ipc::CallKind::Transfer(uniserve_ipc::TransferMode::CacheExport)
             && completion.output.status == uniserve_ipc::CallStatus::Ok
         {
             let export = completion
                 .output
-                .kv_output
+                .cache_output
                 .as_ref()
-                .context("successful KV export has no transfer descriptor")?;
+                .context("successful cache export has no transfer descriptor")?;
             anyhow::ensure!(
-                Some(export.source) == planned.kv_output,
-                "KV export differs from its declared output"
+                Some(export.source) == planned.cache_output,
+                "cache export differs from its declared output"
             );
             let bytes = export.tensors().try_fold(0_u64, |sum, tensor| {
                 Ok::<_, uniserve_ipc::ValidationError>(sum.saturating_add(tensor.validate()?))
             })?;
             anyhow::ensure!(
                 bytes <= planned.bounds.max_transfer_bytes,
-                "KV export exceeds its transfer-byte bound"
+                "cache export exceeds its transfer-byte bound"
             );
         }
         ordered.push(completion);
@@ -1755,7 +1757,7 @@ fn validate_and_order_rank_report(
 }
 
 /// Merge one participant into the output owner's result. Accepted progress and
-/// allocation generations agree; KV exports contribute immutable rank locations.
+/// allocation generations agree; cache exports contribute immutable rank locations.
 fn merge_completion_record(
     canonical: &mut CallResult,
     rank_completion: &CallResult,
@@ -1770,8 +1772,8 @@ fn merge_completion_record(
             == rank_completion.output.committed_tokens.as_slice()
             && canonical.output.status == rank_completion.output.status
             && canonical.output.position == rank_completion.output.position
-            && canonical.output.kv_visible_len == rank_completion.output.kv_visible_len
-            && canonical.output.kv_computed_len == rank_completion.output.kv_computed_len
+            && canonical.output.cache_visible_len == rank_completion.output.cache_visible_len
+            && canonical.output.cache_computed_len == rank_completion.output.cache_computed_len
             && canonical.output.num_completed_steps == rank_completion.output.num_completed_steps
             && canonical.output.finish_flags == rank_completion.output.finish_flags,
         "completion result fields diverged"
@@ -1789,12 +1791,12 @@ fn merge_completion_record(
         "designated-rank product generations diverged"
     );
     match (
-        &mut canonical.output.kv_output,
-        &rank_completion.output.kv_output,
+        &mut canonical.output.cache_output,
+        &rank_completion.output.cache_output,
     ) {
         (Some(stored), Some(export)) => stored.merge_locations(export)?,
         (None, None) => {}
-        _ => anyhow::bail!("rank KV export presence diverged"),
+        _ => anyhow::bail!("rank cache export presence diverged"),
     }
     Ok(())
 }
@@ -1942,7 +1944,7 @@ impl WorkerGroup {
                 .map(|(rank, mut batch)| {
                     self.process_args.transfer.bind_inputs(
                         &mut batch.input_products,
-                        &mut batch.kv_inputs,
+                        &mut batch.cache_inputs,
                         &self.workers[rank].info().endpoint,
                     )?;
                     Ok((rank, batch))

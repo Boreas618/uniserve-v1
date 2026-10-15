@@ -242,21 +242,21 @@ impl ImageOwners {
             max_text_tokens: config.max_sequence_tokens,
         };
 
-        // The denoiser's attention geometry and the KV pool its context
+        // The denoiser's attention geometry and the cache pool its context
         // reads.
-        let kv = startup.storage.kv.as_ref();
+        let prefix_cache = startup.storage.prefix_cache.as_ref();
         let denoising = targets
             .iter()
             .any(|target| target.kind == CallKind::Media(MediaCall::Denoising));
         let layout = facts.denoiser;
-        let (bounds, capacity, pool) = match (denoising, kv, layout) {
+        let (bounds, capacity, pool) = match (denoising, prefix_cache, layout) {
             (false, ..) => (None, None, None),
-            (true, Some(kv), Some(layout)) => {
+            (true, Some(prefix_cache), Some(layout)) => {
                 let bounds = TextBounds::new(
                     config,
                     startup.request_slots,
-                    kv.plan(),
-                    Some(kv.planes().num_units()),
+                    prefix_cache.plan(),
+                    Some(prefix_cache.planes().num_units()),
                     config.device.is_cuda(),
                 )?;
                 let tokens = flow_tokens(&layout, config);
@@ -269,12 +269,12 @@ impl ImageOwners {
                     width,
                     graph_widths: bounds.widths.iter().map(|&width| width as usize).collect(),
                 };
-                let pool = kv.pool(interface)?;
+                let pool = prefix_cache.pool(interface)?;
                 (Some(bounds), Some(capacity), Some(pool))
             }
             (true, None, _) => {
                 return Err(Error::Invalid(
-                    "an image denoiser requires a KV cache".into(),
+                    "an image denoiser requires a prefix cache".into(),
                 ));
             }
             (true, _, None) => {
@@ -358,14 +358,14 @@ impl ImageOwners {
                         Some(layout),
                         Some(capacity),
                         Some(bounds),
-                        Some(kv),
+                        Some(prefix_cache),
                         Some(latents),
                         Some(pool),
                     ) = (
                         layout,
                         capacity.clone(),
                         bounds.as_ref(),
-                        kv,
+                        prefix_cache,
                         latents.as_ref(),
                         pool.as_ref(),
                     )
@@ -375,7 +375,7 @@ impl ImageOwners {
                         ));
                     };
                     let samples = latents.workspace()?.clone();
-                    let slot_tables = kv
+                    let slot_tables = prefix_cache
                         .storage()
                         .views()
                         .into_iter()
@@ -405,7 +405,7 @@ impl ImageOwners {
                         },
                     )?;
                     order.push((ImageRunner::Denoiser, setup.owner()));
-                    units = Some(kv.bind_units(interface, target.stream.as_ref())?);
+                    units = Some(prefix_cache.bind_units(interface, target.stream.as_ref())?);
                     diffusion = Some((target.component.clone(), runner));
                 }
                 CallKind::Media(MediaCall::ImageDecoding) => {
@@ -513,7 +513,7 @@ impl ImageOwners {
     }
 }
 
-/// Device bytes an image model's runners allocate beside the KV and latent pools:
+/// Device bytes an image model's runners allocate beside the prefix cache and latent pools:
 /// the denoiser's columns and the decoder's staging.
 pub(crate) fn reserved_bytes(
     config: &WorkerConfig,

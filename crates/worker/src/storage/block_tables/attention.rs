@@ -1,4 +1,4 @@
-//! Visible KV pages for numerical attention inputs.
+//! Visible cache pages for numerical attention inputs.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -72,7 +72,7 @@ impl GroupTable {
     }
 }
 
-/// Select the same page ranges for resident execution and startup scratch KV.
+/// Select the same page ranges for resident execution and startup scratch prefix cache.
 pub fn table_pages(
     tables: &[Vec<Arc<GroupTable>>],
     prefixes: &[u32],

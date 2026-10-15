@@ -5,10 +5,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.interface import graphs
-from uniserve_models.nn import QKVParallelLinear, RMSNorm
-from uniserve_models.nn.attention import RotaryQKVProjection
+from uniserve import cuda_graph
+from uniserve.bindings.context import ExecutionContext
+from uniserve.nn import QKVParallelLinear, RMSNorm
+from uniserve.nn.attention import RotaryQKVProjection
 
 
 class Projection(nn.Module):
@@ -106,8 +106,8 @@ def test_rotary_projection_preserves_qkv_values_and_replay(rows, flow_device):
             # The projection runs on the other device: its allocations go
             # to that device's pool for the capture.
             flow = torch.device(flow_device)
-            pool, *_ = graphs.pool(flow.index)
-            graph = graphs.capture(
+            pool, *_ = cuda_graph.pool(flow.index)
+            graph = cuda_graph.capture(
                 lambda: module(inputs, cos, sin),
                 stream=stream,
                 peers=((flow.index, pool),),

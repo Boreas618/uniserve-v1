@@ -57,7 +57,7 @@ pub struct PrefillStats {
     /// Tokens to be prefilled from local prefix cache.
     #[serde(default)]
     pub num_local_cached_tokens: u32,
-    /// Tokens to be prefilled from external KV transfer.
+    /// Tokens to be prefilled from external cache transfer.
     #[serde(default)]
     pub num_external_cached_tokens: u32,
 }
@@ -358,8 +358,8 @@ pub struct SchedulerStats {
     pub step_counter: u64,
     /// Data-parallel wave number. The engine tracks no waves and reports zero.
     pub current_wave: u64,
-    /// Fraction of usable KV blocks not free (gauge). `1.0` means 100% usage.
-    pub kv_cache_usage: f64,
+    /// Fraction of usable cache blocks not free (gauge). `1.0` means 100% usage.
+    pub prefix_cache_usage: f64,
     /// Requests admitted since the previous stats snapshot.
     #[serde(default)]
     pub num_admitted_reqs: u64,

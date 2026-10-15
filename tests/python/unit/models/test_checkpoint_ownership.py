@@ -12,12 +12,13 @@ from safetensors.torch import save_file
 
 from tests.python.fixtures.checkpoints import bagel_checkpoint
 from tests.python.fixtures.h3 import dmd_denoiser
-from uniserve_models import bagel, loading
-from uniserve_models.distributed import DeviceMesh
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.minimax_h3 import Transformer, TransformerConfig
-from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
-from uniserve_models.minimax_h3.weights import transformer_component
+from uniserve import loading
+from uniserve.distributed import DeviceMesh
+from uniserve.loading import checkpoint, weights
+from uniserve.models import bagel
+from uniserve.models.minimax_h3 import Transformer, TransformerConfig
+from uniserve.models.minimax_h3.config import TRANSFORMER_FIELDS
+from uniserve.models.minimax_h3.weights import transformer_component
 
 pytestmark = pytest.mark.unit
 

@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from uniserve_models.interface import kernels
-from uniserve_models.runner.context import kernel_records
+from uniserve.interface import kernels
+from uniserve.runner.context import kernel_records
 
 pytestmark = pytest.mark.unit
 

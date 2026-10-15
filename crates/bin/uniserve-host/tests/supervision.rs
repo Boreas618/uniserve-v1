@@ -178,7 +178,7 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
     // descriptor; this stand-in is given it in its environment. The package
     // is regular so it shadows any installed worker package.
     let modules = tempfile::tempdir().unwrap();
-    let package = modules.path().join("uniserve_models");
+    let package = modules.path().join("uniserve");
     std::fs::create_dir(&package).unwrap();
     std::fs::write(package.join("__init__.py"), "").unwrap();
     std::fs::write(
@@ -244,7 +244,7 @@ impl StandIn {
     fn spawn(head: &mut Channel, group: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
 
-        // The launcher runs `<python> -m uniserve_models.worker ...`; the
+        // The launcher runs `<python> -m uniserve.worker ...`; the
         // script ignores those arguments.
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("rank");

@@ -19,8 +19,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve_models.media import image, video
-from uniserve_models.minimax_h3.packing import (
+from uniserve.media import image, video
+from uniserve.models import Condition, ConditionRole
+from uniserve.models.minimax_h3.packing import (
     AUDIO_CONDITION_GROUP,
     AUDIO_GROUP,
     VIDEO_GROUP,
@@ -30,9 +31,8 @@ from uniserve_models.minimax_h3.packing import (
     region_tables,
     region_tiles,
 )
-from uniserve_models.model import Condition, ConditionRole
-from uniserve_models.nn.attention import vsa
-from uniserve_models.nn.attention.vsa.regions import select
+from uniserve.nn.attention import vsa
+from uniserve.nn.attention.vsa.regions import select
 
 pytestmark = pytest.mark.unit
 

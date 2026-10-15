@@ -6,7 +6,7 @@
 //! owner thread. Frontends submit and control requests through a cloneable
 //! `EngineHandle` (`handle`) and receive each request's events on its
 //! `EventRx`. On the owner thread, the `Scheduler` (`scheduler`) admits
-//! requests, assigns KV pages (`kv`) and other worker storage (`storage`),
+//! requests, assigns cache pages (`prefix_cache`) and other worker storage (`storage`),
 //! and submits calls through the `Executor` trait (`executor`);
 //! `WorkerExecutor` (`worker`) splits each batch into per-worker submissions
 //! to the worker processes.
@@ -18,7 +18,7 @@
 mod core;
 mod executor;
 mod handle;
-mod kv;
+mod prefix_cache;
 mod scheduler;
 #[cfg(feature = "testing")]
 mod sim;
@@ -42,7 +42,7 @@ pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, DomainStats, EncoderStats,
-    ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats, Scheduler, SchedulerConfig,
+    ExecutionDomainStats, GeneralStats, PrefixCacheUsage, PrefixStats, Scheduler, SchedulerConfig,
     SchedulerStats, SchedulerStatsReporter, SchedulingPolicy, TimingStats, WorkerStats,
 };
 #[cfg(feature = "testing")]

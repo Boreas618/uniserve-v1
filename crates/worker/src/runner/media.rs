@@ -2,7 +2,7 @@
 //! and MP4 assembly.
 //!
 //! Host media has no model. [`MediaRunner`] calls the functions of the
-//! Python library's `uniserve_models.media` (and the model's patch packing)
+//! Python library's `uniserve.media` (and the model's patch packing)
 //! by import path. Host calls run as tasks on the rank's host lane (see
 //! [`crate::host::task`]); execution reserves their outputs, configures and
 //! submits the tasks and commits the batch. Their outputs stay deferred
@@ -33,9 +33,9 @@ use crate::{Error, ProductBuffer, Result};
 /// lane they run on.
 pub(crate) struct MediaRunner {
     pub(crate) reader: Option<Arc<ConditionReader>>,
-    /// `uniserve_models.media.codec.encode_video_unit`.
+    /// `uniserve.media.codec.encode_video_unit`.
     encode_video: Function,
-    /// `uniserve_models.media.codec.encode_audio_track`.
+    /// `uniserve.media.codec.encode_audio_track`.
     encode_audio: Function,
     pub(crate) mux: MuxFunctions,
     pub(crate) lane: HostLane<MediaTask>,
@@ -65,8 +65,8 @@ impl MediaRunner {
         };
         Ok(Self {
             reader,
-            encode_video: interface.import("uniserve_models.media.codec.encode_video_unit")?,
-            encode_audio: interface.import("uniserve_models.media.codec.encode_audio_track")?,
+            encode_video: interface.import("uniserve.media.codec.encode_video_unit")?,
+            encode_audio: interface.import("uniserve.media.codec.encode_audio_track")?,
             mux: MuxFunctions::new(interface)?,
             lane: HostLane::new(capacity, 1, "uniserve-media")?,
             components,

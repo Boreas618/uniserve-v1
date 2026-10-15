@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 from uniserve_kernels.attention.vsa_tiles import compose_to_head_shards
 
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.nn.attention import vsa
+from uniserve.bindings.context import ExecutionContext
+from uniserve.nn.attention import vsa
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

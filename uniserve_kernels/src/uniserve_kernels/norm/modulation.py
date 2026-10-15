@@ -11,7 +11,7 @@ floating-point contraction: Triton evaluates a BF16 round trip as native BF16
 arithmetic, and a contracted multiply-add would round the rounded product's
 sum only once.
 
-``uniserve_models.nn.functional`` owns validation and raises on CUDA when
+``uniserve.nn.functional`` owns validation and raises on CUDA when
 :func:`unsupported` reports a reason.
 """
 

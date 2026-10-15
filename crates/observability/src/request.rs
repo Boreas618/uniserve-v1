@@ -196,13 +196,13 @@ pub struct RequestMetrics {
         init = Family::new_with_constructor(request_params_n_histogram as fn() -> Histogram)
     )]
     pub request_params_n: HistogramFamily,
-    /// Newly computed prefill KV token distribution.
+    /// Newly computed prefill cache token distribution.
     #[metric(
         name = "uniserve:request_prefill_kv_computed_tokens",
         help = "Histogram of new KV tokens computed during prefill (excluding cached tokens).",
         init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
     )]
-    pub request_prefill_kv_computed_tokens: HistogramFamily,
+    pub request_prefill_cache_computed_tokens: HistogramFamily,
     /// Time-to-first-token distribution in seconds.
     #[metric(
         name = "uniserve:time_to_first_token_seconds",

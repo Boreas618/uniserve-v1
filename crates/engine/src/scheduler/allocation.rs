@@ -1,7 +1,7 @@
 //! Request backing and retained encoder exports owned by the scheduler.
 //!
 //! The scheduler owns the logical allocation of worker-side storage: it
-//! chooses request rows, KV pages, latent pages, and buffer byte spans, and
+//! chooses request rows, cache pages, latent pages, and buffer byte spans, and
 //! workers use the addresses they are handed. Allocations follow a request
 //! from admission (`RequestAllocations`, `MediaAllocations`) through
 //! retirement: a finished request registered with its workers parks its
@@ -14,9 +14,9 @@ use uniserve_ipc::BufferId;
 
 /// Logical storage reservations and retained exports owned by the engine.
 pub(super) struct Storage {
-    /// Text KV pages and prefix cache; `None` when the runtime has no KV cache.
-    pub(super) cache: Option<KVCacheManager>,
-    pub(super) encoder_cache: crate::kv::EncoderCacheManager,
+    /// Text cache pages and prefix cache; `None` when the runtime has no prefix cache.
+    pub(super) cache: Option<PrefixCacheManager>,
+    pub(super) encoder_cache: crate::prefix_cache::EncoderCacheManager,
     /// Encoder-cache entries promised to admitted requests. `admit` checks it
     /// against `EncoderCacheManager::budget` only for requests that reserve
     /// their worst case.
@@ -25,7 +25,7 @@ pub(super) struct Storage {
     /// the runtime's `request_slots`.
     pub(super) request_pool: RequestPool,
     pub(super) latent_pool: LatentPool,
-    /// KV units reserved by admitted worst-case requests.
+    /// Cache units reserved by admitted worst-case requests.
     pub(super) reserved_units: usize,
     /// Byte spans of persistent products in the runtime's buffer pool.
     pub(super) buffer_pool: BufferPool,
@@ -85,22 +85,24 @@ impl Storage {
         Ok(())
     }
 
-    /// Returns the text KV cache, which exists when the worker serves token
+    /// Returns the text prefix cache, which exists when the worker serves token
     /// generation; token requests are rejected at submission without it.
-    pub(super) fn cache(&self) -> Option<&KVCacheManager> {
+    pub(super) fn cache(&self) -> Option<&PrefixCacheManager> {
         self.cache.as_ref()
     }
 
-    /// Returns the queued KV units, including cached ones allocation evicts.
+    /// Returns the queued cache units, including cached ones allocation evicts.
     pub(super) fn free_units(&self) -> usize {
         self.cache
             .as_ref()
             .map_or(0, |cache| cache.block_pool.free_units())
     }
 
-    /// Returns the KV units the scheduler may allocate.
+    /// Returns the cache units the scheduler may allocate.
     pub(super) fn usable_units(&self) -> usize {
-        self.cache.as_ref().map_or(0, KVCacheManager::usable_units)
+        self.cache
+            .as_ref()
+            .map_or(0, PrefixCacheManager::usable_units)
     }
 
     /// Transfer the existing Tensor allocation to encoder-cache retention.
@@ -165,8 +167,8 @@ pub(super) struct RetiringRequest {
 /// shared pools.
 pub(super) struct RequestAllocations {
     pub(super) request_slot: RequestSlot,
-    /// One block table per KV cache group.
-    pub(super) kv: KvAllocation,
+    /// One block table per cache group.
+    pub(super) prefix_cache: CacheAllocation,
     /// Latent pages of the current image trajectory, reserved by its latent
     /// preparation or denoising call on a worker that tracks image latents
     /// and released when its image decoding completes or with the request's
@@ -184,7 +186,7 @@ impl RequestAllocations {
 
     /// Returns shared access to the request block tables.
     pub(super) fn block_tables(&self) -> &[BlockTable] {
-        &self.kv.tables
+        &self.prefix_cache.tables
     }
 
     /// Takes ownership of the request buffer allocation.
@@ -194,7 +196,7 @@ impl RequestAllocations {
 
     /// Releases each resource through its owning pool.
     ///
-    /// KV units need no explicit release: each page in `kv` is a counted
+    /// Cache units need no explicit release: each page in `prefix_cache` is a counted
     /// reference, dropped with `self`.
     pub(super) fn free(self, storage: &mut Storage) {
         for buffer in self.buffers.into_values() {

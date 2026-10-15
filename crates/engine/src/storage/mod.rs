@@ -1,25 +1,25 @@
-//! Scheduler-owned request slots, KV references, latent pages, and Tensor spans.
+//! Scheduler-owned request slots, cache references, latent pages, and Tensor spans.
 //!
 //! Each pool allocates its actual backing. Worker addresses are assembled from
 //! these owned allocations when constructing a batch; no region copies persist.
 //!
 //! The backing storage itself lives in the worker processes, which report its
 //! capacity in `WorkerInfo`; these pools assign its rows, units, pages, and
-//! byte ranges. Row zero of the request state, unit zero of the KV pool and
+//! byte ranges. Row zero of the request state, unit zero of the cache pool and
 //! page zero of the latent pool are the worker's inactive sentinels, so no
 //! pool ever hands them out, and the worker IPC validation rejects a request
-//! row, KV unit or latent page of zero.
+//! row, cache unit or latent page of zero.
 //!
 //! An allocation is an owned, non-`Clone` value that the issuing pool's `free`
 //! consumes; the value does not record which pool issued it, so the caller
-//! returns it to the right one. `KvAllocation` has no `free`: its units return
+//! returns it to the right one. `CacheAllocation` has no `free`: its units return
 //! to the `BlockPool` when its tables drop.
 
 use uniserve_core::{ByteAllocator, HashAlgo};
 use uniserve_ipc::{RequestKey, WorkerInfo};
 
-pub(crate) use crate::kv::KvAllocation;
-use crate::kv::{BlockPool, GroupShape, KvCacheCoordinator};
+pub(crate) use crate::prefix_cache::CacheAllocation;
+use crate::prefix_cache::{BlockPool, GroupShape, PrefixCacheCoordinator};
 
 /// Owned request row, returned only after its request epoch retires.
 ///
@@ -64,8 +64,8 @@ pub enum OutOfStorage {
     /// No request-state row remains available.
     RequestSlots,
     #[error("KV unit capacity is exhausted")]
-    /// The paged KV unit pool cannot satisfy the requested token capacity.
-    Kv,
+    /// The paged cache unit pool cannot satisfy the requested token capacity.
+    PrefixCache,
     #[error("latent page capacity is exhausted")]
     /// The latent page pool cannot satisfy the requested trajectory capacity.
     Latent,
@@ -176,26 +176,32 @@ impl LatentPool {
     }
 }
 
-/// KV unit pool and cross-group coordination derived from worker
+/// Cache unit pool and cross-group coordination derived from worker
 /// capabilities.
-pub(crate) struct KVCacheManager {
+pub(crate) struct PrefixCacheManager {
     pub(crate) block_pool: BlockPool,
-    pub(crate) coordinator: KvCacheCoordinator,
+    pub(crate) coordinator: PrefixCacheCoordinator,
 }
 
-impl KVCacheManager {
-    /// Builds scheduler KV state when a worker advertises a paged unit pool.
+impl PrefixCacheManager {
+    /// Builds scheduler cache state when a worker advertises a paged unit pool.
     ///
-    /// Returns `None` when `info` has no KV cache. `BlockPool::new` panics on
+    /// Returns `None` when `info` has no prefix cache. `BlockPool::new` panics on
     /// a pool without an allocatable unit and `BlockTable::new` on an empty
-    /// page shape; `KvCacheInfo::validate` rejects each of these.
+    /// page shape; `PrefixCacheInfo::validate` rejects each of these.
     pub(crate) fn from_worker_info(info: &WorkerInfo) -> Option<Self> {
-        info.kv_cache.as_ref().map(|kv_cache| KVCacheManager {
-            block_pool: BlockPool::new(kv_cache.num_units),
-            coordinator: KvCacheCoordinator::new(
-                kv_cache.groups.iter().map(GroupShape::from_group).collect(),
-            ),
-        })
+        info.prefix_cache
+            .as_ref()
+            .map(|prefix_cache| PrefixCacheManager {
+                block_pool: BlockPool::new(prefix_cache.num_units),
+                coordinator: PrefixCacheCoordinator::new(
+                    prefix_cache
+                        .groups
+                        .iter()
+                        .map(GroupShape::from_group)
+                        .collect(),
+                ),
+            })
     }
 
     /// Returns the units the scheduler may allocate, excluding the sentinel.
@@ -300,14 +306,14 @@ impl BufferPool {
     }
 }
 
-impl KVCacheManager {
+impl PrefixCacheManager {
     /// Acquire one table per cache group holding `tokens` tokens for a read
     /// from token zero, atomically.
-    pub(crate) fn allocate(&self, tokens: u32) -> Result<KvAllocation, OutOfStorage> {
+    pub(crate) fn allocate(&self, tokens: u32) -> Result<CacheAllocation, OutOfStorage> {
         let mut allocation = self.coordinator.empty();
         self.coordinator
             .ensure_capacity(&self.block_pool, &mut allocation, 0, tokens as usize)
-            .ok_or(OutOfStorage::Kv)?;
+            .ok_or(OutOfStorage::PrefixCache)?;
         Ok(allocation)
     }
 
@@ -316,7 +322,7 @@ impl KVCacheManager {
     /// references.
     pub(crate) fn grow(
         &self,
-        allocation: &mut KvAllocation,
+        allocation: &mut CacheAllocation,
         read_start: u32,
         tokens: u32,
     ) -> Result<(), OutOfStorage> {
@@ -327,10 +333,10 @@ impl KVCacheManager {
                 read_start as usize,
                 tokens as usize,
             )
-            .ok_or(OutOfStorage::Kv)
+            .ok_or(OutOfStorage::PrefixCache)
     }
 
-    pub(crate) fn set_prefix_cache(&mut self, enabled: bool) {
+    pub(crate) fn set_prefix_reuse(&mut self, enabled: bool) {
         self.coordinator.set_prefix_enabled(enabled);
     }
 

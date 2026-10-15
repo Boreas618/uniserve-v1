@@ -14,18 +14,18 @@ from huggingface_hub.utils import SafetensorsFileMetadata, TensorInfo
 from safetensors.torch import load_file, save_file
 
 from tests.python.fixtures.checkpoints import qwen_checkpoint
-from uniserve_models import catalog as models
-from uniserve_models import loading
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.loading import weights
-from uniserve_models.model import TextInput, TextSize
-from uniserve_models.nn.attention import (
+from uniserve import loading
+from uniserve.bindings.context import ExecutionContext
+from uniserve.loading import weights
+from uniserve.models import TextInput, TextSize
+from uniserve.models import registry as models
+from uniserve.nn.attention import (
     AttentionBatch,
     SequenceLengths,
     VarlenInput,
 )
-from uniserve_models.processing import load_tokenizer
-from uniserve_models.quantization import (
+from uniserve.processing import load_tokenizer
+from uniserve.quantization import (
     QuantizationConfig,
     QuantizedTensor,
     Quantizer,

@@ -1,4 +1,4 @@
-"""Observable full-sequence decoder behavior without resident KV storage."""
+"""Observable full-sequence decoder behavior without resident cache storage."""
 
 from __future__ import annotations
 
@@ -6,12 +6,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_models.nn.attention import (
+from uniserve.models.qwen3 import Config, Transformer
+from uniserve.nn.attention import (
     AttentionBatch,
     SequenceLengths,
     VarlenInput,
 )
-from uniserve_models.qwen3 import Config, Transformer
 
 pytestmark = pytest.mark.unit
 
@@ -113,7 +113,7 @@ def test_full_sequence_decoder_returns_requested_residual_stream(
 @pytest.mark.parametrize("factor", [None, 2.0])
 @pytest.mark.parametrize("dim", [16, 32])
 def test_axis_rotary_preserves_full_frequency_range(dim, factor):
-    from uniserve_models.nn.rope import LinearScaling, RotaryEmbedding
+    from uniserve.nn.rope import LinearScaling, RotaryEmbedding
 
     theta = 10000.0
     rotary = RotaryEmbedding(

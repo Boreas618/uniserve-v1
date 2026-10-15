@@ -4,7 +4,7 @@
 //! scheduler, worker protocol, and simulation runtime. This root module holds
 //! request and call identities, wall-clock and monotonic clocks, dtype wire
 //! names, [`SamplingParams`] and [`ImageParams`] with their request
-//! validation, KV-cache descriptors, and the [`CommandWaker`] that interrupts
+//! validation, prefix-cache descriptors, and the [`CommandWaker`] that interrupts
 //! an engine waiting for commands.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -157,7 +157,7 @@ pub fn now_monotonic_us() -> u64 {
 /// Process-wide origin shared by the monotonic clocks, set on first use.
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// Index of a physical allocation unit in the paged KV pool.
+/// Index of a physical allocation unit in the paged cache pool.
 ///
 /// The engine's block pool allocates units, and a block table maps each
 /// logical page of a cache group onto that group's number of units; worker
@@ -261,7 +261,7 @@ pub struct ModelDtypeParseError(String);
 
 /// Storage dtype used by paged key/value cache tensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum KvCacheDtype {
+pub enum PrefixCacheDtype {
     /// IEEE 754 half precision.
     #[serde(rename = "float16")]
     Float16,
@@ -276,7 +276,7 @@ pub enum KvCacheDtype {
     Float8E4m3Fn,
 }
 
-impl KvCacheDtype {
+impl PrefixCacheDtype {
     /// Returns the stable wire name for this dtype.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -288,32 +288,32 @@ impl KvCacheDtype {
     }
 }
 
-impl std::str::FromStr for KvCacheDtype {
-    type Err = KvCacheDtypeParseError;
+impl std::str::FromStr for PrefixCacheDtype {
+    type Err = PrefixCacheDtypeParseError;
 
-    /// Parses a stable KV-cache dtype wire name.
+    /// Parses a stable prefix-cache dtype wire name.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "float16" => Ok(Self::Float16),
             "bfloat16" => Ok(Self::BFloat16),
             "float32" => Ok(Self::Float32),
             "float8_e4m3fn" => Ok(Self::Float8E4m3Fn),
-            _ => Err(KvCacheDtypeParseError(value.to_owned())),
+            _ => Err(PrefixCacheDtypeParseError(value.to_owned())),
         }
     }
 }
 
-impl std::fmt::Display for KvCacheDtype {
-    /// Writes the stable KV-cache dtype wire name.
+impl std::fmt::Display for PrefixCacheDtype {
+    /// Writes the stable prefix-cache dtype wire name.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-/// Error returned for an unsupported KV-cache dtype string.
+/// Error returned for an unsupported prefix-cache dtype string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported KV-cache dtype {0:?}")]
-pub struct KvCacheDtypeParseError(String);
+pub struct PrefixCacheDtypeParseError(String);
 
 /// Text sampling parameters.
 ///
@@ -328,7 +328,7 @@ pub struct KvCacheDtypeParseError(String);
 /// state.
 ///
 /// The worker receives these fields in a request's admission message and
-/// stages them for the Python samplers in `uniserve_models.sampling`. All consumers share this FP32 representation
+/// stages them for the Python samplers in `uniserve.sampling`. All consumers share this FP32 representation
 /// and its numerical validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
@@ -885,14 +885,14 @@ pub struct CfgParams {
     pub interval: (f32, f32),
 }
 
-/// History retention policy of a KV-cache group.
+/// History retention policy of a cache group.
 ///
 /// A model whose layers read different histories (for example full and
 /// sliding-window attention) reports one group per policy and page shape.
 /// Every group draws its pages from the same unit pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum KvGroupKind {
+pub enum CacheGroupKind {
     /// Full attention: every page is retained for the request's lifetime.
     #[default]
     Full,
@@ -911,7 +911,7 @@ pub enum KvGroupKind {
     },
 }
 
-impl KvGroupKind {
+impl CacheGroupKind {
     /// Returns the history bound in tokens, or `None` for full attention.
     pub const fn window(self) -> Option<u32> {
         match self {
@@ -921,15 +921,15 @@ impl KvGroupKind {
     }
 }
 
-/// One KV-cache group of a worker's unit pool, reported at handshake.
+/// One cache group of a worker's unit pool, reported at handshake.
 ///
 /// A logical page of the group holds `page_tokens` tokens of every layer in
 /// the group and occupies `units_per_page` physical units. Unit and column
 /// geometry belong to the worker; the scheduler only needs the page shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvCacheGroup {
+pub struct CacheGroup {
     /// History retention policy of the group.
-    pub kind: KvGroupKind,
+    pub kind: CacheGroupKind,
     /// Tokens stored per logical page; a power of two.
     pub page_tokens: u32,
     /// Physical units one logical page occupies.
@@ -947,7 +947,7 @@ pub struct KvCacheGroup {
     pub head_dim: u32,
 }
 
-impl KvCacheGroup {
+impl CacheGroup {
     /// Whether two groups share retention policy, page shape and logical head
     /// geometry, whatever layers and heads each rank stores.
     pub fn same_page_shape(&self, other: &Self) -> bool {

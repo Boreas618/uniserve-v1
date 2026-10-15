@@ -7,7 +7,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from uniserve_models.interface.graphs import capture, export, pool
+from uniserve.cuda_graph import capture, export, pool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

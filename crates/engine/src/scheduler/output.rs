@@ -394,9 +394,9 @@ impl Scheduler {
                     is_feedback_computation(&call),
                 ) {
                     // A prefill with neither image features nor a token output
-                    // is the `CloseKv` write. It publishes nothing, and
+                    // is the `CloseCache` write. It publishes nothing, and
                     // `process_generation_result` has already moved the request
-                    // to `PublishKv`.
+                    // to `PublishCache`.
                     (false, _) if !is_prompt_extend(&call) => return,
                     // Latent input-image block ingest. The encoder index wraps
                     // to zero once the image's last block has been written.
@@ -943,8 +943,8 @@ impl Scheduler {
             | CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::VideoEncoding)
             | CallKind::Transfer(TransferMode::Tensor)
-            | CallKind::Transfer(TransferMode::KvExport)
-            | CallKind::Transfer(TransferMode::KvInstall) => {}
+            | CallKind::Transfer(TransferMode::CacheExport)
+            | CallKind::Transfer(TransferMode::CacheInstall) => {}
         }
     }
 
@@ -1047,18 +1047,18 @@ impl Scheduler {
         }
     }
 
-    /// Converts a worst-case KV reservation into concrete generation-branch capacity.
+    /// Converts a worst-case cache reservation into concrete generation-branch capacity.
     ///
     /// Succeeds, clearing `image_reservation_pending`, when the request reserves
     /// its worst-case envelope and every block table already covers
-    /// `max_reserved_kv_tokens` tokens. Otherwise finishes the request with
+    /// `max_reserved_cache_tokens` tokens. Otherwise finishes the request with
     /// `FinishReason::Error` and returns `false`; a request that is not running
     /// also returns `false`.
     pub(super) fn promote_gen_branch_reservation(&mut self, id: RequestId) -> bool {
         let Some((required_tokens, reserves_envelope)) = self
             .running
             .get(&id)
-            .map(|st| (st.max_reserved_kv_tokens, st.reserve_worstcase))
+            .map(|st| (st.max_reserved_cache_tokens, st.reserve_worstcase))
         else {
             return false;
         };
@@ -1083,8 +1083,8 @@ impl Scheduler {
 
     /// Opens the next image-generation branch.
     ///
-    /// Moves the request to `Phase::CloseKv` under a new `image_id` and checks
-    /// its KV reservation, which can finish the request with an error. When
+    /// Moves the request to `Phase::CloseCache` under a new `image_id` and checks
+    /// its cache reservation, which can finish the request with an error. When
     /// calls of the request are still in flight, its speculative chain is
     /// marked invalidated: those results are discarded on arrival, and nothing
     /// new is scheduled for the request until they drain.
@@ -1097,7 +1097,7 @@ impl Scheduler {
             st.denoising.close();
             st.image_id += 1;
             st.text_tokens_since_image = 0;
-            st.phase = Phase::CloseKv;
+            st.phase = Phase::CloseCache;
             st.image_reservation_pending = true;
         }
         self.promote_gen_branch_reservation(id);
@@ -1488,7 +1488,7 @@ impl Scheduler {
                 image_id = state.image_id,
                 denoise_steps_done = state.denoising.completed(),
                 logical_position = state.logical_position,
-                physical_kv_len = state.kv_visible_len,
+                physical_cache_len = state.cache_visible_len,
                 "scheduler request terminated with an internal error"
             );
         }
@@ -1547,7 +1547,7 @@ impl Scheduler {
                 let reserved = self.storage.cache().map_or(0, |cache| {
                     cache
                         .coordinator
-                        .units_for_tokens(st.max_reserved_kv_tokens)
+                        .units_for_tokens(st.max_reserved_cache_tokens)
                 });
                 self.storage.reserved_units = self.storage.reserved_units.saturating_sub(reserved);
             }
@@ -1596,7 +1596,7 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    /// Applies a completed forward's accepted KV extent to the request's
+    /// Applies a completed forward's accepted cache extent to the request's
     /// cache tables.
     ///
     /// First publishes the prompt pages the request has now computed, keyed
@@ -1605,9 +1605,9 @@ impl Scheduler {
     /// holds it. Then retires the sliding-window pages no later reader needs:
     /// calls apply in submission order, so every earlier reader has
     /// completed, and later calls read no history before the accepted extent
-    /// minus the window. A request without its prefill worker or KV cache
+    /// minus the window. A request without its prefill worker or prefix cache
     /// breaks a scheduler invariant.
-    pub(super) fn advance_request_kv(&mut self, id: RequestId) {
+    pub(super) fn advance_request_cache(&mut self, id: RequestId) {
         let Some(state) = self.running.get(&id) else {
             return;
         };
@@ -1624,13 +1624,13 @@ impl Scheduler {
                     .find(|(id, _)| id == worker)
             })
             .map(|(_, worker)| Arc::new(worker.endpoint.clone()));
-        let (Some(source), Some(state), Some(kv)) = (
+        let (Some(source), Some(state), Some(prefix_cache)) = (
             source,
             self.running.get_mut(&id),
             self.storage.cache.as_ref(),
         ) else {
             self.invariant_broken(
-                "a prefilled request keeps its loaded prefill worker and KV cache",
+                "a prefilled request keeps its loaded prefill worker and prefix cache",
             );
             return;
         };
@@ -1641,11 +1641,11 @@ impl Scheduler {
         let hashes = std::mem::take(&mut state.prefix_page_hashes);
         let mut published = std::mem::take(&mut state.prefix_published);
         let computed = state.num_computed_prompt_tokens as usize;
-        let visible = state.kv_visible_len as usize;
+        let visible = state.cache_visible_len as usize;
         let cache_write = state.req.cache.write;
-        let advanced = state.kv_mut().is_some_and(|allocation| {
-            kv.coordinator.publish_prompt(
-                &kv.block_pool,
+        let advanced = state.prefix_cache_mut().is_some_and(|allocation| {
+            prefix_cache.coordinator.publish_prompt(
+                &prefix_cache.block_pool,
                 allocation,
                 &prompt,
                 &hashes,
@@ -1653,13 +1653,13 @@ impl Scheduler {
                 &mut published,
                 cache_write,
                 &source,
-            ) && kv.coordinator.release_window(allocation, visible)
+            ) && prefix_cache.coordinator.release_window(allocation, visible)
         });
         state.req.prompt_token_ids = prompt;
         state.prefix_page_hashes = hashes;
         state.prefix_published = published;
         if !advanced {
-            self.invariant_broken("an admitted request's KV tables match the cache groups");
+            self.invariant_broken("an admitted request's cache tables match the cache groups");
         }
     }
 }

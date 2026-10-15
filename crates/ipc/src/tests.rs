@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use uniserve_core::{CfgRenorm, KvGroupKind, RequestId, UnitId};
+use uniserve_core::{CacheGroupKind, CfgRenorm, RequestId, UnitId};
 
 use super::*;
 
@@ -39,8 +39,8 @@ fn ar_decode_call() -> Call {
         token_input: None,
         coordinates: CallCoordinates {
             logical_position: 7,
-            kv_visible_len: 5,
-            kv_computed_len: 6,
+            cache_visible_len: 5,
+            cache_computed_len: 6,
             flow_step: 0,
         },
 
@@ -56,8 +56,8 @@ fn ar_decode_call() -> Call {
         transition_output: None,
 
         input_image: None,
-        kv_input: None,
-        kv_output: None,
+        cache_input: None,
+        cache_output: None,
         input_token_ids: Vec::new(),
         readout: None,
         canvas: None,
@@ -68,7 +68,7 @@ fn ar_decode_call() -> Call {
         code: kind,
         bounds: Bounds {
             max_tokens: 1,
-            max_kv_units: 1,
+            max_cache_units: 1,
             ..Bounds::default()
         },
         inputs: Vec::new(),
@@ -111,15 +111,15 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         transition_output: None,
 
         input_image: None,
-        kv_input: (kind == CallKind::Transfer(TransferMode::KvInstall)).then_some(BufferId {
+        cache_input: (kind == CallKind::Transfer(TransferMode::CacheInstall)).then_some(BufferId {
             owner: request_key(),
             producer_call_id: CallId::new(1, 0),
             output_index: 0,
             generation: 1,
         }),
-        kv_output: matches!(
+        cache_output: matches!(
             kind,
-            CallKind::Transfer(TransferMode::KvExport | TransferMode::KvInstall)
+            CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
         )
         .then_some(BufferId {
             owner: request_key(),
@@ -181,15 +181,15 @@ fn completion_record() -> RequestOutput {
         timing_counters: TimingCounters::default(),
         code: CallKind::Forward(ForwardMode::Decode),
         position: 5,
-        kv_visible_len: 5,
-        kv_computed_len: 5,
+        cache_visible_len: 5,
+        cache_computed_len: 5,
         num_completed_steps: 0,
 
         committed_tokens: vec![271],
         candidate_logprobs: Vec::new(),
         finish_flags: FinishFlags::default(),
         media_output: None,
-        kv_output: None,
+        cache_output: None,
     }
 }
 
@@ -354,7 +354,7 @@ fn forward_columns_preserve_cfg_rows_and_reject_misalignment() {
         request_pool_indices: vec![2, 1, 2],
         seq_lens: vec![2, 17, 6],
         query_lens: vec![2, 4, 4],
-        write_kv: vec![true, false, false],
+        write_cache: vec![true, false, false],
     };
     assert_eq!(execute_round_trip(run.clone()), run);
 
@@ -402,7 +402,7 @@ fn computation_coordinates_survive_physical_dispatch_and_reject_collisions() {
 
 /// Builds a batch around `calls` with the planner columns `Batch::validate`
 /// expects for them: a buffer allocation for every declared buffer output, a
-/// block table, cache-page allocation, and forward row for every call with KV
+/// block table, cache-page allocation, and forward row for every call with cache
 /// page capacity, latent params for every call that addresses a trajectory,
 /// and a decode range for every video or audio decode or encode call.
 fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>) -> Batch {
@@ -423,7 +423,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             });
             next_buffer_offset += bytes;
         }
-        let capacity_units = call.bounds.max_kv_units;
+        let capacity_units = call.bounds.max_cache_units;
         if capacity_units > 0 {
             // The request id doubles as the request pool slot, which forward
             // rows, block tables, and unit allocations require to be positive.
@@ -744,8 +744,8 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             transition_output: None,
 
             input_image: None,
-            kv_input: None,
-            kv_output: None,
+            cache_input: None,
+            cache_output: None,
             input_token_ids: Vec::new(),
             readout: None,
             canvas: None,
@@ -952,7 +952,7 @@ fn tensor_export_preserves_static_axes_within_dynamic_capacity() {
 }
 
 #[test]
-fn unchanged_kv_export_round_trips_without_physical_tensors() {
+fn unchanged_cache_export_round_trips_without_physical_tensors() {
     let source = BufferId {
         owner: request_key(),
         producer_call_id: CallId::new(11, 0),
@@ -962,8 +962,8 @@ fn unchanged_kv_export_round_trips_without_physical_tensors() {
     let mut report = lane_report(
         5,
         vec![RequestOutput {
-            code: CallKind::Transfer(TransferMode::KvExport),
-            kv_output: Some(KvTransfer {
+            code: CallKind::Transfer(TransferMode::CacheExport),
+            cache_output: Some(CacheTransfer {
                 groups: Vec::new(),
                 source,
                 destination: "decoder".into(),
@@ -982,9 +982,9 @@ fn unchanged_kv_export_round_trips_without_physical_tensors() {
     assert_eq!(decoded.report().unwrap(), &report);
 
     // A grown extent must carry the tensors of its suffix.
-    let KvTransfer {
+    let CacheTransfer {
         exported_extent, ..
-    } = report.completions[0].kv_output.as_mut().unwrap();
+    } = report.completions[0].cache_output.as_mut().unwrap();
     *exported_extent = 17;
     assert!(report.validate().is_err());
 }
@@ -1022,7 +1022,7 @@ fn tensor_coverage_preserves_replicas_and_detects_missing_regions() {
 }
 
 #[test]
-fn raw_kv_export_round_trips_page_representation_and_exact_request() {
+fn raw_cache_export_round_trips_page_representation_and_exact_request() {
     let source = BufferId {
         owner: request_key(),
         producer_call_id: CallId::new(11, 0),
@@ -1034,7 +1034,7 @@ fn raw_kv_export_round_trips_page_representation_and_exact_request() {
         locations: vec![Locator {
             source: WorkerInfo::default().endpoint,
             transport: TransferTransport::PosixShm {
-                endpoint: "uniserve-kv-publisher".into(),
+                endpoint: "uniserve-cache-publisher".into(),
                 name: name.into(),
             },
             nbytes: shape.iter().product::<u64>() * itemsize,
@@ -1073,15 +1073,15 @@ fn raw_kv_export_round_trips_page_representation_and_exact_request() {
         let report = lane_report(
             5,
             vec![RequestOutput {
-                code: CallKind::Transfer(TransferMode::KvExport),
-                kv_output: Some(KvTransfer {
+                code: CallKind::Transfer(TransferMode::CacheExport),
+                cache_output: Some(CacheTransfer {
                     groups: vec![
-                        KvGroupTransfer {
+                        CacheGroupTransfer {
                             start: 3,
                             page_tokens: 4,
                             tensors,
                         },
-                        KvGroupTransfer {
+                        CacheGroupTransfer {
                             start: 6,
                             page_tokens: 8,
                             tensors: window,
@@ -1108,14 +1108,14 @@ fn raw_kv_export_round_trips_page_representation_and_exact_request() {
         // scales are each rejected on encode.
         for invalid_field in ["source", "base", "page_tokens", "start", "extent", "scales"] {
             let mut invalid = report.clone();
-            let KvTransfer {
+            let CacheTransfer {
                 source,
                 base,
                 base_extent,
                 exported_extent,
                 groups,
                 ..
-            } = invalid.completions[0].kv_output.as_mut().unwrap();
+            } = invalid.completions[0].cache_output.as_mut().unwrap();
             match invalid_field {
                 "source" => source.generation = 0,
                 "base" => base.as_mut().unwrap().generation = 0,
@@ -1419,7 +1419,7 @@ fn batch_rejects_two_calls_for_one_request() {
         buffer_allocations: Vec::new(),
         commands: Vec::new(),
         input_products: Vec::new(),
-        kv_inputs: Vec::new(),
+        cache_inputs: Vec::new(),
     };
     assert!(batch.validate().is_err());
 }
@@ -1543,12 +1543,12 @@ fn worker_info_round_trips() {
             model_dtype: "bfloat16".into(),
             attention_backend: "torch".into(),
             weight_formats: vec!["dense".into()],
-            kv_cache: Some(KvCacheInfo {
-                groups: vec![KvCacheGroup {
+            prefix_cache: Some(PrefixCacheInfo {
+                groups: vec![CacheGroup {
                     layer_ids: (11..20).collect(),
-                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
+                    ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
                 }],
-                ..WorkerInfo::default().kv_cache.unwrap()
+                ..WorkerInfo::default().prefix_cache.unwrap()
             }),
             components: vec![ComponentInfo {
                 name: "denoiser".into(),
@@ -1628,7 +1628,7 @@ fn a_component_round_trips_with_and_without_a_distribution() {
 }
 
 #[test]
-fn kv_free_worker_info_round_trips() {
+fn cache_free_worker_info_round_trips() {
     let info = WorkerInfo {
         media_components: video_components(),
         num_inference_steps: 4,
@@ -1636,7 +1636,7 @@ fn kv_free_worker_info_round_trips() {
             .into_keys()
             .map(CallKind::Media)
             .collect(),
-        kv_cache: None,
+        prefix_cache: None,
         latent_page_units: 64,
         latent_pages: 3,
         ..WorkerInfo::default()
@@ -1663,21 +1663,21 @@ fn worker_info_rejects_duplicate_set_members() {
     assert!(info.validate().is_err());
 }
 
-/// A KV pool needs an allocatable unit; every page size must be a power of
+/// A cache pool needs an allocatable unit; every page size must be a power of
 /// two dividing the largest one; a layer belongs to one group; heads stay
 /// within their logical bounds; and a sliding window retains no sink.
 #[test]
-fn worker_info_rejects_inconsistent_kv_groups() {
+fn worker_info_rejects_inconsistent_cache_groups() {
     let valid = full_caps();
     assert!(valid.clone().validate().is_ok());
-    let cases: [fn(&mut KvCacheInfo); 6] = [
+    let cases: [fn(&mut PrefixCacheInfo); 6] = [
         |cache| cache.num_units = 1,
         |cache| cache.groups[1].page_tokens = 48,
         |cache| cache.groups[1].layer_ids.push(0),
         |cache| cache.groups[0].layer_ids.clear(),
         |cache| cache.groups[0].kv_head_offset = 1,
         |cache| {
-            cache.groups[1].kind = KvGroupKind::SlidingWindow {
+            cache.groups[1].kind = CacheGroupKind::SlidingWindow {
                 window: 4096,
                 sink: 64,
             }
@@ -1685,7 +1685,7 @@ fn worker_info_rejects_inconsistent_kv_groups() {
     ];
     for invalidate in cases {
         let mut info = valid.clone();
-        invalidate(info.kv_cache.as_mut().unwrap());
+        invalidate(info.prefix_cache.as_mut().unwrap());
         assert!(info.validate().is_err());
     }
 }
@@ -1693,8 +1693,8 @@ fn worker_info_rejects_inconsistent_kv_groups() {
 /// Stages combine into the narrowest pool with the largest unit and the
 /// union of their layers, and must agree on every group's page shape.
 #[test]
-fn kv_stages_merge_into_the_narrowest_pool() {
-    let first = full_caps().kv_cache.unwrap();
+fn cache_stages_merge_into_the_narrowest_pool() {
+    let first = full_caps().prefix_cache.unwrap();
     let mut second = first.clone();
     second.num_units = 1024;
     second.unit_bytes = first.unit_bytes * 2;
@@ -1818,15 +1818,17 @@ fn comprehensive_batches() -> Vec<Batch> {
             transition_output: None,
 
             input_image: None,
-            kv_input: (kind == CallKind::Transfer(TransferMode::KvInstall)).then_some(BufferId {
-                owner: key,
-                producer_call_id: CallId::new(2, 0),
-                output_index: 0,
-                generation: 1,
-            }),
-            kv_output: matches!(
+            cache_input: (kind == CallKind::Transfer(TransferMode::CacheInstall)).then_some(
+                BufferId {
+                    owner: key,
+                    producer_call_id: CallId::new(2, 0),
+                    output_index: 0,
+                    generation: 1,
+                },
+            ),
+            cache_output: matches!(
                 kind,
-                CallKind::Transfer(TransferMode::KvExport | TransferMode::KvInstall)
+                CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
             )
             .then_some(BufferId {
                 owner: key,
@@ -1848,7 +1850,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             code: kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
-                max_kv_units: 3,
+                max_cache_units: 3,
                 max_latent_bytes: 1 << 20,
                 max_completion_bytes: 4096,
                 max_transfer_bytes: 1 << 16,
@@ -1921,24 +1923,24 @@ fn full_caps() -> WorkerInfo {
         // A full-attention group with 64-token pages of one unit and a
         // sliding-window group with 32-token pages of two units share one
         // pool.
-        kv_cache: Some(KvCacheInfo {
+        prefix_cache: Some(PrefixCacheInfo {
             groups: vec![
-                KvCacheGroup {
+                CacheGroup {
                     layer_ids: (0..14).collect(),
-                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
+                    ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
                 },
-                KvCacheGroup {
-                    kind: KvGroupKind::SlidingWindow {
+                CacheGroup {
+                    kind: CacheGroupKind::SlidingWindow {
                         window: 4096,
                         sink: 0,
                     },
                     page_tokens: 32,
                     units_per_page: 2,
                     layer_ids: (14..28).collect(),
-                    ..WorkerInfo::default().kv_cache.unwrap().groups[0].clone()
+                    ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
                 },
             ],
-            ..WorkerInfo::default().kv_cache.unwrap()
+            ..WorkerInfo::default().prefix_cache.unwrap()
         }),
         endpoint: WorkerEndpoint {
             rank: 1,
@@ -2036,9 +2038,9 @@ fn full_run_result() -> BatchOutput {
         },
         code: CallKind::Forward(ForwardMode::Decode),
         position: 5,
-        kv_visible_len: 6,
+        cache_visible_len: 6,
         num_completed_steps: 7,
-        kv_computed_len: 8,
+        cache_computed_len: 8,
 
         committed_tokens: vec![271, 272],
         candidate_logprobs: Vec::new(),
@@ -2048,7 +2050,7 @@ fn full_run_result() -> BatchOutput {
             stop: false,
         },
         media_output: None,
-        kv_output: None,
+        cache_output: None,
     };
     let mut predicated_record = ok_record.clone();
     predicated_record.request_key = key_for_request(101);

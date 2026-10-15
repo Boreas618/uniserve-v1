@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 
-from uniserve_models import diffusion_gemma, loading
+from uniserve import loading
+from uniserve.models import diffusion_gemma
 
 
 def neo_metadata():

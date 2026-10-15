@@ -10,20 +10,20 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve_models.bindings.context import ExecutionContext, Scratch
-from uniserve_models.cache import Config, mha
-from uniserve_models.cache.units import UnitPool
-from uniserve_models.interface import graphs
-from uniserve_models.model import TextSize
-from uniserve_models.nn import Linear, MergedColumnParallelLinear
-from uniserve_models.nn.attention import (
+from uniserve import cuda_graph
+from uniserve.bindings.context import ExecutionContext, Scratch
+from uniserve.models import TextSize
+from uniserve.nn import Linear, MergedColumnParallelLinear
+from uniserve.nn.attention import (
     Attention,
     AttentionBatch,
     DenseInput,
     PagedInput,
 )
-from uniserve_models.quantization import Quantizer
-from uniserve_models.tensors import BufferConfig
+from uniserve.prefix_cache import Config, mha
+from uniserve.prefix_cache.units import UnitPool
+from uniserve.quantization import Quantizer
+from uniserve.tensors import BufferConfig
 
 pytestmark = pytest.mark.integration
 
@@ -97,7 +97,7 @@ def test_device_lengths_drive_current_attention_values(
             context.bind_attention(AttentionBatch.single(batch))
             layer(query, key, value, AttentionBatch.single(batch), out=output)
             if replay:
-                graph = graphs.capture(
+                graph = cuda_graph.capture(
                     lambda: layer(
                         query,
                         key,
@@ -317,8 +317,10 @@ def test_shared_projection_has_independent_encoded_graph_inputs(axis):
         with ExecutionContext(layer, stream=stream) as b:
             b.prepare(TextSize(8, 1))
             layer(y, out=second)
-            ga = graphs.capture(lambda: project(a, x, first), stream=stream)
-            gb = graphs.capture(lambda: project(b, y, second), stream=stream)
+            ga = cuda_graph.capture(lambda: project(a, x, first), stream=stream)
+            gb = cuda_graph.capture(
+                lambda: project(b, y, second), stream=stream
+            )
             x.mul_(4)
             ga.replay()
             expected_x = layer(x)
@@ -629,7 +631,7 @@ def test_contexts_sharing_scratch_replay_their_own_values():
                 return layer(inputs[rows], out=outputs[rows])
 
         project()
-        captured[rows] = graphs.capture(project, stream=stream)
+        captured[rows] = cuda_graph.capture(project, stream=stream)
 
     # FP32 accumulation over K=128, rounded once to BF16.
     for _ in range(2):

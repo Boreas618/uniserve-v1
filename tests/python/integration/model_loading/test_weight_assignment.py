@@ -11,15 +11,15 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
 
-from uniserve_models import loading
-from uniserve_models.distributed import DeviceMesh
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.nn.linear import (
+from uniserve import loading
+from uniserve.distributed import DeviceMesh
+from uniserve.loading import checkpoint, weights
+from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
     MergedColumnParallelLinear,
 )
-from uniserve_models.quantization import (
+from uniserve.quantization import (
     QuantizationConfig,
     QuantizedTensor,
     Quantizer,
@@ -188,8 +188,8 @@ def test_post_load_can_derive_constants_without_hiding_unused_sources(
 def test_merged_parameter_updates_are_visible_across_execution_contexts(
     tmp_path, quantizer
 ):
-    from uniserve_models.bindings.context import ExecutionContext
-    from uniserve_models.model import TextSize
+    from uniserve.bindings.context import ExecutionContext
+    from uniserve.models import TextSize
 
     first = torch.arange(32).reshape(8, 4).float().sin()
     second = torch.arange(32).reshape(8, 4).float().cos() * 20

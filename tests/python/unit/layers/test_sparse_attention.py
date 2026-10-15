@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from uniserve_models.nn.attention import vsa
+from uniserve.nn.attention import vsa
 
 pytestmark = pytest.mark.unit
 

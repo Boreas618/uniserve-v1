@@ -30,22 +30,22 @@ from tests.python.fixtures.checkpoints import (
     VOCAB,
     diffusion_gemma_checkpoint,
 )
-from uniserve_models import catalog as models
-from uniserve_models.bindings.context import ExecutionContext, Scratch
-from uniserve_models.cache.units import UnitPool
-from uniserve_models.diffusion import canvas as sampler
-from uniserve_models.interface import graphs
-from uniserve_models.interface.loading import Loaded
-from uniserve_models.loading import weights
-from uniserve_models.model import DiffusionLMInput, TextInput, TextSize
-from uniserve_models.nn.attention import (
+from uniserve import cuda_graph
+from uniserve.bindings.context import ExecutionContext, Scratch
+from uniserve.diffusion import canvas as sampler
+from uniserve.interface.loading import Loaded
+from uniserve.loading import weights
+from uniserve.models import DiffusionLMInput, TextInput, TextSize
+from uniserve.models import registry as models
+from uniserve.nn.attention import (
     AttentionBatch,
     BlockTable,
     PagedInput,
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve_models.runner import diffusion_lm
+from uniserve.prefix_cache.units import UnitPool
+from uniserve.runner import diffusion_lm
 
 pytestmark = pytest.mark.integration
 
@@ -642,12 +642,14 @@ GPU = _Setup(
 )
 
 
-def _capture(session, pool, method, *arguments) -> graphs.Graph:
+def _capture(
+    session, pool, method, *arguments
+) -> cuda_graph.BreakableCUDAGraph:
     """Capture one call of a runner method that already ran eagerly."""
     torch.cuda.synchronize()
-    recording = graphs.begin_capture(pool, session.stream.cuda_stream, 0)
+    recording = cuda_graph.capture_begin(pool, session.stream.cuda_stream, 0)
     method(*arguments)
-    graph, _ = graphs.end_capture(recording)
+    graph, _ = cuda_graph.capture_end(recording)
     torch.cuda.synchronize()
     return graph
 
@@ -680,7 +682,7 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
     session = _Session(tmp_path, sampling=True, setup=GPU)
     runner, buffers = session.runner, session.buffers
     setup, vocab = GPU, GPU.vocab
-    pool = graphs.pool(0)[0]
+    pool = cuda_graph.pool(0)[0]
     generator = torch.Generator().manual_seed(4)
 
     lengths = [32, 20]

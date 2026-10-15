@@ -10,8 +10,8 @@ import dataclasses
 
 import pytest
 
-from uniserve_models.media import image
-from uniserve_models.minimax_h3.packing import (
+from uniserve.media import image
+from uniserve.models.minimax_h3.packing import (
     TileExtent,
     tile_extent,
     tile_packing,

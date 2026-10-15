@@ -1,7 +1,7 @@
 //! Multiprocess launch, request lifecycle, token execution, close and rank
 //! recovery.
 //!
-//! These tests launch real rank processes (`uniserve_models.worker` with the
+//! These tests launch real rank processes (`uniserve.worker` with the
 //! weightless stub model on CPU) and drive them through the engine's
 //! `WorkerGroup`, `WorkerExecutor` or `EngineCore`, or through a raw
 //! `Channel` when the worker's own protocol handling is under test.
@@ -94,7 +94,7 @@ impl RawHead {
     ) -> anyhow::Result<(Self, std::process::Child)> {
         let listener = uniserve_ipc::Listener::bind(&[address])?;
         let mut child = std::process::Command::new(worker_python())
-            .args(["-m", "uniserve_models.worker"])
+            .args(["-m", "uniserve.worker"])
             .args(["--head", &listener.addresses()[0]])
             .args(["--worker-id", &descriptor.worker_id])
             .args(["--rank", &descriptor.rank.to_string()])
@@ -234,7 +234,10 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
             };
             info.validate()?;
             anyhow::ensure!(info.queue_depth == 8, "queue depth changed");
-            anyhow::ensure!(info.kv_cache.is_some(), "the stub reports no KV pool");
+            anyhow::ensure!(
+                info.prefix_cache.is_some(),
+                "the stub reports no cache pool"
+            );
 
             let first = text_admission(51, 1, 1)?;
             let first_key = first.request_key;
@@ -483,7 +486,7 @@ fn a_rank_group_reports_its_launch_and_refuses_work_after_close() -> anyhow::Res
     assert_eq!(info.max_batch_tokens, 256);
     assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);
     assert_eq!(info.model_dtype, "bfloat16");
-    assert!(info.kv_cache.is_some());
+    assert!(info.prefix_cache.is_some());
 
     // Admit two requests, then finish one while admitting a third into the
     // retired slot's neighbour; each batch returns one empty result.
@@ -669,9 +672,9 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
     let changes: [(&str, Change); 3] = [
         ("model dtype", |info| info.model_dtype = "float32".into()),
         ("batch tokens", |info| info.max_batch_tokens = 128),
-        ("KV capacity", |info| {
-            if let Some(kv_cache) = info.kv_cache.as_mut() {
-                kv_cache.num_units /= 2;
+        ("cache capacity", |info| {
+            if let Some(prefix_cache) = info.prefix_cache.as_mut() {
+                prefix_cache.num_units /= 2;
             }
         }),
     ];
@@ -812,7 +815,7 @@ fn a_rank_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()> {
     assert_eq!(first_record.prompt_logprobs.len(), 1);
     assert_eq!(first_record.prompt_logprobs[0][0].token_id, 8);
     assert_eq!(first_record.position, 2);
-    assert_eq!(first_record.kv_visible_len, 2);
+    assert_eq!(first_record.cache_visible_len, 2);
 
     // A repeated or conflicting batch id is refused before submission.
     assert!(executor.submit_batch(initial, &CallReaders::new()).is_err());
@@ -972,8 +975,8 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     // rejected draft must leave only three positions visible to the next decode.
     resumed.calls[0].coordinates = CallCoordinates {
         logical_position: 3,
-        kv_visible_len: 3,
-        kv_computed_len: 5,
+        cache_visible_len: 3,
+        cache_computed_len: 5,
         flow_step: 0,
     };
     for mut batch in [first, successor, verifier, resumed] {
@@ -1020,12 +1023,12 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     );
     assert_eq!(outputs[&first_id].committed_tokens, vec![1000]);
     assert_eq!(outputs[&second_id].committed_tokens, vec![1001]);
-    assert_eq!(outputs[&second_id].kv_visible_len, 2);
+    assert_eq!(outputs[&second_id].cache_visible_len, 2);
     assert_eq!(outputs[&verify_id].committed_tokens, vec![151_670]);
-    assert_eq!(outputs[&verify_id].kv_visible_len, 3);
-    assert_eq!(outputs[&verify_id].kv_computed_len, 5);
+    assert_eq!(outputs[&verify_id].cache_visible_len, 3);
+    assert_eq!(outputs[&verify_id].cache_computed_len, 5);
     assert_eq!(outputs[&resumed_id].committed_tokens, vec![1002]);
-    assert_eq!(outputs[&resumed_id].kv_visible_len, 4);
+    assert_eq!(outputs[&resumed_id].cache_visible_len, 4);
     assert_eq!(outputs[&resumed_id].position, 4);
     executor.close()?;
     Ok(())
@@ -1085,8 +1088,8 @@ fn token_batch(
     // logical sequence and the initialized cache advance together.
     call.coordinates = CallCoordinates {
         logical_position: prefix_length,
-        kv_visible_len: prefix_length,
-        kv_computed_len: prefix_length,
+        cache_visible_len: prefix_length,
+        cache_computed_len: prefix_length,
         flow_step: 0,
     };
     call.token_output = Some(token_output);
@@ -1094,7 +1097,7 @@ fn token_batch(
     call.component = "model".into();
     call.bounds = Bounds {
         max_tokens: tokens.len().max(1) as u32,
-        max_kv_units: u32::from(prefix_length == 0),
+        max_cache_units: u32::from(prefix_length == 0),
         ..Bounds::default()
     };
     let input_length = tokens.len() as u32;
@@ -1121,7 +1124,7 @@ fn token_batch(
         request_pool_indices: vec![request_pool_idx],
         seq_lens: vec![prefix_length + input_length.max(1)],
         query_lens: vec![input_length.max(1)],
-        write_kv: vec![true],
+        write_cache: vec![true],
     };
     batch
 }
@@ -1552,7 +1555,7 @@ fn rank_group_args(max_message_bytes: usize) -> WorkerProcessArgs {
         components: WorkerConfig::single_component("model", WORLD_SIZE),
         queue_depth: QUEUE_DEPTH,
         max_message_bytes,
-        kv_token_capacity: Some(4096),
+        cache_token_capacity: Some(4096),
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
@@ -1602,9 +1605,9 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         checksum_manifest: None,
         model_dtype: "bfloat16".into(),
         quantization_config: serde_json::json!({}),
-        kv_cache_dtype: None,
-        kv_memory_fraction: 0.7,
-        kv_token_capacity: Some(4096),
+        prefix_cache_dtype: None,
+        cache_memory_fraction: 0.7,
+        cache_token_capacity: Some(4096),
         attention_backend: "torch_sdpa".into(),
         block_size: Some(16),
         max_batch_calls: 8,
@@ -1687,7 +1690,7 @@ fn text_admission(
 }
 
 // Products and transfers: tensor products published by one component or
-// worker and imported by another, KV exports, and the retirement of work
+// worker and imported by another, cache exports, and the retirement of work
 // that reads a failed or unreachable product.
 
 #[test]
@@ -2461,11 +2464,11 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     Ok(())
 }
 
-/// Publishes a prefilled request's KV with a `TransferMode::KvExport` call
+/// Publishes a prefilled request's prefix cache with a `TransferMode::CacheExport` call
 /// on a two-rank text group and requires every published tensor to name a
 /// location on each rank.
 #[test]
-fn a_kv_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
+fn a_cache_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let admission = text_admission(13, 1, 3)?;
     let request_key = admission.request_key;
@@ -2496,10 +2499,10 @@ fn a_kv_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
     let mut call = Call::new(
         request_key,
         CallId::new(10, 0),
-        CallKind::Transfer(TransferMode::KvExport),
+        CallKind::Transfer(TransferMode::CacheExport),
     );
     call.coordinates = coordinates_after(&first.results[0].output);
-    call.kv_output = Some(buffer);
+    call.cache_output = Some(buffer);
     call.bounds = Bounds {
         max_transfer_bytes: 4096,
         ..Bounds::default()
@@ -2511,9 +2514,9 @@ fn a_kv_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
     assert_eq!(report.results[0].output.status, CallStatus::Ok);
     let export = report.results[0]
         .output
-        .kv_output
+        .cache_output
         .as_ref()
-        .context("KV export has no physical locations")?;
+        .context("cache export has no physical locations")?;
     assert_eq!(export.source, buffer);
     assert_eq!(export.exported_extent, 2);
     for tensor in export.tensors() {
@@ -2530,12 +2533,12 @@ fn a_kv_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Publishes a prefilled request's KV under a transfer-byte bound the
+/// Publishes a prefilled request's cache under a transfer-byte bound the
 /// export exceeds, which fails the call once its locations are known, and
 /// requires the same extent to be exportable afterwards: the refused
 /// export left no reservation or location behind.
 #[test]
-fn a_refused_kv_export_leaves_its_request_exportable() -> anyhow::Result<()> {
+fn a_refused_cache_export_leaves_its_request_exportable() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let admission = text_admission(14, 1, 3)?;
     let request_key = admission.request_key;
@@ -2565,10 +2568,10 @@ fn a_refused_kv_export_leaves_its_request_exportable() -> anyhow::Result<()> {
         let mut call = Call::new(
             request_key,
             CallId::new(batch, 0),
-            CallKind::Transfer(TransferMode::KvExport),
+            CallKind::Transfer(TransferMode::CacheExport),
         );
         call.coordinates = coordinates_after(&first.results[0].output);
-        call.kv_output = Some(buffer);
+        call.cache_output = Some(buffer);
         call.bounds = Bounds {
             max_transfer_bytes,
             ..Bounds::default()
@@ -2583,16 +2586,16 @@ fn a_refused_kv_export_leaves_its_request_exportable() -> anyhow::Result<()> {
     let (_, refused) = export(10, 1);
     let report = execute(&mut executor, refused)?;
     assert_eq!(report.results[0].output.status, CallStatus::Error);
-    assert!(report.results[0].output.kv_output.is_none());
+    assert!(report.results[0].output.cache_output.is_none());
 
     let (buffer, accepted) = export(11, 4096);
     let report = execute(&mut executor, accepted)?;
     assert_eq!(report.results[0].output.status, CallStatus::Ok);
     let transfer = report.results[0]
         .output
-        .kv_output
+        .cache_output
         .as_ref()
-        .context("KV export has no physical locations")?;
+        .context("cache export has no physical locations")?;
     assert_eq!(transfer.source, buffer);
     assert_eq!(transfer.exported_extent, 2);
     assert_eq!(transfer.base, None);
@@ -2745,10 +2748,10 @@ fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result
 }
 
 /// A request prefilled on one worker continues on another: the source
-/// publishes its visible KV extent, the target installs it into the pages
+/// publishes its visible cache extent, the target installs it into the pages
 /// the scheduler assigned there, and the target's next decode reads it.
 #[test]
-fn a_request_continues_on_the_worker_that_installed_its_kv() -> anyhow::Result<()> {
+fn a_request_continues_on_the_worker_that_installed_its_cache() -> anyhow::Result<()> {
     use uniserve_engine::{WorkerExecutor, WorkerId};
 
     let edges = "source->target=shm";
@@ -2767,7 +2770,7 @@ fn a_request_continues_on_the_worker_that_installed_its_kv() -> anyhow::Result<(
     let admission = text_admission(91, 1, 1)?;
     let key = admission.request_key;
 
-    // The source prefills two prompt tokens and publishes their KV.
+    // The source prefills two prompt tokens and publishes their prefix cache.
     let prefill = token_batch(
         1,
         1,
@@ -2792,21 +2795,21 @@ fn a_request_continues_on_the_worker_that_installed_its_kv() -> anyhow::Result<(
     let mut export = Call::new(
         key,
         CallId::new(2, 0),
-        CallKind::Transfer(TransferMode::KvExport),
+        CallKind::Transfer(TransferMode::CacheExport),
     );
     export.coordinates = coordinates_after(&prefilled.results[0].output);
-    export.kv_output = Some(exported);
+    export.cache_output = Some(exported);
     export.bounds.max_transfer_bytes = 4096;
     let mut publish = Batch::new(2, Vec::new(), vec![export]);
     publish.block_tables = tables;
     executor.submit(place(publish, "source", Vec::new()))?;
-    let published = poll_logical(&mut executor)?.context("KV export did not complete")?;
+    let published = poll_logical(&mut executor)?.context("cache export did not complete")?;
     assert_eq!(published.results[0].output.status, CallStatus::Ok);
     let transfer = published.results[0]
         .output
-        .kv_output
+        .cache_output
         .clone()
-        .context("KV export has no transfer")?;
+        .context("cache export has no transfer")?;
     assert_eq!((transfer.base_extent, transfer.exported_extent), (0, 2));
 
     // The target admits the request and installs the published extent into
@@ -2820,10 +2823,10 @@ fn a_request_continues_on_the_worker_that_installed_its_kv() -> anyhow::Result<(
     let mut install = Call::new(
         key,
         CallId::new(3, 0),
-        CallKind::Transfer(TransferMode::KvInstall),
+        CallKind::Transfer(TransferMode::CacheInstall),
     );
-    install.kv_input = Some(exported);
-    install.kv_output = Some(installed);
+    install.cache_input = Some(exported);
+    install.cache_output = Some(installed);
     install.bounds.max_transfer_bytes = 4096;
     let mut target = Batch::new(3, vec![admission], vec![install]);
     target.block_tables = vec![BlockTable {
@@ -2839,10 +2842,13 @@ fn a_request_continues_on_the_worker_that_installed_its_kv() -> anyhow::Result<(
         unit_ids: vec![UnitId(5)],
     }];
     executor.submit(place(target, "target", Vec::new()))?;
-    let installation = poll_logical(&mut executor)?.context("KV install did not complete")?;
+    let installation = poll_logical(&mut executor)?.context("cache install did not complete")?;
     let record = &installation.results[0].output;
     assert_eq!(record.status, CallStatus::Ok);
-    assert_eq!((record.kv_visible_len, record.kv_computed_len), (2, 2));
+    assert_eq!(
+        (record.cache_visible_len, record.cache_computed_len),
+        (2, 2)
+    );
 
     // The target decodes the sampled token after the installed prefix.
     let mut decode = token_batch(
@@ -2862,7 +2868,7 @@ fn a_request_continues_on_the_worker_that_installed_its_kv() -> anyhow::Result<(
     let record = &decoded.results[0].output;
     assert_eq!(record.status, CallStatus::Ok);
     assert_eq!(record.committed_tokens, vec![1001]);
-    assert_eq!(record.kv_visible_len, 3);
+    assert_eq!(record.cache_visible_len, 3);
 
     executor.submit(uniserve_engine::ExecutionBatch::new(
         5,
@@ -3005,11 +3011,11 @@ fn device_products_cross_workers_over_cuda_vmm() -> anyhow::Result<()> {
 }
 
 /// A request prefilled on a worker with a BF16 cache continues on a worker
-/// with an FP16 cache: its KV crosses the processes over CUDA VMM and is
+/// with an FP16 cache: its cache crosses the processes over CUDA VMM and is
 /// converted into the target's representation by the cache's conversion.
 #[test]
 #[ignore = "requires a CUDA device"]
-fn a_converting_cache_installs_kv_another_worker_exported() -> anyhow::Result<()> {
+fn a_converting_cache_installs_cache_another_worker_exported() -> anyhow::Result<()> {
     use uniserve_engine::{WorkerExecutor, WorkerId};
 
     let edges = "source->target=cuda_vmm";
@@ -3021,7 +3027,11 @@ fn a_converting_cache_installs_kv_another_worker_exported() -> anyhow::Result<()
             ),
             (
                 WorkerId("target".into()),
-                cuda_worker("target", edges, Some(uniserve_core::KvCacheDtype::Float16))?,
+                cuda_worker(
+                    "target",
+                    edges,
+                    Some(uniserve_core::PrefixCacheDtype::Float16),
+                )?,
             ),
         ],
         uniserve_engine::TransferConfig::parse(edges)?,
@@ -3051,21 +3061,21 @@ fn a_converting_cache_installs_kv_another_worker_exported() -> anyhow::Result<()
     let mut export = Call::new(
         key,
         CallId::new(2, 0),
-        CallKind::Transfer(TransferMode::KvExport),
+        CallKind::Transfer(TransferMode::CacheExport),
     );
     export.coordinates = coordinates_after(&prefilled.results[0].output);
-    export.kv_output = Some(exported);
+    export.cache_output = Some(exported);
     export.bounds.max_transfer_bytes = 1 << 20;
     let mut publish = Batch::new(2, Vec::new(), vec![export]);
     publish.block_tables = tables;
     executor.submit(place(publish, "source", Vec::new()))?;
-    let published = poll_logical(&mut executor)?.context("KV export did not complete")?;
+    let published = poll_logical(&mut executor)?.context("cache export did not complete")?;
     assert_eq!(published.results[0].output.status, CallStatus::Ok);
     let transfer = published.results[0]
         .output
-        .kv_output
+        .cache_output
         .clone()
-        .context("KV export has no transfer")?;
+        .context("cache export has no transfer")?;
     assert_eq!(transfer.exported_extent, 3);
     assert!(
         transfer
@@ -3079,10 +3089,10 @@ fn a_converting_cache_installs_kv_another_worker_exported() -> anyhow::Result<()
     let mut install = Call::new(
         key,
         CallId::new(3, 0),
-        CallKind::Transfer(TransferMode::KvInstall),
+        CallKind::Transfer(TransferMode::CacheInstall),
     );
-    install.kv_input = Some(exported);
-    install.kv_output = Some(uniserve_ipc::BufferId {
+    install.cache_input = Some(exported);
+    install.cache_output = Some(uniserve_ipc::BufferId {
         owner: key,
         producer_call_id: CallId::new(3, 0),
         output_index: 0,
@@ -3103,9 +3113,9 @@ fn a_converting_cache_installs_kv_another_worker_exported() -> anyhow::Result<()
         unit_ids: vec![UnitId(6)],
     }];
     executor.submit(place(target, "target", Vec::new()))?;
-    let installation = poll_logical(&mut executor)?.context("KV install did not complete")?;
+    let installation = poll_logical(&mut executor)?.context("cache install did not complete")?;
     assert_eq!(installation.results[0].output.status, CallStatus::Ok);
-    assert_eq!(installation.results[0].output.kv_visible_len, 3);
+    assert_eq!(installation.results[0].output.cache_visible_len, 3);
 
     let mut decode = token_batch(
         4,
@@ -3123,19 +3133,19 @@ fn a_converting_cache_installs_kv_another_worker_exported() -> anyhow::Result<()
     let decoded = poll_logical(&mut executor)?.context("target decode did not complete")?;
     assert_eq!(decoded.results[0].output.status, CallStatus::Ok);
     assert_eq!(decoded.results[0].output.committed_tokens, vec![1001]);
-    assert_eq!(decoded.results[0].output.kv_visible_len, 4);
+    assert_eq!(decoded.results[0].output.cache_visible_len, 4);
     executor.close()?;
     Ok(())
 }
 
-/// A real model's request continues on another worker from the KV it
+/// A real model's request continues on another worker from the prefix cache it
 /// installed: the target's greedy continuation of a prompt equals the
 /// source's token for token, since the installed pages hold the source's
 /// bytes. `UNISERVE_KV_INSTALL_MODEL` names the checkpoint and
 /// `UNISERVE_KV_INSTALL_PROMPT` the prompt's token ids (a JSON list).
 #[test]
 #[ignore = "requires a CUDA device and the checkpoint UNISERVE_KV_INSTALL_MODEL names"]
-fn a_model_continues_greedily_from_installed_kv() -> anyhow::Result<()> {
+fn a_model_continues_greedily_from_installed_cache() -> anyhow::Result<()> {
     use uniserve_engine::{WorkerExecutor, WorkerId};
 
     let model = std::env::var("UNISERVE_KV_INSTALL_MODEL")?;
@@ -3192,24 +3202,24 @@ fn a_model_continues_greedily_from_installed_kv() -> anyhow::Result<()> {
     let mut export = Call::new(
         key,
         CallId::new(2, 0),
-        CallKind::Transfer(TransferMode::KvExport),
+        CallKind::Transfer(TransferMode::CacheExport),
     );
     export.coordinates = coordinates_after(&prefilled.results[0].output);
-    export.kv_output = Some(exported);
+    export.cache_output = Some(exported);
     export.bounds.max_transfer_bytes = 1 << 30;
     let mut publish = Batch::new(2, Vec::new(), vec![export]);
     publish.block_tables = tables;
     executor.submit(place(publish, "source", Vec::new()))?;
-    let published = poll_logical(&mut executor)?.context("KV export did not complete")?;
+    let published = poll_logical(&mut executor)?.context("cache export did not complete")?;
     assert_eq!(published.results[0].output.status, CallStatus::Ok);
 
     let mut install = Call::new(
         key,
         CallId::new(3, 0),
-        CallKind::Transfer(TransferMode::KvInstall),
+        CallKind::Transfer(TransferMode::CacheInstall),
     );
-    install.kv_input = Some(exported);
-    install.kv_output = Some(uniserve_ipc::BufferId {
+    install.cache_input = Some(exported);
+    install.cache_output = Some(uniserve_ipc::BufferId {
         owner: key,
         producer_call_id: CallId::new(3, 0),
         output_index: 0,
@@ -3230,7 +3240,7 @@ fn a_model_continues_greedily_from_installed_kv() -> anyhow::Result<()> {
         unit_ids: vec![UnitId(7)],
     }];
     executor.submit(place(target, "target", Vec::new()))?;
-    let installed = poll_logical(&mut executor)?.context("KV install did not complete")?;
+    let installed = poll_logical(&mut executor)?.context("cache install did not complete")?;
     assert_eq!(installed.results[0].output.status, CallStatus::Ok);
 
     // Greedy continuations of the same prefix on both workers.
@@ -3266,18 +3276,18 @@ fn a_model_continues_greedily_from_installed_kv() -> anyhow::Result<()> {
 }
 
 /// Launch arguments of a one-rank stub worker on the first visible CUDA
-/// device, with a cache of `kv_cache_dtype` (the model's dtype by default)
+/// device, with a cache of `prefix_cache_dtype` (the model's dtype by default)
 /// and the transfer `edges`.
 fn cuda_worker(
     worker_id: &str,
     edges: &str,
-    kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
+    prefix_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
 ) -> anyhow::Result<WorkerGroup> {
     let mut args = single_rank_args(worker_id, QUEUE_DEPTH);
     for rank in &mut args.ranks {
         rank.device = "cuda:0".into();
     }
-    args.kv_cache_dtype = kv_cache_dtype;
+    args.prefix_cache_dtype = prefix_cache_dtype;
     args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
     WorkerGroup::spawn(args)
 }
@@ -3367,7 +3377,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         let directory = tempfile::tempdir()?;
         let wrapper = directory.path().join("worker");
         let name_path = directory.path().join("media-name");
-        // `WorkerGroup` runs `<python> -m uniserve_models.worker <args>`, so
+        // `WorkerGroup` runs `<python> -m uniserve.worker <args>`, so
         // the wrapper drops its first two arguments and runs this test
         // binary's `media_rank` with the rest.
         std::fs::write(
@@ -3544,8 +3554,8 @@ fn media_rank() -> anyhow::Result<()> {
                             timing_counters: Default::default(),
                             code: call.code,
                             position: call.coordinates.logical_position + length,
-                            kv_visible_len: call.coordinates.kv_visible_len + length,
-                            kv_computed_len: call.coordinates.kv_computed_len + length,
+                            cache_visible_len: call.coordinates.cache_visible_len + length,
+                            cache_computed_len: call.coordinates.cache_computed_len + length,
                             num_completed_steps: 0,
                             committed_tokens: vec![1000],
                             sampled_logprob: None,
@@ -3554,7 +3564,7 @@ fn media_rank() -> anyhow::Result<()> {
                             candidate_logprobs: Vec::new(),
                             finish_flags: Default::default(),
                             media_output: None,
-                            kv_output: None,
+                            cache_output: None,
                         }
                     })
                     .collect();
@@ -3760,8 +3770,8 @@ fn image_admission(
 fn coordinates_after(output: &uniserve_ipc::RequestOutput) -> CallCoordinates {
     CallCoordinates {
         logical_position: output.position,
-        kv_visible_len: output.kv_visible_len,
-        kv_computed_len: output.kv_computed_len,
+        cache_visible_len: output.cache_visible_len,
+        cache_computed_len: output.cache_computed_len,
         flow_step: output.num_completed_steps,
     }
 }

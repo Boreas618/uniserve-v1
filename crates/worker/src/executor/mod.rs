@@ -201,7 +201,7 @@ impl<B: Backend> Batch<B> {
                     .chain(call.predicate.iter())
                     .map(|input| input.producer_call_id.batch_id),
             );
-            if let Some(input) = &call.kv_input {
+            if let Some(input) = &call.cache_input {
                 producers.insert(input.producer_call_id.batch_id);
             }
         }
@@ -215,7 +215,7 @@ impl<B: Backend> Batch<B> {
     }
 
     /// `requests` includes calls and lifecycle commands. `producers` names
-    /// batches supplying tensor, predicate, or KV inputs on this rank.
+    /// batches supplying tensor, predicate, or cache inputs on this rank.
     /// A lifecycle-only batch has no collective sequence.
     pub fn new(
         id: u64,

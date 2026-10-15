@@ -29,17 +29,17 @@ pub(crate) struct PrefillShape {
     pub(crate) token_bucket: usize,
     pub(crate) row_bucket: usize,
     /// Least rows served by this bucket: one, or the preceding row bucket.
-    /// Startup uses this count to fit scratch KV within the physical pool.
+    /// Startup uses this count to fit scratch prefix cache within the physical pool.
     pub(crate) live_rows: usize,
     /// None selects per-row device causality flags.
     pub(crate) causal: Option<bool>,
     pub(crate) embeddings: bool,
-    /// False captures KV writes alone, without computing hidden outputs.
+    /// False captures cache writes alone, without computing hidden outputs.
     pub(crate) outputs: bool,
 }
 
 impl PrefillShape {
-    /// Fit capture rows into the scratch KV pool without exceeding a row's
+    /// Fit capture rows into the scratch cache pool without exceeding a row's
     /// token limit. Tokens that do not fit become graph padding.
     ///
     /// Cache groups supply `(tokens per page, units per page)`. Page sizes are

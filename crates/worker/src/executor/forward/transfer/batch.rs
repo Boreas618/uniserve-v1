@@ -11,10 +11,10 @@
 //! ([`Recorded::commit`]). Exports are located only there, so nothing of an
 //! export reaches another process before the device work it describes is
 //! complete. Every owner's update is then validated (products and their
-//! exports, KV exports and installs, pending calls) and they become visible
+//! exports, cache exports and installs, pending calls) and they become visible
 //! together. A failure before that point retires everything the batch
 //! reserved ([`Recorded::discard`]), also from the job's completion on: the
-//! job still carries what the batch recorded before it failed (KV table
+//! job still carries what the batch recorded before it failed (cache table
 //! installs and unit resets do their host bookkeeping when recorded, so
 //! their device work follows), and an export is revoked only after the
 //! copies into it ran. Of an export that failed itself the job keeps only
@@ -32,8 +32,8 @@ use uniserve_ipc::{
 
 use super::super::launch::{Launched, flag, lock, reports_output, request_flag, seal};
 use super::super::products::Publications;
-use super::kv::{self, Exporting, Installation, Published};
 use super::latents::{self, PendingExport};
+use super::prefix_cache::{self, Exporting, Installation, Published};
 use crate::executor::PendingOutput;
 use crate::executor::forward::batch::image::ImageParts;
 use crate::ffi::Device;
@@ -193,7 +193,7 @@ pub(crate) struct Recorded {
     pub(super) products: VecDeque<(usize, ProductBuffer, ProductExport)>,
     /// Trajectory versions exported from the latent pool, with their calls.
     pub(super) versions: VecDeque<(usize, PendingExport)>,
-    /// KV exports, and the installs resident once the batch commits.
+    /// Cache exports, and the installs resident once the batch commits.
     pub(super) exports: VecDeque<Exporting>,
     pub(super) installations: Vec<Installation>,
     started: Instant,
@@ -469,7 +469,7 @@ impl Recorded {
         } = located;
         storage.tensors.commit_writes(&self.writes).map_err(fatal)?;
         publications.register(&storage.tensors).map_err(fatal)?;
-        kv::apply(storage, published, self.installations).map_err(fatal)?;
+        prefix_cache::apply(storage, published, self.installations).map_err(fatal)?;
         requests.add_pending(&pending(plan)).map_err(fatal)?;
 
         let mut stats = ForwardStats::default();
@@ -535,7 +535,7 @@ impl Recorded {
 
         while let Some(export) = self.exports.pop_front() {
             let export = export.locate(storage)?;
-            self.calls[export.call].output.output.kv_output = Some(export.transfer.clone());
+            self.calls[export.call].output.output.cache_output = Some(export.transfer.clone());
             located.published.push(export);
         }
         Ok(())
@@ -556,7 +556,7 @@ impl Recorded {
             }
         }
         located.publications.validate(&storage.tensors)?;
-        kv::validate(storage, &located.published, &self.installations)
+        prefix_cache::validate(storage, &located.published, &self.installations)
     }
 
     /// Retire every reservation after a failure before the commit point:
@@ -597,9 +597,9 @@ impl Recorded {
         };
 
         for export in &published {
-            self.calls[export.call].output.output.kv_output = None;
+            self.calls[export.call].output.output.cache_output = None;
         }
-        let mut unpublished = kv::revoke(storage, published);
+        let mut unpublished = prefix_cache::revoke(storage, published);
         for export in self.exports.drain(..) {
             unpublished = unpublished.and(export.revoke(storage));
         }

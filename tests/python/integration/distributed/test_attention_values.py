@@ -10,19 +10,19 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.cache import Config, mha
-from uniserve_models.cache.units import UnitPool
-from uniserve_models.distributed import DeviceMesh, parallelize_
-from uniserve_models.interface import graphs
-from uniserve_models.model import TextSize
-from uniserve_models.nn.attention import (
+from uniserve import cuda_graph
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.models import TextSize
+from uniserve.nn.attention import (
     Attention,
     AttentionBatch,
     AttentionParallelConfig,
     PagedInput,
     Ulysses,
 )
+from uniserve.prefix_cache import Config, mha
+from uniserve.prefix_cache.units import UnitPool
 
 pytestmark = pytest.mark.integration
 
@@ -116,7 +116,7 @@ def test_ulysses_paged_attention_values():
 
 
 def _context(rank, listener, gpu):
-    from uniserve_models.nn.attention import (
+    from uniserve.nn.attention import (
         ContextParallelConfig,
         SegmentedInput,
         SequenceLengths,
@@ -356,7 +356,7 @@ def _context(rank, listener, gpu):
                         atol=2e-2 if gpu else 1e-6,
                     )
                     if gpu:
-                        graph = graphs.capture(invoke, stream=stream)
+                        graph = cuda_graph.capture(invoke, stream=stream)
                         q.mul_(0.7)
                         k.add_(0.25)
                         ends.sub_(1).clamp_min_(0)

@@ -21,10 +21,10 @@ from tests.python.fixtures.vsa import (
     region_reference,
     region_tables,
 )
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import DeviceMesh, parallelize_
-from uniserve_models.nn import MergedColumnParallelLinear
-from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses, vsa
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.nn import MergedColumnParallelLinear
+from uniserve.nn.attention import AttentionParallelConfig, Ulysses, vsa
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

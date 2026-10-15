@@ -11,17 +11,17 @@ import torch
 from uniserve_kernels.attention.vsa_rows import pack_sparse_input_rows
 
 from tests.python.fixtures.vsa import reference_attention
-from uniserve_models.backends.attention import vsa as providers
-from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
-from uniserve_models.interface import graphs
-from uniserve_models.nn.attention import vsa
+from uniserve import cuda_graph
+from uniserve.backends.attention import vsa as providers
+from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.nn.attention import vsa
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 @pytest.fixture
 def provider(request):
-    from uniserve_models.backends.attention import vsa as providers
+    from uniserve.backends.attention import vsa as providers
 
     name = request.param
     if not import_module(f"{providers.__name__}.{name}").available(
@@ -127,7 +127,7 @@ def test_large_hopper_key_domain_preserves_head_values_on_graph_replay(stream):
         torch.testing.assert_close(
             out[::64], codes.expand(tiles, -1, -1), rtol=2e-2, atol=2e-2
         )
-        graph = graphs.capture(invoke, stream=stream)
+        graph = cuda_graph.capture(invoke, stream=stream)
         valid.fill_(32)
         codes = 1 - codes
         value.copy_(codes.expand(rows, -1, -1))
@@ -183,7 +183,7 @@ def test_selection_compression_and_projected_chunks(provider, stream):
         torch.testing.assert_close(
             result[live], expected[live], rtol=2e-2, atol=2e-2
         )
-        graph = graphs.capture(invoke, stream=stream)
+        graph = cuda_graph.capture(invoke, stream=stream)
         # Numerical inputs change without changing the prepared tile shape.
         projections.mul_(0.5)
         valid[1] = 9
@@ -249,7 +249,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
 
     # The reference normalizes and rotates the projections up front with the
     # public functional, then attends the prepared chunks.
-    from uniserve_models.nn.functional import qk_norm_rope
+    from uniserve.nn.functional import qk_norm_rope
 
     normalized_q, normalized_k = qk_norm_rope(
         q,
@@ -298,7 +298,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
         )
         replayed = torch.empty_like(q)
         norm_rope = vsa.NormRope(query_weight, key_weight, 1e-6, cos, sin)
-        graph = graphs.capture(
+        graph = cuda_graph.capture(
             lambda: attend(q, k, norm_rope, replayed), stream=stream
         )
         q.add_(0.3)

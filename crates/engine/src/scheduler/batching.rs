@@ -35,7 +35,7 @@ pub(super) struct PassRows {
     pub(super) context: usize,
 }
 
-/// Returns the KV capacity, in tokens, that must be allocated before a decode
+/// Returns the cache capacity, in tokens, that must be allocated before a decode
 /// that writes position `pos` and `spec_len` further positions.
 fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
     pos.saturating_add(1).saturating_add(spec_len)
@@ -327,9 +327,9 @@ impl Scheduler {
                     || (prefill && generation::prefill_rows(&call) > rows_left.context)
                 {
                     if let Some(state) = self.running.get_mut(&id) {
-                        state.num_kv_units_sent = state
-                            .num_kv_units_sent
-                            .saturating_sub(u64::from(call.bounds.max_kv_units));
+                        state.num_cache_units_sent = state
+                            .num_cache_units_sent
+                            .saturating_sub(u64::from(call.bounds.max_cache_units));
                     }
                     continue;
                 }
@@ -350,9 +350,9 @@ impl Scheduler {
                             if !ledger.admits(&demand, id, self) {
                                 self.record_domain_backpressure(call.code);
                                 if let Some(state) = self.running.get_mut(&id) {
-                                    state.num_kv_units_sent = state
-                                        .num_kv_units_sent
-                                        .saturating_sub(u64::from(call.bounds.max_kv_units));
+                                    state.num_cache_units_sent = state
+                                        .num_cache_units_sent
+                                        .saturating_sub(u64::from(call.bounds.max_cache_units));
                                 }
                                 continue;
                             }
@@ -369,12 +369,12 @@ impl Scheduler {
                 // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
                     self.record_domain_backpressure(call.code);
-                    // Planning a forward advanced `num_kv_units_sent` past its
+                    // Planning a forward advanced `num_cache_units_sent` past its
                     // fresh units; roll it back so the next plan declares them.
                     if let Some(state) = self.running.get_mut(&id) {
-                        state.num_kv_units_sent = state
-                            .num_kv_units_sent
-                            .saturating_sub(u64::from(call.bounds.max_kv_units));
+                        state.num_cache_units_sent = state
+                            .num_cache_units_sent
+                            .saturating_sub(u64::from(call.bounds.max_cache_units));
                     }
                     tracing::debug!(
                         request_id = id.0,
@@ -537,7 +537,7 @@ impl Scheduler {
     /// Chooses the highest-priority execution lane that has schedulable work.
     ///
     /// A ready readout pass takes the decode lane first: one pass answers
-    /// the readout and releases its KV. Otherwise prefill wins while fewer
+    /// the readout and releases its prefix cache. Otherwise prefill wins while fewer
     /// than `PREFILL_WINDOW_CREDITS` batches carrying `BatchKind::Prefill`
     /// calls await their results; past that window, ready decode work takes
     /// the pass, and prefill runs only when no decode is ready.
@@ -614,9 +614,9 @@ impl Scheduler {
     /// values are assembled first.
     ///
     /// Context ingestion (encoders and prefill) comes first; then token decode,
-    /// verification and canvas denoising, image decoding, and KV installation;
+    /// verification and canvas denoising, image decoding, and cache installation;
     /// then denoising and the video and audio media calls; and last latent
-    /// preparation, tensor transfers, KV export, and requests with no
+    /// preparation, tensor transfers, cache export, and requests with no
     /// next call.
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_call_variant(id) {
@@ -631,7 +631,7 @@ impl Scheduler {
                     ForwardMode::Decode | ForwardMode::Verify | ForwardMode::TokenDenoising,
                 )
                 | CallKind::Media(MediaCall::ImageDecoding)
-                | CallKind::Transfer(TransferMode::KvInstall),
+                | CallKind::Transfer(TransferMode::CacheInstall),
             ) => 1,
             Some(CallKind::Media(
                 MediaCall::MediaReading
@@ -645,7 +645,7 @@ impl Scheduler {
             Some(
                 CallKind::Media(MediaCall::LatentPreparation)
                 | CallKind::Transfer(TransferMode::Tensor)
-                | CallKind::Transfer(TransferMode::KvExport),
+                | CallKind::Transfer(TransferMode::CacheExport),
             )
             | None => 3,
         }
@@ -680,8 +680,8 @@ impl Scheduler {
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
             Phase::Prefill => CallKind::Forward(ForwardMode::Prefill),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
-            Phase::CloseKv => CallKind::Forward(ForwardMode::Prefill),
-            Phase::PublishKv => CallKind::Transfer(TransferMode::KvExport),
+            Phase::CloseCache => CallKind::Forward(ForwardMode::Prefill),
+            Phase::PublishCache => CallKind::Transfer(TransferMode::CacheExport),
             Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
             Phase::DenoiseGen if st.denoising.is_complete() => {
                 CallKind::Media(MediaCall::ImageDecoding)
@@ -708,13 +708,13 @@ impl Scheduler {
 
     /// Registers one selected computation with its allocated physical inputs and outputs.
     ///
-    /// Sets the call's device predicate, derives its KV, forward-row, and
+    /// Sets the call's device predicate, derives its prefix cache, forward-row, and
     /// latent inputs from the lengths its in-flight predecessors project,
     /// mints product identities, moves `reserved_buffers` into the request's
     /// allocations, selects the executing worker, registers the call in
     /// flight, and appends it with its `RequestPlacement` to `batch`.
     /// `admitted` marks a call whose batch carries the request's `Start`, so
-    /// its complete KV tables are sent.
+    /// its complete cache tables are sent.
     ///
     /// Returns `None` when a scheduler invariant fails, including an unsafe
     /// projected successor; most such paths latch engine-fatal first.
@@ -809,14 +809,14 @@ impl Scheduler {
 
         // Freeze physical inputs before registering this computation as pending.
         // Accepted progress may stop on cancellation while these inputs still drain.
-        // `visible` is the KV length after the in-flight predecessors; `input`
+        // `visible` is the cache length after the in-flight predecessors; `input`
         // counts the tokens this call appends. Export, latent preparation,
-        // and denoising only read the request's KV.
+        // and denoising only read the request's prefix cache.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
-        let kv_lengths = match call.code {
+        let cache_lengths = match call.code {
             // A context prefill's bound counts its prompt tokens and its
-            // vision blocks' exact KV lengths.
-            CallKind::Forward(ForwardMode::Prefill) => Some(KvLengths {
+            // vision blocks' exact cache lengths.
+            CallKind::Forward(ForwardMode::Prefill) => Some(CacheLengths {
                 visible,
                 input: if is_prompt_extend(&call) || consumes_image_features(&call) {
                     call.bounds.max_tokens
@@ -825,12 +825,12 @@ impl Scheduler {
                 },
             }),
             CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
-                Some(KvLengths { visible, input: 1 })
+                Some(CacheLengths { visible, input: 1 })
             }
             CallKind::Forward(ForwardMode::TokenDenoising)
-            | CallKind::Transfer(TransferMode::KvExport)
+            | CallKind::Transfer(TransferMode::CacheExport)
             | CallKind::Media(MediaCall::LatentPreparation)
-            | CallKind::Media(MediaCall::Denoising) => Some(KvLengths { visible, input: 0 }),
+            | CallKind::Media(MediaCall::Denoising) => Some(CacheLengths { visible, input: 0 }),
             _ => None,
         };
         // Latent preparation opens the trajectory at step zero, a denoising
@@ -845,10 +845,10 @@ impl Scheduler {
                 .map(|state| u32::from(state.req.image.steps)),
             _ => None,
         };
-        // An image-feature extension declares the KV tokens of the encoder
+        // An image-feature extension declares the cache tokens of the encoder
         // that produced its feature: the scheduled feedback encoder, or the
         // current input image's encoder.
-        let num_image_kv_tokens = if consumes_image_features(&call) {
+        let num_image_cache_tokens = if consumes_image_features(&call) {
             let state = self.running.get(&request_id)?;
             let encoder = if is_feedback_computation(&call) {
                 state
@@ -864,7 +864,7 @@ impl Scheduler {
                     .get(state.num_ingested_images)
                     .and_then(|image| image.encoders.get(state.image_encoder_index))
             };
-            encoder.and_then(|encoder| encoder.num_kv_tokens)
+            encoder.and_then(|encoder| encoder.num_cache_tokens)
         } else {
             None
         };
@@ -898,7 +898,7 @@ impl Scheduler {
         let context_segments = if is_prompt_extend(&call) && !call.vision_inputs.is_empty() {
             let segments = self.context_segments(request_id, &call);
             let Some(segments) = segments.filter(|segments| {
-                kv_lengths
+                cache_lengths
                     .as_ref()
                     .is_some_and(|lengths| segments.iter().sum::<u32>() == lengths.input)
             }) else {
@@ -915,19 +915,19 @@ impl Scheduler {
         let mut call_block_tables = Vec::new();
         let mut call_new_cache_units = Vec::new();
         let mut call_forward = ForwardBatch::default();
-        if let Some(lengths) = kv_lengths {
+        if let Some(lengths) = cache_lengths {
             // Registration above found the request running, and a running
-            // token request always has its KV tables.
+            // token request always has its cache tables.
             let Some(state) = self.running.get_mut(&request_id) else {
-                self.invariant_broken("a registered token request is admitted with a KV cache");
+                self.invariant_broken("a registered token request is admitted with a prefix cache");
                 return None;
             };
-            let fresh_count = u64::from(call.bounds.max_kv_units);
-            let declared = state.num_kv_units_sent;
+            let fresh_count = u64::from(call.bounds.max_cache_units);
+            let declared = state.num_cache_units_sent;
             let (Some(request_pool_idx), Some(allocation)) =
-                (state.request_pool_idx(), state.kv_mut())
+                (state.request_pool_idx(), state.prefix_cache_mut())
             else {
-                self.invariant_broken("a registered token request is admitted with a KV cache");
+                self.invariant_broken("a registered token request is admitted with a prefix cache");
                 return None;
             };
 
@@ -938,7 +938,7 @@ impl Scheduler {
             // allocated since the declared watermark (`plan_computation`).
             // Admission (or re-admission) declares every table again, with
             // every allocated page fresh; pages acquired from the prefix
-            // cache already hold computed KV and are never fresh.
+            // cache already hold computed keys and values and are never fresh.
             if admitted {
                 allocation.clear_sent();
             }
@@ -973,9 +973,9 @@ impl Scheduler {
             // A context prefill with vision blocks appends one forward row per
             // segment, in context order: the prompt tokens between blocks, and
             // each block, which the worker evaluates as one attention block.
-            // Every other call that appends KV has one row. Each row attends
+            // Every other call that appends prefix cache has one row. Each row attends
             // to the visible prefix and the rows before it, and persists its
-            // tokens in KV.
+            // tokens in the prefix cache.
             if !context_segments.is_empty() {
                 let mut end = lengths.visible;
                 for &segment in &context_segments {
@@ -1064,21 +1064,21 @@ impl Scheduler {
         }
 
         // A denoising call adds one query row per guidance branch; its query
-        // is the latent grid plus the commit marker tokens and writes no KV.
-        // Branch 0 attends to the request's own conditioning KV. Every other
-        // branch attends to the flow prefix (the negative-prompt KV in its own
+        // is the latent grid plus the commit marker tokens and writes nothing to the prefix cache.
+        // Branch 0 attends to the request's own conditioning prefix cache. Every other
+        // branch attends to the flow prefix (the negative-prompt prefix cache in its own
         // request row) when the request holds one, and to the request's own
-        // KV otherwise. Until a denoising call completes successfully and
+        // prefix cache otherwise. Until a denoising call completes successfully and
         // finalizes the prefix, the call also prefills a non-empty negative
         // prompt into it; the prefix's tables are resent until then and
         // whenever the prefix has gained pages.
         if call.code == CallKind::Media(MediaCall::Denoising) {
-            let Some(KvLengths {
+            let Some(CacheLengths {
                 visible: conditioning_tokens,
                 ..
-            }) = kv_lengths
+            }) = cache_lengths
             else {
-                self.invariant_broken("denoising declares its conditioning KV range");
+                self.invariant_broken("denoising declares its conditioning cache range");
                 return None;
             };
             let query_len = u32::try_from(
@@ -1201,17 +1201,17 @@ impl Scheduler {
         };
         call.component = entry;
 
-        // An image extension writes its block's KV, and a context prefill
+        // An image extension writes its block's prefix cache, and a context prefill
         // with vision blocks exactly its bound: its prompt tokens and blocks.
-        let image_kv = if consumes_image_features(&call) || !call.vision_inputs.is_empty() {
-            let Some(lengths) = kv_lengths else {
-                self.invariant_broken("an image extension declares its KV input range");
+        let image_cache = if consumes_image_features(&call) || !call.vision_inputs.is_empty() {
+            let Some(lengths) = cache_lengths else {
+                self.invariant_broken("an image extension declares its cache input range");
                 return None;
             };
             Some((
                 lengths.visible,
                 if consumes_image_features(&call) {
-                    num_image_kv_tokens
+                    num_image_cache_tokens
                 } else {
                     Some(lengths.input)
                 },
@@ -1223,7 +1223,7 @@ impl Scheduler {
         self.register_inflight(
             call.clone(),
             InflightInput::Generation {
-                image_kv,
+                image_cache,
                 latent: latent.clone(),
             },
             submitted_us.saturating_sub(planned_us),
@@ -1277,7 +1277,7 @@ impl Scheduler {
             .pending
             .store(self.pending_request_count(), Ordering::Relaxed);
         self.stats
-            .kv_cache
+            .prefix_cache
             .free_units
             .store(self.storage.free_units(), Ordering::Relaxed);
         self.inflight.register_pending_batch(&batch, submit_at);
@@ -1328,14 +1328,14 @@ impl Scheduler {
                 .matches_generated(&st.req.prompt_token_ids)
     }
 
-    /// Grows the request's KV tables for a call that reads from KV token
+    /// Grows the request's cache tables for a call that reads from cache token
     /// `read_start` and holds `total_tokens` tokens.
     ///
     /// A sliding-window group needs only the pages the read's window and the
     /// call's tokens intersect; every group's units come from one pool.
     /// Returns `false` when the request is not running, the cache cannot
     /// grow, or (after latching engine-fatal) a running request lacks its
-    /// allocations or the KV cache.
+    /// allocations or the prefix cache.
     pub(super) fn ensure_request_capacity(
         &mut self,
         id: RequestId,
@@ -1348,40 +1348,40 @@ impl Scheduler {
         let (Some(allocations), Some(cache)) =
             (state.allocations_mut(), self.storage.cache.as_ref())
         else {
-            self.invariant_broken("a running token request is admitted with a KV cache");
+            self.invariant_broken("a running token request is admitted with a prefix cache");
             return false;
         };
         cache
             .grow(
-                &mut allocations.kv,
+                &mut allocations.prefix_cache,
                 read_start.min(u32::MAX as usize) as u32,
                 total_tokens.min(u32::MAX as usize) as u32,
             )
             .is_ok()
     }
 
-    /// Activates the KV tables reserved for a request.
+    /// Activates the cache tables reserved for a request.
     ///
     /// A request holds tables only once admitted, and only token requests,
-    /// which always have the KV cache, hold them.
+    /// which always have the prefix cache, hold them.
     pub(super) fn activate_request_tables(&self, id: RequestId) {
         let tables = self.running.get(&id).and_then(RequestState::block_tables);
-        if let (Some(tables), Some(kv)) = (tables, self.storage.cache()) {
+        if let (Some(tables), Some(prefix_cache)) = (tables, self.storage.cache()) {
             for table in tables {
-                table.activate(&kv.block_pool);
+                table.activate(&prefix_cache.block_pool);
             }
         }
     }
 
-    /// Builds a computation and records the KV units owned by its next dispatch.
+    /// Builds a computation and records the cache units owned by its next dispatch.
     ///
-    /// For a forward call, sets `bounds.max_kv_units` to the units every
+    /// For a forward call, sets `bounds.max_cache_units` to the units every
     /// group's table gained since the last dispatch and advances
-    /// `num_kv_units_sent`; a caller that drops the call must roll that back.
+    /// `num_cache_units_sent`; a caller that drops the call must roll that back.
     ///
     /// Returns `None` when the request is not running, when planning fails
     /// (the request is then finished with `Error`), or, after latching
-    /// engine-fatal, when a forward's request holds no KV tables.
+    /// engine-fatal, when a forward's request holds no cache tables.
     pub(super) fn plan_computation(
         &mut self,
         id: RequestId,
@@ -1396,21 +1396,23 @@ impl Scheduler {
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
                 ) {
-                    // The KV owner keeps unit identities. The scheduled record
+                    // The cache owner keeps unit identities. The scheduled record
                     // only needs the number of fresh units for dispatch and drain.
                     let state = self.running.get_mut(&id)?;
                     let Some(allocated) = state
                         .allocations()
-                        .map(|allocations| allocations.kv.allocated_units())
+                        .map(|allocations| allocations.prefix_cache.allocated_units())
                     else {
-                        self.invariant_broken("a request planning a forward holds its KV tables");
+                        self.invariant_broken(
+                            "a request planning a forward holds its cache tables",
+                        );
                         return None;
                     };
-                    call.bounds.max_kv_units = allocated
-                        .saturating_sub(state.num_kv_units_sent)
+                    call.bounds.max_cache_units = allocated
+                        .saturating_sub(state.num_cache_units_sent)
                         .min(u64::from(u32::MAX))
                         as u32;
-                    state.num_kv_units_sent = allocated;
+                    state.num_cache_units_sent = allocated;
                 }
                 Some(call)
             }
@@ -1429,7 +1431,7 @@ impl Scheduler {
     /// A canvas pass takes the next readout rows that fit both `budget`
     /// tokens and the pass's canvas `rows`, and a context prefill the
     /// segments that fit its context rows. Returns `None` when nothing can be
-    /// planned now, including when the KV capacity a call needs, the
+    /// planned now, including when the cache capacity a call needs, the
     /// image-branch reservation, or room for one whole canvas row is
     /// unavailable.
     pub(super) fn next_generation_computation(
@@ -1439,7 +1441,7 @@ impl Scheduler {
         rows: PassRows,
     ) -> Option<Call> {
         let canvas_rows = rows.canvas;
-        let (logical_position, kv_visible_len) = self.scheduled_token_lengths(id)?;
+        let (logical_position, cache_visible_len) = self.scheduled_token_lengths(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
             self.num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count < st.req.prompt_token_ids.len() as u32)
@@ -1468,7 +1470,7 @@ impl Scheduler {
                     .min(self.config.long_prefill_threshold)
                     .min(budget.max(1));
                 let end = (cursor + chunk_cap.max(1)).min(n);
-                if !self.ensure_request_capacity(id, kv_visible_len as usize, end) {
+                if !self.ensure_request_capacity(id, cache_visible_len as usize, end) {
                     return None;
                 }
                 let sampling_state = self.build_token_masks(id, 0, 0);
@@ -1503,7 +1505,7 @@ impl Scheduler {
                 let pos = logical_position;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let capacity_target = decode_capacity_target(pos as usize, 0);
-                if !self.ensure_request_capacity(id, kv_visible_len as usize, capacity_target) {
+                if !self.ensure_request_capacity(id, cache_visible_len as usize, capacity_target) {
                     return None;
                 }
 
@@ -1518,29 +1520,29 @@ impl Scheduler {
                     )
                 })
             }
-            Phase::CloseKv => {
+            Phase::CloseCache => {
                 let token = self.running.get(&id)?.next_token;
-                let capacity_target = decode_capacity_target(kv_visible_len as usize, 0);
-                if !self.ensure_request_capacity(id, kv_visible_len as usize, capacity_target) {
+                let capacity_target = decode_capacity_target(cache_visible_len as usize, 0);
+                if !self.ensure_request_capacity(id, cache_visible_len as usize, capacity_target) {
                     return None;
                 }
 
                 self.plan_computation(id, |_scheduler, request| {
-                    generation::plan_close_kv(request, token, false)
+                    generation::plan_close_cache(request, token, false)
                 })
             }
-            Phase::PublishKv => self.plan_computation(id, |scheduler, request| {
-                generation::plan_kv_export(
+            Phase::PublishCache => self.plan_computation(id, |scheduler, request| {
+                generation::plan_cache_export(
                     scheduler
                         .info
-                        .kv_cache
+                        .prefix_cache
                         .as_ref()
-                        .map_or(0, |cache| cache.transfer_bytes(kv_visible_len)),
+                        .map_or(0, |cache| cache.transfer_bytes(cache_visible_len)),
                     request,
                 )
             }),
             Phase::PrepareGen => {
-                let conditioning = self.kv_conditioning(id)?;
+                let conditioning = self.cache_conditioning(id)?;
                 self.plan_computation(id, |scheduler, request| {
                     generation::plan_diffusion_prepare(
                         &scheduler.generation_limits,
@@ -1560,7 +1562,7 @@ impl Scheduler {
                     .denoising
                     .next(scheduled, u32::from(self.denoise_step_burst))?;
                 let denoise_step_count = u16::try_from(count).ok()?;
-                let conditioning = self.kv_conditioning(id)?;
+                let conditioning = self.cache_conditioning(id)?;
                 let latent = self
                     .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.denoising.latent())
@@ -1747,8 +1749,8 @@ impl Scheduler {
                 {
                     return None;
                 }
-                let end = (kv_visible_len as usize).saturating_add(tokens.len());
-                if !self.ensure_request_capacity(id, kv_visible_len as usize, end) {
+                let end = (cache_visible_len as usize).saturating_add(tokens.len());
+                if !self.ensure_request_capacity(id, cache_visible_len as usize, end) {
                     return None;
                 }
                 self.plan_computation(id, |_scheduler, request| {
@@ -1776,7 +1778,7 @@ impl Scheduler {
     /// starts with a block may exceed the threshold within the budget. Its
     /// forward rows (`generation::prefill_rows`) stay within `context_rows`.
     /// Returns `None` when nothing can be planned now, including when the
-    /// next block does not fit this pass or the request's KV capacity is
+    /// next block does not fit this pass or the request's cache capacity is
     /// unavailable.
     pub(super) fn next_context_computation(
         &mut self,
@@ -1785,7 +1787,7 @@ impl Scheduler {
         context_rows: usize,
     ) -> Option<Call> {
         let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
-        let (_, kv_visible_len) = self.scheduled_token_lengths(id)?;
+        let (_, cache_visible_len) = self.scheduled_token_lengths(id)?;
 
         // A latent block's encoder product awaits its own extension.
         if self.running.get(&id)?.phase == Phase::IngestState {
@@ -1794,15 +1796,15 @@ impl Scheduler {
             let (_, encoder_input) = state.input_block(state.block_cursor())?;
             let encoder_input = *encoder_input;
             // Submission validated every input encoder's capacity.
-            let Ok(physical_bound) = encoder_input.kv_token_capacity(&self.generation_limits)
+            let Ok(physical_bound) = encoder_input.cache_token_capacity(&self.generation_limits)
             else {
-                self.invariant_broken("a queued input encoder has a valid KV capacity");
+                self.invariant_broken("a queued input encoder has a valid cache capacity");
                 return None;
             };
             if !self.ensure_request_capacity(
                 id,
-                kv_visible_len as usize,
-                kv_visible_len.saturating_add(physical_bound) as usize,
+                cache_visible_len as usize,
+                cache_visible_len.saturating_add(physical_bound) as usize,
             ) {
                 return None;
             }
@@ -1911,9 +1913,9 @@ impl Scheduler {
                 {
                     break;
                 }
-                // Submission validated every vision block's exact KV length.
-                let Some(tokens) = input.num_kv_tokens else {
-                    self.invariant_broken("an input vision block declares its exact KV length");
+                // Submission validated every vision block's exact cache length.
+                let Some(tokens) = input.num_cache_tokens else {
+                    self.invariant_broken("an input vision block declares its exact cache length");
                     return None;
                 };
                 // A block joins only whole: one that would overflow the chunk
@@ -1942,8 +1944,8 @@ impl Scheduler {
         let written = end - cursor + block_tokens as usize;
         if !self.ensure_request_capacity(
             id,
-            kv_visible_len as usize,
-            kv_visible_len as usize + written,
+            cache_visible_len as usize,
+            cache_visible_len as usize + written,
         ) {
             return None;
         }
@@ -2005,7 +2007,7 @@ impl Scheduler {
 
     /// Returns the forward-row lengths of a context prefill `call` with vision
     /// blocks, in context order: the prompt tokens before, between and after
-    /// its blocks, and each block's exact KV length. The blocks are the
+    /// its blocks, and each block's exact cache length. The blocks are the
     /// request's next ones after its scheduled block cursor.
     fn context_segments(&self, id: RequestId, call: &Call) -> Option<Vec<u32>> {
         let state = self.running.get(&id)?;
@@ -2021,7 +2023,7 @@ impl Scheduler {
                 text_start = input.offset;
             }
             let (_, encoder) = state.input_block(block)?;
-            segments.push(encoder.num_kv_tokens?);
+            segments.push(encoder.num_cache_tokens?);
             block = state.next_block(block)?;
         }
         let text = u32::try_from(call.input_token_ids.len()).ok()?;

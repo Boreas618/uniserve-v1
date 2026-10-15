@@ -10,13 +10,13 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve_models.backends import moe as moe_backends
-from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
-from uniserve_models.interface import graphs
-from uniserve_models.model import TextSize
-from uniserve_models.nn import functional
-from uniserve_models.nn.moe import FusedMoE
-from uniserve_models.quantization import Quantizer, ScaleLayout
+from uniserve import cuda_graph
+from uniserve.backends import moe as moe_backends
+from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.models import TextSize
+from uniserve.nn import functional
+from uniserve.nn.moe import FusedMoE
+from uniserve.quantization import Quantizer, ScaleLayout
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -81,7 +81,7 @@ def _replay_matches(
             actual.double(), expected(hidden, ids, weights), rtol=rtol, atol=0
         )
 
-        graph = graphs.capture(
+        graph = cuda_graph.capture(
             lambda: module(hidden, ids, weights), stream=stream
         )
         replacement_ids, replacement_weights = _routes(
@@ -185,7 +185,7 @@ def test_bf16_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
             first = module(hidden, ids, weights).clone()
             for _ in range(16):
                 assert torch.equal(module(hidden, ids, weights), first)
-        graph = graphs.capture(
+        graph = cuda_graph.capture(
             lambda: module(hidden, ids, weights), stream=stream
         )
         for _ in range(16):
@@ -561,7 +561,7 @@ def test_nvfp4_experts_read_hidden_states_stored_in_their_input_encoding(
                     ids,
                     weights,
                 )
-        graph = graphs.capture(
+        graph = cuda_graph.capture(
             lambda: module(encoded, ids, weights), stream=stream
         )
         assert torch.equal(graph.replay(), expected)
@@ -607,7 +607,7 @@ def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
             )
             for _ in range(16):
                 assert torch.equal(module(hidden, ids, weights), first)
-        graph = graphs.capture(
+        graph = cuda_graph.capture(
             lambda: module(hidden, ids, weights), stream=stream
         )
         for _ in range(16):
@@ -737,7 +737,7 @@ def test_native_experts_prepare_after_the_portable_reference_is_loaded():
     A process may evaluate CPU experts, which loads the portable provider,
     before it prepares GPU experts.
     """
-    from uniserve_models.backends.moe import resolve
+    from uniserve.backends.moe import resolve
 
     reference = FusedMoE(4, 16, 16, top_k=2, activation="silu")
     resolve("auto", module=reference, device=torch.device("cpu"))

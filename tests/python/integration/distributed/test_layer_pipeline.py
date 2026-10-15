@@ -13,9 +13,9 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models.distributed import DeviceMesh, parallelize_
-from uniserve_models.model import TransformerDecoder
-from uniserve_models.nn.attention import (
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.models import TransformerDecoder
+from uniserve.nn.attention import (
     AttentionBatch,
     AttentionParallelConfig,
     SequenceLengths,

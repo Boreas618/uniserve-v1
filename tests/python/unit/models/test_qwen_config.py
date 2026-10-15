@@ -10,9 +10,9 @@ import pytest
 import torch
 from transformers import Qwen3Config, Qwen3MoeConfig
 
-from uniserve_models import loading, qwen3
-from uniserve_models.model import EmbeddingReplacement, TextInput
-from uniserve_models.nn.attention import (
+from uniserve import loading
+from uniserve.models import EmbeddingReplacement, TextInput, qwen3
+from uniserve.nn.attention import (
     AttentionBatch,
     SequenceLengths,
     VarlenInput,

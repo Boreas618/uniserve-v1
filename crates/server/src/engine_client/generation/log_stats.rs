@@ -37,7 +37,7 @@ struct EngineMetrics {
     // Gauges for instantaneous scheduler state.
     scheduler_running: U64Gauge,
     scheduler_waiting: U64Gauge,
-    kv_cache_usage: F64Gauge,
+    prefix_cache_usage: F64Gauge,
 }
 
 /// Cumulative counter values summed across engines at one sample, used to
@@ -93,7 +93,7 @@ fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMe
                 prefix_cache_hits: m.scheduler.prefix_cache_hits.get_or_create_owned(&el),
                 scheduler_running: m.scheduler.scheduler_running.get_or_create_owned(&el),
                 scheduler_waiting: m.scheduler.scheduler_waiting.get_or_create_owned(&el),
-                kv_cache_usage: m.scheduler.kv_cache_usage.get_or_create_owned(&el),
+                prefix_cache_usage: m.scheduler.prefix_cache_usage.get_or_create_owned(&el),
             }
         })
         .collect()
@@ -141,7 +141,7 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
             && last_generation_throughput == 0.0;
 
         // Read scheduler gauges (aggregate across engines).
-        let (num_running, num_waiting, kv_cache_usage) = read_scheduler_gauges(&engines);
+        let (num_running, num_waiting, prefix_cache_usage) = read_scheduler_gauges(&engines);
 
         // Compute prefix cache hit rate over this interval.
         let delta_queries = curr
@@ -164,7 +164,7 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
              Waiting: {num_waiting}, \
              GPU KV cache used: {:.1}%, \
              Prefix cache hit rate: {prefix_cache_hit_rate:.1}%",
-            kv_cache_usage * 100.0,
+            prefix_cache_usage * 100.0,
         )
         .is_err()
         {
@@ -203,24 +203,24 @@ fn read_counters(engines: &[EngineMetrics]) -> CounterSnapshot {
 
 /// Reads the current scheduler gauge values, aggregated across engines.
 ///
-/// Running and waiting counts are summed; KV cache usage is the mean of the
+/// Running and waiting counts are summed; prefix cache usage is the mean of the
 /// per-engine usage fractions (0.0 to 1.0), or 0.0 with no engines.
 fn read_scheduler_gauges(engines: &[EngineMetrics]) -> (u64, u64, f64) {
     let mut num_running = 0u64;
     let mut num_waiting = 0u64;
-    let mut kv_cache_usage_sum = 0.0f64;
+    let mut prefix_cache_usage_sum = 0.0f64;
 
     for e in engines {
         num_running += e.scheduler_running.get();
         num_waiting += e.scheduler_waiting.get();
-        kv_cache_usage_sum += e.kv_cache_usage.get();
+        prefix_cache_usage_sum += e.prefix_cache_usage.get();
     }
 
-    let kv_cache_usage = if !engines.is_empty() {
-        kv_cache_usage_sum / engines.len() as f64
+    let prefix_cache_usage = if !engines.is_empty() {
+        prefix_cache_usage_sum / engines.len() as f64
     } else {
         0.0
     };
 
-    (num_running, num_waiting, kv_cache_usage)
+    (num_running, num_waiting, prefix_cache_usage)
 }

@@ -235,7 +235,7 @@ fn controls_and_disconnection_release_requests_during_preprocessing() {
     });
 }
 
-/// A chat prompt that exceeds the total capacity of a two-unit KV cache is
+/// A chat prompt that exceeds the total capacity of a two-unit prefix cache is
 /// returned as a stream and then rejected by engine admission. Collecting the
 /// completion must report that rejection as HTTP 400 and record the request
 /// as `Rejected`.

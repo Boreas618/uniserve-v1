@@ -7,8 +7,7 @@
 use crate::config::DescriptorError;
 
 /// Usage line printed with an argument or descriptor error.
-pub const USAGE: &str =
-    "usage: python -m uniserve_models.worker --head ADDRESS --worker-id ID --rank R";
+pub const USAGE: &str = "usage: python -m uniserve.worker --head ADDRESS --worker-id ID --rank R";
 
 /// Parsed command-line arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]

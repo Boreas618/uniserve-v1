@@ -31,7 +31,7 @@ use crate::executor::{
 use anyhow::Context;
 use uniserve_core::CommandWaker;
 use uniserve_ipc::{
-    BatchCommand, BufferAllocation, BufferId, Call, KvTransfer, NewRequest, RequestKey,
+    BatchCommand, BufferAllocation, BufferId, CacheTransfer, Call, NewRequest, RequestKey,
     TensorExport, TensorRef,
 };
 
@@ -86,7 +86,7 @@ struct WorkerSubmission {
     /// Products this worker reads that another worker, or a component of this
     /// worker that does not share the reader's storage, produces. The
     /// submission stays at its queue head until each has an export in
-    /// `transfer_products` or `kv_transfers`.
+    /// `transfer_products` or `cache_transfers`.
     dependencies: Vec<BufferId>,
 }
 
@@ -96,14 +96,14 @@ impl WorkerSubmission {
     /// A batch carries one computation to one component, so a worker receives
     /// it once, under one identity, and answers it once. Product inputs the
     /// worker does not yet hold travel as dependencies and hold the submission
-    /// in its queue until they resolve. Inputs, KV inputs, and dependencies
+    /// in its queue until they resolve. Inputs, cache inputs, and dependencies
     /// that none of `calls` reads are dropped.
     fn build(
         batch_id: u64,
         calls: Vec<(Call, RequestPlacement)>,
         commands: Vec<BatchCommand>,
         inputs: Vec<TensorExport>,
-        kv_inputs: Vec<KvTransfer>,
+        cache_inputs: Vec<CacheTransfer>,
         dependencies: Vec<BufferId>,
     ) -> Self {
         let consumed = calls
@@ -119,7 +119,7 @@ impl WorkerSubmission {
             .filter(|product| consumed.contains(product))
             .collect();
         let mut batch = ExecutionBatch::new(batch_id, calls, commands, input_transfers);
-        batch.kv_inputs = kv_inputs
+        batch.cache_inputs = cache_inputs
             .into_iter()
             .filter(|export| consumed.contains(&export.source))
             .collect();
@@ -151,7 +151,7 @@ struct BufferRoute {
     /// a component publishes from its output ranks
     /// (`ComponentConfig::publishes_on_every_rank`). Every member rank
     /// holds its own copy of the call's other results: its device scalars,
-    /// encoder features, image, latents and KV.
+    /// encoder features, image, latents and prefix cache.
     declared_output: bool,
 }
 
@@ -191,8 +191,8 @@ pub struct WorkerExecutor {
     /// the product's bytes, which the head therefore holds until the buffer
     /// is freed or its request finishes without retaining it.
     transfer_products: HashMap<BufferId, TensorExport>,
-    /// KV exports returned by producing workers.
-    kv_transfers: HashMap<BufferId, KvTransfer>,
+    /// Cache exports returned by producing workers.
+    cache_transfers: HashMap<BufferId, CacheTransfer>,
     /// Per-worker FIFO of submissions the `WorkerGroup` has not yet accepted.
     worker_submissions: Vec<VecDeque<WorkerSubmission>>,
     /// Last collective sequence each worker accepted. It must strictly
@@ -501,7 +501,7 @@ impl WorkerExecutor {
             buffer_allocations: HashMap::new(),
             buffer_workers: HashMap::new(),
             transfer_products: HashMap::new(),
-            kv_transfers: HashMap::new(),
+            cache_transfers: HashMap::new(),
             worker_submissions: (0..worker_count).map(|_| VecDeque::new()).collect(),
             worker_collective_seqs: vec![0; worker_count],
             command_wake_pending: false,
@@ -595,7 +595,7 @@ impl WorkerExecutor {
             }
         }
         if lost {
-            for (buffer, export) in &mut self.kv_transfers {
+            for (buffer, export) in &mut self.cache_transfers {
                 for tensor in export.tensors_mut() {
                     tensor
                         .locations
@@ -616,7 +616,7 @@ impl WorkerExecutor {
             if (lost
                 && route.worker_index == index
                 && !self.transfer_products.contains_key(buffer)
-                && !self.kv_transfers.contains_key(buffer))
+                && !self.cache_transfers.contains_key(buffer))
                 || failed_calls.contains(&(buffer.owner, buffer.producer_call_id))
             {
                 buffers.insert(*buffer);
@@ -960,14 +960,14 @@ impl WorkerExecutor {
             .chain(batch.commands.iter().cloned())
             .collect();
         let mut inputs = batch.input_transfers.clone();
-        let mut kv_inputs = batch.kv_inputs.clone();
+        let mut cache_inputs = batch.cache_inputs.clone();
         for dependency in &submission.dependencies {
-            if let Some(export) = self.kv_transfers.get(dependency) {
+            if let Some(export) = self.cache_transfers.get(dependency) {
                 anyhow::ensure!(
-                    !kv_inputs.iter().any(|input| input.source == *dependency),
-                    "KV input is supplied more than once"
+                    !cache_inputs.iter().any(|input| input.source == *dependency),
+                    "cache input is supplied more than once"
                 );
-                kv_inputs.push(export.clone());
+                cache_inputs.push(export.clone());
                 continue;
             }
             anyhow::ensure!(
@@ -995,7 +995,7 @@ impl WorkerExecutor {
             requests: batch.requests.clone(),
             commands,
             input_transfers: inputs,
-            kv_inputs,
+            cache_inputs,
         }
         .into_protocol(collective_seq)?;
 
@@ -1046,7 +1046,7 @@ impl WorkerExecutor {
             .map(|payload| &mut payload.value)
             .flat_map(|handle| handle.tensors_mut())
             .chain(
-                wire.kv_inputs
+                wire.cache_inputs
                     .iter_mut()
                     .flat_map(|export| export.tensors_mut()),
             );
@@ -1162,7 +1162,7 @@ impl WorkerExecutor {
                 };
                 let ready = head.dependencies.iter().all(|buffer| {
                     self.transfer_products.contains_key(buffer)
-                        || self.kv_transfers.contains_key(buffer)
+                        || self.cache_transfers.contains_key(buffer)
                 });
                 if !ready {
                     continue;
@@ -1219,7 +1219,7 @@ impl WorkerExecutor {
     /// Routes a worker result into its worker aggregate and publishes transferable products.
     ///
     /// Validates the report against the worker's pending calls, stores the
-    /// product and KV exports it returns, and publishes its completions.
+    /// product and cache exports it returns, and publishes its completions.
     /// When some calls failed, the report, failed completions included, is
     /// still published and the method then returns a `WorkerFailure` naming
     /// the failed calls' requests and the buffers those calls would have
@@ -1324,20 +1324,20 @@ impl WorkerExecutor {
         for export in report
             .results
             .iter()
-            .filter_map(|completion| completion.output.kv_output.as_ref())
+            .filter_map(|completion| completion.output.cache_output.as_ref())
         {
             let route = self
                 .buffer_routes
                 .get(&export.source)
-                .context("worker returned an unplanned KV export")?;
+                .context("worker returned an unplanned cache export")?;
             anyhow::ensure!(
                 route.worker_index == worker_index,
-                "KV export was returned by another owner"
+                "cache export was returned by another owner"
             );
-            if let Some(stored) = self.kv_transfers.get_mut(&export.source) {
+            if let Some(stored) = self.cache_transfers.get_mut(&export.source) {
                 stored.merge_locations(export)?;
             } else {
-                self.kv_transfers.insert(export.source, export.clone());
+                self.cache_transfers.insert(export.source, export.clone());
             }
         }
 
@@ -1424,7 +1424,7 @@ impl WorkerExecutor {
                         self.buffer_allocations
                             .retain(|(_, identity), _| *identity != buffer);
                         self.buffer_routes.retain(|identity, _| *identity != buffer);
-                        self.kv_transfers.remove(&buffer);
+                        self.cache_transfers.remove(&buffer);
                         self.transfer_products
                             .retain(|identity, _| *identity != buffer);
                     }
@@ -1450,7 +1450,7 @@ impl WorkerExecutor {
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
         self.transfer_products
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
-        self.kv_transfers
+        self.cache_transfers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
         self.buffer_allocations
             .retain(|(_, buffer), _| buffer.owner != request || retained.contains(buffer));
@@ -1551,7 +1551,7 @@ impl Executor for WorkerExecutor {
             let mut worker_inputs = (0..self.workers.len())
                 .map(|_| Vec::new())
                 .collect::<Vec<Vec<TensorExport>>>();
-            let mut worker_kv_inputs: Vec<Vec<KvTransfer>> =
+            let mut worker_cache_inputs: Vec<Vec<CacheTransfer>> =
                 (0..self.workers.len()).map(|_| Vec::new()).collect();
             let mut worker_dependencies = (0..self.workers.len())
                 .map(|_| Vec::new())
@@ -1607,7 +1607,7 @@ impl Executor for WorkerExecutor {
                         self.buffer_routes.insert(output, route);
                     }
                     // Every physical product needs release routing, including
-                    // paged latents, KV, and request-relay values that have no
+                    // paged latents, prefix cache, and request-relay values that have no
                     // buffer allocation.
                     self.buffer_workers
                         .entry(output)
@@ -1659,12 +1659,12 @@ impl Executor for WorkerExecutor {
                     worker_inputs[worker_index].push(payload.clone());
                 }
             }
-            for export in &batch.kv_inputs {
+            for export in &batch.cache_inputs {
                 let workers = input_routes
                     .get(&export.source)
-                    .context("cannot route undeclared KV input")?;
+                    .context("cannot route undeclared cache input")?;
                 for &worker_index in workers {
-                    worker_kv_inputs[worker_index].push(export.clone());
+                    worker_cache_inputs[worker_index].push(export.clone());
                 }
             }
 
@@ -1683,7 +1683,7 @@ impl Executor for WorkerExecutor {
                             worker_inputs[consumer_worker]
                                 .iter()
                                 .any(|payload| payload.product.buffer_id() == input)
-                                || worker_kv_inputs[consumer_worker]
+                                || worker_cache_inputs[consumer_worker]
                                     .iter()
                                     .any(|export| export.source == input),
                             "input {:?} has no registered producer or supplied export",
@@ -1700,7 +1700,7 @@ impl Executor for WorkerExecutor {
                         !worker_inputs[consumer_worker]
                             .iter()
                             .any(|existing| existing.product.buffer_id() == input)
-                            && !worker_kv_inputs[consumer_worker]
+                            && !worker_cache_inputs[consumer_worker]
                                 .iter()
                                 .any(|export| export.source == input),
                         "transfer descriptor must be supplied by its producing worker"
@@ -1781,7 +1781,7 @@ impl Executor for WorkerExecutor {
                     calls,
                     commands,
                     input_products,
-                    std::mem::take(&mut worker_kv_inputs[worker_index]),
+                    std::mem::take(&mut worker_cache_inputs[worker_index]),
                     dependencies,
                 ));
             }
@@ -1827,7 +1827,7 @@ impl Executor for WorkerExecutor {
                         .retain(|identity, _| *identity != *buffer);
                     self.buffer_routes
                         .retain(|identity, _| *identity != *buffer);
-                    self.kv_transfers.remove(buffer);
+                    self.cache_transfers.remove(buffer);
                 }
             }
             Ok(())

@@ -34,7 +34,7 @@ use crate::serving::{
 ///
 /// Each run leaves the prompt, and its image enters at the count of prompt
 /// tokens before it: the engine writes the image's vision features there,
-/// one KV entry and one position per soft token. `images` are indexed by
+/// one cache entry and one position per soft token. `images` are indexed by
 /// [`ImagePlacement::source`], and `placements` are in prompt order.
 pub(crate) fn engine_images(
     token_ids: &[u32],
@@ -57,8 +57,8 @@ pub(crate) fn engine_images(
             num_positions: placement.soft_tokens,
             encoders: vec![ImageEncoderInput {
                 encoder: ImageIngestStep::VitEncode,
-                num_kv_tokens: Some(placement.soft_tokens),
-                max_kv_tokens: None,
+                num_cache_tokens: Some(placement.soft_tokens),
+                max_cache_tokens: None,
             }],
         });
     }

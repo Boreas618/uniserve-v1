@@ -2,7 +2,7 @@
 //!
 //! [`VideoModel`] asks the sizing methods of the Python runners what
 //! admission, capacity planning and the runners need; [`DenoiserRunner`]
-//! is the Rust half of `uniserve_models.runner.denoiser.DenoiserRunner`.
+//! is the Rust half of `uniserve.runner.denoiser.DenoiserRunner`.
 //!
 //! A video request's samples live in the latent pool: two banks of pages
 //! whose slot owns `pages` consecutive pages after page 0. A solver step
@@ -10,7 +10,7 @@
 //! copies the request's state (its slot rows of every state table and of
 //! the retained conditioning) into the fixed state buffers, writes the
 //! evaluation index, launches the layout's captured graph (or runs
-//! `DenoiserRunner.denoise` of `uniserve_models.runner.denoiser` on the
+//! `DenoiserRunner.denoise` of `uniserve.runner.denoiser` on the
 //! Python thread) and scatters the scratch into the other bank. Every one of
 //! those buffers is allocated here; the Python half receives the tensors of
 //! a forward as its arguments.
@@ -313,7 +313,7 @@ impl Conditioner {
     }
 }
 
-/// The Python half: `uniserve_models.runner.denoiser.DenoiserRunner` and
+/// The Python half: `uniserve.runner.denoiser.DenoiserRunner` and
 /// its methods, each called with the runner first.
 struct Methods {
     runner: Handle,
@@ -471,7 +471,7 @@ impl DenoiserRunner {
             setup.pages.page_units as usize,
         )?;
 
-        const RUNNER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
+        const RUNNER: &str = "uniserve.runner.denoiser.DenoiserRunner";
         let interface = setup.interface;
         let method = |name: &str| interface.import(&format!("{RUNNER}.{name}"));
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));
@@ -1676,10 +1676,10 @@ impl Trajectories for DenoiserRunner {
     }
 }
 
-const DENOISER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
-const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
-const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
-const OUTPUTS: &str = "uniserve_models.runner.denoiser.Outputs";
+const DENOISER: &str = "uniserve.runner.denoiser.DenoiserRunner";
+const DECODER: &str = "uniserve.runner.decoder.DecoderRunner";
+const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
+const OUTPUTS: &str = "uniserve.runner.denoiser.Outputs";
 
 /// What the model reports about its video timeline.
 #[derive(Debug, Clone, PartialEq)]

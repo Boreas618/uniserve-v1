@@ -26,7 +26,7 @@ pub struct RequestPlacement {
     /// space. Unset placements retain the admission's canonical row;
     /// `WorkerExecutor` applies the override to the `Start` it sends the worker.
     pub request_pool_idx: Option<u32>,
-    /// KV tables and newly acquired units used by this computation.
+    /// Cache tables and newly acquired units used by this computation.
     pub block_tables: Vec<BlockTable>,
     pub new_cache_units: Vec<CacheUnitAllocation>,
     /// Rows use a local call index until gathered into the physical batch:
@@ -63,11 +63,11 @@ pub struct ExecutionBatch {
     pub commands: Vec<BatchCommand>,
     /// Published transfer descriptors supplied by an external storage owner.
     pub input_transfers: Vec<TensorExport>,
-    /// External cache exports consumed by explicit KV installation.
+    /// External cache exports consumed by explicit cache installation.
     ///
     /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
     /// the worker-local batches it builds.
-    pub kv_inputs: Vec<uniserve_ipc::KvTransfer>,
+    pub cache_inputs: Vec<uniserve_ipc::CacheTransfer>,
 }
 
 impl ExecutionBatch {
@@ -83,7 +83,7 @@ impl ExecutionBatch {
             requests,
             commands,
             input_transfers,
-            kv_inputs: Vec::new(),
+            cache_inputs: Vec::new(),
         }
     }
 
@@ -99,7 +99,7 @@ impl ExecutionBatch {
     /// independent calls.
     ///
     /// Drops the calls and `Start` commands of every request key in
-    /// `requests`, then the input transfers and KV inputs no remaining call
+    /// `requests`, then the input transfers and cache inputs no remaining call
     /// reads. The requests' `Finish` and `Free` commands stay, since they still
     /// retire physical state and reader obligations on the workers. Returns the
     /// removed calls with the placements describing their resources. The batch
@@ -126,10 +126,10 @@ impl ExecutionBatch {
             .collect::<std::collections::HashSet<_>>();
         self.input_transfers
             .retain(|payload| inputs.contains(&payload.product));
-        self.kv_inputs.retain(|export| {
+        self.cache_inputs.retain(|export| {
             self.requests
                 .iter()
-                .any(|(call, _)| call.kv_input == Some(export.source))
+                .any(|(call, _)| call.cache_input == Some(export.source))
         });
         retired
     }
@@ -139,7 +139,7 @@ impl ExecutionBatch {
     /// Requires at least one call or command; checks each call and its
     /// placement, that call identities are unique and belong to this batch,
     /// and that every `Start` is unique and names a request with a call in
-    /// this batch; and validates every command, input transfer, and KV input.
+    /// this batch; and validates every command, input transfer, and cache input.
     /// Wire-level constraints between calls (one kind and component per batch,
     /// allocation tables matching their calls, non-overlapping spans) are left
     /// to `Batch::validate`, which `into_protocol` runs.
@@ -221,7 +221,7 @@ impl ExecutionBatch {
         for transfer in &self.input_transfers {
             transfer.validate()?;
         }
-        for export in &self.kv_inputs {
+        for export in &self.cache_inputs {
             export.validate()?;
         }
         Ok(())
@@ -244,7 +244,7 @@ impl ExecutionBatch {
             requests,
             commands,
             input_transfers: input_products,
-            kv_inputs,
+            cache_inputs,
         } = self;
         let mut block_tables = Vec::new();
         let mut new_cache_units = Vec::new();
@@ -276,7 +276,7 @@ impl ExecutionBatch {
             buffer_allocations,
             commands,
             input_products,
-            kv_inputs,
+            cache_inputs,
         };
         batch.validate()?;
         Ok(batch)

@@ -4,7 +4,7 @@ import pytest
 import torch
 from transformers import Qwen3VLConfig, Qwen3VLModel
 
-from uniserve_models.qwen3_vl import rope_index
+from uniserve.models.qwen3_vl import rope_index
 
 pytestmark = pytest.mark.unit
 

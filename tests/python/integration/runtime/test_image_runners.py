@@ -19,10 +19,10 @@ from PIL import Image
 
 from tests.python.fixtures.image_harness import image_harness
 from tests.python.fixtures.stub import load_stub
-from uniserve_models import interface
-from uniserve_models.media import image
-from uniserve_models.media.pixels import prepare_host_image, quantize_image_hwc
-from uniserve_models.model import VisionInput
+from uniserve import interface
+from uniserve.media import image
+from uniserve.media.pixels import prepare_host_image, quantize_image_hwc
+from uniserve.models import VisionInput
 
 pytestmark = pytest.mark.integration
 

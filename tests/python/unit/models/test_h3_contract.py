@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve_models.loading import Config as IOConfig
-from uniserve_models.minimax_h3 import (
+from uniserve.loading import Config as IOConfig
+from uniserve.models.minimax_h3 import (
     DenseAttention,
     Model,
     PddGrid,
@@ -19,9 +19,9 @@ from uniserve_models.minimax_h3 import (
     UniformGrid,
     entry_points,
 )
-from uniserve_models.minimax_h3.checkpoint import Kind, detect
-from uniserve_models.minimax_h3.config import Config, normalize, read_config
-from uniserve_models.nn.functional import Rounding
+from uniserve.models.minimax_h3.checkpoint import Kind, detect
+from uniserve.models.minimax_h3.config import Config, normalize, read_config
+from uniserve.nn.functional import Rounding
 
 pytestmark = pytest.mark.unit
 
@@ -298,8 +298,8 @@ def test_h3_direct_configuration_preserves_cross_component_dimensions():
     from dataclasses import replace
 
     from tests.python.fixtures.h3 import dmd_denoiser
-    from uniserve_models.minimax_h3 import audio_vae, video_vae
-    from uniserve_models.minimax_h3.encoder import TextEncoderConfig
+    from uniserve.models.minimax_h3 import audio_vae, video_vae
+    from uniserve.models.minimax_h3.encoder import TextEncoderConfig
 
     with pytest.raises(ValueError, match="conditioning width"):
         Config(

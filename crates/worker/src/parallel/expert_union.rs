@@ -8,7 +8,7 @@
 //! - the union's step agreement ([`ExpertParallel`]) and, during startup,
 //!   the warmup announcements expert-only ranks follow (here);
 //! - one expert exchange per microbatch (an opaque library object, created
-//!   collectively by `uniserve_models.distributed.experts.create_exchange`),
+//!   collectively by `uniserve.distributed.experts.create_exchange`),
 //!   each with its own stream, and the microbatch threads that rotate eager
 //!   forwards (`microbatches.rs`);
 //! - joins: per microbatch the owner of an execution context, whose
@@ -67,10 +67,10 @@ use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 
 /// The library module of expert exchanges.
-const MODULE: &str = "uniserve_models.distributed.experts";
+const MODULE: &str = "uniserve.distributed.experts";
 
 /// The library class over the worker's host collectives.
-const HOST_BOOTSTRAP: &str = "uniserve_models.backends.experts.HostBootstrap";
+const HOST_BOOTSTRAP: &str = "uniserve.backends.experts.HostBootstrap";
 
 /// The library functions of expert exchanges, reached by import path.
 #[derive(Clone)]

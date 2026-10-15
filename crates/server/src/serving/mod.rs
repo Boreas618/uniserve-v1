@@ -274,16 +274,16 @@ pub enum ServeError {
         /// Maximum token count declared by the profile.
         max_tokens: u32,
     },
-    /// The request's full KV requirement exceeds runtime capacity.
+    /// The request's full cache requirement exceeds runtime capacity.
     #[error(
         "request `{request_id}` requires {required_tokens} KV tokens, exceeding the {max_tokens}-token runtime limit"
     )]
     ContextCapacityExceeded {
         /// Identifier of the rejected request.
         request_id: ServeRequestId,
-        /// Total KV tokens required by the request.
+        /// Total cache tokens required by the request.
         required_tokens: u64,
-        /// Maximum KV tokens available to one request.
+        /// Maximum cache tokens available to one request.
         max_tokens: u32,
     },
     /// Another live request already owns the same identifier.
@@ -920,7 +920,7 @@ pub struct RequestStatsSnapshot {
     pub image_steps: u32,
     /// Cache policy and pin counts.
     pub cache: CacheAccounting,
-    /// KV and media resources reserved for the request.
+    /// Prefix cache and media resources reserved for the request.
     pub resources: ResourceAccounting,
     /// Request phase durations.
     pub timings: RuntimeTimings,
@@ -1312,11 +1312,11 @@ pub struct CacheAccounting {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// KV, latent, and encoder-cache requirements computed for one request during preprocessing.
+/// Prefix cache, latent, and encoder-cache requirements computed for one request during preprocessing.
 /// Media requests report `ResourceAccounting::default()`.
 pub struct ResourceAccounting {
-    /// KV-token capacity required for the request.
-    pub expected_kv_tokens: u64,
+    /// Cache-token capacity required for the request.
+    pub expected_cache_tokens: u64,
     /// Latent image units reserved for generation.
     pub image_latent_units: u64,
     /// Number of encoder-cache entries retained by the request.
@@ -1380,7 +1380,7 @@ pub enum RequestOutput {
         scheduled_at: Option<f64>,
         /// Cache policy and pin counts.
         cache: CacheAccounting,
-        /// KV and media resources reserved for the request.
+        /// Prefix cache and media resources reserved for the request.
         resources: ResourceAccounting,
     },
     /// Newly decoded user-visible text.
@@ -1501,7 +1501,7 @@ pub enum RequestOutput {
         image_steps: u32,
         /// Cache policy and pin counts.
         cache: CacheAccounting,
-        /// KV and media resources reserved for the request.
+        /// Prefix cache and media resources reserved for the request.
         resources: ResourceAccounting,
         /// Request phase durations.
         timings: RuntimeTimings,
@@ -1662,7 +1662,7 @@ mod tests {
                 encoder_pin_count: 0,
             },
             resources: ResourceAccounting {
-                expected_kv_tokens: 2,
+                expected_cache_tokens: 2,
                 replayable: true,
                 ..ResourceAccounting::default()
             },

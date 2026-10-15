@@ -21,14 +21,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn import functional as F
 
-from uniserve_models.backends import experts as transports
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import Communicator, partition_experts
-from uniserve_models.interface import graphs
-from uniserve_models.model import TextSize
-from uniserve_models.nn import functional
-from uniserve_models.nn.moe import FusedMoE
-from uniserve_models.quantization import Quantizer, ScaleLayout
+from uniserve import cuda_graph
+from uniserve.backends import experts as transports
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import Communicator, partition_experts
+from uniserve.models import TextSize
+from uniserve.nn import functional
+from uniserve.nn.moe import FusedMoE
+from uniserve.quantization import Quantizer, ScaleLayout
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -183,7 +183,7 @@ def _run(rank, port):
 
             eager = step()
             # Every rank captures the same step, then replays it.
-            graph = graphs.capture(step, stream=stream)
+            graph = cuda_graph.capture(step, stream=stream)
             captured = _replay(graph, stream)
             graph.release()
 
@@ -260,7 +260,7 @@ def _run_joined(rank, port):
                 # The join warms with the peer's first step, is captured
                 # without communication, and its replay meets the second.
                 join()
-                graph = graphs.capture(join, stream=stream)
+                graph = cuda_graph.capture(join, stream=stream)
                 _replay(graph, stream)
                 graph.release()
 
@@ -480,7 +480,7 @@ def _run_encoded(rank, port, provider, transport):
 
             dense = step(hidden).clone()
             eager = step(encoded).clone()
-            graph = graphs.capture(lambda: step(encoded), stream=stream)
+            graph = cuda_graph.capture(lambda: step(encoded), stream=stream)
             captured = _replay(graph, stream).clone()
             graph.release()
 
@@ -648,7 +648,7 @@ def _run_megamoe(rank, port, activation):
                 )
                 eager = step(hidden).clone()
                 stored = step(encoded).clone()
-                graph = graphs.capture(lambda: step(hidden), stream=stream)
+                graph = cuda_graph.capture(lambda: step(hidden), stream=stream)
                 captured = _replay(graph, stream).clone()
                 graph.release()
 

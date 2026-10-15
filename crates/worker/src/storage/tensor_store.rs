@@ -1743,7 +1743,7 @@ impl TensorStore {
 
     /// Release retired requests' products, except retained persistent ones,
     /// and revoke every export location registered for their buffers
-    /// (products and published KV extents). What follows a product's
+    /// (products and published cache extents). What follows a product's
     /// outstanding fences is deferred through `stream`.
     pub fn release_requests(
         &self,

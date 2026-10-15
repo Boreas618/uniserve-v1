@@ -17,8 +17,9 @@ from diffusers.modular_pipelines.minimax_h3.before_denoise import (
     MiniMaxH3SetTimestepsStep,
 )
 
-from uniserve_models.media import image, video
-from uniserve_models.minimax_h3.packing import (
+from uniserve.media import image, video
+from uniserve.models import Condition, ConditionRole
+from uniserve.models.minimax_h3.packing import (
     AUDIO_CONDITION_GROUP,
     AUDIO_GROUP,
     AUDIO_TAG,
@@ -32,7 +33,6 @@ from uniserve_models.minimax_h3.packing import (
     latent_raster,
     video_latent_frames,
 )
-from uniserve_models.model import Condition, ConditionRole
 
 pytestmark = pytest.mark.unit
 

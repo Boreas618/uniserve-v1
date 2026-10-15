@@ -2,7 +2,7 @@
 
 import pytest
 
-from uniserve_models.runner.denoiser import Outputs
+from uniserve.runner.denoiser import Outputs
 
 pytestmark = pytest.mark.unit
 

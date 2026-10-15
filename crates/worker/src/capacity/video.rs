@@ -6,7 +6,7 @@
 //! therefore sized by storage (each candidate count's state, products,
 //! product store and latent pool must fit the device grant on every rank of
 //! the group), and the engine schedules against those slots instead of a
-//! KV pool. This module derives the per-request quantities from the model
+//! cache pool. This module derives the per-request quantities from the model
 //! ([`VideoModel`]) and the deployment, and the products every component
 //! declares.
 

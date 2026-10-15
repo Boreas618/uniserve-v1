@@ -22,13 +22,12 @@ from PIL import Image
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
 from tests.python.fixtures.image_harness import image_harness
 from tests.python.fixtures.stub import load_model, read_config
-from uniserve_models import catalog as models
-from uniserve_models import interface
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.interface import graphs
-from uniserve_models.loading import weights
-from uniserve_models.media.pixels import prepare_host_image
-from uniserve_models.model import VisionInput
+from uniserve import cuda_graph, interface
+from uniserve.bindings.context import ExecutionContext
+from uniserve.loading import weights
+from uniserve.media.pixels import prepare_host_image
+from uniserve.models import VisionInput
+from uniserve.models import registry as models
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -115,7 +114,7 @@ def test_packed_images_encode_as_they_do_alone(tmp_path):
             encoder.packed_grids((), slots), dtype=torch.long, device=DEVICE
         )
         encoder.encode_packed(static_pixels, static_grids)
-        graph = graphs.capture(
+        graph = cuda_graph.capture(
             lambda: encoder.encode_packed(static_pixels, static_grids),
             stream=stream,
         )

@@ -17,10 +17,10 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import DeviceMesh, parallelize_
-from uniserve_models.nn import ColumnParallelLinear
-from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.nn import ColumnParallelLinear
+from uniserve.nn.attention import AttentionParallelConfig, Ulysses
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

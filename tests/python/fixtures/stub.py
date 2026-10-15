@@ -2,16 +2,12 @@
 
 import json
 
-from uniserve_models.interface import runtime
+from uniserve.interface import runtime
 
 # The functions as a rank reaches them: by import path, with failures
 # carrying the interface's error kinds.
-_READ_CONFIG = runtime.import_path(
-    "uniserve_models.interface.loading.read_config"
-)
-_LOAD_MODEL = runtime.import_path(
-    "uniserve_models.interface.loading.load_model"
-)
+_READ_CONFIG = runtime.import_path("uniserve.interface.loading.read_config")
+_LOAD_MODEL = runtime.import_path("uniserve.interface.loading.load_model")
 
 LOCAL = {
     "ranks": [0],

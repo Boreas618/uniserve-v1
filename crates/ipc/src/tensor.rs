@@ -6,8 +6,8 @@
 //! runs. A producing worker reports the product as a [`TensorExport`],
 //! whose [`TransferHandle`] carries the actual logical shape
 //! ([`TensorTransfer`]) and one [`Locator`] per shard or replica, each naming
-//! the [`TransferTransport`] a consumer opens. A published KV extent travels as
-//! a [`KvTransfer`] identified by a [`BufferId`] alone.
+//! the [`TransferTransport`] a consumer opens. A published cache extent travels as
+//! a [`CacheTransfer`] identified by a [`BufferId`] alone.
 //!
 //! The validators here are the wire contract: a [`Frame`](crate::Frame) runs
 //! them, through `Batch::validate` and `BatchOutput::validate`, whenever it
@@ -192,7 +192,7 @@ pub struct TensorRef {
 
 /// Stable identity for one cross-call buffer, independent of its physical representation.
 ///
-/// A [`TensorRef`] projects to one through [`TensorRef::buffer_id`]; a KV
+/// A [`TensorRef`] projects to one through [`TensorRef::buffer_id`]; a cache
 /// export carries one directly. The engine routes buffers and frees them
 /// (`BatchCommand::Free`) by this identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -467,14 +467,14 @@ fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
     })
 }
 
-/// One cache group's share of a KV export.
+/// One cache group's share of a cache export.
 ///
 /// The tensors carry the group's tokens `[start, exported_extent)` of the
-/// enclosing [`KvTransfer`]. A full-attention group starts at the
+/// enclosing [`CacheTransfer`]. A full-attention group starts at the
 /// export's `base_extent`; a sliding-window group starts no earlier than
 /// the first token its readers need, so it never carries retired history.
 /// With `T = exported_extent - start`, the tensors use this layout, whose
-/// shape relations [`KvTransfer::validate`] checks:
+/// shape relations [`CacheTransfer::validate`] checks:
 ///
 /// - keys and values: `[T, layers, kv heads, head dim]` over the group's
 ///   layers, one dtype shared by both (`float16`, `bfloat16`, `float32`,
@@ -487,18 +487,18 @@ fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
 /// A group that carries no token (`start == exported_extent`) has no
 /// tensors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvGroupTransfer {
+pub struct CacheGroupTransfer {
     /// First absolute token the tensors carry.
     pub start: u32,
     /// Tokens per source page. With quantized storage it also determines how
     /// many scale rows the carried tokens span.
     pub page_tokens: u32,
-    /// Published KV tensors: keys, values, and scales when the storage is
+    /// Published cache tensors: keys, values, and scales when the storage is
     /// quantized, in that order.
     pub tensors: Vec<TensorTransfer>,
 }
 
-impl KvGroupTransfer {
+impl CacheGroupTransfer {
     /// Validates the carried interval and the raw K/V/scale geometry.
     fn validate(&self, base_extent: u32, exported_extent: u32) -> ValidationResult<()> {
         let Self {
@@ -508,11 +508,11 @@ impl KvGroupTransfer {
         } = self;
         ensure_valid!(
             *page_tokens > 0 && base_extent <= *start && *start <= exported_extent,
-            "KV group transfer interval is invalid"
+            "cache group transfer interval is invalid"
         );
         ensure_valid!(
             tensors.is_empty() == (*start == exported_extent),
-            "KV group tensor presence disagrees with its carried interval"
+            "cache group tensor presence disagrees with its carried interval"
         );
         if tensors.is_empty() {
             return Ok(());
@@ -520,7 +520,7 @@ impl KvGroupTransfer {
 
         ensure_valid!(
             matches!(tensors.len(), 2 | 3),
-            "KV transfer requires raw keys, values and optional scales"
+            "cache transfer requires raw keys, values and optional scales"
         );
         let key = &tensors[0];
         let value = &tensors[1];
@@ -541,12 +541,12 @@ impl KvGroupTransfer {
                     dtype,
                     Some("float16" | "bfloat16" | "float32" | "float64" | "float8_e4m3fn")
                 ),
-            "KV transfer has invalid raw token/layer/head geometry"
+            "cache transfer has invalid raw token/layer/head geometry"
         );
         let quantized = dtype == Some("float8_e4m3fn");
         ensure_valid!(
             (tensors.len() == 3) == quantized,
-            "KV transfer scale presence disagrees with its storage"
+            "cache transfer scale presence disagrees with its storage"
         );
         if quantized {
             // Scale rows cover whole source pages, starting at the page that
@@ -565,7 +565,7 @@ impl KvGroupTransfer {
                         .first()
                         .map(|location| location.dtype.as_str())
                         == Some("float32"),
-                "KV transfer scales disagree with its source pages"
+                "cache transfer scales disagree with its source pages"
             );
         }
         for tensor in tensors {
@@ -575,37 +575,37 @@ impl KvGroupTransfer {
     }
 }
 
-/// A published KV extent and the physical tensors needed to install its suffix.
+/// A published cache extent and the physical tensors needed to install its suffix.
 ///
 /// The export is incremental: the destination already holds `base`, when
 /// set, up to `base_extent` tokens, and each group carries only its tokens
-/// from its [`KvGroupTransfer::start`] on. An unchanged extent
+/// from its [`CacheGroupTransfer::start`] on. An unchanged extent
 /// (`exported_extent == base_extent`) carries no groups; otherwise there is
 /// one entry per cache group, in table order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvTransfer {
+pub struct CacheTransfer {
     /// Published tensors of every cache group, in group order.
-    pub groups: Vec<KvGroupTransfer>,
+    pub groups: Vec<CacheGroupTransfer>,
     /// Published buffer identity represented by the export.
     pub source: BufferId,
     /// Destination worker or pool identity.
     pub destination: String,
     /// Optional published buffer already installed at the destination.
     pub base: Option<BufferId>,
-    /// KV token extent represented by `base`.
+    /// Cache token extent represented by `base`.
     pub base_extent: u32,
-    /// Total KV token extent represented by this export.
+    /// Total cache token extent represented by this export.
     pub exported_extent: u32,
     /// Compute precision used when reading quantized source pages.
     pub compute_dtype: String,
 }
 
-impl KvTransfer {
+impl CacheTransfer {
     /// Validate source/base identities and every group's raw K/V/scale
     /// geometry, including rank shards.
     ///
     /// Also bounds the descriptor by [`MAX_TRANSFER_HANDLE_BYTES`] as
-    /// estimated by [`KvTransfer::encoded_size_bound`].
+    /// estimated by [`CacheTransfer::encoded_size_bound`].
     pub fn validate(&self) -> ValidationResult<()> {
         let Self {
             groups,
@@ -628,18 +628,18 @@ impl KvTransfer {
                 )
                 && *base_extent <= *exported_extent
                 && (base.is_some() || *base_extent == 0),
-            "KV transfer export metadata is invalid"
+            "cache transfer export metadata is invalid"
         );
         ensure_valid!(
             groups.is_empty() == (exported_extent == base_extent),
-            "KV group presence disagrees with its incremental extent"
+            "cache group presence disagrees with its incremental extent"
         );
         for group in groups {
             group.validate(*base_extent, *exported_extent)?;
         }
         ensure_valid!(
             self.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
-            "KV transfer exceeds its descriptor byte bound"
+            "cache transfer exceeds its descriptor byte bound"
         );
         Ok(())
     }
@@ -669,7 +669,7 @@ impl KvTransfer {
     /// The engine merges reports that carry locators for the same `source`,
     /// such as per-rank reports of one call, this way. Every export field
     /// except the locators must agree, and the merged result must pass
-    /// [`KvTransfer::validate`]; on any error `self` is left unchanged.
+    /// [`CacheTransfer::validate`]; on any error `self` is left unchanged.
     pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
         ensure_valid!(
             self.source == other.source
@@ -682,7 +682,7 @@ impl KvTransfer {
                 && self.groups.iter().zip(&other.groups).all(|(left, right)| {
                     left.start == right.start && left.page_tokens == right.page_tokens
                 }),
-            "KV locations disagree on export metadata"
+            "cache locations disagree on export metadata"
         );
         let mut candidate = self.clone();
         for (destination, source) in candidate.groups.iter_mut().zip(&other.groups) {
@@ -971,7 +971,7 @@ impl TensorExport {
 
 /// Maximum estimated encoded size in bytes of one transfer descriptor, as
 /// computed by `TransferHandle::encoded_size_bound` and
-/// `KvTransfer::encoded_size_bound`.
+/// `CacheTransfer::encoded_size_bound`.
 pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
 impl Locator {

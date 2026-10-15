@@ -4,8 +4,8 @@ import pytest
 import torch
 
 from tests.python.fixtures.diffusion import LinearDenoiser, Size
-from uniserve_models.diffusion import DenoisingStep, EulerSolver
-from uniserve_models.model import DenoiserInput, LatentInput
+from uniserve.diffusion import DenoisingStep, EulerSolver
+from uniserve.models import DenoiserInput, LatentInput
 
 pytestmark = pytest.mark.unit
 

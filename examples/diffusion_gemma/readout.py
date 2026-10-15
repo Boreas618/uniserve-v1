@@ -14,17 +14,16 @@ from dataclasses import replace
 import torch
 from transformers import AutoTokenizer
 
-from uniserve_models import catalog
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.cache.units import UnitPool, plan_units
-from uniserve_models.model import DiffusionLMInput, TextInput, TextSize
-from uniserve_models.nn.attention import (
+from uniserve.bindings.context import ExecutionContext
+from uniserve.models import DiffusionLMInput, TextInput, TextSize, registry
+from uniserve.nn.attention import (
     AttentionBatch,
     BlockTable,
     PagedInput,
     SegmentedInput,
     SequenceLengths,
 )
+from uniserve.prefix_cache.units import UnitPool, plan_units
 
 
 @torch.inference_mode()
@@ -34,8 +33,8 @@ def read_candidates(model, prompt, canvas, position, candidates):
     Inputs are one-dimensional token tensors on the model's device. The
     candidate IDs name single vocabulary tokens. Return normalized candidate
     probabilities and their full-vocabulary mass as owned CPU tensors. The
-    caller owns model loading; this call owns and releases its KV and native
-    execution resources, and does not sample or mutate the canvas.
+    caller owns model loading; this call owns and releases its prefix cache and
+    native execution resources, and does not sample or mutate the canvas.
     """
     device = prompt.device
     length, count = prompt.numel(), canvas.numel()
@@ -141,7 +140,7 @@ def main():
     parser.add_argument("--question", required=True)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
-    config = catalog.read_config(
+    config = registry.read_config(
         args.checkpoint, modules=frozenset(("text", "denoiser"))
     )
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
@@ -174,7 +173,7 @@ def main():
         [diffusion.pad_token_id] * (diffusion.canvas_length - len(scaffold))
     )
     device = torch.device(args.device)
-    model = catalog.load_model(config, device=device).model
+    model = registry.load_model(config, device=device).model
     probabilities, mass = read_candidates(
         model,
         torch.tensor(prompt, device=device),

@@ -1,4 +1,4 @@
-//! Text warmup: graph capture on scratch KV and a representative request.
+//! Text warmup: graph capture on scratch prefix cache and a representative request.
 //!
 //! Capture runs every runner's prefill buckets (largest footprint first, so
 //! smaller captures reuse pool blocks), then its decode buckets (largest
@@ -38,7 +38,7 @@ use crate::lane::{BLOCK_ON_TIMEOUT, Job, JobQueues};
 use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
-use crate::storage::{KVCache, ScratchUnits};
+use crate::storage::{PrefixCache, ScratchUnits};
 use crate::stream::Issue;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
@@ -56,12 +56,12 @@ impl WarmupHooks for CausalLMWarmup {
         let (Some(runtime), Some(storage)) = (parts.text, parts.storage) else {
             return Ok(());
         };
-        let kv = storage
-            .kv
+        let prefix_cache = storage
+            .prefix_cache
             .as_mut()
-            .ok_or(Error::State("text warmup requires a KV cache"))?;
+            .ok_or(Error::State("text warmup requires a prefix cache"))?;
         runtime
-            .warmup(kv, self.row_tokens, parts.experts, &lanes)
+            .warmup(prefix_cache, self.row_tokens, parts.experts, &lanes)
             .map_err(|error| {
                 WorkerError::classify(error, Some("text graph capture")).with_phase("warmup")
             })
@@ -78,11 +78,11 @@ impl WarmupHooks for CausalLMWarmup {
 /// Lend scratch units to slots `1..` as block tables of `lengths` tokens,
 /// issued to `stream`: the units are reset, then the tables installed.
 pub(crate) fn install_scratch(
-    kv: &mut KVCache,
+    prefix_cache: &mut PrefixCache,
     lengths: &[usize],
     stream: impl Issue,
 ) -> Result<ScratchUnits> {
-    let shapes = kv.plan().group_shapes()?;
+    let shapes = prefix_cache.plan().group_shapes()?;
     let count: usize = lengths
         .iter()
         .map(|&length| {
@@ -95,7 +95,7 @@ pub(crate) fn install_scratch(
                 .sum::<usize>()
         })
         .sum();
-    let scratch = kv.scratch_units(count as u32, stream)?;
+    let scratch = prefix_cache.scratch_units(count as u32, stream)?;
     let mut unit = *scratch.units().start();
     let mut tables = Vec::new();
     for (row, &length) in lengths.iter().enumerate() {
@@ -112,7 +112,7 @@ pub(crate) fn install_scratch(
             unit += units as u32;
         }
     }
-    kv.install(&tables, stream)?;
+    prefix_cache.install(&tables, stream)?;
     Ok(scratch)
 }
 
@@ -120,14 +120,14 @@ pub(crate) fn install_scratch(
 /// issued to `stream`: the stream waits for what wrote the units, resets
 /// them and waits for the resets.
 pub(crate) fn release_scratch(
-    kv: &mut KVCache,
+    prefix_cache: &mut PrefixCache,
     scratch: ScratchUnits,
     rows: usize,
     stream: impl Issue,
 ) -> Result<()> {
     let slots: Vec<u32> = (1..=rows as u32).collect();
-    let cleared = kv.release_slots(&slots, stream);
-    let finished = scratch.finish(kv, stream);
+    let cleared = prefix_cache.release_slots(&slots, stream);
+    let finished = scratch.finish(prefix_cache, stream);
     cleared.and(finished)
 }
 
@@ -135,14 +135,14 @@ pub(crate) fn release_scratch(
 /// `operation`, then clear the tables and reset the scratch units, issuing
 /// on `stream` at once: for a capture that issues its own stream work.
 pub(crate) fn with_scratch<T>(
-    kv: &mut KVCache,
+    prefix_cache: &mut PrefixCache,
     lengths: &[usize],
     stream: Option<&uniserve_cuda::Stream>,
-    operation: impl FnOnce(&mut KVCache) -> Result<T>,
+    operation: impl FnOnce(&mut PrefixCache) -> Result<T>,
 ) -> Result<T> {
-    let scratch = install_scratch(kv, lengths, stream)?;
-    let result = operation(kv);
-    let released = release_scratch(kv, scratch, lengths.len(), stream);
+    let scratch = install_scratch(prefix_cache, lengths, stream)?;
+    let result = operation(prefix_cache);
+    let released = release_scratch(prefix_cache, scratch, lengths.len(), stream);
     let value = result?;
     released?;
     Ok(value)
@@ -183,17 +183,17 @@ impl CausalLMRunners {
     /// dedicated expert ranks), in which the other microbatches join.
     fn warmup(
         &mut self,
-        kv: &mut KVCache,
+        prefix_cache: &mut PrefixCache,
         row_tokens: usize,
         experts: Option<&Arc<ExpertUnion>>,
         lanes: &JobQueues,
     ) -> Result<()> {
-        let shapes = kv.plan().group_shapes()?;
+        let shapes = prefix_cache.plan().group_shapes()?;
         let pages: Vec<(usize, usize)> = shapes
             .iter()
             .map(|shape| (shape.page_tokens as usize, shape.units_per_page as usize))
             .collect();
-        let units = kv.planes().num_units() as usize - 1;
+        let units = prefix_cache.planes().num_units() as usize - 1;
         // Step capacities a graph of `tokens` tokens is captured at.
         let variants = |tokens: usize| -> Vec<Option<usize>> {
             match experts {
@@ -232,7 +232,7 @@ impl CausalLMRunners {
             let stream = stream.as_ref();
             let kind = self.kind(group)?;
             let run = |runtime: &mut CausalLMRunners,
-                       kv: &mut KVCache,
+                       prefix_cache: &mut PrefixCache,
                        rows: &[TokenRow],
                        decode: bool,
                        capacity: Option<usize>,
@@ -241,7 +241,7 @@ impl CausalLMRunners {
                     experts,
                     lanes,
                     (group, peer),
-                    kv,
+                    prefix_cache,
                     rows,
                     decode,
                     capacity,
@@ -257,56 +257,70 @@ impl CausalLMRunners {
                 };
                 for capacity in variants(shape.token_bucket) {
                     let rows = rows(1, &lengths, 0, selection);
-                    self.warmup_bucket(lanes, kind, kv, &lengths, stream, |runtime, kv, _| {
-                        run(runtime, kv, &rows, false, capacity, Job::new())
-                    })?;
+                    self.warmup_bucket(
+                        lanes,
+                        kind,
+                        prefix_cache,
+                        &lengths,
+                        stream,
+                        |runtime, prefix_cache, _| {
+                            run(runtime, prefix_cache, &rows, false, capacity, Job::new())
+                        },
+                    )?;
                 }
             }
             for size in decode {
                 let lengths = vec![1; size];
                 let tables = vec![2; size];
-                self.warmup_bucket(lanes, kind, kv, &tables, stream, |runtime, kv, after| {
-                    // One real token per row, prefilled in batches no larger than
-                    // the scheduler admits (the largest prefill bucket's live
-                    // rows) and committed as each slot's cache; then the decode
-                    // the graph captures with every row's continuation flag set.
-                    for first in (0..size).step_by(prime) {
-                        let count = prime.min(size - first);
-                        run(
-                            runtime,
-                            kv,
-                            &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
-                            false,
-                            None,
-                            Job::new(),
-                        )?;
-                    }
-                    let slots: Vec<usize> = (1..=size).collect();
-                    let prefilled: Vec<[i64; 8]> = slots
-                        .iter()
-                        .map(|&slot| [slot as i64, COMMIT_CACHE, -1, 1, 0, 0, 0, 0])
-                        .collect();
-                    runtime.warmup_commit(lanes, index, group, &prefilled)?;
+                self.warmup_bucket(
+                    lanes,
+                    kind,
+                    prefix_cache,
+                    &tables,
+                    stream,
+                    |runtime, prefix_cache, after| {
+                        // One real token per row, prefilled in batches no larger than
+                        // the scheduler admits (the largest prefill bucket's live
+                        // rows) and committed as each slot's cache; then the decode
+                        // the graph captures with every row's continuation flag set.
+                        for first in (0..size).step_by(prime) {
+                            let count = prime.min(size - first);
+                            run(
+                                runtime,
+                                prefix_cache,
+                                &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
+                                false,
+                                None,
+                                Job::new(),
+                            )?;
+                        }
+                        let slots: Vec<usize> = (1..=size).collect();
+                        let prefilled: Vec<[i64; 8]> = slots
+                            .iter()
+                            .map(|&slot| [slot as i64, COMMIT_CACHE, -1, 1, 0, 0, 0, 0])
+                            .collect();
+                        runtime.warmup_commit(lanes, index, group, &prefilled)?;
 
-                    // The flags are set by the job of the first decode step
-                    // and cleared by the job that clears the tables.
-                    let mut job = Job::new();
-                    runtime.state.set_predicates(&slots, true, job.on(stream))?;
-                    runtime
-                        .state
-                        .set_predicates(&slots, false, after.on(stream))?;
-                    for capacity in variants(size) {
-                        run(
-                            runtime,
-                            kv,
-                            &rows(1, &lengths, 1, TokenSelection::LastLogits),
-                            true,
-                            capacity,
-                            std::mem::take(&mut job),
-                        )?;
-                    }
-                    Ok(())
-                })?;
+                        // The flags are set by the job of the first decode step
+                        // and cleared by the job that clears the tables.
+                        let mut job = Job::new();
+                        runtime.state.set_predicates(&slots, true, job.on(stream))?;
+                        runtime
+                            .state
+                            .set_predicates(&slots, false, after.on(stream))?;
+                        for capacity in variants(size) {
+                            run(
+                                runtime,
+                                prefix_cache,
+                                &rows(1, &lengths, 1, TokenSelection::LastLogits),
+                                true,
+                                capacity,
+                                std::mem::take(&mut job),
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             let runner = &self.runners[index];
             tracing::info!(
@@ -329,10 +343,10 @@ impl CausalLMRunners {
         &mut self,
         lanes: &JobQueues,
         kind: CallKind,
-        kv: &mut KVCache,
+        prefix_cache: &mut PrefixCache,
         lengths: &[usize],
         stream: Option<&uniserve_cuda::Stream>,
-        steps: impl FnOnce(&mut Self, &mut KVCache, &Job) -> Result<()>,
+        steps: impl FnOnce(&mut Self, &mut PrefixCache, &Job) -> Result<()>,
     ) -> Result<()> {
         let perform = |job: Job| -> Result<()> {
             let completion = lanes.block_on(kind, job, BLOCK_ON_TIMEOUT)?;
@@ -343,12 +357,12 @@ impl CausalLMRunners {
         };
 
         let before = Job::new();
-        let scratch = install_scratch(kv, lengths, before.on(stream))?;
+        let scratch = install_scratch(prefix_cache, lengths, before.on(stream))?;
         perform(before)?;
 
         let after = Job::new();
-        let stepped = steps(self, kv, &after);
-        let released = release_scratch(kv, scratch, lengths.len(), after.on(stream));
+        let stepped = steps(self, prefix_cache, &after);
+        let released = release_scratch(prefix_cache, scratch, lengths.len(), after.on(stream));
         let performed = perform(after);
         stepped.and(released).and(performed)
     }
@@ -366,13 +380,13 @@ impl CausalLMRunners {
         experts: Option<&Arc<ExpertUnion>>,
         lanes: &JobQueues,
         (group, peer): (usize, usize),
-        kv: &mut KVCache,
+        prefix_cache: &mut PrefixCache,
         rows: &[TokenRow],
         decode: bool,
         capacity: Option<usize>,
         job: Job,
     ) -> Result<()> {
-        let (tables, cache) = kv.split();
+        let (tables, cache) = prefix_cache.split();
         let prompt = PromptChunks::default();
         let request = StepRequest {
             mode: if decode {
@@ -448,8 +462,8 @@ fn tokens(scenarios: &mut Scenarios<'_>) -> std::result::Result<(), WorkerError>
     let shapes = scenarios
         .backend()
         .rank_storage()
-        .and_then(|storage| storage.kv.as_ref())
-        .ok_or(Error::State("text warmup requires a KV cache"))?
+        .and_then(|storage| storage.prefix_cache.as_ref())
+        .ok_or(Error::State("text warmup requires a prefix cache"))?
         .plan()
         .group_shapes()?;
 
@@ -534,8 +548,8 @@ fn token_call(
     let mut call = Call::new(key, id, CallKind::Forward(mode));
     call.coordinates = CallCoordinates {
         logical_position: prefix,
-        kv_visible_len: prefix,
-        kv_computed_len: prefix,
+        cache_visible_len: prefix,
+        cache_computed_len: prefix,
         flow_step: 0,
     };
     call.bounds = Bounds {
@@ -582,7 +596,7 @@ fn token_batch(
         request_pool_indices: vec![slot],
         seq_lens: vec![prefix + query],
         query_lens: vec![query],
-        write_kv: vec![true],
+        write_cache: vec![true],
     };
     batch
 }

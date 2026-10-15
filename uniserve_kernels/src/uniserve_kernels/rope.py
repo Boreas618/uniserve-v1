@@ -1,9 +1,9 @@
 """Rotary factor tables, rotary rotation and fused Q/K normalization + RoPE.
 
 These Triton kernels back the rotary entry points of
-``uniserve_models.nn.functional`` (``apply_rotary``, ``qk_norm_rope`` and
+``uniserve.nn.functional`` (``apply_rotary``, ``qk_norm_rope`` and
 ``qk_bias_rms_norm_rope_``) and the factor tables of
-``uniserve_models.nn.rope.RotaryEmbedding``. Those callers validate the public
+``uniserve.nn.rope.RotaryEmbedding``. Those callers validate the public
 contract, run the matching ``unsupported_*`` check and raise on CUDA with its
 reason; tensor operations evaluate the same formulas only off CUDA.
 
@@ -640,7 +640,7 @@ def unsupported_qk_norm_rope(
 ) -> str | None:
     """Return why the fused kernel cannot take a Q/K call, or ``None``.
 
-    ``uniserve_models.nn.functional.qk_norm_rope`` validates the domain and axis
+    ``uniserve.nn.functional.qk_norm_rope`` validates the domain and axis
     partition first. Here, Q, K and their outputs are floating
     ``[..., heads, head_dim]`` tensors whose token axes merge into one
     strided axis with unit feature stride; each output is its source itself
@@ -912,7 +912,7 @@ def unsupported_qk_bias_rms_norm_rope(
     Leading token axes must flatten affinely to rows whose heads own disjoint
     unit-strided coordinates, as merged projections lend them. Q, K and V
     share one layout; factors and biases are contiguous; ``head_dim`` is at
-    most 256. ``qk_bias_rms_norm_rope_`` in ``uniserve_models.nn.functional``
+    most 256. ``qk_bias_rms_norm_rope_`` in ``uniserve.nn.functional``
     validates shapes, dtypes, device agreement and factor token axes before
     calling it.
     """
@@ -971,7 +971,7 @@ def qk_bias_rms_norm_rope_(
     present or both ``None`` because the kernel applies both when
     ``query_bias`` is present; ``value`` and ``value_bias`` likewise pair,
     keyed on ``value_bias``. ``qk_bias_rms_norm_rope_`` in
-    ``uniserve_models.nn.functional`` enforces both pairings.
+    ``uniserve.nn.functional`` enforces both pairings.
     """
     head_dim, heads = int(query.shape[-1]), int(query.shape[-2])
     rows = query.numel() // (heads * head_dim)

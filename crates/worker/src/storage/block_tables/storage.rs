@@ -175,7 +175,7 @@ impl BlockTableStorage {
         &self.alloced_lens
     }
 
-    /// Per-slot verified KV lengths; the decode state reads and advances
+    /// Per-slot verified cache lengths; the decode state reads and advances
     /// them as well.
     pub fn verified_lengths(&self) -> &StorageView {
         &self.verified_lengths
@@ -335,7 +335,7 @@ impl BlockTableStorage {
         unsafe { stream.copy(&batch) }
     }
 
-    /// Set a slot's verified KV length after an import installed `extent`
+    /// Set a slot's verified cache length after an import installed `extent`
     /// tokens. The caller checked `extent` against the slot's allocation.
     pub fn set_verified(&self, slot: u32, extent: u32, stream: impl Issue) -> Result<()> {
         self.require_slot(slot)?;

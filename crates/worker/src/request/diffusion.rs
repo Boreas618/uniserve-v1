@@ -1,4 +1,4 @@
-//! Image trajectories of admitted requests: guidance plans and the KV
+//! Image trajectories of admitted requests: guidance plans and the cache
 //! prefixes each guidance branch conditions on.
 //!
 //! An image request denoises one trajectory per generated image. When its
@@ -7,7 +7,7 @@
 //! by Python once per trajectory and kept as an opaque handle the solver
 //! update receives back), and the request's guidance prefixes.
 //!
-//! Each guidance branch attends to a KV prefix: the conditioned branch to
+//! Each guidance branch attends to a cache prefix: the conditioned branch to
 //! the request's own context; the unconditional branches to prefixes the
 //! scheduler placed in other request slots, which the runtime prefills the
 //! first time a branch is evaluated. A prefix's tokens are resolved once
@@ -25,7 +25,7 @@ use uniserve_ipc::RequestKey;
 use crate::ffi::Handle;
 use crate::{Error, Result};
 
-/// A classifier-free guidance branch (`uniserve_models.diffusion.Branch`).
+/// A classifier-free guidance branch (`uniserve.diffusion.Branch`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Branch {
     Conditioned,
@@ -101,7 +101,7 @@ impl BranchSet {
     }
 }
 
-/// What a guidance branch conditions on (`uniserve_models.processing.BranchSource`).
+/// What a guidance branch conditions on (`uniserve.processing.BranchSource`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BranchSource {
     /// The image prompt, or the request's own context when blank.
@@ -137,11 +137,11 @@ impl BranchSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prefix {
     pub tokens: Arc<[u32]>,
-    /// The branch attends to the request's own conditioning KV.
+    /// The branch attends to the request's own conditioning prefix cache.
     pub reuses_conditioning: bool,
 }
 
-/// KV coordinates of a request slot: its visible tokens and its allocated
+/// Cache coordinates of a request slot: its visible tokens and its allocated
 /// token capacity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Coordinates {
@@ -169,7 +169,7 @@ pub struct ForwardSlot {
 }
 
 /// A prefix prefill the runtime submits before a step's denoising rows:
-/// `tokens` written as KV from position zero of `slot`, causally, with the
+/// `tokens` written as prefix cache from position zero of `slot`, causally, with the
 /// hidden states selected (and discarded).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrefixFill {
@@ -347,11 +347,10 @@ impl ImageTrajectory {
     ) -> Result<Vec<(Branch, Coordinates, u64)>> {
         set.iter()
             .map(|branch| {
-                let coordinates = self
-                    .branches
-                    .get(&branch)
-                    .copied()
-                    .ok_or_else(|| Error::Invalid("guidance branch has no KV prefix".into()))?;
+                let coordinates =
+                    self.branches.get(&branch).copied().ok_or_else(|| {
+                        Error::Invalid("guidance branch has no cache prefix".into())
+                    })?;
                 let temporal = if branch == Branch::Conditioned {
                     logical_position
                 } else {

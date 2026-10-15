@@ -4,7 +4,7 @@ The reference is the pinned Transformers ``DiffusionGemmaGenerationMixin``:
 its temperature processor, entropy-bound acceptance, stable-and-confident
 stop, self-conditioning embedding and canvas finalization. Its multinomial
 and re-noise draws come from torch's generator; the step draws them from
-the Philox contract of ``uniserve_models.diffusion.tokens`` instead, so the test
+the Philox contract of ``uniserve.diffusion.tokens`` instead, so the test
 checks those draws against that contract.
 """
 
@@ -14,7 +14,7 @@ from transformers.models.diffusion_gemma import (
     generation_diffusion_gemma as reference,
 )
 
-from uniserve_models.diffusion import canvas, tokens
+from uniserve.diffusion import canvas, tokens
 
 pytestmark = pytest.mark.unit
 

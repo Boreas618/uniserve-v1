@@ -43,7 +43,7 @@ impl RequestKey {
 
 /// The numerical mode of a token model forward.
 ///
-/// `Prefill`, `Decode` and `Verify` extend a request's KV cache causally.
+/// `Prefill`, `Decode` and `Verify` extend a request's prefix cache causally.
 /// `TokenDenoising` runs one denoising pass over rows of a token canvas that
 /// read the request's cached prefix without writing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -130,19 +130,19 @@ impl MediaCall {
 #[repr(u8)]
 pub enum TransferMode {
     Tensor,
-    KvExport,
-    KvInstall,
+    CacheExport,
+    CacheInstall,
 }
 
 impl TransferMode {
     /// Every transfer mode in declaration order.
-    pub const ALL: [Self; 3] = [Self::Tensor, Self::KvExport, Self::KvInstall];
+    pub const ALL: [Self; 3] = [Self::Tensor, Self::CacheExport, Self::CacheInstall];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tensor => "tensor",
-            Self::KvExport => "kv_export",
-            Self::KvInstall => "kv_install",
+            Self::CacheExport => "cache_export",
+            Self::CacheInstall => "cache_install",
         }
     }
 }
@@ -293,8 +293,8 @@ impl CallKind {
         Self::Media(MediaCall::AudioEncoding),
         Self::Media(MediaCall::Muxing),
         Self::Transfer(TransferMode::Tensor),
-        Self::Transfer(TransferMode::KvExport),
-        Self::Transfer(TransferMode::KvInstall),
+        Self::Transfer(TransferMode::CacheExport),
+        Self::Transfer(TransferMode::CacheInstall),
     ];
 
     /// Returns whether a call of this kind advances its request's state.
@@ -321,15 +321,15 @@ impl CallKind {
 ///
 /// [`Call::validate`] checks `max_tokens` against `input_token_ids` and
 /// `max_latent_bytes` against encoder, latent, and image outputs;
-/// [`Batch::validate`] checks `max_transfer_bytes` against installed KV
-/// inputs. Neither checks `max_kv_units` or `max_completion_bytes`.
+/// [`Batch::validate`] checks `max_transfer_bytes` against installed cache
+/// inputs. Neither checks `max_cache_units` or `max_completion_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Bounds {
     /// Maximum tokens the call may process or produce.
     pub max_tokens: u32,
     /// Paged-KV units newly allocated to the request's tables and first
     /// declared to workers by this call.
-    pub max_kv_units: u32,
+    pub max_cache_units: u32,
     /// Maximum latent storage in bytes.
     pub max_latent_bytes: u64,
     /// Maximum host-visible completion data in bytes.
@@ -411,10 +411,10 @@ impl SamplingState {
 pub struct CallCoordinates {
     /// Position of this call's first token in the request's logical sequence.
     pub logical_position: u32,
-    /// Tokens whose KV a numerical call may attend to at submission.
-    pub kv_visible_len: u32,
-    /// Tokens whose KV is initialized at submission; never below the visible extent.
-    pub kv_computed_len: u32,
+    /// Tokens whose prefix cache a numerical call may attend to at submission.
+    pub cache_visible_len: u32,
+    /// Tokens whose prefix cache is initialized at submission; never below the visible extent.
+    pub cache_computed_len: u32,
     /// Denoising steps completed for this request at submission.
     pub flow_step: u32,
 }
@@ -423,8 +423,8 @@ impl CallCoordinates {
     /// Validates the containment the coordinates must satisfy.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.kv_visible_len <= self.kv_computed_len,
-            "call coordinates place visible KV beyond the computed extent"
+            self.cache_visible_len <= self.cache_computed_len,
+            "call coordinates place visible prefix cache beyond the computed extent"
         );
         Ok(())
     }
@@ -513,7 +513,7 @@ pub const DEFAULT_COMPONENT: &str = "model";
 
 /// One image block of a context prefill.
 ///
-/// The block writes the vision-encoder product `feature` into KV as one
+/// The block writes the vision-encoder product `feature` into the prefix cache as one
 /// attention block, before the call's input token `offset`: the call's
 /// context is its input tokens `[0, offset)`, then the block, then the
 /// tokens from `offset` on. Blocks sharing an offset follow in list order.
@@ -598,9 +598,9 @@ pub struct Call {
     /// Dispatch and in-flight matching share these immutable bytes.
     pub input_image: Option<std::sync::Arc<str>>,
     /// Published or installed cache extent consumed by this computation.
-    pub kv_input: Option<BufferId>,
+    pub cache_input: Option<BufferId>,
     /// Identity under which this computation publishes or installs cache state.
-    pub kv_output: Option<BufferId>,
+    pub cache_output: Option<BufferId>,
 }
 
 impl Call {
@@ -635,8 +635,8 @@ impl Call {
             readout: None,
             canvas: None,
             input_image: None,
-            kv_input: None,
-            kv_output: None,
+            cache_input: None,
+            cache_output: None,
         }
     }
 
@@ -721,14 +721,14 @@ impl Call {
         self.tensor_inputs()
             .chain(self.predicate.iter())
             .map(TensorRef::buffer_id)
-            .chain(self.kv_input)
+            .chain(self.cache_input)
     }
 
     /// Resource identities published by this computation.
     pub fn output_buffers(&self) -> impl Iterator<Item = BufferId> + '_ {
         self.tensor_outputs()
             .map(TensorRef::buffer_id)
-            .chain(self.kv_output)
+            .chain(self.cache_output)
     }
 
     /// Returns whether successful execution advances request state.
@@ -739,7 +739,7 @@ impl Call {
     /// Validates the invariants one call carries on its own.
     ///
     /// Checks identity, component, coordinates, the token bound, canonical
-    /// sampling-state sets, the encoded-image source, KV export
+    /// sampling-state sets, the encoded-image source, cache export
     /// identities, product ownership, generations, output indices, dtypes and
     /// byte bounds, cross-request inputs, and the predicate. `rng` is not
     /// checked. Relationships to other calls and to the batch's allocation
@@ -815,40 +815,41 @@ impl Call {
         }
 
         // Every output must be uniquely owned by this producer and fit the
-        // resource class reserved for the call. The KV output shares the
+        // resource class reserved for the call. The cache output shares the
         // output-index space with the tensor outputs.
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
-        let publishes_kv = matches!(
+        let publishes_cache = matches!(
             self.code,
-            CallKind::Transfer(TransferMode::KvExport | TransferMode::KvInstall)
+            CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
         );
         ensure_valid!(
-            self.kv_output.is_some() == publishes_kv,
-            "KV export or installation requires one cache output identity"
+            self.cache_output.is_some() == publishes_cache,
+            "cache export or installation requires one cache output identity"
         );
-        if let Some(output) = self.kv_output {
+        if let Some(output) = self.cache_output {
             output.validate()?;
             ensure_valid!(
                 output.owner == self.request_key && output.producer_call_id == self.call_id,
-                "KV output is not owned by its producing computation"
+                "cache output is not owned by its producing computation"
             );
             output_indices.insert(output.output_index);
         }
-        let consumes_kv = matches!(
+        let consumes_cache = matches!(
             self.code,
-            CallKind::Transfer(TransferMode::KvInstall)
+            CallKind::Transfer(TransferMode::CacheInstall)
                 | CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
         );
-        if let Some(input) = self.kv_input {
+        if let Some(input) = self.cache_input {
             input.validate()?;
             ensure_valid!(
-                consumes_kv && input.owner == self.request_key,
-                "KV input is incompatible with its computation or request"
+                consumes_cache && input.owner == self.request_key,
+                "cache input is incompatible with its computation or request"
             );
         }
         ensure_valid!(
-            self.code != CallKind::Transfer(TransferMode::KvInstall) || self.kv_input.is_some(),
-            "KV installation requires a source export"
+            self.code != CallKind::Transfer(TransferMode::CacheInstall)
+                || self.cache_input.is_some(),
+            "cache installation requires a source export"
         );
 
         for output in self.tensor_outputs() {
@@ -1042,10 +1043,10 @@ pub struct RequestOutput {
     pub code: CallKind,
     /// Model position for the next input, including image-feedback position advances.
     pub position: u32,
-    /// Accepted KV prefix available to a successor.
-    pub kv_visible_len: u32,
-    /// KV extent initialized by execution, including rejected speculative positions.
-    pub kv_computed_len: u32,
+    /// Accepted cache prefix available to a successor.
+    pub cache_visible_len: u32,
+    /// Cache extent initialized by execution, including rejected speculative positions.
+    pub cache_computed_len: u32,
     /// Completed denoising steps, independent of latent tensor dimensions.
     pub num_completed_steps: u32,
     /// Token identifiers accepted by the sampler.
@@ -1063,8 +1064,8 @@ pub struct RequestOutput {
     pub finish_flags: FinishFlags,
     /// Completed artifact and its external storage lifetime, when produced.
     pub media_output: Option<MediaOutput>,
-    /// Physical KV export, including this rank's tensor locations.
-    pub kv_output: Option<KvTransfer>,
+    /// Physical cache export, including this rank's tensor locations.
+    pub cache_output: Option<CacheTransfer>,
 }
 
 impl RequestOutput {
@@ -1074,20 +1075,20 @@ impl RequestOutput {
             self.call_id.batch_id > 0,
             "completion call id must be positive"
         );
-        if let Some(export) = &self.kv_output {
+        if let Some(export) = &self.cache_output {
             export.validate()?;
             ensure_valid!(
                 self.status == CallStatus::Ok
-                    && self.code == CallKind::Transfer(TransferMode::KvExport)
+                    && self.code == CallKind::Transfer(TransferMode::CacheExport)
                     && export.source.owner == self.request_key
                     && export.source.producer_call_id == self.call_id,
-                "KV export does not belong to its successful completion"
+                "cache export does not belong to its successful completion"
             );
         }
 
         ensure_valid!(
-            self.kv_visible_len <= self.kv_computed_len,
-            "completion selected KV length exceeds computed length"
+            self.cache_visible_len <= self.cache_computed_len,
+            "completion selected cache length exceeds computed length"
         );
         match self.status {
             CallStatus::Error => ensure_valid!(
@@ -1376,7 +1377,7 @@ impl NewRequest {
     }
 }
 
-/// One request slot's complete unit table in one KV cache group.
+/// One request slot's complete unit table in one cache group.
 ///
 /// `unit_ids` lists the units of logical pages `start_page..`, page-major:
 /// the group's `units_per_page` units of page `start_page` come first. Pages
@@ -1388,7 +1389,7 @@ impl NewRequest {
 pub struct BlockTable {
     /// Scheduler-assigned request-state row that owns the table.
     pub request_pool_idx: u32,
-    /// KV cache group addressed by the table.
+    /// Cache group addressed by the table.
     pub group_id: u32,
     /// First logical page the units cover; earlier pages are retired.
     pub start_page: u32,
@@ -1405,7 +1406,7 @@ pub struct BlockTable {
 pub struct CacheUnitAllocation {
     /// Scheduler-assigned request-state row receiving the units.
     pub request_pool_idx: u32,
-    /// KV cache group receiving the units.
+    /// Cache group receiving the units.
     pub group_id: u32,
     /// Newly allocated physical unit identifiers.
     pub unit_ids: Vec<UnitId>,
@@ -1457,8 +1458,8 @@ pub struct ForwardBatch {
     pub seq_lens: Vec<u32>,
     /// Query tokens evaluated by each row.
     pub query_lens: Vec<u32>,
-    /// Whether the query interval persists in KV after its visible prefix.
-    pub write_kv: Vec<bool>,
+    /// Whether the query interval persists in the prefix cache after its visible prefix.
+    pub write_cache: Vec<bool>,
 }
 
 impl ForwardBatch {
@@ -1469,13 +1470,13 @@ impl ForwardBatch {
         request_pool_index: u32,
         seq_len: u32,
         query_len: u32,
-        write_kv: bool,
+        write_cache: bool,
     ) {
         self.call_indices.push(call_index);
         self.request_pool_indices.push(request_pool_index);
         self.seq_lens.push(seq_len);
         self.query_lens.push(query_len);
-        self.write_kv.push(write_kv);
+        self.write_cache.push(write_cache);
     }
 
     /// Move forward inputs into a physical batch, offsetting only physical row ownership.
@@ -1500,7 +1501,7 @@ impl ForwardBatch {
         self.request_pool_indices.extend(other.request_pool_indices);
         self.seq_lens.extend(other.seq_lens);
         self.query_lens.extend(other.query_lens);
-        self.write_kv.extend(other.write_kv);
+        self.write_cache.extend(other.write_cache);
         Ok(())
     }
 
@@ -1518,7 +1519,7 @@ impl ForwardBatch {
                     self.request_pool_indices[row],
                     self.seq_lens[row],
                     self.query_lens[row],
-                    self.write_kv[row],
+                    self.write_cache[row],
                 );
             }
         }
@@ -1532,7 +1533,7 @@ impl ForwardBatch {
             self.request_pool_indices.len() == rows
                 && self.seq_lens.len() == rows
                 && self.query_lens.len() == rows
-                && self.write_kv.len() == rows,
+                && self.write_cache.len() == rows,
             "forward input columns have different lengths"
         );
         ensure_valid!(
@@ -1667,9 +1668,9 @@ pub struct Batch {
     pub collective_seq: u64,
     /// Calls executed by this invocation.
     pub calls: Vec<Call>,
-    /// Complete scheduler-owned KV page tables required by the calls.
+    /// Complete scheduler-owned cache page tables required by the calls.
     pub block_tables: Vec<BlockTable>,
-    /// Physical KV units newly allocated for this invocation.
+    /// Physical cache units newly allocated for this invocation.
     pub new_cache_units: Vec<CacheUnitAllocation>,
     /// Columnar model inputs carried directly by the worker message.
     pub forward: ForwardBatch,
@@ -1683,8 +1684,8 @@ pub struct Batch {
     pub commands: Vec<BatchCommand>,
     /// Host-supplied input product values matched by `TensorRef` identity.
     pub input_products: Vec<TensorExport>,
-    /// Imported KV exports consumed by explicit cache installation call kinds.
-    pub kv_inputs: Vec<KvTransfer>,
+    /// Imported cache exports consumed by explicit cache installation call kinds.
+    pub cache_inputs: Vec<CacheTransfer>,
 }
 
 impl Batch {
@@ -1710,7 +1711,7 @@ impl Batch {
                 })
                 .collect(),
             input_products: Vec::new(),
-            kv_inputs: Vec::new(),
+            cache_inputs: Vec::new(),
         }
     }
 
@@ -1744,7 +1745,7 @@ impl Batch {
     /// call, and checks what spans calls, including one call per request, one
     /// kind and component per batch, allocation tables that match the calls
     /// addressing them, non-overlapping latent pages and buffer spans, and
-    /// input products and KV inputs that some call declares.
+    /// input products and cache inputs that some call declares.
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish the run envelope before validating relationships within it.
         ensure_valid!(
@@ -1784,7 +1785,7 @@ impl Batch {
             .map(|call| ((call.request_key, call.call_id), call))
             .collect::<HashMap<_, _>>();
 
-        // KV allocations are subsets of unique block tables for the same pool group.
+        // Cache allocations are subsets of unique block tables for the same pool group.
         let mut table_ids = HashSet::with_capacity(self.block_tables.len());
         for table in &self.block_tables {
             table.validate()?;
@@ -2048,27 +2049,30 @@ impl Batch {
             payload.validate()?;
         }
 
-        // Each imported KV export feeds exactly one installation call and
+        // Each imported cache export feeds exactly one installation call and
         // fits that call's transfer-byte bound.
-        let mut kv_sources = HashSet::new();
-        for export in &self.kv_inputs {
+        let mut cache_sources = HashSet::new();
+        for export in &self.cache_inputs {
             export.validate()?;
-            ensure_valid!(kv_sources.insert(export.source), "run repeats a KV input");
+            ensure_valid!(
+                cache_sources.insert(export.source),
+                "run repeats a cache input"
+            );
             let consumers = self
                 .calls()
-                .filter(|call| call.kv_input == Some(export.source))
+                .filter(|call| call.cache_input == Some(export.source))
                 .collect::<Vec<_>>();
             ensure_valid!(
                 consumers.len() == 1
-                    && consumers[0].code == CallKind::Transfer(TransferMode::KvInstall),
-                "KV transfer requires one installation consumer"
+                    && consumers[0].code == CallKind::Transfer(TransferMode::CacheInstall),
+                "cache transfer requires one installation consumer"
             );
             let bytes = export.tensors().try_fold(0_u64, |sum, tensor| {
                 Ok::<_, ValidationError>(sum.saturating_add(tensor.validate()?))
             })?;
             ensure_valid!(
                 bytes <= consumers[0].bounds.max_transfer_bytes,
-                "KV input exceeds its installation transfer-byte bound"
+                "cache input exceeds its installation transfer-byte bound"
             );
         }
 

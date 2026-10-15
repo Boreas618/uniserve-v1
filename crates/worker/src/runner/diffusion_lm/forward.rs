@@ -56,7 +56,7 @@ use crate::ffi::Device;
 use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
-use crate::storage::{KVCache, OutputLease, OutputPlacement, ProductBuffer, TensorStore};
+use crate::storage::{OutputLease, OutputPlacement, PrefixCache, ProductBuffer, TensorStore};
 use crate::stream::EventPool;
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
@@ -68,7 +68,7 @@ struct Context<'a> {
     rank: usize,
     runner: &'a mut DiffusionLMRunner,
     requests: &'a mut RequestPool,
-    kv: &'a mut KVCache,
+    prefix_cache: &'a mut PrefixCache,
     tensors: &'a TensorStore,
     events: &'a Arc<EventPool>,
     plan: &'a BatchPlan,
@@ -163,7 +163,7 @@ struct CallState {
 /// Resources a batch reserved, retired on failure.
 struct Reserved {
     writes: Vec<ProductBuffer>,
-    /// Signals the physical end of the batch's KV reads.
+    /// Signals the physical end of the batch's cache reads.
     retirement: Arc<Retirement>,
 }
 
@@ -270,7 +270,7 @@ impl Opening {
         let Context {
             runner,
             requests,
-            kv,
+            prefix_cache,
             tensors,
             events,
             plan,
@@ -324,7 +324,7 @@ impl Opening {
             runner,
             experts,
             requests,
-            kv,
+            prefix_cache,
             tensors,
             events,
             plan,
@@ -477,7 +477,7 @@ struct Batch<'a> {
     runner: &'a DiffusionLMRunner,
     experts: Option<&'a Arc<ExpertUnion>>,
     requests: &'a mut RequestPool,
-    kv: &'a mut KVCache,
+    prefix_cache: &'a mut PrefixCache,
     tensors: &'a TensorStore,
     events: &'a Arc<EventPool>,
     plan: &'a BatchPlan,
@@ -527,7 +527,9 @@ impl Batch<'_> {
             .filter(|table| slots.contains(&table.request_pool_idx))
             .cloned()
             .collect();
-        self.kv.install(&assignments, issue).map_err(&reserve)?;
+        self.prefix_cache
+            .install(&assignments, issue)
+            .map_err(&reserve)?;
 
         // Every active call retains the prefix it reads until the batch's
         // device work retires. A windowed group starts at its first
@@ -536,8 +538,8 @@ impl Batch<'_> {
             if !state.active {
                 continue;
             }
-            let visible = state.output.progress.kv_visible_len;
-            let tables = self.kv.tables();
+            let visible = state.output.progress.cache_visible_len;
+            let tables = self.prefix_cache.tables();
             tables.coordinates(state.slot, visible).map_err(&reserve)?;
             let mut spans = Vec::new();
             for group in 0..tables.groups().len() as u32 {
@@ -547,7 +549,7 @@ impl Batch<'_> {
                     spans.extend(table.spans(start, visible - start).map_err(&reserve)?);
                 }
             }
-            self.kv.manager().retain_execution(
+            self.prefix_cache.manager().retain_execution(
                 call.request_key,
                 &spans,
                 Arc::clone(&reserved.retirement),
@@ -573,7 +575,7 @@ impl Batch<'_> {
                 || call.transition_output.is_some()
                 || call.image_output.is_some()
                 || call.encoder_output.is_some()
-                || call.kv_output.is_some()
+                || call.cache_output.is_some()
             {
                 return Err(reserve(Error::Unsupported(
                     "token-denoising calls publish only a completion flag".into(),
@@ -670,14 +672,14 @@ impl Batch<'_> {
                         &calls[row],
                         &rows[row],
                         state.slot,
-                        progress.kv_visible_len,
+                        progress.cache_visible_len,
                         progress.logical_position,
                     )
                     .map_err(&execute)?,
             );
         }
         let pages = self
-            .kv
+            .prefix_cache
             .tables()
             .prepare_attention(&readouts.attention, |_, _, _| Ok(()))
             .map_err(&execute)?;
@@ -735,7 +737,7 @@ impl Batch<'_> {
                 )));
             }
             state.output.candidate_range = Some((offset, count));
-            let visible = state.output.progress.kv_visible_len;
+            let visible = state.output.progress.cache_visible_len;
             state.output.set_cache_length(visible);
         }
         Ok(executed)
@@ -770,7 +772,7 @@ impl Batch<'_> {
                 &rows[row],
                 request.admission(),
                 served.as_ref(),
-                progress.kv_visible_len,
+                progress.cache_visible_len,
                 progress.logical_position,
             )
             .map_err(&execute)?;
@@ -786,7 +788,7 @@ impl Batch<'_> {
             steps.push(step);
         }
         let pages = self
-            .kv
+            .prefix_cache
             .tables()
             .prepare_attention(&attention, |_, _, _| Ok(()))
             .map_err(&execute)?;
@@ -811,7 +813,7 @@ impl Batch<'_> {
         for (position, &row) in active.iter().enumerate() {
             let state = &mut states[row];
             state.output.canvas_range = Some((offset + position * width, width));
-            let visible = state.output.progress.kv_visible_len;
+            let visible = state.output.progress.cache_visible_len;
             state.output.set_cache_length(visible);
         }
 
@@ -928,7 +930,7 @@ fn context<'a>(
         ));
     };
     let Some(RankStorage {
-        kv: Some(kv),
+        prefix_cache: Some(prefix_cache),
         tensors,
         events,
         ..
@@ -941,7 +943,7 @@ fn context<'a>(
         rank: parts.rank,
         runner,
         requests: parts.requests,
-        kv,
+        prefix_cache,
         tensors,
         events,
         plan,

@@ -1,7 +1,7 @@
 //! `Methods`: the Python half of a runner, reached by import path.
 //!
 //! A runner's Python half is a class of the library, for example
-//! `uniserve_models.runner.causal_lm.CausalLMRunner`. [`Methods`] constructs
+//! `uniserve.runner.causal_lm.CausalLMRunner`. [`Methods`] constructs
 //! the object, resolves the methods a runner calls and builds their calls.
 //! A method takes the runner first, then its scalar arguments and the
 //! tensors it reads and writes; the Python contract of each is its

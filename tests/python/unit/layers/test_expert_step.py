@@ -11,10 +11,10 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_models.backends.experts import ExpertTransport
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import Communicator
-from uniserve_models.nn.moe import FusedMoE
+from uniserve.backends.experts import ExpertTransport
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import Communicator
+from uniserve.nn.moe import FusedMoE
 
 pytestmark = pytest.mark.unit
 
@@ -74,7 +74,7 @@ def bound(modules, transport):
 
 
 def _size(tokens):
-    from uniserve_models.model import TextSize
+    from uniserve.models import TextSize
 
     return TextSize(tokens, 1)
 

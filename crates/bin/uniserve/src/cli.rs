@@ -16,7 +16,7 @@ use educe::Educe;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
-use uniserve_core::{KvCacheDtype, ModelDtype};
+use uniserve_core::{ModelDtype, PrefixCacheDtype};
 use uniserve_engine::{
     AttentionBackend, DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
@@ -221,11 +221,11 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long, default_value = "ffprobe", value_name = "PATH")]
     pub ffprobe: std::path::PathBuf,
     /// Optional explicit KV token capacity override for the worker.
-    #[arg(long = "max-total-tokens")]
-    pub kv_token_capacity: Option<u64>,
+    #[arg(long = "max-total-tokens", value_name = "KV_TOKEN_CAPACITY")]
+    pub cache_token_capacity: Option<u64>,
     /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
-    #[arg(long)]
-    pub disable_prefix_cache: bool,
+    #[arg(long = "disable-prefix-cache")]
+    pub disable_prefix_reuse: bool,
     /// Largest message in bytes a rank's channel carries.
     #[arg(long = "resp-slot-cap", default_value_t = EngineSettings::DEFAULT_MAX_MESSAGE_BYTES, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub max_message_bytes: usize,
@@ -477,7 +477,7 @@ impl SharedRuntimeArgs {
         let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
         worker_process.max_message_bytes = self.max_message_bytes;
-        worker_process.kv_token_capacity = self.kv_token_capacity;
+        worker_process.cache_token_capacity = self.cache_token_capacity;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
 
@@ -491,7 +491,7 @@ impl SharedRuntimeArgs {
                 .long_prefill_threshold
                 .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
             mixed_prefill_tokens: self.mixed_prefill_tokens,
-            prefix_cache: !self.disable_prefix_cache,
+            prefix_reuse: !self.disable_prefix_reuse,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;
             // an explicit `--max-model-len` overrides it.
@@ -599,16 +599,17 @@ pub(crate) struct WorkerProcessOptions {
         value_name = "JSON"
     )]
     pub quantization_config: serde_json::Value,
-    #[arg(long)]
-    pub kv_cache_dtype: Option<KvCacheDtype>,
+    #[arg(long = "kv-cache-dtype", value_name = "KV_CACHE_DTYPE")]
+    pub prefix_cache_dtype: Option<PrefixCacheDtype>,
     /// Each worker rank's share of its device's total storage, in (0, 1].
     /// A deployment file's `memory_fraction` overrides it for one worker.
     #[arg(
         long = "mem-fraction-static",
         default_value = "0.70",
-        value_parser = parse_storage_fraction
+        value_parser = parse_storage_fraction,
+        value_name = "KV_STORAGE_FRACTION"
     )]
-    pub kv_storage_fraction: f64,
+    pub cache_storage_fraction: f64,
     /// Parallelism mesh forwarded to the worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1`.
     #[arg(long, hide = true)]
@@ -679,8 +680,8 @@ impl WorkerProcessOptions {
             checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype,
             quantization_config: self.quantization_config.clone(),
-            kv_cache_dtype: self.kv_cache_dtype,
-            kv_storage_fraction: self.kv_storage_fraction,
+            prefix_cache_dtype: self.prefix_cache_dtype,
+            cache_storage_fraction: self.cache_storage_fraction,
             mesh: self.worker_mesh.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),

@@ -4,7 +4,7 @@
 // experts, optional renormalization and an optional per-expert scale.
 //
 // uniserve_kernels.routing documents the contract; the composition in
-// uniserve_models.nn.functional.topk_softmax defines the numbers. One warp owns
+// uniserve.nn.functional.topk_softmax defines the numbers. One warp owns
 // one token and reproduces that composition's FP32 arithmetic order:
 //
 // - softmax as PyTorch's warp softmax evaluates a row: lane l holds scores

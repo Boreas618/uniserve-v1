@@ -94,7 +94,7 @@ impl VideoSetup<'_> {
         let stream = forked.stream()?.clone();
         let scratch = Handle::new(
             self.interface
-                .import("uniserve_models.bindings.context.Scratch")?
+                .import("uniserve.bindings.context.Scratch")?
                 .call_values(&[])?,
         )?;
         Ok((stream, scratch))

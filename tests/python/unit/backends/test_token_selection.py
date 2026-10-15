@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_models.sampling.logprobs import LogprobRequest, prompt_logprobs
-from uniserve_models.sampling.select import (
+from uniserve.sampling.logprobs import LogprobRequest, prompt_logprobs
+from uniserve.sampling.select import (
     FREQUENCY,
     PARAMETER_COLUMNS,
     PRESENCE,
@@ -17,7 +17,7 @@ from uniserve_models.sampling.select import (
     TYPICAL_P,
     select_categorical,
 )
-from uniserve_models.sampling.state import (
+from uniserve.sampling.state import (
     COMMIT_FIELDS,
     DECODE,
     EXPLICIT,

@@ -1,6 +1,6 @@
-//! Paged attention columns of a binding that attends to the KV cache.
+//! Paged attention columns of a binding that attends to the prefix cache.
 //!
-//! A binding reading the KV cache through block tables (a causal LM, an
+//! A binding reading the prefix cache through block tables (a causal LM, an
 //! image denoiser) owns one set of fixed device columns sized for `R` rows
 //! and `T` tokens over `Tb` numerical tables of width `W`. Per invocation
 //! the runner selects each row's visible pages against the installed block
@@ -13,10 +13,10 @@
 //! | each table's selected page count | `R + 1` each |
 //! | each token's row | `T` |
 //!
-//! The binding's gather (`uniserve_models.nn.attention.gather`) derives the
+//! The binding's gather (`uniserve.nn.attention.gather`) derives the
 //! device block tables, lengths, offsets and write indices from it and the
 //! slots' installed tables in one launch
-//! (`uniserve_models.interface.attention`).
+//! (`uniserve.interface.attention`).
 
 use std::sync::Arc;
 

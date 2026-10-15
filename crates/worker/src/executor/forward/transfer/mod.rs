@@ -1,4 +1,4 @@
-//! The transfer runtime: tensor product transfers, KV exports and KV
+//! The transfer runtime: tensor product transfers, cache exports and cache
 //! installs (`CallKind::Transfer`).
 //!
 //! - **Tensor** (`TransferMode::Tensor`): each call copies its one input
@@ -8,24 +8,24 @@
 //!   components, ranks and workers can import it ([`tensor`]). A call with
 //!   a latent input and output publishes its request's committed trajectory
 //!   version from the latent pool instead ([`latents`]).
-//! - **KV export** (`TransferMode::KvExport`): each call publishes its
-//!   request's visible KV extent ([`kv`]), which an image's latent
+//! - **Cache export** (`TransferMode::CacheExport`): each call publishes its
+//!   request's visible cache extent ([`prefix_cache`]), which an image's latent
 //!   preparation and denoising calls name as their conditioning.
-//! - **KV install** (`TransferMode::KvInstall`): each call adopts the KV
-//!   import its batch prepared into its slot's pages ([`kv`]).
+//! - **Cache install** (`TransferMode::CacheInstall`): each call adopts the cache
+//!   import its batch prepared into its slot's pages ([`prefix_cache`]).
 //!
 //! A batch is jobs of its lane ([`forward`], [`complete`], see [`batch`]):
 //! its calls bind their outputs, a first job reads the host predicates that
 //! skip calls, the last job carries the transfers, and every owner commits
-//! together at that job's completion. KV transfers run on the stream of the
+//! together at that job's completion. Cache transfers run on the stream of the
 //! component's text prefill, ordered with the text batches that read and
 //! write the same pages; tensor transfers run on the stream serving them on
 //! the component's device.
 
 mod batch;
 mod cache;
-pub(crate) mod kv;
 pub(crate) mod latents;
+pub(crate) mod prefix_cache;
 mod tensor;
 
 use std::collections::HashMap;
@@ -152,7 +152,7 @@ impl RequestStorage for TransferRuntime {
     }
 }
 
-/// Whether `kind` transfers KV, on the stream of the component's text
+/// Whether `kind` transfers prefix cache, on the stream of the component's text
 /// prefill.
 fn transfers_cache(kind: CallKind) -> bool {
     kind != CallKind::Transfer(TransferMode::Tensor)
@@ -178,12 +178,12 @@ fn placement(
         ));
     }
     if transfers_cache(kind) {
-        // KV transfers read and write the pages text batches use, on their
+        // Cache transfers read and write the pages text batches use, on their
         // stream.
         let text = backend
             .parts()
             .text
-            .ok_or_else(|| Error::Unsupported("KV transfers require the text runtime".into()))?;
+            .ok_or_else(|| Error::Unsupported("cache transfers require the text runtime".into()))?;
         let (device, stream, _) = text.placement(&first.component)?;
         Ok((device, stream))
     } else {
@@ -193,7 +193,7 @@ fn placement(
 }
 
 /// Bind the batch's outputs and record in `job` its order after the text
-/// runtime's batches (KV transfers) and the reads of its predicates.
+/// runtime's batches (cache transfers) and the reads of its predicates.
 fn open(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
@@ -209,7 +209,7 @@ fn open(
     if transfers_cache(kind) {
         let text = parts
             .text
-            .ok_or_else(|| Error::Unsupported("KV transfers require the text runtime".into()))?;
+            .ok_or_else(|| Error::Unsupported("cache transfers require the text runtime".into()))?;
         text.order().wait(job.on(stream))?;
     }
     Opening::open(
@@ -262,7 +262,7 @@ fn record(
         batch.bind_flags()?;
         if cache {
             let text = parts.text.as_deref().ok_or_else(|| {
-                Error::Unsupported("KV transfers require the text runtime".into())
+                Error::Unsupported("cache transfers require the text runtime".into())
             })?;
             let component = &plan.calls[0].component;
             batch.reserve_cache(text.unit_column(component)?, inputs)?;
@@ -271,8 +271,8 @@ fn record(
             CallKind::Transfer(TransferMode::Tensor) => {
                 batch.copy_products(parts.image.as_mut())?
             }
-            CallKind::Transfer(TransferMode::KvExport) => batch.export_cache()?,
-            CallKind::Transfer(TransferMode::KvInstall) => batch.install_cache(inputs)?,
+            CallKind::Transfer(TransferMode::CacheExport) => batch.export_cache()?,
+            CallKind::Transfer(TransferMode::CacheInstall) => batch.install_cache(inputs)?,
             _ => {
                 return Err(Error::Unsupported(format!(
                     "{} is served by another runtime",
@@ -439,7 +439,7 @@ fn fail(
 ) -> std::result::Result<(), WorkerError> {
     batch.set_stage(Stage::Done);
     if failure.committed {
-        // Products, KV directories and pending calls may already be
+        // Products, cache directories and pending calls may already be
         // visible; the rank cannot roll them back.
         let mut error = WorkerError::classify(failure.error, Some("transfer batch"));
         error.fatal = true;

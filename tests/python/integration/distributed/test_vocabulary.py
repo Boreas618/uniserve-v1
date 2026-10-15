@@ -15,11 +15,11 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models import loading
-from uniserve_models.distributed import DeviceMesh
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.model import Logits
-from uniserve_models.nn.linear import VocabParallelEmbedding, VocabParallelHead
+from uniserve import loading
+from uniserve.distributed import DeviceMesh
+from uniserve.loading import checkpoint, weights
+from uniserve.models import Logits
+from uniserve.nn.linear import VocabParallelEmbedding, VocabParallelHead
 
 pytestmark = pytest.mark.integration
 

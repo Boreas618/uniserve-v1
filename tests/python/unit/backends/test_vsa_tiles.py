@@ -9,7 +9,7 @@ import pytest
 import torch
 from uniserve_kernels.attention import vsa_native
 
-from uniserve_models.backends.attention import vsa
+from uniserve.backends.attention import vsa
 
 pytestmark = pytest.mark.unit
 

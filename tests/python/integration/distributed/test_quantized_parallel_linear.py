@@ -15,18 +15,17 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models import loading
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import DeviceMesh
-from uniserve_models.interface import graphs
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.model import TextSize
-from uniserve_models.nn import (
+from uniserve import cuda_graph, loading
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import DeviceMesh
+from uniserve.loading import checkpoint, weights
+from uniserve.models import TextSize
+from uniserve.nn import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve_models.quantization import QuantizationConfig, Quantizer
+from uniserve.quantization import QuantizationConfig, Quantizer
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -114,7 +113,7 @@ def _run(rank, listener, directory, source):
                     def invoke():
                         return model.row(local), model.branches(x), model.qkv(x)
 
-                    graph = graphs.capture(invoke, stream=stream)
+                    graph = cuda_graph.capture(invoke, stream=stream)
                     for multiplier in (1.0, 2.0):
                         if multiplier == 2.0:
                             x.mul_(2)

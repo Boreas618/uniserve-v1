@@ -1,11 +1,11 @@
 //! Image understanding and generation through a native worker process.
 //!
 //! These tests run the engine (`EngineCore`) over one real rank process
-//! (`uniserve_models.worker` with the weightless stub model on CPU), so every
+//! (`uniserve.worker` with the weightless stub model on CPU), so every
 //! image call the engine plans executes in the worker's image and text
 //! runtimes: vision encoding of an inline image and the context prefill that
 //! places its features; and an image's generation: the conditioning prefill
-//! and KV export, latent preparation, guided denoising with guidance prefix
+//! and cache export, latent preparation, guided denoising with guidance prefix
 //! prefills, decoding to a PNG and the generated image's feedback encoding.
 //! The stub's denoiser predicts zero velocity, so a generated image is its
 //! seeded initial latent decoded: identical for one seed, different across
@@ -92,7 +92,7 @@ fn engine() -> anyhow::Result<EngineCore> {
         components,
         queue_depth: 2,
         max_message_bytes: 8 << 20,
-        kv_token_capacity: Some(4096),
+        cache_token_capacity: Some(4096),
         block_size: Some(16),
         max_batch_calls: 16,
         max_batch_tokens: 256,
@@ -139,8 +139,8 @@ fn policy(feedback: bool) -> ImageGenerationConfig {
         feedback_encoders: if feedback {
             vec![ImageEncoderInput {
                 encoder: ImageIngestStep::VaeEncode,
-                num_kv_tokens: None,
-                max_kv_tokens: None,
+                num_cache_tokens: None,
+                max_cache_tokens: None,
             }]
         } else {
             Vec::new()
@@ -330,8 +330,8 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
                 num_positions: 1,
                 encoders: vec![ImageEncoderInput {
                     encoder: ImageIngestStep::VitEncode,
-                    num_kv_tokens: Some(4),
-                    max_kv_tokens: None,
+                    num_cache_tokens: Some(4),
+                    max_cache_tokens: None,
                 }],
             }],
         };

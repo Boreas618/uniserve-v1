@@ -1,7 +1,7 @@
 """DiffusionGemma served by one data-parallel replica per visible GPU.
 
 ``uniserve serve --data-parallel-size N`` runs a full model replica on each
-of the N visible GPUs, each with its own scheduler and KV cache, and routes
+of the N visible GPUs, each with its own scheduler and prefix cache, and routes
 every request to the replica with the fewest requests in flight; with
 ``--expert-parallel`` the replicas also shard the routed experts and exchange
 tokens at every expert layer. DWDP instead prefetches immutable weights and

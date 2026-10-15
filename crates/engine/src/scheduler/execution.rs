@@ -320,7 +320,7 @@ pub(crate) fn generation_consuming_calls(media_call: MediaCall) -> Option<&'stat
 pub(super) struct ScheduledContext {
     /// Model position after the in-flight calls.
     pub(super) logical: u32,
-    /// KV length after the in-flight calls, at their submitted maxima.
+    /// Cache length after the in-flight calls, at their submitted maxima.
     pub(super) physical: u32,
     /// The next input-image block no accepted or in-flight call writes.
     pub(super) blocks: BlockCursor,
@@ -1454,7 +1454,7 @@ impl Scheduler {
         batches
     }
 
-    /// Publishes request, in-flight batch, KV-cache and encoder-cache gauges
+    /// Publishes request, in-flight batch, prefix-cache and encoder-cache gauges
     /// to scheduler counters.
     pub(super) fn publish_cache_stats(&mut self) {
         self.stats
@@ -1466,27 +1466,27 @@ impl Scheduler {
             .pending
             .store(self.pending_request_count(), Ordering::Relaxed);
         self.stats
-            .kv_cache
+            .prefix_cache
             .free_units
             .store(self.storage.free_units(), Ordering::Relaxed);
         self.stats
             .general
             .in_flight
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
-        if let Some(kv) = self.storage.cache.as_ref() {
-            let pool = kv.block_pool.stats();
+        if let Some(prefix_cache) = self.storage.cache.as_ref() {
+            let pool = prefix_cache.block_pool.stats();
             self.stats
-                .kv_cache
+                .prefix_cache
                 .pages_evicted
                 .store(pool.evictions, Ordering::Relaxed);
             self.stats
-                .kv_cache
+                .prefix_cache
                 .pages_stored
                 .store(pool.pages_stored, Ordering::Relaxed);
             self.stats
-                .kv_cache
+                .prefix_cache
                 .cached_pages
-                .store(kv.block_pool.cached_pages(), Ordering::Relaxed);
+                .store(prefix_cache.block_pool.cached_pages(), Ordering::Relaxed);
         }
         self.stats
             .encoder
@@ -1574,10 +1574,10 @@ impl Scheduler {
     }
 
     /// Projects the request's accepted context through its in-flight calls:
-    /// logical and KV extents, and the input-image block cursor.
+    /// logical and cache extents, and the input-image block cursor.
     pub(super) fn scheduled_context(&self, id: RequestId) -> Option<ScheduledContext> {
         let state = self.running.get(&id)?;
-        let (mut logical, mut physical) = (state.logical_position, state.kv_visible_len);
+        let (mut logical, mut physical) = (state.logical_position, state.cache_visible_len);
         let mut blocks = state.block_cursor();
         let mut feedback_index = state.feedback_encoder_index;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
@@ -1588,7 +1588,7 @@ impl Scheduler {
                     let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
                     let advance = state.context_advance(count, call.vision_inputs.len(), blocks)?;
                     logical = logical.saturating_add(advance.logical);
-                    physical = physical.saturating_add(advance.kv);
+                    physical = physical.saturating_add(advance.prefix_cache);
                     blocks = advance.cursor;
                 }
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
@@ -1636,7 +1636,7 @@ impl Scheduler {
     /// resolves before any successor is scheduled.
     pub(super) fn projected_coordinates(&self, id: RequestId) -> Option<CallCoordinates> {
         let state = self.running.get(&id)?;
-        let (logical_position, kv_visible_len) = self.scheduled_token_lengths(id)?;
+        let (logical_position, cache_visible_len) = self.scheduled_token_lengths(id)?;
         let forward_submitted = self
             .inflight
             .pending_calls
@@ -1646,11 +1646,11 @@ impl Scheduler {
             .any(|pending| matches!(pending.call.code, CallKind::Forward(_)));
         Some(CallCoordinates {
             logical_position,
-            kv_visible_len,
-            kv_computed_len: if forward_submitted {
-                kv_visible_len
+            cache_visible_len,
+            cache_computed_len: if forward_submitted {
+                cache_visible_len
             } else {
-                state.kv_computed_len.max(kv_visible_len)
+                state.cache_computed_len.max(cache_visible_len)
             },
             flow_step: self.num_scheduled_denoise_steps(id)?,
         })
@@ -1704,14 +1704,14 @@ impl Scheduler {
         Some((index, images))
     }
 
-    /// Returns the KV buffer the request's next call is conditioned on: the
-    /// `kv_output` of its latest in-flight call that publishes one, otherwise
+    /// Returns the cache buffer the request's next call is conditioned on: the
+    /// `cache_output` of its latest in-flight call that publishes one, otherwise
     /// the accepted `image_conditioning` of the running request.
-    pub(super) fn kv_conditioning(&self, id: RequestId) -> Option<uniserve_ipc::BufferId> {
+    pub(super) fn cache_conditioning(&self, id: RequestId) -> Option<uniserve_ipc::BufferId> {
         self.inflight
             .pending_calls
             .get(&id)
-            .and_then(|pending| pending.iter().rev().find_map(|item| item.call.kv_output))
+            .and_then(|pending| pending.iter().rev().find_map(|item| item.call.cache_output))
             .or_else(|| {
                 self.running
                     .get(&id)
@@ -1781,8 +1781,8 @@ impl Scheduler {
                         Phase::Prefill
                     }
                 }
-                CallKind::Forward(ForwardMode::Prefill) => Phase::PublishKv,
-                CallKind::Transfer(TransferMode::KvExport) => Phase::PrepareGen,
+                CallKind::Forward(ForwardMode::Prefill) => Phase::PublishCache,
+                CallKind::Transfer(TransferMode::CacheExport) => Phase::PrepareGen,
                 CallKind::Media(MediaCall::LatentPreparation)
                 | CallKind::Media(MediaCall::Denoising) => Phase::DenoiseGen,
                 CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
@@ -1951,10 +1951,10 @@ impl Scheduler {
             return false;
         };
 
-        // A KV export is never queued behind an unresolved call, and a
+        // A cache export is never queued behind an unresolved call, and a
         // request with a `RoundCloseThenSuffix` image trigger queues no
         // successor at all.
-        if target == CallKind::Transfer(TransferMode::KvExport) {
+        if target == CallKind::Transfer(TransferMode::CacheExport) {
             return false;
         }
         if matches!(
@@ -2022,7 +2022,7 @@ impl Scheduler {
     /// Two successors follow unconditionally:
     /// - The canvas pass that follows the prefill completing a context (a
     ///   readout's pass or a block's first step), since the prefill cannot
-    ///   stop the request. The pass reads the KV the prefill writes, and only
+    ///   stop the request. The pass reads the prefix cache the prefill writes, and only
     ///   the worker's device order puts the write first: forwards run in
     ///   submission order on one stream, and a forward on an execution lane
     ///   forks from and joins back into the device's control stream
@@ -2030,9 +2030,9 @@ impl Scheduler {
     /// - A stopped block's commit queued behind the block's steps still in
     ///   flight. The host has accepted the step that stopped the block, so
     ///   every step behind it is a no-op whose completion is false, and the
-    ///   commit runs regardless. The commit writes the block's tokens to KV
+    ///   commit runs regardless. The commit writes the block's tokens to cache
     ///   positions `[P, P + canvas)`, where `P` is the context length each
-    ///   step of the block reads; a canvas step reads KV below `P` and writes
+    ///   step of the block reads; a canvas step reads cache below `P` and writes
     ///   none, so the commit's writes never overlap what those steps read.
     ///   Each rank also runs the commit after them in submission order on
     ///   its device stream, under data and expert parallelism alike.
@@ -2095,8 +2095,8 @@ impl Scheduler {
         }
         Some(match self.next_generation_phase(id)? {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
-            Phase::CloseKv | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
-            Phase::PublishKv => CallKind::Transfer(TransferMode::KvExport),
+            Phase::CloseCache | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
+            Phase::PublishCache => CallKind::Transfer(TransferMode::CacheExport),
             Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
             Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
             Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
@@ -2974,12 +2974,15 @@ impl Scheduler {
 
                 // Media calls update their independent call progress immediately;
                 // generation calls continue through semantic validation.
-                let (image_kv, latent) = match input {
+                let (image_cache, latent) = match input {
                     InflightInput::Media { latent, decode } => {
                         self.process_diffusion_result(call, latent, decode, record, media);
                         continue;
                     }
-                    InflightInput::Generation { image_kv, latent } => (image_kv, latent),
+                    InflightInput::Generation {
+                        image_cache,
+                        latent,
+                    } => (image_cache, latent),
                 };
 
                 // A request already finishing with an error discards the
@@ -2996,7 +2999,7 @@ impl Scheduler {
                 }
 
                 // A descendant submitted before its chain was invalidated is
-                // discarded: `num_kv_units_sent` drops by its `max_kv_units`
+                // discarded: `num_cache_units_sent` drops by its `max_cache_units`
                 // bound, so the next dispatch declares those units again, its
                 // products are freed, and the chain stays marked while later
                 // descendants remain in flight.
@@ -3007,9 +3010,9 @@ impl Scheduler {
                 if discard_invalidated_descendant {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
-                        state.num_kv_units_sent = state
-                            .num_kv_units_sent
-                            .saturating_sub(u64::from(call.bounds.max_kv_units));
+                        state.num_cache_units_sent = state
+                            .num_cache_units_sent
+                            .saturating_sub(u64::from(call.bounds.max_cache_units));
                         state.speculative_chain_invalidated = has_unresolved_descendants;
                     }
                     self.free_buffers(call.output_buffers());
@@ -3028,7 +3031,7 @@ impl Scheduler {
                 };
                 if let Err(error) = generation::validate_generation_result(
                     &call,
-                    image_kv,
+                    image_cache,
                     latent.as_ref(),
                     state,
                     &record,
@@ -3096,11 +3099,11 @@ impl Scheduler {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
                 }
-                // An accepted forward extends the request's KV: publish the
+                // An accepted forward extends the request's prefix cache: publish the
                 // prompt pages it completed, then retire sliding-window pages
                 // no later reader needs.
                 if progress_result.is_some() && matches!(call.code, CallKind::Forward(_)) {
-                    self.advance_request_kv(id);
+                    self.advance_request_cache(id);
                 }
 
                 // Apply accepted progress directly; the output decoder separately
@@ -3180,9 +3183,9 @@ impl Scheduler {
                 if record.status == CallStatus::Predicated {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
                     if let Some(state) = self.running.get_mut(&id) {
-                        state.num_kv_units_sent = state
-                            .num_kv_units_sent
-                            .saturating_sub(u64::from(call.bounds.max_kv_units));
+                        state.num_cache_units_sent = state
+                            .num_cache_units_sent
+                            .saturating_sub(u64::from(call.bounds.max_cache_units));
                         let stop_observed = state.phase == Phase::CommitCanvas
                             && call
                                 .canvas

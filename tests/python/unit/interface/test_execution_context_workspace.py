@@ -3,12 +3,12 @@
 import pytest
 import torch
 
-from uniserve_models.bindings.context import (
+from uniserve.bindings.context import (
     ExecutionContext,
     TensorBuffers,
     Workspace,
 )
-from uniserve_models.tensors import BufferConfig
+from uniserve.tensors import BufferConfig
 
 pytestmark = pytest.mark.unit
 
@@ -92,8 +92,8 @@ def test_a_symmetric_field_comes_from_the_allocation_function():
     the others as every member's view in member order. Other fields are
     ordinary tensors.
     """
-    from uniserve_models.distributed import Communicator
-    from uniserve_models.nn.attention.storage import StorageRequirement
+    from uniserve.distributed import Communicator
+    from uniserve.nn.attention.storage import StorageRequirement
 
     requirement = StorageRequirement(
         Communicator((3, 5), 0, "ulysses"),

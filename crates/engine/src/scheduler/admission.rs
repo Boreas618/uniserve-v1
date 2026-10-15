@@ -10,7 +10,7 @@
 //! storage allow. A head that does not fit yet blocks the requests behind it
 //! in its queue, and running requests are never preempted to make room.
 //!
-//! A token request reserves a request row and one KV table per cache group;
+//! A token request reserves a request row and one cache table per cache group;
 //! every group draws units from one pool, so admission compares the sum of
 //! the groups' unit demand with the free units. Its prefill worker is
 //! recorded in `Placement::affinity`. A media request
@@ -33,11 +33,11 @@ pub(super) struct MediaOutput {
 impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
     ///
-    /// Rejects with `RejectionKind::Invalid` when the runtime has no KV cache,
+    /// Rejects with `RejectionKind::Invalid` when the runtime has no prefix cache,
     /// the request fails validation, a unit the scheduler never splits (a
     /// readout row, a generation canvas, an input image's vision block)
     /// exceeds the step token budget, the worker lacks a required generation
-    /// feature, or `validate_resources` or `max_kv_tokens` fails against
+    /// feature, or `validate_resources` or `max_cache_tokens` fails against
     /// `generation_limits`; rejects with `RejectionKind::Overloaded` when the
     /// waiting bound is reached. A rejection is sent on `event_tx` and its
     /// send result is ignored.
@@ -90,7 +90,7 @@ impl Scheduler {
             return;
         }
         // A context prefill writes an input image's vision block whole, as
-        // one attention block of one call, so the block's exact KV length
+        // one attention block of one call, so the block's exact cache length
         // must fit one scheduling step's token budget.
         if let Some(tokens) = req
             .multimodal_inputs
@@ -98,7 +98,7 @@ impl Scheduler {
             .iter()
             .flat_map(|image| &image.encoders)
             .filter(|input| input.encoder == ImageIngestStep::VitEncode)
-            .filter_map(|input| input.num_kv_tokens)
+            .filter_map(|input| input.num_cache_tokens)
             .find(|&tokens| tokens as usize > self.config.max_num_batched_tokens)
         {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
@@ -119,11 +119,11 @@ impl Scheduler {
             });
             return;
         }
-        // Resource validation includes the KV bound, so a request that passes
-        // it has a worst-case KV token count.
-        let max_kv_tokens = match req
+        // Resource validation includes the cache bound, so a request that passes
+        // it has a worst-case cache token count.
+        let max_cache_tokens = match req
             .validate_resources(&self.generation_limits)
-            .and_then(|()| req.max_kv_tokens(&self.generation_limits))
+            .and_then(|()| req.max_cache_tokens(&self.generation_limits))
         {
             Ok(tokens) => tokens,
             Err(error) => {
@@ -147,8 +147,8 @@ impl Scheduler {
             });
             return;
         }
-        // Multimodal requests reserve their configured bounded KV envelope at
-        // admission so excess concurrency queues instead of exhausting KV.
+        // Multimodal requests reserve their configured bounded cache envelope at
+        // admission so excess concurrency queues instead of exhausting the prefix cache.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
         let finish_token_ids = finish_token_ids(&req, &self.ctrl.eos);
         let st = RequestState {
@@ -171,8 +171,8 @@ impl Scheduler {
             context_features: Vec::new(),
             round_closing: false,
             logical_position: 0,
-            kv_visible_len: 0,
-            kv_computed_len: 0,
+            cache_visible_len: 0,
+            cache_computed_len: 0,
             next_token: 0,
             num_generated_tokens: 0,
             image_id: 0,
@@ -184,11 +184,11 @@ impl Scheduler {
             feedback_source: None,
             feedback_features: None,
             worker_registered: false,
-            num_kv_units_sent: 0,
+            num_cache_units_sent: 0,
             reserve_worstcase,
             // `admit` reserves the units of this worst-case extent only for
             // requests with `reserve_worstcase` set.
-            max_reserved_kv_tokens: max_kv_tokens,
+            max_reserved_cache_tokens: max_cache_tokens,
             prefix_page_hashes: Vec::new(),
             prefix_published: Vec::new(),
             generated_token_ids: Vec::new(),
@@ -771,14 +771,14 @@ impl Scheduler {
             * ceil_div_u64((width as u64).max(1), downsample)
     }
 
-    /// Materializes the negative-prompt KV prefix required by multi-branch guidance.
+    /// Materializes the negative-prompt cache prefix required by multi-branch guidance.
     ///
-    /// Allocates the prefix its own request row and KV tables sized to the
+    /// Allocates the prefix its own request row and cache tables sized to the
     /// negative prompt, and stores them in `RequestState::flow_prefix`.
     /// Returns `true` when the prefix is in place, the request uses a single
     /// guidance branch, or the request is not running. Returns `false`,
-    /// holding nothing new, when no request row or KV capacity is free, or
-    /// (after latching engine-fatal) the KV cache is missing;
+    /// holding nothing new, when no request row or cache capacity is free, or
+    /// (after latching engine-fatal) the prefix cache is missing;
     /// `reserve_generation_resources` then declines the denoising call.
     pub(super) fn ensure_flow_prefix(&mut self, id: RequestId) -> bool {
         let (prefix_tokens, needs_alternative) = self
@@ -807,21 +807,21 @@ impl Scheduler {
         };
         let Some(cache) = self.storage.cache() else {
             self.storage.request_pool.free(request_slot);
-            self.invariant_broken("a running token request has a KV cache");
+            self.invariant_broken("a running token request has a prefix cache");
             return false;
         };
-        let Ok(kv) = cache.allocate(prefix_tokens as u32) else {
+        let Ok(prefix_cache) = cache.allocate(prefix_tokens as u32) else {
             self.storage.request_pool.free(request_slot);
             return false;
         };
-        let new_units = kv
+        let new_units = prefix_cache
             .tables
             .iter()
             .map(|table| (table.group_id() as u32, table.unit_ids()))
             .collect();
         let allocations = RequestAllocations {
             request_slot,
-            kv,
+            prefix_cache,
             latent: None,
             buffers: HashMap::new(),
         };
@@ -851,7 +851,7 @@ impl Scheduler {
     /// Reaps terminal requests after all submitted descendants resolve.
     pub(super) fn reap_cancellations(&mut self) {
         // A cancelled request closes only after every submitted descendant has
-        // resolved. Host KV ownership then remains pinned through the close
+        // resolved. Host cache ownership then remains pinned through the close
         // acknowledgement and ordered worker request retirement.
         let cancelled: Vec<(RequestId, TerminalIntent)> = self
             .running
@@ -893,14 +893,14 @@ impl Scheduler {
 
     /// Admits requests from the queue head while sequence and storage budgets allow.
     ///
-    /// Requests configured for worst-case reservation acquire their full KV capacity here,
+    /// Requests configured for worst-case reservation acquire their full cache capacity here,
     /// keeping that capacity resident for the request lifetime.
     ///
-    /// A worst-case request is admitted when the free KV units cover the
-    /// units of `max_reserved_kv_tokens` in every group and its
+    /// A worst-case request is admitted when the free cache units cover the
+    /// units of `max_reserved_cache_tokens` in every group and its
     /// encoder-cache entries fit the budget; any other request needs only
     /// the units of its first prefill chunk beyond its cached prefix, summed
-    /// over every cache group. A head that can never fit the total KV
+    /// over every cache group. A head that can never fit the total cache
     /// capacity is rejected with `RejectionKind::Invalid`. Admission stops
     /// when the queue is empty, `max_num_seqs` is reached, no request row is
     /// free, the head does not fit yet or finds no ready prefill worker, or a
@@ -915,15 +915,15 @@ impl Scheduler {
             let Some(head) = self.waiting.front() else {
                 break;
             };
-            // Submission rejects token requests when the worker has no KV
+            // Submission rejects token requests when the worker has no prefix
             // cache, so a queued one always finds it.
             let Some(cache) = self.storage.cache() else {
-                self.invariant_broken("a queued token request has a KV cache");
+                self.invariant_broken("a queued token request has a prefix cache");
                 break;
             };
 
             if head.reserve_worstcase {
-                let tokens = head.max_reserved_kv_tokens;
+                let tokens = head.max_reserved_cache_tokens;
                 let need = cache.coordinator.units_for_tokens(tokens);
                 let encoder_entries = head.req.num_encoder_cache_entries();
                 let encoder_ok = self
@@ -1029,7 +1029,7 @@ impl Scheduler {
             }
 
             // The head does not fit yet. Resident requests keep their physical
-            // KV units and are never preempted or relocated to make room, and
+            // cache units and are never preempted or relocated to make room, and
             // later requests do not bypass the head, so admission waits for
             // capacity to free.
             break;
@@ -1042,11 +1042,11 @@ impl Scheduler {
     /// the component name it binds, plus the prefix hit on that worker's
     /// endpoint (prefix-cache residency is keyed by endpoint). The hit is an
     /// estimate; `acquire_cached_prefix` takes the actual prefix. Returns
-    /// `None` when the runtime has no KV cache or no prefill worker is ready.
+    /// `None` when the runtime has no prefix cache or no prefill worker is ready.
     fn prefill_target(
         &self,
         state: &RequestState,
-    ) -> Option<((crate::WorkerId, String), crate::kv::PrefixHit)> {
+    ) -> Option<((crate::WorkerId, String), crate::prefix_cache::PrefixHit)> {
         let cache = self.storage.cache()?;
         self.placement
             .worker_candidates(
@@ -1092,7 +1092,7 @@ impl Scheduler {
     /// Reserves what admission to `target` needs before the request commits.
     ///
     /// Admission checked request-row capacity and chose `target` among loaded
-    /// workers, and the text KV cache exists for every queued token request, so
+    /// workers, and the text prefix cache exists for every queued token request, so
     /// an error names the scheduler invariant that no longer holds. Nothing
     /// stays reserved on error.
     fn reserve_admission(
@@ -1111,22 +1111,22 @@ impl Scheduler {
             .storage
             .cache
             .as_ref()
-            .ok_or("a queued token request has a KV cache")?;
+            .ok_or("a queued token request has a prefix cache")?;
         let request_slot = self
             .storage
             .request_pool
             .allocate()
             .map_err(|_| "admission checked request-row capacity")?;
         // Admission owns the request row and an initially empty table for every
-        // KV group before the request enters the runnable set.
-        let Ok(kv) = cache.allocate(0) else {
+        // cache group before the request enters the runnable set.
+        let Ok(prefix_cache) = cache.allocate(0) else {
             self.storage.request_pool.free(request_slot);
-            return Err("an empty KV allocation always fits");
+            return Err("an empty cache allocation always fits");
         };
         Ok(AdmissionReservation {
             source,
             request_slot,
-            kv,
+            prefix_cache,
         })
     }
 
@@ -1149,14 +1149,14 @@ impl Scheduler {
         let AdmissionReservation {
             source,
             request_slot,
-            kv,
+            prefix_cache,
         } = reservation;
         self.placement
             .affinity
             .insert((request_key, target.1), target.0);
         st.allocations = Some(RequestAllocations {
             request_slot,
-            kv,
+            prefix_cache,
             latent: None,
             buffers: HashMap::new(),
         });
@@ -1187,10 +1187,14 @@ impl Scheduler {
         // Prefix-cache acquisition pins every reused block to this request's
         // newly installed block tables.
         let acquired = match (self.running.get_mut(&id), self.storage.cache.as_ref()) {
-            (Some(st), Some(kv)) => {
-                acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats, &source)
-            }
-            _ => Err("an admitted request runs with a KV cache"),
+            (Some(st), Some(prefix_cache)) => acquire_cached_prefix(
+                &prefix_cache.coordinator,
+                st,
+                &prefix_cache.block_pool,
+                &self.stats,
+                &source,
+            ),
+            _ => Err("an admitted request runs with a prefix cache"),
         };
         if let Err(invariant) = acquired {
             self.invariant_broken(invariant);
@@ -1203,16 +1207,16 @@ pub(super) struct AdmissionReservation {
     /// The prefill worker's endpoint, which keys its prefix-cache residency.
     source: uniserve_ipc::WorkerEndpoint,
     request_slot: RequestSlot,
-    kv: KvAllocation,
+    prefix_cache: CacheAllocation,
 }
 
 /// Acquires the longest prefix every cache group can reuse and records cache
 /// accounting on the request.
 ///
 /// Fails, acquiring nothing, when the request holds no block tables or its
-/// tables do not match the pool's KV groups.
+/// tables do not match the pool's cache groups.
 fn acquire_cached_prefix(
-    coordinator: &KvCacheCoordinator,
+    coordinator: &PrefixCacheCoordinator,
     state: &mut RequestState,
     pool: &BlockPool,
     stats: &SchedulerStats,
@@ -1223,7 +1227,7 @@ fn acquire_cached_prefix(
     let cache_read = state.req.cache.read;
     let isolation_key = state.req.cache.isolation_key;
     let allocation = state
-        .kv_mut()
+        .prefix_cache_mut()
         .ok_or("an admitted request holds its block tables")?;
     let hit = coordinator
         .acquire_prefix(
@@ -1235,7 +1239,7 @@ fn acquire_cached_prefix(
             isolation_key,
             source,
         )
-        .ok_or("an admitted request's block tables cover every KV group")?;
+        .ok_or("an admitted request's block tables cover every cache group")?;
 
     // Queries count the tokens eligible for reuse under the same rule as the
     // prefix selection: a multiple of the largest page size that leaves at
@@ -1256,7 +1260,7 @@ fn acquire_cached_prefix(
         .hit_tokens
         .fetch_add(hit.cached_tokens as u64, Ordering::Relaxed);
 
-    // The reused tokens are already in KV, so every prompt and KV cursor
+    // The reused tokens are already in the prefix cache, so every prompt and cache cursor
     // starts past them, and their pages are already published.
     state.prefix_published = coordinator
         .groups()
@@ -1266,7 +1270,7 @@ fn acquire_cached_prefix(
     state.prefix_page_hashes = hit.page_hashes;
     state.num_computed_prompt_tokens = hit.cached_tokens as u32;
     state.logical_position = state.num_computed_prompt_tokens;
-    state.kv_visible_len = state.num_computed_prompt_tokens;
-    state.kv_computed_len = state.num_computed_prompt_tokens;
+    state.cache_visible_len = state.num_computed_prompt_tokens;
+    state.cache_computed_len = state.num_computed_prompt_tokens;
     Ok(())
 }

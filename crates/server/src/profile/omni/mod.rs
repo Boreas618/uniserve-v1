@@ -2,12 +2,12 @@
 //!
 //! The SenseNova and Bagel profiles fix each family's control tokens, prompt
 //! framing, output filters, image-generation defaults, and runtime limit
-//! ceilings. They also predict the KV tokens an input or generated image
+//! ceilings. They also predict the cache tokens an input or generated image
 //! occupies from its pixel dimensions, and the request carries that count as
-//! an exact `ImageEncoderInput::num_kv_tokens`. The predictions replicate the
+//! an exact `ImageEncoderInput::num_cache_tokens`. The predictions replicate the
 //! worker's image resize arithmetic in
 //! `uniserve_worker/model_executor/image_inputs.py` and must stay in step with
-//! it: the engine scheduler rejects a worker result whose KV length differs
+//! it: the engine scheduler rejects a worker result whose cache length differs
 //! from the declared count (`image_kv_mismatch`).
 
 pub mod bagel;

@@ -2,7 +2,7 @@
 //!
 //! Rust decides which shapes are captured, in which order, into which
 //! allocator pool, and which captured graph a forward runs. Python records
-//! a graph (`uniserve_models.interface.graphs`): a capture function runs one
+//! a graph (`uniserve.cuda_graph`): a capture function runs one
 //! bound step under `torch.cuda.CUDAGraph` in the pool Rust passes and
 //! returns the graph with the raw executable of each of its segments. Rust
 //! launches those executables itself on the forward's stream

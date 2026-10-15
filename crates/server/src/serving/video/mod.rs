@@ -21,7 +21,7 @@
 //!    [`presentation::present`] tokenizes the conditioner's presentation and
 //!    tags every token for the denoiser's AdaLN modulation.
 //!
-//! The rules are those of `uniserve_models/minimax_h3/processing.py`; both
+//! The rules are those of `uniserve/models/minimax_h3/processing.py`; both
 //! implementations are tested against
 //! `tests/python/fixtures/minimax_h3_plan.json`, generated from the diffusers
 //! reference pipeline.

@@ -34,7 +34,7 @@ const CANVAS: u32 = 16;
 /// Denoising steps a block runs at most.
 const MAX_STEPS: u32 = 4;
 
-/// A block-diffusion worker with 16-token KV pages whose synthetic text
+/// A block-diffusion worker with 16-token cache pages whose synthetic text
 /// holds `text_len` tokens before EOS.
 fn worker(text_len: usize) -> SimEngine {
     let mut sim = SimEngine::new();
@@ -276,10 +276,10 @@ fn blocks_are_denoised_published_and_committed_until_eos() {
                 call.code,
                 call.canvas.map(|step| (step.block, step.step)),
                 call.input_token_ids.clone(),
-                call.coordinates.kv_visible_len,
+                call.coordinates.cache_visible_len,
                 forward.query_lens.clone(),
                 forward.seq_lens.clone(),
-                forward.write_kv.clone(),
+                forward.write_cache.clone(),
             )
         })
         .collect();
@@ -469,7 +469,7 @@ fn a_blocks_commit_is_queued_behind_its_no_op_step() {
         .iter()
         .filter(|(_, call)| {
             call.code == CallKind::Forward(ForwardMode::Prefill)
-                && call.coordinates.kv_visible_len >= 24
+                && call.coordinates.cache_visible_len >= 24
         })
         .collect();
     assert_eq!(commits.len(), 2);
@@ -540,7 +540,7 @@ fn the_completion_limit_truncates_inside_a_block() {
         .into_iter()
         .filter(|(call, _)| {
             call.code == CallKind::Forward(ForwardMode::Prefill)
-                && call.coordinates.kv_visible_len > 0
+                && call.coordinates.cache_visible_len > 0
         })
         .count();
     assert_eq!(commits, 1, "only the first block is committed");
@@ -657,7 +657,7 @@ fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
     let prompt_done = first(&|call: &Call| {
         call.request_key.request_id == RequestId(3)
             && call.code == CallKind::Forward(ForwardMode::Prefill)
-            && call.coordinates.kv_visible_len + call.input_token_ids.len() as u32 == 200
+            && call.coordinates.cache_visible_len + call.input_token_ids.len() as u32 == 200
     });
     let block_stopped = first(&|call: &Call| {
         call.request_key.request_id == RequestId(2)

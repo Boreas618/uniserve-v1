@@ -4,7 +4,7 @@ import pytest
 import torch
 import tvm_ffi
 
-from uniserve_models.interface import errors
+from uniserve.interface import errors
 
 pytestmark = pytest.mark.unit
 

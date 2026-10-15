@@ -588,7 +588,7 @@ impl ExpertWeights {
 }
 
 /// The library module of expert exchanges and distributed expert weights.
-const MODULE: &str = "uniserve_models.distributed.experts";
+const MODULE: &str = "uniserve.distributed.experts";
 
 // Distributed expert weights of a rank (DWDP): setup is collective over the
 // expert union, after loading and before capacity planning. `weight_fields`
@@ -718,7 +718,7 @@ impl DwdpManager {
 
         let weights = Arc::new(weights);
         let breaks = GraphBreaks::default();
-        let break_graph = interface.import("uniserve_models.interface.graphs.break_graph")?;
+        let break_graph = interface.import("uniserve.cuda_graph.break_graph")?;
         let prefetch = Handle::new(
             interface
                 .import(&format!("{MODULE}.bind_prefetch"))?

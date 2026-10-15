@@ -4,7 +4,7 @@
 //! what the process already holds, never more than the device has free. The
 //! process figure is NVML's per-process usage, which counts every allocation
 //! of the process's context: PyTorch's caching allocator (weights,
-//! activations, graph pools), Rust driver allocations (KV planes, arenas,
+//! activations, graph pools), Rust driver allocations (cache planes, arenas,
 //! workspaces), communicator buffers and loaded modules. The caching
 //! allocator first returns unused cached blocks, so reusable cache does not
 //! count against the grant.

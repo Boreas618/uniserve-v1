@@ -17,12 +17,12 @@ from tests.python.fixtures.h3 import (
     dmd_denoiser,
     omniref_denoiser,
 )
-from uniserve_models.media import image, video
-from uniserve_models.minimax_h3 import TransformerConfig
-from uniserve_models.minimax_h3.denoiser import Denoiser
-from uniserve_models.minimax_h3.inputs import DenoiserSize
-from uniserve_models.minimax_h3.packing import patchify_video
-from uniserve_models.model import Condition, ConditionRole
+from uniserve.media import image, video
+from uniserve.models import Condition, ConditionRole
+from uniserve.models.minimax_h3 import TransformerConfig
+from uniserve.models.minimax_h3.denoiser import Denoiser
+from uniserve.models.minimax_h3.inputs import DenoiserSize
+from uniserve.models.minimax_h3.packing import patchify_video
 
 pytestmark = pytest.mark.unit
 

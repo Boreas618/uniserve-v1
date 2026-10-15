@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "uniserve"
 version = "2.0.0"
-description = "UniServe: Rust serving runtime with the uniserve_models numerical library."
+description = "UniServe: Rust serving runtime with the uniserve numerical library."
 readme = "README.md"
 requires-python = ">=3.11"
 # Keep the CUDA-13 PyTorch and torchvision release lines aligned. The locked
@@ -88,19 +88,19 @@ override-dependencies = [
 # (`uniserve_kernels/pyproject.toml`, `uniserve_eval/pyproject.toml`) so the
 # root serving distribution cannot mask a missing kernel install and does not
 # ship a console script whose dependencies it never declares.
-include = ["uniserve_models*"]
+include = ["uniserve", "uniserve.*"]
 
 [tool.setuptools.package-data]
 # Grouped-expert providers read this fixed tactic catalog at preparation.
-uniserve_models = ["backends/moe/tactics.json"]
+uniserve = ["backends/moe/tactics.json"]
 
 # Rust worker runtime. It is a TVM-FFI library rather than a Python extension
-# module: `uniserve_models.worker` loads it with `tvm_ffi.load_module`. Serving
+# module: `uniserve.worker` loads it with `tvm_ffi.load_module`. Serving
 # runs these native targets, so they build with Cargo's release profile even
 # for an editable install, where setuptools-rust would otherwise choose a
 # debug build.
 [[tool.setuptools-rust.ext-modules]]
-target = "uniserve_models._worker"
+target = "uniserve._worker"
 path = "crates/worker/Cargo.toml"
 binding = "NoBinding"
 debug = false
@@ -171,8 +171,8 @@ convention = "google"
 # Use the invoking Python version so installed dependency stubs match CI's runtime.
 # Source of truth for the type-check scope. Must match the explicit paths
 # passed by CI (.github/workflows/ci.yml) and the justfile `lint` target
-# (`mypy uniserve_models uniserve_eval`) so bare/editor invocations agree with CI.
-files = ["uniserve_models", "uniserve_eval"]
+# (`mypy uniserve uniserve_eval`) so bare/editor invocations agree with CI.
+files = ["uniserve", "uniserve_eval"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -184,6 +184,6 @@ ignore_missing_imports = true
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Keep aligned with [tool.mypy].files and the CI/justfile type-check scope.
-include = ["uniserve_models", "uniserve_eval"]
+include = ["uniserve", "uniserve_eval"]
 exclude = ["refs", "target", ".venv"]
 reportMissingImports = "warning"

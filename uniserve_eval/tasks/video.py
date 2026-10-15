@@ -6,7 +6,7 @@ ratio and duration. A t2va row carries no conditions; an fl2va or ref2va row
 lists its condition media, which the body names by ``file://`` URI under the
 point's ``video.condition_root``. The canvas and frame count a target
 resolves to follow the model package's request rules
-(``uniserve_models.minimax_h3.processing``), which the server's planner
+(``uniserve.models.minimax_h3.processing``), which the server's planner
 shares; validation holds every MP4 to its own request's canvas and frames.
 Media files are read when the request is built, before measurement, and
 inspection uses each request's shape and never runs inside a load slot.
@@ -94,7 +94,7 @@ def target_canvas(
     """
     # The model package loads torch, which only video points need, so the
     # rules are imported on first use.
-    from uniserve_models.minimax_h3 import processing
+    from uniserve.models.minimax_h3 import processing
 
     ratio = _named_ratio(task, aspect_ratio)
     if ratio is None:
@@ -117,7 +117,7 @@ def target_frames(seconds: float) -> int:
     Raises:
         ValueError: The duration lies outside 4 to 15 seconds.
     """
-    from uniserve_models.minimax_h3 import processing
+    from uniserve.models.minimax_h3 import processing
 
     return processing.frame_count(seconds)
 
@@ -128,7 +128,7 @@ def _named_ratio(task: str, aspect_ratio: str) -> tuple[int, int] | None:
     Raises:
         ValueError: The ratio is neither ``auto`` nor a named ratio.
     """
-    from uniserve_models.minimax_h3 import processing
+    from uniserve.models.minimax_h3 import processing
 
     if aspect_ratio == "auto":
         return None

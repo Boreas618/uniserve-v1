@@ -1,6 +1,6 @@
 """Dynamic E4M3 encoding and magnitude statistics over floating rows.
 
-``uniserve_models.quantization.quantizer.Quantizer`` runs these kernels for FP8
+``uniserve.quantization.quantizer.Quantizer`` runs these kernels for FP8
 quantization of CUDA inputs, with one scale per row of a rank-2 matrix or
 one scale for the whole tensor, and for the FP32 magnitude statistics
 (``Quantizer.amax``) that dynamic scales and NVFP4 tensor scales derive

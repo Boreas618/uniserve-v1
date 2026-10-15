@@ -1,6 +1,6 @@
 //! Rust-owned allocations and the typed views exported to Python.
 //!
-//! Runtime storage (KV planes, graph inputs and outputs, workspaces, staging)
+//! Runtime storage (cache planes, graph inputs and outputs, workspaces, staging)
 //! is allocated here and handed to Python as DLPack tensors. A [`Memory`]
 //! value owns one allocation; a [`StorageView`] is a typed, strided window
 //! into it that retains the allocation. Dropping the last Rust and Python

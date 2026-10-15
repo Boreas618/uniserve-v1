@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from uniserve_models import catalog as models
-from uniserve_models.loading import Config as IOConfig
-from uniserve_models.minimax_h3 import PddGrid, SparseAttention
+from uniserve.loading import Config as IOConfig
+from uniserve.models import registry as models
+from uniserve.models.minimax_h3 import PddGrid, SparseAttention
 
 pytestmark = pytest.mark.unit
 

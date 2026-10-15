@@ -29,7 +29,7 @@ pub enum Error {
     #[error("{0}")]
     Invariant(String),
     /// A Python numerical function raised. `kind` is the translated error
-    /// kind (`uniserve_models.interface.errors`) and `traceback` the Python
+    /// kind (`uniserve.interface.errors`) and `traceback` the Python
     /// traceback carried by TVM-FFI.
     #[error("{function}: {kind}: {message}")]
     Numerical {
@@ -374,7 +374,7 @@ fn kind_code(error: &Error) -> ErrorCode {
 /// Map the kind of a failed interface call to a code.
 ///
 /// The numerical library translates every exception its functions raise to
-/// one of its interface kinds (`uniserve_models.interface.errors`). The
+/// one of its interface kinds (`uniserve.interface.errors`). The
 /// remaining kinds are the ones TVM-FFI itself reports when a value that
 /// crossed the interface cannot be converted: a wrong type, a missing key,
 /// an index out of range or a value out of range.

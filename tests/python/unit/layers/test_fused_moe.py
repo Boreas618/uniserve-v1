@@ -4,9 +4,9 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.model import TextSize
-from uniserve_models.nn.moe import FusedMoE, TopK
+from uniserve.bindings.context import ExecutionContext
+from uniserve.models import TextSize
+from uniserve.nn.moe import FusedMoE, TopK
 
 pytestmark = pytest.mark.unit
 

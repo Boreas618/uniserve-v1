@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_models.nn.functional import (
+from uniserve.nn.functional import (
     qk_bias_rms_norm_rope_,
     scaled_residual_layer_norm_absmax,
     scaled_residual_rms_norm_absmax_,

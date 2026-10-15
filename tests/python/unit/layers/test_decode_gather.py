@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_models.nn.attention.gather import gather_request_decode_inputs
+from uniserve.nn.attention.gather import gather_request_decode_inputs
 
 pytestmark = pytest.mark.unit
 

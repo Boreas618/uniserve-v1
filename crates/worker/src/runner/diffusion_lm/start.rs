@@ -31,7 +31,7 @@ use crate::parallel::{DwdpManager, ExpertUnion};
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::methods::{Argument, Methods};
 use crate::runner::scratch::Scratches;
-use crate::storage::{GroupShape, KVCache, KVPlan, OutputPool};
+use crate::storage::{CachePlan, GroupShape, OutputPool, PrefixCache};
 use crate::{Error, Result};
 
 /// The call kind the runner serves.
@@ -66,7 +66,7 @@ impl Bounds {
     fn new(
         config: &WorkerConfig,
         request_slots: usize,
-        cache: &KVPlan,
+        cache: &CachePlan,
         units: Option<u32>,
         facts: &Facts,
         cuda: bool,
@@ -213,7 +213,7 @@ pub(crate) struct Startup<'a> {
     /// disaggregated expert union (zero when every rank holds its experts).
     pub(crate) experts: (bool, usize),
     pub(crate) lanes: &'a Lanes,
-    pub(crate) kv: Option<&'a KVCache>,
+    pub(crate) prefix_cache: Option<&'a PrefixCache>,
     pub(crate) components: &'a mut Components,
     /// The shared work areas of the rank's streams.
     pub(crate) scratches: &'a mut Scratches,
@@ -273,14 +273,14 @@ impl DiffusionLMRunner {
         if placed.is_empty() {
             return Ok(Vec::new());
         }
-        let kv = startup
-            .kv
+        let prefix_cache = startup
+            .prefix_cache
             .ok_or_else(|| Error::Invalid("a diffusion LM reads a prefix cache".into()))?;
         let config = startup.config;
         let interface = startup.interface;
 
         // The attention layers' view of the pool.
-        let cache = kv.pool(interface)?;
+        let cache = prefix_cache.pool(interface)?;
 
         let mut experts = startup.expert_runtime;
         if let Some(experts) = experts.as_ref()
@@ -304,8 +304,8 @@ impl DiffusionLMRunner {
             let bounds = Bounds::new(
                 config,
                 startup.request_slots,
-                kv.plan(),
-                Some(kv.planes().num_units()),
+                prefix_cache.plan(),
+                Some(prefix_cache.planes().num_units()),
                 &facts,
                 cuda.is_some(),
             )?;
@@ -507,7 +507,7 @@ pub(crate) fn reserved_bytes(
     experts: (bool, usize),
     config: &WorkerConfig,
     request_slots: usize,
-    cache: &KVPlan,
+    cache: &CachePlan,
 ) -> Result<u64> {
     let cuda = config.device.cuda_index().is_some();
     let mut bytes = 0;

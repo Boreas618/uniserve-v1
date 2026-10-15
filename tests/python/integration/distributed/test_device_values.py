@@ -6,10 +6,10 @@ They also preserve caller state.
 import pytest
 import torch
 
-from uniserve_models.cache import Config, mha
-from uniserve_models.cache.units import UnitPool
-from uniserve_models.nn import RotaryEmbedding
-from uniserve_models.quantization import Quantizer
+from uniserve.nn import RotaryEmbedding
+from uniserve.prefix_cache import Config, mha
+from uniserve.prefix_cache.units import UnitPool
+from uniserve.quantization import Quantizer
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

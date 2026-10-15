@@ -11,13 +11,13 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import DeviceMesh, parallelize_
-from uniserve_models.interface import graphs
-from uniserve_models.model import TextSize
-from uniserve_models.nn import ColumnParallelLinear
-from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
-from uniserve_models.quantization import Quantizer
+from uniserve import cuda_graph
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.models import TextSize
+from uniserve.nn import ColumnParallelLinear
+from uniserve.nn.attention import AttentionParallelConfig, Ulysses
+from uniserve.quantization import Quantizer
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -140,7 +140,7 @@ def _run(rank, listener):
                     return result
 
                 invoke()
-                graph = graphs.capture(invoke, stream=stream)
+                graph = cuda_graph.capture(invoke, stream=stream)
                 for multiplier in (1.0, 3.0):
                     local.copy_(source[interval] * multiplier)
                     actual = graph.replay()

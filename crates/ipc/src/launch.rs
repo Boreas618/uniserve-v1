@@ -34,7 +34,7 @@ pub fn rank_command(python: impl AsRef<OsStr>, head: &str, worker_id: &str, rank
     let mut command = Command::new(python);
     command
         .arg("-m")
-        .arg("uniserve_models.worker")
+        .arg("uniserve.worker")
         .arg("--head")
         .arg(head)
         .arg("--worker-id")
@@ -151,10 +151,10 @@ pub struct LaunchDescriptor {
     pub model_dtype: String,
     /// Precision selectors, a JSON object.
     pub quantization_config: serde_json::Value,
-    pub kv_cache_dtype: Option<String>,
+    pub prefix_cache_dtype: Option<String>,
     /// Fraction of device memory this rank may hold, in (0, 1].
-    pub kv_memory_fraction: f64,
-    pub kv_token_capacity: Option<u64>,
+    pub cache_memory_fraction: f64,
+    pub cache_token_capacity: Option<u64>,
     /// Attention backend name.
     pub attention_backend: String,
     pub block_size: Option<u32>,

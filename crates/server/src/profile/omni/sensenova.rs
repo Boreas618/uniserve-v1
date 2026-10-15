@@ -2,7 +2,7 @@
 //!
 //! Input images and generated-image feedback both use the ViT encode step,
 //! whose grid is 32 pixels per token (the default patch size 16 at downsample
-//! ratio 0.5 in `uniserve_models/sensenova_u1`). Output canvases are limited
+//! ratio 0.5 in `uniserve/models/sensenova_u1`). Output canvases are limited
 //! to the fixed resolution buckets in `resolution_policy`.
 
 use serde::{Deserialize, Serialize};
@@ -41,9 +41,9 @@ pub struct SenseNovaProfile {
     pub resolution_policy: ResolutionPolicy,
     /// Filters applied to decoded assistant output.
     pub output_filter: OutputFilterPolicy,
-    /// Ordered encoders and their loaded KV requirements for input images.
+    /// Ordered encoders and their loaded cache requirements for input images.
     pub image_encoders: Vec<ImageEncoderInput>,
-    /// Logical positions contributed by one input image, independently of KV tokens.
+    /// Logical positions contributed by one input image, independently of cache tokens.
     pub image_num_positions: u32,
     /// Image trigger and feedback encoder requirements.
     pub image_generation: ImageGenerationConfig,
@@ -110,8 +110,8 @@ impl SenseNovaProfile {
         };
         let image_encoders = vec![ImageEncoderInput {
             encoder: ImageIngestStep::VitEncode,
-            num_kv_tokens: None,
-            max_kv_tokens: None,
+            num_cache_tokens: None,
+            max_cache_tokens: None,
         }];
         let image_num_positions = 1;
         let image_generation = ImageGenerationConfig {
@@ -126,8 +126,8 @@ impl SenseNovaProfile {
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
                 encoder: ImageIngestStep::VitEncode,
-                num_kv_tokens: None,
-                max_kv_tokens: None,
+                num_cache_tokens: None,
+                max_cache_tokens: None,
             }],
             sample_feedback_continuation: true,
         };
@@ -234,7 +234,7 @@ impl SenseNovaProfile {
     /// image exceeds 2048x2048: `min(2048 * 2048, 4096 * 4096 / n)` with
     /// floor division, as the reference preprocessing computes it and the
     /// worker's `PatchTransform.pixel_bound` applies it with the SenseNova
-    /// processor (`uniserve_models/sensenova_u1/processing.py`).
+    /// processor (`uniserve/models/sensenova_u1/processing.py`).
     pub fn input_image_max_pixels(image_count: usize) -> u64 {
         let count = u64::try_from(image_count).unwrap_or(u64::MAX).max(1);
         Self::MAX_IMAGE_PIXELS.min(Self::MAX_TOTAL_PIXELS / count)
@@ -263,12 +263,12 @@ impl SenseNovaProfile {
         )?;
         Ok(vec![ImageEncoderInput {
             encoder: ImageIngestStep::VitEncode,
-            num_kv_tokens: Some(tokens),
-            max_kv_tokens: None,
+            num_cache_tokens: Some(tokens),
+            max_cache_tokens: None,
         }])
     }
 
-    /// Resolves the generated-image feedback KV contribution for the requested canvas.
+    /// Resolves the generated-image feedback cache contribution for the requested canvas.
     ///
     /// Uses the grid of a single input image plus one marker token: a
     /// generated image does not share the input images' pixel budget. Fails
@@ -298,8 +298,8 @@ impl SenseNovaProfile {
                 "image feedback encoders do not match the model processor",
             ));
         }
-        policy.feedback_encoders[0].num_kv_tokens = Some(tokens);
-        policy.feedback_encoders[0].max_kv_tokens = None;
+        policy.feedback_encoders[0].num_cache_tokens = Some(tokens);
+        policy.feedback_encoders[0].max_cache_tokens = None;
         Ok(policy)
     }
 }

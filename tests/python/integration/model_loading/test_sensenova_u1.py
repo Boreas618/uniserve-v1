@@ -6,20 +6,20 @@ from safetensors.torch import save_file
 from torch.nn import functional as F
 
 from tests.python.fixtures.checkpoints import sensenova_checkpoint
-from uniserve_models import loading
-from uniserve_models import sensenova_u1 as u1
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.cache.units import UnitPool
-from uniserve_models.diffusion import normal_noise
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.media import image
-from uniserve_models.model import LatentInput, TextInput, TextSize, VisionInput
-from uniserve_models.nn.attention import (
+from uniserve import loading
+from uniserve.bindings.context import ExecutionContext
+from uniserve.diffusion import normal_noise
+from uniserve.loading import checkpoint, weights
+from uniserve.media import image
+from uniserve.models import LatentInput, TextInput, TextSize, VisionInput
+from uniserve.models import sensenova_u1 as u1
+from uniserve.nn.attention import (
     AttentionBatch,
     PagedInput,
     SequenceLengths,
     VarlenInput,
 )
+from uniserve.prefix_cache.units import UnitPool
 
 pytestmark = pytest.mark.integration
 
@@ -303,7 +303,7 @@ def test_tied_vocabulary_uses_the_canonical_embedding_at_pipeline_endpoints(
 ):
     from dataclasses import replace
 
-    from uniserve_models.distributed import DeviceMesh
+    from uniserve.distributed import DeviceMesh
 
     template, _ = sensenova_checkpoint(tmp_path, torch.float32)
     config = replace(

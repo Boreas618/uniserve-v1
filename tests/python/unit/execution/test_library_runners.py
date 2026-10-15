@@ -5,21 +5,21 @@ import torch
 from torch import nn
 
 from tests.python.fixtures.diffusion import LinearDenoiser, Size
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.execution import (
+from uniserve.bindings.context import ExecutionContext
+from uniserve.execution import (
     DenoisingRunner,
     EncoderRunner,
     ImageRunner,
     ModelRunner,
 )
-from uniserve_models.media import image
-from uniserve_models.model import (
+from uniserve.media import image
+from uniserve.models import (
     DenoiserInput,
     Encoder,
     ImageDecoder,
     LatentInput,
 )
-from uniserve_models.nn.vae import RGBDecoder
+from uniserve.nn.vae import RGBDecoder
 
 pytestmark = pytest.mark.unit
 

@@ -47,9 +47,9 @@ pub struct WorkerConfig {
     pub expert_exchange: String,
     pub expert_microbatches: usize,
 
-    /// Tokens per KV page in the group with the widest token rows; unset until binding.
+    /// Tokens per cache page in the group with the widest token rows; unset until binding.
     pub block_size: Option<usize>,
-    pub kv_token_capacity: Option<usize>,
+    pub cache_token_capacity: Option<usize>,
     pub attention_backend: Option<String>,
     pub max_batch_calls: usize,
     pub max_batch_tokens: usize,
@@ -81,9 +81,9 @@ pub struct WorkerConfig {
     /// Device-storage grant after loaded weights and fixed overhead, in bytes.
     pub pool_storage_bytes: Option<usize>,
     pub model_dtype: String,
-    pub kv_cache_dtype: Option<String>,
+    pub prefix_cache_dtype: Option<String>,
     /// Fraction of total device storage available to this process.
-    pub kv_storage_fraction: f64,
+    pub cache_storage_fraction: f64,
     pub lanes: Vec<LaneConfig>,
 
     pub graph_policy: String,
@@ -107,7 +107,7 @@ impl Default for WorkerConfig {
             expert_exchange: "alltoall".into(),
             expert_microbatches: 1,
             block_size: None,
-            kv_token_capacity: None,
+            cache_token_capacity: None,
             attention_backend: None,
             max_batch_calls: 1024,
             max_batch_tokens: 8192,
@@ -126,8 +126,8 @@ impl Default for WorkerConfig {
             min_request_pool_size: 1,
             pool_storage_bytes: None,
             model_dtype: "bfloat16".into(),
-            kv_cache_dtype: None,
-            kv_storage_fraction: 0.7,
+            prefix_cache_dtype: None,
+            cache_storage_fraction: 0.7,
             lanes: vec![],
             graph_policy: "auto".into(),
             decode_graph_batch_sizes: default_decode_sizes(),
@@ -160,7 +160,7 @@ pub fn default_prefill_sizes() -> Vec<usize> {
 /// A prefill bucket reserves at least one inert padding sequence.
 pub const PREFILL_ROW_BUCKETS: &[usize] = &[8, 16, 32];
 
-/// Additional KV pages that the widest default graph padding may occupy.
+/// Additional cache pages that the widest default graph padding may occupy.
 pub fn graph_padding_block_count(block_size: usize) -> usize {
     let decode = default_decode_sizes().into_iter().max().unwrap_or(1) - 1;
     let prefill = default_prefill_sizes()
@@ -192,7 +192,7 @@ impl WorkerConfig {
             )));
         }
         Ok(Self {
-            kv_token_capacity: None,
+            cache_token_capacity: None,
             attention_backend: None,
             generation_device: None,
             max_batch_calls: slots,
@@ -291,7 +291,7 @@ impl WorkerConfig {
             }
         }
 
-        if !(self.kv_storage_fraction > 0.0 && self.kv_storage_fraction <= 1.0) {
+        if !(self.cache_storage_fraction > 0.0 && self.cache_storage_fraction <= 1.0) {
             return Err(invalid(
                 "worker configuration KV storage fraction must be in (0, 1]",
             ));
@@ -304,7 +304,7 @@ impl WorkerConfig {
             return Err(invalid("worker model dtype is unsupported"));
         }
 
-        if self.kv_cache_dtype.as_deref().is_some_and(|dtype| {
+        if self.prefix_cache_dtype.as_deref().is_some_and(|dtype| {
             !matches!(dtype, "float16" | "bfloat16" | "float32" | "float8_e4m3fn")
         }) {
             return Err(invalid("worker KV dtype is unsupported"));

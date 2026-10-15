@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from uniserve_models import interface
+from uniserve import interface
 
 pytestmark = pytest.mark.unit
 
@@ -26,8 +26,8 @@ STARTUP_ENTRIES = {
 
 # Entries an expert-parallel rank resolves; a missing one fails the rank.
 EXPERT_ENTRIES = {
-    "graphs.begin_capture",
-    "graphs.end_capture",
+    "graphs.capture_begin",
+    "graphs.capture_end",
     "graphs.release",
 }
 
@@ -43,7 +43,7 @@ def test_building_the_table_does_not_initialize_cuda():
     # A fresh interpreter: an earlier test could have initialized CUDA.
     code = (
         "import torch\n"
-        "from uniserve_models import interface\n"
+        "from uniserve import interface\n"
         "interface.table()\n"
         "print(torch.cuda.is_initialized())\n"
     )

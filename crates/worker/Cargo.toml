@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The cdylib is the library `uniserve_models.worker` loads through TVM-FFI;
+# The cdylib is the library `uniserve.worker` loads through TVM-FFI;
 # the rlib serves Rust tests and benches.
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -30,7 +30,7 @@ uniserve-cuda.workspace = true
 uniserve-ipc.workspace = true
 uuid.workspace = true
 
-# A TVM-FFI library that Python GPU tests load to drive the native KV owners
+# A TVM-FFI library that Python GPU tests load to drive the native cache owners
 # with the real numerical interface (tests/python/integration/storage).
 [[example]]
 name = "storage_harness"

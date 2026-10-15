@@ -22,7 +22,7 @@ use std::ops::Range;
 
 use crate::{Error, Result};
 
-/// How features enter the sequence (`uniserve_models.processing.FeatureLayout`).
+/// How features enter the sequence (`uniserve.processing.FeatureLayout`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeatureLayout {
     Direct,

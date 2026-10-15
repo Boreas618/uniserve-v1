@@ -27,7 +27,7 @@ const WAITING_REASON_CAPACITY: &str = "capacity";
 /// time.
 ///
 /// Interval-delta fields of `stats` are added to Prometheus counters, while
-/// point-in-time values (running and waiting requests, KV usage, active
+/// point-in-time values (running and waiting requests, cache usage, active
 /// credits) and lifetime maxima (`max_queue_wait_us`, `peak_credits`) are set
 /// on gauges. `stats` must therefore be an interval snapshot: passing a
 /// cumulative one, or the same snapshot twice, double-counts every counter.
@@ -64,9 +64,9 @@ pub fn record_scheduler_stats(
         })
         .set(stats.num_waiting_reqs);
     metrics
-        .kv_cache_usage
+        .prefix_cache_usage
         .get_or_create(&labels)
-        .set(stats.kv_cache_usage);
+        .set(stats.prefix_cache_usage);
     metrics
         .scheduler_admitted
         .get_or_create(&labels)

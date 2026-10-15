@@ -17,6 +17,27 @@ from tests.python.fixtures.distributed import (
     rendezvous,
 )
 from tests.python.fixtures.h3 import WIDE
+from uniserve import cuda_graph
+from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.diffusion import DenoisingStep, normal_noise
+from uniserve.distributed import DeviceMesh, communication_axes
+from uniserve.models import LatentInput, TextSize
+from uniserve.models import registry as models
+from uniserve.models.minimax_h3 import (
+    DenoiserInput,
+    weight_config,
+)
+from uniserve.models.minimax_h3.packing import (
+    audio_latent_frames,
+    tile_packing,
+    unpatchify_video,
+    video_latent_frames,
+)
+from uniserve.nn.attention import (
+    AttentionParallelConfig,
+    ContextParallelConfig,
+    Ulysses,
+)
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
 from uniserve_eval.types import (
     BenchmarkPoint,
@@ -24,27 +45,6 @@ from uniserve_eval.types import (
     MetricDefinition,
     TaskName,
     VideoConfig,
-)
-from uniserve_models import catalog as models
-from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
-from uniserve_models.diffusion import DenoisingStep, normal_noise
-from uniserve_models.distributed import DeviceMesh, communication_axes
-from uniserve_models.interface import graphs
-from uniserve_models.minimax_h3 import (
-    DenoiserInput,
-    weight_config,
-)
-from uniserve_models.minimax_h3.packing import (
-    audio_latent_frames,
-    tile_packing,
-    unpatchify_video,
-    video_latent_frames,
-)
-from uniserve_models.model import LatentInput, TextSize
-from uniserve_models.nn.attention import (
-    AttentionParallelConfig,
-    ContextParallelConfig,
-    Ulysses,
 )
 
 pytestmark = [
@@ -313,7 +313,7 @@ def _generate_latents(
                             value.copy_(saved[name])
 
                     restore()
-                    graph = graphs.capture(step, stream=stream)
+                    graph = cuda_graph.capture(step, stream=stream)
                     graph.replay()
                     for name, value in state.items():
                         torch.testing.assert_close(

@@ -4,9 +4,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.interface import graphs
-from uniserve_models.nn.attention import Attention, AttentionBatch, DenseInput
+from uniserve import cuda_graph
+from uniserve.bindings.context import ExecutionContext
+from uniserve.nn.attention import Attention, AttentionBatch, DenseInput
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -103,7 +103,7 @@ def test_dense_attention_preserves_heads_and_graph_inputs(
         torch.testing.assert_close(
             actual, reference(), rtol=tolerance, atol=tolerance
         )
-        graph = graphs.capture(execute, stream=stream)
+        graph = cuda_graph.capture(execute, stream=stream)
         q.mul_(0.5)
         v.add_(0.25)
         actual = graph.replay()

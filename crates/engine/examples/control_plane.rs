@@ -45,8 +45,8 @@ fn main() {
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
                 encoder: ImageIngestStep::VitEncode,
-                num_kv_tokens: None,
-                max_kv_tokens: None,
+                num_cache_tokens: None,
+                max_cache_tokens: None,
             }],
             sample_feedback_continuation: true,
         };

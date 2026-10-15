@@ -17,29 +17,29 @@ from tests.python.fixtures.model_metadata import (
     diffusion_gemma_metadata,
     read_diffusion_gemma,
 )
-from uniserve_models import bagel, diffusion_gemma, siglip
-from uniserve_models import sensenova_u1 as u1
-from uniserve_models.bagel import vae
-from uniserve_models.diffusion import NoiseScale
-from uniserve_models.media.pixels import (
+from uniserve.diffusion import NoiseScale
+from uniserve.media.pixels import (
     patch_grid_shape,
     prepare_host_image,
     prepare_tensor_image,
 )
-from uniserve_models.processing import (
+from uniserve.models import bagel, diffusion_gemma, siglip
+from uniserve.models import sensenova_u1 as u1
+from uniserve.models.bagel import vae
+from uniserve.models.sensenova_u1 import flow, vision
+from uniserve.processing import (
     ImageProcessor,
     PatchTransform,
     PixelBounds,
     StrideResize,
     TowerTransform,
 )
-from uniserve_models.sensenova_u1 import flow, vision
 
 pytestmark = pytest.mark.unit
 
 _FIXTURES = Path(__file__).parents[2] / "fixtures"
 
-# Resize cases shared with the server's KV-token prediction tests.
+# Resize cases shared with the server's cache-token prediction tests.
 _BAGEL_RESIZE_CASES = json.loads(
     (_FIXTURES / "bagel_image_resize.json").read_text()
 )["cases"]
@@ -221,7 +221,7 @@ def test_sensenova_input_images_share_a_pixel_budget(case):
         input_images=case["input_images"],
     )
 
-    # 16-pixel patches, merged 2x2 into one KV token each by the tower.
+    # 16-pixel patches, merged 2x2 into one cache token each by the tower.
     grid = (case["resized_height"] // 16, case["resized_width"] // 16)
     assert result.grid_shape == grid
     assert (
@@ -233,7 +233,7 @@ def test_sensenova_input_images_share_a_pixel_budget(case):
         )
         == grid
     )
-    assert grid[0] * grid[1] // 4 == case["kv_tokens"]
+    assert grid[0] * grid[1] // 4 == case["cache_tokens"]
 
 
 def test_sensenova_generated_images_keep_the_single_image_bound():

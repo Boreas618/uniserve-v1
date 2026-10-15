@@ -15,8 +15,8 @@ from tests.python.fixtures.vsa import (
     region_reference,
     region_tables,
 )
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.nn.attention import vsa
+from uniserve.bindings.context import ExecutionContext
+from uniserve.nn.attention import vsa
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

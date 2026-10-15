@@ -8,7 +8,7 @@
 
 use super::*;
 
-/// Physical KV unit pool exposed by a worker that executes AR work.
+/// Physical cache unit pool exposed by a worker that executes AR work.
 ///
 /// The pool is `num_units` allocation units, unit zero being the padding
 /// sentinel. Each group's logical pages draw `units_per_page` units from the
@@ -16,20 +16,20 @@ use super::*;
 /// group also places this rank's share of the model's logical cache: its
 /// layers by global id and its KV heads by offset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct KvCacheInfo {
+pub struct PrefixCacheInfo {
     /// Allocation units in the pool, including the unit-zero sentinel.
     pub num_units: u32,
     /// Physical bytes one unit occupies on this rank: every column plane of
     /// the unit plus its per-unit metadata (initialization flags and, with
     /// FP8, scales).
     pub unit_bytes: u64,
-    /// Element data type of KV tensors.
-    pub dtype: KvCacheDtype,
+    /// Element data type of cache tensors.
+    pub dtype: PrefixCacheDtype,
     /// Cache groups in table order.
-    pub groups: Vec<KvCacheGroup>,
+    pub groups: Vec<CacheGroup>,
 }
 
-impl KvCacheInfo {
+impl PrefixCacheInfo {
     /// Returns the units the scheduler may allocate: all but the sentinel.
     pub fn usable_units(&self) -> u32 {
         self.num_units.saturating_sub(1)
@@ -47,7 +47,7 @@ impl KvCacheInfo {
             .unwrap_or(0)
     }
 
-    /// Bounds the logical export of a `tokens`-long visible KV extent,
+    /// Bounds the logical export of a `tokens`-long visible cache extent,
     /// independently of the producing TP size.
     ///
     /// An export carries each group's keys and values over the group's
@@ -58,13 +58,13 @@ impl KvCacheInfo {
     /// complete scale for every head group.
     pub fn transfer_bytes(&self, tokens: u32) -> u64 {
         let width = match self.dtype {
-            KvCacheDtype::Float16 | KvCacheDtype::BFloat16 => 2,
-            KvCacheDtype::Float32 => 4,
-            KvCacheDtype::Float8E4m3Fn => 1,
+            PrefixCacheDtype::Float16 | PrefixCacheDtype::BFloat16 => 2,
+            PrefixCacheDtype::Float32 => 4,
+            PrefixCacheDtype::Float8E4m3Fn => 1,
         };
 
         // FP8 scales are FP32.
-        let scale_bytes = if self.dtype == KvCacheDtype::Float8E4m3Fn {
+        let scale_bytes = if self.dtype == PrefixCacheDtype::Float8E4m3Fn {
             4
         } else {
             0
@@ -98,7 +98,7 @@ impl KvCacheInfo {
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.num_units > 1 && self.unit_bytes > 0 && !self.groups.is_empty(),
-            "worker info declare an incomplete KV unit pool"
+            "worker info declare an incomplete cache unit pool"
         );
 
         let largest = self.max_page_tokens();
@@ -109,29 +109,29 @@ impl KvCacheInfo {
                     && largest.is_multiple_of(group.page_tokens)
                     && group.units_per_page > 0
                     && group.units_per_page < self.num_units,
-                "worker KV group page shape is invalid"
+                "worker cache group page shape is invalid"
             );
             ensure_valid!(
                 !group.layer_ids.is_empty()
                     && group.layer_ids.iter().all(|layer| layers.insert(*layer)),
-                "worker KV groups omit or repeat a layer"
+                "worker cache groups omit or repeat a layer"
             );
             ensure_valid!(
                 group.num_kv_heads > 0
                     && u64::from(group.kv_head_offset) + u64::from(group.num_kv_heads)
                         <= u64::from(group.total_kv_heads)
                     && group.head_dim > 0,
-                "worker KV group head interval exceeds its logical bounds"
+                "worker cache group head interval exceeds its logical bounds"
             );
             ensure_valid!(
-                !matches!(group.kind, KvGroupKind::SlidingWindow { sink, .. } if sink > 0),
-                "worker KV group retains sliding-window sink tokens"
+                !matches!(group.kind, CacheGroupKind::SlidingWindow { sink, .. } if sink > 0),
+                "worker cache group retains sliding-window sink tokens"
             );
         }
         Ok(())
     }
 
-    /// Combines the pools of two KV stages that one request may traverse.
+    /// Combines the pools of two cache stages that one request may traverse.
     ///
     /// Stages must agree on dtype and on every group's retention policy and
     /// page shape; their rank-local layer ids and head placement may differ.
@@ -147,7 +147,7 @@ impl KvCacheInfo {
                     .iter()
                     .zip(&other.groups)
                     .all(|(left, right)| left.same_page_shape(right)),
-            "KV stages expose incompatible cache layouts"
+            "cache stages expose incompatible cache layouts"
         );
 
         let groups = self
@@ -163,7 +163,7 @@ impl KvCacheInfo {
                         .filter(|layer| !left.layer_ids.contains(layer)),
                 );
                 layer_ids.sort_unstable();
-                KvCacheGroup {
+                CacheGroup {
                     layer_ids,
                     ..left.clone()
                 }
@@ -433,15 +433,15 @@ pub struct WorkerInfo {
     /// `max_batch_calls` alone, as when they run eagerly.
     pub max_prefill_calls: u32,
     /// Maximum calls in one decode run: the rows the rank's largest captured
-    /// decode graph holds, fewer when its KV pool cannot hold a page of
+    /// decode graph holds, fewer when its cache pool cannot hold a page of
     /// every cache group for more rows. A decode run no captured graph
     /// holds fails, so the scheduler never forms one. Zero leaves decode
     /// runs bounded by `max_batch_calls` alone, as when they run eagerly.
     pub max_decode_calls: u32,
     /// Number of resident request slots.
     pub request_slots: u32,
-    /// Paged KV geometry when autoregressive work is supported.
-    pub kv_cache: Option<KvCacheInfo>,
+    /// Paged cache geometry when autoregressive work is supported.
+    pub prefix_cache: Option<PrefixCacheInfo>,
     /// Model-defined units stored in one latent page.
     pub latent_page_units: u32,
     /// Physical latent pages including the reserved sentinel page, which
@@ -466,10 +466,12 @@ impl WorkerInfo {
         self.num_inference_steps
     }
 
-    /// Returns the advertised allocatable KV units, or zero when KV is
+    /// Returns the advertised allocatable cache units, or zero when prefix cache is
     /// unsupported.
-    pub fn kv_usable_units(&self) -> u32 {
-        self.kv_cache.as_ref().map_or(0, KvCacheInfo::usable_units)
+    pub fn cache_usable_units(&self) -> u32 {
+        self.prefix_cache
+            .as_ref()
+            .map_or(0, PrefixCacheInfo::usable_units)
     }
 
     /// Returns total latent capacity in model-defined units.
@@ -478,9 +480,9 @@ impl WorkerInfo {
             .saturating_mul(u64::from(self.latent_page_units))
     }
 
-    /// Returns whether the worker advertises paged KV capacity.
-    pub fn uses_kv(&self) -> bool {
-        self.kv_cache.is_some()
+    /// Returns whether the worker advertises paged cache capacity.
+    pub fn uses_cache(&self) -> bool {
+        self.prefix_cache.is_some()
     }
 
     /// Validates worker identity, capacity, call, and rank invariants.
@@ -545,12 +547,12 @@ impl WorkerInfo {
             );
         }
 
-        // A collective-only participant owns no request components or KV.
+        // A collective-only participant owns no request components or prefix cache.
         // It remains addressable for progress, failure and shutdown.
         ensure_valid!(
             !self.supported_calls.is_empty()
                 || (self.components.is_empty()
-                    && self.kv_cache.is_none()
+                    && self.prefix_cache.is_none()
                     && self.latent_pages == 0
                     && self.media_components.is_empty()),
             "a worker without call kinds must own no request computation"
@@ -601,17 +603,17 @@ impl WorkerInfo {
         );
 
         // Advertised call families require their corresponding pools; every
-        // token-model forward reads or extends a request's KV cache.
-        let requires_kv = self
+        // token-model forward reads or extends a request's prefix cache.
+        let requires_cache = self
             .supported_calls
             .iter()
             .any(|variant| matches!(variant, CallKind::Forward(_)));
         ensure_valid!(
-            !requires_kv || self.kv_cache.is_some(),
-            "worker advertises token work without a KV cache"
+            !requires_cache || self.prefix_cache.is_some(),
+            "worker advertises token work without a prefix cache"
         );
-        if let Some(kv_cache) = &self.kv_cache {
-            kv_cache.validate()?;
+        if let Some(prefix_cache) = &self.prefix_cache {
+            prefix_cache.validate()?;
         }
         // Latent capacity is either absent or at least one usable page beyond
         // the sentinel.
@@ -666,11 +668,11 @@ impl Default for WorkerInfo {
             // One full-attention group of 28 layers with 8 BF16 heads of 128:
             // each 64-token page is one unit of 28 columns of 128 KiB K and V
             // planes plus one initialization flag per plane.
-            kv_cache: Some(KvCacheInfo {
+            prefix_cache: Some(PrefixCacheInfo {
                 num_units: 4096,
                 unit_bytes: 28 * 2 * (64 * 8 * 128 * 2 + 1),
-                dtype: KvCacheDtype::BFloat16,
-                groups: vec![KvCacheGroup {
+                dtype: PrefixCacheDtype::BFloat16,
+                groups: vec![CacheGroup {
                     kind: Default::default(),
                     page_tokens: 64,
                     units_per_page: 1,

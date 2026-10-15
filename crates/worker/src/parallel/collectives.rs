@@ -14,7 +14,7 @@ use crate::model::interface::Interface;
 use crate::{CUDAStream, Error, Result};
 
 /// The library class over one communicator's collective functions.
-const NATIVE_COLLECTIVES: &str = "uniserve_models.interface.distributed.NativeCollectives";
+const NATIVE_COLLECTIVES: &str = "uniserve.interface.distributed.NativeCollectives";
 
 /// An NCCL communicator bound to one computation stream.
 ///
@@ -448,7 +448,7 @@ struct GroupComm {
 /// numerical calls use, and their TVM-FFI collective functions.
 ///
 /// Communicator ranks follow ascending process-world rank, as the backend
-/// order of `uniserve_models.distributed.Communicator` assumes; collectives
+/// order of `uniserve.distributed.Communicator` assumes; collectives
 /// enqueue on the binding's stream (asynchronous ones on its transfer fork),
 /// so they are ordered with the binding's computation and captured with it.
 pub struct StreamCollectives {

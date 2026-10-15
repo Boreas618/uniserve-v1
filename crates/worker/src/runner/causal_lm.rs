@@ -76,7 +76,7 @@ use crate::request::decode_state::DecodeState;
 use crate::sampling::SamplingPath;
 use crate::sampling::plan::{SamplingGroup, padded};
 use crate::storage::memory::StorageView;
-use crate::storage::{AttentionRow, BlockTables, KVCacheManager};
+use crate::storage::{AttentionRow, BlockTables, PrefixCacheManager};
 use crate::stream::{Fill, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
@@ -85,7 +85,7 @@ use runners::{COMPLETION_FIELDS, StepParts};
 use input_buffers::ROW_SECTIONS;
 
 /// The commit mode of a row that only sets its slot's cache length
-/// (`uniserve_models.sampling.state.CACHE`).
+/// (`uniserve.sampling.state.CACHE`).
 pub(crate) const COMMIT_CACHE: i64 = 3;
 
 /// A numerical block table's page layout.
@@ -161,7 +161,7 @@ pub(crate) struct StepRequest<'a> {
 /// The storage a step borrows.
 pub(crate) struct StepContext<'a> {
     pub(crate) tables: &'a BlockTables,
-    pub(crate) cache: &'a mut KVCacheManager<Arc<Retirement>>,
+    pub(crate) cache: &'a mut PrefixCacheManager<Arc<Retirement>>,
     pub(crate) state: &'a DecodeState,
 }
 

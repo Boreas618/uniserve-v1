@@ -13,9 +13,9 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
-from uniserve_models import loading
-from uniserve_models.minimax_h3 import processing, weight_config
-from uniserve_models.minimax_h3.generation import generate
+from uniserve import loading
+from uniserve.models.minimax_h3 import processing, weight_config
+from uniserve.models.minimax_h3.generation import generate
 
 root = Path("/path/to/MiniMax-H3")
 config = loading.read_config(

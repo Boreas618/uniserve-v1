@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from uniserve_models.quantization import Quantizer, ScaleLayout
+from uniserve.quantization import Quantizer, ScaleLayout
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -65,11 +65,11 @@ def test_block_encoding_and_scale_repacking_preserve_native_values(format):
 @pytest.mark.parametrize("format", ["fp8", "mxfp8", "nvfp4"])
 @torch.inference_mode()
 def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
-    from uniserve_models.bindings.context import ExecutionContext
-    from uniserve_models.interface import graphs
-    from uniserve_models.model import TextSize
-    from uniserve_models.nn import Linear
-    from uniserve_models.nn.functional import linear
+    from uniserve import cuda_graph
+    from uniserve.bindings.context import ExecutionContext
+    from uniserve.models import TextSize
+    from uniserve.nn import Linear
+    from uniserve.nn.functional import linear
 
     x = torch.full((128, 256), 2.0, dtype=torch.bfloat16, device="cuda:0")
     weight = torch.ones((128, 256), dtype=torch.bfloat16, device="cuda:0")
@@ -91,7 +91,7 @@ def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
         context.prepare(TextSize(160, 1))
         assert layer(x, out=out) is out
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
-        graph = graphs.capture(lambda: layer(x, out=out), stream=stream)
+        graph = cuda_graph.capture(lambda: layer(x, out=out), stream=stream)
         x.mul_(2)
         graph.replay()
         encoded = converter.quantize(x)
@@ -110,10 +110,10 @@ def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
 def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
     format, branch_width
 ):
-    from uniserve_models.bindings.context import ExecutionContext
-    from uniserve_models.interface import graphs
-    from uniserve_models.model import TextSize
-    from uniserve_models.nn import MergedColumnParallelLinear
+    from uniserve import cuda_graph
+    from uniserve.bindings.context import ExecutionContext
+    from uniserve.models import TextSize
+    from uniserve.nn import MergedColumnParallelLinear
 
     device = torch.device("cuda:0")
     generator = torch.Generator(device=device).manual_seed(718)
@@ -201,7 +201,9 @@ def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
             for name, branch in layer.projections.items()
         }
         layer(source, out=out)
-        graph = graphs.capture(lambda: layer(source, out=out), stream=stream)
+        graph = cuda_graph.capture(
+            lambda: layer(source, out=out), stream=stream
+        )
         source.mul_(2)
         for branch in layer.projections.values():
             if quantizer is None:

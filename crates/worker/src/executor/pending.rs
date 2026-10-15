@@ -60,8 +60,8 @@ impl PendingOutput {
         let progress = RequestProgress {
             logical_position: u64::from(coordinates.logical_position),
             flow_step: u64::from(coordinates.flow_step),
-            kv_visible_len: u64::from(coordinates.kv_visible_len),
-            kv_computed_len: u64::from(coordinates.kv_computed_len),
+            cache_visible_len: u64::from(coordinates.cache_visible_len),
+            cache_computed_len: u64::from(coordinates.cache_computed_len),
             ..previous
         };
         let mut output = request_output(call.request_key, call.call_id, call.code, progress)?;
@@ -179,11 +179,11 @@ impl PendingOutput {
         }
     }
 
-    /// Ordinary forwards and imported KV expose their complete written extent.
+    /// Ordinary forwards and imported cache expose their complete written extent.
     /// Speculative verification retains its distinct initialized extent.
     pub fn set_cache_length(&mut self, length: u64) {
-        self.progress.kv_visible_len = length;
-        self.progress.kv_computed_len = length;
+        self.progress.cache_visible_len = length;
+        self.progress.cache_computed_len = length;
     }
 
     /// Mirror a validated physical trajectory commit in the call's progress.
@@ -196,7 +196,7 @@ impl PendingOutput {
         };
     }
 
-    /// Verification initializes KV for the full draft. Acceptance later makes
+    /// Verification initializes the prefix cache for the full draft. Acceptance later makes
     /// only its selected prefix visible, starting from these base coordinates.
     pub fn set_speculation(
         &mut self,
@@ -205,8 +205,8 @@ impl PendingOutput {
         visible: u64,
         initialized: u64,
     ) {
-        self.progress.kv_visible_len = visible;
-        self.progress.kv_computed_len = initialized;
+        self.progress.cache_visible_len = visible;
+        self.progress.cache_computed_len = initialized;
         self.speculation = Some(Speculation {
             draft_tokens,
             terminal_prefix,
@@ -224,10 +224,10 @@ impl PendingOutput {
             ));
         }
 
-        if let Some(output) = &self.output.kv_output {
-            if Some(output.source) != call.kv_output {
+        if let Some(output) = &self.output.cache_output {
+            if Some(output.source) != call.cache_output {
                 return Err(Error::Invalid(
-                    "KV export differs from its declared output".into(),
+                    "cache export differs from its declared output".into(),
                 ));
             }
 
@@ -239,12 +239,12 @@ impl PendingOutput {
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             if bytes > call.bounds.max_transfer_bytes {
                 return Err(Error::Invalid(
-                    "KV export exceeds its transfer-byte bound".into(),
+                    "cache export exceeds its transfer-byte bound".into(),
                 ));
             }
             if output.encoded_size_bound() > MAX_TRANSFER_HANDLE_BYTES {
                 return Err(Error::Invalid(
-                    "KV transfer exceeds its descriptor byte bound".into(),
+                    "cache transfer exceeds its descriptor byte bound".into(),
                 ));
             }
         }
@@ -269,7 +269,7 @@ impl PendingOutput {
             self.output.committed_tokens.clear();
             self.output.product_generations.clear();
             self.output.finish_flags = Default::default();
-            self.output.kv_output = None;
+            self.output.cache_output = None;
         }
         if self.output.status == CallStatus::Predicated {
             self.output.error_code = None;
@@ -395,15 +395,17 @@ impl PendingOutput {
         }
 
         let base = speculation.base;
-        let visible = base.kv_visible_len + tokens.len() as u64;
-        if self.progress.kv_computed_len != base.kv_computed_len || visible > base.kv_computed_len {
+        let visible = base.cache_visible_len + tokens.len() as u64;
+        if self.progress.cache_computed_len != base.cache_computed_len
+            || visible > base.cache_computed_len
+        {
             return Err(Error::State(
-                "speculative acceptance exceeds initialized KV state",
+                "speculative acceptance exceeds initialized cache state",
             ));
         }
         self.progress.logical_position = base.logical_position + tokens.len() as u64;
         self.progress.rng_counter = base.rng_counter + tokens.len() as u64;
-        self.progress.kv_visible_len = visible;
+        self.progress.cache_visible_len = visible;
         self.output.committed_tokens = tokens;
         Ok(())
     }
@@ -425,8 +427,8 @@ pub fn request_output(
         error_code: None,
         timing_counters: Default::default(),
         position: 0,
-        kv_visible_len: 0,
-        kv_computed_len: 0,
+        cache_visible_len: 0,
+        cache_computed_len: 0,
         num_completed_steps: 0,
         committed_tokens: Vec::new(),
         sampled_logprob: None,
@@ -435,7 +437,7 @@ pub fn request_output(
         candidate_logprobs: Vec::new(),
         finish_flags: Default::default(),
         media_output: None,
-        kv_output: None,
+        cache_output: None,
     };
     set_progress(&mut output, progress)?;
     Ok(output)
@@ -446,8 +448,8 @@ fn set_progress(output: &mut RequestOutput, progress: RequestProgress) -> Result
         u32::try_from(value).map_err(|_| Error::State("request coordinate exceeds its wire range"))
     };
     output.position = narrow(progress.logical_position)?;
-    output.kv_visible_len = narrow(progress.kv_visible_len)?;
-    output.kv_computed_len = narrow(progress.kv_computed_len)?;
+    output.cache_visible_len = narrow(progress.cache_visible_len)?;
+    output.cache_computed_len = narrow(progress.cache_computed_len)?;
     output.num_completed_steps = narrow(progress.flow_step)?;
     Ok(())
 }

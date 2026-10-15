@@ -15,7 +15,7 @@ use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
 use crate::runner::causal_lm::warmup::with_scratch;
 use crate::runner::component::Component;
-use crate::storage::{ImageLatents, KVCache, UnitColumn};
+use crate::storage::{ImageLatents, PrefixCache, UnitColumn};
 use crate::{Error, Result};
 
 /// Prefix tokens of each scratch slot a captured denoising step reads; host
@@ -47,7 +47,7 @@ pub(crate) struct DenoiserRunners {
     /// graphs are off.
     flow: Vec<FlowShape>,
     flow_pools: Vec<Arc<GraphPool<Handle>>>,
-    /// Resets newly assigned KV units on the image denoiser's stream.
+    /// Resets newly assigned cache units on the image denoiser's stream.
     pub(crate) units: Option<UnitColumn>,
 }
 
@@ -69,21 +69,23 @@ impl DenoiserRunners {
         }
     }
 
-    /// Capture the image denoiser's configured steps over scratch KV of
-    /// `kv`, with their samples in the step workspace of `latents`.
+    /// Capture the image denoiser's configured steps over scratch prefix cache of
+    /// `prefix_cache`, with their samples in the step workspace of `latents`.
     pub(crate) fn capture_flow(
         &mut self,
         latents: Option<&ImageLatents>,
-        kv: Option<&mut KVCache>,
+        prefix_cache: Option<&mut PrefixCache>,
     ) -> Result<()> {
-        let (Some(kv), Some(latents)) = (kv.filter(|_| !self.flow_pools.is_empty()), latents)
-        else {
+        let (Some(prefix_cache), Some(latents)) = (
+            prefix_cache.filter(|_| !self.flow_pools.is_empty()),
+            latents,
+        ) else {
             return Ok(());
         };
         let pools = self.flow_pools.clone();
         let shapes = self.flow.clone();
         for shape in &shapes {
-            self.capture_step(shape, &pools, latents, kv)?;
+            self.capture_step(shape, &pools, latents, prefix_cache)?;
         }
         if let Some((_, diffusion)) = &self.image {
             if let Some(stream) = diffusion.stream() {
@@ -107,7 +109,7 @@ impl DenoiserRunners {
         shape: &FlowShape,
         pools: &[Arc<GraphPool<Handle>>],
         latents: &ImageLatents,
-        kv: &mut KVCache,
+        prefix_cache: &mut PrefixCache,
     ) -> Result<()> {
         let page_units = latents.pool.page_units() as u32;
         let workspace = latents.workspace()?.clone();
@@ -138,8 +140,8 @@ impl DenoiserRunners {
             }
         }
         let lengths = vec![prefix; shape.images];
-        with_scratch(kv, &lengths, stream.as_ref(), |kv| {
-            diffusion.capture(&rows, kv.tables(), pools, &mut || Ok(()))
+        with_scratch(prefix_cache, &lengths, stream.as_ref(), |prefix_cache| {
+            diffusion.capture(&rows, prefix_cache.tables(), pools, &mut || Ok(()))
         })
     }
 

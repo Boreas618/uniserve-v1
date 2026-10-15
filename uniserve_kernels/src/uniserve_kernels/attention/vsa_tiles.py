@@ -5,7 +5,7 @@ attention inputs, pool fixed-size 64-row token tiles into per-tile means,
 normalize tile-to-tile scores, write each query tile's selected key-tile list
 (the block map), and combine attended values with learned compression tokens.
 Composition can write one local result or route rank-local heads directly
-into exchange shards. The VSA layer (``uniserve_models.nn.attention.vsa``) calls
+into exchange shards. The VSA layer (``uniserve.nn.attention.vsa``) calls
 the pooling, block-map, softmax and composition entry points; the block map
 it writes is read by the runtime VSA providers.
 
