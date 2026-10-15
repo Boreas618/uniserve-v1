@@ -292,19 +292,77 @@ def prepare_tensor_image(
     return PreparedImage(pixels, grid_shape, *canvas)
 
 
+def image_size(encoded: str | bytes) -> tuple[int, int]:
+    """Return the ``(height, width)`` of a base64 image payload.
+
+    Read from the image's header without decoding its pixels; decoding
+    (:func:`prepare_host_image`) yields an image of these dimensions.
+
+    Raises:
+        ValueError: The payload is not a valid encoded image.
+    """
+    try:
+        with Image.open(io.BytesIO(_payload_bytes(encoded))) as image:
+            width, height = image.size
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "inline image payload is not a valid encoded image"
+        ) from error
+    return int(height), int(width)
+
+
+def prepared_shape(
+    processor: ImageProcessor,
+    tower: Tower,
+    height: int,
+    width: int,
+    input_images: int | None,
+) -> tuple[tuple[int, int], tuple[int, int] | None, tuple[int, ...]]:
+    """Return what preparing an image of ``height`` x ``width`` produces.
+
+    The canvas (height, width), the (rows, columns) patch grid of a
+    ``PatchTransform`` tower (None otherwise) and the shape of
+    ``PreparedImage.pixels``, as :func:`prepare_host_image` (with
+    ``input_images``) and :func:`prepare_tensor_image` (with None) prepare
+    the image.
+
+    Raises:
+        ValueError: The model declares no transform for ``tower``, or its
+            resize policy rejects the dimensions.
+    """
+    transform, canvas, size = _image_plan(
+        processor, tower, height, width, input_images
+    )
+    if isinstance(transform, PatchTransform):
+        patch = transform.patch_size
+        grid = (size[0] // patch, size[1] // patch)
+        return canvas, grid, (grid[0] * grid[1], 3 * patch * patch)
+    return canvas, None, (3, *size)
+
+
+def _payload_bytes(encoded: str | bytes) -> bytes:
+    """The encoded image bytes of a base64 payload."""
+    if not isinstance(encoded, (str, bytes)) or not encoded:
+        raise ValueError("inline image payload must be non-empty base64")
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError(
+            "inline image payload is not a valid encoded image"
+        ) from error
+
+
 def _decode_rgb(encoded: str | bytes, alpha: str) -> Image.Image:
     """Decode a base64 image payload and convert it to RGB.
 
     ``alpha`` is the processor's ``ImageProcessor.alpha`` policy for images
     with transparency.
     """
-    if not isinstance(encoded, (str, bytes)) or not encoded:
-        raise ValueError("inline image payload must be non-empty base64")
+    raw = _payload_bytes(encoded)
     try:
-        raw = base64.b64decode(encoded, validate=True)
         image = Image.open(io.BytesIO(raw))
         image.load()
-    except (binascii.Error, OSError, ValueError) as error:
+    except (OSError, ValueError) as error:
         raise ValueError(
             "inline image payload is not a valid encoded image"
         ) from error

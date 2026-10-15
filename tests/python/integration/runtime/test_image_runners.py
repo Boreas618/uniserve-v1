@@ -88,7 +88,8 @@ def test_latent_encodings_match_the_autoencoder(stub):
     latents, (_, eager) = _encode(
         stub, "model", "", "latent_encoder", "vae", payloads
     )
-    assert eager == 1
+    # One numerical call per latent image.
+    assert eager == 2
     for payload, actual in zip(payloads, latents, strict=True):
         host = prepare_host_image(
             model.image_processor, "vae", payload, input_images=2, pin=False

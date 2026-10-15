@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::ffi::{DType, Function, Handle, Interpreter, integers};
 use crate::lane::{Completion, Job};
 use crate::request::diffusion::{BranchSource, Prefix};
+use crate::runner::encoder::ImagePreparation;
 use crate::runner::methods::{Argument, MethodCall};
 use crate::runner::vision::{FeatureInjection, FeatureLayout, PositionLayout};
 use crate::{Error, Result};
@@ -286,8 +287,7 @@ impl ImageModel {
 #[derive(Clone)]
 pub(crate) struct ImagePolicy {
     loaded: Handle,
-    prepare_input: Function,
-    image_facts: Function,
+    preparation: ImagePreparation,
     patch_grid: Function,
     guidance_prefix: Function,
     /// The patch grid of every image size asked so far
@@ -303,27 +303,18 @@ pub(crate) type GridKey = (u32, u32, u32);
 impl ImagePolicy {
     pub(crate) fn new(loaded: Handle) -> Result<Self> {
         Ok(Self {
+            preparation: ImagePreparation::new(loaded.clone())?,
             loaded,
-            prepare_input: Interpreter::import(&format!("{ENCODER}.prepare_image"))?,
-            image_facts: Interpreter::import(&format!("{ENCODER}.image_facts"))?,
             patch_grid: Interpreter::import(&format!("{ENCODER}.patch_grid"))?,
             guidance_prefix: Interpreter::import(&format!("{DENOISER}.guidance_prefix"))?,
             grids: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    pub(crate) fn loaded(&self) -> &Handle {
-        &self.loaded
-    }
-
-    /// `EncoderRunner.prepare_image` (called from host lanes).
-    pub(crate) fn prepare_input(&self) -> &Function {
-        &self.prepare_input
-    }
-
-    /// `EncoderRunner.image_facts` (called with each prepared image).
-    pub(crate) fn image_facts(&self) -> &Function {
-        &self.image_facts
+    /// The policy's image preparation (called from host lanes, and for
+    /// the facts of resident images).
+    pub(crate) fn preparation(&self) -> &ImagePreparation {
+        &self.preparation
     }
 
     /// The vision tower's patch grid of an image, when it was asked

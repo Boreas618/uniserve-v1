@@ -27,8 +27,6 @@ pub(crate) enum Argument {
     Texts(Vec<String>),
     Tensor(StorageView),
     Handle(Handle),
-    /// A list of objects the library holds.
-    Handles(Vec<Handle>),
     None,
 }
 
@@ -98,9 +96,6 @@ impl MethodCall {
                     Argument::Text(text) => Any::from(tvm_ffi::String::from(text.as_str())),
                     Argument::Texts(texts) => Any::from(crate::ffi::strings(&texts)),
                     Argument::Handle(handle) => handle.to_any(),
-                    Argument::Handles(handles) => {
-                        Any::from(crate::ffi::list(handles.iter().map(Handle::to_any)))
-                    }
                     Argument::None => Any::default(),
                 })
             })

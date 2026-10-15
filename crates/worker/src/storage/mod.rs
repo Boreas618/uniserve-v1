@@ -6,6 +6,7 @@ mod host_buffers;
 pub(crate) mod latent;
 pub mod memory;
 mod output;
+mod pinned_pool;
 mod prefix_cache;
 pub(crate) mod products;
 mod request_slots;
@@ -15,6 +16,7 @@ pub use host_buffers::HostBuffers;
 pub(crate) use latent::{LatentCache, Scratch};
 pub use latent::{LatentExport, LatentImport, LatentPool, LatentStorage, LatentUpdate};
 pub use output::{LogprobLayout, OutputBuffer, OutputLease, OutputPool, OutputStorage};
+pub use pinned_pool::{PinnedBlock, PinnedPool};
 pub use prefix_cache::block_tables::{
     AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
     TablePages, table_pages,

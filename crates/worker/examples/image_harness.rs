@@ -23,8 +23,8 @@ use uniserve_worker::config::Device;
 use uniserve_worker::ffi::{Backing, DType, Handle, Interpreter};
 use uniserve_worker::storage::memory::{Memory, StorageView};
 use uniserve_worker::{
-    DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool, ImageSetup,
-    Result, Tower, prepare_input,
+    DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool,
+    ImagePreparation, ImageSetup, Result, Tower,
 };
 
 /// Bytes of the host product arena; every product of these cases fits.
@@ -146,19 +146,19 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         } else {
             Tower::Vae
         };
-        let function = Interpreter::import("uniserve.runner.encoder.EncoderRunner.prepare_image")?;
-        let facts = Interpreter::import("uniserve.runner.encoder.EncoderRunner.image_facts")?;
+        let preparation = ImagePreparation::new(loaded.clone())?;
+        let dtype = runner
+            .pixel_dtype()
+            .ok_or_else(|| uniserve_worker::Error::Invalid("the harness encodes images".into()))?;
         let images = payloads
             .iter()
             .map(|payload| {
-                prepare_input(
-                    &function,
-                    &facts,
-                    &loaded,
+                preparation.prepare(
                     tower,
                     payload.as_str(),
                     payloads.len() as u32,
-                    stream.is_some(),
+                    runner.pinned(),
+                    dtype,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -180,7 +180,10 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
                 .collect::<Result<Vec<_>>>()?;
             next += order.len();
             let batch: Vec<_> = order.iter().map(|&index| &images[index]).collect();
-            let encoded = runner.encode(&batch, &outputs)?;
+            // A sampled posterior draws each image's noise at seed 0 and the
+            // image's index.
+            let draws: Vec<_> = order.iter().map(|&index| (0, index as u64)).collect();
+            let encoded = runner.encode(&batch, &draws, &outputs)?;
             for (shape, output) in encoded.shapes.iter().zip(&outputs) {
                 results.push(Any::from(view(output, shape)?));
             }

@@ -48,17 +48,46 @@ class PatchAutoencoder(nn.Module):
         self.latent_dtype, self.downsample = latent_dtype, downsample
         self.scale, self.shift = scale, shift
 
+    @property
+    def samples_posterior(self) -> bool:
+        """Whether encoding samples the posterior rather than taking its
+        mean, and so takes noise.
+        """  # noqa: D205
+        return bool(self.posterior.sample)
+
+    def posterior_shape(self, height: int, width: int) -> tuple[int, int, int]:
+        """The ``(channels, height, width)`` posterior of one image of
+        ``height`` x ``width`` pixels.
+
+        One latent patch spans ``downsample`` pixels and ``patch_size``
+        posterior positions on each axis.
+        """  # noqa: D205
+        stride = self.downsample // self.patch_size
+        return (self.latent_channels, height // stride, width // stride)
+
     def encode(
-        self, pixels: torch.Tensor, *, generator: torch.Generator | None = None
+        self,
+        pixels: torch.Tensor,
+        *,
+        noise: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        """Sample NCHW pixels into normalized latent patch rows."""
+        """Sample NCHW pixels into normalized latent patch rows.
+
+        A sampled posterior takes standard normal ``noise`` of shape
+        ``[N, *posterior_shape(height, width)]`` in any floating dtype (it
+        is converted to the moments' dtype), or draws from ``generator``.
+        """
         if pixels.ndim != 4:
             raise ValueError("latent encoding requires NCHW pixels")
 
         dtype = next(self.encoder.parameters()).dtype
         moments = self.encoder(pixels.to(dtype))
+        if noise is not None:
+            noise = noise.to(moments.dtype)
         latents = self.scale * (
-            self.posterior(moments, generator=generator) - self.shift
+            self.posterior(moments, generator=generator, noise=noise)
+            - self.shift
         )
 
         # Trim to complete latent patches before serialization.
