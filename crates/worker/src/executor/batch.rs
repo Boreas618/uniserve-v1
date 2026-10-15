@@ -198,6 +198,11 @@ impl<F: Default> Opening<F> {
 }
 
 impl<F> Opening<F> {
+    /// The calls' states.
+    pub(crate) fn calls(&self) -> &[CallState<F>] {
+        &self.calls
+    }
+
     /// The calls' states, for a capability that sets what they contribute
     /// to its forward.
     pub(crate) fn calls_mut(&mut self) -> &mut [CallState<F>] {

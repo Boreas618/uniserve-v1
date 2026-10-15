@@ -27,6 +27,7 @@ use crate::ffi::Device;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};
 use crate::runner::denoiser::image::ConditionRow;
+use crate::runner::denoiser::image_model::GridKey;
 use crate::runner::denoiser::image_model::ROPE_ADVANCE;
 use crate::runner::vision::{BlockPositions, PositionLayout};
 use crate::storage::memory::StorageView;
@@ -204,20 +205,22 @@ fn vision_row(
             "vision features must have shape [tokens, hidden]".into(),
         ));
     };
-    // FIXME: a call of the library made while the batch is recorded: the
-    // control thread waits for the Python thread here. The grid of an
-    // image's size is a fact of the model, to be read where the image's
-    // features are produced and carried with them. It belongs to the
-    // feature product's metadata, a message type that changes with the
-    // channel's integration, so the call stays until then.
-    let grid = image
-        .policy()
-        .patch_grid(
-            feature.height,
-            feature.width,
-            (!close_image).then_some(sources.input_images),
-        )
-        .ok();
+    // Spatial positions place the features on the image's patch grid, a
+    // fact of the model asked when the batch's inputs were admitted.
+    let grid = match injection.positions {
+        PositionLayout::TemporalSpatial => {
+            let key = grid_key(
+                feature.height,
+                feature.width,
+                close_image,
+                sources.input_images,
+            );
+            Some(image.policy().grid(key).ok_or_else(|| {
+                Error::Invariant("an image's patch grid was not asked at admission".into())
+            })?)
+        }
+        PositionLayout::Temporal | PositionLayout::Sequential => None,
+    };
     let block = injection.block(tokens as usize, position, close_image, grid)?;
     let count = block.len();
     let positions = match block.positions {
@@ -477,4 +480,11 @@ pub(super) fn visual(
             latent: None,
         },
     ))
+}
+
+/// The patch grid key of an image of `height` x `width`: a generated image
+/// (`close_image`) keeps the single-image pixel bound, a request's input
+/// image counts the request's `input_images`.
+pub(crate) fn grid_key(height: u32, width: u32, close_image: bool, input_images: u32) -> GridKey {
+    (height, width, if close_image { 0 } else { input_images })
 }
