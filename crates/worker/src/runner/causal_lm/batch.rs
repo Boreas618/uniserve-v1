@@ -3,7 +3,7 @@
 //! [`Opening::open`] binds every call's pending output and records the
 //! reads of the batch's host-gated predicates. [`Batch::lease`] leases the
 //! batch's output storage. [`Batch::reserve`] installs the active calls'
-//! block tables, resets newly assigned units, retains the KV extents the
+//! block tables, resets newly assigned units, retains the cache extents the
 //! batch reads and writes until its device work retires, binds its scalar
 //! products and leases its relayed predicates. [`Batch::discard`] retires
 //! all of it after a failure before the commit point.
@@ -118,7 +118,7 @@ pub(super) struct Batch<'a> {
     pub(super) buffer: OutputLease,
     pub(super) writes: Vec<ProductBuffer>,
     pub(super) reads: Vec<Arc<ProductRead>>,
-    /// Signals the physical end of the batch's KV accesses.
+    /// Signals the physical end of the batch's cache accesses.
     pub(super) retirement: Arc<Retirement>,
     pub(super) started: Instant,
     /// The batch's next job on its lane.
@@ -357,16 +357,16 @@ impl<'a> Batch<'a> {
         )
     }
 
-    /// Install tables, reset units, retain KV extents, bind products and
+    /// Install tables, reset units, retain cache extents, bind products and
     /// lease relayed predicates of the active calls.
     pub(super) fn reserve(&mut self) -> Result<()> {
         let stream = self.job.on(self.stream.as_ref());
         let plan = self.plan;
-        let kv = self
+        let prefix_cache = self
             .storage
-            .kv
+            .prefix_cache
             .as_mut()
-            .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
+            .ok_or_else(|| Error::Unsupported("text calls require a prefix cache".into()))?;
 
         // Tables and new units precede any of the batch's writes.
         let active: HashSet<u32> = self
@@ -381,7 +381,7 @@ impl<'a> Batch<'a> {
             .filter(|table| active.contains(&table.request_pool_idx))
             .cloned()
             .collect();
-        kv.install(&assignments, stream)?;
+        prefix_cache.install(&assignments, stream)?;
         let units: Vec<u32> = plan
             .new_cache_units
             .iter()
@@ -390,7 +390,7 @@ impl<'a> Batch<'a> {
             .collect();
         if !units.is_empty() {
             let lane = self.runtime.groups[self.group][0];
-            kv.recycle(&units, &self.runtime.columns[lane], stream)?;
+            prefix_cache.recycle(&units, &self.runtime.columns[lane], stream)?;
         }
 
         // Each active call has one forward row on its own slot; a context
@@ -427,7 +427,7 @@ impl<'a> Batch<'a> {
             }
             let declared =
                 u64::from(forward.seq_lens[first].saturating_sub(forward.query_lens[first]));
-            let visible = state.output.progress.kv_visible_len;
+            let visible = state.output.progress.cache_visible_len;
             let relayed = call
                 .predicate
                 .as_ref()
@@ -440,13 +440,13 @@ impl<'a> Batch<'a> {
             for &row in call_rows {
                 // Readers retain their prefix, writers also their query
                 // tokens; a windowed group starts at its first resident page.
-                let length = u64::from(if forward.write_kv[row] {
+                let length = u64::from(if forward.write_cache[row] {
                     forward.seq_lens[row]
                 } else {
                     forward.seq_lens[row] - forward.query_lens[row]
                 });
                 let mut spans = Vec::new();
-                let tables = kv.tables();
+                let tables = prefix_cache.tables();
                 for group in 0..tables.groups().len() as u32 {
                     let table = tables.table(state.slot as u32, group)?;
                     let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
@@ -454,7 +454,7 @@ impl<'a> Batch<'a> {
                         spans.extend(table.spans(start, length - start)?);
                     }
                 }
-                kv.manager().retain_execution(
+                prefix_cache.manager().retain_execution(
                     call.request_key,
                     &spans,
                     Arc::clone(&self.retirement),
@@ -575,7 +575,7 @@ impl<'a> Batch<'a> {
         Ok(())
     }
 
-    /// Seal the lease on the batch's stream and retire its KV accesses and
+    /// Seal the lease on the batch's stream and retire its cache accesses and
     /// output storage once the fences complete.
     pub(super) fn seal(&self) -> Result<()> {
         seal(

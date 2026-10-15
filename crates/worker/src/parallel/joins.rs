@@ -20,12 +20,12 @@ use crate::ffi::{DeferredCall, Function, Handle};
 use crate::profiling::range;
 use crate::{Error, Result};
 
-/// The shared graph interface (`uniserve_models.interface.graphs`).
+/// The shared graph interface (`uniserve.cuda_graph`).
 #[derive(Clone)]
 pub struct GraphFunctions {
-    /// `graphs.begin_capture(pool, stream, device) -> capture`.
+    /// `graphs.capture_begin(pool, stream, device) -> capture`.
     pub begin: Function,
-    /// `graphs.end_capture(capture) -> [graph, executables]`.
+    /// `graphs.capture_end(capture) -> [graph, executables]`.
     pub end: Function,
     /// `graphs.release(graph)`.
     pub release: Function,
@@ -34,8 +34,8 @@ pub struct GraphFunctions {
 impl GraphFunctions {
     pub fn from_interface(interface: &crate::model::interface::Interface) -> Result<Self> {
         Ok(Self {
-            begin: interface.function("graphs.begin_capture")?,
-            end: interface.function("graphs.end_capture")?,
+            begin: interface.function("graphs.capture_begin")?,
+            end: interface.function("graphs.capture_end")?,
             release: interface.function("graphs.release")?,
         })
     }

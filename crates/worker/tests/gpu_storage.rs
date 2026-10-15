@@ -527,7 +527,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
     with_shared.close().unwrap();
 }
 
-/// Resident KV pages and latent pages reach a VMM consumer where they lie:
+/// Resident cache pages and latent pages reach a VMM consumer where they lie:
 /// an export larger than the VMM pool needs no host mechanism.
 #[test]
 #[ignore = "requires a CUDA device"]
@@ -542,9 +542,10 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
 
     // Six tokens of both columns: 6 MiB of bfloat16, more than the 4 MiB
     // pool `transports` configures.
-    let plan = Arc::new(kv_plan("bfloat16", 1 << 17));
-    let planes = uniserve_worker::KVPlanes::allocate(plan, Some(DEVICE), 2, Some(&stream)).unwrap();
-    let kv_page = Spans::single(planes.page(0, 0, 1, 0, 6).unwrap()).unwrap();
+    let plan = Arc::new(cache_plan("bfloat16", 1 << 17));
+    let planes =
+        uniserve_worker::CachePlanes::allocate(plan, Some(DEVICE), 2, Some(&stream)).unwrap();
+    let cache_page = Spans::single(planes.page(0, 0, 1, 0, 6).unwrap()).unwrap();
 
     // One page of 768 units of 2048 f32 elements, also 6 MiB.
     let latents = LatentStorage::allocate(
@@ -560,7 +561,7 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
     .unwrap();
     let latent_page = latents.spans(0, &[1], 768).unwrap();
 
-    for source in [kv_page, latent_page] {
+    for source in [cache_page, latent_page] {
         assert_eq!(source.nbytes(), 6 << 20);
         let locations = located(
             &transports,
@@ -687,28 +688,28 @@ fn vmm_export_consumer() {
 
 /// A one-group FP8 plan: two layers in two columns, 8-token pages of two
 /// 4-wide heads (8-byte rows, 64-byte planes).
-fn fp8_plan() -> uniserve_worker::KVPlan {
-    kv_plan("float8_e4m3fn", 4)
+fn fp8_plan() -> uniserve_worker::CachePlan {
+    cache_plan("float8_e4m3fn", 4)
 }
 
 /// A one-group plan storing `dtype`: two layers in two columns, 8-token
 /// pages of two heads of `head_dim` elements.
-fn kv_plan(dtype: &str, head_dim: u32) -> uniserve_worker::KVPlan {
+fn cache_plan(dtype: &str, head_dim: u32) -> uniserve_worker::CachePlan {
     use uniserve_worker::ffi::{DType, Handle};
-    use uniserve_worker::storage::{GroupAxis, KVGroupPlan};
+    use uniserve_worker::storage::{CacheGroupPlan, GroupAxis};
 
     let quantized = dtype == "float8_e4m3fn";
     let element_bytes = if quantized { 1 } else { 2 };
     let plane_bytes = u64::from(8 * 2 * head_dim * element_bytes);
     // Each plane carries one initialized flag, and an FP8 plane one f32 scale.
     let metadata_bytes = if quantized { 5 } else { 1 };
-    uniserve_worker::KVPlan {
+    uniserve_worker::CachePlan {
         columns: 2,
         plane_bytes,
         quantized,
         unit_bytes: 2 * 2 * (plane_bytes + metadata_bytes),
         dtype: dtype.parse().unwrap(),
-        groups: vec![KVGroupPlan {
+        groups: vec![CacheGroupPlan {
             window: None,
             page_tokens: 8,
             units_per_page: 1,
@@ -731,14 +732,15 @@ fn kv_plan(dtype: &str, head_dim: u32) -> uniserve_worker::KVPlan {
 
 #[test]
 #[ignore = "requires a CUDA device"]
-fn kv_planes_reset_scratch_and_restore_snapshots() {
+fn cache_planes_reset_scratch_and_restore_snapshots() {
     let _driver = exclusive_driver();
     use uniserve_worker::storage::UnitSnapshot;
 
     let stream = stream();
     let plan = Arc::new(fp8_plan());
     assert_eq!(plan.info(6).unit_bytes, 276);
-    let planes = uniserve_worker::KVPlanes::allocate(plan, Some(DEVICE), 6, Some(&stream)).unwrap();
+    let planes =
+        uniserve_worker::CachePlanes::allocate(plan, Some(DEVICE), 6, Some(&stream)).unwrap();
     let views: std::collections::HashMap<_, _> = planes.views().unwrap().into_iter().collect();
     assert_eq!(views["key.values"].shape(), &[2, 6, 64]);
     assert_eq!(views["key.scale"].shape(), &[2, 6]);

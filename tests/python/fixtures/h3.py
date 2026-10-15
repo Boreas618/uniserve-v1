@@ -4,8 +4,9 @@ from dataclasses import replace
 
 from torch import nn
 
-from uniserve_models.media import image
-from uniserve_models.minimax_h3 import (
+from uniserve.media import image
+from uniserve.models import ComponentEntry, EntryPoint
+from uniserve.models.minimax_h3 import (
     Config,
     DenoiserConfig,
     DenseAttention,
@@ -18,9 +19,8 @@ from uniserve_models.minimax_h3 import (
     audio_vae,
     video_vae,
 )
-from uniserve_models.minimax_h3.encoder import TextEncoderConfig
-from uniserve_models.model import ComponentEntry, EntryPoint
-from uniserve_models.nn.functional import Rounding
+from uniserve.models.minimax_h3.encoder import TextEncoderConfig
+from uniserve.nn.functional import Rounding
 
 # The 16:9 canvas FastH3 DMD exports generate.
 WIDE = image.Config(768, 1344)

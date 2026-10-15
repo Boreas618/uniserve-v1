@@ -1,10 +1,10 @@
-//! Scheduler-assigned KV pages and their numerical block-table updates.
+//! Scheduler-assigned cache pages and their numerical block-table updates.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use uniserve_core::UnitId;
-use uniserve_ipc::{BlockTable, KvTransfer, RequestKey};
+use uniserve_ipc::{BlockTable, CacheTransfer, RequestKey};
 
 use crate::{Error, Result};
 
@@ -14,7 +14,7 @@ mod storage;
 pub use attention::{AttentionRow, TablePages, table_pages};
 pub use storage::BlockTableStorage;
 
-/// Page dimensions needed to address one KV cache group.
+/// Page dimensions needed to address one cache group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GroupShape {
     pub page_tokens: u32,
@@ -45,7 +45,9 @@ impl GroupShape {
 
     pub fn new(page_tokens: u32, units_per_page: u32, window: Option<u32>) -> Result<Self> {
         if page_tokens == 0 || units_per_page == 0 {
-            return Err(Error::Invalid("KV page dimensions must be positive".into()));
+            return Err(Error::Invalid(
+                "cache page dimensions must be positive".into(),
+            ));
         }
 
         Ok(Self {
@@ -90,7 +92,7 @@ impl GroupTable {
             || end.is_none_or(|end| end > self.end_page() * tokens)
         {
             return Err(Error::Invalid(
-                "KV token interval exceeds its unit table".into(),
+                "cache token interval exceeds its unit table".into(),
             ));
         }
 
@@ -190,17 +192,17 @@ impl BlockTables {
         &self,
         slot: u32,
         tables: &[Arc<GroupTable>],
-        transfer: &KvTransfer,
+        transfer: &CacheTransfer,
         initialized: &[u32],
     ) -> Result<Vec<(u32, u32, u32)>> {
         if slot == 0 || slot > self.request_pool_size || tables.len() != self.groups.len() {
             return Err(Error::Invalid(
-                "KV import requires a destination table per group".into(),
+                "cache import requires a destination table per group".into(),
             ));
         }
         if !transfer.groups.is_empty() && transfer.groups.len() != tables.len() {
             return Err(Error::Invalid(
-                "KV transfer groups do not match destination groups".into(),
+                "cache transfer groups do not match destination groups".into(),
             ));
         }
 
@@ -214,7 +216,7 @@ impl BlockTables {
                 || u64::from(table.start_page) * page_tokens > u64::from(transfer.exported_extent)
             {
                 return Err(Error::Invalid(
-                    "KV import exceeds its scheduler block table".into(),
+                    "cache import exceeds its scheduler block table".into(),
                 ));
             }
             held.extend(table.units.iter().map(|unit| unit.0));
@@ -235,7 +237,7 @@ impl BlockTables {
                         || units.iter().any(|unit| reset.contains(&unit.0))
                     {
                         return Err(Error::Invalid(
-                            "KV import would replace its installed base units".into(),
+                            "cache import would replace its installed base units".into(),
                         ));
                     }
                 }
@@ -249,7 +251,7 @@ impl BlockTables {
                 });
                 if source.start != start || start > transfer.exported_extent {
                     return Err(Error::Invalid(
-                        "KV transfer starts outside its destination history".into(),
+                        "cache transfer starts outside its destination history".into(),
                     ));
                 }
                 spans.extend(table.spans(
@@ -261,7 +263,7 @@ impl BlockTables {
 
         if reset.len() != initialized.len() || !reset.is_subset(&held) {
             return Err(Error::Invalid(
-                "KV import resets repeated units or units outside its block tables".into(),
+                "cache import resets repeated units or units outside its block tables".into(),
             ));
         }
 
@@ -428,7 +430,7 @@ impl BlockTables {
         self.lengths.get(&slot).copied().unwrap_or(0)
     }
 
-    /// Resolve one request's visible prefix against every installed KV group.
+    /// Resolve one request's visible prefix against every installed cache group.
     /// The returned capacity is the common extent, including sliding windows.
     pub fn coordinates(&self, slot: u32, visible: u64) -> Result<(u32, u64, u32)> {
         for group in 0..self.groups.len() as u32 {

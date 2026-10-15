@@ -12,7 +12,7 @@
 //!   release never waits behind an allocation-dependent batch; existing
 //!   readers keep their leases.
 //!
-//! Request storage (tensor store, KV cache, latent pool, block tables,
+//! Request storage (tensor store, prefix cache, latent pool, block tables,
 //! decode and diffusion LM state) is owned by the storage and capability runtimes
 //! and takes part through [`RequestStorage`].
 //!

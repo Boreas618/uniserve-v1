@@ -20,11 +20,11 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-pub use uniserve_core::{CallId, ForwardStats};
 use uniserve_core::{
-    ImageParams, KvCacheDtype, KvCacheGroup, KvGroupKind, RequestId, SamplingParams, TokenLogprob,
-    UnitId,
+    CacheGroup, CacheGroupKind, ImageParams, PrefixCacheDtype, RequestId, SamplingParams,
+    TokenLogprob, UnitId,
 };
+pub use uniserve_core::{CallId, ForwardStats};
 
 /// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;

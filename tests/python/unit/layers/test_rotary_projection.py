@@ -4,15 +4,15 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from uniserve_models.nn import RMSNorm, RotaryEmbedding
-from uniserve_models.nn.attention import (
+from uniserve.nn import RMSNorm, RotaryEmbedding
+from uniserve.nn.attention import (
     AxialQKVProjection,
     QKVProjection,
     RotaryQKVProjection,
 )
-from uniserve_models.nn.functional import Rounding, apply_rotary, qk_norm_rope
-from uniserve_models.nn.linear import QKVParallelLinear
-from uniserve_models.nn.rope import (
+from uniserve.nn.functional import Rounding, apply_rotary, qk_norm_rope
+from uniserve.nn.linear import QKVParallelLinear
+from uniserve.nn.rope import (
     DynamicScaling,
     LinearScaling,
     LongRoPEScaling,

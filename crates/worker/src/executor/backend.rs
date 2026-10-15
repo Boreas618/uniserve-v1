@@ -51,7 +51,7 @@ pub struct WorkerBackend {
     info: WorkerInfo,
     rank: usize,
     requests: RequestPool,
-    /// The rank's storage owners (events, products, transports, KV cache).
+    /// The rank's storage owners (events, products, transports, prefix cache).
     rank_storage: Option<RankStorage>,
     /// The text runtime, on ranks holding a causal language model.
     text: Option<crate::runner::causal_lm::CausalLMRunners>,
@@ -75,7 +75,7 @@ pub struct WorkerBackend {
     experts: Option<Arc<crate::parallel::ExpertUnion>>,
     /// Distributed expert weights, on ranks that prefetch them.
     weights: Option<crate::parallel::DwdpManager>,
-    /// The transfer runtime: tensor transfers, KV exports and installs, and
+    /// The transfer runtime: tensor transfers, cache exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<forward::transfer::TransferRuntime>,
     /// The admitted video requests, on ranks of a video model.
@@ -210,7 +210,7 @@ pub struct WorkerBatch {
     image: Option<forward::batch::image::Pending>,
     /// The video requests the batch started, while the library sizes them.
     sizing: Option<crate::request::video::Sizing>,
-    /// Products and KV transfers imported from other calls.
+    /// Products and cache transfers imported from other calls.
     inputs: forward::inputs::Inputs,
     /// A media batch's calls and completion.
     media: Option<forward::batch::MediaBatch>,
@@ -883,7 +883,7 @@ impl WorkerBackend {
                 unsupported.into_iter().collect::<Vec<_>>()
             )));
         }
-        if let Some(cache) = &self.info.kv_cache
+        if let Some(cache) = &self.info.prefix_cache
             && plan
                 .new_cache_units
                 .iter()
@@ -891,7 +891,7 @@ impl WorkerBackend {
                 .any(|unit| unit.0 >= cache.num_units)
         {
             return Err(Error::Invalid(
-                "KV allocation exceeds the fixed physical pool".into(),
+                "cache allocation exceeds the fixed physical pool".into(),
             ));
         }
         if let Some(allocation) = plan
@@ -1033,7 +1033,7 @@ impl WorkerBackend {
                     .chain(call.predicate.iter())
                     .map(|input| (input.request_key, input.producer_call_id)),
             );
-            if let Some(input) = call.kv_input {
+            if let Some(input) = call.cache_input {
                 consumed.insert((input.owner, input.producer_call_id));
             }
         }
@@ -1256,7 +1256,7 @@ impl Backend for WorkerBackend {
         batch: &mut WorkerBatch,
         submission: &Arc<Submission>,
     ) -> std::result::Result<bool, WorkerError> {
-        // The KV transfers other calls published are imported behind the
+        // The cache transfers other calls published are imported behind the
         // admitted products (`admit_inputs`), and the batch waits for both
         // (`await_inputs` subscribes to what blocks them).
         if !forward::inputs::prepare(self, batch)? {

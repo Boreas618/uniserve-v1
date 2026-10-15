@@ -1,7 +1,7 @@
 //! [`Facts`]: what the rank sizes a diffusion LM runner's buffers and graphs
 //! from before the runner exists.
 //!
-//! Each fact is a function of `uniserve_models.runner.diffusion_lm` over the
+//! Each fact is a function of `uniserve.runner.diffusion_lm` over the
 //! loaded model and the diffusion LM's module path, returning a scalar or a
 //! flat list: the model's own read-only method of the same name. The module
 //! itself does not cross: a callable object would cross as a function.
@@ -12,7 +12,7 @@ use crate::ffi::{DType, Handle};
 use crate::model::interface::Interface;
 use crate::{Error, Result};
 
-const MODULE: &str = "uniserve_models.runner.diffusion_lm";
+const MODULE: &str = "uniserve.runner.diffusion_lm";
 
 /// What a diffusion LM's rank computes.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3,7 +3,7 @@
 Each case plans a recorded diffusers reference request from its media's
 probed facts (``processing.plan_request``, the planner the server's rules
 are checked against) and reads every image and soundtrack through
-``uniserve_models.media.reader`` with the plan's values, as the serving
+``uniserve.media.reader`` with the plan's values, as the serving
 worker's host reader does. The reader applies the reference conditioning's
 own operations in its order, so every result is compared bit for bit:
 
@@ -27,8 +27,8 @@ import numpy as np
 import pytest
 import torch
 
-from uniserve_models.media.reader import read_audio, read_image
-from uniserve_models.minimax_h3 import processing
+from uniserve.media.reader import read_audio, read_image
+from uniserve.models.minimax_h3 import processing
 
 pytestmark = [
     pytest.mark.integration,

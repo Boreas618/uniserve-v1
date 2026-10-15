@@ -8,7 +8,7 @@
 //! whose folders supply its other components, [`BASE_COMPONENTS`].
 //! [`PipelineCheckpoint`] reads each component file from the checkpoint or
 //! from that base, which it resolves by the rules the worker's loader
-//! (`uniserve_models.loading`) applies:
+//! (`uniserve.loading`) applies:
 //!
 //! * a configured local directory supplies the base components in place;
 //! * otherwise the base is the Hub cache's snapshot of the pinned commit,

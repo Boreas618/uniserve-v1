@@ -8,7 +8,7 @@
 //!
 //! A text encoder and the vision tower that encodes its prompt's packed
 //! vision blocks compute through the Python half,
-//! `uniserve_models.runner.encoder.EncoderRunner`, constructed directly
+//! `uniserve.runner.encoder.EncoderRunner`, constructed directly
 //! with its stream's shared scratch ([`EncoderRunner::text`]): the text
 //! encoder's half owns the execution context, its tower borrows it, and
 //! `encode` takes the tensors of one forward as arguments.
@@ -95,7 +95,7 @@ use crate::storage::{Metadata, OutputPlacement, ProductBuffer, ValueRange};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
-const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
+const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
 
 /// The largest packed vision slot count: it bounds retained activations
 /// independently of the admitted batch size. Larger batches replay full
@@ -124,7 +124,7 @@ impl Tower {
 /// planning needs.
 #[derive(Clone, Debug)]
 pub struct PreparedImage {
-    /// The prepared pixels (`uniserve_models.media.pixels.PreparedImage`).
+    /// The prepared pixels (`uniserve.media.pixels.PreparedImage`).
     pub value: Handle,
     /// `[patches, row]` for a patch tower, `[channels, height, width]`
     /// otherwise.
@@ -599,7 +599,7 @@ struct PackedVision {
     features: StorageView,
 }
 
-/// The Python half (`uniserve_models.runner.encoder.EncoderRunner`) and its
+/// The Python half (`uniserve.runner.encoder.EncoderRunner`) and its
 /// methods, each called with the runner first.
 struct EncoderMethods {
     runner: Handle,
@@ -780,7 +780,7 @@ impl EncoderRunner {
 
     /// The runner of a text encoder (`path` `""`) or of its vision tower
     /// (`"vision"`) over its constructed Python half `runner`
-    /// (`uniserve_models.runner.encoder.EncoderRunner`). A text encoder's
+    /// (`uniserve.runner.encoder.EncoderRunner`). A text encoder's
     /// token, feature and position buffers are allocated here for the
     /// largest prompt capacity.
     #[expect(

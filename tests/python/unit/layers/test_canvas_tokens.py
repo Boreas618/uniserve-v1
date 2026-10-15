@@ -10,7 +10,7 @@ from transformers.models.diffusion_gemma import (
     generation_diffusion_gemma as reference,
 )
 
-from uniserve_models.diffusion import tokens
+from uniserve.diffusion import tokens
 
 pytestmark = pytest.mark.unit
 

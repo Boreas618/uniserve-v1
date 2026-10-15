@@ -29,10 +29,12 @@ impl WarmupHooks for DenoiserWarmup {
         } else {
             let parts = backend.parts();
             if let Some(image) = parts.image {
-                let kv = parts.storage.and_then(|storage| storage.kv.as_mut());
+                let prefix_cache = parts
+                    .storage
+                    .and_then(|storage| storage.prefix_cache.as_mut());
                 image
                     .denoisers
-                    .capture_flow(image.latents.as_deref(), kv)
+                    .capture_flow(image.latents.as_deref(), prefix_cache)
                     .map_err(|error| {
                         WorkerError::classify(error, Some("image graph capture"))
                             .with_phase("warmup")

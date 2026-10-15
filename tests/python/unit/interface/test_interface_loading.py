@@ -3,10 +3,10 @@
 import pytest
 
 from tests.python.fixtures.stub import load_model, read_config
-from uniserve_models import interface
-from uniserve_models.interface import cache, loading
-from uniserve_models.interface.errors import UnsupportedSetup
-from uniserve_models.runner import causal_lm
+from uniserve import interface
+from uniserve.interface import cache, loading
+from uniserve.interface.errors import UnsupportedSetup
+from uniserve.runner import causal_lm
 
 pytestmark = pytest.mark.unit
 
@@ -19,7 +19,7 @@ def loaded():
 
 def test_description_reports_calls_with_capability_tags():
     description = read_config()
-    assert description.model_name() == "uniserve_models.stub.model.Model"
+    assert description.model_name() == "uniserve.models.stub.model.Model"
     assert description.components() == ["model", "vision_encoder"]
     assert description.call_paths("model")[:2] == ["", ""]
     assert description.call_methods("model")[:2] == [

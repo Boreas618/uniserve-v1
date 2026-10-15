@@ -5,8 +5,8 @@ import torch
 from diffusers.schedulers.scheduling_minimax_h3 import MiniMaxH3Scheduler
 
 from tests.python.fixtures.h3 import base_denoiser, dmd_denoiser
-from uniserve_models.minimax_h3.denoiser import Denoiser
-from uniserve_models.minimax_h3.packing import audio_latent_frames
+from uniserve.models.minimax_h3.denoiser import Denoiser
+from uniserve.models.minimax_h3.packing import audio_latent_frames
 
 pytestmark = pytest.mark.unit
 
@@ -79,8 +79,8 @@ def test_audio_track_decodes_exactly_the_generated_latent_timeline():
     count the denoiser generates, so the decoder never reads past the
     generated latents or leaves requested samples uncovered.
     """
-    from uniserve_models.minimax_h3 import audio_vae
-    from uniserve_models.minimax_h3.decoding import AudioDecoder
+    from uniserve.models.minimax_h3 import audio_vae
+    from uniserve.models.minimax_h3.decoding import AudioDecoder
 
     with torch.device("meta"):
         decoder = AudioDecoder(audio_vae.Config(), sample_rate=32000)

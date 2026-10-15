@@ -3,13 +3,13 @@
 import pytest
 import torch
 
-from uniserve_models.nn.vae.layers import DiagonalGaussian
+from uniserve.nn.vae.layers import DiagonalGaussian
 
 pytestmark = pytest.mark.unit
 
 
 def test_latent_decoder_preserves_float32_normalization():
-    from uniserve_models.nn.vae import LatentDecoder
+    from uniserve.nn.vae import LatentDecoder
 
     linear = torch.nn.Linear(4, 4, bias=False)
     with torch.no_grad():
@@ -66,7 +66,7 @@ def test_spatial_encoder_tiles_reproduce_a_local_encoding():
     placed at their raster positions agree on every overlap and the blended
     seams reproduce the whole-raster encoding.
     """
-    from uniserve_models.nn.vae import SpatialEncoder
+    from uniserve.nn.vae import SpatialEncoder
 
     encoder = SpatialEncoder(
         torch.nn.AvgPool2d(4),

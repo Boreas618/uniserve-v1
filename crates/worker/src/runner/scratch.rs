@@ -1,7 +1,7 @@
 //! `Scratches`: the shared work areas of the rank's streams.
 //!
 //! Execution contexts serialized on one stream borrow one Python `Scratch`
-//! (`uniserve_models.bindings.context.Scratch`) per device: a transient
+//! (`uniserve.bindings.context.Scratch`) per device: a transient
 //! work area grows to the largest context prepared and keeps what captured
 //! graphs address. Rust holds the scratch of each stream and device and
 //! passes it to every runner constructed on that stream, so their contexts
@@ -34,7 +34,7 @@ impl Scratches {
         }
         let scratch = Handle::new(
             interface
-                .import("uniserve_models.bindings.context.Scratch")?
+                .import("uniserve.bindings.context.Scratch")?
                 .call_values(&[])?,
         )?;
         self.scratches.insert(key, scratch.clone());

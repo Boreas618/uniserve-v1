@@ -14,7 +14,7 @@
 //! connection has closed as dead.
 //!
 //! The host exchanges batch descriptors and bounded result values while
-//! tensors, KV pages, and latent storage remain worker-resident.
+//! tensors, cache pages, and latent storage remain worker-resident.
 //!
 //! The module also defines the launch settings `WorkerProcessArgs` carries
 //! (`LaneConfig`, `FlashInferBackend`), that type's defaults, and the launch
@@ -154,7 +154,7 @@ impl Default for WorkerProcessArgs {
             stub: false,
             queue_depth: 2,
             max_message_bytes: 8 << 20,
-            kv_token_capacity: None,
+            cache_token_capacity: None,
             block_size: None,
             max_batch_calls: 128,
             max_batch_tokens: 16_384,
@@ -171,8 +171,8 @@ impl Default for WorkerProcessArgs {
             checksum_manifest: None,
             model_dtype: uniserve_core::ModelDtype::BFloat16,
             quantization_config: serde_json::json!({}),
-            kv_cache_dtype: None,
-            kv_storage_fraction: 0.70,
+            prefix_cache_dtype: None,
+            cache_storage_fraction: 0.70,
             mesh: None,
             distributed_backend: None,
             lanes: Vec::new(),
@@ -346,12 +346,12 @@ impl WorkerProcessArgs {
             checksum_manifest: self.checksum_manifest.as_deref().map(path),
             model_dtype: self.model_dtype.as_str().to_owned(),
             quantization_config: self.quantization_config.clone(),
-            kv_cache_dtype: self
-                .kv_cache_dtype
+            prefix_cache_dtype: self
+                .prefix_cache_dtype
                 .as_ref()
                 .map(|value| value.as_str().to_owned()),
-            kv_memory_fraction: self.kv_storage_fraction,
-            kv_token_capacity: self.kv_token_capacity,
+            cache_memory_fraction: self.cache_storage_fraction,
+            cache_token_capacity: self.cache_token_capacity,
             attention_backend: self.attention_backend.as_name(),
             block_size: self.block_size,
             max_batch_calls: self.max_batch_calls,
@@ -1315,7 +1315,7 @@ mod tests {
         }
     }
 
-    /// A lane partitions compute only: its calls share the worker-wide KV
+    /// A lane partitions compute only: its calls share the worker-wide prefix cache
     /// and latent pools, whose placement the scheduler owns, so a lane
     /// naming a capacity of its own is refused rather than accepted without
     /// effect.

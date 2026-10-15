@@ -6,7 +6,7 @@ They also retain solver math.
 import pytest
 import torch
 
-from uniserve_models.diffusion import (
+from uniserve.diffusion import (
     AdditiveGuidance,
     Branch,
     CleanSampleEulerSolver,
@@ -151,8 +151,8 @@ def test_noise_preserves_native_draw_order_and_global_rng():
 
 
 def test_patch_order_preserves_pixels_then_channels():
-    from uniserve_models.media import image
-    from uniserve_models.nn.functional import patchify, unpatchify
+    from uniserve.media import image
+    from uniserve.nn.functional import patchify, unpatchify
 
     pixels = torch.arange(16).reshape(2, 2, 4)
     expected = torch.tensor(
@@ -169,10 +169,10 @@ def test_patch_order_preserves_pixels_then_channels():
 
 
 def test_public_image_step_uses_borrowed_sample_and_input_time():
-    from uniserve_models.diffusion import DenoisingStep
-    from uniserve_models.media import image
-    from uniserve_models.model import DenoiserInput, ImageDenoiser, LatentInput
-    from uniserve_models.tensors import OutputLayout, TensorOutput
+    from uniserve.diffusion import DenoisingStep
+    from uniserve.media import image
+    from uniserve.models import DenoiserInput, ImageDenoiser, LatentInput
+    from uniserve.tensors import OutputLayout, TensorOutput
 
     class Expansion(ImageDenoiser):
         def __init__(self):
@@ -248,10 +248,10 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
 
 
 def test_image_decoder_restores_different_rasters_in_input_order():
-    from uniserve_models.media import image
-    from uniserve_models.model import ImageDecoder
-    from uniserve_models.nn import RGBDecoder
-    from uniserve_models.nn.functional import patchify
+    from uniserve.media import image
+    from uniserve.models import ImageDecoder
+    from uniserve.nn import RGBDecoder
+    from uniserve.nn.functional import patchify
 
     sizes = (image.Config(2, 4), image.Config(4, 2), image.Config(2, 4))
     pixels = tuple(

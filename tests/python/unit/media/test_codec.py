@@ -3,7 +3,7 @@
 The serving worker encodes each media unit on its own codec rank and
 remuxes the units, in order and at the decode-time offsets it tracks, with
 the request's soundtrack into the request's MP4. These tests drive the same
-codec boundary (``uniserve_models.media.codec``) and decode the result.
+codec boundary (``uniserve.media.codec``) and decode the result.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import torch
 
-from uniserve_models.media import codec
+from uniserve.media import codec
 
 av = pytest.importorskip("av")
 

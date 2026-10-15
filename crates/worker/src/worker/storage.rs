@@ -2,7 +2,7 @@
 //!
 //! Startup allocates them on the capacity plan: the device event pool, the
 //! product store (relay lanes and the buffer pool), the product transports
-//! and, for a text model, the KV cache (unit planes, block tables and import
+//! and, for a text model, the prefix cache (unit planes, block tables and import
 //! workspaces). Capability runtimes borrow them to execute calls; lifecycle
 //! commands release their request storage through [`RequestStorage`].
 
@@ -15,7 +15,7 @@ use uniserve_ipc::{BufferId, CallKind, ForwardMode, RequestKey, Wake};
 
 use crate::Result;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
-use crate::storage::{KVCache, TensorStore};
+use crate::storage::{PrefixCache, TensorStore};
 use crate::stream::EventPool;
 use crate::transfer::{Notify, Transports};
 
@@ -34,9 +34,9 @@ const RELEASE: CallKind = CallKind::Forward(ForwardMode::Decode);
 pub struct RankStorage {
     pub events: Arc<EventPool>,
     pub tensors: TensorStore,
-    /// Shared with the KV import copy tasks that read through them.
+    /// Shared with the cache import copy tasks that read through them.
     pub transports: Arc<Transports>,
-    pub kv: Option<KVCache>,
+    pub prefix_cache: Option<PrefixCache>,
     /// Stream that orders slot releases after the batches reading them: the
     /// stream serving token calls, shared with its lane.
     release_stream: Option<Stream>,
@@ -52,29 +52,29 @@ impl RankStorage {
         events: Arc<EventPool>,
         tensors: TensorStore,
         transports: Arc<Transports>,
-        kv: Option<KVCache>,
+        prefix_cache: Option<PrefixCache>,
         release_stream: Option<Stream>,
     ) -> Self {
         Self {
             events,
             tensors,
             transports,
-            kv,
+            prefix_cache,
             release_stream,
             finished_prefixes: HashSet::new(),
             retired_prefixes: HashSet::new(),
         }
     }
 
-    /// Release the products (and KV exports) of finished calls.
+    /// Release the products (and cache exports) of finished calls.
     pub fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Result<()> {
         if calls.is_empty() {
             return Ok(());
         }
         self.tensors.release_calls(calls);
-        if let Some(kv) = &mut self.kv {
-            let released = kv.manager().release_calls(calls);
-            kv.manager().release_exports(&released);
+        if let Some(prefix_cache) = &mut self.prefix_cache {
+            let released = prefix_cache.manager().release_calls(calls);
+            prefix_cache.manager().release_exports(&released);
         }
         Ok(())
     }
@@ -88,9 +88,10 @@ impl RequestStorage for RankStorage {
 
     fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()> {
         self.tensors.release_buffers(buffers, jobs.any().on(None))?;
-        if let Some(kv) = &mut self.kv {
-            kv.release_imports(buffers)?;
-            kv.manager()
+        if let Some(prefix_cache) = &mut self.prefix_cache {
+            prefix_cache.release_imports(buffers)?;
+            prefix_cache
+                .manager()
                 .release_exports(&buffers.iter().copied().collect::<Vec<_>>());
         }
         Ok(())
@@ -104,15 +105,15 @@ impl RequestStorage for RankStorage {
     ) -> Result<()> {
         self.tensors
             .release_requests(requests, retained, jobs.any().on(None))?;
-        if let Some(kv) = &mut self.kv {
-            kv.cancel_request_imports(requests, retained)?;
-            let exports: Vec<BufferId> = kv
+        if let Some(prefix_cache) = &mut self.prefix_cache {
+            prefix_cache.cancel_request_imports(requests, retained)?;
+            let exports: Vec<BufferId> = prefix_cache
                 .manager()
                 .exported_buffers()
                 .into_iter()
                 .filter(|buffer| requests.contains(&buffer.owner) && !retained.contains(buffer))
                 .collect();
-            kv.manager().release_exports(&exports);
+            prefix_cache.manager().release_exports(&exports);
             self.finished_prefixes.extend(requests.iter().copied());
         }
         Ok(())
@@ -125,10 +126,11 @@ impl RequestStorage for RankStorage {
         retained: &HashSet<BufferId>,
     ) -> Result<bool> {
         let ready = self.tensors.retirement_ready(buffers, requests, retained)?
-            && self
-                .kv
-                .as_mut()
-                .is_none_or(|kv| kv.manager().retirement_ready(buffers, requests, retained));
+            && self.prefix_cache.as_mut().is_none_or(|prefix_cache| {
+                prefix_cache
+                    .manager()
+                    .retirement_ready(buffers, requests, retained)
+            });
         if ready {
             // Their prefix slots clear with the requests' own slots.
             for request in requests {
@@ -141,7 +143,7 @@ impl RequestStorage for RankStorage {
     }
 
     fn retire_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()> {
-        if let Some(kv) = &mut self.kv {
+        if let Some(prefix_cache) = &mut self.prefix_cache {
             // The rows are cleared by the lane that owns the release
             // stream, behind the batches it already performed.
             let release = match &self.release_stream {
@@ -154,12 +156,12 @@ impl RequestStorage for RankStorage {
                 None => jobs.any().on(None),
             };
             let slots: Vec<u32> = slots.iter().map(|&slot| slot as u32).collect();
-            kv.release_slots(&slots, release)?;
+            prefix_cache.release_slots(&slots, release)?;
             for request in std::mem::take(&mut self.retired_prefixes) {
-                kv.release_request_prefixes(request, release)?;
+                prefix_cache.release_request_prefixes(request, release)?;
                 // A later epoch of the request id starts without the
                 // retired epoch's resident transfers and accepted bases.
-                kv.manager().drop_request(request);
+                prefix_cache.manager().drop_request(request);
             }
         }
         Ok(())
@@ -169,8 +171,8 @@ impl RequestStorage for RankStorage {
         // Work deferred on other threads gets its job from this one.
         self.events.submit_deferred()?;
         self.transports.reap()?;
-        if let Some(kv) = &self.kv {
-            kv.reap_imports()?;
+        if let Some(prefix_cache) = &self.prefix_cache {
+            prefix_cache.reap_imports()?;
         }
         Ok(())
     }
@@ -182,8 +184,8 @@ impl RequestStorage for RankStorage {
     fn set_wake(&self, wake: Option<Wake>) {
         self.events.set_wake(wake.clone());
         self.transports.set_wake(wake.clone());
-        if let Some(kv) = &self.kv {
-            kv.set_wake(wake);
+        if let Some(prefix_cache) = &self.prefix_cache {
+            prefix_cache.set_wake(wake);
         }
     }
 
@@ -191,20 +193,20 @@ impl RequestStorage for RankStorage {
     fn close(&mut self, aborted: bool) -> Result<()> {
         if aborted {
             // Device work may still address the pool and the staging.
-            std::mem::forget(self.kv.take());
+            std::mem::forget(self.prefix_cache.take());
             return Ok(());
         }
         // Revoke every published product, stop the imports reading through
         // the transports, then close the transports, which retires the
-        // exports they still register (the KV cache requires its exports
+        // exports they still register (the prefix cache requires its exports
         // retired before it closes).
         let mut result = self.tensors.revoke_exports();
-        if let Some(kv) = &mut self.kv {
-            result = result.and(kv.stop_imports());
+        if let Some(prefix_cache) = &mut self.prefix_cache {
+            result = result.and(prefix_cache.stop_imports());
         }
         result = result.and(self.transports.close());
-        if let Some(kv) = &mut self.kv {
-            result = result.and(kv.close());
+        if let Some(prefix_cache) = &mut self.prefix_cache {
+            result = result.and(prefix_cache.close());
         }
         self.tensors.close();
         result.and(self.events.close())

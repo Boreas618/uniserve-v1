@@ -7,16 +7,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_models.backends.attention import resolve
-from uniserve_models.bindings.context import TensorBuffers
-from uniserve_models.cache import Config, mha
-from uniserve_models.cache.units import UnitPool
-from uniserve_models.model import TextSize
-from uniserve_models.nn.attention import (
+from uniserve.backends.attention import resolve
+from uniserve.bindings.context import TensorBuffers
+from uniserve.models import TextSize
+from uniserve.nn.attention import (
     BlockTable,
     SegmentedInput,
     SequenceLengths,
 )
+from uniserve.prefix_cache import Config, mha
+from uniserve.prefix_cache.units import UnitPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 

@@ -11,9 +11,9 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from uniserve_models import loading
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.nn import Linear
+from uniserve import loading
+from uniserve.loading import checkpoint, weights
+from uniserve.nn import Linear
 
 pytestmark = pytest.mark.integration
 
@@ -211,9 +211,9 @@ def test_shared_parameter_rejects_conflicting_placement_before_materialization(
 def test_contexts_deliver_cross_device_components_with_independent_graphs(
     component_checkpoint,
 ):
-    from uniserve_models.bindings.context import ExecutionContext
-    from uniserve_models.interface import graphs
-    from uniserve_models.model import TextSize
+    from uniserve import cuda_graph
+    from uniserve.bindings.context import ExecutionContext
+    from uniserve.models import TextSize
 
     root, io = component_checkpoint
     model = _load(
@@ -223,7 +223,7 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
     second = torch.tensor([[3.0, 4.0]], device="cuda:0")
     streams = tuple(torch.cuda.Stream(device="cuda:0") for _ in range(2))
     # Each graph keeps its secondary-device allocation domain alive for replay.
-    peers = tuple(((1, graphs.pool(1)[0]),) for _ in range(2))
+    peers = tuple(((1, cuda_graph.pool(1)[0]),) for _ in range(2))
     with ExecutionContext(model, stream=streams[0]) as a:
         a.prepare(TextSize(1, 1))
         streams[0].wait_stream(torch.cuda.default_stream("cuda:0"))
@@ -235,7 +235,7 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
         torch.testing.assert_close(
             model(first), first.new_tensor([[5.0, 66.0]])
         )
-        ga = graphs.capture(
+        ga = cuda_graph.capture(
             lambda: model(first), stream=streams[0], peers=peers[0]
         )
         with ExecutionContext(model, stream=streams[1]) as b:
@@ -244,7 +244,7 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
             torch.testing.assert_close(
                 model(second), second.new_tensor([[11.0, 150.0]])
             )
-            gb = graphs.capture(
+            gb = cuda_graph.capture(
                 lambda: model(second), stream=streams[1], peers=peers[1]
             )
             with torch.cuda.stream(streams[0]):
@@ -272,8 +272,8 @@ def test_contexts_deliver_cross_device_components_with_independent_graphs(
 def test_shared_components_deliver_independently_on_concurrent_contexts(
     component_checkpoint,
 ):
-    from uniserve_models.bindings.context import ExecutionContext
-    from uniserve_models.model import TextSize
+    from uniserve.bindings.context import ExecutionContext
+    from uniserve.models import TextSize
 
     root, io = component_checkpoint
     model = _load(
@@ -316,8 +316,8 @@ def test_cpu_context_unwinds_a_pending_gpu_call_without_waiting(
     component_checkpoint,
 ):
     from tests.python.fixtures.cuda_stream import blocked_stream
-    from uniserve_models.bindings.context import ExecutionContext
-    from uniserve_models.model import TextSize
+    from uniserve.bindings.context import ExecutionContext
+    from uniserve.models import TextSize
 
     root, io = component_checkpoint
     model = _load(root, io, device="cpu", devices={"decoder": "cuda:1"}).model
@@ -348,8 +348,8 @@ def test_component_delivery_preserves_nested_inputs_and_named_output_storage(
     source,
     destination,
 ):
-    from uniserve_models.bindings.context import ExecutionContext
-    from uniserve_models.model import TextSize
+    from uniserve.bindings.context import ExecutionContext
+    from uniserve.models import TextSize
 
     @dataclass(frozen=True)
     class Residual:

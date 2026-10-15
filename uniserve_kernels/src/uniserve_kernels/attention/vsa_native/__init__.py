@@ -5,7 +5,7 @@ The kernel sources live in ``csrc/`` and build through
 rows): the first :func:`load` with a given source, block size and toolchain
 compiles them, later processes import the finished module, and support
 queries never compile.
-``uniserve_models.backends.attention.vsa.sm100`` calls :func:`load` while
+``uniserve.backends.attention.vsa.sm100`` calls :func:`load` while
 preparing its operator and routes complete calls here: block-64 calls when
 ``vsa_cute.should_use`` declines a shape, and every block-128 call.
 """

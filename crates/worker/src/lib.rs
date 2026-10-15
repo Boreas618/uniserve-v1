@@ -1,7 +1,7 @@
 //! The UniServe rank runtime.
 //!
 //! A worker rank is a Rust process body hosted by a Python interpreter: the
-//! `uniserve_models.worker` entry loads this library through TVM-FFI and calls
+//! `uniserve.worker` entry loads this library through TVM-FFI and calls
 //! its exported `main` with the numerical interface table. Rust owns request
 //! state, storage, streams, graphs policy, transfers and the IPC service;
 //! Python computes through the functions in that table.
@@ -78,24 +78,24 @@ pub use sampling::{
 pub use service::{Service, ServiceBackend};
 pub use storage::{
     AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, BufferBinding, BufferPool,
-    GroupShape, GroupTable, HostBuffers, KVCache, KVCacheManager, KVPlan, KVPlanes, LatentExport,
-    LatentImport, LatentPool, LatentStorage, LatentUpdate, LogprobLayout, OutputBuffer, OutputPool,
-    OutputStorage, ProductBuffer, ProductRead, RequestSlots, TablePages, TensorStore, UnitColumn,
-    table_pages,
+    CachePlan, CachePlanes, GroupShape, GroupTable, HostBuffers, LatentExport, LatentImport,
+    LatentPool, LatentStorage, LatentUpdate, LogprobLayout, OutputBuffer, OutputPool,
+    OutputStorage, PrefixCache, PrefixCacheManager, ProductBuffer, ProductRead, RequestSlots,
+    TablePages, TensorStore, UnitColumn, table_pages,
 };
 pub use stream::{CUDAStream, Deferred, EventPool, Fill, Issue, RowFill, Submitter};
 pub use transfer::{
-    BufferRegistry, DescriptorGrants, ImportBackend, ImportCopy, KVImport, KVImporter, PeerStorage,
-    Read, ReadBackend, ReadRegion, ReadReservation, RegisteredBuffer, SHM_HEADER_BYTES,
-    SharedBuffer, SharedMapping, SharedRead, Spans, TransferCapacity, TransferPool, TransferRead,
-    TransferTicket, Transport, TransportKind, TransportOptions, Transports, fetch_descriptor,
-    plan_reads,
+    BufferRegistry, CacheImport, DescriptorGrants, ImportBackend, ImportCopy, KVImporter,
+    PeerStorage, Read, ReadBackend, ReadRegion, ReadReservation, RegisteredBuffer,
+    SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead, Spans, TransferCapacity,
+    TransferPool, TransferRead, TransferTicket, Transport, TransportKind, TransportOptions,
+    Transports, fetch_descriptor, plan_reads,
 };
 
 /// The library's exported entry point, `main(argv, interface) -> int`.
 ///
 /// The Python entry calls it once with the process arguments and the
-/// numerical interface table (`uniserve_models.interface.table()`); the
+/// numerical interface table (`uniserve.interface.table()`); the
 /// returned value is the process exit status.
 fn main(
     argv: tvm_ffi::Array<tvm_ffi::String>,

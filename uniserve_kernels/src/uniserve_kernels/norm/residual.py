@@ -7,7 +7,7 @@ the residual ``hidden`` in place; the RMS variant normalizes the unrounded sum.
 variants, selected by passing ``partials``, record one per-row absolute maximum
 of the stored output; ``uniserve_kernels.reduction.absmax`` finishes them.
 
-``uniserve_models.nn.functional`` owns validation and output allocation, and
+``uniserve.nn.functional`` owns validation and output allocation, and
 raises on CUDA when :func:`unsupported` reports a reason.
 """
 

@@ -7,9 +7,9 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_models.interface import cache, errors, runtime
-from uniserve_models.model import CausalLM, TransformerDecoder
-from uniserve_models.nn.attention import Attention
+from uniserve.interface import cache, errors, runtime
+from uniserve.models import CausalLM, TransformerDecoder
+from uniserve.nn.attention import Attention
 
 pytestmark = pytest.mark.unit
 
@@ -176,9 +176,7 @@ def test_a_failed_unit_reset_crosses_the_interface_with_its_kind():
     units = torch.tensor([9, 0, 0, 0], dtype=torch.int64)
     resets = cache.UnitResets(units, 0, list(fields), *fields.values())
     # The rank reaches the method by import path.
-    zero = runtime.import_path(
-        "uniserve_models.interface.cache.UnitResets.zero"
-    )
+    zero = runtime.import_path("uniserve.interface.cache.UnitResets.zero")
 
     with pytest.raises(errors.InputError):
         zero(resets, 1)
@@ -285,7 +283,7 @@ def test_conversion_binding_encodes_scratch_spans_like_writes():
 def test_interface_import_does_not_initialize_cuda():
     code = (
         "import torch\n"
-        "from uniserve_models.interface import cache\n"
+        "from uniserve.interface import cache\n"
         "assert not torch.cuda.is_initialized()\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)

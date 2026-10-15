@@ -30,13 +30,13 @@ pub struct GeneralStats {
     pub in_flight: AtomicUsize,
 }
 
-/// KV unit-pool observability.
+/// Cache unit-pool observability.
 #[derive(Default)]
-pub struct KvCacheStats {
-    /// Physical KV units currently available for allocation, including
+pub struct PrefixCacheUsage {
+    /// Physical cache units currently available for allocation, including
     /// cached ones allocation evicts.
     pub free_units: AtomicUsize,
-    /// Usable physical KV units managed by the scheduler, set once at
+    /// Usable physical cache units managed by the scheduler, set once at
     /// construction.
     pub num_units: AtomicUsize,
     /// Cumulative pages evicted from the prefix cache.
@@ -260,8 +260,8 @@ pub struct WorkerStats {
 pub struct SchedulerStats {
     /// General scheduler loop and queue counters.
     pub general: GeneralStats,
-    /// Paged KV allocation and prefix-cache counters.
-    pub kv_cache: KvCacheStats,
+    /// Paged cache allocation and prefix-cache counters.
+    pub prefix_cache: PrefixCacheUsage,
     /// Prefix-cache lookup counters.
     pub prefix: PrefixStats,
     /// Encoder-output cache counters.

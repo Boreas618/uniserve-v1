@@ -10,8 +10,8 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models.distributed import DeviceMesh, Distribution
-from uniserve_models.quantization import Quantizer
+from uniserve.distributed import DeviceMesh, Distribution
+from uniserve.quantization import Quantizer
 
 pytestmark = pytest.mark.integration
 

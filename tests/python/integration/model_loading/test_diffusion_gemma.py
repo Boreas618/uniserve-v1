@@ -1,6 +1,6 @@
 """Public DiffusionGemma loading agrees with the pinned Transformers model.
 
-A prompt pass through ``Model.text`` writes the K/V cache and yields causal
+A prompt pass through ``Model.text`` writes the prefix cache and yields causal
 logits; a canvas pass through ``Model.denoiser`` reads that cache without
 writing it and yields soft-capped canvas logits. Both run on the CPU through
 the torch attention backend and compare against the Transformers encoder,
@@ -29,28 +29,28 @@ from tests.python.fixtures.checkpoints import (
     diffusion_gemma_checkpoint,
     load_diffusion_gemma,
 )
-from uniserve_models import catalog as models
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.cache.units import UnitPool, plan_units
-from uniserve_models.diffusion.tokens import self_conditioning_embedding
-from uniserve_models.distributed import Communicator
-from uniserve_models.loading import weights
-from uniserve_models.model import (
+from uniserve.bindings.context import ExecutionContext
+from uniserve.diffusion.tokens import self_conditioning_embedding
+from uniserve.distributed import Communicator
+from uniserve.loading import weights
+from uniserve.models import (
     DiffusionLMInput,
     EmbeddingReplacement,
     TextInput,
     TextSize,
     VisionInput,
 )
-from uniserve_models.nn.attention import (
+from uniserve.models import registry as models
+from uniserve.nn.attention import (
     AttentionBatch,
     BlockTable,
     PagedInput,
     SegmentedInput,
     SequenceLengths,
 )
-from uniserve_models.nn.functional import patchify
-from uniserve_models.nn.moe import FusedMoE
+from uniserve.nn.functional import patchify
+from uniserve.nn.moe import FusedMoE
+from uniserve.prefix_cache.units import UnitPool, plan_units
 
 pytestmark = pytest.mark.integration
 
@@ -547,7 +547,7 @@ def test_disagreeing_layer_scalars_are_rejected(tmp_path):
 def _pipeline_stage(rank, rendezvous, root):
     import torch.distributed as dist
 
-    from uniserve_models.interface import distributed
+    from uniserve.interface import distributed
 
     dist.init_process_group(
         "gloo", init_method=rendezvous, rank=rank, world_size=2

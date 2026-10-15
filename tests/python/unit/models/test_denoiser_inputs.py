@@ -13,10 +13,10 @@ import pytest
 import torch
 
 from tests.python.fixtures.model_metadata import neo_metadata
-from uniserve_models.loading import Config as IOConfig
-from uniserve_models.media import image
-from uniserve_models.model import LatentInput
-from uniserve_models.nn.attention import (
+from uniserve.loading import Config as IOConfig
+from uniserve.media import image
+from uniserve.models import LatentInput
+from uniserve.nn.attention import (
     AttentionBatch,
     SequenceLengths,
     VarlenInput,
@@ -26,9 +26,9 @@ pytestmark = pytest.mark.unit
 
 
 def _sensenova_denoiser(tmp_path):
-    from uniserve_models.sensenova_u1 import read_config
-    from uniserve_models.sensenova_u1.denoiser import Denoiser
-    from uniserve_models.sensenova_u1.transformer import Transformer
+    from uniserve.models.sensenova_u1 import read_config
+    from uniserve.models.sensenova_u1.denoiser import Denoiser
+    from uniserve.models.sensenova_u1.transformer import Transformer
 
     (tmp_path / "config.json").write_text(json.dumps(neo_metadata()))
     config = read_config(tmp_path, IOConfig(), sources={})
@@ -37,7 +37,7 @@ def _sensenova_denoiser(tmp_path):
 
 
 def _stub_denoiser(tmp_path):
-    from uniserve_models.stub import Config, Model
+    from uniserve.models.stub import Config, Model
 
     del tmp_path
     return Model(Config()).denoiser

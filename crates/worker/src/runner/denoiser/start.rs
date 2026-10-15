@@ -52,7 +52,7 @@ impl DenoiserRunners {
         let graph_pool = setup.graph_pool(DENOISER_GRAPHS, &placed.name, device)?;
         // The conditioner's call runs on one pipeline stage; only a rank of
         // that stage holds its module and constructs its runners.
-        let holds = interface.import("uniserve_models.runner.encoder.EncoderRunner.holds")?;
+        let holds = interface.import("uniserve.runner.encoder.EncoderRunner.holds")?;
         let mut conditioner = None;
         for call in &placed.calls {
             let encodes =

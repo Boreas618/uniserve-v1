@@ -8,7 +8,7 @@ use crate::cuda_graph::graph_storage_budget_bytes;
 use crate::{Error, Result};
 
 /// Every CUDA device other than the primary one needs its own grant for its
-/// fixed storage plus graph capture. KV sizing already charged the primary
+/// fixed storage plus graph capture. Cache sizing already charged the primary
 /// device's fixed storage.
 pub fn auxiliary(
     config: &WorkerConfig,
@@ -22,7 +22,9 @@ pub fn auxiliary(
         if device == config.device {
             continue;
         }
-        let available = budget.budget(index, config.kv_storage_fraction)?.available;
+        let available = budget
+            .budget(index, config.cache_storage_fraction)?
+            .available;
         let reserved = bytes + graph_storage_budget_bytes(total_bytes(index)? as i64);
         if reserved > available {
             return Err(Error::Unsupported(format!(
@@ -53,8 +55,8 @@ pub fn startup(
         } else {
             0
         };
-        let measured = budget.budget(index, config.kv_storage_fraction)?;
-        let grant = (measured.total as f64 * config.kv_storage_fraction) as u64;
+        let measured = budget.budget(index, config.cache_storage_fraction)?;
+        let grant = (measured.total as f64 * config.cache_storage_fraction) as u64;
         let remaining = products.saturating_sub(resident_products(device));
         if remaining > measured.available || measured.process + remaining > grant {
             return Err(Error::Unsupported(format!(

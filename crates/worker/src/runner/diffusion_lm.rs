@@ -1,6 +1,6 @@
 //! `DiffusionLMRunner`: the forwards of a diffusion language model on one
 //! lane, the Rust half of
-//! `uniserve_models.runner.diffusion_lm.DiffusionLMRunner`.
+//! `uniserve.runner.diffusion_lm.DiffusionLMRunner`.
 //!
 //! A readout evaluates blocks of tokens over their requests' cached
 //! prefixes and reads candidate log-probabilities at answer slots: one
@@ -70,7 +70,7 @@ use crate::model::interface::Interface;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{GroupShape, GroupTable, KVCache, OutputPool, TablePages, table_pages};
+use crate::storage::{GroupShape, GroupTable, OutputPool, PrefixCache, TablePages, table_pages};
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 
@@ -97,7 +97,7 @@ struct Expert<'a> {
 const CANDIDATES: usize = 1 << 16;
 
 /// The import path of the runner's Python half.
-const RUNNER: &str = "uniserve_models.runner.diffusion_lm.DiffusionLMRunner";
+const RUNNER: &str = "uniserve.runner.diffusion_lm.DiffusionLMRunner";
 
 /// The methods of the Python half the rank calls.
 struct Functions {
@@ -882,7 +882,7 @@ impl DiffusionLMRunner {
     /// units are startup work this call issues itself, between jobs.
     fn warm(
         &mut self,
-        kv: &mut KVCache,
+        prefix_cache: &mut PrefixCache,
         experts: Option<&Arc<ExpertUnion>>,
         lanes: &JobQueues,
     ) -> Result<()> {
@@ -891,13 +891,13 @@ impl DiffusionLMRunner {
             .iter()
             .map(|group| group.units_per_page as usize)
             .sum();
-        let scratch = kv.scratch_units(
+        let scratch = prefix_cache.scratch_units(
             (self.shapes.capacity() * row_units) as u32,
             self.stream.as_ref(),
         )?;
         let first = *scratch.units().start() as usize;
         let warmed = self.warm_shapes(first, row_units, experts, lanes);
-        let finished = scratch.finish(kv, self.stream.as_ref());
+        let finished = scratch.finish(prefix_cache, self.stream.as_ref());
         warmed.and(finished)?;
         if let Some(stream) = &self.stream {
             stream.synchronize()?;
@@ -1150,14 +1150,16 @@ impl WarmupHooks for DiffusionLMWarmup {
             return Ok(());
         };
         for runner in parts.diffusion_lm {
-            let kv = storage
-                .kv
+            let prefix_cache = storage
+                .prefix_cache
                 .as_mut()
-                .ok_or(Error::State("diffusion LM warmup requires a KV cache"))?;
-            runner.warm(kv, experts.as_ref(), &lanes).map_err(|error| {
-                WorkerError::classify(error, Some("diffusion LM graph capture"))
-                    .with_phase("warmup")
-            })?;
+                .ok_or(Error::State("diffusion LM warmup requires a prefix cache"))?;
+            runner
+                .warm(prefix_cache, experts.as_ref(), &lanes)
+                .map_err(|error| {
+                    WorkerError::classify(error, Some("diffusion LM graph capture"))
+                        .with_phase("warmup")
+                })?;
         }
         Ok(())
     }

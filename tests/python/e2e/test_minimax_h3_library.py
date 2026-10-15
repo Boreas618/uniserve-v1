@@ -15,9 +15,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve_models import catalog as models
-from uniserve_models.minimax_h3 import processing, weight_config
-from uniserve_models.minimax_h3.generation import generate
+from uniserve.models import registry as models
+from uniserve.models.minimax_h3 import processing, weight_config
+from uniserve.models.minimax_h3.generation import generate
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 

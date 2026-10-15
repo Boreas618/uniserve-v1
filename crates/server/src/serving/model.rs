@@ -458,7 +458,7 @@ impl ModelConfig {
             ModelParameters::SenseNova(_) => SenseNovaProfile::runtime_limits(model_dtype),
             ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
             // A readout prefills text and encoded images and denoises its
-            // canvases once over them. An image writes one KV entry per soft
+            // canvases once over them. An image writes one cache entry per soft
             // token; the worker's encoder entries bound the feature bytes and
             // the number of cached encodings, so the model states no bound of
             // its own for either.
@@ -946,7 +946,7 @@ impl InputProcessor {
         // Each model fills its actual computation inputs in the same request.
         // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
-        let (output_processor, max_kv_tokens, image_latent_units) =
+        let (output_processor, max_cache_tokens, image_latent_units) =
             (|| -> std::result::Result<_, crate::serving::TokenizeError> {
                 let output_processor = match &self.config.parameters {
                     ModelParameters::Qwen3 => self.preprocess_qwen3_input(
@@ -1006,7 +1006,7 @@ impl InputProcessor {
                 }
                 Ok((
                     output_processor,
-                    generation.max_kv_tokens(&self.limits)?,
+                    generation.max_cache_tokens(&self.limits)?,
                     generation.image_latent_units(&self.limits)?,
                 ))
             })()
@@ -1032,7 +1032,7 @@ impl InputProcessor {
                 encoder_pin_count: generation.num_encoder_cache_entries(),
             },
             resources: ResourceAccounting {
-                expected_kv_tokens: max_kv_tokens as u64,
+                expected_cache_tokens: max_cache_tokens as u64,
                 image_latent_units,
                 encoder_cache_pins: generation.num_encoder_cache_entries(),
                 replayable: !generation.feeds_back_images(),
@@ -1149,7 +1149,7 @@ fn omni_required_features(
 }
 
 impl InputProcessor {
-    /// Renders a Qwen prompt and fills its token, sampling, and KV requirements.
+    /// Renders a Qwen prompt and fills its token, sampling, and cache requirements.
     fn preprocess_qwen3_input(
         &self,
         prompt: PromptInput,
@@ -1632,7 +1632,7 @@ mod tests {
             .unwrap();
 
         // The image's soft-token run leaves the prompt between `<|image>` and
-        // `<image|>`; the image enters there with one position and one KV
+        // `<image|>`; the image enters there with one position and one cache
         // entry per soft token, as many as the Gemma-4 processor sizes.
         let tokenizer =
             HuggingFaceTokenizer::new(&directory.path().join("tokenizer.json")).unwrap();
@@ -1645,7 +1645,7 @@ mod tests {
         };
         let soft_tokens = profile.images.soft_tokens(64, 48).unwrap();
         assert_eq!(input.num_positions, soft_tokens);
-        assert_eq!(input.encoders[0].num_kv_tokens, Some(soft_tokens));
+        assert_eq!(input.encoders[0].num_cache_tokens, Some(soft_tokens));
         let position = input.position as usize;
         assert_eq!(generation.prompt_token_ids[position - 1], image_start);
         assert_eq!(

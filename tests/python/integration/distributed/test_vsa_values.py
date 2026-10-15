@@ -13,11 +13,11 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import DeviceMesh, parallelize_
-from uniserve_models.interface import graphs
-from uniserve_models.nn import MergedColumnParallelLinear
-from uniserve_models.nn.attention import (
+from uniserve import cuda_graph
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.nn import MergedColumnParallelLinear
+from uniserve.nn.attention import (
     AttentionParallelConfig,
     ContextParallelConfig,
     Ulysses,
@@ -225,7 +225,7 @@ def _run(rank, listener):
                     rtol=2e-2,
                     atol=2e-2,
                 )
-                graph = graphs.capture(invoke, stream=stream)
+                graph = cuda_graph.capture(invoke, stream=stream)
                 hidden.mul_(0.75)
                 graph.replay()
                 expected, live = _reference(projections(), valid)

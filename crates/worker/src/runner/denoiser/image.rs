@@ -1,4 +1,4 @@
-//! KV-conditioned image denoising (`ImageDenoiser` models: BAGEL,
+//! Cache-conditioned image denoising (`ImageDenoiser` models: BAGEL,
 //! SenseNova-U1).
 //!
 //! FIXME: [`ImageDiffusion`] is the image family of `DenoiserRunner` under
@@ -10,10 +10,10 @@
 //! An [`ImageDiffusion`] runner serves one bound image denoiser. A denoising
 //! step evaluates, for every image of the batch, one row per guidance
 //! branch: the image's framed latent sequence attending (non-causally, read
-//! only) to the KV prefix its branch conditions on. Rust owns the rows'
+//! only) to the cache prefix its branch conditions on. Rust owns the rows'
 //! geometry: positions ([`ImageDenoiserLayout::positions`]), timesteps,
 //! attention pages and the graph choice; the Python half
-//! (`uniserve_models.runner.denoiser.DenoiserRunner`) gathers the rows'
+//! (`uniserve.runner.denoiser.DenoiserRunner`) gathers the rows'
 //! attention metadata on the device, evaluates the network into its
 //! predictions (`denoise`) and, per image, combines its branch predictions
 //! with the trajectory's guidance and advances its samples in place
@@ -99,7 +99,7 @@ pub struct DenoiseRow {
     pub units: u32,
     pub height: u32,
     pub width: u32,
-    /// The request slot holding the branch's KV prefix and its visible
+    /// The request slot holding the branch's cache prefix and its visible
     /// tokens.
     pub slot: u32,
     pub prefix: u32,
@@ -170,7 +170,7 @@ pub struct DiffusionStorage {
     pub samples: StorageView,
     /// The latent pool's per-slot timesteps `[slots + 1, 1]` float32.
     pub slot_timesteps: StorageView,
-    /// The KV cache's slot tables (`unit_tables`, `start_pages`,
+    /// The prefix cache's slot tables (`unit_tables`, `start_pages`,
     /// `table_shapes`), and each numerical block table's page tokens and
     /// whether it is windowed.
     pub slot_tables: Vec<(String, StorageView)>,
@@ -178,7 +178,7 @@ pub struct DiffusionStorage {
     pub windowed: Vec<i64>,
 }
 
-const RUNNER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
+const RUNNER: &str = "uniserve.runner.denoiser.DenoiserRunner";
 
 /// The Python half and its methods, each called with the runner first.
 struct Methods {
@@ -296,7 +296,7 @@ impl ImageDiffusion {
                 .slot_tables
                 .iter()
                 .find(|(table, _)| table == name)
-                .ok_or_else(|| Error::Invariant(format!("the KV cache has no {name}")))?;
+                .ok_or_else(|| Error::Invariant(format!("the prefix cache has no {name}")))?;
             Ok(Any::from(view.to_tensor()?))
         };
         let method = |name: &str| interface.import(&format!("{RUNNER}.{name}"));
@@ -808,7 +808,7 @@ impl ImageDiffusion {
     }
 }
 
-// Image latent preparation and KV-conditioned denoising batches
+// Image latent preparation and cache-conditioned denoising batches
 // (`LatentPreparation`, `Denoising`).
 //
 // A trajectory starts with latent preparation: its guidance plan opens, its
@@ -948,20 +948,19 @@ impl ImageBatch<'_> {
         ))
     }
 
-    /// The request's own conditioning KV: the export it published and its
+    /// The request's own conditioning prefix cache: the export it published and its
     /// visible extent.
     fn conditioning(&mut self, index: usize) -> Result<Coordinates> {
         let call = &self.plan.calls[index];
-        let buffer = call.kv_input.ok_or_else(|| {
-            Error::Invalid("image trajectory requires its conditioning KV".into())
+        let buffer = call.cache_input.ok_or_else(|| {
+            Error::Invalid("image trajectory requires its conditioning prefix cache".into())
         })?;
         let slot = self.calls[index].slot as u32;
-        let visible = self.calls[index].output.progress.kv_visible_len;
-        let kv =
-            self.storage.kv.as_mut().ok_or_else(|| {
-                Error::Unsupported("image trajectories require a KV cache".into())
-            })?;
-        let (tables, manager) = kv.split();
+        let visible = self.calls[index].output.progress.cache_visible_len;
+        let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
+            Error::Unsupported("image trajectories require a prefix cache".into())
+        })?;
+        let (tables, manager) = prefix_cache.split();
         let coordinates = tables.coordinates(slot, visible)?;
         manager.validate_conditioning(call.request_key, buffer, slot, visible, tables)?;
         Ok(coordinates.into())
@@ -1248,17 +1247,16 @@ impl ImageBatch<'_> {
             .chain(active.iter().map(|&index| self.calls[index].slot as u32))
             .collect();
         let units = self.parts.denoisers.units.as_ref();
-        let kv =
-            self.storage.kv.as_mut().ok_or_else(|| {
-                Error::Unsupported("image trajectories require a KV cache".into())
-            })?;
+        let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
+            Error::Unsupported("image trajectories require a prefix cache".into())
+        })?;
         let assignments: Vec<_> = plan
             .block_tables
             .iter()
             .filter(|table| slots.contains(&table.request_pool_idx))
             .cloned()
             .collect();
-        kv.install(&assignments, stream)?;
+        prefix_cache.install(&assignments, stream)?;
         let new_units: Vec<u32> = plan
             .new_cache_units
             .iter()
@@ -1267,9 +1265,9 @@ impl ImageBatch<'_> {
             .collect();
         if !new_units.is_empty() {
             let column = units.ok_or_else(|| {
-                Error::Unsupported("image trajectories reset KV units on their stream".into())
+                Error::Unsupported("image trajectories reset cache units on their stream".into())
             })?;
-            kv.recycle(&new_units, column, stream)?;
+            prefix_cache.recycle(&new_units, column, stream)?;
         }
 
         for (row, &call) in forward.call_indices.iter().enumerate() {
@@ -1280,7 +1278,7 @@ impl ImageBatch<'_> {
             let key = plan.calls[index].request_key;
             let slot = forward.request_pool_indices[row];
             let own = self.calls[index].slot as u32;
-            let tables = kv.tables_mut();
+            let tables = prefix_cache.tables_mut();
             if slot != own {
                 if forward.seq_lens[row] - forward.query_lens[row] > tables.allocated_length(slot) {
                     return Err(Error::Invalid(
@@ -1290,7 +1288,7 @@ impl ImageBatch<'_> {
                 tables.retain_prefix(key, slot);
             }
             // Readers retain their prefix, writers also their query tokens.
-            let length = u64::from(if forward.write_kv[row] {
+            let length = u64::from(if forward.write_cache[row] {
                 forward.seq_lens[row]
             } else {
                 forward.seq_lens[row] - forward.query_lens[row]
@@ -1303,8 +1301,11 @@ impl ImageBatch<'_> {
                     spans.extend(table.spans(start, length - start)?);
                 }
             }
-            kv.manager()
-                .retain_execution(key, &spans, std::sync::Arc::clone(&self.retirement));
+            prefix_cache.manager().retain_execution(
+                key,
+                &spans,
+                std::sync::Arc::clone(&self.retirement),
+            );
         }
         Ok(descriptors)
     }
@@ -1606,10 +1607,10 @@ impl ImageBatch<'_> {
                     .get(&trajectory.index)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                let kv = self.storage.kv.as_ref().ok_or_else(|| {
-                    Error::Unsupported("image trajectories require a KV cache".into())
+                let prefix_cache = self.storage.prefix_cache.as_ref().ok_or_else(|| {
+                    Error::Unsupported("image trajectories require a prefix cache".into())
                 })?;
-                let tables = kv.tables();
+                let tables = prefix_cache.tables();
                 let open = self
                     .parts
                     .trajectories
@@ -1641,10 +1642,10 @@ impl ImageBatch<'_> {
                 let text = text.as_deref_mut().ok_or_else(|| {
                     Error::Unsupported("guidance prefixes require the text image".into())
                 })?;
-                let kv = self.storage.kv.as_mut().ok_or_else(|| {
-                    Error::Unsupported("image trajectories require a KV cache".into())
+                let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
+                    Error::Unsupported("image trajectories require a prefix cache".into())
                 })?;
-                let (tables, manager) = kv.split();
+                let (tables, manager) = prefix_cache.split();
                 let prefixes: Vec<(u32, &[u32])> = fills
                     .iter()
                     .map(|(_, slot, tokens)| (*slot, &tokens[..]))
@@ -1699,10 +1700,10 @@ impl ImageBatch<'_> {
                 continue;
             }
             let key = plan.calls[trajectory.index].request_key;
-            let kv = self.storage.kv.as_mut().ok_or_else(|| {
-                Error::Unsupported("image trajectories require a KV cache".into())
+            let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
+                Error::Unsupported("image trajectories require a prefix cache".into())
             })?;
-            kv.release_prefixes(key, &slots, job.on(stream.as_ref()))?;
+            prefix_cache.release_prefixes(key, &slots, job.on(stream.as_ref()))?;
         }
         if let Some(text) = text {
             text.order_mut().record(job.on(stream.as_ref()))?;
@@ -1768,13 +1769,14 @@ impl ImageBatch<'_> {
             }
         }
         for (_, rows, owners) in &groups {
-            let kv = self.storage.kv.as_ref().ok_or_else(|| {
-                Error::Unsupported("image trajectories require a KV cache".into())
+            let prefix_cache = self.storage.prefix_cache.as_ref().ok_or_else(|| {
+                Error::Unsupported("image trajectories require a prefix cache".into())
             })?;
             let diffusion = self.parts.diffusion_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
             })?;
-            let predicted = diffusion.predict(rows, kv.tables(), |_, _, _| Ok(()), job)?;
+            let predicted =
+                diffusion.predict(rows, prefix_cache.tables(), |_, _, _| Ok(()), job)?;
             let mode = predicted.mode.as_str();
             *stats.mode_counts.entry(mode.into()).or_default() += 1;
             if predicted.mode == GraphMode::Replay {

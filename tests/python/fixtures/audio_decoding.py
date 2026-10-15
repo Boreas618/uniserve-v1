@@ -5,9 +5,9 @@ from types import MappingProxyType
 import torch
 from torch import nn
 
-from uniserve_models.minimax_h3 import audio_vae
-from uniserve_models.minimax_h3.decoding import AudioDecoder
-from uniserve_models.model import ComponentEntry, EntryPoint
+from uniserve.models import ComponentEntry, EntryPoint
+from uniserve.models.minimax_h3 import audio_vae
+from uniserve.models.minimax_h3.decoding import AudioDecoder
 
 # A decoder small enough to run on CPU whose halo is a few latent frames, so a
 # short track still exercises a partial context window rather than the whole

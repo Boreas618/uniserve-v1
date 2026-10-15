@@ -9,14 +9,14 @@ import torch
 from PIL import Image
 
 from tests.python.fixtures.stub import load_stub
-from uniserve_models import interface
-from uniserve_models.bindings.context import Scratch
-from uniserve_models.media.pixels import (
+from uniserve import interface
+from uniserve.bindings.context import Scratch
+from uniserve.media.pixels import (
     prepare_host_image,
     prepare_tensor_image,
 )
-from uniserve_models.model import VisionInput
-from uniserve_models.runner.encoder import EncoderRunner
+from uniserve.models import VisionInput
+from uniserve.runner.encoder import EncoderRunner
 
 pytestmark = pytest.mark.unit
 

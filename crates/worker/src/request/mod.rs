@@ -15,15 +15,15 @@ use crate::{Error, Result};
 
 /// Accepted coordinates of a state-consuming call.
 ///
-/// KV lengths and logical positions count tokens. `flow_step` counts solver
+/// Cache lengths and logical positions count tokens. `flow_step` counts solver
 /// steps; `rng_counter` counts draws in the request's sampling stream.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RequestProgress {
     pub logical_position: u64,
     pub rng_counter: u64,
     pub flow_step: u64,
-    pub kv_visible_len: u64,
-    pub kv_computed_len: u64,
+    pub cache_visible_len: u64,
+    pub cache_computed_len: u64,
     pub prompt_logits_ready: bool,
 }
 
@@ -62,8 +62,8 @@ impl Request {
             state: Mutex::new(RequestState {
                 progress: RequestProgress {
                     logical_position: prefix,
-                    kv_visible_len: prefix,
-                    kv_computed_len: prefix,
+                    cache_visible_len: prefix,
+                    cache_computed_len: prefix,
                     ..RequestProgress::default()
                 },
                 ..RequestState::default()

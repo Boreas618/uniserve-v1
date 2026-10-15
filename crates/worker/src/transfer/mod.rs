@@ -16,13 +16,13 @@ use uniserve_cuda::{DeviceGuard, Event, Stream};
 use crate::stream::Issue;
 use crate::{Completion, Error, EventPool, Outcome, Result};
 
+pub mod cache_export;
+mod cache_import;
 mod cuda_vmm;
 mod descriptor_grants;
 mod endpoint;
 pub mod exports;
 pub mod fetch;
-pub mod kv_export;
-mod kv_import;
 mod peer;
 mod pool;
 mod read;
@@ -33,11 +33,11 @@ mod spans;
 mod transport;
 pub mod vmm_pool;
 
-pub use descriptor_grants::{DescriptorGrants, fetch_descriptor};
-pub(crate) use kv_import::{CacheImporter, ImportTask, KVImportBackend, Retired};
-pub use kv_import::{
-    ImportBackend, ImportCopy, ImportEntry, ImportWorkspace, KVImport, KVImporter,
+pub use cache_import::{
+    CacheImport, ImportBackend, ImportCopy, ImportEntry, ImportWorkspace, KVImporter,
 };
+pub(crate) use cache_import::{CacheImportBackend, CacheImporter, ImportTask, Retired};
+pub use descriptor_grants::{DescriptorGrants, fetch_descriptor};
 pub use peer::{PeerExchange, PeerStorage};
 pub use read::{Read, ReadRef};
 pub use registry::{BufferRegistry, RegisteredBuffer};
@@ -52,7 +52,7 @@ pub use pool::{ReadBackend, TransferPool, TransferRead};
 /// owner that notifies them.
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
-/// The physical retirement signal of an export, a read or a KV import.
+/// The physical retirement signal of an export, a read or a cache import.
 pub type Retirement = Completion<Error, Notify>;
 
 /// A rank's shared transfer byte budget and read credits.

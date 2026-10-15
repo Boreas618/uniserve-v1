@@ -14,17 +14,17 @@ from tests.python.fixtures.distributed import (
     process_world,
     rendezvous,
 )
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import DeviceMesh, parallelize_
-from uniserve_models.model import TextSize
-from uniserve_models.nn.attention import AttentionParallelConfig, Ulysses
-from uniserve_models.nn.linear import (
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.models import TextSize
+from uniserve.nn.attention import AttentionParallelConfig, Ulysses
+from uniserve.nn.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve_models.quantization import Quantizer
+from uniserve.quantization import Quantizer
 
 pytestmark = pytest.mark.integration
 

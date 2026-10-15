@@ -28,7 +28,7 @@ use crate::config::{Device, WorkerLaunch};
 use crate::ffi::{Handle, integer_list, list, strings, texts};
 
 /// The library module that reads and loads a rank's model.
-const LOADING: &str = "uniserve_models.interface.loading";
+const LOADING: &str = "uniserve.interface.loading";
 use crate::{Error, Result};
 use components::Declarations;
 use interface::Interface;

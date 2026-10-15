@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from uniserve_models.cache import Config, State, mha
-from uniserve_models.cache.units import CacheTable, UnitPool, plan_units
-from uniserve_models.quantization import Quantizer
+from uniserve.prefix_cache import Config, State, mha
+from uniserve.prefix_cache.units import CacheTable, UnitPool, plan_units
+from uniserve.quantization import Quantizer
 
 pytestmark = pytest.mark.unit
 

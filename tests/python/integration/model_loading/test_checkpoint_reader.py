@@ -7,7 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from uniserve_models.loading import Config, checkpoint
+from uniserve.loading import Config, checkpoint
 
 pytestmark = pytest.mark.integration
 

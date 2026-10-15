@@ -1,7 +1,7 @@
 """Architecture-portable Triton provider for block-64 video sparse attention.
 
 ``block_sparse_attention`` is the numerical call behind the runtime's Triton
-VSA backend (``uniserve_models.backends.attention.vsa.triton``). It reads a
+VSA backend (``uniserve.backends.attention.vsa.triton``). It reads a
 live, device-resident block map (per head and 64-row query tile, a list of
 key tiles and its count) plus per-key-tile valid row counts, so the map can
 change between calls without host-side planning. The provider is fixed to

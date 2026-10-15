@@ -3,7 +3,7 @@
 //! A [`HostGroup`] connects every member of a rank group to every other
 //! member once, at startup, and runs small host-side collectives over those
 //! connections: barriers, byte gathers and broadcasts, and integer
-//! reductions. It carries startup agreement (page sizes, KV capacity, slot
+//! reductions. It carries startup agreement (page sizes, cache capacity, slot
 //! fits), plan comparison, warmup broadcasts and the bootstrap bytes of
 //! device communicators (NCCL unique ids, torch store addresses). Device
 //! collectives never use it.

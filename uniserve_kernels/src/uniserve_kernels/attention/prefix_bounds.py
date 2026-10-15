@@ -6,7 +6,7 @@ exclusive end of the key range a sequence-local query row may see. Reducing
 it per query tile gives the key tiles every row of the tile sees (below the
 tile minimum) and the key tiles some row sees (below the tile maximum).
 FlashAttention-4 consumes the result as block sparsity through
-``uniserve_models.backends.attention.flash_attn_4``.
+``uniserve.backends.attention.flash_attn_4``.
 """
 
 from __future__ import annotations
