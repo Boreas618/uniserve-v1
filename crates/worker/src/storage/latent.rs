@@ -148,6 +148,23 @@ impl<C> LatentExport<C> {
     }
 }
 
+impl<F, M, C> LatentExport<C>
+where
+    C: Deref<Target = Completion<F, M>>,
+{
+    /// Whether transport readers may still read this version: it is not
+    /// released, or a reader has not completed successfully (a failed or
+    /// cancelled read establishes nothing about the device).
+    fn retained(&self) -> bool {
+        let state = self.state();
+        !state.released
+            || state
+                .retirements
+                .iter()
+                .any(|completion| !completion.succeeded())
+    }
+}
+
 /// Own scheduler-assigned pages, committed trajectories and transfer access.
 /// I and S retain import/export objects at stable addresses, as Arc does.
 /// [`LatentStorage`](super::LatentStorage) holds the pages' memory.
@@ -311,12 +328,6 @@ where
     I: Deref<Target = LatentImport<T>>,
     S: Deref<Target = LatentExport<C>>,
 {
-    pub fn require_initial(&self, slot: usize, pages: &[usize]) -> Result<()> {
-        self.require_empty(slot)?;
-        self.require_owners(pages, 0, None)?;
-        self.require_writable(1, pages)
-    }
-
     /// Check the trajectory addressed by a call and return its committed bank.
     #[allow(clippy::too_many_arguments)]
     pub fn current_bank(
@@ -352,17 +363,6 @@ where
 
     pub fn next_bank(&self, slot: usize) -> u8 {
         1 - self.slots[slot].bank
-    }
-
-    pub fn require_writable(&self, bank: u8, pages: &[usize]) -> Result<()> {
-        if self.exports.values().any(|source| {
-            source.bank == bank && source.pages.iter().any(|page| pages.contains(page))
-        }) {
-            return Err(Error::Invalid(
-                "latent bank is retained by a published version".into(),
-            ));
-        }
-        Ok(())
     }
 
     /// Prepare an export before the backend constructs its numerical views.
@@ -789,17 +789,35 @@ where
     I: Deref<Target = LatentImport<T>>,
     S: Deref<Target = LatentExport<C>>,
 {
+    pub fn require_initial(&self, slot: usize, pages: &[usize]) -> Result<()> {
+        self.require_empty(slot)?;
+        self.require_owners(pages, 0, None)?;
+        self.require_writable(1, pages)
+    }
+
+    /// Fail when a version that transport readers still retain covers
+    /// `pages` of `bank`. A released version whose readers all completed
+    /// retains nothing, whether or not the pool has reaped it yet: its
+    /// readers' completions are applied by the owning thread in their own
+    /// order, and a write that waited for them may be recorded before the
+    /// next reap.
+    pub fn require_writable(&self, bank: u8, pages: &[usize]) -> Result<()> {
+        if self.exports.values().any(|source| {
+            source.bank == bank
+                && source.pages.iter().any(|page| pages.contains(page))
+                && source.retained()
+        }) {
+            return Err(Error::Invalid(
+                "latent bank is retained by a published version".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Failed or cancelled physical completions retain their pages. Logical
     /// cancellation revokes visibility; it never establishes physical reuse.
     pub fn reap(&mut self) {
-        self.exports.retain(|_, source| {
-            let state = source.state();
-            !state.released
-                || state
-                    .retirements
-                    .iter()
-                    .any(|completion| !completion.succeeded())
-        });
+        self.exports.retain(|_, source| source.retained());
         self.imports.retain(|&slot, write| {
             let state = write.state();
             if (!state.adopted && !state.released)
