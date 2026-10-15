@@ -74,7 +74,7 @@ use crate::runner::start::{
     ImageOwners, Startup as ImageStartup, reserved_bytes as image_reserved_bytes, start_video,
 };
 use crate::service::Service;
-use crate::storage::{BufferPool, CachePlan, GroupShape, PrefixCache, TensorStore};
+use crate::storage::{BufferPool, CachePlan, GroupShape, PrefixCache, ProductStore};
 use crate::stream::{CUDAStream, EventPool, Streams};
 use crate::transfer::{Capacity, TransportKind, TransportOptions, Transports};
 use crate::warmup::{Scenarios, WarmupHooks};
@@ -934,7 +934,7 @@ fn allocate_storage(
     let physical = plan.physical_buffer_pool_bytes.max(1);
     let buffer_pool =
         BufferPool::allocate(physical, physical < plan.info.buffer_pool_bytes, &devices)?;
-    let tensors = TensorStore::new(
+    let tensors = ProductStore::new(
         plan.arena.tensor_store,
         plan.arena.device_product_bytes.max(1) as usize,
         plan.info.encoder_entry_bytes.max(1) as usize,

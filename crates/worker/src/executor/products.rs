@@ -16,7 +16,7 @@
 //!
 //! A call reads products other calls published (`Call::inputs`, a
 //! predicate) and publishes its own (`Call::outputs`, a completion scalar).
-//! Products live in the rank's [`TensorStore`]: imports from other ranks
+//! Products live in the rank's [`ProductStore`]: imports from other ranks
 //! reach it before the batch executes ([`crate::executor::inputs`]), and every input
 //! is then leased from it ([`Reads`]); host codecs read some inputs in place
 //! from their shared-memory exports instead. [`bind_outputs`] reserves a
@@ -25,7 +25,7 @@
 
 use crate::executor::PendingOutput;
 use crate::ffi::Device;
-use crate::storage::{OutputPlacement, ProductBuffer, ProductExport, TensorStore};
+use crate::storage::{OutputPlacement, ProductBuffer, ProductExport, ProductStore};
 use crate::stream::Issue;
 use crate::transfer::Transports;
 use crate::transfer::exports::{self, Location};
@@ -73,7 +73,7 @@ impl Publications {
     /// otherwise. [`Self::locate`] publishes the export once that work was
     /// performed.
     pub(crate) fn issue_feature(
-        tensors: &TensorStore,
+        tensors: &ProductStore,
         transports: &Transports,
         call: &Call,
         write: &ProductBuffer,
@@ -100,7 +100,7 @@ impl Publications {
     /// joins the call's completion products.
     pub(crate) fn locate(
         &mut self,
-        tensors: &TensorStore,
+        tensors: &ProductStore,
         write: &ProductBuffer,
         export: ProductExport,
         output: &mut PendingOutput,
@@ -111,7 +111,7 @@ impl Publications {
 
     /// Check, before the commit point, that no buffer already registers
     /// different locations.
-    pub(crate) fn validate(&self, tensors: &TensorStore) -> Result<()> {
+    pub(crate) fn validate(&self, tensors: &ProductStore) -> Result<()> {
         for (buffer, locations) in &self.exports {
             tensors.validate_exports(*buffer, locations)?;
         }
@@ -120,7 +120,7 @@ impl Publications {
 
     /// Register the locations with their buffers at the commit point; they
     /// are revoked when the buffers are released.
-    pub(crate) fn register(&mut self, tensors: &TensorStore) -> Result<()> {
+    pub(crate) fn register(&mut self, tensors: &ProductStore) -> Result<()> {
         for (buffer, locations) in self.exports.drain(..) {
             tensors.register_exports(buffer, locations)?;
         }
@@ -142,7 +142,7 @@ impl Publications {
 /// The rank's product owners a batch uses.
 #[derive(Clone, Copy)]
 pub(crate) struct ProductOwners<'a> {
-    pub(crate) store: &'a TensorStore,
+    pub(crate) store: &'a ProductStore,
     pub(crate) transports: &'a Transports,
     pub(crate) events: &'a Arc<EventPool>,
 }
@@ -177,7 +177,7 @@ impl Reads {
     /// waits on its writer.
     pub(crate) fn read(
         &mut self,
-        store: &TensorStore,
+        store: &ProductStore,
         product: &TensorRef,
         consumer: CallId,
         device: Device,
@@ -194,7 +194,7 @@ impl Reads {
     }
 
     /// End every lease behind the batch's readers, which `stream` issued.
-    pub(crate) fn complete(&mut self, store: &TensorStore, stream: impl Issue) -> Result<()> {
+    pub(crate) fn complete(&mut self, store: &ProductStore, stream: impl Issue) -> Result<()> {
         let reads = std::mem::take(&mut self.leases);
         if reads.is_empty() {
             return Ok(());
@@ -221,7 +221,7 @@ pub(crate) struct OutputShape {
 
 /// Reserve a call's persistent outputs at their placement on `device`.
 pub(crate) fn bind_outputs(
-    store: &TensorStore,
+    store: &ProductStore,
     outputs: &[OutputShape],
     device: Device,
     placement: &Placement<'_>,
@@ -259,7 +259,7 @@ pub(crate) fn bind_outputs(
 
 /// Reserve a call's completion scalar in its request's relay lane.
 pub(crate) fn bind_completion(
-    store: &TensorStore,
+    store: &ProductStore,
     call: &Call,
     device: Device,
     slots: &HashMap<RequestKey, usize>,
