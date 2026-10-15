@@ -19,11 +19,9 @@ mod dlpack;
 mod function;
 mod handle;
 mod interpreter;
-mod values;
 
 pub use dlpack::{Backing, DType, Device, contiguous_strides, export};
-pub use function::{DeferredCall, Function};
+pub use function::{DeferredCall, Function, integer_list, integers, is_none, list, strings, texts};
 pub use handle::Handle;
 pub use interpreter::{Interpreter, cooperative};
 pub use tvm_ffi::{Array, Map, Shape, Tensor};
-pub use values::{integer_list, integers, is_none, list, strings, texts};
