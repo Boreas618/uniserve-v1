@@ -81,13 +81,14 @@ use uniserve_ipc::{Batch as BatchPlan, CallKind, ForwardStats, MediaCall};
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
+use crate::executor::batch::CallState;
 use crate::executor::image::ImageParts;
 use crate::executor::image::{ImageBatch, Progress, Resume, allocations};
 use crate::executor::products::Publications;
 use crate::executor::products::{OutputShape, Placement, bind_outputs};
-use crate::executor::video::MediaBatch;
 use crate::executor::video::{
-    Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
+    MediaBatch, Parts, VideoCall, bind_rows, decode_range, product_name, publish, publish_bound,
+    row_width, stream_of,
 };
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Completion, Job};
@@ -2233,20 +2234,11 @@ pub(crate) fn encode_text(
     let visual = call
         .inputs
         .first()
-        .map(|input| {
-            batch.inputs.read(
-                parts.owners().store,
-                input,
-                call.call_id,
-                batch.device,
-                issue,
-            )
-        })
+        .map(|input| batch.read(parts.owners().store, input, call.call_id, issue))
         .transpose()?;
     let write = bind_rows(
         parts,
         batch,
-        index,
         &call.outputs[0],
         vec![tokens.len() as u64, width],
         placement,
@@ -2314,17 +2306,10 @@ pub(crate) fn encode_vision(
     let tokens: u64 = blocks.iter().map(|block| block.1).sum();
     let stream = stream_of(batch)?;
     let issue = job.on(Some(&stream));
-    let patches = batch.inputs.read(
-        parts.owners().store,
-        &call.inputs[0],
-        call.call_id,
-        batch.device,
-        issue,
-    )?;
+    let patches = batch.read(parts.owners().store, &call.inputs[0], call.call_id, issue)?;
     let write = bind_rows(
         parts,
         batch,
-        index,
         &call.outputs[0],
         vec![tokens, width],
         placement,
@@ -2458,21 +2443,16 @@ fn condition_input(
 pub(crate) fn setup_conditions(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
-    batch: &MediaBatch,
-    slots: &HashMap<uniserve_ipc::RequestKey, usize>,
+    calls: &[CallState<VideoCall>],
     job: &Job,
 ) -> Result<Option<ConditionSetup>> {
     let mut inputs = Vec::new();
-    for (index, call) in plan.calls.iter().enumerate() {
-        if call.code != CallKind::Media(MediaCall::LatentEncoding) || batch.calls[index].skipped {
+    for (call, state) in plan.calls.iter().zip(calls) {
+        // A skipped call encodes nothing.
+        if call.code != CallKind::Media(MediaCall::LatentEncoding) || !state.active {
             continue;
         }
-        inputs.extend(condition_input(
-            parts,
-            plan,
-            call,
-            slots[&call.request_key],
-        )?);
+        inputs.extend(condition_input(parts, plan, call, state.slot)?);
     }
     if inputs.is_empty() {
         return Ok(None);
@@ -2523,13 +2503,7 @@ pub(crate) fn encode_conditions(
         ConditionInput::Units { rows, region, .. } => (*rows, Some(vec![region.clone(), 0..width])),
         ConditionInput::Tracks { rows, .. } => (*rows, None),
     };
-    let read = batch.inputs.read(
-        owners.store,
-        &call.inputs[0],
-        call.call_id,
-        batch.device,
-        issue,
-    )?;
+    let read = batch.read(owners.store, &call.inputs[0], call.call_id, issue)?;
     let write = bind_outputs(
         owners.store,
         &[OutputShape {
@@ -2537,13 +2511,13 @@ pub(crate) fn encode_conditions(
             shape: vec![rows, width],
             region,
         }],
-        batch.device,
+        batch.target(),
         placement,
     )?
     .into_iter()
     .next()
     .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
-    batch.calls[index].writes.push(write.clone());
+    batch.batch.writes.push(write.clone());
 
     let latent = parts
         .encoders

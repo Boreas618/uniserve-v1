@@ -212,8 +212,8 @@ pub struct WorkerBatch {
     sizing: Option<crate::request::video::Sizing>,
     /// Products and cache transfers imported from other calls.
     inputs: super::inputs::Inputs,
-    /// A media batch's calls and completion.
-    media: Option<super::video::MediaBatch>,
+    /// A video model's media batch between two of its jobs.
+    media: Option<super::video::Pending>,
     output: Option<BatchResult>,
 }
 
@@ -344,16 +344,16 @@ impl WorkerBatch {
         (&self.plan, &mut self.image, &mut self.image_inputs)
     }
 
-    /// The batch's plan, the inputs it reads in place and its video batch
-    /// state, borrowed apart.
+    /// The batch's plan, its imported inputs and its media batch between
+    /// jobs, borrowed apart.
     pub(crate) fn media_parts(
         &mut self,
     ) -> (
         &BatchPlan,
-        HashSet<uniserve_ipc::BufferId>,
-        &mut Option<super::video::MediaBatch>,
+        &super::inputs::Inputs,
+        &mut Option<super::video::Pending>,
     ) {
-        (&self.plan, self.inputs.borrowed(), &mut self.media)
+        (&self.plan, &self.inputs, &mut self.media)
     }
 
     /// The batch's imported inputs.
@@ -1515,16 +1515,6 @@ impl Backend for WorkerBackend {
             batch.running = None;
             advanced = true;
         }
-        if batch.output.is_none()
-            && let Some(media) = &mut batch.media
-        {
-            let parts = self.media_parts()?;
-            let owners = parts.owners();
-            if let Some(result) = media.poll(&batch.plan, owners, parts.requests)? {
-                batch.output = Some(result);
-                advanced = true;
-            }
-        }
         if batch.output.is_none() {
             return Ok((advanced, false));
         }
@@ -1564,17 +1554,10 @@ impl Backend for WorkerBackend {
         // Calls become pending only when a capability runtime commits them;
         // unresolved launched work cancels its pending calls. Lifecycle
         // commands hold no resource beyond their retirement.
-        let mut abandoned = batch
+        let abandoned = batch
             .running
             .take()
             .map_or(Ok(()), |running| batch::abandon(self, running));
-        if let Some(media) = &mut batch.media {
-            let closed = self.media_parts().and_then(|parts| {
-                let owners = parts.owners();
-                media.close(owners, parts.requests)
-            });
-            abandoned = abandoned.and(closed.map_err(WorkerError::from));
-        }
         // Imports the batch did not consume are abandoned; their storage
         // retires with their physical accesses.
         let closed = super::inputs::close(self, batch).map_err(WorkerError::from);

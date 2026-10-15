@@ -30,7 +30,7 @@ use crate::executor::backend::{Parts, WorkerBackend, WorkerBatch};
 use crate::executor::batch::{
     Batch, Failure, HostStage, Launched, Opening, Stage, fail, unsupported,
 };
-use crate::executor::products::Publications;
+use crate::executor::products::{ProductOwners, Publications};
 use crate::executor::transfer::latents::{self, PendingExport};
 use crate::ffi::Device;
 use crate::host::image::ImageResult;
@@ -901,7 +901,14 @@ impl HostStage for Encodings {
             .all(|encoding| encoding.task.completion.done()))
     }
 
-    fn finish(&mut self, outputs: &mut [PendingOutput]) -> Result<()> {
+    fn finish(
+        &mut self,
+        _plan: &BatchPlan,
+        _products: ProductOwners<'_>,
+        outputs: &mut [PendingOutput],
+    ) -> Result<()> {
+        // The encoded images are delivered as media; nothing is published
+        // as a product.
         for encoding in std::mem::take(&mut self.encodings) {
             let output = outputs
                 .get_mut(encoding.call)

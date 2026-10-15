@@ -17,11 +17,12 @@
 //! A call reads products other calls published (`Call::inputs`, a
 //! predicate) and publishes its own (`Call::outputs`, a completion scalar).
 //! Products live in the rank's [`ProductStore`]: imports from other ranks
-//! reach it before the batch executes ([`crate::executor::inputs`]), and every input
-//! is then leased from it ([`Reads`]); host codecs read some inputs in place
-//! from their shared-memory exports instead. [`bind_outputs`] reserves a
-//! call's outputs at their scheduler placement and [`export`] publishes a
-//! written one.
+//! reach it before the batch executes ([`crate::executor::inputs`]), and
+//! every input is then leased from it
+//! ([`crate::executor::video::MediaBatch::read`]); host codecs read some
+//! inputs in place from their shared-memory exports instead.
+//! [`bind_outputs`] reserves a call's outputs at their scheduler placement
+//! and [`export`] publishes a written one.
 
 use crate::executor::PendingOutput;
 use crate::ffi::Device;
@@ -29,11 +30,9 @@ use crate::storage::{OutputPlacement, ProductBuffer, ProductExport, ProductStore
 use crate::stream::Issue;
 use crate::transfer::Transports;
 use crate::transfer::exports::{self, Location};
-use crate::{Error, EventPool, ProductRead, Result};
-use std::collections::{HashMap, HashSet};
+use crate::{Error, Result};
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
-use uniserve_core::CallId;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, RequestKey, TensorExport, TensorRef,
@@ -139,68 +138,11 @@ impl Publications {
     }
 }
 
-/// The rank's product owners a batch uses.
+/// The rank's product owners a batch publishes through.
 #[derive(Clone, Copy)]
 pub(crate) struct ProductOwners<'a> {
     pub(crate) store: &'a ProductStore,
     pub(crate) transports: &'a Transports,
-    pub(crate) events: &'a Arc<EventPool>,
-}
-
-/// One batch's reads of products in the rank's tensor store.
-///
-/// Products other ranks published were imported and published into the
-/// store before the batch executes ([`crate::executor::inputs`]), so every input is
-/// leased like a product of this rank. Inputs a host codec reads in place
-/// from their shared-memory exports (*borrowed*) are not in the store.
-#[derive(Default)]
-pub(crate) struct Reads {
-    leases: Vec<Arc<ProductRead>>,
-    borrowed: HashSet<BufferId>,
-}
-
-impl Reads {
-    /// The reads of a batch whose `borrowed` inputs are read in place.
-    pub(crate) fn new(borrowed: HashSet<BufferId>) -> Self {
-        Self {
-            leases: Vec::new(),
-            borrowed,
-        }
-    }
-
-    /// Whether an input is read in place from its export.
-    pub(crate) fn borrowed(&self, product: &TensorRef) -> bool {
-        self.borrowed.contains(&product.buffer_id())
-    }
-
-    /// Lease one input for `consumer`, whole; what `stream` issues next
-    /// waits on its writer.
-    pub(crate) fn read(
-        &mut self,
-        store: &ProductStore,
-        product: &TensorRef,
-        consumer: CallId,
-        device: Device,
-        stream: impl Issue,
-    ) -> Result<Arc<ProductRead>> {
-        let read = store.consume(product, consumer, Some(device), stream)?;
-        self.leases.push(Arc::clone(&read));
-        if read.region().is_some() {
-            return Err(Error::Invalid(
-                "media computation requires complete input coverage".into(),
-            ));
-        }
-        Ok(read)
-    }
-
-    /// End every lease behind the batch's readers, which `stream` issued.
-    pub(crate) fn complete(&mut self, store: &ProductStore, stream: impl Issue) -> Result<()> {
-        let reads = std::mem::take(&mut self.leases);
-        if reads.is_empty() {
-            return Ok(());
-        }
-        store.complete_reads(&reads, stream, &[])
-    }
 }
 
 /// The scheduler placement of a call's outputs on this rank: buffer-pool
@@ -255,26 +197,6 @@ pub(crate) fn bind_outputs(
             shapes: Some(&shapes),
         },
     )
-}
-
-/// Reserve a call's completion scalar in its request's relay lane.
-pub(crate) fn bind_completion(
-    store: &ProductStore,
-    call: &Call,
-    device: Device,
-    slots: &HashMap<RequestKey, usize>,
-) -> Result<Option<ProductBuffer>> {
-    let Some(product) = &call.completion_output else {
-        return Ok(None);
-    };
-    let bound = store.bind_outputs(
-        &[(product.clone(), device)],
-        OutputPlacement {
-            request_slots: Some(slots),
-            ..OutputPlacement::default()
-        },
-    )?;
-    Ok(bound.into_iter().next())
 }
 
 /// Export a written product to the call's consumers. `regions` limits the
