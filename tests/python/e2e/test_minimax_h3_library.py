@@ -1,25 +1,38 @@
 """The MiniMax-H3 library generates a clip from a diffusers root eagerly.
 
 Loads the base checkpoint's text encoder, denoiser, decoders and
-post-processor on one GPU through the public loader, plans and presents a
-four-second 9:16 t2va request with the model package's planner, and runs
-``generation.generate``. The clip has the planned frames at the planned
-canvas and a stereo track covering them.
+post-processor on one GPU as a rank loads them
+(``uniserve.loading.rank``), plans and presents a four-second 9:16 t2va
+request with the model package's planner, and runs ``generation.generate``,
+which drives the runners serving uses. The clip has the planned frames at
+the planned canvas and a stereo track covering them.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pytest
 import torch
 
-from uniserve.models import registry as models
-from uniserve.models.minimax_h3 import processing, weight_config
+from tests.python.fixtures.stub import LOCAL, load_model, read_config
+from uniserve.models.minimax_h3 import processing
 from uniserve.models.minimax_h3.generation import generate
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
+
+# The components generation runs, each on this rank alone, and the module
+# paths they hold.
+_COMPONENTS = ("text_encoder", "denoiser", "video_decoder", "audio_decoder")
+_MODULES = [
+    "text_encoder",
+    "denoiser",
+    "video_decoder",
+    "video_postprocessor",
+    "audio_decoder",
+]
 
 
 def test_library_generates_a_portrait_clip() -> None:
@@ -30,21 +43,20 @@ def test_library_generates_a_portrait_clip() -> None:
         )
     transformers = pytest.importorskip("transformers")
 
-    config = models.read_config(
-        root,
-        modules=frozenset(
-            {
-                "text_encoder",
-                "denoiser",
-                "video_decoder",
-                "video_postprocessor",
-                "audio_decoder",
-            }
-        ),
+    # Serving's defaults: the checkpoint's own precision at BF16 and a
+    # 512 MiB FlashInfer workspace.
+    description = read_config(
+        stub=False,
+        path=root,
+        device="cuda:0",
+        components=json.dumps(dict.fromkeys(_COMPONENTS, LOCAL)),
     )
-    model = models.load_model(
-        config, device="cuda", weights=weight_config(config.model)
-    ).model
+    loaded = load_model(
+        description,
+        modules=_MODULES,
+        device="cuda:0",
+        workspace_size=512 << 20,
+    )
 
     plan = processing.plan_request(
         processing.Task.T2VA,
@@ -59,7 +71,7 @@ def test_library_generates_a_portrait_clip() -> None:
         "crash against the rocks below.",
     )
     generation = generate(
-        model,
+        loaded,
         prompt_token_ids=presentation.token_ids,
         num_frames=plan.num_frames,
         canvas=plan.canvas,
