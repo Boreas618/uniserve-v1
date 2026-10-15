@@ -59,9 +59,10 @@ pub use request::{Request, RequestPool, RequestProgress};
 pub use runner::ImageSetup;
 pub use runner::attention::{AttentionCapacity, AttentionMetadata, ROW_SECTIONS, pack_rows};
 pub use runner::decoder::{DecodeImage, DecoderRunner};
+pub use runner::denoiser::DenoiserRunner;
 pub use runner::denoiser::image::{
-    ConditionRow, DenoiseRow, DiffusionCapacity, DiffusionShape, DiffusionStorage, ImageDiffusion,
-    IntegrateRow, Predicted,
+    ConditionRow, DenoiseRow, DiffusionCapacity, DiffusionShape, DiffusionStorage, IntegrateRow,
+    Predicted,
 };
 pub use runner::denoiser::image_model::ImageDenoiserLayout;
 pub use runner::encoder::{

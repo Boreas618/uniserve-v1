@@ -1,16 +1,14 @@
 //! Cache-conditioned image denoising (`ImageDenoiser` models: BAGEL,
-//! SenseNova-U1).
+//! SenseNova-U1): the image family of [`DenoiserRunner`].
 //!
-//! FIXME: [`ImageDiffusion`] is the image family of `DenoiserRunner` under
-//! its own type. Its forward is driven per row with a trajectory plan
-//! handle (`plan`, `predict`, `integrate`), the video family's per layout
-//! with slot state; the two become one type once the image forward reads
-//! per-slot state rows.
-//!
-//! An [`ImageDiffusion`] runner serves one bound image denoiser. A denoising
-//! step evaluates, for every image of the batch, one row per guidance
-//! branch: the image's framed latent sequence attending (non-causally, read
-//! only) to the cache prefix its branch conditions on. Rust owns the rows'
+//! An image denoiser's runner serves one bound image denoiser
+//! ([`ImageDenoiser`] holds the state only this family has). Its forward
+//! is driven per row with the trajectory's guidance plan (`plan`,
+//! `predict`, `integrate`), where the video family's is driven per layout
+//! with slot state. A denoising step evaluates, for every image of the
+//! batch, one row per guidance branch: the image's framed latent sequence
+//! attending (non-causally, read only) to the cache prefix its branch
+//! conditions on. Rust owns the rows'
 //! geometry: positions ([`ImageDenoiserLayout::positions`]), timesteps,
 //! attention pages and the graph choice; the Python half
 //! (`uniserve.runner.denoiser.DenoiserRunner`) gathers the rows'
@@ -53,14 +51,14 @@ use crate::ffi::{DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Completion, Job, Value};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
-use crate::profiling::kernels::KernelRecord;
 use crate::request::diffusion::{BranchSet, BranchSource, GuidancePlan, Prefix};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionMetadata};
 use crate::runner::causal_lm::{CausalLMRunners, Step};
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
-use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
+use crate::runner::denoiser::{DENOISER, DenoiserRunner, Family, Methods};
+use crate::runner::methods::{Argument, MethodCall};
 use crate::storage::AttentionRow;
 use crate::storage::LatentUpdate;
 use crate::storage::PrefixCache;
@@ -180,33 +178,17 @@ pub struct DiffusionStorage {
     pub windowed: Vec<i64>,
 }
 
-const RUNNER: &str = "uniserve.runner.denoiser.DenoiserRunner";
-
-/// The Python half and its methods, each called with the runner first.
-struct Methods {
-    runner: Handle,
+/// An image denoiser's state: the columns its forwards stage, their
+/// attention metadata and the graphs of its denoising steps.
+pub(crate) struct ImageDenoiser {
+    /// `DenoiserRunner.plan`, `plan_denoise` and `step`, which only an
+    /// image denoiser has.
     plan: Function,
-    draw_noise: Function,
-    prepare_latents: Function,
-    denoise: Function,
     plan_denoise: Function,
-    encode_conditions: Function,
     step: Function,
-    kernels: Function,
-    close: Function,
     /// Whether an attention operator plans each launch on the host.
     plans_attention: bool,
-    /// Captures a forward between its begin and end.
-    capture: GraphFunctions,
-}
-
-/// The runner of one bound image denoiser.
-pub struct ImageDiffusion {
-    owner: String,
     layout: ImageDenoiserLayout,
-    device: Device,
-    stream: Option<Stream>,
-    methods: Methods,
     capacity: DiffusionCapacity,
     attention: AttentionMetadata,
     positions: StorageView,
@@ -214,7 +196,7 @@ pub struct ImageDiffusion {
     /// One image's initial noise, `[P, width]` in the samples' dtype: the
     /// library's seeded draw fills it and `prepare_latents` reads it.
     noise: StorageView,
-    graphs: GraphTable<DiffusionShape>,
+    pub(super) graphs: GraphTable<DiffusionShape>,
     capturing: bool,
 }
 
@@ -239,11 +221,12 @@ fn bytes<T: Copy>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
 
-impl ImageDiffusion {
-    /// Allocate the runner's columns and construct the Python half of the
-    /// denoiser `setup` names over the prefix cache `cache`. Every step and
-    /// sample update runs on the setup's stream.
-    pub fn new(
+impl DenoiserRunner {
+    /// The runner of an image model's denoiser: allocate its columns and
+    /// construct the Python half of the denoiser `setup` names over the
+    /// prefix cache `cache`. Every step and sample update runs on the
+    /// setup's stream.
+    pub fn image(
         setup: &ImageSetup<'_>,
         cache: &Handle,
         layout: ImageDenoiserLayout,
@@ -300,7 +283,7 @@ impl ImageDiffusion {
                 .ok_or_else(|| Error::Invariant(format!("the prefix cache has no {name}")))?;
             Ok(view.handle()?.to_any())
         };
-        let method = |name: &str| Interpreter::import(&format!("{RUNNER}.{name}"));
+        let method = |name: &str| Interpreter::import(&format!("{DENOISER}.{name}"));
         let mut arguments = setup.arguments();
         arguments.extend([
             cache.to_any(),
@@ -320,58 +303,45 @@ impl ImageDiffusion {
         let plans_attention = method("plans_attention")?.call_as::<bool>(&[runner.view()])?;
         let capture = GraphFunctions::import()?;
         Ok(Self {
-            graphs: GraphTable::new(owner.clone(), capture.release.clone()),
-            methods: Methods {
-                runner,
+            family: Family::Image(Box::new(ImageDenoiser {
                 plan: method("plan")?,
-                draw_noise: method("draw_noise")?,
-                prepare_latents: method("prepare_latents")?,
-                denoise: method("denoise")?,
                 plan_denoise: method("plan_denoise")?,
-                encode_conditions: method("encode_conditions")?,
                 step: method("step")?,
-                kernels: method("kernels")?,
-                close: method("close")?,
                 plans_attention,
-                capture,
-            },
+                layout,
+                capacity,
+                attention,
+                positions,
+                timesteps,
+                noise,
+                graphs: GraphTable::new(owner.clone(), capture.release.clone()),
+                capturing: false,
+            })),
+            methods: Methods::import(runner)?,
+            capture,
             owner,
-            layout,
             device,
             stream,
-            capacity,
-            attention,
-            positions,
-            timesteps,
-            noise,
-            capturing: false,
         })
     }
 
-    pub fn layout(&self) -> &ImageDenoiserLayout {
-        &self.layout
+    /// An image denoiser's layout.
+    pub fn layout(&self) -> Result<&ImageDenoiserLayout> {
+        Ok(&self.family.image()?.layout)
     }
 
-    pub fn device(&self) -> Device {
-        self.device
-    }
-
-    /// The runner's stream; `None` on the host.
-    pub fn stream(&self) -> Option<&Stream> {
-        self.stream.as_ref()
-    }
-
-    pub fn capacity(&self) -> &DiffusionCapacity {
-        &self.capacity
+    /// An image denoiser's column capacity.
+    pub fn capacity(&self) -> Result<&DiffusionCapacity> {
+        Ok(&self.family.image()?.capacity)
     }
 
     /// Record the call that makes the guidance plan of an admitted image's
     /// trajectory. The plan is a host computation of the library, so it is
     /// an operation of the job like the forward's other eager calls; the
     /// job's completion carries what it returned ([`Self::planned`]).
-    pub(crate) fn plan(&self, image: &ImageParams, job: &Job) {
+    pub(crate) fn plan(&self, image: &ImageParams, job: &Job) -> Result<()> {
         job.call_values(MethodCall::new(
-            &self.methods.plan,
+            &self.family.image()?.plan,
             vec![
                 Argument::Handle(self.methods.runner.clone()),
                 Argument::Integer(i64::from(image.steps)),
@@ -384,6 +354,7 @@ impl ImageDiffusion {
                 Argument::Float(f64::from(image.cfg_renorm_min)),
             ],
         ));
+        Ok(())
     }
 
     /// The guidance plan of an image of `params` from what its plan call
@@ -394,7 +365,7 @@ impl ImageDiffusion {
         params: Arc<ImageParams>,
         values: Vec<Value>,
     ) -> Result<GuidancePlan> {
-        let name = self.methods.plan.name();
+        let name = self.family.image()?.plan.name();
         let steps = usize::from(params.steps);
         let Ok([timesteps, Value::Integers(masks)]) = <[Value; 2]>::try_from(values) else {
             return Err(Error::Interface(format!(
@@ -442,7 +413,7 @@ impl ImageDiffusion {
         job: &Job,
     ) -> Result<()> {
         let runner = Argument::Handle(self.methods.runner.clone());
-        let noise = Argument::Tensor(self.noise.clone());
+        let noise = Argument::Tensor(self.family.image()?.noise.clone());
         job.call(MethodCall::new(
             &self.methods.draw_noise,
             vec![
@@ -470,77 +441,6 @@ impl ImageDiffusion {
         Ok(())
     }
 
-    /// Write each row's positions and timestep into the columns; returns
-    /// the rows' token count and prediction offsets.
-    fn stage_rows(
-        &self,
-        rows: impl Iterator<Item = (u32, u32, u32, [Vec<i64>; 3], f32)>,
-        stream: impl Issue,
-    ) -> Result<(usize, Vec<u32>, Vec<[i64; 7]>)> {
-        let tokens_capacity = self.capacity.tokens;
-        let mut axes: [Vec<i64>; 3] = Default::default();
-        let mut times = Vec::new();
-        let mut offsets = Vec::new();
-        let mut described = Vec::new();
-        let mut predicted = 0_u32;
-        for (sample, height, width, positions, timestep) in rows {
-            let units = self.layout.latent_rows(height, width)?;
-            let token = axes[0].len();
-            let count = positions[0].len();
-            for (axis, values) in axes.iter_mut().zip(positions) {
-                axis.extend(values);
-            }
-            described.push([
-                i64::from(sample),
-                i64::from(units),
-                i64::from(height),
-                i64::from(width),
-                token as i64,
-                count as i64,
-                i64::from(predicted),
-            ]);
-            offsets.push(predicted);
-            times.push(timestep);
-            predicted += units;
-        }
-        let tokens = axes[0].len();
-        if described.len() > self.capacity.rows
-            || tokens > tokens_capacity
-            || predicted as usize > self.capacity.units
-        {
-            return Err(Error::Invalid(format!(
-                "{}: {} image rows of {tokens} tokens exceed the denoiser's columns",
-                self.owner,
-                described.len()
-            )));
-        }
-        for (axis, values) in axes.iter().enumerate() {
-            self.positions
-                .select(0, axis as i64)?
-                .upload(bytes(values), stream)?;
-        }
-        self.timesteps.upload(bytes(&times), stream)?;
-        Ok((tokens, offsets, described))
-    }
-
-    /// The arguments of the Python half's `denoise`, `plan_denoise` and
-    /// `encode_conditions` for staged rows and their staged attention
-    /// metadata.
-    fn arguments(&self, rows: &[[i64; 7]]) -> Vec<Argument> {
-        let attention = &self.attention;
-        vec![
-            Argument::Handle(self.methods.runner.clone()),
-            Argument::Tensor(attention.row_columns().clone()),
-            Argument::Tensor(self.positions.clone()),
-            Argument::Tensor(self.timesteps.clone()),
-            Argument::Integers(rows.iter().flatten().copied().collect()),
-            Argument::Integers(attention.queries.clone()),
-            Argument::Integers(attention.prefixes.clone()),
-            Argument::Integers(attention.starts.clone()),
-            Argument::Integers(attention.widths.clone()),
-        ]
-    }
-
     /// Evaluate the denoising rows of one step. Rows of one image share
     /// samples; their attention reads `prefix_cache`'s pages.
     pub(crate) fn predict(
@@ -551,11 +451,13 @@ impl ImageDiffusion {
     ) -> Result<Predicted> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
+        let image = self.family.image_mut()?;
         let positions = rows
             .iter()
-            .map(|row| self.layout.positions(row.height, row.width, row.temporal))
+            .map(|row| image.layout.positions(row.height, row.width, row.temporal))
             .collect::<Result<Vec<_>>>()?;
-        let (_, offsets, described) = self.stage_rows(
+        let (_, offsets, described) = image.stage_rows(
+            &self.owner,
             rows.iter().zip(positions).map(|(row, positions)| {
                 (row.sample, row.height, row.width, positions, row.timestep)
             }),
@@ -574,17 +476,18 @@ impl ImageDiffusion {
 
         // A captured shape is launched when the rows match it exactly.
         let captured = match DiffusionShape::of(rows) {
-            Some(shape) if self.capturing && self.graphs.contains(&shape, None) => Some(shape),
+            Some(shape) if image.capturing && image.graphs.contains(&shape, None) => Some(shape),
             _ => None,
         };
         let widths = captured
             .as_ref()
-            .map(|_| self.capacity.graph_widths.clone());
-        self.attention
+            .map(|_| image.capacity.graph_widths.clone());
+        image
+            .attention
             .stage(&attention, prefix_cache, widths.as_deref(), issue)?;
-        let arguments = self.arguments(&described);
+        let arguments = image.arguments(&self.methods.runner, &described);
         let graph = match (&captured, &stream) {
-            (Some(shape), Some(_)) => match self.graphs.lookup(shape, None)? {
+            (Some(shape), Some(_)) => match image.graphs.lookup(shape, None)? {
                 Lookup::Replay(graph) => Some(graph),
                 Lookup::Capture => None,
             },
@@ -592,8 +495,8 @@ impl ImageDiffusion {
         };
         let mode = match graph {
             Some(graph) => {
-                if self.methods.plans_attention {
-                    job.call(MethodCall::new(&self.methods.plan_denoise, arguments));
+                if image.plans_attention {
+                    job.call(MethodCall::new(&image.plan_denoise, arguments));
                 }
                 issue.launch(graph)?;
                 GraphMode::Replay
@@ -603,13 +506,13 @@ impl ImageDiffusion {
                 GraphMode::Eager
             }
         };
-        self.graphs.record(mode);
+        image.graphs.record(mode);
         Ok(Predicted { mode, offsets })
     }
 
     /// Write the K/V of latent images inserted as conditioning into
     /// `prefix_cache`, every write checked against its live accesses.
-    pub(crate) fn condition(
+    pub(crate) fn condition_latents(
         &mut self,
         rows: &[ConditionRow],
         prefix_cache: &mut PrefixCache,
@@ -617,22 +520,25 @@ impl ImageDiffusion {
     ) -> Result<()> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
+        let image = self.family.image_mut()?;
         let positions = rows
             .iter()
             .map(|row| {
-                self.layout
+                image
+                    .layout
                     .conditioning_positions(row.height, row.width, row.position)
             })
             .collect::<Result<Vec<_>>>()?;
         for row in rows {
-            let units = self.layout.latent_rows(row.height, row.width)?;
-            if row.features.shape() != [i64::from(units), i64::from(self.layout.width())] {
+            let units = image.layout.latent_rows(row.height, row.width)?;
+            if row.features.shape() != [i64::from(units), i64::from(image.layout.width())] {
                 return Err(Error::Invalid(
                     "state latent does not match the declared image dimensions".into(),
                 ));
             }
         }
-        let (_, _, described) = self.stage_rows(
+        let (_, _, described) = image.stage_rows(
+            &self.owner,
             rows.iter()
                 .zip(positions)
                 .map(|(row, positions)| (0, row.height, row.width, positions, 0.0)),
@@ -648,9 +554,10 @@ impl ImageDiffusion {
                 write: true,
             })
             .collect();
-        self.attention
+        image
+            .attention
             .stage(&attention, prefix_cache, None, issue)?;
-        let mut arguments = self.arguments(&described);
+        let mut arguments = image.arguments(&self.methods.runner, &described);
         // Each row's features follow the forward's tensors as a tensor of
         // their own.
         arguments.extend(
@@ -663,9 +570,9 @@ impl ImageDiffusion {
 
     /// Combine each image's branch predictions and advance its samples by
     /// one solver step, on the sample stream.
-    pub(crate) fn integrate(&self, rows: &[IntegrateRow], job: &Job) {
+    pub(crate) fn integrate(&self, rows: &[IntegrateRow], job: &Job) -> Result<()> {
         if rows.is_empty() {
-            return;
+            return Ok(());
         }
         let mut arguments = vec![
             Argument::Handle(self.methods.runner.clone()),
@@ -707,33 +614,36 @@ impl ImageDiffusion {
                 .map(|row| row.params.cfg_renorm_type.as_str().to_owned())
                 .collect(),
         ));
-        job.call(MethodCall::new(&self.methods.step, arguments));
+        job.call(MethodCall::new(&self.family.image()?.step, arguments));
+        Ok(())
     }
 
-    /// Capture the shape of `rows` after an eager evaluation of them (its
-    /// warmup), which gathered the geometry the graph reads. `pools` holds
-    /// the owner's allocator pool on the runner's device and one on each
-    /// other device the network's modules run on (a generation tower).
-    /// `check` runs after the capture (the graph storage budget); a failed
-    /// check releases it.
-    pub fn capture(
+    /// Capture the denoising step that evaluates `rows` after an eager
+    /// evaluation of them (its warmup), which gathered the geometry the
+    /// graph reads. `pools` holds the owner's allocator pool on the
+    /// runner's device and one on each other device the network's modules
+    /// run on (a generation tower). `check` runs after the capture (the
+    /// graph storage budget); a failed check releases it.
+    pub fn capture_step(
         &mut self,
         rows: &[DenoiseRow],
         prefix_cache: &mut PrefixCache,
         pools: &[Arc<GraphPool<Handle>>],
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let image = self.family.image_mut()?;
         let shape = DiffusionShape::of(rows).ok_or_else(|| {
             Error::Invalid("a captured denoising step evaluates rows of one image size".into())
         })?;
-        if self.graphs.contains(&shape, None) {
+        if image.graphs.contains(&shape, None) {
             return Ok(());
         }
         let positions = rows
             .iter()
-            .map(|row| self.layout.positions(row.height, row.width, row.temporal))
+            .map(|row| image.layout.positions(row.height, row.width, row.temporal))
             .collect::<Result<Vec<_>>>()?;
-        let (_, _, described) = self.stage_rows(
+        let (_, _, described) = image.stage_rows(
+            &self.owner,
             rows.iter().zip(positions).map(|(row, positions)| {
                 (row.sample, row.height, row.width, positions, row.timestep)
             }),
@@ -749,14 +659,14 @@ impl ImageDiffusion {
                 write: false,
             })
             .collect();
-        self.attention.stage(
+        image.attention.stage(
             &attention,
             prefix_cache,
-            Some(&self.capacity.graph_widths),
+            Some(&image.capacity.graph_widths),
             self.stream.as_ref(),
         )?;
         // The warmup evaluation, then the capture of the same forward.
-        let arguments = self.arguments(&described);
+        let arguments = image.arguments(&self.methods.runner, &described);
         MethodCall::new(&self.methods.denoise, arguments.clone()).invoke()?;
         let (Some(ordinal), Some(stream)) = (self.device.cuda_index(), &self.stream) else {
             return Err(Error::Invariant(
@@ -772,7 +682,7 @@ impl ImageDiffusion {
             .filter(|pool| pool.device != ordinal)
             .map(|pool| (pool.device, pool.value.clone()))
             .collect();
-        let capture = &self.methods.capture;
+        let capture = &self.capture;
         let denoise = MethodCall::new(&self.methods.denoise, arguments);
         let graph =
             capture.capture_with_peers(&pool.value, &peers, stream.raw(), ordinal, || {
@@ -784,46 +694,89 @@ impl ImageDiffusion {
             }
             return Err(error);
         }
-        self.graphs.insert(shape, None, graph)?;
-        self.capturing = true;
+        image.graphs.insert(shape, None, graph)?;
+        image.capturing = true;
         Ok(())
     }
 
-    /// Graphs captured so far.
-    pub fn captured(&self) -> usize {
-        self.graphs.len()
+    /// The graph pool's identity: the address of an image denoiser's
+    /// positions column, which no other runner shares.
+    pub fn graph_key(&self) -> Result<usize> {
+        Ok(self.family.image()?.positions.address() as usize)
+    }
+}
+
+impl ImageDenoiser {
+    /// Write each row's positions and timestep into the columns; returns
+    /// the rows' token count and prediction offsets. `owner` names the
+    /// runner in errors.
+    fn stage_rows(
+        &self,
+        owner: &str,
+        rows: impl Iterator<Item = (u32, u32, u32, [Vec<i64>; 3], f32)>,
+        stream: impl Issue,
+    ) -> Result<(usize, Vec<u32>, Vec<[i64; 7]>)> {
+        let tokens_capacity = self.capacity.tokens;
+        let mut axes: [Vec<i64>; 3] = Default::default();
+        let mut times = Vec::new();
+        let mut offsets = Vec::new();
+        let mut described = Vec::new();
+        let mut predicted = 0_u32;
+        for (sample, height, width, positions, timestep) in rows {
+            let units = self.layout.latent_rows(height, width)?;
+            let token = axes[0].len();
+            let count = positions[0].len();
+            for (axis, values) in axes.iter_mut().zip(positions) {
+                axis.extend(values);
+            }
+            described.push([
+                i64::from(sample),
+                i64::from(units),
+                i64::from(height),
+                i64::from(width),
+                token as i64,
+                count as i64,
+                i64::from(predicted),
+            ]);
+            offsets.push(predicted);
+            times.push(timestep);
+            predicted += units;
+        }
+        let tokens = axes[0].len();
+        if described.len() > self.capacity.rows
+            || tokens > tokens_capacity
+            || predicted as usize > self.capacity.units
+        {
+            return Err(Error::Invalid(format!(
+                "{owner}: {} image rows of {tokens} tokens exceed the denoiser's columns",
+                described.len()
+            )));
+        }
+        for (axis, values) in axes.iter().enumerate() {
+            self.positions
+                .select(0, axis as i64)?
+                .upload(bytes(values), stream)?;
+        }
+        self.timesteps.upload(bytes(&times), stream)?;
+        Ok((tokens, offsets, described))
     }
 
-    /// The graph pool's identity: the address of the runner's positions
-    /// column, which no other runner shares.
-    pub fn graph_key(&self) -> usize {
-        self.positions.address() as usize
-    }
-
-    /// Refuse further captures: serving replays what startup captured.
-    pub fn seal(&mut self) {
-        self.graphs.seal();
-    }
-
-    /// Release the runner's graphs; the caller drained its streams.
-    pub fn close(&mut self, aborted: bool) -> Result<()> {
-        let graphs = self.graphs.close(aborted);
-        let flag = Any::from(aborted);
-        graphs.and(
-            self.methods
-                .close
-                .invoke(&[self.methods.runner.view(), (&flag).into()]),
-        )
-    }
-
-    /// The calls that list the kernels the denoiser's operators selected.
-    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
-        vec![kernels_call(&self.methods.kernels, &self.methods.runner)]
-    }
-
-    /// The kernels the denoiser's operators selected.
-    pub fn kernels(&self) -> Result<Vec<KernelRecord>> {
-        list_kernels(self.kernel_calls())
+    /// The arguments of the Python half `runner`'s `denoise`,
+    /// `plan_denoise` and `encode_conditions` for staged rows and their
+    /// staged attention metadata.
+    fn arguments(&self, runner: &Handle, rows: &[[i64; 7]]) -> Vec<Argument> {
+        let attention = &self.attention;
+        vec![
+            Argument::Handle(runner.clone()),
+            Argument::Tensor(attention.row_columns().clone()),
+            Argument::Tensor(self.positions.clone()),
+            Argument::Tensor(self.timesteps.clone()),
+            Argument::Integers(rows.iter().flatten().copied().collect()),
+            Argument::Integers(attention.queries.clone()),
+            Argument::Integers(attention.prefixes.clone()),
+            Argument::Integers(attention.starts.clone()),
+            Argument::Integers(attention.widths.clone()),
+        ]
     }
 }
 
@@ -845,7 +798,7 @@ impl ImageDiffusion {
 pub(crate) fn image_placement(
     image: &ImageParts<'_>,
 ) -> Result<(Option<i32>, Option<Stream>, usize)> {
-    let runner = image.diffusion().ok_or_else(|| {
+    let runner = image.denoiser().ok_or_else(|| {
         Error::Unsupported("image trajectories are served by an image denoiser".into())
     })?;
     let stream = runner.stream().cloned();
@@ -946,9 +899,9 @@ impl ImageBatch<'_> {
         let params = self.latent_params(index)?;
         let layout = *self
             .parts
-            .diffusion()
+            .denoiser()
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?
-            .layout();
+            .layout()?;
         if (params.height, params.width) != (image.height, image.width)
             || params.latent_units != layout.latent_rows(params.height, params.width)?
         {
@@ -1046,11 +999,11 @@ impl ImageBatch<'_> {
         image: &ImageParams,
         job: &Job,
     ) -> Result<Planned> {
-        let diffusion = self
+        let denoiser = self
             .parts
-            .diffusion()
+            .denoiser()
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?;
-        diffusion.plan(image, job);
+        denoiser.plan(image, job)?;
 
         let negative = self
             .requests
@@ -1065,7 +1018,7 @@ impl ImageBatch<'_> {
         for source in [
             BranchSource::Conditioning,
             BranchSource::NegativeOrStart,
-            diffusion.layout().image_unconditional,
+            denoiser.layout()?.image_unconditional,
         ] {
             if prefixes.iter().any(|(known, _)| *known == source) {
                 continue;
@@ -1105,11 +1058,11 @@ impl ImageBatch<'_> {
             params,
             prefixes,
         } = planned;
-        let diffusion = self
+        let denoiser = self
             .parts
-            .diffusion()
+            .denoiser()
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?;
-        let plan = diffusion.planned(params, completion.values()?)?;
+        let plan = denoiser.planned(params, completion.values()?)?;
         let prefixes = prefixes
             .into_iter()
             .map(|(source, given)| {
@@ -1192,7 +1145,7 @@ impl ImageBatch<'_> {
 
         for ((trajectory, image, rng), scratch) in trajectories.iter().zip(&scratch) {
             let call = &self.plan.calls[trajectory.index];
-            let diffusion = self.parts.diffusion().ok_or_else(|| {
+            let denoiser = self.parts.denoiser().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
             })?;
             let planned = self.plan_trajectory(
@@ -1209,7 +1162,7 @@ impl ImageBatch<'_> {
                 .require_initial(trajectory.slot, &scratch.pages)?;
             let semantic = u32::try_from(rng.semantic_index_base)
                 .map_err(|_| Error::Invalid("image index exceeds its range".into()))?;
-            diffusion.initial_latent(
+            denoiser.initial_latent(
                 scratch.sample,
                 scratch.units,
                 scratch.padded(page_units),
@@ -1530,9 +1483,9 @@ impl ImageBatch<'_> {
 
         let layout = *self
             .parts
-            .diffusion()
+            .denoiser()
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?
-            .layout();
+            .layout()?;
         let component = trajectories
             .first()
             .map(|(trajectory, _)| plan.calls[trajectory.index].component.clone())
@@ -1780,10 +1733,10 @@ impl ImageBatch<'_> {
             let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a prefix cache".into())
             })?;
-            let diffusion = self.parts.diffusion_mut().ok_or_else(|| {
+            let denoiser = self.parts.denoiser_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
             })?;
-            let predicted = diffusion.predict(rows, prefix_cache, job)?;
+            let predicted = denoiser.predict(rows, prefix_cache, job)?;
             let mode = predicted.mode.as_str();
             *stats.mode_counts.entry(mode.into()).or_default() += 1;
             if predicted.mode == GraphMode::Replay {
@@ -1813,9 +1766,9 @@ impl ImageBatch<'_> {
                 });
             }
             self.parts
-                .diffusion()
+                .denoiser()
                 .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?
-                .integrate(&updates, job);
+                .integrate(&updates, job)?;
         }
 
         // Intervals ending at this step publish their successor into
