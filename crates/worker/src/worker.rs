@@ -408,7 +408,7 @@ impl Worker {
                 let leases = 2 * info.queue_depth as usize + 2;
                 let words = info.max_batch_calls.max(1) as usize;
                 Some((
-                    VideoRequests::new(video, capacity.media),
+                    VideoRequests::new(video, capacity.media).map_err(phase("storage"))?,
                     encoders,
                     denoisers,
                     decoders,

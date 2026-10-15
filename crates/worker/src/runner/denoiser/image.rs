@@ -41,7 +41,7 @@ use std::sync::Arc;
 use tvm_ffi::Any;
 use uniserve_core::ImageParams;
 use uniserve_cuda::Stream;
-use uniserve_ipc::{DrawLayout, ForwardStats, LatentParams};
+use uniserve_ipc::{DrawLayout, ForwardStats, LatentParams, RequestKey};
 
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
@@ -54,7 +54,7 @@ use crate::lane::{Completion, Job, Value};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::request::diffusion::{BranchSet, GuidancePlan};
+use crate::request::diffusion::{BranchSet, BranchSource, GuidancePlan, Prefix};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
@@ -879,6 +879,11 @@ pub(crate) struct DenoiseResume {
 /// not prepare, or one resumed at another size). Their plans say which
 /// branches each step evaluates, so the steps are recorded once they are
 /// known.
+///
+/// FIXME: no test and no reference request reaches this boundary. A rank
+/// opens the trajectories it denoises when it prepares their latents; one
+/// it did not prepare arrives only as a transferred trajectory, which the
+/// stub rank's tests and the image harness do not build.
 pub(crate) struct PlanResume {
     /// Each active call's trajectory, admitted image and conditioning
     /// coordinates.
@@ -1010,6 +1015,97 @@ impl ImageBatch<'_> {
         latents.place(&params)
     }
 
+    /// Record into `job` the calls a trajectory of request `key` opens
+    /// with: its guidance plan, and the prefix of each source one of its
+    /// guidance branches may condition on. The model frames and tokenizes
+    /// a prefix; admitted negative tokens are the negative prefix as they
+    /// are. [`Self::planned_trajectory`] opens the trajectory from the
+    /// job's completion.
+    fn plan_trajectory(
+        &self,
+        slot: usize,
+        key: RequestKey,
+        size: (u32, u32),
+        image: &ImageParams,
+        job: &Job,
+    ) -> Result<Planned> {
+        let diffusion = self
+            .parts
+            .diffusion()
+            .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?;
+        diffusion.plan(image, job);
+
+        let negative = self
+            .requests
+            .get(key.request_id.0)?
+            .admission()
+            .ar
+            .as_ref()
+            .map(|ar| ar.negative_token_ids.clone())
+            .unwrap_or_default();
+        let prompt = image.image_prompts.first().cloned().unwrap_or_default();
+        let mut prefixes: Vec<(BranchSource, Option<Prefix>)> = Vec::new();
+        for source in [
+            BranchSource::Conditioning,
+            BranchSource::NegativeOrStart,
+            diffusion.layout().image_unconditional,
+        ] {
+            if prefixes.iter().any(|(known, _)| *known == source) {
+                continue;
+            }
+            let given =
+                (source == BranchSource::NegativeOrStart && !negative.is_empty()).then(|| Prefix {
+                    tokens: Arc::from(&negative[..]),
+                    reuses_conditioning: false,
+                });
+            if given.is_none() {
+                self.parts
+                    .policy
+                    .ask_prefix(source, &prompt, &image.negative_prompt, job);
+            }
+            prefixes.push((source, given));
+        }
+        Ok(Planned {
+            slot,
+            key,
+            size,
+            steps: usize::from(image.steps),
+            prefixes,
+        })
+    }
+
+    /// The trajectory `planned` opens and its slot, from the `completion`
+    /// of the job that made its calls.
+    pub(crate) fn planned_trajectory(
+        &self,
+        planned: Planned,
+        completion: &mut Completion,
+    ) -> Result<(usize, ImageTrajectory)> {
+        let Planned {
+            slot,
+            key,
+            size,
+            steps,
+            prefixes,
+        } = planned;
+        let diffusion = self
+            .parts
+            .diffusion()
+            .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?;
+        let plan = diffusion.planned(steps, completion.values()?)?;
+        let prefixes = prefixes
+            .into_iter()
+            .map(|(source, given)| {
+                let prefix = match given {
+                    Some(prefix) => prefix,
+                    None => self.parts.policy.prefix(&completion.returned()?)?,
+                };
+                Ok((source, prefix))
+            })
+            .collect::<Result<_>>()?;
+        Ok((slot, ImageTrajectory::new(key, size, plan, prefixes)))
+    }
+
     /// Draw each trajectory's seeded initial latent and stage it as its
     /// first committed version.
     pub(crate) fn prepare_latents(&mut self) -> Result<ForwardStats> {
@@ -1082,7 +1178,13 @@ impl ImageBatch<'_> {
             let diffusion = self.parts.diffusion().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
             })?;
-            diffusion.plan(image, job);
+            let planned = self.plan_trajectory(
+                trajectory.slot,
+                call.request_key,
+                (trajectory.params.height, trajectory.params.width),
+                image,
+                job,
+            )?;
             let latents = self.parts.latents()?;
             let page_units = latents.pool.page_units();
             latents
@@ -1102,14 +1204,9 @@ impl ImageBatch<'_> {
             )?;
             latents.scatter(1, scratch, issue)?;
             self.publish_latent(trajectory.index, 1, 0, &trajectory.params, issue)?;
-            // The trajectory opens with the batch's commit, once the plan
-            // call was made.
-            self.plans.push(Planned {
-                slot: trajectory.slot,
-                key: call.request_key,
-                size: (trajectory.params.height, trajectory.params.width),
-                steps: usize::from(image.steps),
-            });
+            // The trajectory opens with the batch's commit, once its
+            // calls were made.
+            self.plans.push(planned);
             self.updates.push((
                 trajectory.index,
                 LatentUpdate::for_call(trajectory.slot, call, &trajectory.params)?,
@@ -1269,20 +1366,9 @@ impl ImageBatch<'_> {
             descriptors,
             plans,
         } = resume;
-        for Planned {
-            slot,
-            key,
-            size,
-            steps,
-        } in plans
-        {
-            let diffusion = self.parts.diffusion().ok_or_else(|| {
-                Error::Unsupported("image trajectories require a denoiser".into())
-            })?;
-            let guidance = diffusion.planned(steps, completion.values()?)?;
-            self.parts
-                .trajectories
-                .open(slot, ImageTrajectory::new(key, size, guidance));
+        for planned in plans {
+            let (slot, trajectory) = self.planned_trajectory(planned, completion)?;
+            self.parts.trajectories.open(slot, trajectory);
         }
 
         let job = std::mem::take(&mut self.job);
@@ -1356,16 +1442,7 @@ impl ImageBatch<'_> {
                 .get(trajectory.slot, key)
                 .is_none_or(|open| open.size != size);
             if reopen {
-                let diffusion = self.parts.diffusion().ok_or_else(|| {
-                    Error::Unsupported("image trajectories require a denoiser".into())
-                })?;
-                diffusion.plan(&image, job);
-                plans.push(Planned {
-                    slot: trajectory.slot,
-                    key,
-                    size,
-                    steps: usize::from(image.steps),
-                });
+                plans.push(self.plan_trajectory(trajectory.slot, key, size, &image, job)?);
             }
             trajectories.push((trajectory, image, conditioning));
         }
@@ -1518,9 +1595,7 @@ impl ImageBatch<'_> {
             // Timesteps and guidance branches of this step.
             let mut stepping: Stepping = Vec::new();
             let mut fills: Fills = Vec::new();
-            for (position, ((trajectory, image), _)) in
-                trajectories.iter().zip(&scratch).enumerate()
-            {
+            for (position, ((trajectory, _), _)) in trajectories.iter().zip(&scratch).enumerate() {
                 let params = &trajectory.params;
                 if offset >= params.step_count {
                     continue;
@@ -1531,33 +1606,20 @@ impl ImageBatch<'_> {
                     .get(&trajectory.index)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                let policy = self.parts.policy.clone();
                 let kv = self.storage.kv.as_ref().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a KV cache".into())
                 })?;
                 let tables = kv.tables();
-                let negative = self
-                    .requests
-                    .get(key.request_id.0)?
-                    .admission()
-                    .ar
-                    .as_ref()
-                    .map(|ar| ar.negative_token_ids.clone())
-                    .unwrap_or_default();
                 let open = self
                     .parts
                     .trajectories
                     .get(trajectory.slot, key)
                     .ok_or_else(|| Error::Invariant("an image trajectory closed".into()))?;
                 let (set, time) = open.plan.step(step as usize)?;
-                let prompt = image.image_prompts.first().cloned().unwrap_or_default();
                 let filled = open.resolve_branches(
                     set,
                     layout.image_unconditional,
                     call_rows,
-                    |source| {
-                        policy.guidance_prefix(source, &prompt, &image.negative_prompt, &negative)
-                    },
                     |slot, visible| tables.coordinates(slot, visible).map(Coordinates::from),
                 )?;
                 fills.extend(
