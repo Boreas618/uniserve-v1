@@ -12,11 +12,11 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::ffi::{Function, Handle};
+use crate::ffi::DType;
 use crate::host::{HostAction, HostTask};
-use crate::runner::encoder::{PreparedImage, Tower, prepare_input};
-use crate::storage::OutputLease;
+use crate::runner::encoder::{ImagePreparation, PreparedImage, Tower};
 use crate::storage::memory::StorageView;
+use crate::storage::{OutputLease, PinnedPool};
 use crate::{Error, Outcome, Result};
 
 /// Encode `pixels` (`height * width * 3` bytes, HWC) as a base64 PNG of at
@@ -76,16 +76,15 @@ fn encoding(error: png::EncodingError) -> Error {
 
 /// One unit of image host work.
 pub(crate) enum ImageWork {
-    /// Decode and transform one inline image of a request.
+    /// Decode and transform one inline image of a request into a block of
+    /// `pool`, in `dtype`.
     Prepare {
-        function: Function,
-        /// `EncoderRunner.image_facts`.
-        facts: Function,
-        loaded: Handle,
+        preparation: ImagePreparation,
         tower: Tower,
         payload: Arc<str>,
         input_images: u32,
-        pin: bool,
+        pool: Arc<PinnedPool>,
+        dtype: DType,
     },
     /// Encode one image's quantized pixels, read back into `lease`, as a
     /// base64 PNG of at most `maximum` bytes.
@@ -140,23 +139,15 @@ impl HostAction for ImageTask {
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         match &*work {
             ImageWork::Prepare {
-                function,
-                facts,
-                loaded,
+                preparation,
                 tower,
                 payload,
                 input_images,
-                pin,
-            } => prepare_input(
-                function,
-                facts,
-                loaded,
-                *tower,
-                payload,
-                *input_images,
-                *pin,
-            )
-            .map(ImageResult::Prepared),
+                pool,
+                dtype,
+            } => preparation
+                .prepare(*tower, payload, *input_images, pool, *dtype)
+                .map(ImageResult::Prepared),
             ImageWork::Encode {
                 pixels,
                 height,

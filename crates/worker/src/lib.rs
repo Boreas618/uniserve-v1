@@ -61,9 +61,9 @@ pub use runner::denoiser::image::{
 };
 pub use runner::denoiser::image_model::ImageDenoiserLayout;
 pub use runner::encoder::{
-    Encoded, EncoderConfig, EncoderGraph, EncoderInfo, EncoderRunner, LatentEncoder,
-    MAX_PACKED_IMAGES, PreparedImage, PromptVision, TextEncoder, Tower, VisionEncoder,
-    packed_grids, prepare_input, text_capacity,
+    Encoded, EncoderConfig, EncoderGraph, EncoderInfo, EncoderRunner, ImageFacts, ImagePixels,
+    ImagePreparation, LatentEncoder, MAX_PACKED_IMAGES, PreparedImage, PromptVision, TextEncoder,
+    Tower, VisionEncoder, packed_grids, text_capacity,
 };
 pub use runner::vision::{
     BlockPositions, FeatureInjection, FeatureLayout, PositionLayout, VisionBlock,
@@ -75,8 +75,8 @@ pub use storage::{
     AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, BufferBinding, BufferPool,
     CachePlan, CachePlanes, GroupShape, GroupTable, HostBuffers, LatentExport, LatentImport,
     LatentPool, LatentStorage, LatentUpdate, LogprobLayout, OutputBuffer, OutputPool,
-    OutputStorage, PrefixCache, ProductBuffer, ProductRead, ProductStore, RequestSlots, TablePages,
-    UnitColumn, table_pages,
+    OutputStorage, PinnedBlock, PinnedPool, PrefixCache, ProductBuffer, ProductRead, ProductStore,
+    RequestSlots, TablePages, UnitColumn, table_pages,
 };
 pub use stream::{CUDAStream, Deferred, EventPool, Fill, Issue, RowFill, Submitter};
 pub use transfer::{

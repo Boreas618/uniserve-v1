@@ -17,13 +17,15 @@ from typing import Any, cast
 import torch
 
 from uniserve.bindings.context import ExecutionContext
+from uniserve.diffusion import normal_noise
 from uniserve.errors import SetupError
 from uniserve.loading.rank import capability
 from uniserve.media.pixels import (
-    PreparedImage,
     Tower,
+    image_size,
     prepare_host_image,
     prepare_tensor_image,
+    prepared_shape,
 )
 from uniserve.models import (
     AudioEncoder,
@@ -34,8 +36,9 @@ from uniserve.models import (
     VideoEncoder,
     VisionInput,
 )
+from uniserve.nn.rng import posterior_noise_seed
 from uniserve.nn.vae import PatchAutoencoder
-from uniserve.processing import PatchTransform
+from uniserve.processing import PatchTransform, TowerTransform
 from uniserve.runner.context import (
     execution_context,
     held_module,
@@ -71,6 +74,15 @@ def _device_grid(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
     if device.type == "cuda":
         grid = grid.pin_memory()
     return grid.to(device, non_blocking=True)
+
+
+def _fill(out: torch.Tensor, pixels: torch.Tensor) -> None:
+    """Write prepared ``pixels`` into the worker storage ``out``."""
+    if tuple(out.shape) != tuple(pixels.shape) or out.dtype != pixels.dtype:
+        raise ValueError(
+            "prepared pixels disagree with the shape and dtype of their storage"
+        )
+    out.copy_(pixels, non_blocking=True)
 
 
 class EncoderRunner:
@@ -190,12 +202,12 @@ class EncoderRunner:
         runner._loaded = loaded
         runner._bind(module, context)
         # An image model's encoder takes prepared images.
-        runner._encode = (
-            runner._encode_packed
-            if isinstance(module, PatchEncoder)
-            and module.max_patches is not None
-            else runner._encode_images
-        )
+        if isinstance(module, PatchAutoencoder):
+            runner._encode = runner._encode_latent
+        elif module.max_patches is not None:
+            runner._encode = runner._encode_packed
+        else:
+            runner._encode = runner._encode_images
         return runner
 
     def _bind(self, module, context: ExecutionContext) -> None:
@@ -337,18 +349,23 @@ class EncoderRunner:
         ``[samples, 2]`` FP32 PCM, the tracks' sample counts ``lengths``;
         the tracks' rows fill ``out`` in order.
 
-        An image model's unpacked vision encoder and its latent encoder
-        take ``(images, out)``: prepared images of one pixel shape
-        (:meth:`prepare_image`, :meth:`prepare_resident`) and one product
-        region per image, which receives the image's features in the
-        product's dtype. They return each image's feature shape. A latent
-        encoder that samples its posterior draws from the device's default
-        generator.
+        An image model's unpacked vision encoder takes ``(grids, *pixels,
+        *out)``: ``n`` prepared images of one pixel shape, then ``n`` product
+        regions, which receive the images' features in the product's dtype;
+        ``grids`` is the ``[rows, columns]`` patch grid of each image of a
+        patch tower, flattened, and empty otherwise. A latent encoder takes
+        ``(pixels, out)`` for one prepared image, and ``(pixels, out,
+        noise)`` when it samples its posterior: ``noise`` is a flat FP32
+        draw whose leading elements are the image's posterior noise
+        (:meth:`draw_noise`). Prepared pixels are host or device tensors of
+        :meth:`image_facts`' shape (:meth:`prepare_image`,
+        :meth:`prepare_resident`). Both return each image's feature shape.
 
         An image model's packed vision encoder (``max_patches`` set) takes
         ``(pixels, grids, features)``: ``pixels`` ``[slots * max_patches,
-        row]`` holds image ``i``'s patch rows at the front of slot ``i``
-        (:meth:`pack_images`), ``grids`` ``[2 * slots, 2]`` int64 the slot
+        row]`` holds image ``i``'s prepared patch rows at the front of slot
+        ``i`` (copied by the worker, or written by :meth:`prepare_resident`),
+        ``grids`` ``[2 * slots, 2]`` int64 the slot
         grids (``PatchEncoder.packed_grids``) and ``features`` ``[slots *
         tokens, output_size]`` receives every slot's features, ``tokens``
         being ``max_patches // downsample**2``. Its shapes are fixed by its
@@ -601,13 +618,94 @@ class EncoderRunner:
         )
 
     @staticmethod
+    def image_size(payload: str) -> list[int]:
+        """The ``[height, width]`` of an inline image, read from its header.
+
+        Raises:
+            ValueError: The payload is not a valid encoded image.
+        """
+        return list(image_size(str(payload)))
+
+    @staticmethod
+    def image_facts(
+        loaded, tower: str, height: int, width: int, input_images: int
+    ) -> list[int]:
+        """What preparing an image of ``height`` x ``width`` pixels produces.
+
+        ``[canvas_height, canvas_width, grid_rows, grid_columns,
+        *pixel_shape]``: the canvas the encoder's features describe, the
+        patch grid of a patch tower (``0, 0`` otherwise) and the shape of
+        the prepared pixels (``[patches, row]`` for a patch tower,
+        ``[channels, height, width]`` otherwise), which
+        :meth:`prepare_image` and :meth:`prepare_resident` write in
+        :meth:`pixel_dtype`. ``input_images`` is the request's input image
+        count for a request input image, which a shared pixel budget
+        divides, or 0 for a generated image.
+
+        Raises:
+            ValueError: The model declares no transform for ``tower``, or
+                its resize policy rejects the dimensions.
+        """
+        processor = loaded.image_processor
+        if processor is None:
+            raise ValueError("the model declares no image processing")
+        canvas, grid, shape = prepared_shape(
+            processor,
+            # The caller sends a plain string; the plan rejects unknown
+            # towers.
+            cast(Tower, str(tower)),
+            int(height),
+            int(width),
+            int(input_images) or None,
+        )
+        rows, columns = grid or (0, 0)
+        return [*canvas, rows, columns, *shape]
+
+    @staticmethod
+    def image_elements(loaded, tower: str) -> int:
+        """Elements of the largest image ``tower``'s transform prepares.
+
+        A patch tower's images hold three values per pixel of its pixel
+        bound; another tower's longest side is at most its resize policy's
+        ``max_size``. 0 for a model without that transform.
+        """
+        processor = getattr(loaded, "image_processor", None)
+        transform = (
+            None
+            if processor is None
+            else processor.vit
+            if str(tower) == "vit"
+            else processor.vae
+        )
+        if isinstance(transform, PatchTransform):
+            return 3 * int(transform.pixel_bound())
+        if isinstance(transform, TowerTransform):
+            return 3 * int(transform.resize.max_size) ** 2
+        return 0
+
+    @staticmethod
+    def noise_elements(loaded, path: str) -> int:
+        """Elements of the largest posterior noise a latent encoder draws.
+
+        The posterior of the largest image the ``vae`` transform prepares;
+        0 for an encoder that takes its posterior's mean.
+        """
+        module = _module(loaded, path)
+        if not module.samples_posterior:
+            return 0
+        side = int(loaded.image_processor.vae.resize.max_size)
+        return prod(module.posterior_shape(side, side))
+
+    @staticmethod
     def prepare_image(
-        loaded, tower: str, payload: str, input_images: int, pin: int
-    ) -> PreparedImage:
-        """Decode and transform one inline image of a request on the host.
+        loaded, tower: str, payload: str, input_images: int, out
+    ) -> None:
+        """Decode and transform one inline request image into ``out``.
 
         Touches no device and keeps no state, so the caller runs it beside
-        device work.
+        device work. ``out`` is host memory of the pixel shape
+        :meth:`image_facts` reports for the image and of
+        :meth:`pixel_dtype`.
 
         Args:
             loaded: The loaded model; its ``image_processor`` is the policy.
@@ -616,51 +714,26 @@ class EncoderRunner:
             payload: The image's base64 payload.
             input_images: The request's input image count, which a shared
                 pixel budget divides.
-            pin: Nonzero to place the pixels in page-locked memory for an
-                asynchronous copy to a CUDA device.
-
-        Returns:
-            The prepared image, opaque to the caller, which reads what it
-            plans an encode with through :meth:`image_facts`.
+            out: The prepared pixels' storage.
 
         Raises:
-            ValueError: The model declares no image policy, or the payload
-                is not an image the policy accepts.
+            ValueError: The model declares no image policy, the payload is
+                not an image the policy accepts, or ``out`` is not its
+                prepared pixels' shape and dtype.
         """
-        # FIXME: a prepared image crosses as an opaque handle; its pixels
-        # become a tensor of the caller's page-locked storage.
         processor = loaded.image_processor
         if processor is None:
             raise ValueError("the model declares no image processing")
         if int(input_images) < 1:
             raise ValueError("request admission declares no input images")
-        return prepare_host_image(
+        prepared = prepare_host_image(
             processor,
-            # The caller sends a plain string; the selection rejects
-            # unknown towers.
             cast(Tower, str(tower)),
             str(payload),
             input_images=int(input_images),
-            pin=bool(pin),
+            pin=False,
         )
-
-    @staticmethod
-    def image_facts(prepared: PreparedImage) -> list[int]:
-        """What a caller plans an encode of a prepared image with.
-
-        ``[height, width, grid_rows, grid_columns, *pixel_shape]``: the
-        canvas the encoder's features describe, the patch grid of a patch
-        tower (``0, 0`` otherwise) and the pixel shape (``[patches, row]``
-        for a patch tower, ``[channels, height, width]`` otherwise).
-        """
-        rows, columns = prepared.grid_shape or (0, 0)
-        return [
-            int(prepared.height),
-            int(prepared.width),
-            int(rows),
-            int(columns),
-            *(int(extent) for extent in prepared.pixels.shape),
-        ]
+        _fill(out, prepared.pixels)
 
     @staticmethod
     def patch_grid(
@@ -698,12 +771,14 @@ class EncoderRunner:
         return "vit" if isinstance(self._module, PatchEncoder) else "vae"
 
     def prepare_resident(
-        self, image, tower: str, signed_unit: int
-    ) -> PreparedImage:
-        """Prepare a resident image product (a tensor) for encoding.
+        self, image, tower: str, signed_unit: int, out
+    ) -> None:
+        """Transform a resident image product (a tensor) into ``out``.
 
         ``signed_unit`` declares pixel values in ``[-1, 1]`` rather than
-        ``[0, 1]``. Returns the prepared image (see :meth:`prepare_image`).
+        ``[0, 1]``. ``out`` is a tensor of the encoder's device, of the
+        pixel shape :meth:`image_facts` reports for the image (with no
+        input images) and of :meth:`pixel_dtype`.
         """
         with torch.inference_mode(), self._context.activate():
             prepared = prepare_tensor_image(
@@ -713,13 +788,32 @@ class EncoderRunner:
                 device=self._device,
                 signed_unit=bool(signed_unit),
             )
-        return prepared
+            _fill(out, prepared.pixels)
+
+    def draw_noise(
+        self, seed: int, index: int, height: int, width: int, noise
+    ) -> None:
+        """Draw a latent encoder's posterior noise for one prepared image.
+
+        Fills the leading elements of ``noise``, a flat FP32 tensor of the
+        encoder's device, with the standard normal draw of the posterior of
+        a ``height`` x ``width`` image, seeded by the request's ``seed``
+        (its bits as a signed integer) and ``index``, the request's latent
+        encodings before this one.
+        """
+        shape = (1, *self._module.posterior_shape(int(height), int(width)))
+        with torch.inference_mode(), self._context.activate():
+            normal_noise(
+                (posterior_noise_seed(int(seed), int(index)),),
+                out=(noise.reshape(-1)[: prod(shape)].view(shape),),
+            )
 
     def warm(self, side: int) -> None:
         """Encode a black ``side`` x ``side`` image and discard the result.
 
         The image passes through the model's input transform; an unpacked
-        encoder's kernels compile here, before serving.
+        encoder's kernels compile here, before serving. A latent encoder
+        that samples its posterior encodes with zero noise.
         """
         side = int(side)
         with torch.inference_mode(), self._context.activate():
@@ -730,64 +824,83 @@ class EncoderRunner:
                 device=self._device,
                 signed_unit=False,
             )
-            self._run_images((prepared,))
-
-    def pack_images(self, pixels: torch.Tensor, *images: PreparedImage) -> None:
-        """Copy image ``i``'s patch rows to the front of slot ``i``.
-
-        ``pixels`` is the packed encoder's ``[slots * max_patches, row]``
-        input. Rows past an image keep earlier finite values, which only
-        padding reads.
-        """
-        capacity = self._module.max_patches
-        with torch.inference_mode(), self._context.activate():
-            for index, prepared in enumerate(images):
-                rows = prepared.pixels.shape[0]
-                if prepared.grid_shape is None or rows > capacity:
-                    raise ValueError(
-                        "packed vision images require patch rows within "
-                        "their slot"
+            if isinstance(self._module, PatchAutoencoder):
+                noise = None
+                if self._module.samples_posterior:
+                    shape = self._module.posterior_shape(
+                        *prepared.pixels.shape[-2:]
                     )
-                pixels[index * capacity : index * capacity + rows].copy_(
-                    prepared.pixels, non_blocking=True
-                )
+                    noise = torch.zeros(prod(shape), device=self._device)
+                self._latent(prepared.pixels, noise)
+            else:
+                self._vision((prepared.pixels,), (prepared.grid_shape,))
 
-    def _run_images(self, images: Sequence[PreparedImage]):
-        module, device = self._module, self._device
-        pixels = tuple(
-            # Host pixels are page-locked; the copy is asynchronous on the
-            # stream.
-            prepared.pixels.to(device, non_blocking=True)
-            for prepared in images
-        )
-        if isinstance(module, PatchAutoencoder):
-            # FIXME: the posterior draws from the device's default
-            # generator; its noise becomes an input the caller supplies.
-            return module.encode(torch.stack(pixels)).unbind(0)
-        return module.encode(
+    def _vision(
+        self,
+        pixels: Sequence[torch.Tensor],
+        grids: Sequence[tuple[int, int] | None],
+    ):
+        """Encode prepared images of one pixel shape with the vision
+        encoder; each image's features.
+        """  # noqa: D205
+        device = self._device
+        return self._module.encode(
             VisionInput(
-                pixels,
+                # Host pixels are page-locked worker storage; the copy is
+                # asynchronous on the stream.
+                tuple(value.to(device, non_blocking=True) for value in pixels),
                 tuple(
-                    None
-                    if prepared.grid_shape is None
-                    else _device_grid(prepared.grid_shape, device)
-                    for prepared in images
+                    None if grid is None else _device_grid(grid, device)
+                    for grid in grids
                 ),
-                tuple(prepared.grid_shape for prepared in images),
+                tuple(grids),
             )
         )
+
+    def _latent(
+        self, pixels: torch.Tensor, noise: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Encode one prepared image with the latent encoder.
+
+        ``noise`` is a flat draw whose leading elements are the image's
+        posterior noise; a sampled posterior requires it and a mean
+        posterior takes none.
+        """
+        module = self._module
+        if module.samples_posterior != (noise is not None):
+            raise ValueError(
+                "a sampled posterior takes its noise and a posterior mean "
+                "takes none"
+            )
+        value = pixels.to(self._device, non_blocking=True).unsqueeze(0)
+        if noise is not None:
+            shape = (1, *module.posterior_shape(*value.shape[-2:]))
+            noise = noise.reshape(-1)[: prod(shape)].view(shape)
+        return module.encode(value, noise=noise)[0]
 
     def _encode_images(
-        self, images: Sequence[PreparedImage], *out: torch.Tensor
+        self, grids: Sequence[int], *tensors: torch.Tensor
     ) -> list[list[int]]:
-        if len(images) != len(out):
-            raise ValueError("images and products must align")
+        count = len(tensors) // 2
+        if len(tensors) != 2 * count or (grids and len(grids) != 2 * count):
+            raise ValueError("images, grids and products must align")
+        shapes = (
+            [cast(tuple[int, int], shape) for shape in _chunks(grids, 2)]
+            if grids
+            else [None] * count
+        )
+        values = self._vision(tensors[:count], shapes)
         return [
             write(product, value)
-            for value, product in zip(
-                self._run_images(images), out, strict=True
-            )
+            for value, product in zip(values, tensors[count:], strict=True)
         ]
+
+    def _encode_latent(
+        self, pixels: torch.Tensor, out: torch.Tensor, *noise: torch.Tensor
+    ) -> list[list[int]]:
+        if len(noise) > 1:
+            raise ValueError("a latent encoding takes one noise draw")
+        return [write(out, self._latent(pixels, noise[0] if noise else None))]
 
     def _encode_packed(
         self, pixels: torch.Tensor, grids: torch.Tensor, features: torch.Tensor

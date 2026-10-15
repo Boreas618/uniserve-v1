@@ -91,17 +91,19 @@ pub(crate) fn prepare_inputs(
             let request = parts.requests.get(call.request_key.request_id.0)?;
             let input_images = request.admission().input_images;
             let route = image.encoders.route(&call.component, call.code)?;
-            let pin = image.encoders.image[route].device().is_cuda();
+            let runner = &image.encoders.image[route];
+            let dtype = runner.pixel_dtype().ok_or_else(|| {
+                Error::Invariant("an image encoding is routed to an image encoder".into())
+            })?;
             let task = image.host.reserve()?;
             tasks.push((index, Arc::clone(&task)));
             task.configure(ImageTask::new(ImageWork::Prepare {
-                function: image.policy.prepare_input().clone(),
-                facts: image.policy.image_facts().clone(),
-                loaded: image.policy.loaded().clone(),
+                preparation: image.policy.preparation().clone(),
                 tower,
                 payload: Arc::clone(payload),
                 input_images,
-                pin,
+                pool: Arc::clone(runner.pinned()),
+                dtype,
             }))?;
             let weak: Weak<Submission> = Arc::downgrade(submission);
             let notify: Box<dyn FnOnce() + Send> = Box::new(move || {

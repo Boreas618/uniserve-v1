@@ -19,9 +19,11 @@ from tests.python.fixtures.model_metadata import (
 )
 from uniserve.diffusion import NoiseScale
 from uniserve.media.pixels import (
+    image_size,
     patch_grid_shape,
     prepare_host_image,
     prepare_tensor_image,
+    prepared_shape,
 )
 from uniserve.models import bagel, diffusion_gemma, siglip
 from uniserve.models import sensenova_u1 as u1
@@ -107,6 +109,46 @@ def test_encoded_pixels_match_channel_normalization(
     torch.testing.assert_close(
         result.pixels, expected.to(getattr(torch, dtype)), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("patches", (False, True))
+@pytest.mark.parametrize("size", ((16, 16), (40, 24), (24, 72)))
+def test_prepared_shapes_describe_the_prepared_pixels(patches, size):
+    height, width = size
+    raw = np.full((height, width, 3), 77, dtype=np.uint8)
+    encoded = io.BytesIO()
+    Image.fromarray(raw).save(encoded, format="PNG")
+    payload = base64.b64encode(encoded.getvalue()).decode()
+    processor = ImageProcessor(
+        vae=TowerTransform(StrideResize(64, 32, 16, 4096)),
+        vit=(
+            PatchTransform(4, 1, PixelBounds(16 * 16, 48 * 48))
+            if patches
+            else TowerTransform(StrideResize(64, 48, 16, 4096))
+        ),
+    )
+    assert image_size(payload) == (height, width)
+    for tower in ("vit", "vae"):
+        # A request input image, of a request with two of them.
+        host = _prepare(processor, tower, payload, input_images=2)
+        assert prepared_shape(processor, tower, height, width, 2) == (
+            (host.height, host.width),
+            host.grid_shape,
+            tuple(host.pixels.shape),
+        )
+        # A generated image keeps the single-image bound.
+        resident = prepare_tensor_image(
+            processor,
+            tower,
+            torch.from_numpy(raw).permute(2, 0, 1).float() / 255,
+            device=torch.device("cpu"),
+            signed_unit=False,
+        )
+        assert prepared_shape(processor, tower, height, width, None) == (
+            (resident.height, resident.width),
+            resident.grid_shape,
+            tuple(resident.pixels.shape),
+        )
 
 
 @pytest.mark.parametrize("tower", ("vae", "vit"))
