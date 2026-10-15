@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use uniserve_core::TokenLogprob;
-use uniserve_cuda::{Event, SourceOrder, Stream};
+use uniserve_cuda::{Event, SourceOrder};
 
 use crate::ffi::{Backing, DType, Device};
 use crate::storage::memory::{Memory, StorageView};
-use crate::transfer::{Spans, copy_on_host, copy_planner};
+use crate::stream::Issue;
+use crate::transfer::{Spans, copy_planner};
 use crate::{Error, EventPool, Result};
 
 mod logprobs;
@@ -140,7 +141,7 @@ impl OutputBuffer {
     pub fn capture(
         &mut self,
         source: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         events: &EventPool,
     ) -> Result<(usize, usize)> {
         let dtype = source.dtype();
@@ -165,7 +166,7 @@ impl OutputBuffer {
     pub fn capture_bytes(
         &mut self,
         source: &StorageView,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         events: &EventPool,
     ) -> Result<StorageView> {
         if source.dtype() != DType::U8 {
@@ -182,13 +183,13 @@ impl OutputBuffer {
     }
 
     /// Copy `source` into host storage at `address`: on `stream` for a
-    /// device source (after fencing its device for timing), on this thread
-    /// for host memory.
+    /// device source (after fencing its device for timing), as a host copy
+    /// in `stream`'s order for host memory.
     fn copy(
         &mut self,
         source: &StorageView,
         address: u64,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         events: &EventPool,
     ) -> Result<()> {
         let memory: Arc<dyn Backing> = Arc::clone(&self.storage()?.memory) as Arc<dyn Backing>;
@@ -204,10 +205,10 @@ impl OutputBuffer {
 
         match source.device() {
             Device::Cuda(device) => {
-                let stream = stream.ok_or_else(|| {
+                let producer = stream.stream().ok_or_else(|| {
                     Error::Invalid("a device capture requires its producing stream".into())
                 })?;
-                if stream.device().0 != device {
+                if producer.device().0 != device {
                     return Err(Error::Invalid(
                         "a capture stream must belong to its source device".into(),
                     ));
@@ -218,7 +219,7 @@ impl OutputBuffer {
                 // SAFETY: the pinned destination stays allocated until the
                 // seal fences complete; the source is the producer's storage,
                 // which the producer keeps until its stream passes this copy.
-                unsafe { plan.submit(stream) }?;
+                unsafe { stream.copy_strided(&plan) }?;
             }
             Device::Cpu | Device::CudaHost => {
                 self.register_device(None)?;
@@ -226,8 +227,9 @@ impl OutputBuffer {
                 let mut plan = copy_planner(None, SourceOrder::Stream)?;
                 target.plan_copy(&source_spans, &mut plan)?;
                 // SAFETY: both operands are host memory; the reserved words
-                // belong to this buffer and no device copy writes them.
-                unsafe { copy_on_host(&plan) };
+                // belong to this buffer and no device copy writes them. The
+                // producer keeps its storage until the copy ran.
+                unsafe { stream.host().copy_strided(&plan) }?;
             }
         }
         Ok(())
@@ -282,7 +284,7 @@ impl OutputBuffer {
         if self.readback.is_some() {
             return Ok(());
         }
-        if self.ready_at()?.is_none() {
+        if self.ready_at().is_none() {
             return Err(Error::Invariant(
                 "completion storage was observed before its copy event was ready".into(),
             ));
@@ -395,7 +397,7 @@ impl OutputBuffer {
     pub fn begin_device(
         &mut self,
         device: Option<i32>,
-        stream: &Stream,
+        stream: impl Issue,
         pool: &EventPool,
     ) -> Result<()> {
         self.register_device(device)?;
@@ -416,7 +418,7 @@ impl OutputBuffer {
     pub fn begin_copy(
         &mut self,
         device: Option<i32>,
-        stream: &Stream,
+        stream: impl Issue,
         pool: &EventPool,
     ) -> Result<()> {
         self.register_device(device)?;
@@ -439,17 +441,17 @@ impl OutputBuffer {
     /// Record all producer fences once, one per declared device on that
     /// device's stream. The caller transfers their pool references to
     /// deferred release and calls `copies_finished` after they complete.
-    pub fn seal(
+    pub fn seal<I: Issue>(
         &mut self,
-        streams: &[&Stream],
+        streams: &[I],
         pool: &EventPool,
     ) -> Result<Option<Vec<Arc<Event>>>> {
         if self.sealed {
             return Ok(None);
         }
 
-        for stream in streams {
-            let device = stream.device().0;
+        for &stream in streams {
+            let device = device_of(&stream)?;
             if self.timing_events {
                 self.begin_copy(Some(device), stream, pool)?;
             }
@@ -468,6 +470,10 @@ impl OutputBuffer {
 
         self.sealed = true;
         self.sealed_at = Some(Instant::now());
+        // Without a fence no device work writes the words: they are ready.
+        if self.fences().next().is_none() {
+            self.ready_at = self.sealed_at;
+        }
         Ok(Some(self.events()))
     }
 
@@ -483,23 +489,25 @@ impl OutputBuffer {
         self.devices.iter().filter_map(|events| events.end.as_ref())
     }
 
-    /// First observed completion time, or None while device writes are pending.
-    pub fn ready_at(&mut self) -> Result<Option<Instant>> {
-        if !self.sealed {
-            return Ok(None);
-        }
-        if self.ready_at.is_some() {
-            return Ok(self.ready_at);
-        }
+    /// Each fence with the device whose stream recorded it.
+    pub fn device_fences(&self) -> impl Iterator<Item = (i32, &Arc<Event>)> {
+        self.devices
+            .iter()
+            .filter_map(|events| Some((events.device, events.end.as_ref()?)))
+    }
 
-        for event in self.fences() {
-            if !event.query()? {
-                return Ok(None);
-            }
-        }
+    /// When the lease learned that every copy into it completed, or `None`
+    /// while it has not: a lease without fences knows when it is sealed,
+    /// one with fences when it is told ([`Self::fences_completed`],
+    /// [`Self::copies_finished`]). The lease does not ask the driver.
+    pub fn ready_at(&self) -> Option<Instant> {
+        self.ready_at.filter(|_| self.sealed)
+    }
 
-        self.ready_at = Some(Instant::now());
-        Ok(self.ready_at)
+    /// The device finished every copy the fences cover: the words can be
+    /// read without asking the driver.
+    pub fn fences_completed(&mut self) {
+        self.ready_at.get_or_insert_with(Instant::now);
     }
 
     pub fn copies_finished(&mut self) {
@@ -513,9 +521,9 @@ impl OutputBuffer {
                 "completion row is outside its output buffer".into(),
             ));
         }
-        let Some(ready_at) = self.ready_at()? else {
+        let Some(ready_at) = self.ready_at() else {
             return Err(Error::Invariant(
-                "completion row was observed before query-ready".into(),
+                "completion row was observed before its copies completed".into(),
             ));
         };
         let timing = match self.timing {
@@ -602,8 +610,16 @@ fn micros(end: Instant, start: Instant) -> u64 {
     end.saturating_duration_since(start).as_micros() as u64
 }
 
-fn record(pool: &EventPool, stream: &Stream, timing: bool) -> Result<Arc<Event>> {
-    let device = stream.device().0;
+/// The device of the stream `stream` issues on.
+fn device_of(stream: &impl Issue) -> Result<i32> {
+    stream
+        .stream()
+        .map(|stream| stream.device().0)
+        .ok_or_else(|| Error::Invariant("an output fence is recorded on a stream".into()))
+}
+
+fn record(pool: &EventPool, stream: impl Issue, timing: bool) -> Result<Arc<Event>> {
+    let device = device_of(&stream)?;
     let event = pool.acquire(device, timing, false)?;
     pool.retain(&event, device, 1)?;
     pool.record(&event, stream)?;
@@ -724,5 +740,61 @@ impl OutputPool {
     pub fn finish_close(&mut self) {
         self.active.clear();
         self.available.clear();
+    }
+}
+
+impl crate::executor::lifecycle::RequestStorage for OutputPool {
+    fn admit_slots(
+        &mut self,
+        _slots: &[usize],
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_buffers(
+        &mut self,
+        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_requests(
+        &mut self,
+        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
+        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn retirement_ready(
+        &mut self,
+        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
+        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn retire_slots(
+        &mut self,
+        _slots: &[usize],
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return the storage of retired leases to the pool.
+    fn reap(&mut self) -> Result<()> {
+        OutputPool::reap(self);
+        Ok(())
+    }
+
+    fn close(&mut self, _aborted: bool) -> Result<()> {
+        self.begin_close();
+        self.finish_close();
+        Ok(())
     }
 }

@@ -1,26 +1,27 @@
-"""Model description, checkpoint resolution, loading and model facts.
+"""Reading a checkpoint's configuration and loading a rank's model.
 
-The worker loads a model in phases around process-group creation:
+A rank loads a model in two calls around process-group creation, each
+reached by import path with explicit arguments:
 
-1. ``model.describe`` reads the checkpoint configuration, builds a meta
-   skeleton and reports the declared components, their capability tags and
-   the axes they communicate over, before any collective exists.
-2. ``model.resolve`` narrows the checkpoint to this rank's modules and the
-   launch's weight choices.
-3. ``model.load`` materializes the resident modules on the meshes Rust
+1. :func:`read_config` reads the checkpoint configuration and builds a meta
+   skeleton, before any collective exists. The rank reads the declared
+   components, their calls, capability tags and communication axes from the
+   returned :class:`Description`, one scalar or flat list per method.
+2. :func:`load_model` narrows the checkpoint to this rank's modules and the
+   launch's weight choices and materializes them on the meshes the rank
    created.
-4. ``model.facts`` reports every model-derived quantity capacity planning
-   and reporting need, so the worker never inspects Python objects.
 
-Requests arrive as TVM-FFI maps and arrays; handles returned here are opaque
-to the worker and passed back unchanged.
+The objects returned here are opaque to the rank and passed back unchanged.
+What the rank reports of a loaded model it reads from the functions below
+:func:`load_model`; a fact of one capability belongs to that capability's
+runner.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
@@ -33,15 +34,10 @@ from uniserve_models import loading as library
 from uniserve_models.distributed import Communicator, communication_axes
 from uniserve_models.loading.precision import weight_config
 from uniserve_models.model import (
-    AudioEncoder,
     CausalLM,
     Denoiser,
     ImageDecoder,
-    ImageDenoiser,
-    PatchEncoder,
-    TextEncoder,
     VideoDecoder,
-    VideoEncoder,
     VideoPostprocessor,
 )
 from uniserve_models.nn.attention.vsa import BlockAttention
@@ -64,15 +60,6 @@ logger = logging.getLogger(__name__)
 _Kind = TypeVar("_Kind")
 
 
-def functions() -> dict[str, Callable[..., Any]]:
-    return {
-        "model.describe": describe,
-        "model.resolve": resolve,
-        "model.load": load,
-        "model.facts": facts,
-    }
-
-
 def _text(value: Any) -> str | None:
     return None if value is None else str(value)
 
@@ -80,6 +67,12 @@ def _text(value: Any) -> str | None:
 @dataclass
 class Description:
     """A checkpoint's configuration and meta skeleton before loading.
+
+    The rank reads its declarations through the methods: each returns a
+    scalar or one flat list. A method over a component returns one value per
+    declared call of that component, in declared order; ``capabilities`` and
+    ``selection_axes`` concatenate their per-call and per-selection lists,
+    with the lengths in ``capability_counts`` and ``selection_sizes``.
 
     ``metadata`` is ``None`` for the stub model.
     """
@@ -92,6 +85,72 @@ class Description:
     io: library.Config
     entries: Mapping[str, Any]
     calls: dict[str, tuple[Call, ...]]
+    # Axis selections each component's calls communicate over on the reading
+    # rank's mesh; empty for a component the rank does not place.
+    selections: Mapping[str, tuple[tuple[str, ...], ...]]
+    # Module paths of the routed experts a split deployment places apart.
+    expert_paths: tuple[str, ...]
+
+    def model_name(self) -> str:
+        """``module.QualName`` of the model class."""
+        return _name(self.model)
+
+    def components(self) -> list[str]:
+        """The declared components, in declared order."""
+        return list(self.calls)
+
+    def call_paths(self, component: str) -> list[str]:
+        """Each call's module path within the model; empty for the root."""
+        return [call.path for call in self.calls[str(component)]]
+
+    def call_methods(self, component: str) -> list[str]:
+        """Each call's method name on its module."""
+        return [call.entry_point.method for call in self.calls[str(component)]]
+
+    def call_stages(self, component: str) -> list[str]:
+        """The pipeline stages running each call.
+
+        ``"all"``, ``"first"`` or ``"last"``.
+        """
+        return [call.entry_point.stage for call in self.calls[str(component)]]
+
+    def capability_counts(self, component: str) -> list[int]:
+        """How many of ``capabilities`` belong to each call."""
+        return [
+            len(capability_tags(call.module))
+            for call in self.calls[str(component)]
+        ]
+
+    def capabilities(self, component: str) -> list[str]:
+        """Every call's capability tags, concatenated in call order."""
+        return [
+            tag
+            for call in self.calls[str(component)]
+            for tag in capability_tags(call.module)
+        ]
+
+    def selection_sizes(self, component: str) -> list[int]:
+        """The axis count of each selection the component communicates over."""
+        return [len(axes) for axes in self.selections[str(component)]]
+
+    def selection_axes(self, component: str) -> list[str]:
+        """Every selection's mesh axes, concatenated in selection order."""
+        return [
+            axis for axes in self.selections[str(component)] for axis in axes
+        ]
+
+    def routed_experts(self) -> list[str]:
+        """Module paths of the routed expert layers placed on dedicated ranks.
+
+        Empty unless routed experts run apart from attention.
+        """
+        return list(self.expert_paths)
+
+    def decodes_video(self) -> bool:
+        """Whether the model reconstructs video."""
+        return any(
+            isinstance(module, VideoDecoder) for module in self.model.modules()
+        )
 
 
 @dataclass
@@ -114,34 +173,43 @@ class Loaded:
     image_processor: Any = None
     flow_prompt: Any = None
     tokenizer: Path | None = None
-    model_name: str = ""
 
     @property
     def model(self) -> nn.Module:
         return self.module
 
 
-def _io(value: Mapping[str, Any]) -> library.Config:
-    directory = _text(value.get("download_dir"))
-    manifest = _text(value.get("checksum_manifest"))
-    threads = value.get("num_threads")
-    # The worker sends plain strings; ``Config`` rejects unknown values.
-    return library.Config(
-        format=cast(Literal["auto", "safetensors", "pt"], str(value["format"])),
-        mode=cast(Literal["eager", "layered", "dummy"], str(value["mode"])),
-        download_dir=None if directory is None else Path(directory),
-        num_threads=None if threads is None else int(threads),
-        checksum_manifest=None if manifest is None else Path(manifest),
-    )
+def read_config(
+    stub: bool,
+    path: str | None,
+    base_model: str | None,
+    io_format: str,
+    io_mode: str,
+    download_dir: str | None,
+    num_threads: int | None,
+    checksum_manifest: str | None,
+    device: str,
+    generation_device: str | None,
+    components: str,
+    rank: int,
+    role: str,
+    expert_split: bool,
+) -> Description:
+    """Read a checkpoint's configuration and this rank's view of it.
 
-
-def describe(request: Mapping[str, Any]) -> list[Any]:
-    """Describe the model and this rank's view of its components.
-
-    Returns:
-        ``[description, info]`` where ``info`` is ``{"model_name",
-        "entries": [{"name", "calls": [{"path", "method", "stage",
-        "capabilities", "axes"}]}], "expert_paths", "video_decoder"}``.
+    Args:
+        stub: Describe the stub model instead of a checkpoint.
+        path: The checkpoint directory.
+        base_model: The base checkpoint an adapter refers to.
+        io_format, io_mode, download_dir, num_threads, checksum_manifest:
+            How weights are read (``uniserve_models.loading.Config``).
+        device: The rank's primary device.
+        generation_device: The device of a generation tower placed apart.
+        components: The launch's component placement as JSON object text:
+            each component's ranks and parallel configuration.
+        rank: This rank.
+        role: ``"model"`` or ``"experts"``.
+        expert_split: Routed experts run on dedicated ranks.
 
     Raises:
         SetupError: The placement does not fit the declarations, no installed
@@ -149,11 +217,20 @@ def describe(request: Mapping[str, Any]) -> list[Any]:
             a generation device has no flow route to place, or a split expert
             deployment has no routed expert layer.
     """
-    stub = bool(request["stub"])
-    io = _io(request["io"])
-    path, base = _text(request.get("path")), _text(request.get("base_model"))
-    rank, role = int(request["rank"]), str(request["role"])
-    placed = placements(request["components"])
+    stub = bool(stub)
+    # The caller sends plain strings; ``Config`` rejects unknown values.
+    io = library.Config(
+        format=cast(Literal["auto", "safetensors", "pt"], str(io_format)),
+        mode=cast(Literal["eager", "layered", "dummy"], str(io_mode)),
+        download_dir=None if download_dir is None else Path(str(download_dir)),
+        num_threads=None if num_threads is None else int(num_threads),
+        checksum_manifest=None
+        if checksum_manifest is None
+        else Path(str(checksum_manifest)),
+    )
+    path, base = _text(path), _text(base_model)
+    rank, role = int(rank), str(role)
+    placed = placements(json.loads(str(components)))
     if stub:
         from uniserve_models.stub import Model, entry_points
 
@@ -180,13 +257,13 @@ def describe(request: Mapping[str, Any]) -> list[Any]:
         if rank in placement.ranks
         for call in calls.get(name, ())
     }
-    _require_sparse_tiles(model, resident, str(request["device"]))
-    generation = _text(request.get("generation_device"))
+    _require_sparse_tiles(model, resident, str(device))
+    generation = _text(generation_device)
     if generation is not None:
         _devices(model, generation)
 
     expert_paths: list[str] = []
-    if request.get("expert_split"):
+    if expert_split:
         expert_paths = [
             name
             for name, module in model.named_modules()
@@ -197,46 +274,39 @@ def describe(request: Mapping[str, Any]) -> list[Any]:
                 "disaggregated workers require routed expert layers"
             )
 
-    reported = []
+    selections = {}
     for name, items in calls.items():
         placement = placed.get(name)
         topology = None if placement is None else placement.topology(rank)
-        reported.append(
-            {
-                "name": name,
-                "calls": [
-                    {
-                        "path": call.path,
-                        "method": call.entry_point.method,
-                        "stage": call.entry_point.stage,
-                        "capabilities": capability_tags(call.module),
-                        "axes": [
-                            list(axes)
-                            for axes in _axes(call, placement, topology)
-                        ],
-                    }
+        selections[name] = tuple(
+            sorted(
+                {
+                    axes
                     for call in items
-                ],
-            }
+                    for axes in _axes(call, placement, topology)
+                }
+            )
         )
-    description = Description(
-        stub, model, metadata, path, base, io, entries, calls
+    return Description(
+        stub,
+        model,
+        metadata,
+        path,
+        base,
+        io,
+        entries,
+        calls,
+        selections,
+        tuple(expert_paths),
     )
-    info = {
-        "model_name": f"{type(model).__module__}.{type(model).__qualname__}",
-        "entries": reported,
-        "expert_paths": expert_paths,
-        "video_decoder": any(
-            isinstance(module, VideoDecoder) for module in model.modules()
-        ),
-    }
-    return [description, info]
 
 
-def _axes(call: Call, placement: Placement | None, topology):
+def _axes(
+    call: Call, placement: Placement | None, topology
+) -> set[tuple[str, ...]]:
     """Axis selections a call communicates over on this rank's mesh."""
     if placement is None or topology is None:
-        return []
+        return set()
     axes = set(
         communication_axes(
             call.module,
@@ -245,54 +315,115 @@ def _axes(call: Call, placement: Placement | None, topology):
         )
     )
     axes |= set(call.entry_point.communication_axes(topology))
-    return sorted(axes)
+    return {tuple(str(axis) for axis in selection) for selection in axes}
 
 
-def resolve(
-    description: Description, request: Mapping[str, Any]
+def _resolve(
+    description: Description,
+    modules: Sequence[str],
+    exclude_modules: Sequence[str],
+    quantization: str,
+    model_dtype: str,
 ) -> Description | Resolved:
     """Narrow the checkpoint to this rank's modules and weight choices.
 
-    ``request`` carries ``modules``, ``exclude_modules``, ``quantization``
-    (the launch's precision selectors as JSON object text) and
-    ``model_dtype``. The stub model needs no checkpoint and is returned
-    unchanged.
+    The stub model needs no checkpoint and is returned unchanged.
     """
     if description.stub:
         return description
-    # ``describe`` requires a checkpoint path of every model but the stub.
+    # ``read_config`` requires a checkpoint path of every model but the stub.
     assert description.path is not None
     source = catalog.read_config(
         description.path,
         io=description.io,
-        modules=frozenset(str(path) for path in request["modules"]),
+        modules=frozenset(str(path) for path in modules),
         base=description.base,
-        exclude_modules=frozenset(
-            str(path) for path in request["exclude_modules"]
-        ),
+        exclude_modules=frozenset(str(path) for path in exclude_modules),
     )
-    options = json.loads(str(request["quantization"]))
-    weights = weight_config(source, options, str(request["model_dtype"]))
+    options = json.loads(str(quantization))
+    weights = weight_config(source, options, str(model_dtype))
     return Resolved(replace(source, weights=weights), description)
 
 
-def load(
-    resolved: Description | Resolved, request: Mapping[str, Any]
+def load_model(
+    description: Description,
+    modules: Sequence[str],
+    exclude_modules: Sequence[str],
+    quantization: str,
+    model_dtype: str,
+    device: str,
+    generation_device: str | None,
+    role: str,
+    host_only: bool,
+    mesh_components: Sequence[str],
+    mesh_path_counts: Sequence[int],
+    mesh_paths: Sequence[str],
+    meshes: Sequence[Any],
+    mesh_units: Sequence[Any],
+    mesh_sequences: Sequence[str],
+    expert_world: Any,
+    attention_ranks: int,
+    expert_dedicated: bool,
+    attention_backend: str,
+    workspace_size: int,
+    decode_backend: str,
+    prefill_backend: str,
+    disable_split_kv: bool,
+    decode_split_tile_size: int | None,
+    prefill_split_tile_size: int | None,
+    use_tensor_core: bool | None,
 ) -> Loaded:
-    """Materialize this rank's selected modules on their meshes.
+    """Materialize this rank's modules of a described model on its meshes.
 
     The stub model is built directly on the device and serves with the
     portable ``torch`` attention backend. A host-only rank keeps the
     weight-less description. Otherwise each listed outermost path loads on
     its component's mesh with that component's attention partition.
+
+    Args:
+        description: The description :func:`read_config` returned.
+        modules: Module paths resident on this rank.
+        exclude_modules: Module paths left unloaded below them.
+        quantization: The launch's precision selectors as JSON object text.
+        model_dtype: The compute element type's name.
+        device, generation_device, role: As in :func:`read_config`.
+        host_only: The rank holds only host components.
+        mesh_components: One entry per component with a mesh.
+        mesh_path_counts: How many of ``mesh_paths`` each component has.
+        mesh_paths: Every component's outermost module paths, back to back.
+        meshes: Each component's device mesh.
+        mesh_units: Each component's unit mesh, or ``None``.
+        mesh_sequences: Each component's sequence-parallel kind.
+        expert_world: The torch world holding the expert union's
+            communicator; ``None`` without an expert union.
+        attention_ranks: Attention ranks of a disaggregated union.
+        expert_dedicated: This rank holds only routed experts.
+        attention_backend: The attention backend's name.
+        workspace_size, decode_backend, prefill_backend, disable_split_kv,
+        decode_split_tile_size, prefill_split_tile_size, use_tensor_core:
+            FlashInfer options (``flashinfer.Config``); ``None`` keeps an
+            option's default.
     """
-    device = str(request["device"])
-    generation = _text(request.get("generation_device"))
-    role = str(request["role"])
-    dedicated = role == "experts"
-    backend = str(request["attention_backend"])
-    options = {
-        str(key): value for key, value in dict(request["attention"]).items()
+    resolved = _resolve(
+        description, modules, exclude_modules, quantization, model_dtype
+    )
+    device = str(device)
+    generation = _text(generation_device)
+    dedicated = str(role) == "experts"
+    host_only = bool(host_only)
+    backend = str(attention_backend)
+    options: dict[str, Any] = {
+        name: value
+        for name, value in (
+            ("workspace_size", int(workspace_size)),
+            ("decode_backend", str(decode_backend)),
+            ("prefill_backend", str(prefill_backend)),
+            ("disable_split_kv", bool(disable_split_kv)),
+            ("decode_split_tile_size", decode_split_tile_size),
+            ("prefill_split_tile_size", prefill_split_tile_size),
+            ("use_tensor_core", use_tensor_core),
+        )
+        if value is not None
     }
 
     if isinstance(resolved, Description):
@@ -300,14 +431,18 @@ def load(
     else:
         description, source = resolved.description, resolved.source
 
-    meshes, attention, units = {}, {}, {}
-    for item in request.get("meshes") or ():
-        component = str(item["component"])
-        if item.get("units") is not None:
-            units[component] = item["units"].get_group("units")
-        for path in item["paths"]:
-            meshes[str(path)] = item["mesh"]
-            attention[str(path)] = attention_parallel(str(item["sequence"]))
+    placed, attention, units = {}, {}, {}
+    first = 0
+    for index, component in enumerate(mesh_components):
+        count = int(mesh_path_counts[index])
+        if mesh_units[index] is not None:
+            units[str(component)] = mesh_units[index].get_group("units")
+        for path in mesh_paths[first : first + count]:
+            placed[str(path)] = meshes[index]
+            attention[str(path)] = attention_parallel(
+                str(mesh_sequences[index])
+            )
+        first += count
 
     module: nn.Module
     if description.stub:
@@ -321,10 +456,9 @@ def load(
             description,
             image_processor=image_processor(),
             attention_backend="torch",
-            model_name=f"{type(module).__module__}.{type(module).__qualname__}",
         )
-    elif request.get("host_only"):
-        # ``resolve`` returns a bare description for the stub model alone.
+    elif host_only:
+        # Only the stub model resolves to a bare description.
         assert source is not None
         # A host rank holds only host components: the weight-less
         # description carries the media geometry, rates and unit division.
@@ -338,22 +472,22 @@ def load(
             attention_backend=backend,
             image_processor=source.image_processor,
             flow_prompt=source.flow_prompt,
-            model_name=_name(description.model),
         )
     else:
-        # ``resolve`` returns a bare description for the stub model alone.
+        # Only the stub model resolves to a bare description.
         assert source is not None
-        partition = _expert_partition(request.get("experts"))
+        partition = _expert_partition(
+            expert_world, int(attention_ranks), bool(expert_dedicated)
+        )
         result = catalog.load_model(
             source,
             device=device,
-            meshes=meshes,
+            meshes=placed,
             attention=attention,
             devices=_devices(description.model, generation),
             experts=partition,
         )
         module = result.model
-        name = _name(module)
         if dedicated:
             # The worker owns invocation of the loaded expert modules, in
             # numerical traversal order; no other capability is fabricated.
@@ -370,10 +504,9 @@ def load(
             image_processor=source.image_processor,
             flow_prompt=source.flow_prompt,
             tokenizer=None if dedicated else source.tokenizer,
-            model_name=name,
         )
 
-    if not dedicated and not request.get("host_only"):
+    if not dedicated and not host_only:
         loaded.calls = _bind_calls(loaded.module, description, units)
     from uniserve_models.backends import attention as attention_backends
     from uniserve_models.backends.attention import flashinfer
@@ -390,7 +523,9 @@ def _name(module: nn.Module) -> str:
     return f"{type(module).__module__}.{type(module).__qualname__}"
 
 
-def _expert_partition(experts) -> Communicator | None:
+def _expert_partition(
+    world, attention_ranks: int, dedicated: bool
+) -> Communicator | None:
     """The communicator a rank's routed experts shard over.
 
     Colocated expert parallelism partitions over the whole union. A
@@ -398,13 +533,12 @@ def _expert_partition(experts) -> Communicator | None:
     dedicated expert rank shards over the expert ranks with an unbound
     communicator: the exchange, not torch, moves its tokens.
     """
-    if experts is None:
+    if world is None:
         return None
-    union = experts["world"].experts
-    attention_ranks = int(experts["attention_ranks"])
+    union = world.experts
     if not attention_ranks:
         return None if union.size == 1 else union
-    if not experts["dedicated"]:
+    if not dedicated:
         return None
     return Communicator(
         union.ranks[attention_ranks:],
@@ -504,18 +638,6 @@ def _devices(
     return paths
 
 
-# Torch dtypes a product may carry on the wire.
-_PRODUCT_DTYPES = {
-    torch.uint8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-    torch.float16,
-    torch.bfloat16,
-    torch.float32,
-}
-
-
 def capability(model: nn.Module, kind: type[_Kind]) -> _Kind | None:
     """The model's unique module of ``kind``, if any."""
     found: list[_Kind] = []
@@ -529,155 +651,41 @@ def capability(model: nn.Module, kind: type[_Kind]) -> _Kind | None:
     return found[0] if found else None
 
 
-def product_name(module: nn.Module, name: str) -> str:
-    """Name a numerical output by its downstream protocol use."""
-    if isinstance(module, Denoiser):
-        return {"video": "video_latents", "audio": "audio_latents"}.get(
-            name, name
-        )
-    if isinstance(module, PatchEncoder) and name == "features":
-        return "vision_features"
-    if isinstance(module, VideoEncoder) and name == "video":
-        return "condition_video_latents"
-    if isinstance(module, AudioEncoder) and name == "audio":
-        return "condition_audio_latents"
-    if isinstance(module, VideoDecoder) and name == "video":
-        return "video_units"
-    return name
+def attention_backend(loaded: Loaded) -> str:
+    """The name of the attention backend the model was loaded with."""
+    return loaded.attention_backend
 
 
-def _outputs(
-    calls: Mapping[str, Sequence[Call]], max_sequence_tokens: int, dtype
-) -> dict[str, list[dict[str, Any]]]:
-    """Products the loaded calls publish, bounded by the admitted sizes.
+def weight_formats(loaded: Loaded) -> list[str]:
+    """The storage formats of the loaded parameters, sorted.
 
-    A text encoder's ``encode`` publishes its encoded conditioning. Products
-    of media timelines (denoisers, decoders and condition encoders, sized by
-    a media builder) are declared by the media runtimes' facts.
+    ``"dense"`` or a quantizer's format name.
     """
-    result = {}
-    for component, items in calls.items():
-        outputs = []
-        for call in items:
-            if not (
-                isinstance(call.module, TextEncoder)
-                and call.entry_point.method == "encode"
-            ):
-                continue
-            layouts = call.module.output_layout(max_sequence_tokens, dtype)
-            for name, layout in layouts.items():
-                if layout.dtype not in _PRODUCT_DTYPES:
-                    raise SetupError(
-                        f"result {component}.{name} has no protocol dtype"
-                    )
-                if len(layout.variable_axes) > 1:
-                    raise SetupError(
-                        f"result {component}.{name} exceeds the protocol "
-                        "dynamic axes"
-                    )
-                outputs.append(
-                    {
-                        "name": product_name(call.module, name),
-                        "dtype": str(layout.dtype).removeprefix("torch."),
-                        "shape": list(layout.shape),
-                        "variable_axes": list(layout.variable_axes),
-                        "raster_axes": None,
-                    }
-                )
-        if outputs:
-            result[component] = outputs
-    return result
-
-
-def _vision_feature_bytes(model: nn.Module, processor) -> int:
-    """Bytes of the largest vision feature product the processor admits.
-
-    Rows come from the processor's ViT transform pixel bound and the
-    encoder stride; zero without a ``PatchEncoder``, processor or ViT.
-    """
-    encoder = capability(model, PatchEncoder)
-    if encoder is None or processor is None or processor.vit is None:
-        return 0
-    from uniserve_models.media import image
-    from uniserve_models.processing import PatchTransform
-
-    transform = processor.vit
-    pixels = (
-        transform.pixel_bound()
-        if isinstance(transform, PatchTransform)
-        else min(transform.resize.max_pixels, transform.resize.max_size**2)
-    )
-    stride = encoder.patch_size * encoder.downsample
-    tokens = pixels // stride**2
-    if tokens == 0:
-        return 0
-    feature = encoder.output_layout(image.Config(stride, stride))["features"]
-    return tokens * feature.shape[1] * feature.dtype.itemsize
-
-
-def _image_flow(model: nn.Module) -> dict[str, int] | None:
-    """The image denoiser's latent geometry for the latent pool plan."""
-    # mypy rejects an abstract class as a ``type`` argument; the lookup
-    # only tests membership.
-    denoiser = capability(model, ImageDenoiser)  # type: ignore[type-abstract]
-    if denoiser is None:
-        return None
-    return {
-        "max_tokens": int(denoiser.max_sequence_tokens),
-        "latent_channels": int(denoiser.latent_channels),
-        "patch_size": int(denoiser.patch_size),
-    }
-
-
-def facts(loaded: Loaded, bounds: Mapping[str, Any]) -> dict[str, Any]:
-    """Report model-derived quantities for capacity planning and reporting.
-
-    ``bounds`` carries ``max_sequence_tokens``, ``model_dtype``,
-    ``kv_cache_dtype``, ``role``, ``deployment_components`` and
-    ``max_condition_rows``.
-    """
-    from uniserve_models.nn import Linear
     from uniserve_models.quantization import QuantizedTensor
 
-    model = loaded.module
-    dtype = getattr(torch, str(bounds["model_dtype"]).removeprefix("torch."))
-    text = (
-        None
-        if str(bounds["role"]) == "experts"
-        else capability(model, CausalLM)
-    )
-    weight_formats = sorted(
+    return sorted(
         {
             value.quantizer.format
             if isinstance(value, QuantizedTensor)
             else "dense"
-            for value in model.parameters()
+            for value in loaded.module.parameters()
         }
     )
-    activation_formats = sorted(
+
+
+def activation_formats(loaded: Loaded) -> list[str]:
+    """The input formats of the loaded linear layers, sorted.
+
+    ``"dense"`` or an input quantizer's format name.
+    """
+    from uniserve_models.nn import Linear
+
+    return sorted(
         {
             "dense"
             if child.input_quantizer is None
             else child.input_quantizer.format
-            for child in model.modules()
+            for child in loaded.module.modules()
             if isinstance(child, Linear)
         }
     )
-    experts = str(bounds["role"]) == "experts"
-    return {
-        "model_name": loaded.model_name or _name(model),
-        "attention_backend": loaded.attention_backend,
-        "vocab_size": None if text is None else int(text.backbone.vocab_size),
-        "hidden_size": None if text is None else int(text.backbone.hidden_size),
-        # Expert results return through the bound exchange, not request IPC.
-        "outputs": {}
-        if experts
-        else _outputs(loaded.calls, int(bounds["max_sequence_tokens"]), dtype),
-        "weight_formats": weight_formats,
-        "activation_formats": activation_formats,
-        "image_processor": loaded.image_processor is not None,
-        "vision_feature_bytes": _vision_feature_bytes(
-            model, loaded.image_processor
-        ),
-        "image_flow": None if experts else _image_flow(model),
-    }

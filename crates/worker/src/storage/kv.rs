@@ -17,19 +17,22 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{BlockTable, BufferId, KvTransfer, RequestKey, Wake};
 
-use super::kv_plan::KVPlan;
+use super::kv_plan::{CACHE, KVPlan};
 use super::kv_planes::{KVPlanes, UnitColumn};
 use super::memory::StorageView;
 use super::{BlockTableStorage, BlockTables, GroupTable, KVCacheManager};
-use crate::ffi::Function;
+use crate::ffi::Handle;
 use crate::host::HostLane;
-use crate::transfer::exports::Location;
+use crate::model::interface::Interface;
+use crate::stream::Issue;
+use crate::transfer::kv_export::{self, KvExport};
 use crate::transfer::{
     CacheImporter, ImportCopy, ImportEntry, ImportTask, ImportWorkspace, KVImport, KVImportBackend,
-    Retired, Retirement, Transports, kv_export,
+    Retired, Retirement, Transports,
 };
 use crate::{Error, HostTask, Outcome, Result};
 
@@ -159,9 +162,8 @@ impl KVCache {
     /// Allocate the pool, the tables and the import workspaces on `device`
     /// (host memory when `None`), resetting device storage on `stream`.
     ///
-    /// `bind_units` and `bind_conversion` are the interface's
-    /// `cache.bind_units` and `cache.bind_conversion`; every import
-    /// workspace binds both on its own stream.
+    /// Every import workspace constructs the library's unit resets and
+    /// page conversion on its own stream.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pool's complete startup facts"
@@ -174,8 +176,7 @@ impl KVCache {
         import_capacity: usize,
         device: Option<i32>,
         stream: Option<&Stream>,
-        bind_units: &Function,
-        bind_conversion: &Function,
+        interface: &Interface,
     ) -> Result<Self> {
         let shapes = plan.group_shapes()?;
         let planes = Arc::new(KVPlanes::allocate(plan, device, num_units, stream)?);
@@ -185,7 +186,7 @@ impl KVCache {
 
         let workers = Self::import_workers(import_capacity);
         let workspaces = (0..workers)
-            .map(|_| ImportWorkspace::bind(&planes, bind_units, bind_conversion).map(Arc::new))
+            .map(|_| ImportWorkspace::bind(&planes, interface).map(Arc::new))
             .collect::<Result<Vec<_>>>()?;
         let importer = Arc::new(CacheImporter::new(workspaces));
         let lane = HostLane::new(import_capacity.max(1), workers, "worker-kv-import")?;
@@ -245,19 +246,30 @@ impl KVCache {
         Ok(views)
     }
 
-    /// The plan map with the unit count, as cache bindings receive it.
-    pub fn layout(&self) -> Result<tvm_ffi::Map<tvm_ffi::String, tvm_ffi::Any>> {
-        self.plan().layout(self.planes.num_units())
+    /// The attention layers' view of the unit pool (the library's `pool`
+    /// over the plan, the unit count and the unit fields by name), which
+    /// execution contexts read prefixes through.
+    pub fn pool(&self, interface: &Interface) -> Result<Handle> {
+        let mut arguments = vec![
+            self.plan().handle.to_any(),
+            Any::from(i64::from(self.planes.num_units())),
+        ];
+        arguments.extend(self.planes.field_arguments()?);
+        Handle::new(
+            interface
+                .import(&format!("{CACHE}.pool"))?
+                .call_values(&arguments)?,
+        )
     }
 
     /// Bind the unit resets to another stream (one per executing lane).
-    pub fn bind_units(&self, bind_units: &Function, stream: Option<&Stream>) -> Result<UnitColumn> {
-        UnitColumn::bind(&self.planes, bind_units, stream)
+    pub fn bind_units(&self, interface: &Interface, stream: Option<&Stream>) -> Result<UnitColumn> {
+        UnitColumn::bind(&self.planes, interface, stream)
     }
 
     /// Install scheduler page assignments: validate them all, write the
     /// changed rows on `stream`, then commit them on the host.
-    pub fn install(&mut self, assignments: &[BlockTable], stream: Option<&Stream>) -> Result<()> {
+    pub fn install(&mut self, assignments: &[BlockTable], stream: impl Issue) -> Result<()> {
         let update = self.tables.prepare(assignments)?;
         self.storage.install(&update, stream)?;
         self.tables.commit(update);
@@ -270,7 +282,7 @@ impl KVCache {
         &mut self,
         units: &[u32],
         column: &UnitColumn,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         if units.iter().collect::<HashSet<_>>().len() != units.len() {
             return Err(Error::Invalid("recycled KV units repeat a unit".into()));
@@ -283,7 +295,7 @@ impl KVCache {
 
     /// Clear released slots' rows on `stream` (ordered after every batch
     /// that read them) and forget them on the host.
-    pub fn release_slots(&mut self, slots: &[u32], stream: Option<&Stream>) -> Result<()> {
+    pub fn release_slots(&mut self, slots: &[u32], stream: impl Issue) -> Result<()> {
         let slots = self.tables.release_slots(slots)?;
         self.storage.clear(&slots, stream)?;
         self.tables.release(&slots);
@@ -296,7 +308,7 @@ impl KVCache {
         &mut self,
         request: RequestKey,
         slots: &[u32],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         let slots = self.tables.release_slots(slots)?;
         self.storage.clear(&slots, stream)?;
@@ -308,7 +320,7 @@ impl KVCache {
     pub fn release_request_prefixes(
         &mut self,
         request: RequestKey,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         let slots = self.tables.prefix_slots(request);
         if slots.is_empty() {
@@ -317,7 +329,9 @@ impl KVCache {
         self.release_prefixes(request, &slots, stream)
     }
 
-    /// Export a slot's visible KV extent (see [`kv_export::export`]).
+    /// Export a slot's visible KV extent (see [`kv_export::export`]). Its
+    /// transfer and locations exist once the issuer's work was performed
+    /// ([`KvExport::locate`] with [`Self::manager`]).
     #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
     pub fn export(
         &mut self,
@@ -327,8 +341,8 @@ impl KVCache {
         buffer: BufferId,
         transports: &Transports,
         consumers: &[usize],
-        stream: Option<&Stream>,
-    ) -> Result<(KvTransfer, Vec<Location>)> {
+        stream: impl Issue,
+    ) -> Result<KvExport> {
         kv_export::export(
             &mut self.manager,
             &self.tables,
@@ -438,12 +452,12 @@ impl KVCache {
     /// Accept a finished import as the slot's installed prefix under
     /// `installed`: recheck the accepted base and the slot's tables (another
     /// import may have advanced them while the copy ran), then publish the
-    /// imported length on `stream`.
+    /// imported length in `stream`'s order.
     pub fn adopt_import(
         &mut self,
         import: &PendingImport,
         installed: BufferId,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<KvTransfer>> {
         if installed.owner != import.export.source.owner {
             return Err(Error::Invalid(
@@ -514,9 +528,9 @@ impl KVCache {
     }
 
     /// Lend units `1..=count` as warmup scratch: no access may be pending,
-    /// and the units are reset natively on `stream` now and when the
-    /// scratch is returned.
-    pub fn scratch_units(&mut self, count: u32, stream: Option<&Stream>) -> Result<ScratchUnits> {
+    /// and the units are reset natively, issued to `stream`, now and when
+    /// the scratch is returned.
+    pub fn scratch_units(&mut self, count: u32, stream: impl Issue) -> Result<ScratchUnits> {
         if self.manager.has_pending_accesses() {
             return Err(Error::State("KV scratch requires an idle cache"));
         }
@@ -567,15 +581,11 @@ impl ScratchUnits {
         1..=self.count
     }
 
-    /// Wait for the warmup's writes on `stream`, then reset the units again.
-    pub fn finish(self, cache: &KVCache, stream: Option<&Stream>) -> Result<()> {
-        if let Some(stream) = stream {
-            stream.synchronize()?;
-        }
+    /// Wait for the warmup's writes on `stream`, reset the units again and
+    /// wait for the resets, all issued to `stream`.
+    pub fn finish(self, cache: &KVCache, stream: impl Issue) -> Result<()> {
+        Issue::synchronize(&stream)?;
         cache.planes.zero_leading(self.count, stream)?;
-        if let Some(stream) = stream {
-            stream.synchronize()?;
-        }
-        Ok(())
+        Issue::synchronize(&stream)
     }
 }

@@ -1,9 +1,10 @@
 //! A token batch's invocation: input rows, sampling tasks and prompt scoring.
 //!
-//! Every active call contributes its input rows: one row, or for a prefill
-//! placing image features one row per prompt run and vision block. The
-//! calls split into one invocation per expert microbatch of the batch's
-//! runner group (one invocation without microbatches). Sampled calls become
+//! Every active call contributes its input rows ([`Batch::rows`]): one row,
+//! or for a prefill placing image features one row per prompt run and
+//! vision block. The calls split into one invocation per expert microbatch
+//! of the batch's runner group (one invocation without microbatches), and
+//! [`Batch::step`] records their forwards in the batch's job. Sampled calls become
 //! tasks: prefill and decode sample their last projected row, a
 //! verification every candidate row. A prefill chunk that scores its prompt
 //! projects all of its rows; they score its tokens, its last row also
@@ -14,19 +15,22 @@
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
-use super::StepParts;
 use super::batch::Batch;
 use super::calls::{self, Prepared};
 use super::context::{self, Sources};
-use crate::cuda_graph::GraphMode;
+use super::runners::Step;
+use super::{CausalLMRunners, StepParts};
+use crate::executor::forward::batch::image::ImageParts;
+use crate::lane::Job;
 use crate::runner::causal_lm::{
-    Embeddings, Executed, FINISH_IDS, SamplingColumns, StepRequest, TokenRow, logit_layout,
+    Embeddings, FINISH_IDS, PromptChunks, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };
-use crate::runner::diffusion::image::ConditionRow;
+use crate::runner::denoiser::image::ConditionRow;
 use crate::sampling::SamplingMetadata;
 use crate::sampling::plan::{SampleTask, SamplingPlan, logprob_request, logprob_words};
 use crate::storage::LogprobLayout;
 use crate::storage::memory::StorageView;
+use crate::worker::RankStorage;
 use crate::{Error, Result};
 
 /// A prefill chunk's prompt scoring.
@@ -68,18 +72,28 @@ impl Invoked {
     }
 }
 
-/// What a step produced, for capture and commit.
+/// A step as the batch's job holds it, for capture and commit.
 pub(super) struct Stepped {
     /// Every populated microbatch's invocation, in microbatch order.
     pub(super) invocations: Vec<Invoked>,
-    /// How the step ran: the populated invocations' tokens summed, and
-    /// their mode (any capture, else any replay, else eager).
-    pub(super) executed: Executed,
+    /// The invocations' forwards, which the job's completion says how they
+    /// ran; none when no call has a text row.
+    pub(super) step: Option<Step>,
     pub(super) rows: usize,
     pub(super) drafts: u64,
 }
 
 impl Stepped {
+    /// The step of a batch whose calls were all skipped.
+    pub(super) fn skipped() -> Self {
+        Self {
+            invocations: Vec::new(),
+            step: None,
+            rows: 0,
+            drafts: 0,
+        }
+    }
+
     /// The invocation of microbatch runner `runner`.
     pub(super) fn invocation(&self, runner: usize) -> Result<&Invoked> {
         self.invocations
@@ -89,7 +103,18 @@ impl Stepped {
     }
 }
 
-/// One active call's input rows, before the calls split into microbatches.
+/// The active calls' input rows, before the calls split into microbatches.
+pub(crate) struct Rows {
+    /// The calls that have text rows.
+    inputs: Vec<CallRows>,
+    /// Each active call's sampling parameters and finish tokens, by call.
+    params: Vec<Option<(SamplingParams, Vec<u32>)>>,
+    /// The latent images the image denoiser writes the K/V of before the
+    /// invocations run.
+    pub(super) conditions: Vec<ConditionRow>,
+}
+
+/// One active call's input rows.
 struct CallRows {
     /// The call's index in the batch.
     call: usize,
@@ -109,7 +134,7 @@ struct Planned {
     /// selections are final; empty otherwise.
     finish_ids: Vec<[i64; FINISH_IDS]>,
     sampling: Option<SamplingPlan>,
-    prompt: Vec<i64>,
+    prompt: PromptChunks,
     tasks: usize,
 }
 
@@ -120,7 +145,7 @@ impl Planned {
             rows: &self.rows,
             finish_ids: &self.finish_ids,
             sampling: self.sampling.as_ref().map(|plan| SamplingColumns {
-                words: &plan.words,
+                groups: &plan.groups,
                 draws: &plan.draws,
                 params: &plan.params,
                 slots: &plan.slots,
@@ -133,36 +158,27 @@ impl Planned {
 }
 
 impl PromptScore {
-    /// The chunk's record in the step's prompt descriptor: `[row, count,
-    /// token, continued, slot, words, tail, top, requested, ids...]`.
-    fn record(&self, words: &mut Vec<i64>, top: usize, ids: &[u32]) {
-        words.extend([
-            self.span.0 as i64,
-            self.span.1 as i64,
-            self.token as i64,
-            self.continued,
-            self.slot as i64,
-            self.words as i64,
-            self.tail as i64,
-            top as i64,
-            ids.len() as i64,
-        ]);
-        words.extend(ids.iter().map(|&id| i64::from(id)));
+    /// Add the chunk, which reports its `top` tokens and `ids`, to the
+    /// forward's prompt chunks.
+    fn record(&self, chunks: &mut PromptChunks, top: usize, ids: &[u32]) {
+        chunks.rows.push(self.span.0 as i64);
+        chunks.row_counts.push(self.span.1 as i64);
+        chunks.tokens.push(self.token as i64);
+        chunks.continued.push(self.continued);
+        chunks.slots.push(self.slot as i64);
+        chunks.offsets.push(self.words as i64);
+        chunks.tails.push(self.tail as i64);
+        chunks.tops.push(top as i64);
+        chunks.ids.push(ids.to_vec());
     }
 }
 
 impl Batch<'_> {
-    /// Build the active calls' invocations, one per microbatch, and run
-    /// them as one step.
-    ///
-    /// The calls that have input rows split into contiguous microbatches
-    /// of `[i * R / P, (i + 1) * R / P)` calls for `R` such calls and `P`
-    /// microbatches; each microbatch runner samples and scores its own
-    /// calls. A latent conditioning has no text row: the image denoiser
-    /// writes its K/V before the invocations run.
-    pub(super) fn step(&mut self) -> Result<Stepped> {
+    /// Build the active calls' input rows. A latent conditioning has no
+    /// text row: the image denoiser writes its K/V before the invocations
+    /// run.
+    pub(super) fn rows(&mut self) -> Result<Rows> {
         let plan = self.plan;
-        let peers = self.runtime.groups[self.group].clone();
         let kv = self
             .storage
             .kv
@@ -201,10 +217,10 @@ impl Batch<'_> {
                 let scores = call.writes_context() && admitted.prompt_logprobs_requested();
                 let sources = Sources {
                     tensors: &self.storage.tensors,
-                    image: self.image.as_deref(),
+                    image: self.image.as_ref(),
                     tables,
                     device: self.device,
-                    stream: self.stream.as_ref(),
+                    stream: self.job.on(self.stream.as_ref()),
                     input_images,
                 };
                 let slot = state.slot as u32;
@@ -263,9 +279,23 @@ impl Batch<'_> {
             params[index] = Some((admitted, finish));
         }
         self.reads.extend(reads);
-        if !conditions.is_empty() {
-            self.condition_latents(&conditions)?;
-        }
+        Ok(Rows {
+            inputs,
+            params,
+            conditions,
+        })
+    }
+
+    /// Build the invocations of `rows`, one per microbatch, and record
+    /// them in the batch's job as one step.
+    ///
+    /// The calls that have input rows split into contiguous microbatches
+    /// of `[i * R / P, (i + 1) * R / P)` calls for `R` such calls and `P`
+    /// microbatches; each microbatch runner samples and scores its own
+    /// calls.
+    pub(super) fn step(&mut self, rows: Rows) -> Result<Stepped> {
+        let Rows { inputs, params, .. } = rows;
+        let peers = self.runtime.groups[self.group].clone();
 
         let count = peers.len();
         let total = inputs.len();
@@ -285,9 +315,9 @@ impl Batch<'_> {
             )?));
         }
 
-        let executed = if total == 0 {
+        let step = if total == 0 {
             // Only latent conditionings, which the image denoiser wrote.
-            vec![None; count]
+            None
         } else {
             let requests: Vec<Option<StepRequest<'_>>> = planned
                 .iter()
@@ -299,45 +329,32 @@ impl Batch<'_> {
                 .as_mut()
                 .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
             let (tables, cache) = kv.split();
-            self.runtime.invoke(
-                self.experts,
+            Some(self.runtime.forward(
+                self.experts.as_ref(),
                 self.group,
                 &requests,
                 &mut StepParts { tables, cache },
                 None,
-            )?
+                &self.job,
+            )?)
         };
         for (index, controls) in metadata {
             self.calls[index].metadata = Some(controls);
         }
 
-        let mut invocations = Vec::new();
-        let mut summary = Executed {
-            mode: GraphMode::Eager,
-            live_tokens: 0,
-            padded_tokens: 0,
-        };
-        for (planned, executed) in planned.into_iter().zip(executed) {
-            let (Some(planned), Some(executed)) = (planned, executed) else {
-                continue;
-            };
-            summary.live_tokens += executed.live_tokens;
-            summary.padded_tokens += executed.padded_tokens;
-            summary.mode = match (summary.mode, executed.mode) {
-                (GraphMode::Capture, _) | (_, GraphMode::Capture) => GraphMode::Capture,
-                (GraphMode::Replay, _) | (_, GraphMode::Replay) => GraphMode::Replay,
-                _ => GraphMode::Eager,
-            };
-            invocations.push(Invoked {
+        let invocations = planned
+            .into_iter()
+            .flatten()
+            .map(|planned| Invoked {
                 runner: planned.runner,
                 sampling: planned.sampling,
                 tasks: planned.tasks,
-            });
-        }
+            })
+            .collect();
         let rows = || inputs.iter().flat_map(|input| &input.rows);
         Ok(Stepped {
             invocations,
-            executed: summary,
+            step,
             rows: rows().count(),
             drafts: rows()
                 .map(|row| u64::from(row.query.saturating_sub(1)))
@@ -516,7 +533,7 @@ impl Batch<'_> {
             .as_ref()
             .and_then(SamplingPlan::logprob_end)
             .unwrap_or(0);
-        let mut prompt_words = Vec::new();
+        let mut prompt_chunks = PromptChunks::default();
         for (tail, &(index, span, token, continued)) in prompts.iter().enumerate() {
             let (admitted, _) = params[index]
                 .as_ref()
@@ -546,7 +563,7 @@ impl Batch<'_> {
                     max_requested: ids.len(),
                 }),
             };
-            score.record(&mut prompt_words, top, &ids);
+            score.record(&mut prompt_chunks, top, &ids);
             cursor += score.size;
             self.calls[index].prompt.push(score);
         }
@@ -568,35 +585,44 @@ impl Batch<'_> {
             embeddings,
             finish_ids,
             sampling,
-            prompt: prompt_words,
+            prompt: prompt_chunks,
             tasks: task_count,
         })
     }
 }
 
-impl Batch<'_> {
-    /// Write the K/V of latent images inserted as conditioning, through the
-    /// image denoiser on its stream, ordered between this batch's text
-    /// work.
-    fn condition_latents(&mut self, rows: &[ConditionRow]) -> Result<()> {
-        let image = self.image.as_deref_mut().ok_or_else(|| {
-            Error::Unsupported("latent conditioning requires the image runtime".into())
-        })?;
-        let diffusion = image.diffusion_mut().ok_or_else(|| {
-            Error::Unsupported("latent conditioning requires an image denoiser".into())
-        })?;
-        let stream = diffusion.stream().cloned();
-        let kv = self
-            .storage
-            .kv
-            .as_mut()
-            .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
-        let (tables, cache) = kv.split();
-        self.runtime.order().wait(stream.as_ref())?;
-        diffusion.condition(rows, tables, |table, prefix, query| {
+/// Record into `job` the write of the K/V of latent images inserted as
+/// conditioning, through the image denoiser on its stream, ordered between
+/// the text work the job holds for `stream` before and after it.
+pub(super) fn condition_latents(
+    runtime: &mut CausalLMRunners,
+    image: &mut Option<ImageParts<'_>>,
+    storage: &mut RankStorage,
+    rows: &[ConditionRow],
+    stream: Option<&uniserve_cuda::Stream>,
+    job: &Job,
+) -> Result<()> {
+    let image = image.as_mut().ok_or_else(|| {
+        Error::Unsupported("latent conditioning requires the image runtime".into())
+    })?;
+    let diffusion = image.diffusion_mut().ok_or_else(|| {
+        Error::Unsupported("latent conditioning requires an image denoiser".into())
+    })?;
+    let denoiser = diffusion.stream().cloned();
+    let kv = storage
+        .kv
+        .as_mut()
+        .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
+    let (tables, cache) = kv.split();
+    runtime.order().wait(job.on(denoiser.as_ref()))?;
+    diffusion.condition(
+        rows,
+        tables,
+        |table, prefix, query| {
             cache.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
-        })?;
-        self.runtime.order_mut().record(stream.as_ref())?;
-        self.runtime.order().wait(self.stream.as_ref())
-    }
+        },
+        job,
+    )?;
+    runtime.order_mut().record(job.on(denoiser.as_ref()))?;
+    runtime.order().wait(job.on(stream))
 }

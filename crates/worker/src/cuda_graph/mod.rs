@@ -102,8 +102,9 @@ pub struct CUDAGraph {
     /// Rust noted at capture.
     breaks: Arc<[GraphBreak]>,
     /// The Python graph, passed back to release it and to a binding that
-    /// replays the graph itself.
-    graph: Handle,
+    /// replays the graph itself. Shared, so that a launch which holds the
+    /// graph for a job gives up no Python reference when it ends.
+    graph: Arc<Handle>,
 }
 
 impl CUDAGraph {
@@ -126,7 +127,7 @@ impl CUDAGraph {
         Ok(Self {
             segments,
             breaks: Arc::new([]),
-            graph: Handle::new(field(0)?)?,
+            graph: Arc::new(Handle::new(field(0)?)?),
         })
     }
 
@@ -137,14 +138,14 @@ impl CUDAGraph {
         self
     }
 
+    /// The graph's segments: one more than its graph breaks.
+    pub(crate) fn segments(&self) -> usize {
+        self.segments.len()
+    }
+
     /// The Python graph.
     pub fn handle(&self) -> &Handle {
         &self.graph
-    }
-
-    /// Segments of the graph: one more than its graph breaks.
-    pub fn segments(&self) -> usize {
-        self.segments.len()
     }
 
     /// Submit one execution of the forward to `stream` without waiting for

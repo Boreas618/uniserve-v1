@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use uniserve_core::UnitId;
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32, reclaim};
-use uniserve_ipc::{BlockTable, Locator, TransferTransport, WorkerEndpoint};
+use uniserve_ipc::{BlockTable, CallKind, ForwardMode, Locator, TransferTransport, WorkerEndpoint};
 use uniserve_worker::ffi::{Backing, DType, Device};
+use uniserve_worker::lane::JobQueues;
 use uniserve_worker::storage::memory::{Memory, StorageView};
 use uniserve_worker::storage::{
     BlockTableStorage, BlockTables, GroupShape, LatentStorage, OutputBuffer, OutputStorage,
@@ -21,6 +22,28 @@ use uniserve_worker::transfer::{
     Capacity, Spans, TransportKind, TransportOptions, Transports, exports, notify,
 };
 use uniserve_worker::{Error, ErrorCode, EventPool, WorkerError};
+
+/// Export on `stream` and take the locations, complete at once.
+fn located(
+    transports: &Transports,
+    source: &Spans,
+    offset: Option<&[u64]>,
+    consumers: &[usize],
+    host: bool,
+    stream: Option<&Stream>,
+    mut retain: impl FnMut(Arc<uniserve_worker::transfer::Retirement>) -> uniserve_worker::Result<()>,
+) -> uniserve_worker::Result<Vec<uniserve_worker::transfer::exports::Location>> {
+    exports::export(
+        transports,
+        source,
+        offset,
+        consumers,
+        host,
+        stream,
+        &mut retain,
+    )?
+    .locate(&mut retain)
+}
 
 const DEVICE: i32 = 0;
 
@@ -111,11 +134,40 @@ fn endpoint(address_space: &str) -> WorkerEndpoint {
     }
 }
 
+/// What a rank's control thread does for its event pool, done by a test: a
+/// lane of the test's own waits for the events of deferred releases, and
+/// [`Completions::advance`] hands the pool the completions that arrived.
+struct Completions {
+    events: Arc<EventPool>,
+    jobs: JobQueues,
+}
+
+impl Completions {
+    fn serve(events: &Arc<EventPool>) -> Self {
+        let jobs = JobQueues::single_lane().unwrap();
+        let lane = jobs.clone();
+        events.set_submitter(Some(Box::new(move |device, events| {
+            lane.after(CallKind::Forward(ForwardMode::Decode), device, events)
+        })));
+        Self {
+            events: Arc::clone(events),
+            jobs,
+        }
+    }
+
+    fn advance(&self) {
+        self.events.submit_deferred().unwrap();
+        while let Some((job, completion)) = self.jobs.take() {
+            self.events.complete(job, completion).unwrap();
+        }
+    }
+}
+
 fn transports(
     kinds: &[TransportKind],
     address_space: &str,
     slot: usize,
-) -> (Transports, Arc<Capacity>) {
+) -> (Transports, Arc<Capacity>, Completions) {
     let capacity = Arc::new(Capacity::new(1 << 24, 8, notify).unwrap());
     let options = TransportOptions {
         source: endpoint(address_space),
@@ -124,15 +176,17 @@ fn transports(
         cross_host_consumers: false,
         vmm_pool_bytes: 1 << 22,
     };
-    let transports =
-        Transports::new(kinds, Arc::clone(&capacity), EventPool::new(), &options).unwrap();
-    (transports, capacity)
+    let events = EventPool::new();
+    let completions = Completions::serve(&events);
+    let transports = Transports::new(kinds, Arc::clone(&capacity), events, &options).unwrap();
+    (transports, capacity, completions)
 }
 
 /// Reap `transports` until every export credit has returned.
-fn settle(transports: &Transports, capacity: &Capacity) {
+fn settle(transports: &Transports, capacity: &Capacity, completions: &Completions) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while capacity.used() != 0 && std::time::Instant::now() < deadline {
+        completions.advance();
         transports.reap().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -255,7 +309,11 @@ fn output_readback_waits_for_device_copies_and_widens_tokens() {
     let (offset, count) = output.capture(&column, Some(&stream), &events).unwrap();
     assert!(output.readback().is_err(), "readback before sealing");
     output.seal(&[&stream], &events).unwrap();
+    // The lease does not ask the driver: its fences have completed once
+    // it is told so, here by the test that waited for the stream.
+    assert!(output.readback().is_err(), "readback before its fences");
     stream.synchronize().unwrap();
+    output.fences_completed();
     output.readback().unwrap();
     assert_eq!(output.read_tokens(offset, count).unwrap(), [-2, -2, -2]);
     let timing = output.observe(0).unwrap();
@@ -267,7 +325,7 @@ fn output_readback_waits_for_device_copies_and_widens_tokens() {
 fn device_exports_reach_local_shared_and_channel_readers() {
     let _driver = exclusive_driver();
     let stream = stream();
-    let (transports, capacity) = transports(
+    let (transports, capacity, completions) = transports(
         &[
             TransportKind::Local,
             TransportKind::Shm,
@@ -279,7 +337,7 @@ fn device_exports_reach_local_shared_and_channel_readers() {
     let source = counting(&[8, 4], Memory::device(DEVICE, 128).unwrap(), &stream);
     let spans = Spans::single(source).unwrap();
     // Slot 0 is on this host, slot 7 is not: local, shm and channel all apply.
-    let locations = exports::export(
+    let locations = located(
         &transports,
         &spans,
         None,
@@ -332,6 +390,7 @@ fn device_exports_reach_local_shared_and_channel_readers() {
     exports::release(&locations).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while capacity.used() != 0 && std::time::Instant::now() < deadline {
+        completions.advance();
         transports.reap().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -343,10 +402,10 @@ fn device_exports_reach_local_shared_and_channel_readers() {
 #[ignore = "requires a CUDA device"]
 fn cancelled_reads_keep_credits_until_their_copy_drains() {
     let _driver = exclusive_driver();
-    let (transports, capacity) = transports(&[TransportKind::Local], "space", 0);
+    let (transports, capacity, _completions) = transports(&[TransportKind::Local], "space", 0);
     let stream = stream();
     let source = counting(&[256], Memory::device(DEVICE, 1024).unwrap(), &stream);
-    let locations = exports::export(
+    let locations = located(
         &transports,
         &Spans::single(source).unwrap(),
         None,
@@ -421,12 +480,12 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
     let memory = Memory::device(DEVICE, elements as usize * 4).unwrap();
     let spans = Spans::single(counting(&[elements], memory, &stream)).unwrap();
 
-    let (device_only, capacity) = transports(
+    let (device_only, capacity, completions) = transports(
         &[TransportKind::Local, TransportKind::CudaVmm],
         "producer",
         0,
     );
-    let exported = exports::export(
+    let exported = located(
         &device_only,
         &spans,
         None,
@@ -436,10 +495,10 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
         |_| Ok(()),
     );
     assert!(matches!(exported, Err(Error::Resource(_))));
-    settle(&device_only, &capacity);
+    settle(&device_only, &capacity, &completions);
     device_only.close().unwrap();
 
-    let (with_shared, capacity) = transports(
+    let (with_shared, capacity, completions) = transports(
         &[
             TransportKind::Local,
             TransportKind::CudaVmm,
@@ -448,7 +507,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
         "producer",
         0,
     );
-    let locations = exports::export(
+    let locations = located(
         &with_shared,
         &spans,
         None,
@@ -464,7 +523,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
         .collect();
     assert_eq!(kinds, [TransportKind::Local, TransportKind::Shm]);
     exports::release(&locations).unwrap();
-    settle(&with_shared, &capacity);
+    settle(&with_shared, &capacity, &completions);
     with_shared.close().unwrap();
 }
 
@@ -475,7 +534,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() {
 fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
     let _driver = exclusive_driver();
     let stream = stream();
-    let (transports, capacity) = transports(
+    let (transports, capacity, completions) = transports(
         &[TransportKind::Local, TransportKind::CudaVmm],
         "producer",
         0,
@@ -503,7 +562,7 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
 
     for source in [kv_page, latent_page] {
         assert_eq!(source.nbytes(), 6 << 20);
-        let locations = exports::export(
+        let locations = located(
             &transports,
             &source,
             None,
@@ -520,7 +579,7 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
         assert_eq!(kinds, [TransportKind::Local, TransportKind::CudaVmm]);
 
         exports::release(&locations).unwrap();
-        settle(&transports, &capacity);
+        settle(&transports, &capacity, &completions);
     }
     transports.close().unwrap();
 }
@@ -533,14 +592,14 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() {
 fn vmm_exports_are_imported_by_another_process() {
     let _driver = exclusive_driver();
     let stream = stream();
-    let (transports, capacity) = transports(
+    let (transports, capacity, completions) = transports(
         &[TransportKind::Local, TransportKind::CudaVmm],
         "producer",
         0,
     );
     let source = counting(&[16, 8], Memory::device(DEVICE, 512).unwrap(), &stream);
     let mut retirements = Vec::new();
-    let locations = exports::export(
+    let locations = located(
         &transports,
         &Spans::single(source).unwrap(),
         None,
@@ -573,6 +632,7 @@ fn vmm_exports_are_imported_by_another_process() {
     exports::release(&locations).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while capacity.used() != 0 && std::time::Instant::now() < deadline {
+        completions.advance();
         transports.reap().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -590,7 +650,7 @@ fn vmm_export_consumer() {
         return;
     };
     let locator: Locator = serde_json::from_str(&locator).unwrap();
-    let (transports, _) = transports(&[TransportKind::CudaVmm], "consumer", 1);
+    let (transports, _, _completions) = transports(&[TransportKind::CudaVmm], "consumer", 1);
     let transport = transports.get(TransportKind::CudaVmm).unwrap();
     let stream = stream();
     let destination = Spans::single(
@@ -633,49 +693,40 @@ fn fp8_plan() -> uniserve_worker::KVPlan {
 
 /// A one-group plan storing `dtype`: two layers in two columns, 8-token
 /// pages of two heads of `head_dim` elements.
-fn kv_plan(dtype: &str, head_dim: i64) -> uniserve_worker::KVPlan {
+fn kv_plan(dtype: &str, head_dim: u32) -> uniserve_worker::KVPlan {
+    use uniserve_worker::ffi::{DType, Handle};
+    use uniserve_worker::storage::{GroupAxis, KVGroupPlan};
+
     let quantized = dtype == "float8_e4m3fn";
     let element_bytes = if quantized { 1 } else { 2 };
-    let plane_bytes = 8 * 2 * head_dim * element_bytes;
+    let plane_bytes = u64::from(8 * 2 * head_dim * element_bytes);
     // Each plane carries one initialized flag, and an FP8 plane one f32 scale.
     let metadata_bytes = if quantized { 5 } else { 1 };
-    let unit_bytes = 2 * 2 * (plane_bytes + metadata_bytes);
-
-    use tvm_ffi::{Any, Array, Map, String as FfiString};
-    let entry = |key: &str, value: Any| (FfiString::from(key), value);
-    let names: Array<Any> = ["a", "b"]
-        .iter()
-        .map(|name| Any::from(FfiString::from(*name)))
-        .collect();
-    let ids = || -> Array<Any> { [0_i64, 1].iter().map(|&id| Any::from(id)).collect() };
-    let group: Map<FfiString, Any> = [
-        entry("window", Any::from(-1_i64)),
-        entry("page_tokens", Any::from(8_i64)),
-        entry("units_per_page", Any::from(1_i64)),
-        entry("layers", Any::from(names)),
-        entry("layer_ids", Any::from(ids())),
-        entry("axis_layers", Any::from(ids())),
-        entry("num_kv_heads", Any::from(2_i64)),
-        entry("total_kv_heads", Any::from(2_i64)),
-        entry("kv_head_offset", Any::from(0_i64)),
-        entry("head_dim", Any::from(head_dim)),
-        entry("dtype", Any::from(FfiString::from(dtype))),
-        entry("compute_dtype", Any::from(FfiString::from("bfloat16"))),
-    ]
-    .into_iter()
-    .collect();
-    let groups: Array<Any> = [Any::from(group)].into_iter().collect();
-    let plan: Map<FfiString, Any> = [
-        entry("columns", Any::from(2_i64)),
-        entry("plane_bytes", Any::from(plane_bytes)),
-        entry("quantized", Any::from(quantized)),
-        entry("unit_bytes", Any::from(unit_bytes)),
-        entry("dtype", Any::from(FfiString::from(dtype))),
-        entry("groups", Any::from(groups)),
-    ]
-    .into_iter()
-    .collect();
-    uniserve_worker::KVPlan::decode(Any::from(plan)).unwrap()
+    uniserve_worker::KVPlan {
+        columns: 2,
+        plane_bytes,
+        quantized,
+        unit_bytes: 2 * 2 * (plane_bytes + metadata_bytes),
+        dtype: dtype.parse().unwrap(),
+        groups: vec![KVGroupPlan {
+            window: None,
+            page_tokens: 8,
+            units_per_page: 1,
+            layers: vec!["a".into(), "b".into()],
+            layer_ids: vec![0, 1],
+            axis: GroupAxis {
+                offset: 0,
+                total: 2,
+            },
+            num_kv_heads: 2,
+            total_kv_heads: 2,
+            kv_head_offset: 0,
+            head_dim,
+            dtype: DType::from_name(dtype).unwrap(),
+            compute_dtype: DType::BF16,
+        }],
+        handle: Handle::none(),
+    }
 }
 
 #[test]

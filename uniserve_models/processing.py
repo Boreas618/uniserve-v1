@@ -381,6 +381,7 @@ __all__ = [
     "BranchSource",
     "PositionLayout",
     "load_tokenizer",
+    "resolve_prefix",
     "FeatureInjection",
     "FeatureLayout",
     "ImageProcessor",
@@ -436,6 +437,49 @@ class FlowPrompt:
                 framed, add_special_tokens=self.add_special_tokens
             )
         )
+
+
+def resolve_prefix(
+    prompt: FlowPrompt | None,
+    tokenizer,
+    source: str,
+    *,
+    image_prompt: str,
+    negative_prompt: str,
+) -> tuple[tuple[int, ...], bool]:
+    """Tokenize the prefix a guidance branch of ``source`` conditions on.
+
+    ``conditioning`` frames the image prompt, and a blank one reuses the
+    request's own context; ``negative_or_start`` frames the negative
+    prompt; ``start`` frames empty text. Text is stripped as Python strips
+    it. Without prompt framing a model reuses its context for a blank
+    conditioning prompt, refuses a prompt override and leaves its other
+    prefixes empty. ``tokenizer`` returns the model's tokenizer; it is called
+    only when ``prompt`` frames text.
+
+    Returns:
+        The prefix tokens and whether the branch reuses the request's own
+        context.
+
+    Raises:
+        ValueError: A prompt override for a model without prompt framing.
+    """
+    source = str(source)
+    conditioned = source == "conditioning"
+    text = {
+        "conditioning": str(image_prompt),
+        "negative_or_start": str(negative_prompt),
+    }.get(source, "")
+    text = text.strip()
+    if conditioned and not text:
+        return (), True
+    if prompt is None:
+        if conditioned:
+            raise ValueError(
+                "this model does not accept a generation prompt override"
+            )
+        return (), False
+    return prompt.encode(tokenizer(), text=text, conditioned=conditioned), False
 
 
 def load_tokenizer(path: Path):

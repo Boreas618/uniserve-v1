@@ -6,6 +6,17 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use indexmap::IndexMap;
 use uniserve_cuda::{CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, SourceOrder, Stream};
 
+use std::sync::Arc;
+
+use tvm_ffi::{Any, AnyView};
+
+use super::world::World;
+use crate::config::{Device, WorkerLaunch};
+use crate::cuda_graph::GraphBreaks;
+use crate::ffi::{Function, Handle};
+use crate::lane::Lanes;
+use crate::model::LoadedModel;
+use crate::model::interface::Interface;
 use crate::{Error, Result};
 
 #[derive(Default)]
@@ -574,4 +585,242 @@ impl ExpertWeights {
         drop(self.prefetch.close()?);
         Ok(())
     }
+}
+
+/// The library module of expert exchanges and distributed expert weights.
+const MODULE: &str = "uniserve_models.distributed.experts";
+
+// Distributed expert weights of a rank (DWDP): setup is collective over the
+// expert union, after loading and before capacity planning. `weight_fields`
+// places each layer's weights for its kernels and lists this rank's shards;
+// [`ExpertWeights::build`] publishes them and maps every field's full
+// extent; `bind_weights` installs the full views as the layers' parameters,
+// and `bind_prefetch` returns the object execution contexts pass to their
+// expert calls, over the manager's hooks. A prefetch a captured forward
+// reaches is a graph break: the hook ends the segment and notes the copy,
+// which the forward's graph performs at every launch.
+
+/// The rank's distributed expert weights and their prefetch object.
+pub(crate) struct DwdpManager {
+    weights: Arc<ExpertWeights>,
+    /// `bind_prefetch`'s object, passed to every runner's constructor.
+    prefetch: Handle,
+    /// The weight copies noted as graph breaks of the forward being
+    /// captured.
+    breaks: GraphBreaks,
+    closed: bool,
+}
+
+/// A worker error raised back into the calling numerical code.
+fn ffi_error(error: &Error) -> tvm_ffi::Error {
+    tvm_ffi::Error::new(tvm_ffi::RUNTIME_ERROR, &error.to_string(), "")
+}
+
+fn count(value: &AnyView<'_>) -> std::result::Result<usize, tvm_ffi::Error> {
+    let value = i64::try_from(*value)?;
+    usize::try_from(value)
+        .map_err(|_| tvm_ffi::Error::new(tvm_ffi::VALUE_ERROR, "expected a count", ""))
+}
+
+/// The compute stream an expert call names by its handle.
+fn compute(
+    weights: &ExpertWeights,
+    handle: &AnyView<'_>,
+) -> std::result::Result<Stream, tvm_ffi::Error> {
+    // SAFETY: the binding names the stream its expert call runs on, which the
+    // rank's lanes own until the weights close.
+    unsafe { crate::stream::external(weights.device(), count(handle)?) }
+        .map_err(|error| ffi_error(&error))
+}
+
+impl DwdpManager {
+    /// Set up the rank's distributed expert weights, collectively over the
+    /// expert union. `None` unless the union prefetches weights.
+    pub(crate) fn start(
+        interface: &Interface,
+        launch: &WorkerLaunch,
+        world: &World,
+        model: &LoadedModel,
+        lanes: &Lanes,
+        node: &str,
+    ) -> Result<Option<Self>> {
+        let Some(union) = &launch.expert_parallel else {
+            return Ok(None);
+        };
+        if union.exchange != "dwdp" {
+            return Ok(None);
+        }
+        let Device::Cuda(device) = launch.device() else {
+            return Err(Error::Unsupported("DWDP requires CUDA peer memory".into()));
+        };
+        let stream = match lanes.lanes() {
+            [] => lanes.preparation(DeviceId(device)),
+            [lane] => Some(&lane.stream),
+            _ => {
+                return Err(Error::Unsupported(
+                    "DWDP runs every forward on exactly one execution lane".into(),
+                ));
+            }
+        }
+        .ok_or(Error::State("DWDP requires a CUDA stream"))?;
+        let stream = stream.stream()?.clone();
+        let union_group = world
+            .union
+            .as_ref()
+            .ok_or(Error::State("DWDP requires its union's host group"))?;
+
+        // The number of fields of each layer, then every field's name and
+        // shard, the layers back to back.
+        let function = format!("{MODULE}.weight_fields");
+        let mismatch = |error: tvm_ffi::Error| Error::numerical(&function, &error);
+        let listed: tvm_ffi::Array<Any> = interface
+            .import(&function)?
+            .call_as(&[model.handle().view()])?;
+        let part = |index: usize| listed.get(index).map_err(mismatch);
+        let counts = crate::ffi::integers(part(0)?).map_err(mismatch)?;
+        let names = tvm_ffi::Array::<tvm_ffi::String>::try_from(part(1)?).map_err(mismatch)?;
+        // Shard tensors stay referenced by `shards` through the setup copies.
+        let shards = tvm_ffi::Array::<tvm_ffi::Tensor>::try_from(part(2)?).map_err(mismatch)?;
+        let mut fields = names.iter().zip(shards.iter()).map(|(name, shard)| {
+            let bits = usize::from(shard.dtype().bits) * usize::from(shard.dtype().lanes);
+            ShardField {
+                name: name.as_str().to_owned(),
+                address: shard.data_ptr() as u64,
+                bytes: shard.numel() * bits / 8,
+            }
+        });
+        let layers: Vec<Vec<ShardField>> = counts
+            .iter()
+            .map(|&count| fields.by_ref().take(count as usize).collect())
+            .collect();
+        let (weights, views) = ExpertWeights::build(union_group, device, node, &layers, &stream)?;
+        drop(shards);
+        let bind = interface.import(&format!("{MODULE}.bind_weights"))?;
+        for (layer, (fields, views)) in layers.iter().zip(views).enumerate() {
+            let mut arguments = vec![
+                model.handle().to_any(),
+                Any::from(layer as i64),
+                Any::from(crate::ffi::strings(fields.iter().map(|field| &field.name))),
+            ];
+            for view in views {
+                arguments.push(Any::from(view.to_tensor()?));
+            }
+            bind.call_values(&arguments)?;
+        }
+        tracing::info!(
+            target: "uniserve_worker.launch",
+            "DWDP expert weights: {} layers, {} resident and {} slot bytes, {} bytes read per invocation",
+            layers.len(),
+            weights.resident_bytes,
+            weights.buffer_bytes,
+            weights.transfer_bytes,
+        );
+
+        let weights = Arc::new(weights);
+        let breaks = GraphBreaks::default();
+        let break_graph = interface.import("uniserve_models.interface.graphs.break_graph")?;
+        let prefetch = Handle::new(
+            interface
+                .import(&format!("{MODULE}.bind_prefetch"))?
+                .call_values(
+                    &std::iter::once(model.handle().to_any())
+                        .chain(hooks(&weights, &break_graph, &breaks))
+                        .collect::<Vec<_>>(),
+                )?,
+        )?;
+        Ok(Some(Self {
+            weights,
+            prefetch,
+            breaks,
+            closed: false,
+        }))
+    }
+
+    /// The object bindings pass to their expert calls.
+    pub(crate) fn prefetch(&self) -> &Handle {
+        &self.prefetch
+    }
+
+    /// The graph breaks of the forward being captured: whoever captures a
+    /// forward that reads these weights takes them for its graph.
+    pub(crate) fn breaks(&self) -> &GraphBreaks {
+        &self.breaks
+    }
+
+    /// Drain the copy stream and release the weights after every binding
+    /// and graph retired. An aborted close keeps every mapping until exit:
+    /// peers may still read this rank's pages.
+    #[allow(clippy::mem_forget)]
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
+        if std::mem::replace(&mut self.closed, true) {
+            return Ok(());
+        }
+        if aborted {
+            std::mem::forget(Arc::clone(&self.weights));
+            return Ok(());
+        }
+        self.weights.close()
+    }
+}
+
+impl Drop for DwdpManager {
+    fn drop(&mut self) {
+        let _ = self.close(true);
+    }
+}
+
+/// The prefetch hooks as TVM-FFI functions closed over `weights`, in the
+/// order `bind_prefetch` takes them after the model: `begin()`,
+/// `end(stream)`, `before(layer, stream)` and `after(layer, stream)`. They
+/// block on no peer.
+///
+/// Under graph capture a copy is a graph break: `before` ends the segment
+/// with `break_graph` and notes the copy in `breaks`, and the runtime
+/// performs it at every launch.
+fn hooks(weights: &Arc<ExpertWeights>, break_graph: &Function, breaks: &GraphBreaks) -> Vec<Any> {
+    type Hook = dyn Fn(&ExpertWeights, &[AnyView<'_>]) -> std::result::Result<Any, tvm_ffi::Error>;
+    let function = |call: Box<Hook>| {
+        let weights = Arc::clone(weights);
+        tvm_ffi::Function::from_packed(move |args: &[AnyView<'_>]| call(&weights, args))
+    };
+    let unit = |result: Result<()>| {
+        result
+            .map(|()| Any::default())
+            .map_err(|error| ffi_error(&error))
+    };
+    let begin = Any::from(function(Box::new(move |weights, _| unit(weights.begin()))));
+    let end = Any::from(function(Box::new(move |weights, args| {
+        let [stream] = args else {
+            return Err(ffi_error(&Error::Invalid("end takes a stream".into())));
+        };
+        unit(weights.end(&compute(weights, stream)?))
+    })));
+    let before = Any::from({
+        let owner = Arc::clone(weights);
+        let break_graph = break_graph.clone();
+        let breaks = breaks.clone();
+        function(Box::new(move |weights, args| {
+            let [layer, stream] = args else {
+                return Err(ffi_error(&Error::Invalid(
+                    "before takes a layer and a stream".into(),
+                )));
+            };
+            let stream = compute(weights, stream)?;
+            unit(weights.before(count(layer)?, &stream, |index| {
+                break_graph.invoke(&[])?;
+                let owner = Arc::clone(&owner);
+                breaks.note(Arc::new(move || owner.copy(index)));
+                Ok(())
+            }))
+        }))
+    });
+    let after = Any::from(function(Box::new(move |weights, args| {
+        let [layer, stream] = args else {
+            return Err(ffi_error(&Error::Invalid(
+                "after takes a layer and a stream".into(),
+            )));
+        };
+        unit(weights.after(count(layer)?, &compute(weights, stream)?))
+    })));
+    vec![begin, end, before, after]
 }

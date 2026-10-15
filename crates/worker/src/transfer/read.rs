@@ -29,6 +29,7 @@ use super::{
 use crate::ffi::{Backing, DType, Device};
 use crate::host::HostTask;
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
+use crate::stream::Issue;
 use crate::{Error, EventPool, Outcome, Result};
 
 /// Reader acknowledgment states written into a VMM chunk header.
@@ -50,6 +51,8 @@ struct ReadState {
     /// Storage an undrained copy may still address.
     retained: Vec<Box<dyn Any + Send>>,
     work: Option<Weak<HostTask<TransferRead<NativeRead>>>>,
+    /// The read's task was handed to its transport thread.
+    started: bool,
 }
 
 /// One read's consumable result and physical retirement. Cancellation
@@ -72,6 +75,7 @@ impl Read {
                 credit: None,
                 retained: Vec::new(),
                 work: None,
+                started: false,
             }),
             borrower,
         })
@@ -146,7 +150,7 @@ impl Read {
     /// The read's value without a host wait. A device result orders
     /// `stream` after the producing copy; a borrowed result also remembers
     /// `stream`, so [`close`](Self::close) can fence its access.
-    pub fn result(&self, stream: Option<&Stream>) -> Result<Spans> {
+    pub fn result(&self, stream: impl Issue) -> Result<Spans> {
         let mut state = self.lock();
         let value = match state.ticket.result()? {
             Outcome::Success(value) => Spans::clone(&value),
@@ -159,10 +163,10 @@ impl Read {
                     "a fenced transfer result is not device memory".into(),
                 ));
             };
-            let stream = stream.ok_or_else(|| {
+            let consumer = stream.stream().ok_or_else(|| {
                 Error::Invalid("a device transfer result requires a consuming stream".into())
             })?;
-            if stream.device().0 != device {
+            if consumer.device().0 != device {
                 return Err(Error::Invalid(
                     "transfer consumer stream is on another device".into(),
                 ));
@@ -185,7 +189,6 @@ impl Read {
     /// release the source after those fences complete. Copy destinations
     /// remain owned by their caller and stay readable after close.
     pub fn close(self: &Arc<Self>) -> Result<()> {
-        self.events.reap()?;
         let events = {
             let mut state = self.lock();
             if !state.ticket.close() {
@@ -200,22 +203,15 @@ impl Read {
 
         let read = Arc::clone(self);
         self.events
-            .defer(events.clone(), Box::new(move || read.finish_borrow()))?;
-        for event in &events {
-            self.events.wake_after(event)?;
-        }
-        self.events.reap()
+            .defer(events, Box::new(move || read.finish_borrow()))
     }
 
-    /// Close a borrowed read and wait on the host for its consumers
-    /// (shutdown only).
+    /// Close a borrowed read and have the event pool wait on the host for
+    /// its consumers, with the pool's deadline (shutdown only: nobody is
+    /// left to take a completion).
     pub(crate) fn drain(self: &Arc<Self>) -> Result<()> {
         self.close()?;
-        let events = self.lock().ticket.consumer_events().to_vec();
-        for event in events {
-            event.synchronize()?;
-        }
-        self.events.reap()
+        self.events.drain()
     }
 
     pub(crate) fn bind_source(&self, source: SourceGrant) -> Result<()> {
@@ -239,8 +235,40 @@ impl Read {
         self.lock().credit = Some(capacity);
     }
 
-    pub(crate) fn prepare_copy(&self, stream: &Stream) -> Result<()> {
+    pub(crate) fn prepare_copy(&self, stream: impl Issue) -> Result<()> {
         self.lock().ticket.prepare_copy(&self.events, stream)
+    }
+
+    /// Hand the read to its transport thread, whose stream waits on the
+    /// destination's handoff fence.
+    ///
+    /// The caller starts a read once the issuer it was submitted with
+    /// ([`submit`]) performed its work, so the fence's record is made: at
+    /// once after a stream, from the job's completion on after a recorder.
+    /// A read that was cancelled or already started stays as it is. When
+    /// the task cannot be queued it is withdrawn.
+    pub fn start(&self) -> Result<()> {
+        let work = {
+            let mut state = self.lock();
+            if std::mem::replace(&mut state.started, true) {
+                return Ok(());
+            }
+            state.work.as_ref().and_then(Weak::upgrade)
+        };
+        let Some(task) = work else {
+            return Ok(());
+        };
+        if task.completion.done() {
+            return Ok(());
+        }
+
+        let queued = task.submit();
+        if queued.is_err()
+            && let Err(cleanup) = task.cancel(true)
+        {
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to withdraw a transfer read: {cleanup}");
+        }
+        queued
     }
 
     /// Expose a completed value. `event` fences a device copy; the read
@@ -339,7 +367,7 @@ impl Drop for Read {
                 Ok(())
             }),
         );
-        if let Err(error) = deferred.and_then(|()| self.events.reap()) {
+        if let Err(error) = deferred {
             tracing::warn!(target: "uniserve_worker.transfer", "failed to retire transfer read fences: {error}");
         }
     }
@@ -567,7 +595,6 @@ impl NativeRead {
         };
 
         let stream = self.context.stream(device)?;
-        self.context.events.reap()?;
         let copied = (|| -> Result<()> {
             let _device = DeviceGuard::new(DeviceId(device))?;
             if let Some(word) = acknowledgment {
@@ -591,7 +618,7 @@ impl NativeRead {
                 unsafe { memset_d32(word, ACKNOWLEDGED, 1, &stream) }?;
             }
             let completed = self.context.events.acquire(device, false, false)?;
-            self.context.events.record(&completed, &stream)?;
+            self.context.events.record(&completed, stream.as_ref())?;
             self.read.complete(destination.clone(), Some(completed))
         })();
         // The read's waiters and this call's caller observe one failure.
@@ -748,13 +775,15 @@ impl Backing for ChannelPayload {
     }
 }
 
-/// Reserve a read's credits and task, record its destination handoff on
-/// `stream` and submit it. On failure the task is withdrawn.
+/// Reserve a read's credits and task and issue its destination handoff
+/// fence to `stream`. The read is handed to its transport thread by
+/// [`Read::start`], once that fence's record is made. On failure the task
+/// is withdrawn.
 pub(crate) fn submit(
     pool: &Arc<ReadPool>,
     backend: NativeRead,
     nbytes: u64,
-    stream: Option<&Stream>,
+    stream: impl Issue,
     reservation: Option<&super::ReadReservation<Notify>>,
 ) -> Result<Arc<Read>> {
     if let Some(error) = pool.error() {
@@ -772,10 +801,10 @@ pub(crate) fn submit(
     let submitted = (|| -> Result<()> {
         read.set_work(&task);
         if let Device::Cuda(device) = destination_device {
-            let stream = stream.ok_or_else(|| {
+            let submitting = stream.stream().ok_or_else(|| {
                 Error::Invalid("a device read destination requires its submitting stream".into())
             })?;
-            if stream.device().0 != device {
+            if submitting.device().0 != device {
                 return Err(Error::Invalid(
                     "a read's submitting stream is on another device".into(),
                 ));
@@ -787,7 +816,7 @@ pub(crate) fn submit(
             read.add_done_callback(Arc::clone(&wake));
             read.add_retirement_callback(wake);
         }
-        task.submit()
+        Ok(())
     })();
     if let Err(error) = submitted {
         if let Err(cleanup) = task.cancel(true) {
@@ -831,7 +860,10 @@ mod tests {
 
         // Both the copy's activity check and the consumer's result report
         // the cancellation with its own class.
-        for observed in [read.require_active(), read.result(None).map(drop)] {
+        for observed in [
+            read.require_active(),
+            read.result(None::<&Stream>).map(drop),
+        ] {
             let Err(error) = observed else {
                 return Err(Error::State("a cancelled read stayed usable"));
             };

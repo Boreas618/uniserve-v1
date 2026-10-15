@@ -44,20 +44,23 @@ def process_world(
     reach the collectives an orderly teardown would wait for.
     """
     host, port = listener.getsockname()
-    store = {"host": host, "port": port}
     if rank == 0:
-        store["listen_fd"] = listener.detach()
+        listen_fd = listener.detach()
     else:
+        listen_fd = None
         listener.close()
 
     world = distributed.initialize(
-        {
-            "rank": rank,
-            "local_rank": rank,
-            "world_size": world_size,
-            "device": str(device),
-            "store": store,
-        }
+        rank,
+        rank,
+        world_size,
+        str(device),
+        None,
+        host,
+        port,
+        listen_fd,
+        None,
+        None,
     )
     yield world
     distributed.destroy(world)
@@ -86,7 +89,8 @@ def bind_mesh(
     selections = sorted(
         ((axis,) for axis in mesh.axes) if axes is None else axes
     )
-    plan = []
+    # Each planned group's sorted members and whether this rank keeps it.
+    plan: list[tuple[tuple[int, ...], bool]] = []
     entries: dict[tuple[int, ...], int] = {}
     bound = {}
     for selection in selections:
@@ -94,30 +98,32 @@ def bind_mesh(
             key = tuple(sorted(members))
             if len(members) > 1 and key not in entries:
                 entries[key] = len(plan)
-                plan.append(
-                    {
-                        "members": [world.physical(rank) for rank in key],
-                        "local_sync": False,
-                        "keep": mesh.rank in members,
-                    }
-                )
+                plan.append((key, mesh.rank in members))
             if mesh.rank in members:
                 bound[".".join(selection) or "local"] = (members, key)
 
-    handles = distributed.create_groups(world, plan)
+    handles = distributed.create_groups(
+        world,
+        [len(key) for key, _ in plan],
+        [world.physical(rank) for key, _ in plan for rank in key],
+        [False] * len(plan),
+        [keep for _, keep in plan],
+    )
     return distributed.mesh(
         world,
-        {
-            "rank": mesh.rank,
-            "ranks": mesh.ranks,
-            "shape": mesh.shape,
-            "axes": mesh.axes,
-            "groups": {
-                name: {
-                    "members": [world.physical(rank) for rank in members],
-                    "group": handles[entries[key]] if key in entries else None,
-                }
-                for name, (members, key) in bound.items()
-            },
-        },
+        mesh.ranks,
+        mesh.shape,
+        mesh.axes,
+        mesh.rank,
+        list(bound),
+        [len(members) for members, _ in bound.values()],
+        [
+            world.physical(rank)
+            for members, _ in bound.values()
+            for rank in members
+        ],
+        [
+            handles[entries[key]] if key in entries else None
+            for _, key in bound.values()
+        ],
     )

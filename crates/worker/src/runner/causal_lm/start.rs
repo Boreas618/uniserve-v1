@@ -4,9 +4,9 @@
 //! the KV plan, once for capacity planning (bytes to reserve beside the KV
 //! pool, graph-bounded call limits) and again for allocation, so both agree.
 //! [`CausalLMRunners::start`] then creates one runner per execution stream
-//! serving text call kinds: it prepares and binds the causal LM's component
-//! (operators over Rust workspaces and the K/V pool), allocates the runner's
-//! columns and graph pool, and binds the text steps over them.
+//! serving text call kinds: it allocates the runner's columns and graph
+//! pool and constructs the Python runner, whose execution context borrows
+//! the stream's scratch and reads the K/V pool.
 
 use std::collections::HashMap;
 
@@ -21,20 +21,20 @@ use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::{DType, Handle};
 use crate::lane::Lanes;
-use crate::model::bind::{self, Backends, BindingRequest, StreamWorkspaces, TextSize};
+use crate::model::LoadedModel;
 use crate::model::components::RunnerKind;
 use crate::model::interface::Interface;
 use crate::model::registry::Components;
-use crate::model::{LoadedModel, ModelFacts};
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::{
-    CausalLMRunner, Construction, Dimensions, InputBuffers, Methods, RunnerParts, TableShape,
-    model_dtype,
+    CausalLMRunner, Construction, Dimensions, RunnerParts, TableShape, methods, model_dtype,
 };
+use crate::runner::input_buffers::InputBuffers;
+use crate::runner::scratch::Scratches;
 use crate::storage::{KVCache, KVPlan, OutputPool};
 use crate::{Error, Result};
 
-use crate::executor::forward::experts::{ExpertRuntime, WeightRuntime};
+use crate::parallel::{DwdpManager, ExpertUnion, PeerGroup};
 
 /// The text call kinds a runner may serve.
 pub(crate) const TEXT_KINDS: [CallKind; 3] = [
@@ -247,6 +247,19 @@ fn streams(
     Ok(result)
 }
 
+/// One runner to construct: a causal LM on one stream.
+struct Target {
+    component: String,
+    /// The causal LM's module path in the model.
+    path: String,
+    device: Device,
+    stream: Option<Stream>,
+    /// The text call kinds the runner's lane serves.
+    served: Vec<CallKind>,
+    /// The expert exchange of the runner's microbatch.
+    exchange: Option<Handle>,
+}
+
 /// What text startup borrows from the rank.
 pub(crate) struct Startup<'a> {
     pub(crate) interface: &'a Interface,
@@ -255,21 +268,23 @@ pub(crate) struct Startup<'a> {
     pub(crate) queue_depth: usize,
     pub(crate) max_payload_bytes: usize,
     pub(crate) model: &'a LoadedModel,
-    pub(crate) facts: &'a ModelFacts,
+    /// The model declares an image policy.
+    pub(crate) image_processor: bool,
     pub(crate) lanes: &'a Lanes,
     pub(crate) kv: Option<&'a KVCache>,
-    pub(crate) components: &'a mut Components,
-    pub(crate) workspaces: &'a mut StreamWorkspaces,
+    pub(crate) components: &'a Components,
+    /// The shared scratch of each stream the runners' contexts borrow.
+    pub(crate) scratches: &'a mut Scratches,
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
-    /// The expert runtime, when forwards are expert steps: each lane binding
-    /// gets one runner per microbatch, bound to its transport and stream.
-    pub(crate) experts: Option<&'a mut ExpertRuntime>,
-    /// The worker's ranks, across which symmetric workspaces are mapped.
-    pub(crate) peers: Option<&'a bind::PeerGroup<'a>>,
+    /// The expert union, when forwards are expert steps: each lane gets
+    /// one runner per microbatch, on its stream and with its exchange.
+    pub(crate) experts: Option<&'a mut ExpertUnion>,
+    /// The worker's ranks and the mesh groups the model communicates over.
+    pub(crate) peers: Option<&'a PeerGroup<'a>>,
     /// The distributed expert weights, with DWDP.
-    pub(crate) weights: Option<&'a WeightRuntime>,
+    pub(crate) weights: Option<&'a DwdpManager>,
 }
 
 impl CausalLMRunners {
@@ -321,26 +336,11 @@ impl CausalLMRunners {
                 experts.parallel().max_tokens()
             )));
         }
-        let vocab = startup.facts.vocab_size.ok_or_else(|| {
-            Error::Interface("a causal language model reports no vocabulary".into())
-        })?;
+        let vocab = methods::vocab_size(startup.interface, startup.model.handle())?;
         let dtype = model_dtype(&config.model_dtype)?;
 
         // The attention layers' view of the pool, bound once.
-        let views = crate::ffi::Fields::new();
-        let views = kv
-            .views()?
-            .into_iter()
-            .try_fold(views, |fields, (name, view)| -> Result<_> {
-                Ok(fields.with(&name, view.to_tensor()?))
-            })?
-            .into_any();
-        let pool = Handle::new(
-            startup
-                .interface
-                .function("cache.pool")?
-                .call_values(&[tvm_ffi::Any::from(kv.layout()?), views])?,
-        )?;
+        let pool = kv.pool(startup.interface)?;
 
         let state = DecodeState::allocate(
             startup.request_slots,
@@ -351,12 +351,10 @@ impl CausalLMRunners {
             startup.preparation,
         )?;
 
-        // Prepare every binding before binding any, so shared workspaces
-        // hold the largest of them. With experts, each lane binding has one
-        // binding per microbatch: the first on the lane's stream, the others
-        // on the microbatch streams, each with its own transport.
+        // One runner per lane serving text kinds. With experts, each lane
+        // has one runner per microbatch: the first on the lane's stream, the
+        // others on the microbatch streams, each with its own exchange.
         let mut experts = startup.experts;
-        let mut prepared = Vec::new();
         let mut targets = Vec::new();
         let mut groups = Vec::new();
         for (component, path, device, kinds) in &texts {
@@ -364,7 +362,7 @@ impl CausalLMRunners {
                 let mut peers = Vec::new();
                 let microbatches = experts.as_ref().map_or(1, |experts| experts.microbatches());
                 for microbatch in 0..microbatches {
-                    let (stream, transport) = match experts.as_ref() {
+                    let (stream, exchange) = match experts.as_ref() {
                         Some(experts) => {
                             if let Some(lane) = &stream
                                 && microbatch == 0
@@ -380,57 +378,24 @@ impl CausalLMRunners {
                         }
                         None => (stream.clone(), None),
                     };
-                    let handle = stream.as_ref().map_or(0, Stream::raw);
-                    prepared.push(bind::prepare(
-                        startup.interface,
-                        startup.model.handle(),
-                        BindingRequest {
-                            component: component.clone(),
-                            path: path.clone(),
-                            device: *device,
-                            stream: handle,
-                            size: Some(TextSize {
-                                tokens: bounds.tokens,
-                                rows: bounds.rows,
-                            }),
-                            // The loaded model resolved its attention backend.
-                            backends: Backends::default(),
-                            derive_host_lengths: false,
-                            experts: transport,
-                            weights: startup.weights.map(|weights| weights.prefetch().clone()),
-                            cache: Some(pool.clone()),
-                        },
-                    )?);
                     peers.push(targets.len());
-                    targets.push((component.clone(), *device, stream, served.clone()));
+                    targets.push(Target {
+                        component: component.clone(),
+                        path: path.clone(),
+                        device: *device,
+                        stream,
+                        served: served.clone(),
+                        exchange,
+                    });
                 }
                 groups.push(peers);
             }
         }
         if experts.is_some() && groups.len() != 1 {
             return Err(Error::Unsupported(format!(
-                "expert parallelism serves one text binding; {} lane bindings are placed",
+                "expert parallelism serves one text lane; {} lanes serve text",
                 groups.len()
             )));
-        }
-        let bindings = bind::bind(
-            startup.interface,
-            startup.workspaces,
-            prepared,
-            startup.peers,
-        )?;
-        let mut collectives = Vec::new();
-        if let Some(peers) = startup.peers {
-            for ((_, _, stream, _), binding) in targets.iter().zip(&bindings) {
-                let owner = stream
-                    .as_ref()
-                    .and_then(|stream| startup.lanes.owner(stream.raw()));
-                collectives.extend(peers.bind_collectives(startup.interface, binding, owner)?);
-            }
-        }
-        if let Some(experts) = experts.as_deref_mut() {
-            let handles: Vec<&Handle> = bindings.iter().map(|binding| binding.prepared()).collect();
-            experts.bind_joins(&handles)?;
         }
 
         let table_layout: Vec<i64> = bounds
@@ -443,15 +408,35 @@ impl CausalLMRunners {
             .iter()
             .map(|table| i64::from(table.windowed))
             .collect();
-        let bind_units = startup.interface.function("cache.bind_units")?;
         let create_pool = startup.interface.function("graphs.pool")?;
         let mut runners = Vec::new();
         let mut columns = Vec::new();
         let mut routes = HashMap::new();
         let mut shared: HashMap<usize, usize> = HashMap::new();
-        for ((component, device, stream, served), binding) in targets.into_iter().zip(&bindings) {
+        let mut collectives = Vec::new();
+        let mut labels = Vec::new();
+        for target in targets {
+            let Target {
+                component,
+                path,
+                device,
+                stream,
+                served,
+                exchange,
+            } = target;
             let ordinal = device.cuda_index();
             let handle = stream.as_ref().map_or(0, Stream::raw);
+            // The model's collectives on the runner's stream, which its
+            // execution context routes its communicators to.
+            let bound = match startup.peers {
+                Some(peers) => {
+                    let owner = stream
+                        .as_ref()
+                        .and_then(|stream| startup.lanes.owner(stream.raw()));
+                    peers.stream_collectives(&component, device, owner)?
+                }
+                None => None,
+            };
             let slot_tables = kv.storage().views();
             let slot_table = |name: &str| {
                 slot_tables
@@ -460,11 +445,21 @@ impl CausalLMRunners {
                     .map(|(_, view)| view)
                     .ok_or_else(|| Error::Invariant(format!("block tables have no {name}")))
             };
-            let methods = Methods::construct(
+            let methods = methods::construct(
                 startup.interface,
                 &Construction {
-                    prepared: binding.prepared(),
+                    loaded: startup.model.handle(),
+                    path: &path,
+                    device: ordinal,
                     stream: handle,
+                    scratch: startup.scratches.get(startup.interface, handle, ordinal)?,
+                    cache: &pool,
+                    experts: exchange,
+                    weights: startup.weights.map(|weights| weights.prefetch().clone()),
+                    collectives: bound
+                        .as_ref()
+                        .map(|bound| bound.natives(startup.interface).and_then(Handle::new))
+                        .transpose()?,
                     rows: bounds.rows,
                     tokens: bounds.tokens,
                     width: bounds.width(),
@@ -486,9 +481,10 @@ impl CausalLMRunners {
             )?;
 
             // The runner's vocabulary shard sizes its logits columns.
-            let shard = methods.vocab(startup.interface)?;
-            let hidden = methods.hidden_size(startup.interface)?;
-            let plans_attention = methods.plans_attention(startup.interface)?;
+            let functions = methods::Functions::resolve(startup.interface, &methods)?;
+            let shard = methods::vocab(startup.interface, &methods)?;
+            let hidden = methods::hidden_size(startup.interface, startup.model.handle())?;
+            let plans_attention = methods::plans_attention(startup.interface, &methods)?;
             if shard.size != vocab {
                 return Err(Error::Interface(format!(
                     "the text runner's vocabulary ({}) differs from the model's ({vocab})",
@@ -498,7 +494,7 @@ impl CausalLMRunners {
             let mut dimensions = bounds.dimensions(vocab, shard.width(), hidden, dtype);
             // Prompts of a model with an image processor place vision
             // features in place of token embeddings.
-            dimensions.embeddings = startup.facts.image_processor;
+            dimensions.embeddings = startup.image_processor;
             let buffers = InputBuffers::allocate(dimensions, ordinal, startup.preparation)?;
 
             let pool = match (
@@ -521,7 +517,7 @@ impl CausalLMRunners {
                 }
                 _ => None,
             };
-            columns.push(kv.bind_units(&bind_units, stream.as_ref())?);
+            columns.push(kv.bind_units(startup.interface, stream.as_ref())?);
             let group = groups
                 .iter()
                 .position(|peers| peers.contains(&runners.len()))
@@ -536,11 +532,20 @@ impl CausalLMRunners {
                     }
                 }
             }
+            collectives.extend(bound);
+            // The runner's kernel-table label: its component and module path.
+            let label = if path.is_empty() {
+                component.clone()
+            } else {
+                format!("{component}.{path}")
+            };
+            labels.push((label, device.to_string()));
             runners.push(CausalLMRunner::new(RunnerParts {
                 component,
                 device: ordinal,
                 stream,
                 methods,
+                functions,
                 plans_attention,
                 breaks: startup.weights.map(|weights| weights.breaks().clone()),
                 buffers,
@@ -550,7 +555,15 @@ impl CausalLMRunners {
                 pool,
             }));
         }
-        startup.components.add_bindings(bindings);
+        // Idle ranks join expert steps through the runners' contexts, one
+        // per microbatch.
+        if let Some(experts) = experts.as_deref_mut() {
+            let owners: Vec<&Handle> = groups[0]
+                .iter()
+                .map(|&runner| runners[runner].methods.runner())
+                .collect();
+            experts.bind_joins(&owners)?;
+        }
 
         // Completion fields plus payload words per call, as the engine
         // bounds each call's completion bytes.
@@ -571,6 +584,7 @@ impl CausalLMRunners {
         }
         Ok(Some(Self {
             runners,
+            labels,
             groups,
             collectives,
             columns,
@@ -585,22 +599,25 @@ impl CausalLMRunners {
 
 /// Device bytes the causal LM runners allocate beside the KV pool.
 pub(crate) fn reserved_bytes(
+    interface: &Interface,
+    model: &LoadedModel,
     config: &WorkerConfig,
     request_slots: usize,
     cache: &KVPlan,
-    facts: &ModelFacts,
+    image_processor: bool,
     streams: usize,
 ) -> Result<u64> {
-    let Some(vocab) = facts.vocab_size else {
+    // A rank without a causal language model reports no vocabulary.
+    let vocab = methods::vocab_size(interface, model.handle())?;
+    if vocab == 0 {
         return Ok(0);
-    };
+    }
+    let hidden = methods::hidden_size(interface, model.handle())?;
     let cuda = config.device.is_cuda();
     let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
     let dtype = model_dtype(&config.model_dtype)?;
-    let mut dimensions = bounds.dimensions(vocab, vocab, facts.hidden_size.unwrap_or(0), dtype);
-    dimensions.embeddings = facts.image_processor;
-    Ok(
-        dimensions.bytes() * streams.max(1) as u64
-            + DecodeState::bytes(request_slots, vocab, dtype),
-    )
+    let mut dimensions = bounds.dimensions(vocab, vocab, hidden, dtype);
+    dimensions.embeddings = image_processor;
+    Ok(InputBuffers::bytes(&dimensions) * streams.max(1) as u64
+        + DecodeState::bytes(request_slots, vocab, dtype))
 }

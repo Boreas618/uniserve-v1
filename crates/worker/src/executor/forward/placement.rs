@@ -16,13 +16,13 @@ use std::sync::Arc;
 use uniserve_core::CallId;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
-    Batch as BatchPlan, BufferAllocation, BufferId, Call, DType, RequestKey, TensorExport,
-    TensorRef, TransferHandle,
+    Batch as BatchPlan, BufferAllocation, BufferId, Call, RequestKey, TensorExport, TensorRef,
+    TransferHandle,
 };
 
-use super::launch::read_flag;
 use crate::ffi::Device;
 use crate::storage::OutputPlacement;
+use crate::stream::Issue;
 use crate::transfer::Transports;
 use crate::transfer::exports::Location;
 use crate::{Error, EventPool, ProductBuffer, ProductRead, Result, TensorStore};
@@ -61,14 +61,15 @@ impl Reads {
         self.borrowed.contains(&product.buffer_id())
     }
 
-    /// Lease one input for `consumer`, whole; `stream` waits on its writer.
+    /// Lease one input for `consumer`, whole; what `stream` issues next
+    /// waits on its writer.
     pub(crate) fn read(
         &mut self,
         store: &TensorStore,
         product: &TensorRef,
         consumer: CallId,
         device: Device,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<ProductRead>> {
         let read = store.consume(product, consumer, Some(device), stream)?;
         self.leases.push(Arc::clone(&read));
@@ -80,34 +81,14 @@ impl Reads {
         Ok(read)
     }
 
-    /// End every lease after the batch's readers were enqueued on `stream`.
-    pub(crate) fn complete(&mut self, store: &TensorStore, stream: Option<&Stream>) -> Result<()> {
+    /// End every lease behind the batch's readers, which `stream` issued.
+    pub(crate) fn complete(&mut self, store: &TensorStore, stream: impl Issue) -> Result<()> {
         let reads = std::mem::take(&mut self.leases);
         if reads.is_empty() {
             return Ok(());
         }
         store.complete_reads(&reads, stream, &[])
     }
-}
-
-/// Indices of the calls whose host-gated (U8) predicate is false, read
-/// once each on `stream` after its producer.
-pub(crate) fn skipped(
-    store: &TensorStore,
-    plan: &BatchPlan,
-    device: Device,
-    stream: Option<&Stream>,
-) -> Result<HashSet<usize>> {
-    let mut skipped = HashSet::new();
-    for (index, call) in plan.calls.iter().enumerate() {
-        if let Some(predicate) = &call.predicate
-            && predicate.dtype == DType::U8
-            && !read_flag(store, call, predicate, device.cuda_index(), stream)?
-        {
-            skipped.insert(index);
-        }
-    }
-    Ok(skipped)
 }
 
 /// The scheduler placement of a call's outputs on this rank: buffer-pool
@@ -195,7 +176,8 @@ pub(crate) fn export(
     regions: Option<&[Vec<Range<u64>>]>,
     stream: Option<&Stream>,
 ) -> Result<(TensorExport, Vec<Location>)> {
-    owners.store.export_buffer(
+    // Issued on `stream` at once, so the export is located here.
+    let export = owners.store.export_buffer(
         call,
         product,
         write,
@@ -203,7 +185,8 @@ pub(crate) fn export(
         host,
         regions,
         stream,
-    )
+    )?;
+    owners.store.located(write, export)
 }
 
 /// The tensor descriptor of a supplied input product.

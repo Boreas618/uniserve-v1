@@ -16,8 +16,10 @@
 use std::os::fd::IntoRawFd;
 use std::time::Duration;
 
+use tvm_ffi::Any;
+
 use crate::config::{RendezvousConfig, WorkerLaunch};
-use crate::ffi::{Fields, Handle, integer_list, list};
+use crate::ffi::{Handle, integer_list, list, strings};
 use crate::model::components::Declarations;
 use crate::model::interface::Interface;
 use crate::{Error, Result};
@@ -67,11 +69,7 @@ impl World {
                 let members: Vec<usize> = (start..start + execution.world_size).collect();
                 let host = group.subgroup(&members)?;
                 let store = store(&group, &union.rendezvous)?;
-                let union_store = Fields::new()
-                    .with("rank", union.rank as i64)
-                    .with("size", union.size as i64)
-                    .with("store", store.into_any());
-                (host, Some((group, union_store)), None)
+                (host, Some(group), Some(store))
             }
             None => match &launch.rendezvous {
                 Some(rendezvous_config) if execution.world_size > 1 => {
@@ -93,20 +91,33 @@ impl World {
             },
         };
 
-        let (union, union_store) = match union {
-            Some((group, fields)) => (Some(group), Some(fields.map())),
-            None => (None, None),
-        };
-        let request = Fields::new()
-            .with("rank", execution.rank as i64)
-            .with("local_rank", launch.local_rank as i64)
-            .with("world_size", execution.world_size as i64)
-            .text("device", &execution.device.to_string())
-            .optional_text("backend", launch.distributed_backend.as_deref())
-            .optional("store", store.map(Fields::map))
-            .optional("union", union_store)
-            .into_any();
-        let torch = Handle::new(interface.initialize.call(&[(&request).into()])?)?;
+        // The store of the torch world this rank joins (the union's when
+        // there is one) and this rank's place in the union; `None` crosses
+        // for what a one-rank worker or a worker outside a union lacks.
+        let text = |value: &str| Any::from(tvm_ffi::String::from(value));
+        let optional = |value: Option<i64>| value.map(Any::from).unwrap_or_default();
+        let member = launch.expert_parallel.as_ref();
+        let torch = Handle::new(
+            interface.initialize.call_values(&[
+                Any::from(execution.rank as i64),
+                Any::from(launch.local_rank as i64),
+                Any::from(execution.world_size as i64),
+                text(&execution.device.to_string()),
+                launch
+                    .distributed_backend
+                    .as_deref()
+                    .map(text)
+                    .unwrap_or_default(),
+                store
+                    .as_ref()
+                    .map(|store| text(&store.host))
+                    .unwrap_or_default(),
+                optional(store.as_ref().map(|store| store.port)),
+                optional(store.as_ref().and_then(|store| store.listen_fd)),
+                optional(member.map(|union| union.rank as i64)),
+                optional(member.map(|union| union.size as i64)),
+            ])?,
+        )?;
         Ok(Self {
             host,
             union,
@@ -147,19 +158,29 @@ impl World {
             selections: Some(&selections),
         })?;
 
-        let entries = list(plan.entries.iter().map(|entry| {
-            Fields::new()
-                .with(
-                    "members",
-                    integer_list(entry.members.iter().map(|&rank| rank as i64)),
-                )
-                .with("local_sync", entry.local_sync)
-                .with("keep", entry.keep)
-                .into_any()
-        }));
-        let groups: tvm_ffi::Array<tvm_ffi::Any> = interface
+        // Each planned group's members cross back to back, with their
+        // counts.
+        let entries = &plan.entries;
+        let groups: tvm_ffi::Array<Any> = interface
             .create_groups
-            .call_as(&[self.torch.view(), (&tvm_ffi::Any::from(entries)).into()])?;
+            .call_values(&[
+                self.torch.to_any(),
+                Any::from(integer_list(
+                    entries.iter().map(|entry| entry.members.len() as i64),
+                )),
+                Any::from(integer_list(
+                    entries
+                        .iter()
+                        .flat_map(|entry| &entry.members)
+                        .map(|&rank| rank as i64),
+                )),
+                Any::from(list(
+                    entries.iter().map(|entry| Any::from(entry.local_sync)),
+                )),
+                Any::from(list(entries.iter().map(|entry| Any::from(entry.keep)))),
+            ])?
+            .try_into()
+            .map_err(|error| Error::numerical("distributed.create_groups", &error))?;
         if groups.len() != plan.entries.len() {
             return Err(Error::Interface(
                 "distributed.create_groups returns one value per plan entry".into(),
@@ -226,37 +247,38 @@ impl World {
         binding: &MeshBinding,
         groups: &[Handle],
     ) -> Result<Handle> {
-        let mut communicators = Fields::new();
-        for group in &binding.groups {
-            let handle = group
-                .entry
-                .map(|entry| groups[entry].to_any())
-                .unwrap_or_default();
-            communicators = communicators.with(
-                &group.name(),
-                Fields::new()
-                    .with(
-                        "members",
-                        integer_list(group.members.iter().map(|&rank| rank as i64)),
-                    )
-                    .with("group", handle)
-                    .map(),
-            );
-        }
-        let spec = Fields::new()
-            .with(
-                "ranks",
-                integer_list(binding.mesh.ranks.iter().map(|&rank| rank as i64)),
-            )
-            .with(
-                "shape",
-                integer_list(binding.mesh.shape.iter().map(|&size| size as i64)),
-            )
-            .with("axes", crate::ffi::strings(&binding.mesh.axes))
-            .with("rank", binding.rank as i64)
-            .with("groups", communicators.map())
-            .into_any();
-        Handle::new(interface.mesh.call(&[self.torch.view(), (&spec).into()])?)
+        // Each communicator's members cross back to back, with their
+        // counts; a communicator of one member has no created group.
+        let communicators = &binding.groups;
+        Handle::new(
+            interface.mesh.call_values(&[
+                self.torch.to_any(),
+                Any::from(integer_list(
+                    binding.mesh.ranks.iter().map(|&rank| rank as i64),
+                )),
+                Any::from(integer_list(
+                    binding.mesh.shape.iter().map(|&size| size as i64),
+                )),
+                Any::from(strings(&binding.mesh.axes)),
+                Any::from(binding.rank as i64),
+                Any::from(strings(communicators.iter().map(|group| group.name()))),
+                Any::from(integer_list(
+                    communicators.iter().map(|group| group.members.len() as i64),
+                )),
+                Any::from(integer_list(
+                    communicators
+                        .iter()
+                        .flat_map(|group| &group.members)
+                        .map(|&rank| rank as i64),
+                )),
+                Any::from(list(communicators.iter().map(|group| {
+                    group
+                        .entry
+                        .map(|entry| groups[entry].to_any())
+                        .unwrap_or_default()
+                }))),
+            ])?,
+        )
     }
 
     /// Destroy the torch groups after every communication user retired.
@@ -293,9 +315,17 @@ fn rendezvous(config: &RendezvousConfig) -> Result<Rendezvous> {
     }
 }
 
+/// The address of a torch world's rendezvous store.
+struct Store {
+    host: String,
+    port: i64,
+    /// The listening descriptor on the rank that serves the store.
+    listen_fd: Option<i64>,
+}
+
 /// The torch store: its first rank binds a listener beside the rendezvous
 /// and publishes the address; every member learns it over `group`.
-fn store(group: &HostGroup, rendezvous: &RendezvousConfig) -> Result<Fields> {
+fn store(group: &HostGroup, rendezvous: &RendezvousConfig) -> Result<Store> {
     let (listener, address) = if group.rank() == 0 {
         let (listener, address) = bind_beside(&rendezvous.address)?;
         (Some(listener), Some(address))
@@ -313,10 +343,11 @@ fn store(group: &HostGroup, rendezvous: &RendezvousConfig) -> Result<Fields> {
         .map_err(|_| Error::Transport("the store port is invalid".into()))?;
     // The store takes ownership of the listening descriptor.
     let listen_fd = listener.map(|listener| i64::from(listener.into_raw_fd()));
-    Ok(Fields::new()
-        .text("host", host)
-        .with("port", port)
-        .optional("listen_fd", listen_fd))
+    Ok(Store {
+        host: host.to_owned(),
+        port,
+        listen_fd,
+    })
 }
 
 /// How long startup collectives wait for every member.
