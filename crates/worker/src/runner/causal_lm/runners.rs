@@ -59,6 +59,7 @@ use crate::{Error, Result};
 use super::batch::{Opening, Owners, Parked, TokenBatch};
 use super::commit::{Commit, Committed, PHASE};
 use super::step::condition_latents;
+use crate::runner::denoiser::image_model::GridKey;
 
 /// One step's forwards as a job holds them, awaiting its completion.
 pub(crate) struct Step {
@@ -76,6 +77,9 @@ pub(crate) enum Pending {
     Predicates(Opening),
     /// The predicates are known: the batch reserves its storage next.
     Opened(Opening),
+    /// The job on the lane asks the Python thread for the patch grids the
+    /// batch's vision blocks place; the batch reserves its storage next.
+    Grids(Opening, Vec<GridKey>),
     /// The job on the lane is the batch's last.
     Committing(Box<Parked>, Commit),
     /// A job of the batch failed before its commit point: the batch
@@ -611,18 +615,19 @@ pub(crate) fn forward(
     let (job, next) = match state {
         None => match Opening::open(&mut owners, parts.info, parts.rank, &job) {
             Ok(opening) if opening.reads_predicates() => (Some(job), Pending::Predicates(opening)),
-            Ok(opening) => reserve(owners, opening, job),
+            Ok(opening) => grids(owners, opening, job),
             // The fences the opening recorded are still due.
             Err(error) if job.is_empty() => (None, Pending::Failed(Failure::new(PHASE)(error))),
             Err(error) => (Some(job), Pending::Discarding(Failure::new(PHASE)(error))),
         },
-        Some(Pending::Opened(opening)) => reserve(owners, opening, job),
+        Some(Pending::Opened(opening)) => grids(owners, opening, job),
         Some(Pending::Failing(parked, failure)) => {
             let batch = TokenBatch::resume(owners, *parked, job);
             discard(batch, failure)
         }
         Some(
             state @ (Pending::Predicates(_)
+            | Pending::Grids(..)
             | Pending::Committing(..)
             | Pending::Discarding(_)
             | Pending::Failed(_)),
@@ -659,6 +664,21 @@ pub(crate) fn complete(
         }
         (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
             match opening.predicates(&mut completion) {
+                Ok(()) => Pending::Opened(opening),
+                Err(error) => Pending::Failed(Failure::new(PHASE)(error)),
+            }
+        }
+        (Some(Pending::Grids(..)), Err(failure)) => {
+            Pending::Failed(Failure::new(PHASE)(failure.error))
+        }
+        (Some(Pending::Grids(opening, keys)), Ok(mut completion)) => {
+            let answered = match &backend.parts().image {
+                Some(image) => keys
+                    .into_iter()
+                    .try_for_each(|key| image.policy().answer_grid(key, &mut completion)),
+                None => Err(Error::State("the image runtime left a batch in flight")),
+            };
+            match answered {
                 Ok(()) => Pending::Opened(opening),
                 Err(error) => Pending::Failed(Failure::new(PHASE)(error)),
             }
@@ -722,6 +742,24 @@ pub(crate) fn complete(
     };
     *batch.token_parts().1 = Some(next);
     Ok(())
+}
+
+/// Ask the Python thread, in `job`, for the patch grids the opened batch's
+/// vision blocks place that are not known yet; reserve the batch once every
+/// grid is known.
+fn grids<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, Pending) {
+    let keys = match opening.lacking_grids(&owners) {
+        Ok(keys) => keys,
+        Err(error) if job.is_empty() => return (None, Pending::Failed(Failure::new(PHASE)(error))),
+        Err(error) => return (Some(job), Pending::Discarding(Failure::new(PHASE)(error))),
+    };
+    let Some(image) = owners.image.as_ref().filter(|_| !keys.is_empty()) else {
+        return reserve(owners, opening, job);
+    };
+    for &key in &keys {
+        image.policy().ask_grid(key, &job);
+    }
+    (Some(job), Pending::Grids(opening, keys))
 }
 
 /// Lease the opened batch's output storage, reserve for its active calls

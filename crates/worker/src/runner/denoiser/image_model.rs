@@ -8,16 +8,16 @@
 //! latent rows, sequence lengths with framing, and denoising positions.
 //!
 //! Two host functions complete the policy: `EncoderRunner.patch_grid` (the
-//! vision tower's patch grid of an image, which places its features) and
+//! vision tower's patch grid of an image, which places its features),
+//! asked in jobs of the Python thread at input admission and kept, and
 //! `DenoiserRunner.guidance_prefix` (a guidance prefix's tokens, by the
 //! model's prompt framing and tokenizer).
 
-use std::sync::Arc;
-
-use tvm_ffi::Any;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::ffi::{DType, Function, Handle, Interpreter, integers};
-use crate::lane::Job;
+use crate::lane::{Completion, Job};
 use crate::request::diffusion::{BranchSource, Prefix};
 use crate::runner::methods::{Argument, MethodCall};
 use crate::runner::vision::{FeatureInjection, FeatureLayout, PositionLayout};
@@ -290,7 +290,15 @@ pub(crate) struct ImagePolicy {
     image_facts: Function,
     patch_grid: Function,
     guidance_prefix: Function,
+    /// The patch grid of every image size asked so far
+    /// ([`Self::ask_grid`]): facts of the model, asked once and shared by
+    /// the policy's clones.
+    grids: Arc<Mutex<HashMap<GridKey, [u32; 2]>>>,
 }
+
+/// An image's height and width in pixels and its request's input image
+/// count, zero for a generated image: what its patch grid depends on.
+pub(crate) type GridKey = (u32, u32, u32);
 
 impl ImagePolicy {
     pub(crate) fn new(loaded: Handle) -> Result<Self> {
@@ -300,6 +308,7 @@ impl ImagePolicy {
             image_facts: Interpreter::import(&format!("{ENCODER}.image_facts"))?,
             patch_grid: Interpreter::import(&format!("{ENCODER}.patch_grid"))?,
             guidance_prefix: Interpreter::import(&format!("{DENOISER}.guidance_prefix"))?,
+            grids: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -317,29 +326,49 @@ impl ImagePolicy {
         &self.image_facts
     }
 
-    /// The vision tower's patch grid of an image; `input_images` is the
-    /// request's input image count, `None` for a generated image.
-    pub(crate) fn patch_grid(
-        &self,
-        height: u32,
-        width: u32,
-        input_images: Option<u32>,
-    ) -> Result<[u32; 2]> {
-        let value = self.patch_grid.call_values(&[
-            self.loaded.to_any(),
-            Any::from(i64::from(height)),
-            Any::from(i64::from(width)),
-            Any::from(i64::from(input_images.unwrap_or(0))),
-        ])?;
-        let grid =
-            integers(value).map_err(|error| Error::numerical(self.patch_grid.name(), &error))?;
-        match grid[..] {
-            [rows, columns] if rows > 0 && columns > 0 => Ok([rows as u32, columns as u32]),
-            _ => Err(Error::Interface(format!(
-                "{} reports a grid that is not two positive extents",
-                self.patch_grid.name()
-            ))),
-        }
+    /// The vision tower's patch grid of an image, when it was asked
+    /// ([`Self::ask_grid`]).
+    pub(crate) fn grid(&self, key: GridKey) -> Option<[u32; 2]> {
+        self.grids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .copied()
+    }
+
+    /// Record in `job`, a job of the Python thread, the call asking the
+    /// patch grid of `key`: the job's completion carries `[rows, columns]`,
+    /// which [`Self::answer_grid`] keeps.
+    pub(crate) fn ask_grid(&self, key: GridKey, job: &Job) {
+        let (height, width, input_images) = key;
+        job.call_returning(MethodCall::new(
+            &self.patch_grid,
+            vec![
+                Argument::Handle(self.loaded.clone()),
+                Argument::Integer(i64::from(height)),
+                Argument::Integer(i64::from(width)),
+                Argument::Integer(i64::from(input_images)),
+            ],
+        ));
+    }
+
+    /// Keep the grid of `key` the next value of `completion` carries
+    /// ([`Self::ask_grid`]).
+    pub(crate) fn answer_grid(&self, key: GridKey, completion: &mut Completion) -> Result<()> {
+        let grid = match completion.returned()?[..] {
+            [rows, columns] if rows > 0 && columns > 0 => [rows as u32, columns as u32],
+            _ => {
+                return Err(Error::Interface(format!(
+                    "{} reports a grid that is not two positive extents",
+                    self.patch_grid.name()
+                )));
+            }
+        };
+        self.grids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, grid);
+        Ok(())
     }
 
     /// Record the call asking the prefix a guidance branch of `source`

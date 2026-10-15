@@ -28,7 +28,11 @@ use crate::ffi::Device;
 use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
+use crate::runner::causal_lm::context::grid_key;
+use crate::runner::denoiser::image_model::GridKey;
+use crate::runner::vision::PositionLayout;
 use crate::sampling::SamplingControls;
+use crate::storage::Metadata;
 use crate::storage::{OutputPlacement, ProductBuffer, Scalar};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
@@ -171,6 +175,57 @@ impl Opening {
     /// only once it completed.
     pub(super) fn reads_predicates(&self) -> bool {
         self.calls.reads_predicates()
+    }
+
+    /// The patch grids the active calls' vision blocks place that the image
+    /// policy does not know yet: a context prefill's blocks and a
+    /// visual-state row closing an image, of a model whose features take
+    /// spatial positions.
+    pub(super) fn lacking_grids(&self, owners: &Owners<'_>) -> Result<Vec<GridKey>> {
+        let Some(image) = &owners.image else {
+            return Ok(Vec::new());
+        };
+        let spatial = image
+            .facts()
+            .processing
+            .as_ref()
+            .and_then(|processing| processing.injection)
+            .is_some_and(|injection| injection.positions == PositionLayout::TemporalSpatial);
+        if !spatial {
+            return Ok(Vec::new());
+        }
+        let mut keys = Vec::new();
+        for (call, state) in owners.plan.calls.iter().zip(self.calls.calls()) {
+            let close_image = if call.writes_context() {
+                false
+            } else if call.writes_visual_state() && call.latent_feature_input.is_none() {
+                true
+            } else {
+                continue;
+            };
+            if !state.active {
+                continue;
+            }
+            let input_images = owners
+                .requests
+                .get(call.request_key.request_id.0)?
+                .admission()
+                .input_images;
+            for input in &call.vision_inputs {
+                let Some(Metadata::Feature { height, width }) =
+                    owners.storage.tensors.metadata(&input.feature)?
+                else {
+                    return Err(Error::Invalid(
+                        "visual input requires encoder feature metadata".into(),
+                    ));
+                };
+                let key = grid_key(height, width, close_image, input_images);
+                if image.policy().grid(key).is_none() && !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        Ok(keys)
     }
 
     /// Apply the opening job's completion: a call whose predicate read
