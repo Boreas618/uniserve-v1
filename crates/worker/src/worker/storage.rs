@@ -73,8 +73,7 @@ impl RankStorage {
         }
         self.tensors.release_calls(calls);
         if let Some(prefix_cache) = &mut self.prefix_cache {
-            let released = prefix_cache.manager().release_calls(calls);
-            prefix_cache.manager().release_exports(&released);
+            prefix_cache.release_calls(calls);
         }
         Ok(())
     }
@@ -89,10 +88,7 @@ impl RequestStorage for RankStorage {
     fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()> {
         self.tensors.release_buffers(buffers, jobs.any().on(None))?;
         if let Some(prefix_cache) = &mut self.prefix_cache {
-            prefix_cache.release_imports(buffers)?;
-            prefix_cache
-                .manager()
-                .release_exports(&buffers.iter().copied().collect::<Vec<_>>());
+            prefix_cache.release_buffers(buffers)?;
         }
         Ok(())
     }
@@ -106,14 +102,7 @@ impl RequestStorage for RankStorage {
         self.tensors
             .release_requests(requests, retained, jobs.any().on(None))?;
         if let Some(prefix_cache) = &mut self.prefix_cache {
-            prefix_cache.cancel_request_imports(requests, retained)?;
-            let exports: Vec<BufferId> = prefix_cache
-                .manager()
-                .exported_buffers()
-                .into_iter()
-                .filter(|buffer| requests.contains(&buffer.owner) && !retained.contains(buffer))
-                .collect();
-            prefix_cache.manager().release_exports(&exports);
+            prefix_cache.release_requests(requests, retained)?;
             self.finished_prefixes.extend(requests.iter().copied());
         }
         Ok(())
@@ -127,9 +116,7 @@ impl RequestStorage for RankStorage {
     ) -> Result<bool> {
         let ready = self.tensors.retirement_ready(buffers, requests, retained)?
             && self.prefix_cache.as_mut().is_none_or(|prefix_cache| {
-                prefix_cache
-                    .manager()
-                    .retirement_ready(buffers, requests, retained)
+                prefix_cache.retirement_ready(buffers, requests, retained)
             });
         if ready {
             // Their prefix slots clear with the requests' own slots.
@@ -161,7 +148,7 @@ impl RequestStorage for RankStorage {
                 prefix_cache.release_request_prefixes(request, release)?;
                 // A later epoch of the request id starts without the
                 // retired epoch's resident transfers and accepted bases.
-                prefix_cache.manager().drop_request(request);
+                prefix_cache.drop_request(request);
             }
         }
         Ok(())

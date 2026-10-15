@@ -447,26 +447,20 @@ fn resolve(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Resolved> {
             .ok_or_else(|| Error::Invalid("cache installation requires a source export".into()))?;
         if supplied.insert(source) {
             let export = prefix_cache
-                .manager()
                 .resident(source)
                 .ok_or_else(|| Error::Invalid("cache export buffer is not resident".into()))?;
             resident.push(Arc::clone(export));
         }
     }
 
-    if !prefix_cache.manager().has_pending_accesses() {
+    if !prefix_cache.has_pending_accesses() {
         return Ok(Resolved {
             resident,
             hazards: Vec::new(),
         });
     }
     let spans = write_spans(prefix_cache, parts.requests, plan, &resident)?;
-    let hazards = prefix_cache
-        .manager()
-        .write_dependencies(&spans)
-        .into_iter()
-        .map(Arc::clone)
-        .collect();
+    let hazards = prefix_cache.write_dependencies(&spans);
     Ok(Resolved { resident, hazards })
 }
 
@@ -1159,7 +1153,7 @@ fn check_resident(
     for source in sources {
         if let (Some(import), Some(existing)) = (
             batch.inputs().cache_import(source),
-            prefix_cache.manager().resident(source),
+            prefix_cache.resident(source),
         ) && existing.as_ref() != import.export().as_ref()
         {
             return Err(Error::Invalid(

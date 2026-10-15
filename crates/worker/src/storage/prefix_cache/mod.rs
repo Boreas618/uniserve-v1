@@ -5,8 +5,10 @@
 //! - [`CachePlanes`]: the pool's device storage;
 //! - [`BlockTables`] (host) and [`BlockTableStorage`] (device): the
 //!   scheduler's page assignments and their numerical tables;
-//! - [`PrefixCacheManager`]: resident transfers, transfer bases and the physical
-//!   accesses (executions, exports, imports) that decide unit reuse;
+//! - [`TransferBases`]: resident transfers and the bases of incremental
+//!   transfers;
+//! - [`UnitAccesses`]: the physical accesses (executions, exports, imports)
+//!   that decide unit reuse;
 //! - the import lane: bounded workspaces whose host tasks copy other ranks'
 //!   exports into assigned pages.
 //!
@@ -14,127 +16,51 @@
 //! "current" stream. All validation precedes the first device write, and
 //! failed or unknown device completions keep their storage retained.
 
+mod access;
 pub(super) mod block_tables;
-pub(super) mod manager;
+mod imports;
 pub(super) mod plan;
 pub(super) mod planes;
+mod transfers;
+
+pub use access::UnitAccesses;
+use imports::Imports;
+pub use imports::PendingImport;
+pub use transfers::TransferBases;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use tvm_ffi::Any;
+use uniserve_core::CallId;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{BlockTable, BufferId, CacheTransfer, RequestKey, Wake};
 
-use self::block_tables::{BlockTableStorage, BlockTables, GroupTable};
+use self::block_tables::{AttentionRow, BlockTableStorage, BlockTables, GroupTable, TablePages};
 use self::plan::{CACHE, CachePlan};
 use self::planes::{CachePlanes, UnitColumn};
-use super::PrefixCacheManager;
 use super::memory::StorageView;
 use crate::ffi::{Handle, Interpreter};
 use crate::host::HostLane;
 use crate::stream::Issue;
 use crate::transfer::cache_export::{self, CacheExport};
+use crate::transfer::exports::Location;
 use crate::transfer::{
     CacheImport, CacheImportBackend, CacheImporter, ImportCopy, ImportEntry, ImportTask,
     ImportWorkspace, Retired, Retirement, Transports,
 };
-use crate::{Error, HostTask, Outcome, Result};
+use crate::{Error, HostTask, Result};
 
 /// The most import copy threads (and workspaces) a rank runs.
 const IMPORT_WORKERS: usize = 4;
-
-/// A reserved cache import: the destination tables and units it resets, the
-/// export it installs, and its copy task (none when nothing is copied).
-pub struct PendingImport {
-    entry: ImportEntry,
-    tables: Vec<Arc<GroupTable>>,
-    export: Arc<CacheTransfer>,
-    task: Option<Arc<HostTask<ImportTask>>>,
-}
-
-impl PendingImport {
-    pub fn buffer(&self) -> BufferId {
-        self.entry.buffer
-    }
-
-    pub fn slot(&self) -> usize {
-        self.entry.request_pool_idx
-    }
-
-    pub fn export(&self) -> &Arc<CacheTransfer> {
-        &self.export
-    }
-
-    /// Whether an install call adopted the import as its slot's prefix.
-    pub fn adopted(&self) -> bool {
-        self.entry.write().released()
-    }
-
-    /// Whether the copy task finished (successfully or not).
-    pub fn done(&self) -> bool {
-        self.task.as_ref().is_none_or(|task| task.completion.done())
-    }
-
-    /// The import's physical retirement: it completes once the import was
-    /// adopted or abandoned and every read and the workspace stream drained.
-    pub fn retirement(&self) -> &Arc<Retirement> {
-        self.entry.retirement()
-    }
-
-    /// Run `callback` once the copy task finished.
-    pub fn subscribe(&self, callback: Box<dyn FnOnce() + Send>) {
-        match &self.task {
-            Some(task) => {
-                if let Some(callback) = task.completion.subscribe(callback) {
-                    callback();
-                }
-            }
-            None => callback(),
-        }
-    }
-
-    /// The copy's result, without waiting.
-    fn result(&self) -> Result<()> {
-        let Some(task) = &self.task else {
-            return Ok(());
-        };
-        match task.completion.outcome() {
-            Some(Outcome::Success(_)) => Ok(()),
-            Some(Outcome::Failed(error)) => {
-                Err(Error::Transport(format!("cache import failed: {error}")))
-            }
-            Some(Outcome::Cancelled) => Err(Error::Resource("cache import was cancelled")),
-            None => Err(Error::State(
-                "cache import was observed before input readiness",
-            )),
-        }
-    }
-}
-
-/// Import workspaces, their copy lane and the retirement observers.
-struct Imports {
-    importer: Arc<CacheImporter<ImportEntry, ImportWorkspace>>,
-    lane: HostLane<ImportTask>,
-    retired: Arc<Retired>,
-}
-
-impl Imports {
-    fn cancel(&self, reads: Vec<Arc<crate::transfer::ReadRef>>) -> Result<()> {
-        let mut result = Ok(());
-        for read in reads {
-            result = result.and(read.read().cancel());
-        }
-        result.and(self.retired.reap())
-    }
-}
 
 /// The rank's prefix cache owners.
 pub struct PrefixCache {
     planes: Arc<CachePlanes>,
     storage: BlockTableStorage,
     tables: BlockTables,
-    manager: PrefixCacheManager<Arc<Retirement>>,
+    accesses: UnitAccesses<Arc<Retirement>>,
+    bases: TransferBases,
     imports: Imports,
 }
 
@@ -199,7 +125,8 @@ impl PrefixCache {
             planes,
             storage,
             tables,
-            manager: PrefixCacheManager::default(),
+            accesses: UnitAccesses::default(),
+            bases: TransferBases::default(),
             imports: Imports {
                 importer,
                 lane,
@@ -224,18 +151,158 @@ impl PrefixCache {
         &self.tables
     }
 
-    pub fn tables_mut(&mut self) -> &mut BlockTables {
-        &mut self.tables
+    /// Select `rows`' attention pages. Every row that writes is checked
+    /// against the live exports, imports and executions of its units.
+    pub fn prepare_attention(&mut self, rows: &[AttentionRow]) -> Result<Vec<TablePages>> {
+        let accesses = &mut self.accesses;
+        self.tables.prepare_attention(rows, |table, prefix, query| {
+            accesses.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
+        })
     }
 
-    pub fn manager(&mut self) -> &mut PrefixCacheManager<Arc<Retirement>> {
-        &mut self.manager
+    /// Retain `slot`'s extent below `length` tokens, from each group's first
+    /// resident page, for `request` until `retirement`: the physical end of
+    /// the batch that reads or writes it.
+    pub fn retain(
+        &mut self,
+        request: RequestKey,
+        slot: u32,
+        length: u64,
+        retirement: &Arc<Retirement>,
+    ) -> Result<()> {
+        let mut spans = Vec::new();
+        for group in 0..self.tables.groups().len() as u32 {
+            let table = self.tables.table(slot, group)?;
+            let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
+            if length > start {
+                spans.extend(table.spans(start, length - start)?);
+            }
+        }
+        self.accesses
+            .retain_execution(request, &spans, Arc::clone(retirement));
+        Ok(())
     }
 
-    /// The block tables and the access manager together, for a batch that
-    /// resolves attention pages while checking writes.
-    pub fn split(&mut self) -> (&BlockTables, &mut PrefixCacheManager<Arc<Retirement>>) {
-        (&self.tables, &mut self.manager)
+    /// The transfer resident under `buffer`.
+    pub fn resident(&self, buffer: BufferId) -> Option<&Arc<CacheTransfer>> {
+        self.bases.resident(buffer)
+    }
+
+    /// The conditioning export `buffer` of `request`, covered by `slot`'s
+    /// installed keys and values (`visible` tokens).
+    pub fn validate_conditioning(
+        &self,
+        request: RequestKey,
+        buffer: BufferId,
+        slot: u32,
+        visible: u64,
+    ) -> Result<&Arc<CacheTransfer>> {
+        self.bases
+            .validate_conditioning(request, buffer, slot, visible, &self.tables)
+    }
+
+    /// Check a batch's exports and installs against their destinations'
+    /// accepted bases, before the batch's commit point.
+    pub fn validate_transfers(
+        &self,
+        exports: &[(BufferId, CacheTransfer)],
+        installations: &[(BufferId, BufferId, CacheTransfer)],
+    ) -> Result<()> {
+        self.bases.validate_exports(exports, installations)
+    }
+
+    /// Make a checked batch's exports and installs resident.
+    pub fn apply_transfers(
+        &mut self,
+        exports: Vec<(BufferId, CacheTransfer)>,
+        installations: Vec<(BufferId, BufferId, CacheTransfer)>,
+    ) {
+        self.bases.apply_exports(exports, installations);
+    }
+
+    /// The transfer and locations of `export`, once the work it was issued
+    /// with was performed ([`CacheExport::locate`]).
+    pub fn locate_export(&mut self, export: CacheExport) -> Result<(CacheTransfer, Vec<Location>)> {
+        export.locate(&mut self.accesses)
+    }
+
+    /// Revoke `export`, which is not published ([`CacheExport::revoke`]).
+    pub fn revoke_export(&mut self, export: CacheExport) {
+        export.revoke(&mut self.accesses);
+    }
+
+    /// Whether any physical access is outstanding.
+    pub fn has_pending_accesses(&mut self) -> bool {
+        self.accesses.has_pending_accesses()
+    }
+
+    /// The completions a batch writing `spans` waits for.
+    pub fn write_dependencies(&mut self, spans: &[(u32, u32, u32)]) -> Vec<Arc<Retirement>> {
+        self.accesses
+            .write_dependencies(spans)
+            .into_iter()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Release the physical exports of `buffers`.
+    pub fn release_exports(&mut self, buffers: &[BufferId]) {
+        self.accesses.release_exports(buffers);
+    }
+
+    /// Release the resident transfers of finished calls and their exports.
+    pub fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) {
+        let released = self.bases.release_calls(calls);
+        self.accesses.release_exports(&released);
+    }
+
+    /// Release the imports and exports of `buffers`.
+    pub fn release_buffers(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
+        self.release_imports(buffers)?;
+        self.accesses
+            .release_exports(&buffers.iter().copied().collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// Release the imports and exports of finished `requests`, except the
+    /// `retained` buffers.
+    pub fn release_requests(
+        &mut self,
+        requests: &HashSet<RequestKey>,
+        retained: &HashSet<BufferId>,
+    ) -> Result<()> {
+        self.cancel_request_imports(requests, retained)?;
+        let exports: Vec<BufferId> = self
+            .accesses
+            .exported_buffers()
+            .into_iter()
+            .filter(|buffer| requests.contains(&buffer.owner) && !retained.contains(buffer))
+            .collect();
+        self.accesses.release_exports(&exports);
+        Ok(())
+    }
+
+    /// Whether the physical accesses of `buffers` and of `requests` (but
+    /// the `retained` buffers) have retired.
+    pub fn retirement_ready(
+        &mut self,
+        buffers: &HashSet<BufferId>,
+        requests: &HashSet<RequestKey>,
+        retained: &HashSet<BufferId>,
+    ) -> bool {
+        self.accesses.retirement_ready(buffers, requests, retained)
+    }
+
+    /// Keep `slot`, a guidance prefix slot `request` reads, until the
+    /// request releases its prefixes.
+    pub fn retain_prefix(&mut self, request: RequestKey, slot: u32) {
+        self.tables.retain_prefix(request, slot);
+    }
+
+    /// Forget a retired request epoch's resident transfers and accepted
+    /// bases; its physical accesses have drained.
+    pub fn drop_request(&mut self, request: RequestKey) {
+        self.bases.drop_request(request);
     }
 
     /// Every bound tensor of the cache: the planes and the block tables,
@@ -285,7 +352,7 @@ impl PrefixCache {
         }
         let unit_tokens = self.plan().unit_tokens();
         let spans: Vec<_> = units.iter().map(|&unit| (unit, 0, unit_tokens)).collect();
-        self.manager.require_reusable(&spans)?;
+        self.accesses.require_reusable(&spans)?;
         column.recycle(&self.planes, units, stream)
     }
 
@@ -327,7 +394,7 @@ impl PrefixCache {
 
     /// Export a slot's visible cache extent (see [`cache_export::export`]). Its
     /// transfer and locations exist once the issuer's work was performed
-    /// ([`CacheExport::locate`] with [`Self::manager`]).
+    /// ([`Self::locate_export`]).
     #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
     pub fn export(
         &mut self,
@@ -340,7 +407,8 @@ impl PrefixCache {
         stream: impl Issue,
     ) -> Result<CacheExport> {
         cache_export::export(
-            &mut self.manager,
+            &mut self.accesses,
+            &self.bases,
             &self.tables,
             &self.planes,
             slot,
@@ -364,7 +432,7 @@ impl PrefixCache {
         initialized: Vec<u32>,
         transports: Arc<Transports>,
     ) -> Result<PendingImport> {
-        self.manager.validate_install(&export)?;
+        self.bases.validate_install(&export)?;
         let plan = self.planes.plan();
         for (group, target) in export.groups.iter().zip(&plan.groups) {
             let expected = [
@@ -421,10 +489,10 @@ impl PrefixCache {
             }
         }
 
-        let manager = &mut self.manager;
+        let accesses = &mut self.accesses;
         let retirement = Arc::clone(entry.retirement());
         if let Err(error) = self.imports.importer.reserve(entry.clone(), || {
-            manager.reserve_import(export.source, &ranges, retirement)
+            accesses.reserve_import(export.source, &ranges, retirement)
         }) {
             withdraw(&task);
             return Err(error);
@@ -460,7 +528,7 @@ impl PrefixCache {
                 "installed cache buffer does not belong to its source".into(),
             ));
         }
-        self.manager.validate_install(&import.export)?;
+        self.bases.validate_install(&import.export)?;
         let slot = import.slot() as u32;
         for (group, expected) in import.tables.iter().enumerate() {
             if self.tables.table(slot, group as u32)? != *expected {
@@ -527,7 +595,7 @@ impl PrefixCache {
     /// and the units are reset natively, issued to `stream`, now and when
     /// the scratch is returned.
     pub fn scratch_units(&mut self, count: u32, stream: impl Issue) -> Result<ScratchUnits> {
-        if self.manager.has_pending_accesses() {
+        if self.accesses.has_pending_accesses() {
             return Err(Error::State("cache scratch requires an idle cache"));
         }
         if count >= self.planes.num_units() {
@@ -556,12 +624,12 @@ impl PrefixCache {
     /// the caller must not reuse it.
     pub fn close(&mut self) -> Result<()> {
         let stopped = self.stop_imports();
-        let exports = self.manager.exported_buffers();
-        self.manager.release_exports(&exports);
+        let exports = self.accesses.exported_buffers();
+        self.accesses.release_exports(&exports);
         stopped
             .and(self.imports.importer.require_retired())
-            .and(self.manager.require_retired())?;
-        self.manager.clear_resident();
+            .and(self.accesses.require_retired())?;
+        self.bases.clear();
         self.tables.clear();
         Ok(())
     }

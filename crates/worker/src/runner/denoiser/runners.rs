@@ -141,7 +141,7 @@ impl DenoiserRunners {
         }
         let lengths = vec![prefix; shape.images];
         with_scratch(prefix_cache, &lengths, stream.as_ref(), |prefix_cache| {
-            diffusion.capture(&rows, prefix_cache.tables(), pools, &mut || Ok(()))
+            diffusion.capture(&rows, prefix_cache, pools, &mut || Ok(()))
         })
     }
 

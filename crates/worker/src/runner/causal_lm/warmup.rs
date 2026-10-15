@@ -30,7 +30,7 @@ use uniserve_ipc::{
 
 use std::sync::Arc;
 
-use super::{CausalLMRunners, StepParts};
+use super::CausalLMRunners;
 use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
@@ -386,7 +386,6 @@ impl CausalLMRunners {
         capacity: Option<usize>,
         job: Job,
     ) -> Result<()> {
-        let (tables, cache) = prefix_cache.split();
         let prompt = PromptChunks::default();
         let request = StepRequest {
             mode: if decode {
@@ -404,14 +403,7 @@ impl CausalLMRunners {
             (0..self.groups[group].len()).map(|_| None).collect();
         requests[peer] = Some(request);
 
-        let step = self.forward(
-            experts,
-            group,
-            &requests,
-            &mut StepParts { tables, cache },
-            capacity,
-            &job,
-        )?;
+        let step = self.forward(experts, group, &requests, prefix_cache, capacity, &job)?;
         let completion = lanes.block_on(self.kind(group)?, job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.complete(step, &mut completion).map(drop)

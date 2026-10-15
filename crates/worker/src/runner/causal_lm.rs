@@ -60,8 +60,6 @@ pub(crate) use methods::{Construction, Functions};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
 pub(crate) use runners::{CausalLMRunners, Pending, Step, complete, forward};
 
-use std::sync::Arc;
-
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 use uniserve_ipc::ForwardMode;
 
@@ -77,11 +75,10 @@ use crate::runner::attention::pack_rows;
 use crate::sampling::SamplingPath;
 use crate::sampling::{SamplingGroup, padded};
 use crate::storage::memory::StorageView;
-use crate::storage::{AttentionRow, BlockTables, PrefixCacheManager};
+use crate::storage::{AttentionRow, PrefixCache};
 use crate::stream::{Fill, Issue};
-use crate::transfer::Retirement;
 use crate::{Error, Result};
-use runners::{COMPLETION_FIELDS, StepParts};
+use runners::COMPLETION_FIELDS;
 
 /// The commit mode of a row that only sets its slot's cache length
 /// (`uniserve.sampling.state.CACHE`).
@@ -159,8 +156,7 @@ pub(crate) struct StepRequest<'a> {
 
 /// The storage a step borrows.
 pub(crate) struct StepContext<'a> {
-    pub(crate) tables: &'a BlockTables,
-    pub(crate) cache: &'a mut PrefixCacheManager<Arc<Retirement>>,
+    pub(crate) prefix_cache: &'a mut PrefixCache,
     pub(crate) state: &'a DecodeState,
 }
 
@@ -711,12 +707,7 @@ impl CausalLMRunner {
                 write: true,
             })
             .collect();
-        let cache = &mut *context.cache;
-        let pages = context
-            .tables
-            .prepare_attention(&attention, |table, prefix, query| {
-                cache.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
-            })?;
+        let pages = context.prefix_cache.prepare_attention(&attention)?;
         if pages.len() != self.tables.len() {
             return Err(Error::Invariant(
                 "attention pages disagree with the binding's tables".into(),

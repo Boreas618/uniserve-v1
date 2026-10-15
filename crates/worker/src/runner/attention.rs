@@ -23,8 +23,9 @@ use std::sync::Arc;
 use uniserve_cuda::Stream;
 
 use crate::ffi::{Backing, DType};
+use crate::storage::PrefixCache;
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{AttentionRow, BlockTables, GroupTable, TablePages};
+use crate::storage::{AttentionRow, TablePages};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -99,17 +100,16 @@ impl AttentionMetadata {
         &self.row_columns
     }
 
-    /// Select `rows`' pages, pack the host column and copy it to the device
-    /// on `stream`, and keep the forward's host mirrors. `widths` fixes each
+    /// Select `rows`' pages of `prefix_cache` (every write checked against
+    /// its live accesses), pack the host column and copy it to the device on
+    /// `stream`, and keep the forward's host mirrors. `widths` fixes each
     /// table's page width (a captured graph's configured widths); `None`
-    /// uses the rows' own. `check` validates each table's writes against
-    /// the cache's live accesses.
+    /// uses the rows' own.
     pub fn stage(
         &mut self,
         rows: &[AttentionRow],
-        tables: &BlockTables,
+        prefix_cache: &mut PrefixCache,
         widths: Option<&[usize]>,
-        check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
         stream: impl Issue,
     ) -> Result<()> {
         let capacity = self.capacity;
@@ -122,7 +122,7 @@ impl AttentionMetadata {
                 capacity.tokens
             )));
         }
-        let pages = tables.prepare_attention(rows, check)?;
+        let pages = prefix_cache.prepare_attention(rows)?;
         if pages.len() != capacity.tables {
             return Err(Error::Invariant(
                 "attention pages disagree with the runner's tables".into(),

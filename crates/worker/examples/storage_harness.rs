@@ -195,23 +195,18 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
 
     let exported = buffer(0);
     // Issued on the stream at once, so the export is located here.
-    let (transfer, locations) = source
-        .export(
-            1,
-            tokens,
-            "consumer",
-            exported,
-            &transports,
-            &[0],
-            Some(&streams[0]),
-        )?
-        .locate(source.manager())?;
-    source
-        .manager()
-        .validate_exports(&[(exported, transfer.clone())], &[])?;
-    source
-        .manager()
-        .apply_exports(vec![(exported, transfer.clone())], vec![]);
+    let export = source.export(
+        1,
+        tokens,
+        "consumer",
+        exported,
+        &transports,
+        &[0],
+        Some(&streams[0]),
+    )?;
+    let (transfer, locations) = source.locate_export(export)?;
+    source.validate_transfers(&[(exported, transfer.clone())], &[])?;
+    source.apply_transfers(vec![(exported, transfer.clone())], vec![]);
 
     // The consumer assigns fresh units and imports the whole extent.
     let assignments = tables(1, &destination_units, tokens, &destination_plan);
@@ -238,10 +233,8 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     streams[1].synchronize()?;
 
     // Retire every access: the producer's exports, then both caches.
-    source
-        .manager()
-        .release_calls(&[(exported.owner, exported.producer_call_id)]);
-    source.manager().release_exports(&[exported]);
+    source.release_calls(&[(exported.owner, exported.producer_call_id)]);
+    source.release_exports(&[exported]);
     uniserve_worker::transfer::exports::release(&locations)?;
     wait(
         || {
