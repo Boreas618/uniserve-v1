@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use tvm_ffi::Any;
 
+use crate::config::placement::Declarations;
 use crate::config::{RendezvousConfig, WorkerLaunch};
 use crate::ffi::{Handle, Interpreter, integer_list, list, strings};
-use crate::model::components::Declarations;
 use crate::{Error, Result};
 
 use super::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT, bind_beside};

@@ -4,9 +4,9 @@ use uniserve_ipc::MediaCall;
 
 use super::runners::DecoderRunners;
 use super::{DecodeCapacity, DecoderRunner};
+use crate::config::placement::Capability;
+use crate::config::placement::Placed;
 use crate::ffi::DType;
-use crate::model::components::Capability;
-use crate::model::registry::Placed;
 use crate::request::video::VideoSize;
 use crate::runner::RunnerSetup;
 use crate::runner::component::{
