@@ -31,11 +31,20 @@ impl SlotField {
 
 /// Banks of per-slot state: one allocation per field shaped
 /// `[capacity + 1, ...shape]`, where row 0 is the padding slot and request
-/// slots are 1-based. Banks are bound once; a slot's state is a row view.
-/// Contents are uninitialized until their owner writes them.
+/// slots are 1-based. Banks are bound once; a slot's state is a row view,
+/// made once with its bank, so each row crosses to Python as one torch
+/// tensor for the bank's life. Contents are uninitialized until their owner
+/// writes them.
 pub struct RequestSlots {
     capacity: u32,
-    banks: Vec<(SlotField, StorageView)>,
+    banks: Vec<Bank>,
+}
+
+/// One field's bank and its row views, the padding row first.
+struct Bank {
+    field: SlotField,
+    view: StorageView,
+    rows: Vec<StorageView>,
 }
 
 impl RequestSlots {
@@ -74,7 +83,14 @@ impl RequestSlots {
                 shape.extend(&field.shape);
                 let view =
                     StorageView::contiguous(memory as Arc<dyn Backing>, 0, field.dtype, &shape)?;
-                Ok((field.clone(), view))
+                let slots = (0..rows)
+                    .map(|row| view.select(0, row))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Bank {
+                    field: field.clone(),
+                    view,
+                    rows: slots,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { capacity, banks })
@@ -88,17 +104,13 @@ impl RequestSlots {
     pub fn views(&self) -> Vec<(String, StorageView)> {
         self.banks
             .iter()
-            .map(|(field, view)| (field.name.clone(), view.clone()))
+            .map(|bank| (bank.field.name.clone(), bank.view.clone()))
             .collect()
     }
 
     /// A field's whole bank.
     pub fn bank(&self, name: &str) -> Result<&StorageView> {
-        self.banks
-            .iter()
-            .find(|(field, _)| field.name == name)
-            .map(|(_, view)| view)
-            .ok_or_else(|| Error::Invalid(format!("request slots have no field {name}")))
+        self.find(name).map(|bank| &bank.view)
     }
 
     /// One request slot's row of a field; slots are 1-based.
@@ -109,7 +121,14 @@ impl RequestSlots {
                 self.capacity
             )));
         }
-        self.bank(name)?.select(0, i64::from(slot))
+        Ok(self.find(name)?.rows[slot as usize].clone())
+    }
+
+    fn find(&self, name: &str) -> Result<&Bank> {
+        self.banks
+            .iter()
+            .find(|bank| bank.field.name == name)
+            .ok_or_else(|| Error::Invalid(format!("request slots have no field {name}")))
     }
 }
 

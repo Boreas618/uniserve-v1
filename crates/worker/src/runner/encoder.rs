@@ -289,7 +289,7 @@ impl ImagePreparation {
             tower,
             payload,
             input_images,
-            Any::from(pixels.to_tensor()?),
+            pixels.handle()?.to_any(),
         ])?;
         Ok(PreparedImage {
             facts,

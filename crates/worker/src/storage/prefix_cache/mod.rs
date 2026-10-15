@@ -308,7 +308,7 @@ impl PrefixCache {
     /// Every bound tensor of the cache: the planes and the block tables,
     /// keyed as numerical bindings receive them.
     pub fn views(&self) -> crate::Result<Vec<(String, StorageView)>> {
-        let mut views = self.planes.views()?;
+        let mut views = self.planes.views();
         views.extend(self.storage.views());
         Ok(views)
     }

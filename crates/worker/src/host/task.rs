@@ -15,7 +15,7 @@ use uniserve_core::VideoCondition;
 use super::mux::{MuxSession, frame_unit};
 use super::reader::{ConditionProducts, ConditionReader};
 use super::{HostAction, HostTask};
-use crate::ffi::{Backing, DType, Device, Function};
+use crate::ffi::{Backing, DType, Device, Function, Interpreter};
 use crate::storage::memory::StorageView;
 use crate::transfer::{SharedMapping, SharedRead};
 use crate::{Error, Outcome};
@@ -155,10 +155,13 @@ impl MediaTask {
                 row,
             } => {
                 let rgb = frames.view(*count, *height, *width)?;
-                let encoded: tvm_ffi::Bytes = function.call_as(&[
-                    AnyView::from(&Any::from(rgb.to_tensor()?)),
-                    AnyView::from(&Any::from(i64::from(*frame_rate))),
-                ])?;
+                // The view's wrapping and the call take one handoff.
+                let encoded: tvm_ffi::Bytes = Interpreter::execute(|| {
+                    function.call_as(&[
+                        rgb.handle()?.view(),
+                        AnyView::from(&Any::from(i64::from(*frame_rate))),
+                    ])
+                })?;
                 if row.device() != Device::Cpu || !row.is_contiguous() {
                     return Err(Error::Invariant(
                         "an encoded unit row is not contiguous host memory".into(),
@@ -178,11 +181,13 @@ impl MediaTask {
                 rate,
                 session,
             } => {
-                let encoded: tvm_ffi::Bytes = function.call_as(&[
-                    AnyView::from(&Any::from(pcm.to_tensor()?)),
-                    AnyView::from(&Any::from(*samples as i64)),
-                    AnyView::from(&Any::from(i64::from(*rate))),
-                ])?;
+                let encoded: tvm_ffi::Bytes = Interpreter::execute(|| {
+                    function.call_as(&[
+                        pcm.handle()?.view(),
+                        AnyView::from(&Any::from(*samples as i64)),
+                        AnyView::from(&Any::from(i64::from(*rate))),
+                    ])
+                })?;
                 session.set_audio(encoded)?;
                 Ok(TaskOutput::Done)
             }
