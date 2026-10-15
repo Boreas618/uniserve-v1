@@ -1,4 +1,4 @@
-"""The image runners drive the stub model through the numerical interface.
+"""The image runners drive the stub model through the numerical library.
 
 The worker's image harness (``tests.python.fixtures.image_harness``) binds
 one component on the host, runs one runner operation and returns its
@@ -19,18 +19,17 @@ from PIL import Image
 
 from tests.python.fixtures.image_harness import image_harness
 from tests.python.fixtures.stub import load_stub
-from uniserve import interface
 from uniserve.media import image
 from uniserve.media.pixels import prepare_host_image, quantize_image_hwc
 from uniserve.models import VisionInput
+from uniserve.worker import import_path
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
 def stub():
-    table = interface.table()
-    return table, load_stub()
+    return load_stub()
 
 
 def _payload(height: int, width: int, seed: int) -> str:
@@ -43,11 +42,11 @@ def _payload(height: int, width: int, seed: int) -> str:
 
 
 def _encode(stub, component, root, path, tower, payloads):
-    table, model = stub
+    model = stub
     *results, counts = image_harness().encode(
         tvm_ffi.convert(
             {
-                "table": table,
+                "import": import_path,
                 "loaded": model,
                 "component": component,
                 "root": root,
@@ -61,7 +60,7 @@ def _encode(stub, component, root, path, tower, payloads):
 
 
 def test_vision_features_match_the_encoder_one_shape_per_call(stub):
-    _, model = stub
+    model = stub
     payloads = [_payload(32, 48, 1), _payload(48, 48, 2), _payload(32, 48, 3)]
     features, (replays, eager) = _encode(
         stub, "vision_encoder", "vision_encoder", "", "vit", payloads
@@ -84,7 +83,7 @@ def test_vision_features_match_the_encoder_one_shape_per_call(stub):
 
 
 def test_latent_encodings_match_the_autoencoder(stub):
-    _, model = stub
+    model = stub
     payloads = [_payload(32, 32, 4), _payload(32, 32, 5)]
     latents, (_, eager) = _encode(
         stub, "model", "", "latent_encoder", "vae", payloads
@@ -99,7 +98,7 @@ def test_latent_encodings_match_the_autoencoder(stub):
 
 
 def test_decoded_images_stage_quantized_pixels_across_sub_batches(stub):
-    table, model = stub
+    model = stub
     latents = torch.linspace(-1.5, 1.5, 16 * 768).reshape(16, 768)
     latents = latents.to(torch.bfloat16)
     sizes = [[32, 32], [32, 64], [32, 32]]
@@ -107,7 +106,7 @@ def test_decoded_images_stage_quantized_pixels_across_sub_batches(stub):
     results = image_harness().decode(
         tvm_ffi.convert(
             {
-                "table": table,
+                "import": import_path,
                 "loaded": model,
                 "component": "model",
                 "root": "",

@@ -16,7 +16,7 @@
 //! The binding's gather (`uniserve.nn.attention.gather`) derives the
 //! device block tables, lengths, offsets and write indices from it and the
 //! slots' installed tables in one launch
-//! (`uniserve.interface.attention`).
+//! (`uniserve.runner.attention`).
 
 use std::sync::Arc;
 

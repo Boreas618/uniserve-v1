@@ -19,9 +19,8 @@ use std::time::Duration;
 use tvm_ffi::Any;
 
 use crate::config::{RendezvousConfig, WorkerLaunch};
-use crate::ffi::{Handle, integer_list, list, strings};
+use crate::ffi::{Handle, Interpreter, integer_list, list, strings};
 use crate::model::components::Declarations;
-use crate::model::interface::Interface;
 use crate::{Error, Result};
 
 use super::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT, bind_beside};
@@ -51,11 +50,7 @@ pub struct World {
 
 impl World {
     /// Form the host groups and the torch world.
-    pub fn initialize(
-        interface: &Interface,
-        launch: &WorkerLaunch,
-        timeout: Duration,
-    ) -> Result<Self> {
+    pub fn initialize(launch: &WorkerLaunch, timeout: Duration) -> Result<Self> {
         let execution = &launch.execution;
         let (host, union, store) = match &launch.expert_parallel {
             Some(union) => {
@@ -98,7 +93,7 @@ impl World {
         let optional = |value: Option<i64>| value.map(Any::from).unwrap_or_default();
         let member = launch.expert_parallel.as_ref();
         let torch = Handle::new(
-            interface.initialize.call_values(&[
+            Interpreter::import("uniserve.distributed.world.initialize")?.call_values(&[
                 Any::from(execution.rank as i64),
                 Any::from(launch.local_rank as i64),
                 Any::from(execution.world_size as i64),
@@ -123,7 +118,7 @@ impl World {
             union,
             torch,
             components: Vec::new(),
-            destroy: Some(interface.destroy.clone()),
+            destroy: Some(Interpreter::import("uniserve.distributed.world.destroy")?),
         })
     }
 
@@ -137,7 +132,6 @@ impl World {
     /// so its peers are never left waiting in a creation collective.
     pub fn bind_components(
         &mut self,
-        interface: &Interface,
         launch: &WorkerLaunch,
         declarations: &Declarations,
     ) -> Result<()> {
@@ -161,29 +155,31 @@ impl World {
         // Each planned group's members cross back to back, with their
         // counts.
         let entries = &plan.entries;
-        let groups: tvm_ffi::Array<Any> = interface
-            .create_groups
-            .call_values(&[
-                self.torch.to_any(),
-                Any::from(integer_list(
-                    entries.iter().map(|entry| entry.members.len() as i64),
-                )),
-                Any::from(integer_list(
-                    entries
-                        .iter()
-                        .flat_map(|entry| &entry.members)
-                        .map(|&rank| rank as i64),
-                )),
-                Any::from(list(
-                    entries.iter().map(|entry| Any::from(entry.local_sync)),
-                )),
-                Any::from(list(entries.iter().map(|entry| Any::from(entry.keep)))),
-            ])?
-            .try_into()
-            .map_err(|error| Error::numerical("distributed.create_groups", &error))?;
+        let groups: tvm_ffi::Array<Any> =
+            Interpreter::import("uniserve.distributed.world.create_groups")?
+                .call_values(&[
+                    self.torch.to_any(),
+                    Any::from(integer_list(
+                        entries.iter().map(|entry| entry.members.len() as i64),
+                    )),
+                    Any::from(integer_list(
+                        entries
+                            .iter()
+                            .flat_map(|entry| &entry.members)
+                            .map(|&rank| rank as i64),
+                    )),
+                    Any::from(list(
+                        entries.iter().map(|entry| Any::from(entry.local_sync)),
+                    )),
+                    Any::from(list(entries.iter().map(|entry| Any::from(entry.keep)))),
+                ])?
+                .try_into()
+                .map_err(|error| {
+                    Error::numerical("uniserve.distributed.world.create_groups", &error)
+                })?;
         if groups.len() != plan.entries.len() {
             return Err(Error::Interface(
-                "distributed.create_groups returns one value per plan entry".into(),
+                "create_groups returns one value per plan entry".into(),
             ));
         }
         let groups: Vec<Handle> = groups.iter().map(Handle::new).collect::<Result<_>>()?;
@@ -192,12 +188,12 @@ impl World {
             let mesh = component
                 .mesh
                 .as_ref()
-                .map(|binding| self.mesh(interface, binding, &groups))
+                .map(|binding| self.mesh(binding, &groups))
                 .transpose()?;
             let units = component
                 .units
                 .as_ref()
-                .map(|binding| self.mesh(interface, binding, &groups))
+                .map(|binding| self.mesh(binding, &groups))
                 .transpose()?;
             self.components.push(ComponentMeshes {
                 plan: component,
@@ -241,17 +237,12 @@ impl World {
             })
     }
 
-    fn mesh(
-        &self,
-        interface: &Interface,
-        binding: &MeshBinding,
-        groups: &[Handle],
-    ) -> Result<Handle> {
+    fn mesh(&self, binding: &MeshBinding, groups: &[Handle]) -> Result<Handle> {
         // Each communicator's members cross back to back, with their
         // counts; a communicator of one member has no created group.
         let communicators = &binding.groups;
         Handle::new(
-            interface.mesh.call_values(&[
+            Interpreter::import("uniserve.distributed.world.mesh")?.call_values(&[
                 self.torch.to_any(),
                 Any::from(integer_list(
                     binding.mesh.ranks.iter().map(|&rank| rank as i64),

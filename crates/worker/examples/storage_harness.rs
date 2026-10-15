@@ -1,6 +1,7 @@
 //! A TVM-FFI test harness that drives the native cache owners with the real
-//! numerical interface: Python loads this library with
-//! `tvm_ffi.load_module`, passes the interface table and its cache plans
+//! numerical library: Python loads this library with
+//! `tvm_ffi.load_module`, passes the rank's import function
+//! (`uniserve.worker.import_path`) and its cache plans
 //! and inspects the Rust-owned storage through the returned DLPack tensors
 //! (`tests/python/integration/storage`).
 //!
@@ -19,9 +20,8 @@ use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};
 use uniserve_core::{CallId, RequestId, UnitId};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, CallKind, ForwardMode, RequestKey, WorkerEndpoint};
-use uniserve_worker::ffi::{Function, Handle, Record};
+use uniserve_worker::ffi::{Function, Handle, Interpreter, Record};
 use uniserve_worker::lane::JobQueues;
-use uniserve_worker::model::interface::Interface;
 use uniserve_worker::storage::memory::StorageView;
 use uniserve_worker::storage::{CachePlan, PrefixCache};
 use uniserve_worker::transfer::{Capacity, TransportKind, TransportOptions, Transports, notify};
@@ -115,9 +115,9 @@ fn cache_transfer(
 
 fn run(config: Any) -> Result<Map<FfiString, Any>> {
     let config = Record::new("cache_transfer", config)?;
-    let interface = Interface::from_table(config.get("interface")?)?;
+    Interpreter::install_import(config.get("import")?);
     let plan = |key: &str| -> Result<Arc<CachePlan>> {
-        CachePlan::read(&interface, Handle::new(config.value(key)?)?).map(Arc::new)
+        CachePlan::read(Handle::new(config.value(key)?)?).map(Arc::new)
     };
     let source_plan = plan("source_plan")?;
     let destination_plan = plan("destination_plan")?;
@@ -145,7 +145,6 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         1,
         Some(devices[0]),
         Some(&streams[0]),
-        &interface,
     )?;
     let mut destination = PrefixCache::new(
         Arc::clone(&destination_plan),
@@ -155,7 +154,6 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         2,
         Some(devices[1]),
         Some(&streams[1]),
-        &interface,
     )?;
 
     // Python writes the producer's tokens through the bound views.

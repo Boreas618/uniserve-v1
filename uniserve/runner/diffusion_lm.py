@@ -27,7 +27,8 @@ Every value that changes between forwards is the contents of a tensor, the
 sampler derives its random bits on the device from the seed, block and step
 columns, and no method keeps state between calls. The caller captures a
 method into one CUDA graph per shape by calling it between
-``graphs.capture_begin`` and ``graphs.capture_end`` after one eager call of
+``uniserve.cuda_graph.capture_begin`` and ``capture_end`` after one eager call
+of
 the same shape, and launches the graph without Python.
 
 Attention operators that plan a launch on the host read the host mirrors of

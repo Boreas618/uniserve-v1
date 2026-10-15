@@ -11,10 +11,9 @@ use uniserve_ipc::{CallKind, MediaCall, WorkerInfo};
 use crate::capacity::video::VideoCapacity;
 use crate::config::WorkerConfig;
 use crate::cuda_graph::{GraphPool, GraphStorage};
-use crate::ffi::{Device, Handle};
+use crate::ffi::{Device, Handle, Interpreter};
 use crate::lane::Lanes;
 use crate::model::components::Capability;
-use crate::model::interface::Interface;
 use crate::model::registry::Placed;
 use crate::runner::denoiser::VideoModel;
 use crate::{Error, Result};
@@ -66,7 +65,6 @@ pub(crate) const AUDIO_GRAPHS: usize = 1003;
 
 /// What a video model's runners on a rank are built from at startup.
 pub(crate) struct VideoSetup<'a> {
-    pub(crate) interface: &'a Interface,
     pub(crate) loaded: &'a Handle,
     pub(crate) model: &'a VideoModel,
     pub(crate) capacity: &'a VideoCapacity,
@@ -93,9 +91,7 @@ impl VideoSetup<'_> {
         let forked = lanes.fork_module(CallKind::Media(kind), uniserve_cuda::DeviceId(index))?;
         let stream = forked.stream()?.clone();
         let scratch = Handle::new(
-            self.interface
-                .import("uniserve.bindings.context.Scratch")?
-                .call_values(&[])?,
+            Interpreter::import("uniserve.bindings.context.Scratch")?.call_values(&[])?,
         )?;
         Ok((stream, scratch))
     }
@@ -115,7 +111,7 @@ impl VideoSetup<'_> {
         if !capture {
             return Ok(None);
         }
-        let create = self.interface.function("graphs.pool")?;
+        let create = Interpreter::import("uniserve.cuda_graph.pool")?;
         let pools = crate::cuda_graph::reserve_pools(
             self.graphs,
             &create,

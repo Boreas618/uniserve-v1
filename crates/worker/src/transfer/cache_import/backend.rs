@@ -23,8 +23,7 @@ use uniserve_ipc::{CacheTransfer, Locator, Wake};
 
 use super::copy::{ImportBackend, ImportCopy};
 use super::{CacheImport, KVImporter};
-use crate::ffi::{Backing, DType, Function, Handle};
-use crate::model::interface::Interface;
+use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
 use crate::storage::memory::{Memory, StorageView, dtype_name, parse_dtype};
 use crate::storage::{CachePlanes, GroupTable, UnitColumn};
 use crate::transfer::fetch;
@@ -44,7 +43,7 @@ pub struct ImportWorkspace {
 }
 
 /// The library class converting imported pages.
-const PAGE_CONVERSION: &str = "uniserve.interface.cache.PageConversion";
+const PAGE_CONVERSION: &str = "uniserve.prefix_cache.conversion.PageConversion";
 
 impl ImportWorkspace {
     /// Scratch bytes of one workspace: two raw source pages of up to 8-byte
@@ -56,7 +55,7 @@ impl ImportWorkspace {
 
     /// Allocate a workspace for `planes` on its own ordinary stream and
     /// construct the unit resets and the page conversion on it.
-    pub fn bind(planes: &CachePlanes, interface: &Interface) -> Result<Self> {
+    pub fn bind(planes: &CachePlanes) -> Result<Self> {
         let (elements, scales) = planes.plan().page_extents();
         let bytes = Self::scratch_bytes(elements, scales) as usize;
         let (stream, scratch) = match planes.device() {
@@ -66,7 +65,7 @@ impl ImportWorkspace {
             ),
             None => (None, Memory::host(bytes.max(1))),
         };
-        let units = UnitColumn::bind(planes, interface, stream.as_deref())?;
+        let units = UnitColumn::bind(planes, stream.as_deref())?;
 
         let scratch_view = StorageView::contiguous(
             Arc::clone(&scratch) as Arc<dyn Backing>,
@@ -83,14 +82,15 @@ impl ImportWorkspace {
             Any::from(stream.as_ref().map_or(0, |stream| stream.raw() as i64)),
         ];
         arguments.extend(planes.field_arguments()?);
-        let conversion = Handle::new(interface.import(PAGE_CONVERSION)?.call_values(&arguments)?)?;
+        let conversion =
+            Handle::new(Interpreter::import(PAGE_CONVERSION)?.call_values(&arguments)?)?;
         Ok(Self {
             stream,
             scratch,
             elements,
             units,
             conversion,
-            convert: interface.import(&format!("{PAGE_CONVERSION}.convert"))?,
+            convert: Interpreter::import(&format!("{PAGE_CONVERSION}.convert"))?,
         })
     }
 

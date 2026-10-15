@@ -22,12 +22,13 @@ from PIL import Image
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
 from tests.python.fixtures.image_harness import image_harness
 from tests.python.fixtures.stub import load_model, read_config
-from uniserve import cuda_graph, interface
+from uniserve import cuda_graph
 from uniserve.bindings.context import ExecutionContext
 from uniserve.loading import weights
 from uniserve.media.pixels import prepare_host_image
 from uniserve.models import VisionInput
 from uniserve.models import registry as models
+from uniserve.worker import import_path
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -155,7 +156,6 @@ def _load(root):
 @torch.inference_mode()
 def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
     diffusion_gemma_checkpoint(tmp_path, vision=VISION)
-    table = interface.table()
     model = _load(tmp_path)
     # The processor scales each image to the tower's patch budget, so
     # aspect ratios near one keep every grid side within the fixture's
@@ -197,7 +197,7 @@ def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
         image_harness().encode(
             tvm_ffi.convert(
                 {
-                    "table": table,
+                    "import": import_path,
                     "loaded": model,
                     "component": "model",
                     "root": "vision_encoder",

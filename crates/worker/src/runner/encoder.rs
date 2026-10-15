@@ -81,9 +81,8 @@ use crate::executor::forward::batch::{
 };
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::executor::forward::products::Publications;
-use crate::ffi::{Backing, DType, Function, Handle, integer_list};
+use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Completion, Job};
-use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::methods::{
@@ -284,14 +283,9 @@ pub enum EncoderInfo {
 impl EncoderInfo {
     /// Describe the encoder at module `path` of the loaded model, before
     /// its component is bound. `dtype` is the deployment's model dtype.
-    pub fn describe(
-        interface: &Interface,
-        loaded: &Handle,
-        path: &str,
-        dtype: DType,
-    ) -> Result<Self> {
+    pub fn describe(loaded: &Handle, path: &str, dtype: DType) -> Result<Self> {
         let path = Any::from(tvm_ffi::String::from(path));
-        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let method = |name: &str| Interpreter::import(&format!("{ENCODER}.{name}"));
         let extent = |name: &str| -> Result<u32> {
             let function = method(name)?;
             let value: i64 = function.call_as(&[loaded.view(), (&path).into()])?;
@@ -614,8 +608,8 @@ struct EncoderMethods {
 }
 
 impl EncoderMethods {
-    fn new(interface: &Interface, runner: Handle) -> Result<Self> {
-        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+    fn new(runner: Handle) -> Result<Self> {
+        let method = |name: &str| Interpreter::import(&format!("{ENCODER}.{name}"));
         Ok(Self {
             runner,
             encode: method("encode")?,
@@ -624,7 +618,7 @@ impl EncoderMethods {
             image_facts: method("image_facts")?,
             warm: method("warm")?,
             pack_images: method("pack_images")?,
-            capture: GraphFunctions::from_interface(interface)?,
+            capture: GraphFunctions::import()?,
         })
     }
 }
@@ -692,7 +686,6 @@ impl EncoderRunner {
         info: EncoderInfo,
         config: &EncoderConfig,
     ) -> Result<Self> {
-        let interface = setup.interface;
         let owner = setup.owner();
         let (device, stream) = (setup.device, setup.stream.clone());
         if device.is_cuda() != stream.is_some() {
@@ -752,13 +745,13 @@ impl EncoderRunner {
             size.iter()
                 .flat_map(|size| [size.tokens as i64, size.rows as i64]),
         )));
-        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let method = |name: &str| Interpreter::import(&format!("{ENCODER}.{name}"));
         let runner = Handle::new(method("image")?.call_values(&arguments)?)?;
         let context = OwnedContext {
             kernels: method("kernels")?,
             close: method("close")?,
         };
-        let methods = EncoderMethods::new(interface, runner)?;
+        let methods = EncoderMethods::new(runner)?;
         Ok(Self {
             graphs: packed
                 .as_ref()
@@ -783,12 +776,7 @@ impl EncoderRunner {
     /// (`uniserve.runner.encoder.EncoderRunner`). A text encoder's
     /// token, feature and position buffers are allocated here for the
     /// largest prompt capacity.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the Python half and what its buffers are built from"
-    )]
     fn over(
-        interface: &Interface,
         component: &str,
         device: Device,
         runner: Handle,
@@ -802,7 +790,7 @@ impl EncoderRunner {
         } else {
             format!("{component}.{path}")
         };
-        let methods = EncoderMethods::new(interface, runner)?;
+        let methods = EncoderMethods::new(runner)?;
 
         let mut text_capacities = config.text_capacities.clone();
         text_capacities.sort_unstable();
@@ -814,8 +802,7 @@ impl EncoderRunner {
                     .copied()
                     .unwrap_or(config.max_text_tokens)
                     .max(1) as i64;
-                let final_stage = interface
-                    .import(&format!("{ENCODER}.final_stage"))?
+                let final_stage = Interpreter::import(&format!("{ENCODER}.final_stage"))?
                     .call_as::<bool>(&[methods.runner.view()])?;
                 let buffers = TextBuffers {
                     tokens: allocate(device, DType::I64, &[capacity])?,
@@ -1544,10 +1531,10 @@ pub(crate) enum ConditionSetup {
 impl Conditions {
     fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
         Ok(Self {
-            unit_frames: video.interface.import(&format!("{ENCODER}.unit_frames"))?,
+            unit_frames: Interpreter::import(&format!("{ENCODER}.unit_frames"))?,
             loaded: video.loaded.clone(),
-            video: RunnerClass::new(video.interface, ENCODER, "encode", video.arguments())?,
-            audio: RunnerClass::new(audio.interface, ENCODER, "encode", audio.arguments())?,
+            video: RunnerClass::new(ENCODER, "encode", video.arguments())?,
+            audio: RunnerClass::new(ENCODER, "encode", audio.arguments())?,
             frames: HashMap::new(),
             video_runners: HashMap::new(),
             audio_runners: HashMap::new(),
@@ -1731,7 +1718,6 @@ impl Conditions {
 
 /// What a video model's text encoder component is bound with.
 pub(crate) struct TextSetup<'a> {
-    pub(crate) interface: &'a crate::model::interface::Interface,
     pub(crate) loaded: &'a Handle,
     pub(crate) component: &'a str,
     /// The component's root module path.
@@ -1757,7 +1743,6 @@ impl EncoderRunner {
     /// tasks, the vision tower bound with it.
     pub(crate) fn text(setup: TextSetup<'_>) -> Result<(Self, Option<Self>)> {
         let TextSetup {
-            interface,
             loaded,
             component,
             path,
@@ -1769,10 +1754,9 @@ impl EncoderRunner {
             vision,
             dtype,
         } = setup;
-        let text_info = EncoderInfo::describe(interface, loaded, path, dtype)?;
+        let text_info = EncoderInfo::describe(loaded, path, dtype)?;
         let vision_info = if vision {
             Some(EncoderInfo::describe(
-                interface,
                 loaded,
                 &format!("{path}.vision"),
                 dtype,
@@ -1804,8 +1788,8 @@ impl EncoderRunner {
             rows: left.rows.max(right.rows),
         })
         .ok_or_else(|| Error::Invariant("a text encoder declares its size".into()))?;
-        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
-        let runner = Handle::new(interface.import(ENCODER)?.call_values(&[
+        let method = |name: &str| Interpreter::import(&format!("{ENCODER}.{name}"));
+        let runner = Handle::new(Interpreter::import(ENCODER)?.call_values(&[
             loaded.to_any(),
             Any::from(tvm_ffi::String::from(path)),
             Any::from(stream.raw() as i64),
@@ -1821,7 +1805,6 @@ impl EncoderRunner {
                     Any::from(tvm_ffi::String::from("vision")),
                 ])?)?;
                 EncoderRunner::over(
-                    interface,
                     component,
                     device,
                     tower,
@@ -1832,9 +1815,8 @@ impl EncoderRunner {
                 )
             })
             .transpose()?;
-        let mut text = EncoderRunner::over(
-            interface, component, device, runner, "", text_info, &config, stream,
-        )?;
+        let mut text =
+            EncoderRunner::over(component, device, runner, "", text_info, &config, stream)?;
         text.context = Some(OwnedContext {
             kernels: method("kernels")?,
             close: method("close")?,
@@ -1846,13 +1828,12 @@ impl EncoderRunner {
     /// and `audio` name the encoders' module paths; the other fields of
     /// the setups agree.
     pub(crate) fn conditions(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
-        let interface = video.interface;
         Ok(Self {
             owner: video.path.to_owned(),
             info: EncoderInfo::Condition,
             device: Device::Cuda(video.device),
             stream: Some(video.stream.clone()),
-            methods: EncoderMethods::new(interface, Handle::none())?,
+            methods: EncoderMethods::new(Handle::none())?,
             packed: None,
             text: None,
             text_capacities: Vec::new(),

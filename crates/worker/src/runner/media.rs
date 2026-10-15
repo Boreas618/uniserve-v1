@@ -19,12 +19,11 @@ use uniserve_ipc::{Batch as BatchPlan, Call, DimBound, TensorRef, TransferTransp
 
 use crate::executor::forward::batch::{MediaBatch, Parts, Publication, product_name};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, supplied};
-use crate::ffi::{Device, Function, Handle};
+use crate::ffi::{Device, Function, Handle, Interpreter};
 use crate::host::mux::{MuxFunctions, read_unit};
 use crate::host::reader::{ConditionProducts, ConditionReader, ReaderFunctions};
 use crate::host::task::{MediaTask, UnitFrames};
 use crate::host::{HostLane, HostTask};
-use crate::model::interface::Interface;
 use crate::runner::component::units;
 use crate::transfer::TransportKind;
 use crate::{Error, ProductBuffer, Result};
@@ -48,7 +47,6 @@ impl MediaRunner {
     /// placing the media reader reads conditions with `ffmpeg` at the
     /// model's `frame_rate`; `capacity` bounds the lane's queued tasks.
     pub(crate) fn new(
-        interface: &Interface,
         loaded: &Handle,
         components: BTreeMap<String, ComponentConfig>,
         ffmpeg: String,
@@ -56,7 +54,7 @@ impl MediaRunner {
         capacity: usize,
     ) -> Result<Self> {
         let reader = if components.contains_key("media_reader") {
-            let functions = ReaderFunctions::new(interface, loaded)?;
+            let functions = ReaderFunctions::new(loaded)?;
             Some(Arc::new(ConditionReader::new(
                 functions, ffmpeg, frame_rate,
             )))
@@ -65,9 +63,9 @@ impl MediaRunner {
         };
         Ok(Self {
             reader,
-            encode_video: interface.import("uniserve.media.codec.encode_video_unit")?,
-            encode_audio: interface.import("uniserve.media.codec.encode_audio_track")?,
-            mux: MuxFunctions::new(interface)?,
+            encode_video: Interpreter::import("uniserve.media.codec.encode_video_unit")?,
+            encode_audio: Interpreter::import("uniserve.media.codec.encode_audio_track")?,
+            mux: MuxFunctions::new()?,
             lane: HostLane::new(capacity, 1, "uniserve-media")?,
             components,
         })

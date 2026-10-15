@@ -2,9 +2,10 @@
 //!
 //! A worker rank is a Rust process body hosted by a Python interpreter: the
 //! `uniserve.worker` entry loads this library through TVM-FFI and calls
-//! its exported `main` with the numerical interface table. Rust owns request
-//! state, storage, streams, graphs policy, transfers and the IPC service;
-//! Python computes through the functions in that table.
+//! its exported `main` with the function that resolves import paths. Rust
+//! owns request state, storage, streams, graphs policy, transfers and the
+//! IPC service; Python computes through the library functions Rust imports
+//! by path.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -92,17 +93,15 @@ pub use transfer::{
     Transports, fetch_descriptor, plan_reads,
 };
 
-/// The library's exported entry point, `main(argv, interface) -> int`.
+/// The library's exported entry point, `main(argv, import) -> int`.
 ///
 /// The Python entry calls it once with the process arguments and the
-/// numerical interface table (`uniserve.interface.table()`); the
-/// returned value is the process exit status.
-fn main(
-    argv: tvm_ffi::Array<tvm_ffi::String>,
-    interface: tvm_ffi::Map<tvm_ffi::String, tvm_ffi::Function>,
-) -> tvm_ffi::Result<i64> {
+/// function that resolves an import path to a library callable
+/// (`uniserve.worker.import_path`); the returned value is the process exit
+/// status.
+fn main(argv: tvm_ffi::Array<tvm_ffi::String>, import: tvm_ffi::Function) -> tvm_ffi::Result<i64> {
     let argv: Vec<String> = argv.iter().map(|value| value.as_str().to_owned()).collect();
-    Ok(launch::main(&argv, interface))
+    Ok(launch::main(&argv, import))
 }
 
 tvm_ffi::tvm_ffi_dll_export_typed_func!(main, main);

@@ -10,11 +10,11 @@ use uniserve_cuda::nccl::{self, Communicator, CtaPolicy, DataType, ReduceOp, Uni
 use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
 
 use crate::config::Device;
-use crate::model::interface::Interface;
+use crate::ffi::Interpreter;
 use crate::{CUDAStream, Error, Result};
 
 /// The library class over one communicator's collective functions.
-const NATIVE_COLLECTIVES: &str = "uniserve.interface.distributed.NativeCollectives";
+const NATIVE_COLLECTIVES: &str = "uniserve.distributed.collectives.NativeCollectives";
 
 /// An NCCL communicator bound to one computation stream.
 ///
@@ -525,8 +525,8 @@ impl StreamCollectives {
     /// Every group's collectives on this stream, as the list of
     /// `NativeCollectives` an execution context routes its communicators'
     /// collectives to.
-    pub fn natives(&self, interface: &Interface) -> Result<Any> {
-        let construct = interface.import(NATIVE_COLLECTIVES)?;
+    pub fn natives(&self) -> Result<Any> {
+        let construct = Interpreter::import(NATIVE_COLLECTIVES)?;
         let natives = self
             .groups
             .iter()

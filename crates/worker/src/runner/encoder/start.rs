@@ -16,7 +16,7 @@ impl EncoderRunners {
     /// Build the text encoder of a placed component and, when the component
     /// encodes vision patches, the vision tower bound with it.
     pub(crate) fn start_text(&mut self, setup: &mut VideoSetup<'_>, placed: &Placed) -> Result<()> {
-        let (interface, loaded, config) = (setup.interface, setup.loaded, setup.config);
+        let (loaded, config) = (setup.loaded, setup.config);
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
         let device = placed_device(placed);
@@ -39,7 +39,6 @@ impl EncoderRunners {
         let (stream, scratch) = setup.stream(MediaCall::TextEncoding, device)?;
         self.text_pool = setup.graph_pool(TEXT_GRAPHS, &placed.name, device)?;
         let (runner, tower) = EncoderRunner::text(TextSetup {
-            interface,
             loaded,
             component: &placed.name,
             path: &path,
@@ -78,13 +77,12 @@ impl EncoderRunners {
         setup: &mut VideoSetup<'_>,
         placed: &Placed,
     ) -> Result<()> {
-        let (interface, loaded) = (setup.interface, setup.loaded);
+        let loaded = setup.loaded;
         let attention = setup.attention.clone();
         let device = placed_device(placed);
         let (stream, scratch) = setup.stream(MediaCall::LatentEncoding, device)?;
         let setup = |capability| -> Result<RunnerSetup<'_>> {
             Ok(RunnerSetup {
-                interface,
                 loaded,
                 path: call_path(placed, capability)?,
                 stream: stream.clone(),

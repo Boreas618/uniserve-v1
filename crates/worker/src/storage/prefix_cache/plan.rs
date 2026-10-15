@@ -16,14 +16,13 @@ use uniserve_ipc::PrefixCacheInfo;
 
 use tvm_ffi::Any;
 
-use crate::ffi::{DType, Handle, integers, texts};
-use crate::model::interface::Interface;
+use crate::ffi::{DType, Handle, Interpreter, integers, texts};
 use crate::storage::GroupShape;
 use crate::storage::memory::parse_dtype;
 use crate::{Error, Result};
 
 /// The library module of the cache functions.
-pub(super) const CACHE: &str = "uniserve.interface.cache";
+pub(super) const CACHE: &str = "uniserve.prefix_cache.plan";
 
 /// Where this rank's layers of a group lie in the group's transfer layer
 /// axis: a transfer tensor spans `total` layers in global cache-layer order,
@@ -84,56 +83,48 @@ impl CachePlan {
     /// Plan `loaded`'s unit pool for `block_size`-token pages of the widest
     /// rows (`cache_plan`). `prefix_cache_dtype` is `None` for the compute dtype.
     pub fn plan(
-        interface: &Interface,
         loaded: &Handle,
         block_size: usize,
         prefix_cache_dtype: Option<&str>,
     ) -> Result<Self> {
-        let handle = Self::describe(interface, loaded, block_size, prefix_cache_dtype)?;
-        Self::read(interface, handle)
+        let handle = Self::describe(loaded, block_size, prefix_cache_dtype)?;
+        Self::read(handle)
     }
 
     /// Whether the attention `backend` reads every resident layer's pages of
     /// `loaded`'s pool with `block_size`-token pages (`reads_pages`).
     pub fn reads_pages(
-        interface: &Interface,
         loaded: &Handle,
         backend: &str,
         block_size: usize,
         prefix_cache_dtype: Option<&str>,
     ) -> Result<bool> {
-        let plan = Self::describe(interface, loaded, block_size, prefix_cache_dtype)?;
-        interface
-            .import(&format!("{CACHE}.reads_pages"))?
-            .call_as(&[
-                loaded.view(),
-                (&Any::from(tvm_ffi::String::from(backend))).into(),
-                plan.view(),
-            ])
+        let plan = Self::describe(loaded, block_size, prefix_cache_dtype)?;
+        Interpreter::import(&format!("{CACHE}.reads_pages"))?.call_as(&[
+            loaded.view(),
+            (&Any::from(tvm_ffi::String::from(backend))).into(),
+            plan.view(),
+        ])
     }
 
     fn describe(
-        interface: &Interface,
         loaded: &Handle,
         block_size: usize,
         prefix_cache_dtype: Option<&str>,
     ) -> Result<Handle> {
         Handle::new(
-            interface
-                .import(&format!("{CACHE}.cache_plan"))?
-                .call_values(&[
-                    loaded.to_any(),
-                    Any::from(block_size as i64),
-                    Any::from(tvm_ffi::String::from(prefix_cache_dtype.unwrap_or(""))),
-                ])?,
+            Interpreter::import(&format!("{CACHE}.cache_plan"))?.call_values(&[
+                loaded.to_any(),
+                Any::from(block_size as i64),
+                Any::from(tvm_ffi::String::from(prefix_cache_dtype.unwrap_or(""))),
+            ])?,
         )
     }
 
     /// Read a `CachePlan` through its column methods.
-    pub fn read(interface: &Interface, handle: Handle) -> Result<Self> {
+    pub fn read(handle: Handle) -> Result<Self> {
         let call = |method: &str| -> Result<Any> {
-            interface
-                .import(&format!("{CACHE}.CachePlan.{method}"))?
+            Interpreter::import(&format!("{CACHE}.CachePlan.{method}"))?
                 .call_values(&[handle.to_any()])
         };
         let count = |method: &str| -> Result<u64> {
