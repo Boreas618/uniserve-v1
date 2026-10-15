@@ -75,7 +75,7 @@ use crate::lane::{Capture, Completion, Job};
 use crate::request::decode_state::DecodeState;
 use crate::runner::attention::pack_rows;
 use crate::sampling::SamplingPath;
-use crate::sampling::plan::{SamplingGroup, padded};
+use crate::sampling::{SamplingGroup, padded};
 use crate::storage::memory::StorageView;
 use crate::storage::{AttentionRow, BlockTables, PrefixCacheManager};
 use crate::stream::{Fill, Issue};
@@ -117,7 +117,7 @@ pub(crate) struct PromptChunks {
     pub(crate) ids: Vec<Vec<u32>>,
 }
 
-/// The sampling inputs of one forward (see `crate::sampling::plan`).
+/// The sampling inputs of one forward (see [`crate::sampling::SamplingMetadata`]).
 pub(crate) struct SamplingColumns<'a> {
     /// The tasks of each sampler.
     pub(crate) groups: &'a [SamplingGroup],

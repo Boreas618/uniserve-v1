@@ -69,9 +69,7 @@ pub use runner::vision::{
     BlockPositions, FeatureInjection, FeatureLayout, PositionLayout, VisionBlock,
 };
 pub use runner::{ModelBatch, ModelRunners, TokenSelection};
-pub use sampling::{
-    SamplingMetadata, SamplingPath, TOKEN_CONTINUATION_BIT, TOKEN_VALUE_MASK, finish_token_ids,
-};
+pub use sampling::{SamplingPath, TOKEN_CONTINUATION_BIT, TOKEN_VALUE_MASK, finish_token_ids};
 pub use service::{Service, ServiceBackend};
 pub use storage::{
     AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, BufferBinding, BufferPool,
