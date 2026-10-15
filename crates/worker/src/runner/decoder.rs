@@ -232,6 +232,12 @@ impl DecoderRunner {
         self.video_decoder()?.prepare(segments)
     }
 
+    /// Read from the model the window rows of unit `unit` of a
+    /// `frames`-frame video at `canvas`, which a decode of the unit takes.
+    pub(crate) fn read_window(&mut self, frames: u32, canvas: Canvas, unit: u32) -> Result<()> {
+        self.video_decoder()?.read_window(frames, canvas, unit)
+    }
+
     /// Decode and reconstruct a zero latent as a media unit of `shape`
     /// whose window reads `rows` rows, so kernels compile and the ring's
     /// exchange of the round shape is prepared. Every ring member holding
@@ -1031,6 +1037,11 @@ impl VideoDecoder {
     }
 
     /// Construct the runner of every segment, the largest first.
+    ///
+    /// Startup alone constructs (`DecoderRunners::prepare_startup`), for
+    /// every segment an admitted video decodes to: a serving rank
+    /// constructs no decoder runner, and a decode of a segment without one
+    /// is refused.
     pub(crate) fn prepare(&mut self, segments: &[Segment]) -> Result<()> {
         for &segment in segments {
             if self
@@ -1088,9 +1099,11 @@ impl VideoDecoder {
             .reshape(DType::U8, &shape)
     }
 
-    /// The window rows of unit `unit` of a `frames`-frame video at
-    /// `canvas`, as native int64 bytes.
-    fn window(&mut self, frames: u32, canvas: Canvas, unit: u32) -> Result<&[u8]> {
+    /// Read from the model the window rows of unit `unit` of a
+    /// `frames`-frame video at `canvas`. Startup reads the window of every
+    /// unit of every admitted video; a decode takes its window from that
+    /// table ([`Self::window`]).
+    fn read_window(&mut self, frames: u32, canvas: Canvas, unit: u32) -> Result<()> {
         let key = (frames, canvas, unit);
         if !self.windows.contains_key(&key) {
             let value = self.window_rows.call_values(&[
@@ -1105,7 +1118,16 @@ impl VideoDecoder {
             self.windows
                 .insert(key, rows.iter().flat_map(|row| row.to_ne_bytes()).collect());
         }
-        Ok(&self.windows[&key])
+        Ok(())
+    }
+
+    /// The window rows of unit `unit` of a `frames`-frame video at
+    /// `canvas`, as native int64 bytes.
+    fn window(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<&[u8]> {
+        self.windows
+            .get(&(frames, canvas, unit))
+            .map(Vec::as_slice)
+            .ok_or_else(|| Error::Invalid("the rank admits no video with this media unit".into()))
     }
 
     /// Decode and reconstruct a zero latent as a unit of `shape` whose
@@ -1318,6 +1340,10 @@ impl AudioDecoder {
     }
 
     /// Construct the runner of tracks of `latent_frames` latent frames.
+    ///
+    /// Startup alone constructs (`DecoderRunners::prepare_startup`), for
+    /// the track of every admitted frame count: a serving rank constructs
+    /// no decoder runner, and a track without one is refused.
     pub(crate) fn prepare(&mut self, latent_frames: u32) -> Result<()> {
         if !self.runners.contains_key(&latent_frames) {
             let runner = self
@@ -1497,7 +1523,7 @@ pub(crate) fn decode_video(
         ));
     }
     let unit = run.start;
-    let segment: Segment = parts.video.model.segment(frames, canvas, unit)?;
+    let segment: Segment = parts.decoders.segment(frames, canvas, unit)?;
     let owners = parts.owners();
     let stream = stream_of(batch)?;
     let issue = job.on(Some(&stream));
@@ -1610,8 +1636,7 @@ pub(crate) fn decode_audio(
     if run.is_empty() {
         return Ok(());
     }
-    let spans = parts.video.model.audio_units(samples, units)?;
-    let latent_frames = parts.video.model.audio_latent_frames(samples)?;
+    let (latent_frames, spans) = parts.decoders.track(samples, units)?;
     let first = spans[run.start as usize].start;
     let last = spans[run.end as usize - 1].end;
     let owners = parts.owners();
