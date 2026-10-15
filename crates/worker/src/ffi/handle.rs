@@ -9,9 +9,10 @@ use crate::{Error, Result};
 /// captured graph) that Rust only stores and passes back.
 ///
 /// Dropping the last reference releases the Python object, which runs
-/// Python. A handle dropped on another thread therefore hands its reference
-/// to the Python thread and waits until it is dropped there, so objects are
-/// released in the order their owners drop them.
+/// Python. A handle dropped on another thread therefore submits its
+/// reference to the Python thread, which drops it: objects are released in
+/// the order their owners drop them, and the thread that drops one does not
+/// wait for the release.
 #[derive(Clone)]
 pub struct Handle(Any);
 

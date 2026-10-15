@@ -12,24 +12,44 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from math import prod
-from typing import Any
+from typing import Any, cast
 
 import torch
 
 from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.interface import calls
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
-from uniserve_models.interface.workspace import execution_context
+from uniserve_models.media.pixels import (
+    PreparedImage,
+    Tower,
+    prepare_host_image,
+    prepare_tensor_image,
+)
 from uniserve_models.model import (
     AudioEncoder,
     PatchEncoder,
     TextConditioner,
     TextEncoder,
+    TextSize,
     VideoEncoder,
     VisionInput,
 )
+from uniserve_models.nn.vae import PatchAutoencoder
+from uniserve_models.processing import PatchTransform
+from uniserve_models.runner.context import (
+    execution_context,
+    held_module,
+    kernel_records,
+)
 
 __all__ = ["EncoderRunner"]
+
+
+def _module(loaded, path: str):
+    """The module at ``path`` of the loaded model (``""`` for its root)."""
+    path = str(path)
+    return loaded.module.get_submodule(path) if path else loaded.module
 
 
 def _chunks(values: Sequence[int], width: int) -> list[tuple[int, ...]]:
@@ -61,13 +81,20 @@ class EncoderRunner:
         path: The encoder module's path in the model.
         stream: The CUDA stream handle every forward enqueues on.
         attention: The attention backend the model loaded with.
-        allocate: The caller's allocation function for workspace torch
-            cannot provide.
-        size: The shapes of the encoder's inputs, flattened: ``[rows,
-            width]`` of a text conditioner's features, ``[frames, height,
-            width, 3]`` of each visual unit of a video encoder's call,
-            ``[samples, 2]`` of each track of an audio encoder's call.
+        scratch: The stream's shared work areas
+            (``uniserve_models.bindings.context.Scratch``).
+        size: The size the operators are prepared for, flattened:
+            ``[tokens, rows]`` of a text encoder's largest call (its own
+            and its vision tower's, see :meth:`tower`), ``[rows, width]``
+            of a text conditioner's features, ``[frames, height, width,
+            3]`` of each visual unit of a video encoder's call, ``[samples,
+            2]`` of each track of an audio encoder's call.
     """
+
+    # The encoder, of one of the capability classes :meth:`encode` lists.
+    _module: Any
+    # The loaded model of an image model's encoder.
+    _loaded: Any = None
 
     def __init__(
         self,
@@ -75,61 +102,107 @@ class EncoderRunner:
         path: str,
         stream: int,
         attention: str,
-        allocate,
+        scratch,
         size: Sequence[int],
     ) -> None:
-        module = loaded.module.get_submodule(str(path))
-        if isinstance(module, TextConditioner):
-            rank, name = 2, "conditioner"
+        path, attention = str(path), str(attention)
+        module = loaded.module.get_submodule(path) if path else loaded.module
+        prepared: Any
+        if isinstance(module, TextEncoder):
+            tokens, rows = (int(value) for value in size)
+            prepared = TextSize(tokens, rows)
+            if attention == "auto":
+                attention = loaded.attention
+        elif isinstance(module, TextConditioner):
+            prepared = tuple(_chunks(size, 2))
         elif isinstance(module, VideoEncoder):
-            rank, name = 4, "encoder.video"
+            prepared = tuple(_chunks(size, 4))
         elif isinstance(module, AudioEncoder):
-            rank, name = 2, "encoder.audio"
+            prepared = tuple(_chunks(size, 2))
         else:
             raise SetupError(
                 f"{type(module).__qualname__} is not constructed with a size"
             )
-        shapes = tuple(_chunks(size, rank))
-        context = execution_context(
-            module, int(stream), str(attention), allocate, f"{name}.{shapes}"
-        )
-        # The context is keyed by its inputs' shapes, as one numerical
-        # signature of the encoder.
-        context.prepare(shapes)
+        context = execution_context(module, int(stream), attention, scratch)
+        # A condition encoder's context is keyed by its inputs' shapes, as
+        # one numerical signature of the encoder.
+        context.prepare(prepared)
         self._bind(module, context)
 
-    @classmethod
-    def bound(cls, prepared, path: str) -> EncoderRunner:
-        """A runner of the encoder at ``path`` of a bound component.
+    def tower(self, path: str) -> EncoderRunner:
+        """A runner of the encoder at ``path`` below this runner's module.
 
-        ``path`` is relative to the component's root (``""`` for the root
-        itself, ``"vision"`` for a text encoder's vision tower); the runner
-        computes with the component's execution context.
+        The tower (a text encoder's ``"vision"`` patch encoder) computes
+        with this runner's execution context, whose operators were prepared
+        for the larger of the two encoders' calls; this runner releases it.
         """
-        # FIXME: a text encoder and its vision tower are still prepared by
-        # the component binding, which sizes their operators and declares
-        # their workspace before the caller allocates it. They take the
-        # constructor above once that binding is replaced by the caller's
-        # allocation function.
-        context = prepared.context
-        if context is None:
-            raise ValueError("a runner requires a bound component")
-        path = str(path)
-        root = prepared.module
-        module = root.get_submodule(path) if path else root
-        if not isinstance(module, (TextEncoder, PatchEncoder)):
+        module = self._module.get_submodule(str(path))
+        if not isinstance(module, PatchEncoder):
             raise SetupError(
-                f"{type(module).__qualname__} is not a text or patch encoder"
+                f"{type(module).__qualname__} is not a patch encoder"
             )
+        runner = type(self).__new__(type(self))
+        runner._bind(module, self._context)
+        return runner
+
+    @classmethod
+    def image(
+        cls,
+        loaded,
+        path: str,
+        stream: int,
+        device: int,
+        scratch,
+        size: Sequence[int],
+    ) -> EncoderRunner:
+        """A runner of an image model's vision or latent encoder.
+
+        Args:
+            loaded: The loaded model, whose image policy prepares resident
+                images.
+            path: The encoder module's path in the model.
+            stream: The CUDA stream handle every forward enqueues on (0 on
+                the host).
+            device: The CUDA ordinal ``stream`` belongs to, -1 for the
+                host. An encoder placed on a generation tower computes
+                there between the stream's steps.
+            scratch: The stream's shared work areas.
+            size: ``[tokens, rows]``, the most one call passes through the
+                encoder's projections; empty for a latent encoder, whose
+                convolutions need none.
+        """
+        module = _module(loaded, path)
+        if not isinstance(module, (PatchEncoder, PatchAutoencoder)):
+            raise SetupError(
+                f"{type(module).__qualname__} is not a patch or latent encoder"
+            )
+        context = execution_context(
+            module,
+            int(stream),
+            loaded.attention,
+            scratch,
+            device=int(device),
+            derive_host_lengths=True,
+        )
+        values = [int(value) for value in size]
+        context.prepare(TextSize(*values) if values else None)
         runner = cls.__new__(cls)
+        runner._loaded = loaded
         runner._bind(module, context)
+        # An image model's encoder takes prepared images.
+        runner._encode = (
+            runner._encode_packed
+            if isinstance(module, PatchEncoder)
+            and module.max_patches is not None
+            else runner._encode_images
+        )
         return runner
 
     def _bind(self, module, context: ExecutionContext) -> None:
         self._module = module
         self._context = context
         self._device = context.device
-        self._encode: Callable[..., None]
+        self._encode: Callable[..., Any]
         if isinstance(module, TextEncoder):
             self._encode = self._encode_text
         elif isinstance(module, PatchEncoder):
@@ -229,7 +302,7 @@ class EncoderRunner:
 
     # Forward.
 
-    def encode(self, *arguments: Any) -> None:
+    def encode(self, *arguments: Any) -> Any:
         """Encode into the caller's output tensor.
 
         A text encoder takes ``(tokens, out)`` or ``(tokens, out,
@@ -263,9 +336,26 @@ class EncoderRunner:
         An audio encoder takes ``(samples, out, lengths)``: the request's
         ``[samples, 2]`` FP32 PCM, the tracks' sample counts ``lengths``;
         the tracks' rows fill ``out`` in order.
+
+        An image model's unpacked vision encoder and its latent encoder
+        take ``(images, out)``: prepared images of one pixel shape
+        (:meth:`prepare_image`, :meth:`prepare_resident`) and one product
+        region per image, which receives the image's features in the
+        product's dtype. They return each image's feature shape. A latent
+        encoder that samples its posterior draws from the device's default
+        generator.
+
+        An image model's packed vision encoder (``max_patches`` set) takes
+        ``(pixels, grids, features)``: ``pixels`` ``[slots * max_patches,
+        row]`` holds image ``i``'s patch rows at the front of slot ``i``
+        (:meth:`pack_images`), ``grids`` ``[2 * slots, 2]`` int64 the slot
+        grids (``PatchEncoder.packed_grids``) and ``features`` ``[slots *
+        tokens, output_size]`` receives every slot's features, ``tokens``
+        being ``max_patches // downsample**2``. Its shapes are fixed by its
+        tensors, so it is captured into one CUDA graph per slot count.
         """
         with torch.inference_mode(), self._context.activate():
-            self._encode(*arguments)
+            return self._encode(*arguments)
 
     def _encode_text(
         self,
@@ -345,9 +435,368 @@ class EncoderRunner:
             raise ValueError("encoded audio tracks disagree with their rows")
         torch.cat(encoded, out=out)
 
-    def kernels(self) -> list[dict]:
-        """The kernels the runner's operators selected."""
-        return list(self._context.kernels())
+    # Image models.
+
+    # Facts of an encoder, answered from the loaded model before a runner
+    # of it exists. ``path`` is the encoder's module path in the model.
+
+    @staticmethod
+    def holds(loaded, path: str) -> bool:
+        """Whether this rank holds the encoder at ``path``.
+
+        A pipeline stage that does not run an encoder's call holds no
+        module for it, and constructs no runner of it.
+        """
+        return held_module(loaded.module, str(path)) is not None
+
+    @staticmethod
+    def kind(loaded, path: str) -> str:
+        """``"vision"``, ``"latent"`` or ``"text"``.
+
+        Raises:
+            NotImplementedError: The module is no encoder a runner serves.
+        """
+        module = _module(loaded, path)
+        if isinstance(module, PatchEncoder):
+            return "vision"
+        if isinstance(module, PatchAutoencoder):
+            return "latent"
+        if isinstance(module, TextEncoder):
+            return "text"
+        raise NotImplementedError(
+            f"{type(module).__qualname__} is no encoder a runner serves"
+        )
+
+    @staticmethod
+    def patch_size(loaded, path: str) -> int:
+        """Pixels per input patch of a vision encoder, on each axis."""
+        return int(_module(loaded, path).patch_size)
+
+    @staticmethod
+    def downsample(loaded, path: str) -> int:
+        """Input units per output row on each axis.
+
+        A vision encoder's input patches per feature; a latent encoder's
+        pixels per latent patch.
+        """
+        return int(_module(loaded, path).downsample)
+
+    @staticmethod
+    def output_width(loaded, path: str) -> int:
+        """Values per output row.
+
+        A vision encoder's feature width, a latent encoder's patch row
+        width, a text encoder's hidden size.
+        """
+        module = _module(loaded, path)
+        if isinstance(module, PatchEncoder):
+            return int(module.features_layout(1)["features"].shape[1])
+        if isinstance(module, PatchAutoencoder):
+            return int(module.latent_channels * module.patch_size**2)
+        return int(module.network.hidden_size)
+
+    @staticmethod
+    def output_dtype(loaded, path: str) -> str:
+        """The dtype of a vision or latent encoder's output rows.
+
+        A text encoder's hidden states carry the deployment's model dtype.
+        """
+        module = _module(loaded, path)
+        dtype = (
+            module.features_layout(1)["features"].dtype
+            if isinstance(module, PatchEncoder)
+            else module.latent_dtype
+        )
+        return str(dtype).removeprefix("torch.")
+
+    @staticmethod
+    def max_patches(loaded, path: str) -> int:
+        """Patch rows of one packed slot of a vision encoder.
+
+        0 for an unpacked encoder.
+        """
+        return int(_module(loaded, path).max_patches or 0)
+
+    @staticmethod
+    def image_patches(loaded, path: str) -> int:
+        """Patch rows of the largest image the image policy admits.
+
+        0 for a model without an understanding transform.
+        """
+        module = _module(loaded, path)
+        processor = getattr(loaded, "image_processor", None)
+        transform = None if processor is None else processor.vit
+        if transform is None:
+            return 0
+        bound = (
+            transform.pixel_bound()
+            if isinstance(transform, PatchTransform)
+            else min(transform.resize.max_pixels, transform.resize.max_size**2)
+        )
+        return int(bound // module.patch_size**2)
+
+    @staticmethod
+    def processes_images(loaded) -> bool:
+        """Whether the model declares an image policy."""
+        return getattr(loaded, "image_processor", None) is not None
+
+    @staticmethod
+    def image_towers(loaded) -> list[str]:
+        """The image transforms the policy declares.
+
+        ``"vit"`` prepares understanding features (vision encoding),
+        ``"vae"`` latent encoding.
+        """
+        processor = loaded.image_processor
+        return [
+            tower
+            for tower in ("vit", "vae")
+            if getattr(processor, tower) is not None
+        ]
+
+    @staticmethod
+    def packs_patches(loaded) -> bool:
+        """Whether the understanding transform packs patch rows."""
+        return isinstance(loaded.image_processor.vit, PatchTransform)
+
+    @staticmethod
+    def feature_injection(loaded) -> list[str]:
+        """How image features enter a prompt; empty without injection.
+
+        ``[layout, positions]``: the feature layout (``"direct"`` or
+        ``"framed"``) and the position layout (``"temporal"``,
+        ``"temporal_spatial"`` or ``"sequential"``).
+        """
+        injection = loaded.image_processor.feature_injection
+        if injection is None:
+            return []
+        return [injection.layout.value, injection.positions.value]
+
+    @staticmethod
+    def injection_tokens(loaded) -> list[int]:
+        """The ``[start, end]`` token ids framing injected features.
+
+        -1 stands for a token the injection does not place.
+        """
+        injection = loaded.image_processor.feature_injection
+        return [
+            -1 if token is None else int(token)
+            for token in (injection.start_token_id, injection.end_token_id)
+        ]
+
+    @staticmethod
+    def pixel_dtype(loaded) -> str:
+        """The dtype of the pixels the image policy prepares."""
+        processor = getattr(loaded, "image_processor", None)
+        dtype = (
+            None if processor is None else processor.output_dtype
+        ) or torch.float32
+        return str(dtype).removeprefix("torch.")
+
+    @staticmethod
+    def places_vision(loaded, path: str) -> bool:
+        """Whether a text encoder gives vision tokens rotary coordinates."""
+        return (
+            type(_module(loaded, path)).positions is not TextEncoder.positions
+        )
+
+    @staticmethod
+    def prepare_image(
+        loaded, tower: str, payload: str, input_images: int, pin: int
+    ) -> PreparedImage:
+        """Decode and transform one inline image of a request on the host.
+
+        Touches no device and keeps no state, so the caller runs it beside
+        device work.
+
+        Args:
+            loaded: The loaded model; its ``image_processor`` is the policy.
+            tower: ``"vit"`` to prepare understanding features (vision
+                encoding), ``"vae"`` to prepare latent encoding.
+            payload: The image's base64 payload.
+            input_images: The request's input image count, which a shared
+                pixel budget divides.
+            pin: Nonzero to place the pixels in page-locked memory for an
+                asynchronous copy to a CUDA device.
+
+        Returns:
+            The prepared image, opaque to the caller, which reads what it
+            plans an encode with through :meth:`image_facts`.
+
+        Raises:
+            ValueError: The model declares no image policy, or the payload
+                is not an image the policy accepts.
+        """
+        # FIXME: a prepared image crosses as an opaque handle; its pixels
+        # become a tensor of the caller's page-locked storage.
+        processor = loaded.image_processor
+        if processor is None:
+            raise ValueError("the model declares no image processing")
+        if int(input_images) < 1:
+            raise ValueError("request admission declares no input images")
+        return prepare_host_image(
+            processor,
+            # The caller sends a plain string; the selection rejects
+            # unknown towers.
+            cast(Tower, str(tower)),
+            str(payload),
+            input_images=int(input_images),
+            pin=bool(pin),
+        )
+
+    @staticmethod
+    def image_facts(prepared: PreparedImage) -> list[int]:
+        """What a caller plans an encode of a prepared image with.
+
+        ``[height, width, grid_rows, grid_columns, *pixel_shape]``: the
+        canvas the encoder's features describe, the patch grid of a patch
+        tower (``0, 0`` otherwise) and the pixel shape (``[patches, row]``
+        for a patch tower, ``[channels, height, width]`` otherwise).
+        """
+        rows, columns = prepared.grid_shape or (0, 0)
+        return [
+            int(prepared.height),
+            int(prepared.width),
+            int(rows),
+            int(columns),
+            *(int(extent) for extent in prepared.pixels.shape),
+        ]
+
+    @staticmethod
+    def patch_grid(
+        loaded, height: int, width: int, input_images: int
+    ) -> list[int]:
+        """The vit tower's ``[rows, columns]`` patch grid of an image.
+
+        ``input_images`` is the request's input image count for a request
+        input image, or 0 for a generated image, which keeps the
+        single-image pixel bound.
+
+        Raises:
+            ValueError: The model has no patch tower, or its resize policy
+                rejects the dimensions.
+        """
+        processor = loaded.image_processor
+        transform = None if processor is None else processor.vit
+        if not isinstance(transform, PatchTransform):
+            raise ValueError(
+                "temporal-spatial feature injection requires a patch image "
+                "transform"
+            )
+        count = int(input_images)
+        return list(
+            transform.grid_shape(int(height), int(width), count or None)
+        )
+
+    def _processor(self):
+        processor = getattr(self._loaded, "image_processor", None)
+        if processor is None:
+            raise ValueError("the model declares no image processing")
+        return processor
+
+    def _tower(self) -> Tower:
+        return "vit" if isinstance(self._module, PatchEncoder) else "vae"
+
+    def prepare_resident(
+        self, image, tower: str, signed_unit: int
+    ) -> PreparedImage:
+        """Prepare a resident image product (a tensor) for encoding.
+
+        ``signed_unit`` declares pixel values in ``[-1, 1]`` rather than
+        ``[0, 1]``. Returns the prepared image (see :meth:`prepare_image`).
+        """
+        with torch.inference_mode(), self._context.activate():
+            prepared = prepare_tensor_image(
+                self._processor(),
+                cast(Tower, str(tower)),
+                image,
+                device=self._device,
+                signed_unit=bool(signed_unit),
+            )
+        return prepared
+
+    def warm(self, side: int) -> None:
+        """Encode a black ``side`` x ``side`` image and discard the result.
+
+        The image passes through the model's input transform; an unpacked
+        encoder's kernels compile here, before serving.
+        """
+        side = int(side)
+        with torch.inference_mode(), self._context.activate():
+            prepared = prepare_tensor_image(
+                self._processor(),
+                self._tower(),
+                torch.zeros((3, side, side)),
+                device=self._device,
+                signed_unit=False,
+            )
+            self._run_images((prepared,))
+
+    def pack_images(self, pixels: torch.Tensor, *images: PreparedImage) -> None:
+        """Copy image ``i``'s patch rows to the front of slot ``i``.
+
+        ``pixels`` is the packed encoder's ``[slots * max_patches, row]``
+        input. Rows past an image keep earlier finite values, which only
+        padding reads.
+        """
+        capacity = self._module.max_patches
+        with torch.inference_mode(), self._context.activate():
+            for index, prepared in enumerate(images):
+                rows = prepared.pixels.shape[0]
+                if prepared.grid_shape is None or rows > capacity:
+                    raise ValueError(
+                        "packed vision images require patch rows within "
+                        "their slot"
+                    )
+                pixels[index * capacity : index * capacity + rows].copy_(
+                    prepared.pixels, non_blocking=True
+                )
+
+    def _run_images(self, images: Sequence[PreparedImage]):
+        module, device = self._module, self._device
+        pixels = tuple(
+            # Host pixels are page-locked; the copy is asynchronous on the
+            # stream.
+            prepared.pixels.to(device, non_blocking=True)
+            for prepared in images
+        )
+        if isinstance(module, PatchAutoencoder):
+            # FIXME: the posterior draws from the device's default
+            # generator; its noise becomes an input the caller supplies.
+            return module.encode(torch.stack(pixels)).unbind(0)
+        return module.encode(
+            VisionInput(
+                pixels,
+                tuple(
+                    None
+                    if prepared.grid_shape is None
+                    else _device_grid(prepared.grid_shape, device)
+                    for prepared in images
+                ),
+                tuple(prepared.grid_shape for prepared in images),
+            )
+        )
+
+    def _encode_images(
+        self, images: Sequence[PreparedImage], *out: torch.Tensor
+    ) -> list[list[int]]:
+        if len(images) != len(out):
+            raise ValueError("images and products must align")
+        return [
+            calls.write(product, value)
+            for value, product in zip(
+                self._run_images(images), out, strict=True
+            )
+        ]
+
+    def _encode_packed(
+        self, pixels: torch.Tensor, grids: torch.Tensor, features: torch.Tensor
+    ) -> None:
+        features.copy_(self._module.encode_packed(pixels, grids))
+
+    def kernels(self) -> list[str]:
+        """The kernels the runner's operators selected, as JSON objects."""
+        return kernel_records(self._context.kernels())
 
     def close(self, aborted: bool) -> None:
         """Release the runner's operators and workspace.

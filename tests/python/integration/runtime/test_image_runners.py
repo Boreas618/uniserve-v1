@@ -30,7 +30,7 @@ pytestmark = pytest.mark.integration
 @pytest.fixture(scope="module")
 def stub():
     table = interface.table()
-    return table, load_stub(table)
+    return table, load_stub()
 
 
 def _payload(height: int, width: int, seed: int) -> str:

@@ -9,13 +9,20 @@
 //! layouts it prepares; [`MediaPlan::admit`] resolves a request's exact size
 //! and the smallest prepared prompt capacity whose layout holds it.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, ConditionRole, VideoCondition};
+use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::integer_list;
-use crate::runner::denoiser::VideoModel;
+use crate::host::mux::{MuxConfig, MuxSession};
+use crate::lane::{Completion, Job};
+use crate::runner::denoiser::runners::DenoiserRunners;
+use crate::runner::denoiser::{Evicted, VideoModel};
+use crate::runner::media::MediaRunner;
 use crate::{Error, Result};
 
 /// A layout descriptor: `[frames, width, height, text_rows, condition_rows]`.
@@ -31,13 +38,18 @@ pub(crate) struct VideoLayout {
 
 impl VideoLayout {
     pub(crate) fn descriptor(&self) -> Any {
-        Any::from(integer_list([
+        Any::from(integer_list(self.values()))
+    }
+
+    /// The layout's extents, as [`Self::from_values`] reads them.
+    pub(crate) fn values(&self) -> [i64; 5] {
+        [
             i64::from(self.frames),
             i64::from(self.canvas.width),
             i64::from(self.canvas.height),
             i64::from(self.text_rows),
             i64::from(self.condition_rows),
-        ]))
+        ]
     }
 
     pub(crate) fn from_values(values: &[i64]) -> Result<Self> {
@@ -131,28 +143,43 @@ impl VideoSize {
 
     /// The size descriptor `[frames, width, height, tokens]`.
     pub(crate) fn descriptor(&self) -> Any {
-        Any::from(integer_list([
-            i64::from(self.frames),
-            i64::from(self.canvas.width),
-            i64::from(self.canvas.height),
-            i64::from(self.tokens),
-        ]))
+        Any::from(integer_list(self.values()))
     }
 
     /// The flat conditions descriptor, in request order.
     pub(crate) fn conditions_descriptor(&self) -> Any {
-        Any::from(integer_list(
-            self.conditions.iter().flat_map(ConditionShape::descriptor),
-        ))
+        Any::from(integer_list(self.condition_values()))
     }
 
     /// The flat vision spans descriptor.
     pub(crate) fn spans_descriptor(&self) -> Any {
-        Any::from(integer_list(
-            self.spans
-                .iter()
-                .flat_map(|&(start, stop)| [i64::from(start), i64::from(stop)]),
-        ))
+        Any::from(integer_list(self.span_values()))
+    }
+
+    /// The integers of [`VideoSize::descriptor`].
+    pub(crate) fn values(&self) -> Vec<i64> {
+        vec![
+            i64::from(self.frames),
+            i64::from(self.canvas.width),
+            i64::from(self.canvas.height),
+            i64::from(self.tokens),
+        ]
+    }
+
+    /// The integers of [`VideoSize::conditions_descriptor`].
+    pub(crate) fn condition_values(&self) -> Vec<i64> {
+        self.conditions
+            .iter()
+            .flat_map(ConditionShape::descriptor)
+            .collect()
+    }
+
+    /// The integers of [`VideoSize::spans_descriptor`].
+    pub(crate) fn span_values(&self) -> Vec<i64> {
+        self.spans
+            .iter()
+            .flat_map(|&(start, stop)| [i64::from(start), i64::from(stop)])
+            .collect()
     }
 }
 
@@ -408,51 +435,563 @@ impl MediaPlan {
         self.frame_counts.last().copied().unwrap_or(0)
     }
 
-    /// Resolve a request's exact size and the layout it evaluates in: the
-    /// smallest prompt capacity whose layout holds it.
+    /// Refuse a size outside the plan's frame counts, canvases or prompt
+    /// capacity, as an invalid descriptor.
+    fn check(&self, size: &VideoSize) -> Result<()> {
+        if !self.frame_counts.contains(&size.frames)
+            || !self.canvases.contains(&size.canvas)
+            || size.tokens > self.max_text_tokens
+        {
+            return Err(Error::Invalid(
+                "media input exceeds the worker frame, canvas, conditioning or condition capacity"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The layout of a size without conditions at prompt capacity
+    /// `capacity`: one of the startup layouts, in the order
+    /// [`Self::new`] lists them.
+    fn startup_layout(&self, frames: u32, canvas: Canvas, capacity: u32) -> Option<VideoLayout> {
+        let position = |values: &[u32], value: u32| values.iter().position(|&each| each == value);
+        let canvas = self.canvases.iter().position(|&each| each == canvas)?;
+        let frames = self.frame_counts.len() - 1 - position(&self.frame_counts, frames)?;
+        let capacities = self.text_capacities.len();
+        let capacity = capacities - 1 - position(&self.text_capacities, capacity)?;
+        self.layouts
+            .get((canvas * self.frame_counts.len() + frames) * capacities + capacity)
+            .copied()
+    }
+
+    /// The admission of a request the model sized: `condition_rows` are its
+    /// condition rows, `layouts` the layout of each prompt capacity and
+    /// `holds` whether each holds the request. The request evaluates in
+    /// the layout of the smallest capacity that holds it.
     ///
-    /// Fails, as an invalid descriptor, when the frame count or canvas is not
-    /// admitted, the prompt or conditions exceed their capacities, the model
-    /// rejects the size, or no prepared capacity holds it.
-    pub(crate) fn admit(&self, model: &VideoModel, size: VideoSize) -> Result<Admission> {
-        if !self.frame_counts.contains(&size.frames) || !self.canvases.contains(&size.canvas) {
+    /// Fails, as an invalid descriptor, when the conditions exceed their
+    /// capacity or no capacity's layout holds the request.
+    fn select(
+        &self,
+        size: VideoSize,
+        condition_rows: u32,
+        layouts: &[VideoLayout],
+        holds: &[bool],
+    ) -> Result<Admission> {
+        if condition_rows > self.condition_rows {
             return Err(Error::Invalid(
                 "media input exceeds the worker frame, canvas, conditioning or condition capacity"
                     .into(),
             ));
         }
-        let condition_rows = model.request_size(&size)?;
-        if size.tokens > self.max_text_tokens || condition_rows > self.condition_rows {
-            return Err(Error::Invalid(
-                "media input exceeds the worker frame, canvas, conditioning or condition capacity"
-                    .into(),
-            ));
-        }
-        for &capacity in &self.text_capacities {
-            let candidate = VideoSize {
-                tokens: capacity,
-                spans: Arc::from([]),
-                ..size.clone()
-            };
-            let layout = model.layout_size(&candidate)?;
-            if model.holds(&layout, &size)? {
-                return Ok(Admission {
-                    size,
-                    condition_rows,
-                    layout,
-                    text_capacity: capacity,
-                });
-            }
-        }
-        Err(Error::Invalid(
-            "media input has no admitted capacity layout".into(),
-        ))
+        self.text_capacities
+            .iter()
+            .zip(layouts)
+            .zip(holds)
+            .find(|(_, held)| **held)
+            .map(|((&text_capacity, &layout), _)| Admission {
+                size,
+                condition_rows,
+                layout,
+                text_capacity,
+            })
+            .ok_or_else(|| Error::Invalid("media input has no admitted capacity layout".into()))
     }
 }
 
 /// The request-order conditions of an admission, as the denoiser sizes them.
 pub(crate) fn condition_shapes(conditions: &[VideoCondition]) -> Arc<[ConditionShape]> {
     conditions.iter().map(ConditionShape::of).collect()
+}
+
+/// One admitted video request on this rank.
+pub(crate) struct VideoRequest {
+    pub(crate) key: RequestKey,
+    pub(crate) frames: u32,
+    pub(crate) canvas: Canvas,
+    /// The prompt's token ids.
+    pub(crate) tokens: Arc<[i64]>,
+    pub(crate) conditions: Arc<[VideoCondition]>,
+    /// The request's layout on a denoising rank.
+    pub(crate) admission: Option<Admission>,
+    /// The denoiser's prepared layout id of `admission`.
+    pub(crate) layout: Option<usize>,
+    /// Frames of each media unit.
+    pub(crate) units: Arc<[u32]>,
+    /// Samples of the generated audio track.
+    pub(crate) audio_samples: u64,
+    /// The seed of the request's noise.
+    pub(crate) seed: u64,
+    /// The request's MP4 on the muxer rank.
+    pub(crate) mux: Option<Arc<MuxSession>>,
+}
+
+impl VideoRequest {
+    /// The longest media unit's frames.
+    pub(crate) fn longest(&self) -> u32 {
+        self.units.iter().copied().max().unwrap_or(0)
+    }
+}
+
+/// A started request on a denoising rank whose layout the library is asked
+/// for.
+struct Unsized {
+    slot: usize,
+    key: RequestKey,
+    size: VideoSize,
+    /// The layout of each prompt capacity of the plan, in its order: a
+    /// startup layout for a size without conditions, otherwise asked for.
+    layouts: Vec<Option<VideoLayout>>,
+    /// The request's admission once its layout is selected; it waits here
+    /// while the denoiser prepares a layout it does not hold.
+    admitted: Option<Admission>,
+}
+
+/// What the job a sizing submitted last was asked.
+enum Asked {
+    /// The layouts of sizes with conditions.
+    Layouts,
+    /// Each request's condition rows and which of its layouts hold it.
+    Holds,
+    /// The preparation of these layouts, which displaced the held ones.
+    Preparation(Vec<VideoLayout>, Vec<Evicted>),
+}
+
+/// The admission of the video requests a batch started, between the jobs
+/// that ask the library to size them.
+///
+/// A request's condition rows, the layout of its size at each prompt
+/// capacity and whether a layout holds it are the model's arithmetic over
+/// the request's own size, so no table answers them: every request is asked
+/// for, in jobs of the Python thread. A request without conditions takes
+/// one job (its layouts are startup layouts); a conditioned one takes a job
+/// for its layouts first. A request whose layout the denoiser does not
+/// hold (one prepared at startup or for an earlier request) takes a
+/// further job, on the denoiser's lane, that prepares the layout.
+///
+/// The requests a batch started are sized together: a size the model
+/// rejects fails the batch, and with it every request of the sizing that
+/// was not admitted yet.
+pub(crate) struct Sizing {
+    requests: Vec<Unsized>,
+    asked: Asked,
+}
+
+/// What the model answers about a video of one admitted frame count.
+struct AdmittedDuration {
+    /// Frames of each media unit.
+    units: Arc<[u32]>,
+    /// Samples of the generated audio track.
+    audio_samples: u64,
+}
+
+/// The video requests admitted on a rank, with the model and the plan that
+/// admit them.
+pub(crate) struct VideoRequests {
+    pub(crate) model: VideoModel,
+    pub(crate) plan: MediaPlan,
+    /// Every admitted frame count's units and track, read from the model
+    /// when the rank starts: a request is admitted without asking the
+    /// library for them.
+    durations: HashMap<u32, AdmittedDuration>,
+    /// Admitted requests by slot.
+    requests: HashMap<usize, VideoRequest>,
+    /// The started requests no batch asked the library to size yet.
+    waiting: Vec<Unsized>,
+}
+
+impl VideoRequests {
+    /// The requests of a rank that admits `plan`. Asks `model` for the
+    /// units and the track of every admitted frame count.
+    pub(crate) fn new(model: VideoModel, plan: MediaPlan) -> Result<Self> {
+        let durations = plan
+            .frame_counts
+            .iter()
+            .map(|&frames| {
+                let duration = AdmittedDuration {
+                    units: model.unit_frames(frames)?.into(),
+                    audio_samples: model.track_samples(frames)?,
+                };
+                Ok((frames, duration))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            model,
+            plan,
+            durations,
+            requests: HashMap::new(),
+            waiting: Vec::new(),
+        })
+    }
+
+    /// Admit a started video request with its exact size. On a denoising
+    /// rank the layout it evaluates in is the model's answer, which the
+    /// batch that started it asks for next ([`Self::begin_sizing`]); until
+    /// then the request has no layout.
+    pub(crate) fn admit(&mut self, admission: &NewRequest, denoising: bool) -> Result<()> {
+        let (Some(media), Some(video)) = (&admission.diffusion, &admission.video) else {
+            return Ok(());
+        };
+        let slot = admission.request_pool_idx as usize;
+        let canvas = Canvas {
+            width: media.width,
+            height: media.height,
+        };
+        if (video.task == uniserve_core::VideoTask::T2va) != video.conditions.is_empty() {
+            return Err(Error::Invalid(
+                "a video request's task disagrees with its conditions".into(),
+            ));
+        }
+        let duration = self
+            .durations
+            .get(&media.num_frames)
+            .filter(|_| self.plan.canvases.contains(&canvas))
+            .ok_or_else(|| {
+                Error::Invalid(
+                    "media input exceeds the worker frame, canvas, conditioning or condition capacity"
+                        .into(),
+                )
+            })?;
+        let units = Arc::clone(&duration.units);
+        if media.video_units as usize != units.len()
+            || media.num_inference_steps != self.model.facts.num_steps
+        {
+            return Err(Error::Invalid(
+                "video request has invalid computation bounds".into(),
+            ));
+        }
+        let conditions: Arc<[VideoCondition]> = video.conditions.clone().into();
+        let size = VideoSize {
+            frames: media.num_frames,
+            canvas,
+            tokens: admission.prompt_token_ids.len() as u32,
+            conditions: condition_shapes(&conditions),
+            spans: vision_spans(&video.text_tags).into(),
+        };
+        let request = VideoRequest {
+            key: admission.request_key,
+            frames: media.num_frames,
+            canvas,
+            tokens: admission
+                .prompt_token_ids
+                .iter()
+                .map(|&token| i64::from(token))
+                .collect(),
+            conditions,
+            admission: None,
+            layout: None,
+            audio_samples: duration.audio_samples,
+            units,
+            seed: media.seed,
+            mux: None,
+        };
+        if denoising {
+            self.plan.check(&size)?;
+            // A request restarted in the slot replaces the one waiting.
+            self.waiting.retain(|waiting| waiting.slot != slot);
+            self.waiting.push(Unsized {
+                slot,
+                key: admission.request_key,
+                layouts: self
+                    .plan
+                    .text_capacities
+                    .iter()
+                    .map(|&capacity| {
+                        size.conditions
+                            .is_empty()
+                            .then(|| self.plan.startup_layout(size.frames, size.canvas, capacity))
+                            .flatten()
+                    })
+                    .collect(),
+                size,
+                admitted: None,
+            });
+        }
+        self.requests.insert(slot, request);
+        Ok(())
+    }
+
+    /// The requests started since the last call, for the batch that
+    /// started them to have sized. `None` when there is none.
+    pub(crate) fn begin_sizing(&mut self) -> Option<Sizing> {
+        let requests = std::mem::take(&mut self.waiting);
+        (!requests.is_empty()).then_some(Sizing {
+            requests,
+            asked: Asked::Holds,
+        })
+    }
+
+    /// Record into `job` the next step of `sizing`: the layouts not yet
+    /// known; once every layout is known, each request's condition rows and
+    /// whether each of its layouts holds it; and for requests whose
+    /// selected layout `denoisers` does not hold, that layout's
+    /// preparation. Returns whether the job belongs on the denoiser's lane
+    /// (a preparation works on its stream) rather than on the Python thread
+    /// alone.
+    pub(crate) fn ask(
+        &self,
+        sizing: &mut Sizing,
+        denoisers: &mut DenoiserRunners,
+        job: &Job,
+    ) -> Result<bool> {
+        // Selected requests wait for layouts the denoiser lacks.
+        let mut lacking: Vec<VideoLayout> = Vec::new();
+        for admitted in sizing
+            .requests
+            .iter()
+            .filter_map(|request| request.admitted.as_ref())
+        {
+            if denoisers.lacks(&admitted.layout) && !lacking.contains(&admitted.layout) {
+                lacking.push(admitted.layout);
+            }
+        }
+        if !lacking.is_empty() {
+            let evicted = lacking
+                .iter()
+                .map(|&layout| denoisers.ask_layout(&self.model, layout, job))
+                .collect::<Result<Vec<_>>>()?;
+            sizing.asked = Asked::Preparation(lacking, evicted);
+            return Ok(true);
+        }
+
+        let capacities = &self.plan.text_capacities;
+        let layouts = sizing
+            .requests
+            .iter()
+            .any(|request| request.layouts.contains(&None));
+        for request in &sizing.requests {
+            if layouts {
+                // The layout of the request's size at each prompt capacity,
+                // without its vision blocks.
+                for (&capacity, _) in capacities
+                    .iter()
+                    .zip(&request.layouts)
+                    .filter(|(_, layout)| layout.is_none())
+                {
+                    let candidate = VideoSize {
+                        tokens: capacity,
+                        spans: Arc::from([]),
+                        ..request.size.clone()
+                    };
+                    self.model.ask_layout_size(&candidate, job);
+                }
+                continue;
+            }
+            self.model.ask_request_size(&request.size, job);
+            for layout in request.layouts.iter().flatten() {
+                self.model.ask_holds(layout, &request.size, job);
+            }
+        }
+        sizing.asked = if layouts {
+            Asked::Layouts
+        } else {
+            Asked::Holds
+        };
+        Ok(false)
+    }
+
+    /// Take the answers to what [`Self::ask`] recorded from the job's
+    /// `completion`. A request whose layout is selected and held in
+    /// `denoisers` is admitted with it and leaves the sizing; returns
+    /// whether every request has (otherwise `sizing` has more to ask).
+    ///
+    /// A request that ended or was restarted while it was sized is left
+    /// out.
+    pub(crate) fn answer(
+        &mut self,
+        sizing: &mut Sizing,
+        completion: &mut Completion,
+        denoisers: &mut DenoiserRunners,
+    ) -> Result<bool> {
+        match std::mem::replace(&mut sizing.asked, Asked::Holds) {
+            Asked::Layouts => {
+                for request in &mut sizing.requests {
+                    for layout in request.layouts.iter_mut().filter(|layout| layout.is_none()) {
+                        *layout = Some(VideoLayout::from_values(&completion.returned()?)?);
+                    }
+                }
+                return Ok(false);
+            }
+            Asked::Holds => {
+                let integer = |values: Vec<i64>| {
+                    values.first().copied().ok_or_else(|| {
+                        Error::Interface("a sizing function returned no value".into())
+                    })
+                };
+                for waiting in &mut sizing.requests {
+                    let rows = integer(completion.returned()?)?;
+                    let condition_rows = u32::try_from(rows).map_err(|_| {
+                        Error::Interface(
+                            "the video model reports an invalid condition row count".into(),
+                        )
+                    })?;
+                    let layouts: Vec<VideoLayout> =
+                        waiting.layouts.iter().flatten().copied().collect();
+                    let holds = layouts
+                        .iter()
+                        .map(|_| Ok(integer(completion.returned()?)? != 0))
+                        .collect::<Result<Vec<bool>>>()?;
+                    waiting.admitted = Some(self.plan.select(
+                        waiting.size.clone(),
+                        condition_rows,
+                        &layouts,
+                        &holds,
+                    )?);
+                }
+            }
+            Asked::Preparation(layouts, evicted) => {
+                for layout in layouts {
+                    denoisers.accept_layout(&self.model, layout, completion)?;
+                }
+                // The job drained the stream the displaced layouts' last
+                // steps ran on.
+                drop(evicted);
+            }
+        }
+
+        // Admit every selected request whose layout is held. A request
+        // leaves the sizing once it is admitted, so one that fails is still
+        // there for [`Self::abandon`], with those behind it.
+        let mut waiting = Vec::new();
+        for request in std::mem::take(&mut sizing.requests) {
+            let held = request
+                .admitted
+                .as_ref()
+                .is_some_and(|admitted| !denoisers.lacks(&admitted.layout));
+            if !held || !waiting.is_empty() {
+                waiting.push(request);
+                continue;
+            }
+            if let Err(error) = self.admit_sized(&request, denoisers) {
+                waiting.push(request);
+                sizing.requests = waiting;
+                return Err(error);
+            }
+        }
+        sizing.requests = waiting;
+        Ok(sizing.requests.is_empty())
+    }
+
+    /// Hold the selected layout of `sized` in `denoisers` and admit its
+    /// request with it, unless the request ended or was restarted.
+    fn admit_sized(&mut self, sized: &Unsized, denoisers: &mut DenoiserRunners) -> Result<()> {
+        let Some(admitted) = &sized.admitted else {
+            return Ok(());
+        };
+        let live = self
+            .requests
+            .get(&sized.slot)
+            .is_some_and(|request| request.key == sized.key && request.admission.is_none());
+        if !live {
+            return Ok(());
+        }
+        let layout = denoisers.admit(sized.slot, admitted.layout)?;
+        if let Some(request) = self.requests.get_mut(&sized.slot) {
+            request.layout = layout;
+            request.admission = Some(admitted.clone());
+        }
+        Ok(())
+    }
+
+    /// Forget the requests of a sizing that failed and were not admitted:
+    /// their calls are refused as calls of requests this rank did not
+    /// admit.
+    pub(crate) fn abandon(&mut self, sizing: Sizing) {
+        for waiting in sizing.requests {
+            let unadmitted = self
+                .requests
+                .get(&waiting.slot)
+                .is_some_and(|request| request.key == waiting.key && request.admission.is_none());
+            if unadmitted {
+                self.requests.remove(&waiting.slot);
+            }
+        }
+    }
+
+    pub(crate) fn request(&self, slot: usize, key: RequestKey) -> Result<&VideoRequest> {
+        self.requests
+            .get(&slot)
+            .filter(|request| request.key == key)
+            .ok_or_else(|| Error::Invalid("video call has no admitted media dimensions".into()))
+    }
+
+    /// The MP4 session of a request on the muxer rank, created on first use.
+    pub(crate) fn mux_session(
+        &mut self,
+        slot: usize,
+        key: RequestKey,
+        media: Option<&MediaRunner>,
+    ) -> Result<Arc<MuxSession>> {
+        let functions = media
+            .ok_or_else(|| Error::Invalid("this rank holds no muxer".into()))?
+            .mux
+            .clone();
+        let frame_rate = self.model.facts.frame_rate;
+        let audio_rate = self.model.facts.sample_rate;
+        let request = self
+            .requests
+            .get_mut(&slot)
+            .filter(|request| request.key == key)
+            .ok_or_else(|| Error::Invalid("video call has no admitted media dimensions".into()))?;
+        if let Some(session) = &request.mux {
+            return Ok(Arc::clone(session));
+        }
+        let config = MuxConfig::new(
+            request.canvas.width,
+            request.canvas.height,
+            frame_rate,
+            audio_rate,
+            Arc::clone(&request.units),
+        )?;
+        let session = Arc::new(MuxSession::new(config, functions));
+        request.mux = Some(Arc::clone(&session));
+        Ok(session)
+    }
+}
+
+impl RequestStorage for VideoRequests {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+        // A request's state is created when its admission is installed.
+        Ok(())
+    }
+
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_requests(
+        &mut self,
+        _requests: &HashSet<RequestKey>,
+        _retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn retirement_ready(
+        &mut self,
+        _buffers: &HashSet<BufferId>,
+        _requests: &HashSet<RequestKey>,
+        _retained: &HashSet<BufferId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn retire_slots(&mut self, slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+        for slot in slots {
+            self.requests.remove(slot);
+        }
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn close(&mut self, _aborted: bool) -> Result<()> {
+        self.requests.clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +1075,93 @@ mod tests {
             preparation_order(&[extent(portrait, 90, 100), extent(landscape, 90, 100)]),
             vec![portrait, landscape]
         );
+    }
+
+    /// A plan of two canvases, two frame counts and two prompt capacities,
+    /// whose startup layouts name what they were sized for.
+    fn plan() -> MediaPlan {
+        let canvases = vec![canvas(1344, 768), canvas(768, 1344)];
+        let layout = |canvas, frames, text_rows| VideoLayout {
+            frames,
+            canvas,
+            text_rows,
+            condition_rows: 0,
+        };
+        let mut layouts = Vec::new();
+        for &canvas in &canvases {
+            for frames in [121, 49] {
+                for capacity in [2048, 1024] {
+                    layouts.push(layout(canvas, frames, capacity));
+                }
+            }
+        }
+        MediaPlan {
+            frame_counts: vec![49, 121],
+            admitted: canvases.clone(),
+            canvases: canvases.clone(),
+            text_capacities: vec![1024, 2048],
+            max_text_tokens: 2048,
+            condition_rows: 512,
+            maximum: layout(canvases[0], 121, 2048),
+            layouts,
+            largest: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_size_without_conditions_takes_its_startup_layout() {
+        let plan = plan();
+        for &canvas in &plan.canvases {
+            for &frames in &plan.frame_counts {
+                for &capacity in &plan.text_capacities {
+                    let layout = plan.startup_layout(frames, canvas, capacity).unwrap();
+                    assert_eq!(
+                        (layout.canvas, layout.frames, layout.text_rows),
+                        (canvas, frames, capacity)
+                    );
+                }
+            }
+        }
+        // Nothing outside the plan has a startup layout.
+        assert!(plan.startup_layout(73, plan.canvases[0], 1024).is_none());
+        assert!(plan.startup_layout(49, canvas(832, 480), 1024).is_none());
+        assert!(plan.startup_layout(49, plan.canvases[0], 4096).is_none());
+    }
+
+    #[test]
+    fn a_request_evaluates_in_the_smallest_capacity_that_holds_it() {
+        let plan = plan();
+        let size = VideoSize::plain(49, plan.canvases[0], 1500);
+        let layouts: Vec<VideoLayout> = plan
+            .text_capacities
+            .iter()
+            .map(|&capacity| plan.startup_layout(49, size.canvas, capacity).unwrap())
+            .collect();
+
+        let admitted = plan
+            .select(size.clone(), 0, &layouts, &[false, true])
+            .unwrap();
+        assert_eq!(
+            (admitted.text_capacity, admitted.layout),
+            (2048, layouts[1])
+        );
+        let admitted = plan
+            .select(size.clone(), 0, &layouts, &[true, true])
+            .unwrap();
+        assert_eq!(
+            (admitted.text_capacity, admitted.layout),
+            (1024, layouts[0])
+        );
+
+        // No layout holds the request, or its conditions exceed the plan's.
+        let refused = |result: Result<Admission>| matches!(result, Err(Error::Invalid(_)));
+        assert!(refused(plan.select(
+            size.clone(),
+            0,
+            &layouts,
+            &[false, false]
+        )));
+        assert!(refused(plan.select(size, 513, &layouts, &[true, true])));
     }
 
     #[test]

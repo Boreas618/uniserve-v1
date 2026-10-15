@@ -11,24 +11,11 @@ pytestmark = pytest.mark.unit
 
 # Entries the worker resolves at startup; a missing one fails the rank.
 STARTUP_ENTRIES = {
-    "model.describe",
-    "model.resolve",
-    "model.load",
-    "model.facts",
-    "model.cache_plan",
-    "model.reads_pages",
-    "cache.bind_units",
-    "cache.bind_conversion",
-    "cache.pool",
     "graphs.pool",
-    "component.prepare",
-    "component.bind",
     "distributed.initialize",
     "distributed.create_groups",
     "distributed.mesh",
     "distributed.destroy",
-    "memory.stats",
-    "memory.release_cached",
     "kernels.choices",
     "profiling.start",
     "profiling.stop",
@@ -39,20 +26,9 @@ STARTUP_ENTRIES = {
 
 # Entries an expert-parallel rank resolves; a missing one fails the rank.
 EXPERT_ENTRIES = {
-    "experts.layers",
-    "experts.symmetric_bytes",
-    "experts.create_exchange",
-    "experts.bind_microbatches",
-    "experts.bind",
-    "experts.warm_thread",
-    "experts.close_exchange",
-    "experts.weight_fields",
-    "experts.bind_weights",
-    "experts.bind_prefetch",
     "graphs.begin_capture",
     "graphs.end_capture",
     "graphs.release",
-    "distributed.bind_collectives",
 }
 
 

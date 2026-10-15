@@ -24,10 +24,10 @@ column per layer, ``page_tokens`` equal to ``block_size`` and one table, so
 each layer's view and the stacked allocation of each field are the
 ``[layers, blocks, block_size, heads, dim]`` layout of a per-layer stack.
 
-The serving worker allocates the fields itself and binds a ``UnitPool`` over
-them with ``UnitPool.from_plan``; standalone library callers allocate with
-``UnitPool.allocate``. Either way the pool only borrows its fields: unit
-assignment, retirement and the lifetime of the backing belong to its owner.
+The serving worker allocates the fields itself and constructs a ``UnitPool``
+over them; standalone library callers allocate with ``UnitPool.allocate``.
+Either way the pool only borrows its fields: unit assignment, retirement and
+the lifetime of the backing belong to its owner.
 """
 
 from __future__ import annotations
@@ -253,22 +253,6 @@ def plan_units(
     return Planes(columns, plane_bytes, tuple(groups), quantizer is not None)
 
 
-_STORAGE_DTYPES = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-    "float8_e4m3fn": torch.float8_e4m3fn,
-}
-
-
-def _dtype(name: str) -> torch.dtype:
-    """Resolve a storage dtype name (a torch name without its prefix)."""
-    try:
-        return _STORAGE_DTYPES[name.removeprefix("torch.")]
-    except KeyError:
-        raise ValueError(f"unsupported K/V storage dtype {name!r}") from None
-
-
 class UnitPool:
     """Borrowed views of a K/V unit pool's fields and its layers' states.
 
@@ -290,9 +274,13 @@ class UnitPool:
     ) -> None:
         """Bind every layer's state over already allocated ``fields``.
 
-        Use ``from_plan`` or ``allocate``. ``configs`` gives each resident
-        layer's MHA layout. Dense layers bind their group's stored dtype as
-        their logical storage dtype; FP8 layers encode their compute dtype.
+        ``configs`` gives each resident layer's MHA layout; ``allocate``
+        also allocates the fields. Dense layers bind their group's stored
+        dtype as their logical storage dtype; FP8 layers encode their
+        compute dtype.
+
+        Raises:
+            ValueError: A field disagrees with the planes' layout.
         """
         expected = planes.buffers(num_units)
         for name, requirement in expected.items():
@@ -349,59 +337,6 @@ class UnitPool:
                 )
                 self._tables[name] = first_table + row
             first_table += group.units_per_page
-
-    @classmethod
-    def from_plan(
-        cls, plan: Mapping, tensors: Mapping[str, torch.Tensor]
-    ) -> UnitPool:
-        """Bind a pool over fields its owner allocated for ``plan``.
-
-        Args:
-            plan: The cache description ``interface.cache.cache_plan``
-                returns, plus ``"num_units"``, the units the fields hold
-                (sentinel included).
-            tensors: The unit fields by name; other entries, such as block
-                tables, are ignored. Nothing is allocated or initialized.
-
-        Raises:
-            ValueError: A field disagrees with the plan's layout.
-        """
-        quantized = bool(plan["quantized"])
-        groups = []
-        configs = {}
-        for value in plan["groups"]:
-            window = int(value["window"])
-            offset = int(value["kv_head_offset"])
-            heads = int(value["num_kv_heads"])
-            layers = tuple(str(name) for name in value["layers"])
-            groups.append(
-                CacheGroup(
-                    window=None if window < 0 else window,
-                    page_tokens=int(value["page_tokens"]),
-                    units_per_page=int(value["units_per_page"]),
-                    layers=layers,
-                    num_kv_heads=heads,
-                    head_dim=int(value["head_dim"]),
-                    dtype=_dtype(str(value["dtype"])),
-                )
-            )
-            config = mha.Config(
-                int(value["total_kv_heads"]),
-                int(value["head_dim"]),
-                tuple(range(offset, offset + heads)),
-                _dtype(str(value["compute_dtype"])),
-                window=None if window < 0 else window,
-            )
-            configs.update(dict.fromkeys(layers, config))
-        planes = Planes(
-            int(plan["columns"]),
-            int(plan["plane_bytes"]),
-            tuple(groups),
-            quantized,
-        )
-        if planes.unit_bytes != int(plan["unit_bytes"]):
-            raise ValueError("the cache plan's unit bytes disagree with it")
-        return cls(planes, tensors, configs, num_units=int(plan["num_units"]))
 
     @classmethod
     def allocate(

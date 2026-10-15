@@ -43,6 +43,7 @@ __all__ = [
     "export",
     "functions",
     "pool",
+    "pool_bytes",
 ]
 
 # The capture begun by ``begin_capture`` and not yet ended.
@@ -64,7 +65,7 @@ def pool(device: int) -> list[Any]:
     Returns:
         ``[pool, id_a, id_b, total_bytes]``: the pool (an opaque handle Rust
         passes back to captures), its allocator id pair (which names the
-        pool's segments in ``memory.stats``) and the device's total memory,
+        pool in :func:`pool_bytes`) and the device's total memory,
         from which Rust derives the default graph budget.
     """
     device = int(device)
@@ -73,6 +74,24 @@ def pool(device: int) -> list[Any]:
     first, second = handle.id
     total = torch.cuda.get_device_properties(device).total_memory
     return [handle, int(first), int(second), int(total)]
+
+
+def pool_bytes(device: int) -> list[int]:
+    """Bytes the caching allocator holds in each allocator pool of ``device``.
+
+    Returns:
+        A flat list ``[id_a, id_b, bytes, ...]``: one triple per pool with
+        segments on the device. The id pair is the one :func:`pool`
+        returned for a graph pool, ``0, 0`` for the default pool.
+    """
+    device = int(device)
+    sizes: dict[tuple[int, int], int] = {}
+    for segment in torch.cuda.memory_snapshot():
+        if segment["device"] == device:
+            first, second = segment["segment_pool_id"]
+            key = (int(first), int(second))
+            sizes[key] = sizes.get(key, 0) + int(segment["total_size"])
+    return [value for key, size in sizes.items() for value in (*key, size)]
 
 
 class Graph:
@@ -392,13 +411,24 @@ def export(graph: Graph, owner: Any = None) -> list[Any]:
     return [graph if owner is None else owner, graph.raw_cuda_graph_execs()]
 
 
-def begin_capture(pool, stream: int, device: int) -> Capture:
-    """Begin capturing work Rust submits on ``stream`` into ``pool``."""
+def begin_capture(
+    pool, stream: int, device: int, peers: Sequence[Sequence[Any]] = ()
+) -> Capture:
+    """Begin capturing work Rust submits on ``stream`` into ``pool``.
+
+    ``peers`` are ``[device, pool]`` pairs: the allocator pool receiving the
+    work's allocations on each other device its modules run on (see
+    :func:`capture`).
+    """
     global _capturing
     computation = torch.cuda.ExternalStream(
         int(stream), device=torch.device("cuda", int(device))
     )
-    recording = Capture(computation, pool)
+    placed = tuple(
+        (torch.device("cuda", int(ordinal)), handle)
+        for ordinal, handle in peers
+    )
+    recording = Capture(computation, pool, peers=placed)
     recording.begin()
     _capturing = recording
     return recording

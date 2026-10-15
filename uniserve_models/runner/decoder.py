@@ -1,8 +1,9 @@
 """The forwards of the media decoders: :class:`DecoderRunner`.
 
-One runner serves one decoder module on one stream at one size: a video
-decoder at one segment (the native frames and raster a media unit decodes
-to), an audio decoder at one track length. The tensors of a forward are
+One runner serves one decoder module on one stream: a video decoder at one
+segment (the native frames and raster a media unit decodes to), an audio
+decoder at one track length, an image decoder of a bound component at
+every image size (:meth:`DecoderRunner.bound`). The tensors of a forward are
 parameters of :meth:`DecoderRunner.decode`; the parameters depend on the
 decoder's capability class and are documented there. A video decoder's
 forward has shapes fixed by its scalar arguments and takes every changing
@@ -21,15 +22,18 @@ from typing import Any, Protocol, cast
 import torch
 
 from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
+from uniserve_models.interface import calls
 from uniserve_models.interface.errors import SetupError
 from uniserve_models.interface.loading import capability
-from uniserve_models.interface.workspace import execution_context
 from uniserve_models.media import image, video
+from uniserve_models.media.pixels import quantize_image_hwc
 from uniserve_models.model import (
     AudioDecoder,
+    ImageDecoder,
     VideoDecoder,
     VideoPostprocessor,
 )
+from uniserve_models.runner.context import execution_context, kernel_records
 from uniserve_models.tensors import BufferConfig
 
 __all__ = ["DecoderRunner"]
@@ -90,11 +94,16 @@ class DecoderRunner:
         path: The decoder module's path in the model.
         stream: The CUDA stream handle every forward enqueues on.
         attention: The attention backend the model loaded with.
-        allocate: The caller's allocation function for workspace torch
-            cannot provide.
+        scratch: The stream's shared work areas
+            (``uniserve_models.bindings.context.Scratch``).
         size: ``[frames, width, height]`` of a video decoder's segment, or
             ``[latent_frames]`` of an audio decoder's track.
     """
+
+    # An image decoder and its caller's tensors (see :meth:`bound`).
+    _image: ImageDecoder
+    _latents: torch.Tensor
+    _staging: torch.Tensor
 
     def __init__(
         self,
@@ -102,23 +111,19 @@ class DecoderRunner:
         path: str,
         stream: int,
         attention: str,
-        allocate,
+        scratch,
         size: Sequence[int],
     ) -> None:
         module = loaded.module.get_submodule(str(path))
         self._device = next(module.parameters()).device
         extents = [int(extent) for extent in size]
-        self._decode: Callable[..., None]
+        self._decode: Callable[..., Any]
         if isinstance(module, VideoDecoder):
             frames, width, height = extents
             self._decoder = module
             self._segment = _video(frames, width, height)
             self._context: ExecutionContext = execution_context(
-                module,
-                int(stream),
-                str(attention),
-                allocate,
-                f"decoder.{(frames, width, height)}",
+                module, int(stream), str(attention), scratch
             )
             self._context.prepare(self._segment)
             self._postprocessor = _require(loaded, VideoPostprocessor)
@@ -165,7 +170,7 @@ class DecoderRunner:
             (frames,) = extents
             self._audio = module
             self._context = execution_context(
-                module, int(stream), str(attention), allocate, f"audio.{frames}"
+                module, int(stream), str(attention), scratch
             )
             self._context.prepare(frames)
             self._decode = self._decode_audio
@@ -174,7 +179,70 @@ class DecoderRunner:
                 f"{type(module).__qualname__} is not a video or audio decoder"
             )
 
+    @classmethod
+    def image(
+        cls,
+        loaded,
+        path: str,
+        stream: int,
+        device: int,
+        scratch,
+        latents: torch.Tensor,
+        staging: torch.Tensor,
+    ) -> DecoderRunner:
+        """A runner of an image model's decoder.
+
+        Args:
+            loaded: The loaded model.
+            path: The decoder module's path in the model.
+            stream: The CUDA stream handle every forward enqueues on (0 on
+                the host).
+            device: The CUDA ordinal ``stream`` belongs to, -1 for the
+                host. A decoder placed on a generation tower computes
+                there and returns its results to the caller's tensors.
+            scratch: The stream's shared work areas.
+            latents: The latent pool's step workspace ``[units, width]``,
+                into which the caller gathers each completed trajectory's
+                pages before decoding.
+            staging: uint8 bytes receiving each image's quantized HWC
+                pixels, which the caller copies to the host and encodes.
+        """
+        path = str(path)
+        decoder = loaded.module.get_submodule(path) if path else loaded.module
+        if not isinstance(decoder, ImageDecoder):
+            raise SetupError(
+                f"{type(decoder).__qualname__} is not an image decoder"
+            )
+        context = execution_context(
+            decoder,
+            int(stream),
+            loaded.attention,
+            scratch,
+            device=int(device),
+            derive_host_lengths=True,
+        )
+        context.prepare(None)
+        runner = cls.__new__(cls)
+        runner._image = decoder
+        runner._context = context
+        runner._device = context.device
+        runner._latents = latents
+        runner._staging = staging
+        runner._decode = runner._decode_image
+        return runner
+
     # Sizing, answered from configuration.
+
+    @staticmethod
+    def value_range(loaded) -> list[float]:
+        """The image decoder's ``[low, high]`` pixel range.
+
+        Empty without an image decoder.
+        """
+        decoder = capability(loaded.module, ImageDecoder)
+        if decoder is None:
+            return []
+        return [float(value) for value in decoder.decoder.value_range]
 
     @staticmethod
     def frame_rate(loaded) -> int:
@@ -265,7 +333,7 @@ class DecoderRunner:
 
     # Forward.
 
-    def decode(self, *arguments: Any) -> None:
+    def decode(self, *arguments: Any) -> Any:
         """Decode into the caller's output tensor.
 
         A video decoder takes ``(latent, rows, overlap, out, first, last,
@@ -287,8 +355,81 @@ class DecoderRunner:
         ``total`` of a track of ``samples`` samples. ``latent`` is the
         request's complete audio latent timeline; the units' samples, which
         abut, land in ``out`` (``[span, 2]`` int16) in order.
+
+        An image decoder takes ``(rows, *images)``: ``rows`` holds one
+        ``[offset, units, height, width, staging]`` row per image,
+        flattened: its latent rows ``latents[offset:offset + units]``, its
+        size and the staging offset of its pixels. It decodes every image
+        (one numerical call per size), writes image ``i`` to the product
+        tensor ``images[i]`` unless that is None (the decoded values in the
+        product's dtype), quantizes it into the staging bytes and returns
+        each image's byte count, ``height * width * 3``.
         """
-        self._decode(*arguments)
+        return self._decode(*arguments)
+
+    def quantize(
+        self, image: torch.Tensor, low: float, high: float, offset: int
+    ) -> int:
+        """Quantize a resident image product into the staging bytes.
+
+        ``image`` holds values in ``[low, high]``; its HWC pixels land at
+        ``offset`` of the staging bytes. Returns their byte count.
+        """
+        with calls.scope(self._context):
+            return self._stage(
+                image,
+                float(low),
+                float(high),
+                int(offset),
+            )
+
+    def _stage(
+        self, value: torch.Tensor, low: float, high: float, offset: int
+    ) -> int:
+        """Quantize one image into the staging bytes at ``offset``."""
+        staging = self._staging
+        pixels = quantize_image_hwc(value, value_range=(low, high))
+        count = pixels.numel()
+        if offset < 0 or offset + count > staging.numel():
+            raise ValueError("image pixels exceed the decoder staging")
+        staging[offset : offset + count].copy_(
+            calls.local(pixels.reshape(-1), staging.device)
+        )
+        return count
+
+    def _decode_image(
+        self, rows: Sequence[int], *images: torch.Tensor | None
+    ) -> list[int]:
+        decoder, context = self._image, self._context
+        flat = [int(value) for value in rows]
+        described = [
+            tuple(flat[start : start + 5]) for start in range(0, len(flat), 5)
+        ]
+        if len(described) != len(images):
+            raise ValueError("decoder rows and image products must align")
+        low, high = (float(value) for value in decoder.decoder.value_range)
+        with calls.scope(context):
+            # A decoder placed on a generation tower reads its latents there.
+            values = decoder.decode(
+                tuple(
+                    self._latents[offset : offset + units].to(
+                        context.device, non_blocking=True
+                    )
+                    for offset, units, *_ in described
+                ),
+                sizes=tuple(
+                    image.Config(height, width)
+                    for _, _, height, width, _ in described
+                ),
+            )
+            counts = []
+            for value, row, product in zip(
+                values, described, images, strict=True
+            ):
+                if product is not None:
+                    calls.write(product, value)
+                counts.append(self._stage(value, low, high, row[4]))
+            return counts
 
     def _decode_video(
         self,
@@ -351,9 +492,9 @@ class DecoderRunner:
                 raise ValueError("audio units disagree with their output rows")
             torch.cat(outputs, out=out)
 
-    def kernels(self) -> list[dict]:
-        """The kernels the runner's operators selected."""
-        return list(self._context.kernels())
+    def kernels(self) -> list[str]:
+        """The kernels the runner's operators selected, as JSON objects."""
+        return kernel_records(self._context.kernels())
 
     def close(self, aborted: bool) -> None:
         """Release the runner's operators and workspace.

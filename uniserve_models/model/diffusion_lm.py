@@ -12,6 +12,7 @@ tokens belong to the caller.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -158,6 +159,68 @@ class DiffusionLM(nn.Module):
     @property
     def cache_config(self):
         return self.backbone.cache_config
+
+    # Facts a caller sizes its tensors from, before any forward.
+
+    def sequence_length(self) -> int:
+        """Tokens of one generated block."""
+        return self.canvas.length
+
+    def vocab_size(self) -> int:
+        """Real vocabulary entries, the same on every pipeline stage."""
+        pipeline = self.backbone._pipeline
+        head = self.lm_head
+        if pipeline.rank == pipeline.size - 1 and head is not None:
+            # ``nn.Module`` types an attribute read as ``Tensor | Module``.
+            return int(cast(Any, head).vocab.size)
+        return int(self.backbone.vocab_size)
+
+    def hidden_size(self) -> int:
+        """The width of the hidden states and token embeddings."""
+        return int(self.backbone.hidden_size)
+
+    def compute_dtype(self) -> str:
+        """The name of the element type the layers compute in."""
+        dtype = next(self.backbone.layers.parameters()).dtype
+        return str(dtype).removeprefix("torch.")
+
+    def embedding_dtype(self) -> str:
+        """The name of the token embedding's element type.
+
+        Self-conditioning embeddings have it. A stage without the embedding
+        table reports its compute type.
+        """
+        embedding = self.backbone.embedding
+        if embedding is None:
+            return self.compute_dtype()
+        return str(embedding.weight.dtype).removeprefix("torch.")
+
+    def attend_widths(self) -> list[int]:
+        """Per-token widths of the state ``attend`` returns.
+
+        Empty off the last pipeline stage, which returns no state.
+        """
+        pipeline = self.backbone._pipeline
+        if pipeline.rank != pipeline.size - 1:
+            return []
+        return [int(width) for width in self.backbone.attend_widths]
+
+    def stage(self) -> list[int]:
+        """``[rank, size]`` of this rank in the model's pipeline."""
+        pipeline = self.backbone._pipeline
+        return [int(pipeline.rank), int(pipeline.size)]
+
+    def generates(self) -> bool:
+        """Whether this rank can denoise blocks.
+
+        The sampler embeds every distribution with the whole embedding
+        table, so the rank holds the one pipeline stage and the unsharded
+        table.
+        """
+        embedding = self.backbone.embedding
+        if self.backbone._pipeline.size != 1 or embedding is None:
+            return False
+        return bool(embedding.group.size == 1)
 
     def forward(self, inputs: DiffusionLMInput) -> torch.Tensor:
         return self.backbone(

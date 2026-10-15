@@ -30,9 +30,13 @@ pub trait ServiceBackend: Backend<Output = BatchResult> {
     fn has_open_requests(&self) -> Result<bool, Self::Error>;
     fn awaiting_acknowledgment(&self) -> Result<bool, Self::Error>;
 
-    /// Participate without an own forward. Returns (ran a step, group released).
-    /// Closing ranks continue participating until every peer leaves the group.
-    fn join_expert_step(&self, leaving: bool) -> Result<(bool, bool), Self::Error>;
+    /// Participate in the expert union's next step without an own forward.
+    /// The join is submitted and not waited for: `None` while it is in
+    /// flight, which the first call starts; once it completed, the next
+    /// call returns (ran a step, group released), and the call after that
+    /// starts the next join. Closing ranks continue participating until
+    /// every peer leaves the group.
+    fn join_expert_step(&mut self, leaving: bool) -> Result<Option<(bool, bool)>, Self::Error>;
 }
 
 enum PendingResponse {
@@ -87,8 +91,17 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
             }
 
             if self.closing && self.pending.is_empty() && !self.executor.has_work() {
-                if self.experts && !self.executor.backend().join_expert_step(true)?.1 {
-                    continue;
+                if self.experts {
+                    match self.executor.backend_mut().join_expert_step(true)? {
+                        // Every peer has left the group.
+                        Some((_, true)) => {}
+                        Some((_, false)) => continue,
+                        // The join is in flight: its completion wakes.
+                        None => {
+                            self.wait(EXPERT_POLL)?;
+                            continue;
+                        }
+                    }
                 }
 
                 if let Some(response) = self.shutdown.take() {
@@ -116,7 +129,9 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
                     continue;
                 }
 
-                if self.executor.backend().join_expert_step(false)?.0 {
+                // A step that ran may be followed by another at once; an
+                // empty round, or a join in flight, waits below.
+                if let Some((true, _)) = self.executor.backend_mut().join_expert_step(false)? {
                     continue;
                 }
             }
@@ -168,7 +183,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
                     .executor
                     .backend()
                     .batch(Arc::clone(&batch))
-                    .and_then(|data| self.executor.submit(Batch::from_plan(&batch, data), false));
+                    .and_then(|data| self.executor.admit(Batch::from_plan(&batch, data), false));
                 match admitted {
                     Ok(submission) => PendingResponse::Batch {
                         message_id,

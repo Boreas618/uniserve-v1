@@ -1,5 +1,5 @@
 //! Stream collectives over native NCCL communicators, called through their
-//! TVM-FFI tables as numerical code calls them. The tests need two CUDA
+//! TVM-FFI functions as numerical code calls them. The tests need two CUDA
 //! devices and the NCCL a worker process loads (PyTorch's, whose zero-CTA
 //! policy the communicators request); run them with
 //! `LD_LIBRARY_PATH=<site-packages>/nvidia/nccl/lib cargo test -p
@@ -10,7 +10,7 @@
 use std::net::TcpListener;
 use std::time::Duration;
 
-use tvm_ffi::{Any, AnyView, Map};
+use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{DeviceId, memcpy_async};
 use uniserve_worker::CUDAStream;
 use uniserve_worker::ffi::DType;
@@ -49,8 +49,7 @@ fn download(view: &StorageView, stream: &CUDAStream) -> Vec<f32> {
     values
 }
 
-fn call(table: &Map<tvm_ffi::String, Any>, name: &str, args: &[Any]) -> Any {
-    let function = tvm_ffi::Function::try_from(table.get(&name.into()).unwrap().unwrap()).unwrap();
+fn call(function: &tvm_ffi::Function, args: &[Any]) -> Any {
     let views: Vec<AnyView<'_>> = args.iter().map(AnyView::from).collect();
     function.call_packed(&views).unwrap()
 }
@@ -81,10 +80,7 @@ fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
                         ranks: vec![1, 0],
                     }];
                     let mut collectives = StreamCollectives::bind(&stream, &host, &groups).unwrap();
-                    let tables: Map<tvm_ffi::String, Any> =
-                        Map::try_from(collectives.tables()).unwrap();
-                    let table: Map<tvm_ffi::String, Any> =
-                        Map::try_from(tables.get(&"tp".into()).unwrap().unwrap()).unwrap();
+                    let functions = collectives.functions("tp").unwrap();
 
                     let value = upload(
                         &[rank as f32 + 1.0, 10.0 * (rank as f32 + 1.0)],
@@ -92,8 +88,7 @@ fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
                         &stream,
                     );
                     call(
-                        &table,
-                        "all_reduce",
+                        &functions.all_reduce,
                         &[Any::from(value.to_tensor().unwrap()), Any::from(0_i64)],
                     );
                     let reduced = download(&value, &stream);
@@ -101,8 +96,7 @@ fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
                     let local = upload(&[rank as f32; 3], device, &stream);
                     let gathered = upload(&[0.0; 6], device, &stream);
                     call(
-                        &table,
-                        "all_gather",
+                        &functions.all_gather,
                         &[
                             Any::from(gathered.to_tensor().unwrap()),
                             Any::from(local.to_tensor().unwrap()),
@@ -113,24 +107,21 @@ fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
                     // Asynchronous gather, joined on the binding stream.
                     let started = upload(&[0.0; 6], device, &stream);
                     let token = call(
-                        &table,
-                        "start_all_gather",
+                        &functions.start_all_gather,
                         &[
                             Any::from(started.to_tensor().unwrap()),
                             Any::from(local.to_tensor().unwrap()),
                         ],
                     );
                     call(
-                        &table,
-                        "wait",
+                        &functions.wait,
                         &[token, Any::from(stream.handle().unwrap() as i64)],
                     );
                     let started = download(&started, &stream);
 
                     let broadcast = upload(&[rank as f32 + 5.0], device, &stream);
                     call(
-                        &table,
-                        "broadcast",
+                        &functions.broadcast,
                         &[Any::from(broadcast.to_tensor().unwrap()), Any::from(1_i64)],
                     );
                     let broadcast = download(&broadcast, &stream);

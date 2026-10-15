@@ -120,7 +120,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--page-size` | Chosen by the worker | Base KV page size supported by every cache group's attention readers. |
-| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget |
+| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget; a request with an input image whose vision feature block holds more tokens is refused |
 | `--chunked-prefill-size` | `8192` | Per-request prefill bound |
 | `--mem-fraction-static` | `0.70` | Each rank's share of device storage |
 | `--graph-policy` | `auto` | CUDA graph policy: `auto`, `full`, or `off` |

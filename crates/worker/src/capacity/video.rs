@@ -26,6 +26,9 @@ use crate::{Error, Result};
 pub(crate) struct VideoCapacity {
     pub(crate) media: MediaPlan,
     pub(crate) pages: SamplePages,
+    /// Whether the worker holds the denoiser on any of its ranks, and so
+    /// reports the sample pool the head schedules pages by.
+    pub(crate) sampling: bool,
     /// The denoiser's slot state on a denoising rank.
     pub(crate) envelope: Option<StateEnvelope>,
     /// Device bytes of one slot's retained decoder overlap.
@@ -49,8 +52,7 @@ const EDGES: [(MediaCall, MediaCall); 10] = [
 ];
 
 /// The products every component of the deployment publishes: the model's
-/// own (the media timeline's and the text conditioning, beside the `facts`
-/// outputs of the components this rank loads), the video codec's
+/// own (the media timeline's and the text conditioning), the video codec's
 /// encoded unit rows and, for conditioned tasks, the media reader's
 /// condition media. Every rank plans them all, whichever components it
 /// holds, because the engine places a request's products in one logical
@@ -58,26 +60,16 @@ const EDGES: [(MediaCall, MediaCall); 10] = [
 pub(crate) fn outputs(
     model: &VideoModel,
     media: &MediaPlan,
-    facts: &BTreeMap<String, Vec<OutputInfo>>,
     dtype: &str,
 ) -> Result<BTreeMap<String, Vec<OutputInfo>>> {
     let frames = media.max_frames();
-    let mut result = facts.clone();
-    for (component, outputs) in model.outputs(
+    let mut result = model.outputs(
         frames,
         media.max_text_tokens,
         media.condition_rows,
         dtype,
         &media.canvases,
-    )? {
-        let declared = result.entry(component).or_default();
-        for output in outputs {
-            // A loaded component's facts already declare its products.
-            if !declared.iter().any(|known| known.name == output.name) {
-                declared.push(output);
-            }
-        }
-    }
+    )?;
     result
         .entry("video_codec".into())
         .or_default()
@@ -157,12 +149,13 @@ pub(crate) fn local_product_bytes(
 }
 
 /// Plan a video rank's admitted sizes, sample pages, slot state and
-/// products. `denoising` and `decoding` say whether the rank holds the
-/// denoiser and the video decoder.
+/// products. `sampling` says whether the rank's worker holds the denoiser;
+/// `denoising` and `decoding` say whether the rank itself holds the denoiser
+/// and the video decoder.
 pub(crate) fn plan(
     model: &VideoModel,
     config: &WorkerConfig,
-    facts: &BTreeMap<String, Vec<OutputInfo>>,
+    sampling: bool,
     denoising: bool,
     decoding: bool,
 ) -> Result<VideoCapacity> {
@@ -212,10 +205,11 @@ pub(crate) fn plan(
     } else {
         0
     };
-    let outputs = outputs(model, &media, facts, &config.model_dtype)?;
+    let outputs = outputs(model, &media, &config.model_dtype)?;
     Ok(VideoCapacity {
         media,
         pages,
+        sampling,
         envelope,
         overlap_bytes,
         outputs,
@@ -250,7 +244,7 @@ impl VideoCapacity {
                 + self.overlap_bytes,
             local_product_bytes,
             product_bytes,
-            latent: self.envelope.as_ref().map(|_| LatentPlan {
+            latent: self.sampling.then(|| LatentPlan {
                 request_pool_size: slots,
                 num_pages: self.pages.pool_pages(slots as u64) as usize,
                 page_units: self.pages.page_units as usize,
@@ -258,6 +252,7 @@ impl VideoCapacity {
                 element_bytes: 4,
                 with_workspace: false,
             }),
+            stores_latent: self.envelope.is_some(),
             artifact_import_regions,
         })
     }

@@ -1,14 +1,17 @@
 //! Routing and homogeneous batches for the worker's numerical runners.
 
-pub(crate) mod allocate;
 pub(crate) mod attention;
 pub(crate) mod causal_lm;
+pub(crate) mod component;
 pub(crate) mod decoder;
 pub(crate) mod denoiser;
-pub(crate) mod diffusion;
 pub(crate) mod diffusion_lm;
 pub(crate) mod encoder;
+pub(crate) mod input_buffers;
 pub(crate) mod media;
+pub(crate) mod methods;
+pub(crate) mod scratch;
+pub(crate) mod start;
 pub(crate) mod vision;
 
 use std::collections::{HashMap, HashSet};
@@ -19,7 +22,7 @@ use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{Call, CallKind};
 
-use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list};
+use crate::ffi::{Backing, DType, Handle};
 use crate::model::interface::Interface;
 use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
@@ -184,85 +187,67 @@ pub(crate) struct RunnerSetup<'a> {
     pub(crate) stream: Stream,
     pub(crate) device: i32,
     pub(crate) attention: String,
-    /// The worker's workspace allocation function.
-    pub(crate) allocate: tvm_ffi::Function,
+    /// The stream's shared work areas, a Python `Scratch`.
+    pub(crate) scratch: Handle,
 }
 
-/// The Python runners of one module: their constructor's fixed arguments
-/// and their methods, each called with a runner first.
-pub(crate) struct Methods {
-    pub(crate) construct: Function,
-    pub(crate) loaded: Handle,
-    pub(crate) path: String,
-    pub(crate) stream: Stream,
-    pub(crate) attention: String,
-    pub(crate) allocate: tvm_ffi::Function,
-    pub(crate) forward: Function,
-    pub(crate) kernels: Function,
-    pub(crate) close: Function,
+/// What an image runner's Python half is constructed from: the module at
+/// `path` of the loaded model, the stream its forwards enqueue on and that
+/// stream's shared work areas. The half constructs its own execution
+/// context and releases it when the runner closes.
+pub struct ImageSetup<'a> {
+    pub interface: &'a Interface,
+    pub loaded: &'a Handle,
+    /// The component the module belongs to.
+    pub component: &'a str,
+    /// The module's path in the model.
+    pub path: &'a str,
+    /// The device `stream` belongs to. A module placed on a generation
+    /// tower computes there between the stream's steps.
+    pub device: crate::config::Device,
+    /// The stream every forward enqueues on; `None` on the host.
+    pub stream: Option<Stream>,
+    /// The stream's shared work areas, a Python `Scratch`.
+    pub scratch: Handle,
 }
 
-impl Methods {
-    /// The methods of the runner class at import path `class`, whose
-    /// forward method is `forward`.
-    pub(crate) fn new(setup: &RunnerSetup<'_>, class: &str, forward: &str) -> Result<Self> {
-        let method = |name: &str| setup.interface.import(&format!("{class}.{name}"));
-        Ok(Self {
-            construct: setup.interface.import(class)?,
-            loaded: setup.loaded.clone(),
-            path: setup.path.to_owned(),
-            stream: setup.stream.clone(),
-            attention: setup.attention.clone(),
-            allocate: setup.allocate.clone(),
-            forward: method(forward)?,
-            kernels: method("kernels")?,
-            close: method("close")?,
-        })
+impl ImageSetup<'_> {
+    /// The runner's name: its component, with the module path below it.
+    pub fn owner(&self) -> String {
+        if self.path.is_empty() {
+            self.component.to_owned()
+        } else {
+            format!("{}.{}", self.component, self.path)
+        }
     }
 
-    /// Construct the runner of `size`.
-    pub(crate) fn runner(&self, size: impl IntoIterator<Item = i64>) -> Result<Handle> {
-        Handle::new(self.construct.call_values(&[
+    /// The leading constructor arguments of every image runner: the loaded
+    /// model, the module path, the stream handle (0 on the host), the
+    /// device ordinal (-1 for the host) and the scratch.
+    pub fn arguments(&self) -> Vec<Any> {
+        vec![
             self.loaded.to_any(),
-            Any::from(tvm_ffi::String::from(self.path.as_str())),
-            Any::from(self.stream.raw() as i64),
-            Any::from(tvm_ffi::String::from(self.attention.as_str())),
-            Any::from(self.allocate.clone()),
-            Any::from(integer_list(size)),
-        ])?)
+            Any::from(tvm_ffi::String::from(self.path)),
+            Any::from(self.stream.as_ref().map_or(0, Stream::raw) as i64),
+            Any::from(self.device.cuda_index().map_or(-1, i64::from)),
+            self.scratch.to_any(),
+        ]
     }
+}
 
-    /// The kernels the operators of `runners` selected.
-    pub(crate) fn kernels<'a>(
-        &self,
-        label: &str,
-        runners: impl IntoIterator<Item = &'a Handle>,
-    ) -> Result<Vec<Record>> {
-        let mut values: Vec<Any> = Vec::new();
-        for runner in runners {
-            let records: tvm_ffi::Array<Any> = self.kernels.call_as(&[runner.view()])?;
-            values.extend(records.iter());
-        }
-        values
-            .into_iter()
-            .enumerate()
-            .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
-            .collect()
-    }
-
-    /// Close `runners`; an aborted close keeps what device work may still
-    /// address.
-    pub(crate) fn close<'a>(
-        &self,
-        aborted: bool,
-        runners: impl IntoIterator<Item = &'a Handle>,
-    ) -> Result<()> {
-        let flag = Any::from(aborted);
-        let mut result = Ok(());
-        for runner in runners {
-            result = result.and(self.close.invoke(&[runner.view(), (&flag).into()]));
-        }
-        result
+impl RunnerSetup<'_> {
+    /// The arguments every runner of the module is constructed with before
+    /// its size: the loaded model, the module path, the stream handle, the
+    /// attention backend and the stream's scratch.
+    pub(crate) fn arguments(&self) -> Vec<methods::Argument> {
+        use methods::Argument;
+        vec![
+            Argument::Handle(self.loaded.clone()),
+            Argument::Text(self.path.to_owned()),
+            Argument::Integer(self.stream.raw() as i64),
+            Argument::Text(self.attention.clone()),
+            Argument::Handle(self.scratch.clone()),
+        ]
     }
 }
 

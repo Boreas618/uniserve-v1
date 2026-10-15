@@ -1,6 +1,11 @@
 //! One batch of the diffusion LM runner: readouts or denoising steps.
 //!
-//! A batch runs in four stages on its lane's execution thread:
+//! The control thread prepares a batch and applies its results; the lane's
+//! execution thread issues its stream work, which the batch records as jobs
+//! ([`forward`] prepares the next one, [`complete`] applies its
+//! completion). A batch is one job, unless a readout has a host-gated
+//! predicate: the opening job reads those, and its completion decides the
+//! active calls. Its stages:
 //!
 //! 1. **Reservation.** Bind every call's pending output and the batch's
 //!    output lease; install its block tables and retain the prefix cache
@@ -11,13 +16,15 @@
 //!    slot's resident continuation flag, so a step queued behind the one
 //!    that stopped its block runs as a no-op and reports itself skipped.
 //! 2. **Forward.** Validate the calls into one readout or one list of
-//!    denoising rows (a batch carries one form) and run it. A step advances
-//!    its request's submitted block and step.
-//! 3. **Outputs and commit.** Copy candidate values or step results into
-//!    the output lease, publish the steps' completion flags, then commit
-//!    products and pending calls together. A failure before the commit
-//!    point retires everything the batch reserved and reports every call as
-//!    failed; a failure after it is fatal.
+//!    denoising rows (a batch carries one form) and record it. A step
+//!    advances its request's submitted block and step.
+//! 3. **Outputs and commit.** Record the copies of candidate values or
+//!    step results into the output lease and the publication of the steps'
+//!    completion flags, validate every owner's update and seal the lease.
+//!    Products and pending calls are committed together once the job
+//!    completed. A failure before that commit retires everything the batch
+//!    reserved and reports every call as failed; a failure of the commit
+//!    itself is fatal.
 //! 4. **Completion** ([`crate::executor::forward::launch::materialize`]).
 //!    Once the lease's device fences complete, decode each call's result
 //!    and accept its progress. These calls write no prefix cache: each
@@ -34,17 +41,20 @@ use uniserve_ipc::{
 };
 
 use super::calls::{self, DenoiseRow, ReadoutPass, Readouts};
-use super::{DiffusionLMRunner, Executed, KIND};
+use super::{DiffusionLMRunner, Executed, Expert, KIND, Recorded};
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
-use crate::executor::forward::experts::ExpertRuntime;
+use crate::executor::forward::Stage;
 use crate::executor::forward::launch::{
-    Launched, StreamOrder, error_code, failed_output, lock, read_flag, reports_output, seal,
+    Launched, StreamOrder, error_code, failed_output, flag, lock, reports_output, request_flag,
+    seal,
 };
-use crate::executor::lifecycle::RequestStorage;
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
+use crate::lane::{Completion, Job};
+use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
 use crate::storage::{KVCache, OutputLease, OutputPlacement, ProductBuffer, TensorStore};
 use crate::stream::EventPool;
@@ -54,41 +64,30 @@ use crate::{Error, Result};
 
 /// What a batch borrows from the rank.
 struct Context<'a> {
-    pub(crate) info: &'a WorkerInfo,
-    pub(crate) rank: usize,
-    pub(crate) requests: &'a mut RequestPool,
-    pub(crate) kv: &'a mut KVCache,
-    pub(crate) tensors: &'a TensorStore,
-    pub(crate) events: &'a Arc<EventPool>,
+    info: &'a WorkerInfo,
+    rank: usize,
+    runner: &'a mut DiffusionLMRunner,
+    requests: &'a mut RequestPool,
+    kv: &'a mut KVCache,
+    tensors: &'a TensorStore,
+    events: &'a Arc<EventPool>,
+    plan: &'a BatchPlan,
     /// The text runtime's batch order: these forwards read the prefix
     /// cache its prefills write, possibly on another stream.
-    pub(crate) text: Option<&'a StreamOrder>,
-    /// The rank's expert runtime, when forwards are expert steps.
-    pub(crate) experts: Option<&'a ExpertRuntime>,
+    text: Option<&'a StreamOrder>,
+    /// The rank's expert union member, when forwards are expert steps.
+    experts: Option<&'a Arc<ExpertUnion>>,
 }
 
-/// The expert call kind of the runner's forwards: distinct from the text
-/// runtime's kinds, so the union's ready kinds take turns.
-fn expert_kind() -> i64 {
-    64
-}
-
-/// The coordinator of the runner's expert steps: agreement while serving,
-/// announced or `forced` capacities during warmup.
-pub(super) fn coordinator<'a>(
-    experts: Option<&'a ExpertRuntime>,
-    forced: Option<usize>,
-) -> impl FnMut(usize) -> Result<Option<usize>> + 'a {
-    move |extent| {
-        experts
-            .map(|experts| experts.capacity(extent, expert_kind(), forced))
-            .transpose()
-    }
+/// The expert call kind of diffusion LM runner `index`: distinct from the
+/// text runtime's kinds, so the union's ready kinds take turns.
+pub(super) fn expert_kind(index: usize) -> i64 {
+    64 + index as i64
 }
 
 /// A failure, the batch phase it happened in and whether the batch had
-/// passed its commit point.
-struct Failure {
+/// begun its commit.
+pub(crate) struct Failure {
     error: Error,
     phase: &'static str,
     committed: bool,
@@ -103,13 +102,54 @@ impl Failure {
         }
     }
 
-    fn fatal(error: Error) -> Self {
-        Self {
+    fn fatal(phase: &'static str) -> impl Fn(Error) -> Self {
+        move |error| Self {
             error,
-            phase: "batch commit",
+            phase,
             committed: true,
         }
     }
+}
+
+/// A batch whose outputs are bound, before its output storage is leased:
+/// its host-gated predicates decide first which calls are active.
+pub(crate) struct Opening {
+    states: Vec<CallState>,
+    /// The calls whose host-gated predicate the opening job reads, in the
+    /// order of its reads.
+    predicated: Vec<usize>,
+    /// This rank reports the component's host results.
+    reports: bool,
+    started: Instant,
+}
+
+/// A batch whose last job is on its lane: what it reserved, and what the
+/// job's completion is applied to.
+pub(crate) struct Committing {
+    states: Vec<CallState>,
+    buffer: OutputLease,
+    /// The completion flags the batch publishes.
+    writes: Vec<ProductBuffer>,
+    /// The forward the job runs; `None` when every call was skipped.
+    recorded: Option<Recorded>,
+    reports: bool,
+    started: Instant,
+}
+
+/// A batch between two of its jobs.
+pub(crate) enum Pending {
+    /// The job on the lane reads the batch's host-gated predicates.
+    Predicates(Opening),
+    /// The predicates are known: the batch reserves, steps and commits
+    /// next.
+    Opened(Opening),
+    /// The job on the lane is the batch's last.
+    Committing(Box<Committing>),
+    /// The job on the lane ends what the failed batch recorded: its
+    /// fences, and the seal of its lease.
+    Discarding(Failure),
+    /// The batch failed and holds nothing: its calls are reported next.
+    Failed(Failure),
 }
 
 /// One call's state through the batch.
@@ -127,55 +167,49 @@ struct Reserved {
     retirement: Arc<Retirement>,
 }
 
-impl DiffusionLMRunner {
-    /// Run one batch of diffusion LM calls up to its commit point.
-    fn forward(
-        &mut self,
-        context: Context<'_>,
-        plan: &BatchPlan,
-    ) -> std::result::Result<Launched, Failure> {
+impl Opening {
+    /// Bind the batch's outputs to their requests, then record in `job`
+    /// the batch's order after the text runtime's batches and the read of
+    /// every readout's host-gated predicate: the job's completion carries
+    /// one byte each.
+    fn open(context: &mut Context<'_>, job: &Job) -> Result<Self> {
         let started = Instant::now();
-        let reserve = Failure::new("batch registration");
         let Context {
             info,
             rank,
+            runner,
             requests,
-            kv,
             tensors,
-            events,
+            plan,
             text,
-            experts,
+            ..
         } = context;
         let calls = &plan.calls;
         if calls
             .iter()
-            .any(|call| call.code != KIND || call.component != self.component)
+            .any(|call| call.code != KIND || call.component != runner.component)
         {
-            return Err(reserve(Error::Unsupported(format!(
-                "a diffusion LM batch carries calls of component {:?}",
-                self.component
-            ))));
+            return Err(Error::Invalid(format!(
+                "a diffusion LM batch carries token-denoising calls of component {:?}",
+                runner.component
+            )));
         }
-        let device = self.buffers.device();
-        let stream = self.stream.clone();
-        let stream = stream.as_ref();
-        let reports = reports_output(info, rank, &self.component).map_err(&reserve)?;
+        let device = runner.buffers.device();
+        let reports = reports_output(info, *rank, &runner.component)?;
 
         // Output rows, bound to their requests' live epochs and slots.
-        let bound = calls
+        let rows = calls
             .iter()
             .map(|call| {
                 let request = requests.get(call.request_key.request_id.0)?;
                 Ok((call.request_key, call.call_id, request.slot()))
             })
-            .collect::<Result<Vec<_>>>()
-            .and_then(|rows| requests.bind_calls(&rows))
-            .map_err(&reserve)?;
+            .collect::<Result<Vec<_>>>()?;
+        let bound = requests.bind_calls(&rows)?;
         let mut states = Vec::with_capacity(calls.len());
         for (row, (call, request)) in calls.iter().zip(&bound).enumerate() {
             states.push(CallState {
-                output: PendingOutput::new(call, request.progress().map_err(&reserve)?, row)
-                    .map_err(&reserve)?,
+                output: PendingOutput::new(call, request.progress()?, row)?,
                 slot: request.slot() as u32,
                 active: true,
                 completion: None,
@@ -184,23 +218,82 @@ impl DiffusionLMRunner {
 
         // Readouts gate on host predicates. A step's continuation stays on
         // the device: reading it here would serialize steps that can run.
+        // Each predicate is read after its producer's fence, and its lease
+        // ends behind the read.
+        let issue = job.on(runner.stream.as_ref());
         if let Some(text) = text {
-            text.wait(stream).map_err(&reserve)?;
+            text.wait(issue)?;
         }
-        for (call, state) in calls.iter().zip(&mut states) {
-            if let Some(predicate) = &call.predicate
-                && predicate.dtype == DType::U8
-                && call.canvas.is_none()
-                && !read_flag(tensors, call, predicate, device, stream).map_err(&reserve)?
-            {
+        let mut predicated = Vec::new();
+        for (index, call) in calls.iter().enumerate() {
+            let Some(predicate) = call
+                .predicate
+                .as_ref()
+                .filter(|predicate| predicate.dtype == DType::U8 && call.canvas.is_none())
+            else {
+                continue;
+            };
+            request_flag(tensors, call, predicate, device, issue)?;
+            predicated.push(index);
+        }
+        Ok(Self {
+            states,
+            predicated,
+            reports,
+            started,
+        })
+    }
+
+    /// Apply the opening job's completion: a readout whose predicate read
+    /// false is skipped.
+    fn predicates(&mut self, completion: &mut Completion) -> Result<()> {
+        for index in std::mem::take(&mut self.predicated) {
+            if !flag(completion)? {
+                let state = &mut self.states[index];
                 state.active = false;
                 state.output.output.status = CallStatus::Predicated;
             }
         }
+        Ok(())
+    }
+
+    /// Lease the opened batch's output storage and record its reservation,
+    /// forward, outputs and seal in `job`: the batch's last job, or the job
+    /// that ends what a failed batch recorded.
+    fn run(self, context: Context<'_>, job: Job) -> (Option<Job>, Pending) {
+        let Self {
+            mut states,
+            reports,
+            started,
+            ..
+        } = self;
+        let Context {
+            runner,
+            requests,
+            kv,
+            tensors,
+            events,
+            plan,
+            experts,
+            ..
+        } = context;
+        let reserve = Failure::new("batch registration");
+        let ended = |job: Job, failure: Failure| {
+            if job.is_empty() {
+                (None, Pending::Failed(failure))
+            } else {
+                // What the batch recorded before it failed is still due:
+                // the fences of its predicate reads among it.
+                (Some(job), Pending::Discarding(failure))
+            }
+        };
+        let calls = &plan.calls;
+        let device = runner.buffers.device();
+        let stream = runner.stream.clone();
 
         // The output lease: a step's outcome and block, or a readout's
         // candidate values, per call.
-        let length = self.facts.sequence_length;
+        let length = runner.facts.sequence_length;
         let words = calls.iter().fold(0usize, |total, call| {
             total.saturating_add(match &call.readout {
                 Some(readout) => readout.candidate_count().max(1),
@@ -208,14 +301,19 @@ impl DiffusionLMRunner {
             })
         });
         let devices: Vec<i32> = device.into_iter().collect();
-        let buffer = self
-            .outputs
-            .lease(calls.len(), words.max(calls.len()), &devices, false)
-            .map_err(&reserve)?;
-        if let Some(stream) = stream {
-            lock(&buffer)
-                .begin_device(device, stream, events)
-                .map_err(&reserve)?;
+        let buffer =
+            match runner
+                .outputs
+                .lease(calls.len(), words.max(calls.len()), &devices, false)
+            {
+                Ok(buffer) => buffer,
+                Err(error) => return ended(job, reserve(error)),
+            };
+        if stream.is_some()
+            && let Err(error) = lock(&buffer).begin_device(device, job.on(stream.as_ref()), events)
+        {
+            lock(&buffer).abandon();
+            return ended(job, reserve(error));
         }
 
         let mut reserved = Reserved {
@@ -223,64 +321,126 @@ impl DiffusionLMRunner {
             retirement: Arc::new(Retirement::default()),
         };
         let batch = Batch {
-            runner: self,
+            runner,
             experts,
             requests,
             kv,
             tensors,
             events,
             plan,
-            stream,
-            device,
-            reports,
+            stream: stream.as_ref(),
+            job: &job,
         };
         match batch.run(&mut states, &buffer, &mut reserved) {
-            Ok(mut stats) => {
-                stats.component_us.insert(
-                    "canvas_execute".into(),
-                    started.elapsed().as_micros() as u64,
-                );
-                Ok(Launched {
-                    outputs: states.into_iter().map(|state| state.output).collect(),
+            Ok(recorded) => (
+                Some(job),
+                Pending::Committing(Box::new(Committing {
+                    states,
                     buffer,
+                    writes: reserved.writes,
+                    recorded,
+                    reports,
                     started,
-                    stats,
-                    timer: "canvas_materialize",
-                    host: None,
-                })
-            }
-            Err(failure) if failure.committed => Err(failure),
+                })),
+            ),
             Err(failure) => {
-                // Retire every reservation on the consuming stream; storage
-                // returns once the fences recorded here complete.
+                // Retire every reservation; the lease is sealed in the job,
+                // and its storage returns once the fences recorded there
+                // complete.
                 let abandoned = tensors.abandon_writes(&reserved.writes);
                 let sealed = if lock(&buffer).sealed() {
                     Ok(())
                 } else {
-                    seal(events, &buffer, stream, &reserved.retirement)
+                    seal(
+                        events,
+                        &buffer,
+                        job.on(stream.as_ref()),
+                        &reserved.retirement,
+                    )
                 };
                 lock(&buffer).abandon();
-                if let Err(cleanup) = abandoned.and(sealed) {
-                    return Err(Failure {
-                        error: cleanup,
-                        phase: "batch cleanup",
-                        committed: true,
-                    });
+                match abandoned.and(sealed) {
+                    Ok(()) => ended(job, failure),
+                    Err(cleanup) => ended(job, Failure::fatal("batch cleanup")(cleanup)),
                 }
-                Err(failure)
             }
         }
     }
 }
 
+impl Committing {
+    /// Apply the completion of the batch's last job: store what its
+    /// forward captured, then commit products and pending calls together.
+    fn commit(
+        mut self,
+        runner: &mut DiffusionLMRunner,
+        requests: &mut RequestPool,
+        tensors: &TensorStore,
+        plan: &BatchPlan,
+        completed: Result<Completion>,
+    ) -> std::result::Result<Launched, Failure> {
+        let executed = completed.and_then(|mut completion| {
+            self.recorded
+                .take()
+                .map(|recorded| runner.complete(recorded, &mut completion))
+                .transpose()
+        });
+        let executed = match executed {
+            Ok(executed) => executed,
+            Err(error) => {
+                // The job recorded the lease's seal, and the lane makes a
+                // failed job's remaining event records, so only the
+                // reservations of the host are left to retire.
+                let abandoned = tensors.abandon_writes(&self.writes);
+                lock(&self.buffer).abandon();
+                return Err(match abandoned {
+                    Ok(()) => Failure::new("batch execution")(error),
+                    Err(cleanup) => Failure::fatal("batch cleanup")(cleanup),
+                });
+            }
+        };
+
+        // Every owner accepted its update when the job was recorded. Any
+        // failure from here is fatal.
+        let fatal = Failure::fatal("batch commit");
+        for state in &mut self.states {
+            state.output.reports_output = self.reports;
+        }
+        let pending: Vec<_> = plan
+            .calls
+            .iter()
+            .map(|call| (call.request_key, call.call_id, call.advances_state()))
+            .collect();
+        tensors.commit_writes(&self.writes).map_err(&fatal)?;
+        requests.add_pending(&pending).map_err(&fatal)?;
+
+        let mut stats = ForwardStats::default();
+        if let Some(executed) = executed {
+            record(&mut stats, executed);
+        }
+        stats.component_us.insert(
+            "canvas_execute".into(),
+            self.started.elapsed().as_micros() as u64,
+        );
+        Ok(Launched {
+            outputs: self.states.into_iter().map(|state| state.output).collect(),
+            buffer: self.buffer,
+            started: self.started,
+            stats,
+            timer: "canvas_materialize",
+            host: None,
+        })
+    }
+}
+
 impl RequestStorage for DiffusionLMRunner {
-    fn admit_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         // A request's first denoising step starts its block in the banks
         // before any step reads them; admission resets nothing.
         Ok(())
     }
 
-    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>) -> Result<()> {
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -288,6 +448,7 @@ impl RequestStorage for DiffusionLMRunner {
         &mut self,
         _requests: &HashSet<RequestKey>,
         _retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
     ) -> Result<()> {
         Ok(())
     }
@@ -301,7 +462,7 @@ impl RequestStorage for DiffusionLMRunner {
         Ok(true)
     }
 
-    fn retire_slots(&mut self, _slots: &[usize]) -> Result<()> {
+    fn retire_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 
@@ -311,29 +472,40 @@ impl RequestStorage for DiffusionLMRunner {
     }
 }
 
-/// One batch on the runner.
+/// One batch on the runner, recording into its job.
 struct Batch<'a> {
-    runner: &'a mut DiffusionLMRunner,
-    experts: Option<&'a ExpertRuntime>,
+    runner: &'a DiffusionLMRunner,
+    experts: Option<&'a Arc<ExpertUnion>>,
     requests: &'a mut RequestPool,
     kv: &'a mut KVCache,
     tensors: &'a TensorStore,
     events: &'a Arc<EventPool>,
     plan: &'a BatchPlan,
     stream: Option<&'a Stream>,
-    device: Option<i32>,
-    reports: bool,
+    job: &'a Job,
 }
 
 impl Batch<'_> {
+    /// The expert steps of this runner's forwards.
+    fn expert(&self) -> Option<Expert<'_>> {
+        self.experts.map(|union| Expert {
+            union,
+            kind: expert_kind(self.runner.index),
+            forced: None,
+        })
+    }
+
+    /// Record the batch up to the seal of its lease; the forward it
+    /// recorded, when a call is active.
     fn run(
         mut self,
         states: &mut [CallState],
         buffer: &OutputLease,
         reserved: &mut Reserved,
-    ) -> std::result::Result<ForwardStats, Failure> {
+    ) -> std::result::Result<Option<Recorded>, Failure> {
         let reserve = Failure::new("batch registration");
         let plan = self.plan;
+        let issue = self.job.on(self.stream);
         let calls = &plan.calls;
         let slots: HashSet<u32> = states
             .iter()
@@ -355,9 +527,7 @@ impl Batch<'_> {
             .filter(|table| slots.contains(&table.request_pool_idx))
             .cloned()
             .collect();
-        self.kv
-            .install(&assignments, self.stream)
-            .map_err(&reserve)?;
+        self.kv.install(&assignments, issue).map_err(&reserve)?;
 
         // Every active call retains the prefix it reads until the batch's
         // device work retires. A windowed group starts at its first
@@ -391,7 +561,11 @@ impl Batch<'_> {
             .zip(states.iter())
             .map(|(call, state)| (call.request_key, state.slot as usize))
             .collect();
-        let target = self.device.map_or(Device::Cpu, Device::Cuda);
+        let target = self
+            .runner
+            .buffers
+            .device()
+            .map_or(Device::Cpu, Device::Cuda);
         let mut flags: Vec<(TensorRef, Device)> = Vec::new();
         for call in calls {
             if !call.outputs.is_empty()
@@ -444,14 +618,14 @@ impl Batch<'_> {
         for state in states.iter().filter(|state| !state.active) {
             if let Some(write) = &state.completion {
                 self.tensors
-                    .write_scalar(write, crate::storage::Scalar::Int(0), self.stream)
+                    .write_scalar(write, crate::storage::Scalar::Int(0), issue)
                     .map_err(&reserve)?;
             }
         }
 
         let active: Vec<usize> = (0..calls.len()).filter(|&row| states[row].active).collect();
         let execute = Failure::new("batch execution");
-        let mut stats = ForwardStats::default();
+        let mut recorded = None;
         if let Some(&first) = active.first() {
             let steps = calls[first].canvas.is_some();
             if active
@@ -463,25 +637,25 @@ impl Batch<'_> {
                 )));
             }
             let rows = calls::rows_by_call(plan).map_err(&execute)?;
-            let mode = if steps {
+            recorded = Some(if steps {
                 self.steps(states, &active, &rows, buffer)?
             } else {
                 self.readouts(states, &active, &rows, buffer)?
-            };
-            record(&mut stats, mode);
+            });
         }
-        self.commit(states, buffer, reserved)?;
-        Ok(stats)
+        self.seal(states, buffer, reserved)?;
+        Ok(recorded)
     }
 
-    /// Run the active readouts as one pass and capture their candidates.
+    /// Record the active readouts as one pass and the copies of their
+    /// candidates.
     fn readouts(
         &mut self,
         states: &mut [CallState],
         active: &[usize],
         rows: &[Vec<usize>],
         buffer: &OutputLease,
-    ) -> std::result::Result<Executed, Failure> {
+    ) -> std::result::Result<Recorded, Failure> {
         let execute = Failure::new("batch execution");
         let calls = &self.plan.calls;
         let mut readouts = Readouts::new();
@@ -519,12 +693,12 @@ impl Batch<'_> {
         // Candidate values arrive in passes over the bound buffer; each pass
         // is copied to the lease per call, so a call's words stay adjacent.
         let mut spans: Vec<Option<(usize, usize)>> = vec![None; active.len()];
-        let (stream, events) = (self.stream, self.events);
-        let mut coordinate = coordinator(self.experts, None);
+        let (issue, events) = (self.job.on(self.stream), self.events);
+        let expert = self.expert();
         let executed = {
             let mut output = lock(buffer);
             self.runner
-                .readout(&pass, &mut coordinate, |range, values| {
+                .readout(&pass, expert.as_ref(), self.job, |range, values| {
                     for (call, candidates) in ranges.iter().enumerate() {
                         let start = range.start.max(candidates.start);
                         let end = range.end.min(candidates.end);
@@ -535,7 +709,7 @@ impl Batch<'_> {
                         let source = values
                             .narrow(0, (start - range.start) as i64, (end - start) as i64)?
                             .reshape(crate::ffi::DType::U32, &[(end - start) as i64])?;
-                        let (offset, count) = output.capture(&source, stream, events)?;
+                        let (offset, count) = output.capture(&source, issue, events)?;
                         spans[call] = Some(match spans[call] {
                             None => (offset, count),
                             Some((first, total)) if first + total == offset => {
@@ -567,14 +741,15 @@ impl Batch<'_> {
         Ok(executed)
     }
 
-    /// Step the active calls' blocks once and capture their results.
+    /// Record one step of the active calls' blocks and the copies of
+    /// their results.
     fn steps(
         &mut self,
         states: &mut [CallState],
         active: &[usize],
         rows: &[Vec<usize>],
         buffer: &OutputLease,
-    ) -> std::result::Result<Executed, Failure> {
+    ) -> std::result::Result<Recorded, Failure> {
         let execute = Failure::new("batch execution");
         let calls = &self.plan.calls;
         let served = self.runner.sampling;
@@ -615,21 +790,22 @@ impl Batch<'_> {
             .tables()
             .prepare_attention(&attention, |_, _, _| Ok(()))
             .map_err(&execute)?;
-        let mut coordinate = coordinator(self.experts, None);
+        let issue = self.job.on(self.stream);
+        let expert = self.expert();
         let executed = self
             .runner
-            .denoise(&steps, &pages, &mut coordinate)
+            .denoise(&steps, &pages, expert.as_ref(), self.job)
             .map_err(&execute)?;
 
         // One copy of every row's `[outcome | block]` result.
         let results = self
             .runner
             .buffers
-            .view("denoise.results")
+            .column("denoise.results")
             .and_then(|results| results.prefix(steps.len() as i64))
             .map_err(&execute)?;
         let (offset, _) = lock(buffer)
-            .capture(&results, self.stream, self.events)
+            .capture(&results, issue, self.events)
             .map_err(&execute)?;
         let width = 1 + length;
         for (position, &row) in active.iter().enumerate() {
@@ -643,7 +819,7 @@ impl Batch<'_> {
         let continued = self
             .runner
             .buffers
-            .view("denoise.continued")
+            .column("denoise.continued")
             .map_err(&execute)?;
         let mut start = 0;
         while start < active.len() {
@@ -666,15 +842,17 @@ impl Batch<'_> {
                 })
                 .map_err(&execute)?;
             self.tensors
-                .write_scalars(&writes, &values, self.stream)
+                .write_scalars(&writes, &values, issue)
                 .map_err(&execute)?;
             start = end;
         }
         Ok(executed)
     }
 
-    /// Validate every owner's update, then commit them together.
-    fn commit(
+    /// Validate every owner's update and record the seal of the lease.
+    /// The updates are committed once the job completed
+    /// ([`Committing::commit`]).
+    fn seal(
         &mut self,
         states: &mut [CallState],
         buffer: &OutputLease,
@@ -690,24 +868,20 @@ impl Batch<'_> {
         self.tensors
             .validate_writes(&reserved.writes)
             .map_err(&fail)?;
-        seal(self.events, buffer, self.stream, &reserved.retirement).map_err(&fail)?;
-        for state in states.iter_mut() {
-            state.output.reports_output = self.reports;
-        }
+        seal(
+            self.events,
+            buffer,
+            self.job.on(self.stream),
+            &reserved.retirement,
+        )
+        .map_err(&fail)?;
         let pending: Vec<_> = self
             .plan
             .calls
             .iter()
             .map(|call| (call.request_key, call.call_id, call.advances_state()))
             .collect();
-        self.requests.validate_pending(&pending).map_err(&fail)?;
-
-        // Every owner accepted its update. Any failure from here is fatal.
-        let writes = std::mem::take(&mut reserved.writes);
-        self.tensors
-            .commit_writes(&writes)
-            .map_err(Failure::fatal)?;
-        self.requests.add_pending(&pending).map_err(Failure::fatal)
+        self.requests.validate_pending(&pending).map_err(&fail)
     }
 }
 
@@ -730,45 +904,169 @@ fn record(stats: &mut ForwardStats, executed: Executed) {
     }
 }
 
-/// Execute a batch of `kind` calls: launch it, or report every call failed
-/// when it fails before its commit point.
-pub(crate) fn execute(
-    backend: &mut WorkerBackend,
-    batch: &mut WorkerBatch,
+/// The owners a diffusion LM batch of `plan` runs on, or the refusal of
+/// a rank that has no runner for its component.
+fn context<'a>(
+    parts: crate::executor::backend::Parts<'a>,
+    plan: &'a BatchPlan,
+    experts: Option<&'a Arc<ExpertUnion>>,
     kind: CallKind,
-) -> std::result::Result<(), WorkerError> {
-    let plan = Arc::clone(batch.shared_plan());
-    let predecessors = batch.predecessors().to_vec();
-    let parts = backend.parts();
-    let (Some(runner), Some(storage)) = (parts.diffusion_lm, parts.storage) else {
-        return Err(crate::executor::forward::unsupported(kind, "diffusion LM"));
+) -> std::result::Result<Context<'a>, WorkerError> {
+    // A batch carries calls of one component, which names its runner.
+    let component = plan.calls.first().map(|call| call.component.as_str());
+    let runner = parts
+        .diffusion_lm
+        .iter_mut()
+        .find(|runner| Some(runner.component.as_str()) == component);
+    let Some(runner) = runner else {
+        return Err(WorkerError::classify(
+            Error::Unsupported(format!(
+                "component {:?} has no diffusion LM runner on this rank",
+                component.unwrap_or_default()
+            )),
+            None,
+        ));
     };
-    let RankStorage {
+    let Some(RankStorage {
         kv: Some(kv),
         tensors,
         events,
         ..
-    } = storage
+    }) = parts.storage
     else {
         return Err(crate::executor::forward::unsupported(kind, "diffusion LM"));
     };
-    let context = Context {
+    Ok(Context {
         info: parts.info,
         rank: parts.rank,
+        runner,
         requests: parts.requests,
         kv,
         tensors,
         events,
+        plan,
         text: parts.text.map(|text| text.order()),
-        experts: parts.experts,
+        experts,
+    })
+}
+
+/// The next job of a diffusion LM batch on its lane, or `None` when the
+/// batch advanced without one: it failed and its calls are reported.
+pub(crate) fn forward<'a>(
+    backend: &'a mut WorkerBackend,
+    batch: &'a mut WorkerBatch,
+    kind: CallKind,
+) -> std::result::Result<Option<Job>, WorkerError> {
+    let experts = backend.experts().cloned();
+    let state = match batch.denoising_parts().1.take() {
+        Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
+        state => state,
     };
-    let failure = match runner.forward(context, &plan) {
-        Ok(launched) => {
-            batch.launch(launched);
-            return Ok(());
+    let (plan, pending) = batch.denoising_parts();
+    let mut context = context(backend.parts(), plan, experts.as_ref(), kind)?;
+
+    let job = Job::new();
+    let (job, next) = match state {
+        None => match Opening::open(&mut context, &job) {
+            Ok(opening) if !opening.predicated.is_empty() => {
+                (Some(job), Pending::Predicates(opening))
+            }
+            Ok(opening) => opening.run(context, job),
+            Err(error) => {
+                let failure = Failure::new("batch registration")(error);
+                if job.is_empty() {
+                    (None, Pending::Failed(failure))
+                } else {
+                    // The fences the opening recorded are still due.
+                    (Some(job), Pending::Discarding(failure))
+                }
+            }
+        },
+        Some(Pending::Opened(opening)) => opening.run(context, job),
+        Some(
+            state @ (Pending::Predicates(_)
+            | Pending::Committing(_)
+            | Pending::Discarding(_)
+            | Pending::Failed(_)),
+        ) => {
+            // A job of the batch is on the lane: its completion comes
+            // before the next job.
+            *pending = Some(state);
+            return Err(WorkerError::classify(
+                Error::Invariant(
+                    "a diffusion LM batch's job was prepared before its last completed".into(),
+                ),
+                Some("diffusion LM batch"),
+            ));
         }
-        Err(failure) => failure,
     };
+    *pending = Some(next);
+    Ok(job)
+}
+
+/// Apply the completion of the diffusion LM batch's job on the lane.
+pub(crate) fn complete(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    completion: Completion,
+) -> std::result::Result<(), WorkerError> {
+    let (_, pending) = batch.denoising_parts();
+    let next = match (pending.take(), completion.check()) {
+        // A predicate that could not be read fails the batch, which has
+        // reserved nothing yet.
+        (Some(Pending::Predicates(_)), Err(failure)) => {
+            Pending::Failed(Failure::new("batch registration")(failure.error))
+        }
+        (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
+            match opening.predicates(&mut completion) {
+                Ok(()) => Pending::Opened(opening),
+                Err(error) => Pending::Failed(Failure::new("batch registration")(error)),
+            }
+        }
+        (Some(Pending::Committing(committing)), completed) => {
+            let (plan, _) = batch.denoising_parts();
+            let Context {
+                runner,
+                requests,
+                tensors,
+                ..
+            } = context(backend.parts(), plan, None, KIND)?;
+            let completed = completed.map_err(|failure| failure.error);
+            match committing.commit(runner, requests, tensors, plan, completed) {
+                Ok(launched) => {
+                    batch.launch(launched);
+                    batch.set_stage(Stage::Done);
+                    return Ok(());
+                }
+                Err(failure) => Pending::Failed(failure),
+            }
+        }
+        // What the failed batch recorded could not be ended: storage it
+        // fenced stays reserved, and the rank cannot reuse it safely.
+        (Some(Pending::Discarding(_)), Err(failure)) => {
+            Pending::Failed(Failure::fatal("batch cleanup")(failure.error))
+        }
+        (Some(Pending::Discarding(failure)), Ok(_)) => Pending::Failed(failure),
+        (state, _) => {
+            *batch.denoising_parts().1 = state;
+            return Err(WorkerError::classify(
+                Error::Invariant("a diffusion LM batch has no job on its lane".into()),
+                Some("diffusion LM batch"),
+            ));
+        }
+    };
+    *batch.denoising_parts().1 = Some(next);
+    Ok(())
+}
+
+/// Report a failed batch: a failure of its commit stops the rank, any
+/// other completes the batch with its calls failed.
+fn fail(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    failure: Failure,
+) -> std::result::Result<(), WorkerError> {
+    let plan = Arc::clone(batch.shared_plan());
     let mut error = WorkerError::classify(failure.error, Some(failure.phase));
     if failure.committed {
         // Products and pending calls may already be visible; the rank cannot
@@ -790,12 +1088,13 @@ pub(crate) fn execute(
     let output = failed_output(
         backend.requests(),
         &plan,
-        &predecessors,
+        batch.predecessors(),
         error_code(error.code),
     )?;
     batch.complete(BatchResult {
         output,
         media: Vec::new(),
     });
+    batch.set_stage(Stage::Done);
     Ok(())
 }

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d32};
 
 use super::{BlockTableUpdate, GroupShape};
-use crate::ffi::{Backing, DType, Device};
+use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView};
+use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
 /// Byte alignment of each carved table inside the shared allocation.
@@ -223,7 +224,7 @@ impl BlockTableStorage {
     /// tail of a longer previous row), then start pages and lengths. The
     /// host payload is consumed during the call, so installs never wait on
     /// the device. Commit the update on the host after this succeeds.
-    pub fn install(&self, update: &BlockTableUpdate, stream: Option<&Stream>) -> Result<()> {
+    pub fn install(&self, update: &BlockTableUpdate, stream: impl Issue) -> Result<()> {
         let width = self.width as usize;
         let mut payload: Vec<i32> = Vec::with_capacity(
             update.rows.len() * width + update.start_values.len() + update.length_values.len(),
@@ -275,42 +276,27 @@ impl BlockTableStorage {
         &self,
         entries: &[(u64, usize, usize)],
         payload: &[i32],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
-        match (self.device, stream) {
-            (Some(_), Some(stream)) => {
-                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                for &(address, first, words) in entries {
-                    batch.push(address, payload[first..].as_ptr() as u64, words * 4);
-                }
-                // SAFETY: destinations lie inside this allocation and never
-                // overlap (one entry per changed row, start and slot length);
-                // the driver reads the pageable payload during the call.
-                unsafe { batch.submit(stream) }.map_err(Error::from)
-            }
-            (None, None) => {
-                for &(address, first, words) in entries {
-                    // SAFETY: host tables owned by this value; the caller
-                    // serializes table writes with their readers.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            payload[first..].as_ptr(),
-                            address as *mut i32,
-                            words,
-                        );
-                    }
-                }
-                Ok(())
-            }
-            _ => Err(Error::Invalid(
+        if self.device.is_some() != stream.stream().is_some() {
+            return Err(Error::Invalid(
                 "block-table writes use a stream exactly for device tables".into(),
-            )),
+            ));
         }
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        for &(address, first, words) in entries {
+            batch.push(address, payload[first..].as_ptr() as u64, words * 4);
+        }
+        // SAFETY: destinations lie inside this allocation and never overlap
+        // (one entry per changed row, start and slot length); the payload
+        // is read during the call. Host tables are written in the order of
+        // their readers.
+        unsafe { stream.copy(&batch) }
     }
 
     /// Zero released slots' rows, start pages and lengths on `stream`, which
     /// must be ordered after every batch that reads those rows.
-    pub fn clear(&self, slots: &[u32], stream: Option<&Stream>) -> Result<()> {
+    pub fn clear(&self, slots: &[u32], stream: impl Issue) -> Result<()> {
         let mut entries: Vec<(u64, u64, usize)> = Vec::new();
         for &slot in slots {
             self.require_slot(slot)?;
@@ -340,47 +326,28 @@ impl BlockTableStorage {
                 4,
             ));
         }
-        match (self.device, stream) {
-            (Some(_), Some(stream)) => {
-                let mut batch = CopyBatch::new(SourceOrder::Stream);
-                for &(destination, source, bytes) in &entries {
-                    batch.push(destination, source, bytes);
-                }
-                // SAFETY: destinations are distinct entries of this allocation
-                // (callers deduplicate slots) and the zero row is never written.
-                unsafe { batch.submit(stream) }.map_err(Error::from)
-            }
-            (None, None) => {
-                for &(destination, _, bytes) in &entries {
-                    // SAFETY: host tables owned by this value.
-                    unsafe { std::ptr::write_bytes(destination as *mut u8, 0, bytes) };
-                }
-                Ok(())
-            }
-            _ => Err(Error::Invalid(
-                "block-table writes use a stream exactly for device tables".into(),
-            )),
+        let mut batch = CopyBatch::new(SourceOrder::Stream);
+        for &(destination, source, bytes) in &entries {
+            batch.push(destination, source, bytes);
         }
+        // SAFETY: destinations are distinct entries of this allocation
+        // (callers deduplicate slots) and the zero row is never written.
+        unsafe { stream.copy(&batch) }
     }
 
     /// Set a slot's verified KV length after an import installed `extent`
     /// tokens. The caller checked `extent` against the slot's allocation.
-    pub fn set_verified(&self, slot: u32, extent: u32, stream: Option<&Stream>) -> Result<()> {
+    pub fn set_verified(&self, slot: u32, extent: u32, stream: impl Issue) -> Result<()> {
         self.require_slot(slot)?;
         let address = self.entry(&self.verified_lengths, u64::from(slot));
-        match (self.verified_lengths.device(), stream) {
-            // SAFETY: one aligned word of this allocation.
-            (Device::Cuda(_), Some(stream)) => {
-                unsafe { memset_d32(address, extent, 1, stream) }.map_err(Error::from)
-            }
-            (Device::Cpu, None) => {
-                // SAFETY: host tables owned by this value.
-                unsafe { (address as *mut u32).write(extent) };
-                Ok(())
-            }
-            _ => Err(Error::Invalid(
-                "block-table writes use a stream exactly for device tables".into(),
-            )),
+        // SAFETY: one aligned word of this allocation.
+        unsafe {
+            stream.fill(Fill {
+                address,
+                value: extent,
+                width: 4,
+                count: 1,
+            })
         }
     }
 }

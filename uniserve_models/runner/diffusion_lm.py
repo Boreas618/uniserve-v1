@@ -25,9 +25,10 @@ constructor: the banks with one row per request slot (slot zero is the
 padding sentinel). The tensors of one forward are parameters of its method.
 Every value that changes between forwards is the contents of a tensor, the
 sampler derives its random bits on the device from the seed, block and step
-columns, and no method keeps state between calls, so each method is captured
-into one CUDA graph per shape (:meth:`DiffusionLMRunner.capture`) and
-launched without Python.
+columns, and no method keeps state between calls. The caller captures a
+method into one CUDA graph per shape by calling it between
+``graphs.begin_capture`` and ``graphs.end_capture`` after one eager call of
+the same shape, and launches the graph without Python.
 
 Attention operators that plan a launch on the host read the host mirrors of
 the lengths; :meth:`DiffusionLMRunner.plan_attention` builds their plans
@@ -45,9 +46,9 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from uniserve_models.bindings import capturing
 from uniserve_models.diffusion import canvas as sampler
-from uniserve_models.interface import graphs
-from uniserve_models.model import DiffusionLM, DiffusionLMInput
+from uniserve_models.model import DiffusionLM, DiffusionLMInput, TextSize
 from uniserve_models.model.logits import Logits
 from uniserve_models.nn.attention import (
     AttentionBatch,
@@ -56,13 +57,22 @@ from uniserve_models.nn.attention import (
     SequenceLengths,
 )
 from uniserve_models.nn.moe import FusedMoE
+from uniserve_models.runner.context import execution_context, kernel_records
 
 __all__ = [
     "STEP_CONTINUED",
     "STEP_SKIPPED",
     "STEP_STOPPED",
     "DiffusionLMRunner",
-    "describe",
+    "attend_widths",
+    "compute_dtype",
+    "embedding_dtype",
+    "exchanges_readout",
+    "generates",
+    "hidden_size",
+    "sequence_length",
+    "stage",
+    "vocab_size",
     "workspace_bytes",
 ]
 
@@ -109,68 +119,76 @@ def _tail_exchanges(
     )
 
 
-def describe(
+def _placed(loaded, path: str) -> DiffusionLM:
+    """The diffusion LM at ``path`` of a loaded model."""
+    path = str(path)
+    root = loaded.module
+    return _model(root.get_submodule(path) if path else root)
+
+
+# Facts of the diffusion LM at ``path`` of a loaded model, which a caller
+# sizes its tensors from before a runner exists. Each is the model's own
+# read-only method of the same name; the functions exist because a rank
+# reaches the library by import path with values it can hold, and a module
+# is not one (a callable object crosses as a function).
+
+
+def sequence_length(loaded, path: str) -> int:
+    """Tokens of one generated block."""
+    return _placed(loaded, path).sequence_length()
+
+
+def vocab_size(loaded, path: str) -> int:
+    """Real vocabulary entries, the same on every pipeline stage."""
+    return _placed(loaded, path).vocab_size()
+
+
+def hidden_size(loaded, path: str) -> int:
+    """The width of the hidden states and token embeddings."""
+    return _placed(loaded, path).hidden_size()
+
+
+def compute_dtype(loaded, path: str) -> str:
+    """The name of the element type the layers compute in."""
+    return _placed(loaded, path).compute_dtype()
+
+
+def embedding_dtype(loaded, path: str) -> str:
+    """The name of the token embedding's element type."""
+    return _placed(loaded, path).embedding_dtype()
+
+
+def attend_widths(loaded, path: str) -> list[int]:
+    """Per-token widths of the state ``attend`` writes on the last stage."""
+    return _placed(loaded, path).attend_widths()
+
+
+def stage(loaded, path: str) -> list[int]:
+    """``[rank, size]`` of this rank in the model's pipeline."""
+    return _placed(loaded, path).stage()
+
+
+def generates(loaded, path: str) -> bool:
+    """Whether this rank can denoise blocks."""
+    return _placed(loaded, path).generates()
+
+
+def exchanges_readout(
     loaded, path: str, exchange: bool, attention_ranks: int
-) -> dict[str, Any]:
-    """Describe the diffusion LM at ``path`` of a loaded model.
+) -> bool:
+    """Whether ``readout`` of the model exchanges tokens across ranks.
 
     ``exchange`` says routed experts communicate through an expert exchange
     and ``attention_ranks`` counts the attention ranks of a disaggregated
-    expert union (zero when every rank holds its experts).
-
-    Returns:
-        ``sequence_length`` (tokens of one generated block), ``vocab_size``
-        (unpadded), ``hidden_size``, ``dtype`` (the self-conditioning
-        embedding dtype; the compute dtype on a stage without the
-        embedding), ``eos_token_ids``, ``pad_token_id``, ``attend_widths``
-        (per-token widths of the final stage's ``attend`` state, empty on
-        other stages), ``attend_dtype``, ``generates`` (this rank denoises
-        resident blocks: one pipeline stage holding the unsharded embedding
-        table the sampler embeds every distribution with), ``local_tail``
-        (``readout`` exchanges no tokens across ranks, so it runs once per
-        slot chunk), ``pipeline_rank`` and ``pipeline_size``.
-
-    FIXME: the facts cross as one map read by key; they belong in read-only
-    runner methods returning scalars or flat lists.
+    expert union (zero when every rank holds its experts). A ``readout``
+    that exchanges runs once over every slot of a forward; one that does
+    not runs once per slot chunk and is captured per slot bucket.
     """
-    path = str(path)
-    root = loaded.module
-    model = _model(root.get_submodule(path) if path else root)
-    backbone = model.backbone
-    pipeline = backbone._pipeline
-    last = pipeline.rank == pipeline.size - 1
-    embedding = backbone.embedding
-    head = model.lm_head
-    stream_dtype = next(backbone.layers.parameters()).dtype
-
-    def name(dtype: torch.dtype) -> str:
-        return str(dtype).removeprefix("torch.")
-
-    return {
-        "sequence_length": model.canvas.length,
-        # Every stage validates candidate ids against the same vocabulary.
-        "vocab_size": head.vocab.size
-        if last and head is not None
-        else backbone.vocab_size,
-        "hidden_size": backbone.hidden_size,
-        "dtype": name(
-            stream_dtype if embedding is None else _table(embedding).dtype
-        ),
-        "eos_token_ids": list(model.canvas.eos_token_ids),
-        "pad_token_id": model.canvas.pad_token_id,
-        "attend_widths": list(backbone.attend_widths) if last else [],
-        "attend_dtype": name(stream_dtype),
-        "generates": pipeline.size == 1
-        and embedding is not None
-        and embedding.group.size == 1,
-        "local_tail": not _tail_exchanges(
-            model,
-            exchange=bool(exchange),
-            attention_ranks=int(attention_ranks),
-        ),
-        "pipeline_rank": pipeline.rank,
-        "pipeline_size": pipeline.size,
-    }
+    return _tail_exchanges(
+        _placed(loaded, path),
+        exchange=bool(exchange),
+        attention_ranks=int(attention_ranks),
+    )
 
 
 def workspace_bytes(
@@ -239,9 +257,21 @@ class DiffusionLMRunner:
     """The forwards of one diffusion language model on one stream.
 
     Args:
-        prepared: The prepared component: its module is the ``DiffusionLM``
-            and its execution context holds the operators and the prefix
-            cache on the runner's stream.
+        loaded: The loaded model.
+        path: The ``DiffusionLM``'s module path in it.
+        stream: The CUDA stream handle every forward enqueues on (0 for the
+            current stream).
+        scratch: The stream's shared work areas, which the runner's
+            execution context borrows.
+        cache: The prefix cache view object the attention layers read.
+        experts: The expert exchange of an expert-parallel deployment, or
+            ``None``.
+        weights: The distributed expert weights' prefetch object, or
+            ``None``.
+        collectives: The ``NativeCollectives`` of the model's communicators
+            on the stream, or ``None``.
+        tokens: The most tokens one forward evaluates.
+        rows: The most sequences one forward evaluates.
         page_tokens: Tokens per page of each numerical block table.
         windowed: Whether each numerical block table retires pages behind
             an attention window.
@@ -258,12 +288,22 @@ class DiffusionLMRunner:
             latest distribution.
         bank_live: ``[S]`` uint8, whether each slot's block continues.
 
-    A generating runner allocates its sampler workspace here.
+    The runner prepares its execution context here, for the largest
+    forward, and a generating runner allocates its sampler workspace.
     """
 
     def __init__(
         self,
-        prepared,
+        loaded,
+        path: str,
+        stream: int,
+        scratch,
+        cache,
+        experts,
+        weights,
+        collectives,
+        tokens: int,
+        rows: int,
         page_tokens: Sequence[int],
         windowed: Sequence[int],
         chunk_rows: int,
@@ -278,17 +318,27 @@ class DiffusionLMRunner:
         bank_self_conditioning: torch.Tensor | None = None,
         bank_live: torch.Tensor | None = None,
     ) -> None:
-        context = prepared.context
-        if context is None:
-            raise ValueError("a runner requires a bound component")
-        self._context = context
-        self._model = _model(prepared.module)
+        self._model = _placed(loaded, path)
+        context = execution_context(
+            self._model,
+            int(stream),
+            loaded.attention,
+            scratch,
+            cache=cache,
+            experts=experts,
+            weights=weights,
+            collectives=collectives,
+        )
+        context.prepare(TextSize(int(tokens), int(rows)))
+        # Expert joins of the rank run through this context.
+        self.context = self._context = context
         self._page_tokens = tuple(int(value) for value in page_tokens)
         self._windowed = tuple(bool(value) for value in windowed)
 
         backbone = self._model.backbone
         self._pipeline = backbone._pipeline
         self._last = self._pipeline.rank == self._pipeline.size - 1
+        self._device = next(backbone.layers.parameters()).device
         self._length = self._model.canvas.length
 
         # With an exchanging final layer, a readout's expert step spans
@@ -305,10 +355,6 @@ class DiffusionLMRunner:
         self._attended = context.expert_layers(
             self._model
         ) - context.expert_layers(final)
-
-        # The allocator pool and the result of a capture in progress.
-        self._pool = None
-        self._graph: graphs.Graph | None = None
 
         self._chunk_rows = int(chunk_rows)
         # The embedding table the sampler embeds every distribution with.
@@ -360,6 +406,10 @@ class DiffusionLMRunner:
                 device=table.device,
             )
 
+    def close(self) -> None:
+        """Release the execution context after every graph retired."""
+        self._context.close()
+
     # Facts.
 
     def plans_attention(self) -> bool:
@@ -371,14 +421,19 @@ class DiffusionLMRunner:
         """
         return self._context.plans_attention()
 
-    def kernels(self) -> list[dict[str, Any]]:
-        """Kernel records of the sampler's self-conditioning product.
+    def kernels(self) -> list[str]:
+        """Kernel records of the model's layers and of the sampler.
 
-        On CUDA, one ``product`` record per chunk shape the product has run:
-        its positions, vocabulary and hidden sizes and the cuBLASLt
-        algorithm it uses.
+        The selected kernel of every operator of the execution context,
+        then, on CUDA, one ``product`` record per chunk shape the sampler's
+        self-conditioning product has run: its positions, vocabulary and
+        hidden sizes and the cuBLASLt algorithm it uses. Each record is the
+        text of one JSON object.
         """
-        records: list[dict[str, Any]] = []
+        return kernel_records(self._kernels())
+
+    def _kernels(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = list(self._context.kernels())
         workspace, table = self._workspace, self._table
         if (
             workspace is None
@@ -816,60 +871,14 @@ class DiffusionLMRunner:
     def _forward(
         self, batch: AttentionBatch | None, body: Callable[[], None]
     ) -> None:
-        """Run a forward's numerical work eagerly, or record it.
+        """Run a forward's numerical work on the runner's stream.
 
         ``batch`` is the attention the body reads (``None`` without
-        attention). During :meth:`capture` the body is recorded into a
-        graph instead of run.
+        attention). An eager forward plans it here; a forward that is being
+        captured reads the plans of the eager call that preceded it.
         """
         context = self._context
-        if batch is not None:
-            context.bind_attention(batch)
-        if self._pool is None:
-            with context.activate(), torch.inference_mode():
-                body()
-            return
-        # Distributed expert weights submit peer reads between segments.
-        segments = None if context.weights is None else context.weights.capture
-        with context.activate():
-            self._graph = graphs.capture(
-                body, stream=context.stream, pool=self._pool, segments=segments
-            )
-
-    # Graphs.
-
-    def capture(self, pool, method: str, *arguments) -> list[Any]:
-        """Capture one forward: ``method`` called with ``arguments``.
-
-        The caller ran the same call eagerly first, so lazy initialization
-        and algorithm selection (which may synchronize the device) happened
-        outside the capture. The graph addresses the tensors among
-        ``arguments``; launching it runs the forward on their contents.
-
-        Returns:
-            ``[graph, executables]`` (:func:`graphs.export`).
-
-        FIXME: a capture belongs between ``capture_begin`` and
-        ``capture_end`` issued by the control plane. It is recorded here
-        because a distributed expert weight prefetch splits the graph at
-        calls the execution context's activation must bracket.
-        """
-        self._pool = pool
-        try:
-            getattr(self, str(method))(*arguments)
-            graph = self._graph
-            if graph is None:
-                raise ValueError(f"{method} is not a forward of the runner")
-            return graphs.export(graph)
-        finally:
-            self._pool = self._graph = None
-
-    def replay(self, graph: graphs.Graph) -> None:
-        """Run a captured forward whose segments have graph breaks.
-
-        FIXME: the caller launches a one-segment graph itself; the breaks
-        of a distributed expert weight prefetch are Python calls, which run
-        here inside the execution context's activation.
-        """
-        with self._context.activate():
-            graph.replay()
+        with torch.inference_mode(), context.activate():
+            if batch is not None and not capturing(self._device):
+                context.bind_attention(batch)
+            body()

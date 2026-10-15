@@ -6,10 +6,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use uniserve_cuda::Event;
 
 use super::vmm_pool::{PoolChunk, VmmPool};
-use super::{Capacity, DescriptorGrants, Retirement, SharedBuffer, Spans, notify};
+use super::{
+    Capacity, DRAIN_LIMIT, DescriptorGrants, Retirement, SharedBuffer, Spans, drain_event, notify,
+};
 use crate::host::{HostAction, HostTask};
 use crate::storage::memory::Memory;
 use crate::{Error, EventPool, Outcome, Result};
+use std::time::Instant;
 
 /// A device's VMM export pool, shared by the exports placed in it.
 pub(crate) type SharedPool = Arc<Mutex<VmmPool<Arc<Memory>>>>;
@@ -120,10 +123,12 @@ impl TransportBuffer {
         matches!(&*self.lock(), Backing::Shared(storage) if storage.is_cuda())
     }
 
-    /// Wait on the host for the producer's last write (shutdown only).
+    /// Wait on the host for the producer's last write, at most
+    /// [`DRAIN_LIMIT`] (shutdown only: no executor is left to route a
+    /// completion).
     pub(crate) fn drain(&self) -> Result<()> {
         if let Some(event) = self.event() {
-            event.synchronize()?;
+            drain_event(&event, Instant::now() + DRAIN_LIMIT)?;
         } else if let Backing::Shared(storage) = &*self.lock() {
             storage.synchronize()?;
         }
@@ -160,12 +165,9 @@ impl TransportBuffer {
         let retirement = SourceRetirement { buffer, completion };
         match event {
             Some(event) => {
-                events.defer(
-                    vec![Arc::clone(&event)],
-                    Box::new(move || retirement.finish()),
-                )?;
-                events.wake_after(&event)?;
-                events.reap()
+                // The producer's fence was recorded when the buffer was
+                // exported, by a job submitted since or at once.
+                events.defer(vec![event], Box::new(move || retirement.finish()))
             }
             None => retirement.finish(),
         }

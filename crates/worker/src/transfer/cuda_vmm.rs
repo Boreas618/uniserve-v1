@@ -21,10 +21,12 @@ use uniserve_ipc::{Locator, TransferTransport};
 use super::endpoint::Endpoint;
 use super::read::{ACKNOWLEDGED, CLAIMED, NativeRead};
 use super::source::{CudaSource, SharedPool, TransportBuffer};
+use super::transport::Staged;
 use super::vmm_pool::{ACK_SLOTS, VmmPool};
 use super::{Capacity, DescriptorGrants, Spans, copy_planner, fetch_descriptor};
 use crate::ffi::{Backing, Device};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
+use crate::stream::Issue;
 use crate::{Error, EventPool, Result};
 
 /// Bytes of one reader acknowledgment word in a pooled chunk's header.
@@ -49,6 +51,9 @@ struct FailedExport {
 /// The outcome of one export attempt.
 pub(crate) enum Exported {
     Located(Box<Locator>),
+    /// The export's location is complete once the work it issued was
+    /// performed ([`Transport::locate`]).
+    Staged(Box<Staged>),
     /// The payload does not fit the device's export pool; another mechanism
     /// that reaches the consumers may carry it.
     PoolExhausted,
@@ -116,12 +121,17 @@ impl CudaExports {
     pub(crate) fn export(
         &self,
         source: &Spans,
-        stream: &Stream,
+        issue: impl Issue,
         consumers: &[usize],
         capacity: &Arc<Capacity>,
         events: &EventPool,
         locate: impl FnOnce(TransferTransport) -> Result<Locator>,
     ) -> Result<Exported> {
+        if issue.stream().is_none() {
+            return Err(Error::Invalid(
+                "a device export requires its producer stream".into(),
+            ));
+        }
         let Device::Cuda(device) = source.device() else {
             return Err(Error::Invalid(
                 "cuda_vmm transport requires a CUDA tensor".into(),
@@ -131,7 +141,7 @@ impl CudaExports {
         let export_id = uuid::Uuid::new_v4().simple().to_string();
         let mut state = ExportState::default();
 
-        let result = (|| -> Result<Option<Locator>> {
+        let result = (|| -> Result<Option<Staged>> {
             let first = source.first().address();
             let (spans, handle, size, offset) = match Memory::exportable_containing(first) {
                 Some((memory, offset)) => {
@@ -155,7 +165,7 @@ impl CudaExports {
                 }
                 None => {
                     let pool = self.pool(device)?;
-                    let chunk = lock(&pool.pool).reserve(nbytes as usize, stream)?;
+                    let chunk = lock(&pool.pool).reserve(nbytes as usize, issue)?;
                     let Some(chunk) = chunk else {
                         return Ok(None);
                     };
@@ -179,7 +189,7 @@ impl CudaExports {
                     state.submitted = true;
                     // SAFETY: the chunk stays reserved and the producer's spans
                     // stay retained (`copied`) until the export retires.
-                    unsafe { plan.submit(stream) }?;
+                    unsafe { issue.copy_strided(&plan) }?;
                     state.copied = Some(source.clone());
                     (
                         payload,
@@ -194,9 +204,9 @@ impl CudaExports {
             // readiness before sending their allocation handle to readers.
             if self.cross_host {
                 let _range = crate::profiling::range(c"vmm_export_synchronize", None);
-                stream.synchronize()?;
+                issue.synchronize()?;
             }
-            let ready = events.fence(stream, !self.cross_host)?;
+            let ready = events.fence(issue, !self.cross_host)?;
             state.event = Some(Arc::clone(&ready));
             if let Ok(bytes) = <[u8; 4]>::try_from(handle.as_slice()) {
                 let grants = self.grants()?;
@@ -207,11 +217,9 @@ impl CudaExports {
             }
 
             let layout = layout(&spans, offset)?;
-            let ready_event_handle = if self.cross_host {
-                Vec::new()
-            } else {
-                ready.ipc_handle()?.0.to_vec()
-            };
+            // A same-host reader waits on the readiness event through its
+            // interprocess handle, which exists once the record was made:
+            // the location receives it where the export is located.
             let locator = locate(TransferTransport::CudaVmm {
                 endpoint: self.endpoint.name().to_owned(),
                 export_id: export_id.clone(),
@@ -220,7 +228,7 @@ impl CudaExports {
                 span_lengths: layout.lengths,
                 span_counts: layout.counts,
                 tensor_stride: spans.first().strides().to_vec(),
-                ready_event_handle,
+                ready_event_handle: Vec::new(),
                 allocation_handle: handle,
                 acknowledgment_offset: state
                     .allocation
@@ -232,7 +240,7 @@ impl CudaExports {
             let buffer = Arc::new(TransportBuffer::cuda(
                 CudaSource {
                     source: spans,
-                    event: ready,
+                    event: Arc::clone(&ready),
                     copied: state.copied.take(),
                     pool: state.allocation.clone(),
                     consumers: if pooled {
@@ -247,45 +255,50 @@ impl CudaExports {
                 nbytes,
                 Arc::clone(capacity),
             ));
-            state.buffer = Some(Arc::clone(&buffer));
-            self.endpoint.register(locator.clone(), buffer)?;
-            Ok(Some(locator))
+            Ok(Some(Staged::Fenced {
+                locator,
+                // Cross-host readers do not wait on the event: the export
+                // waited for its bytes before its handle leaves.
+                ready: (!self.cross_host).then_some(ready),
+                buffer,
+            }))
         })();
 
         match result {
-            Ok(Some(locator)) => Ok(Exported::Located(Box::new(locator))),
+            Ok(Some(staged)) => Ok(Exported::Staged(Box::new(staged))),
             Ok(None) => Ok(Exported::PoolExhausted),
             Err(error) => {
-                self.abandon(state, stream, events, &export_id, capacity, nbytes)?;
+                self.abandon(state, issue, events, &export_id, capacity, nbytes)?;
                 Err(error)
             }
         }
     }
 
-    /// Undo a failed export. A registered or constructed backing retires
-    /// through the event pool; earlier failures drain the producer stream
-    /// before returning the chunk, grant and bytes. A failed drain retains
-    /// everything and fails every later export.
+    /// Undo an export that failed before its backing was constructed: drain
+    /// the producer stream, then return the chunk, grant and bytes. A failed
+    /// drain retains everything and fails every later export. A constructed
+    /// backing is given up by its transport and retires through the event
+    /// pool ([`Transport::discard`]).
     fn abandon(
         &self,
         mut state: ExportState,
-        stream: &Stream,
+        issue: impl Issue,
         events: &EventPool,
         export_id: &str,
         capacity: &Capacity,
         nbytes: u64,
     ) -> Result<()> {
-        if let Some(buffer) = state.buffer.take() {
-            return TransportBuffer::reclaim(buffer, events, None);
-        }
-
         let cleanup = (|| -> Result<()> {
+            // A stream issued the failed attempt's copies at once and
+            // drains them here; a job gives up the copies and this wait
+            // with the rest of the failed attempt.
             if state.submitted || state.event.is_some() {
-                stream.synchronize()?;
+                issue.synchronize()?;
             }
             if let Some(event) = state.event.take() {
                 let copied = state.copied.take();
-                events.defer(
+                issue.defer(
+                    events,
                     vec![event],
                     Box::new(move || {
                         drop(copied);
@@ -424,7 +437,6 @@ struct ExportState {
     allocation: Option<(SharedPool, Arc<super::vmm_pool::PoolChunk>)>,
     descriptor: Option<OwnedFd>,
     grants: Option<Arc<DescriptorGrants>>,
-    buffer: Option<Arc<TransportBuffer>>,
     submitted: bool,
 }
 

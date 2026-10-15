@@ -14,14 +14,15 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, SourceOrder};
 use uniserve_ipc::{BufferId, KvGroupTransfer, KvTransfer, TensorTransfer};
 
-use super::exports::{self, Location};
-use super::{Spans, Transports, copy_on_host, copy_planner};
+use super::exports::{self, Exports, Location};
+use super::{Spans, Transports, copy_planner};
 use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView, dtype_name};
 use crate::storage::{GroupTable, KVCacheManager, KVPlanes};
+use crate::stream::Issue;
 use crate::transfer::Retirement;
 use crate::{Error, Result};
 
@@ -48,8 +49,8 @@ fn staging(planes: &KVPlanes, bytes: usize) -> Result<Arc<Memory>> {
     }
 }
 
-/// Copy `source` into a new contiguous staging tensor on `stream`.
-fn freeze(planes: &KVPlanes, source: &Spans, stream: Option<&Stream>) -> Result<Spans> {
+/// Copy `source` into a new contiguous staging tensor, in `stream`'s order.
+fn freeze(planes: &KVPlanes, source: &Spans, stream: impl Issue) -> Result<Spans> {
     let shape: Vec<i64> = source.shape().iter().map(|&extent| extent as i64).collect();
     let memory = staging(planes, source.nbytes() as usize)?;
     let target = Spans::single(StorageView::contiguous(
@@ -60,13 +61,10 @@ fn freeze(planes: &KVPlanes, source: &Spans, stream: Option<&Stream>) -> Result<
     )?)?;
     let mut plan = copy_planner(planes.device(), SourceOrder::Stream)?;
     target.plan_copy(source, &mut plan)?;
-    match stream {
-        // SAFETY: the staging is retained by the export's spans until it
-        // retires; the pages are protected by the export reservation.
-        Some(stream) => unsafe { plan.submit(stream) }?,
-        // SAFETY: host operands owned by this export and the pool.
-        None => unsafe { copy_on_host(&plan) },
-    }
+    // SAFETY: the staging is retained by the export's spans until it
+    // retires; the pages are protected by the export reservation. Without
+    // a stream both are host operands of this export and the pool.
+    unsafe { stream.copy_strided(&plan) }?;
     Ok(target)
 }
 
@@ -78,13 +76,92 @@ struct GroupExport<'a> {
     visible: u32,
 }
 
-/// Export `visible` tokens of `slot` to `destination` under `buffer`, on
-/// `stream` (the stream that wrote the pages; `None` for a CPU pool).
+/// A slot's export while its issuer's work is outstanding ([`export`]): the
+/// transfer record without its locations, and the export of every view.
+pub struct KvExport {
+    buffer: BufferId,
+    transfer: KvTransfer,
+    /// The exports of each tensor of each group, in the transfer's order.
+    exports: Vec<Vec<Vec<Exports>>>,
+}
+
+impl KvExport {
+    /// The transfer record with its locations, and every location.
+    ///
+    /// The caller keeps this value until the issuer the export was given
+    /// performed its work and calls this only then: at once after a stream,
+    /// from the job's completion on after a recorder. On failure every
+    /// location is revoked and the reservation released. The returned
+    /// transfer becomes resident only when the batch commits it
+    /// (`KVCacheManager::validate_exports` then `apply_exports`).
+    pub fn locate(
+        self,
+        manager: &mut KVCacheManager<Arc<Retirement>>,
+    ) -> Result<(KvTransfer, Vec<Location>)> {
+        let Self {
+            buffer,
+            mut transfer,
+            exports,
+        } = self;
+        let mut locations: Vec<Location> = Vec::new();
+        let mut result = Ok(());
+        // The exports a failure leaves without locations.
+        let mut unlocated = Vec::new();
+
+        let tensors = transfer
+            .groups
+            .iter_mut()
+            .flat_map(|group| group.tensors.iter_mut());
+        for (tensor, exports) in tensors.zip(exports.into_iter().flatten()) {
+            for export in exports {
+                if result.is_err() {
+                    unlocated.push(export);
+                    continue;
+                }
+                match export.locate(|retirement| manager.retain_export(buffer, retirement)) {
+                    Ok(located) => {
+                        tensor
+                            .locations
+                            .extend(located.iter().map(|(_, locator)| locator.clone()));
+                        locations.extend(located);
+                    }
+                    Err(error) => result = Err(error),
+                }
+            }
+        }
+
+        if let Err(error) = result {
+            unlocated.into_iter().for_each(Exports::revoke);
+            if let Err(cleanup) = exports::release(&locations) {
+                tracing::warn!(target: "uniserve_worker.transfer", "failed to revoke a failed KV export: {cleanup}");
+            }
+            manager.release_exports(&[buffer]);
+            return Err(error);
+        }
+        Ok((transfer, locations))
+    }
+
+    /// Revoke an export that is not published and release its reservation.
+    /// As for [`Self::locate`], only once the issuer performed its work:
+    /// the copies into an export's storage ran before it is given back.
+    pub fn revoke(self, manager: &mut KVCacheManager<Arc<Retirement>>) {
+        self.exports
+            .into_iter()
+            .flatten()
+            .flatten()
+            .for_each(Exports::revoke);
+        manager.release_exports(&[self.buffer]);
+    }
+}
+
+/// Export `visible` tokens of `slot` to `destination` under `buffer`, in
+/// the order of `stream` (the stream that wrote the pages; none for a CPU
+/// pool).
 ///
 /// The exported intervals are reserved before any view is exported. On
-/// failure every accepted locator is revoked and the reservation released.
-/// The returned transfer becomes resident only when the batch commits it
-/// (`KVCacheManager::validate_exports` then `apply_exports`).
+/// failure every accepted export is revoked and the reservation released.
+/// [`KvExport::locate`] gives the transfer and its locations once the
+/// issuer's work was performed.
 #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
 pub fn export(
     manager: &mut KVCacheManager<Arc<Retirement>>,
@@ -96,8 +173,8 @@ pub fn export(
     buffer: BufferId,
     transports: &Transports,
     consumers: &[usize],
-    stream: Option<&Stream>,
-) -> Result<(KvTransfer, Vec<Location>)> {
+    stream: impl Issue,
+) -> Result<KvExport> {
     let (base, base_extent) = manager
         .destination_base(buffer.owner, destination)
         .map_or((None, 0), |(buffer, extent)| (Some(buffer), extent));
@@ -144,10 +221,12 @@ pub fn export(
         groups,
     };
 
-    // A transport can expose a locator before a later group fails: keep
-    // every locator so a failure revokes all accepted exports.
-    let mut locations = Vec::new();
-    let result = (|| -> Result<()> {
+    // A transport can accept an export before a later group fails: keep
+    // every export so a failure revokes all of them. The views are one
+    // attempt: the copies a job recorded for those accepted before the
+    // failure address storage their revocation gives back.
+    let mut exports = Vec::new();
+    let result = stream.attempt(|| -> Result<()> {
         for (index, (group, table)) in transfer.groups.iter_mut().zip(&selected).enumerate() {
             let export = GroupExport {
                 index,
@@ -155,6 +234,7 @@ pub fn export(
                 start: group.start,
                 visible,
             };
+            exports.push(Vec::new());
             group.tensors = export_group(
                 manager,
                 planes,
@@ -163,19 +243,21 @@ pub fn export(
                 transports,
                 consumers,
                 stream,
-                &mut locations,
+                &mut exports[index],
             )?;
         }
         Ok(())
-    })();
+    });
+    let export = KvExport {
+        buffer,
+        transfer,
+        exports,
+    };
     if let Err(error) = result {
-        if let Err(cleanup) = exports::release(&locations) {
-            tracing::warn!(target: "uniserve_worker.transfer", "failed to revoke a failed KV export: {cleanup}");
-        }
-        manager.release_exports(&[buffer]);
+        export.revoke(manager);
         return Err(error);
     }
-    Ok((transfer, locations))
+    Ok(export)
 }
 
 #[expect(
@@ -189,8 +271,8 @@ fn export_group(
     buffer: BufferId,
     transports: &Transports,
     consumers: &[usize],
-    stream: Option<&Stream>,
-    locations: &mut Vec<Location>,
+    stream: impl Issue,
+    exports: &mut Vec<Vec<Exports>>,
 ) -> Result<Vec<TensorTransfer>> {
     let count = export.visible - export.start;
     if count == 0 {
@@ -209,7 +291,8 @@ fn export_group(
 
     let mut tensors = Vec::new();
     for field in 0..2 {
-        let mut field_locations = Vec::new();
+        exports.push(Vec::new());
+        let field_exports = exports.len() - 1;
         // The layers in unit position `row` of every page are one
         // consecutive run of `columns` layers, exported as one tensor per
         // mechanism: the locator count follows the group's units per page,
@@ -235,7 +318,7 @@ fn export_group(
                 u64::from(group.kv_head_offset),
                 0,
             ];
-            let exported = exports::export(
+            exports[field_exports].push(exports::export(
                 transports,
                 &source,
                 Some(&offset),
@@ -243,9 +326,7 @@ fn export_group(
                 false,
                 stream,
                 &mut retain,
-            )?;
-            field_locations.extend(exported.iter().map(|(_, locator)| locator.clone()));
-            locations.extend(exported);
+            )?);
         }
         tensors.push(TensorTransfer {
             shape: vec![
@@ -254,7 +335,7 @@ fn export_group(
                 u64::from(group.total_kv_heads),
                 u64::from(group.head_dim),
             ],
-            locations: field_locations,
+            locations: Vec::new(),
         });
     }
 
@@ -262,7 +343,8 @@ fn export_group(
         // One scale per (unit, column, field): published rows are
         // [page, K/V, layers, head group], frozen like the values. A rank's
         // head group is its KV-head offset divided by its local head count.
-        let mut scale_locations = Vec::new();
+        exports.push(Vec::new());
+        let scale_exports = exports.len() - 1;
         for field in 0..2 {
             for row in 0..table.shape.units_per_page {
                 let units = table.row(row as usize);
@@ -279,23 +361,10 @@ fn export_group(
                         );
                     }
                 }
-                match stream {
-                    // SAFETY: the staging stays retained by the export; the
-                    // scales are protected by the export reservation.
-                    Some(stream) => unsafe { batch.submit(stream) }?,
-                    None => {
-                        for (destination, source, bytes) in batch.iter() {
-                            // SAFETY: host operands of a CPU pool.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    source as *const u8,
-                                    destination as *mut u8,
-                                    bytes,
-                                );
-                            }
-                        }
-                    }
-                }
+                // SAFETY: the staging stays retained by the export; the
+                // scales are protected by the export reservation. Without a
+                // stream both are host operands of a CPU pool.
+                unsafe { stream.copy(&batch) }?;
                 let source = Spans::single(StorageView::contiguous(
                     memory as Arc<dyn Backing>,
                     0,
@@ -308,7 +377,7 @@ fn export_group(
                     u64::from(group.axis.offset + row * columns),
                     u64::from(group.kv_head_offset / group.num_kv_heads),
                 ];
-                let exported = exports::export(
+                exports[scale_exports].push(exports::export(
                     transports,
                     &source,
                     Some(&offset),
@@ -316,9 +385,7 @@ fn export_group(
                     false,
                     stream,
                     &mut retain,
-                )?;
-                scale_locations.extend(exported.iter().map(|(_, locator)| locator.clone()));
-                locations.extend(exported);
+                )?);
             }
         }
         tensors.push(TensorTransfer {
@@ -328,7 +395,7 @@ fn export_group(
                 u64::from(group.axis.total),
                 u64::from(group.total_kv_heads / group.num_kv_heads),
             ],
-            locations: scale_locations,
+            locations: Vec::new(),
         });
     }
     Ok(tensors)

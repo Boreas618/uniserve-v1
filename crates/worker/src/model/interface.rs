@@ -4,7 +4,8 @@
 //! functions. [`Interface`] resolves the entries startup needs into typed
 //! fields once, failing startup with the name of any missing entry, and
 //! keeps every entry so capability runtimes can resolve their own
-//! (`component.bind`, ...) by name.
+//! (`graphs.pool`, ...) by name. Everything else of the library is reached
+//! by import path ([`Interface::import`]).
 
 use std::collections::BTreeMap;
 
@@ -15,18 +16,6 @@ use crate::{Error, Result};
 
 /// Startup and lifecycle entries of the interface table.
 pub struct Interface {
-    /// Read the checkpoint configuration and describe the meta skeleton.
-    pub describe: Function,
-    /// Narrow the checkpoint to this rank's modules and weight choices.
-    pub resolve: Function,
-    /// Materialize this rank's modules on their meshes.
-    pub load: Function,
-    /// Model-derived quantities for capacity, reporting and warmup.
-    pub facts: Function,
-    /// Declare a component call set's workspace requirements.
-    pub prepare: Function,
-    /// Bind Rust-allocated workspaces to a prepared component.
-    pub bind: Function,
     /// Join the torch process world for numerical collectives.
     pub initialize: Function,
     /// Create torch groups on the Rust plan.
@@ -35,10 +24,6 @@ pub struct Interface {
     pub mesh: Function,
     /// Destroy the process world's groups in reverse creation order.
     pub destroy: Function,
-    /// Caching-allocator statistics of one device.
-    pub memory_stats: Function,
-    /// Return cached allocator blocks to the device.
-    pub release_cached: Function,
     /// A counter that changes whenever a kernel provider choice changes.
     pub kernel_choices: Function,
     /// Start a profiler window.
@@ -68,18 +53,10 @@ impl Interface {
             })
         };
         Ok(Self {
-            describe: require("model.describe")?,
-            resolve: require("model.resolve")?,
-            load: require("model.load")?,
-            facts: require("model.facts")?,
-            prepare: require("component.prepare")?,
-            bind: require("component.bind")?,
             initialize: require("distributed.initialize")?,
             create_groups: require("distributed.create_groups")?,
             mesh: require("distributed.mesh")?,
             destroy: require("distributed.destroy")?,
-            memory_stats: require("memory.stats")?,
-            release_cached: require("memory.release_cached")?,
             kernel_choices: require("kernels.choices")?,
             profiler_start: require("profiling.start")?,
             profiler_stop: require("profiling.stop")?,

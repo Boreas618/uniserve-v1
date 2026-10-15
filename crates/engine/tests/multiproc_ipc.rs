@@ -1439,6 +1439,13 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
 struct PausedProcess(Option<i32>);
 
 impl PausedProcess {
+    /// Stops the process and returns once every one of its threads has
+    /// stopped.
+    ///
+    /// `kill` returns when the signal is queued. The kernel hands it to one
+    /// thread, and the others keep running until that thread starts the group
+    /// stop, so a rank whose channel is served off its main thread could
+    /// still answer a request sent right after `kill`.
     fn new(pid: i32) -> anyhow::Result<Self> {
         anyhow::ensure!(pid > 0, "worker process id must be positive");
         anyhow::ensure!(
@@ -1446,7 +1453,17 @@ impl PausedProcess {
             "failed to pause the selected worker: {}",
             std::io::Error::last_os_error()
         );
-        Ok(Self(Some(pid)))
+        let paused = Self(Some(pid));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !all_threads_stopped(pid)? {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "worker process {pid} did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(paused)
     }
 
     fn resume(&mut self) -> anyhow::Result<()> {
@@ -1472,10 +1489,32 @@ impl PausedProcess {
         Ok(())
     }
 }
+
 impl Drop for PausedProcess {
     fn drop(&mut self) {
         let _ = self.resume();
     }
+}
+
+/// Whether every thread of process `pid` is in the stopped state (`T` in
+/// `/proc/<pid>/task/<tid>/stat`).
+fn all_threads_stopped(pid: i32) -> anyhow::Result<bool> {
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+        // A thread that exited between the listing and the read has no file.
+        let Ok(stat) = std::fs::read_to_string(task?.path().join("stat")) else {
+            continue;
+        };
+        // The state follows the command name, which is parenthesized and may
+        // itself contain spaces and parentheses.
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .context("malformed task stat")?;
+        if state != "T" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Spawns the default two-rank stub group from `rank_group_args`.
@@ -2487,6 +2526,76 @@ fn a_kv_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
     }
     // A repeated batch id is refused.
     assert!(execute(&mut executor, publish).is_err());
+    executor.close()?;
+    Ok(())
+}
+
+/// Publishes a prefilled request's KV under a transfer-byte bound the
+/// export exceeds, which fails the call once its locations are known, and
+/// requires the same extent to be exportable afterwards: the refused
+/// export left no reservation or location behind.
+#[test]
+fn a_refused_kv_export_leaves_its_request_exportable() -> anyhow::Result<()> {
+    let mut executor = spawn_rank_group()?;
+    let admission = text_admission(14, 1, 3)?;
+    let request_key = admission.request_key;
+    let mut initial = token_batch(
+        9,
+        5,
+        request_key,
+        Some(admission),
+        CallId::new(9, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7, 8],
+        UnitId(3),
+        0,
+    );
+    initial.calls[0].token_output = None;
+    let tables = initial.block_tables.clone();
+    let first = execute(&mut executor, initial)?;
+    assert_eq!(first.results[0].output.status, CallStatus::Ok);
+
+    let export = |batch: u64, max_transfer_bytes: u64| {
+        let buffer = uniserve_ipc::BufferId {
+            owner: request_key,
+            producer_call_id: CallId::new(batch, 0),
+            output_index: 0,
+            generation: 2,
+        };
+        let mut call = Call::new(
+            request_key,
+            CallId::new(batch, 0),
+            CallKind::Transfer(TransferMode::KvExport),
+        );
+        call.coordinates = coordinates_after(&first.results[0].output);
+        call.kv_output = Some(buffer);
+        call.bounds = Bounds {
+            max_transfer_bytes,
+            ..Bounds::default()
+        };
+        let mut publish = Batch::new(batch, Vec::new(), vec![call]);
+        publish.collective_seq = batch - 4;
+        publish.block_tables = tables.clone();
+        (buffer, publish)
+    };
+
+    // One byte holds no tensor of the extent.
+    let (_, refused) = export(10, 1);
+    let report = execute(&mut executor, refused)?;
+    assert_eq!(report.results[0].output.status, CallStatus::Error);
+    assert!(report.results[0].output.kv_output.is_none());
+
+    let (buffer, accepted) = export(11, 4096);
+    let report = execute(&mut executor, accepted)?;
+    assert_eq!(report.results[0].output.status, CallStatus::Ok);
+    let transfer = report.results[0]
+        .output
+        .kv_output
+        .as_ref()
+        .context("KV export has no physical locations")?;
+    assert_eq!(transfer.source, buffer);
+    assert_eq!(transfer.exported_extent, 2);
+    assert_eq!(transfer.base, None);
     executor.close()?;
     Ok(())
 }

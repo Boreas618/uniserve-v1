@@ -240,7 +240,10 @@ impl Endpoint {
         for buffer in buffers {
             result = result.and(buffer.drain());
         }
-        result = result.and(self.events.reap()).and(self.reap());
+        // No service loop is left to take the completions the deferred
+        // releases wait for: the pool waits for their events on the host.
+        result = result.and(self.events.drain()).and(self.reap());
+        result = result.and(self.events.drain());
 
         // Joining the lane must not hold the registry lock: retirement
         // observers may inspect returned storage.
@@ -254,7 +257,7 @@ impl Endpoint {
                 result = result.and(Err(error));
             }
         }
-        result = result.and(self.reap());
+        result = result.and(self.reap()).and(self.events.drain());
         result.and(self.lock().require_retired())
     }
 

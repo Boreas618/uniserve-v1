@@ -30,16 +30,8 @@
 //! | `input_embeddings` | model | `[T, hidden]` | Rust: vision features (multimodal) |
 //! | `embedding_mask` | u8 | `[T]` | Rust: tokens whose embedding is replaced (multimodal) |
 
-use std::sync::Arc;
-
-use uniserve_cuda::Stream;
-
-use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Memory, StorageView};
-use crate::{Error, Result};
-
-/// Byte alignment of each carved column.
-const ALIGNMENT: usize = 256;
+use crate::ffi::DType;
+use crate::runner::input_buffers::Columns;
 
 /// Host sections of the row gather's column array before the page counts.
 pub(crate) const ROW_SECTIONS: usize = 6;
@@ -81,6 +73,10 @@ impl Dimensions {
     pub(crate) fn logprob_words(&self) -> usize {
         self.tokens * LOGPROB_WORDS_PER_TOKEN
     }
+}
+
+impl Columns for Dimensions {
+    type Name = &'static str;
 
     fn columns(&self) -> Vec<(&'static str, DType, Vec<i64>)> {
         let rows = self.rows as i64;
@@ -117,82 +113,5 @@ impl Dimensions {
             columns.push(("embedding_mask", DType::U8, vec![tokens]));
         }
         columns
-    }
-
-    /// Device bytes of the columns.
-    pub(crate) fn bytes(&self) -> u64 {
-        self.columns()
-            .iter()
-            .map(|(_, dtype, shape)| column_bytes(*dtype, shape).next_multiple_of(ALIGNMENT))
-            .sum::<usize>() as u64
-    }
-}
-
-fn column_bytes(dtype: DType, shape: &[i64]) -> usize {
-    shape.iter().product::<i64>().max(1) as usize * dtype.bytes()
-}
-
-/// A binding's columns in one allocation.
-pub(crate) struct InputBuffers {
-    pub(crate) dimensions: Dimensions,
-    columns: Vec<(&'static str, StorageView)>,
-}
-
-impl InputBuffers {
-    /// Allocate the columns on `device` (host memory when `None`) and zero
-    /// them on `stream`.
-    pub(crate) fn allocate(
-        dimensions: Dimensions,
-        device: Option<i32>,
-        stream: Option<&Stream>,
-    ) -> Result<Self> {
-        let layout = dimensions.columns();
-        let bytes = dimensions.bytes() as usize;
-        let memory = match device {
-            Some(device) => Memory::device(device, bytes)?,
-            None => Memory::host(bytes),
-        };
-        let mut columns = Vec::with_capacity(layout.len());
-        let mut offset = 0;
-        for (name, dtype, shape) in layout {
-            columns.push((
-                name,
-                StorageView::contiguous(
-                    Arc::clone(&memory) as Arc<dyn Backing>,
-                    offset,
-                    dtype,
-                    &shape,
-                )?,
-            ));
-            offset += column_bytes(dtype, &shape).next_multiple_of(ALIGNMENT);
-        }
-        let buffers = Self {
-            dimensions,
-            columns,
-        };
-        match (device, stream) {
-            (Some(_), Some(stream)) => {
-                // SAFETY: the new allocation spans `bytes`. The stream
-                // drains below.
-                unsafe { uniserve_cuda::memset_d32(memory.address(), 0, bytes / 4, stream)? };
-                stream.synchronize()?;
-            }
-            // Host memory starts zeroed.
-            (None, None) => {}
-            _ => {
-                return Err(Error::Invalid(
-                    "text buffers are reset on a stream exactly for device storage".into(),
-                ));
-            }
-        }
-        Ok(buffers)
-    }
-
-    pub(crate) fn column(&self, name: &str) -> Result<&StorageView> {
-        self.columns
-            .iter()
-            .find(|(column, _)| *column == name)
-            .map(|(_, view)| view)
-            .ok_or_else(|| Error::Invariant(format!("text buffers have no column {name}")))
     }
 }

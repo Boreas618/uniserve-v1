@@ -31,10 +31,10 @@ from tests.python.fixtures.checkpoints import (
     diffusion_gemma_checkpoint,
 )
 from uniserve_models import catalog as models
-from uniserve_models.bindings.context import ExecutionContext
+from uniserve_models.bindings.context import ExecutionContext, Scratch
 from uniserve_models.cache.units import UnitPool
 from uniserve_models.diffusion import canvas as sampler
-from uniserve_models.interface import binding, graphs
+from uniserve_models.interface import graphs
 from uniserve_models.interface.loading import Loaded
 from uniserve_models.loading import weights
 from uniserve_models.model import DiffusionLMInput, TextInput, TextSize
@@ -143,48 +143,36 @@ class _Session:
         loaded = Loaded(
             module=self.model, description=None, attention=setup.attention
         )
-        self.facts = diffusion_lm.describe(loaded, "denoiser", False, 0)
-        prepared, requirements = binding.prepare(
-            loaded,
-            {
-                "component": "diffusion_gemma",
-                "path": "denoiser",
-                "stream": 0 if self.stream is None else self.stream.cuda_stream,
-                "attention": setup.attention,
-                "vsa": "auto",
-                "matmul": "auto",
-                "moe": "auto",
-                "derive_host_lengths": True,
-                "cache": self.pool,
-                "size": {"tokens": TOKENS, "rows": 2 * ROWS},
-            },
-        )
-        workspaces = {
-            item["name"]: torch.zeros(
-                item["shape"],
-                dtype=getattr(torch, item["dtype"]),
-                device=setup.device if item["device"] >= 0 else "cpu",
-            )
-            for item in requirements["workspaces"]
-        }
-        binding.bind(prepared, {"workspaces": workspaces})
+        self.loaded = loaded
         self.buffers = self._buffers(sampling)
         groups = [self.pool.groups[table.group] for table in self.pool.tables]
-        page_tokens = [group.page_tokens for group in groups]
-        windowed = [group.window is not None for group in groups]
+        # The constructor's arguments up to the sampling: the model and its
+        # stream, the stream's scratch, the prefix cache, no expert
+        # exchange, weight prefetch or stream collectives, and the largest
+        # forward.
+        construction = [
+            loaded,
+            "denoiser",
+            0 if self.stream is None else self.stream.cuda_stream,
+            Scratch(),
+            self.pool,
+            None,
+            None,
+            None,
+            TOKENS,
+            2 * ROWS,
+            [group.page_tokens for group in groups],
+            [group.window is not None for group in groups],
+        ]
         if sampling:
             self.runner = diffusion_lm.DiffusionLMRunner(
-                prepared,
-                page_tokens,
-                windowed,
+                *construction,
                 2,
                 *SAMPLING,
                 *(self.buffers[f"bank.{name}"] for name in BANKS),
             )
         else:
-            self.runner = diffusion_lm.DiffusionLMRunner(
-                prepared, page_tokens, windowed, 0
-            )
+            self.runner = diffusion_lm.DiffusionLMRunner(*construction, 0)
 
     def attention(self) -> list[torch.Tensor]:
         """The attention metadata tensors, in parameter order."""
@@ -203,7 +191,9 @@ class _Session:
     def attend_state(self) -> list[torch.Tensor]:
         return [
             self.buffers[f"attend_state.{index}"]
-            for index in range(len(self.facts["attend_widths"]))
+            for index in range(
+                len(diffusion_lm.attend_widths(self.loaded, "denoiser"))
+            )
         ]
 
     def attend_arguments(
@@ -303,7 +293,8 @@ class _Session:
         """Allocate the tensors of the forwards, as the worker does."""
         tables, tokens, rows = len(self.pool.tables), TOKENS, 2 * ROWS
         setup = self.setup
-        hidden, dtype = self.facts["hidden_size"], setup.dtype
+        hidden = diffusion_lm.hidden_size(self.loaded, "denoiser")
+        dtype = setup.dtype
         canvas, device = setup.canvas, setup.device
         long = {"dtype": torch.int64, "device": device}
         ints = {"dtype": torch.int32, "device": device}
@@ -324,7 +315,8 @@ class _Session:
                 256, dtype=torch.float32, device=device
             ),
         }
-        for index, width in enumerate(self.facts["attend_widths"]):
+        widths = diffusion_lm.attend_widths(self.loaded, "denoiser")
+        for index, width in enumerate(widths):
             buffers[f"attend_state.{index}"] = torch.zeros(
                 (tokens, width), dtype=dtype, device=device
             )
@@ -441,10 +433,11 @@ def test_a_readout_reads_every_candidate_of_rows_of_different_lengths(
     tmp_path,
 ):
     session = _Session(tmp_path, sampling=False)
-    assert session.facts["sequence_length"] == CANVAS
-    assert session.facts["vocab_size"] == VOCAB
-    assert session.facts["eos_token_ids"] == [1, 6]
-    assert session.facts["generates"] and session.facts["local_tail"]
+    loaded = session.loaded
+    assert diffusion_lm.sequence_length(loaded, "denoiser") == CANVAS
+    assert diffusion_lm.vocab_size(loaded, "denoiser") == VOCAB
+    assert diffusion_lm.generates(loaded, "denoiser")
+    assert not diffusion_lm.exchanges_readout(loaded, "denoiser", False, 0)
 
     generator = torch.Generator().manual_seed(9)
     canvases = [
@@ -649,6 +642,16 @@ GPU = _Setup(
 )
 
 
+def _capture(session, pool, method, *arguments) -> graphs.Graph:
+    """Capture one call of a runner method that already ran eagerly."""
+    torch.cuda.synchronize()
+    recording = graphs.begin_capture(pool, session.stream.cuda_stream, 0)
+    method(*arguments)
+    graph, _ = graphs.end_capture(recording)
+    torch.cuda.synchronize()
+    return graph
+
+
 def _synchronized(function, *arguments):
     """Call a runner method on its stream and wait for it."""
     torch.cuda.synchronize()
@@ -717,17 +720,17 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
         4, 64, 32, [*queries, *padding], [*prefixes, 0, 0], widths, starts
     )
     _synchronized(runner.attend, *arguments)
-    attend, _ = _synchronized(runner.capture, pool, "attend", *arguments)
+    attend = _capture(session, pool, runner.attend, *arguments)
     buffers["candidate_logprobs"].zero_()
     buffers["slot_rows"][len(slots) : 64] = 0
     arguments = session.readout_arguments(64, 256)
     _synchronized(runner.readout, *arguments)
-    readout, _ = _synchronized(runner.capture, pool, "readout", *arguments)
+    readout = _capture(session, pool, runner.readout, *arguments)
     buffers["candidate_logprobs"].zero_()
     buffers["attend_state.0"].zero_()
     buffers["attend_state.1"].zero_()
-    _synchronized(runner.replay, attend)
-    _synchronized(runner.replay, readout)
+    _synchronized(attend.replay)
+    _synchronized(readout.replay)
     torch.testing.assert_close(
         buffers["candidate_logprobs"][:count], eager, rtol=2e-2, atol=2e-2
     )
@@ -760,10 +763,10 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
         results = buffers["step.results"][:2].clone()
 
         restore()
-        graph, _ = _synchronized(runner.capture, pool, "denoise", *arguments)
+        graph = _capture(session, pool, runner.denoise, *arguments)
         restore()
         buffers["step.results"].zero_()
-        _synchronized(runner.replay, graph)
+        _synchronized(graph.replay)
         assert torch.equal(buffers["step.results"][:2], results)
         for name in names:
             assert torch.equal(buffers[f"bank.{name}"], expected[name]), name

@@ -1,9 +1,9 @@
-//! The KV unit pool's layout, decoded from the model's cache plan.
+//! The KV unit pool's layout, read from the model's cache plan.
 //!
-//! Python's `model.cache_plan` groups the resident cache layers and derives
-//! the pool's column planes (`uniserve_models.cache.units.plan_units`). Rust
-//! re-validates every relation it relies on before allocating, because a
-//! malformed plan would make addressing corrupt device memory.
+//! The library's `cache_plan` groups the resident cache layers and derives
+//! the pool's column planes (`uniserve_models.cache.units.plan_units`). It
+//! returns a `CachePlan`, which the rank reads column by column and passes
+//! back unchanged to the library's cache functions.
 //!
 //! Vocabulary: a *unit* is one allocation unit of the pool (unit 0 is the
 //! padding sentinel); a *column* is a layer's position inside a unit
@@ -16,10 +16,14 @@ use uniserve_ipc::KvCacheInfo;
 
 use tvm_ffi::Any;
 
-use crate::ffi::{DType, Handle, Record};
+use crate::ffi::{DType, Handle, integers, texts};
+use crate::model::interface::Interface;
 use crate::storage::GroupShape;
 use crate::storage::memory::parse_dtype;
 use crate::{Error, Result};
+
+/// The library module of the cache functions.
+pub(super) const CACHE: &str = "uniserve_models.interface.cache";
 
 /// Where this rank's layers of a group lie in the group's transfer layer
 /// axis: a transfer tensor spans `total` layers in global cache-layer order,
@@ -72,82 +76,142 @@ pub struct KVPlan {
     /// The published stored dtype (`KvCacheInfo::dtype`).
     pub dtype: KvCacheDtype,
     pub groups: Vec<KVGroupPlan>,
-    /// The plan map as Python returned it, passed back to bindings.
-    record: Handle,
+    /// The library's `CachePlan`, passed back to its cache functions.
+    pub handle: Handle,
 }
 
 impl KVPlan {
-    /// Decode and validate the `model.cache_plan` result.
-    pub fn decode(value: Any) -> Result<Self> {
-        let record = Handle::new(value.clone())?;
-        let plan = Record::new("model.cache_plan", value)?;
-        let groups = plan
-            .get::<tvm_ffi::Array<Any>>("groups")?
-            .iter()
-            .enumerate()
-            .map(|(index, group)| {
-                let group = Record::new(format!("model.cache_plan[groups][{index}]"), group)?;
-                decode_group(&group)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let dtype = plan.string("dtype")?;
-        let dtype = dtype.parse::<KvCacheDtype>().map_err(|_| {
-            Error::Interface(format!("cache plan dtype {dtype:?} is not a KV dtype"))
-        })?;
-
-        let decoded = Self {
-            columns: u32::try_from(plan.count("columns")?).map_err(|_| overflow("columns"))?,
-            plane_bytes: plan.count("plane_bytes")? as u64,
-            quantized: plan.get::<bool>("quantized")?,
-            unit_bytes: plan.count("unit_bytes")? as u64,
-            dtype,
-            groups,
-            record,
-        };
-        decoded.validate()?;
-        Ok(decoded)
+    /// Plan `loaded`'s unit pool for `block_size`-token pages of the widest
+    /// rows (`cache_plan`). `kv_dtype` is `None` for the compute dtype.
+    pub fn plan(
+        interface: &Interface,
+        loaded: &Handle,
+        block_size: usize,
+        kv_dtype: Option<&str>,
+    ) -> Result<Self> {
+        let handle = Self::describe(interface, loaded, block_size, kv_dtype)?;
+        Self::read(interface, handle)
     }
 
-    fn validate(&self) -> Result<()> {
-        let invalid = |message: &str| Err(Error::Interface(format!("cache plan {message}")));
-        if self.groups.is_empty() || self.columns == 0 || self.plane_bytes == 0 {
-            return invalid("has no groups, columns or plane bytes");
-        }
-        for group in &self.groups {
-            let layers = group.layers.len() as u32;
-            if !group.page_tokens.is_power_of_two() {
-                return invalid("page sizes must be powers of two");
-            }
-            if u64::from(group.page_tokens) * group.row_bytes() != self.plane_bytes {
-                return invalid("page rows must fill one plane");
-            }
-            if layers == 0
-                || !layers.is_multiple_of(self.columns)
-                || group.units_per_page != layers / self.columns
-            {
-                return invalid("columns must divide every group's layers into its units per page");
-            }
-            if group.layer_ids.len() != group.layers.len() {
-                return invalid("needs one global id per resident layer");
-            }
-            if group.num_kv_heads == 0
-                || group.head_dim == 0
-                || group.kv_head_offset + group.num_kv_heads > group.total_kv_heads
-            {
-                return invalid("head interval exceeds its logical bounds");
-            }
-            if self.quantized != (group.dtype == DType::F8E4M3) {
-                return invalid("quantized storage holds FP8 planes, and only it does");
-            }
-        }
-        if self.quantized != (self.dtype == KvCacheDtype::Float8E4m3Fn) {
-            return invalid("publishes a dtype that disagrees with its quantization");
-        }
-        let metadata = 1 + if self.quantized { 4 } else { 0 };
-        if u64::from(self.columns) * 2 * (self.plane_bytes + metadata) != self.unit_bytes {
-            return invalid("unit bytes disagree with its planes");
-        }
-        Ok(())
+    /// Whether the attention `backend` reads every resident layer's pages of
+    /// `loaded`'s pool with `block_size`-token pages (`reads_pages`).
+    pub fn reads_pages(
+        interface: &Interface,
+        loaded: &Handle,
+        backend: &str,
+        block_size: usize,
+        kv_dtype: Option<&str>,
+    ) -> Result<bool> {
+        let plan = Self::describe(interface, loaded, block_size, kv_dtype)?;
+        interface
+            .import(&format!("{CACHE}.reads_pages"))?
+            .call_as(&[
+                loaded.view(),
+                (&Any::from(tvm_ffi::String::from(backend))).into(),
+                plan.view(),
+            ])
+    }
+
+    fn describe(
+        interface: &Interface,
+        loaded: &Handle,
+        block_size: usize,
+        kv_dtype: Option<&str>,
+    ) -> Result<Handle> {
+        Handle::new(
+            interface
+                .import(&format!("{CACHE}.cache_plan"))?
+                .call_values(&[
+                    loaded.to_any(),
+                    Any::from(block_size as i64),
+                    Any::from(tvm_ffi::String::from(kv_dtype.unwrap_or(""))),
+                ])?,
+        )
+    }
+
+    /// Read a `CachePlan` through its column methods.
+    pub fn read(interface: &Interface, handle: Handle) -> Result<Self> {
+        let call = |method: &str| -> Result<Any> {
+            interface
+                .import(&format!("{CACHE}.CachePlan.{method}"))?
+                .call_values(&[handle.to_any()])
+        };
+        let count = |method: &str| -> Result<u64> {
+            let value =
+                i64::try_from(call(method)?).map_err(|error| Error::numerical(method, &error))?;
+            Ok(value as u64)
+        };
+        let counts = |method: &str| -> Result<Vec<u32>> {
+            let values =
+                integers(call(method)?).map_err(|error| Error::numerical(method, &error))?;
+            Ok(values.into_iter().map(|value| value as u32).collect())
+        };
+        let names = |method: &str| -> Result<Vec<String>> {
+            texts(call(method)?).map_err(|error| Error::numerical(method, &error))
+        };
+        let dtypes = |method: &str| -> Result<Vec<DType>> {
+            names(method)?
+                .iter()
+                .map(|name| parse_dtype(name))
+                .collect()
+        };
+
+        let dtype: tvm_ffi::String = call("dtype")?
+            .try_into()
+            .map_err(|error| Error::numerical("dtype", &error))?;
+        let dtype = dtype.as_str().parse::<KvCacheDtype>().map_err(|_| {
+            Error::Interface(format!(
+                "cache plan dtype {:?} is not a KV dtype",
+                dtype.as_str()
+            ))
+        })?;
+        let quantized = bool::try_from(call("quantized")?)
+            .map_err(|error| Error::numerical("quantized", &error))?;
+
+        // One value per group; a window of -1 keeps the whole history.
+        let windows =
+            integers(call("windows")?).map_err(|error| Error::numerical("windows", &error))?;
+        let page_tokens = counts("page_tokens")?;
+        let units_per_page = counts("units_per_page")?;
+        let (axis_offsets, axis_sizes) = (counts("axis_offsets")?, counts("axis_sizes")?);
+        let (num_kv_heads, total_kv_heads) = (counts("num_kv_heads")?, counts("total_kv_heads")?);
+        let (kv_head_offsets, head_dims) = (counts("kv_head_offsets")?, counts("head_dims")?);
+        let (stored, compute) = (dtypes("dtypes")?, dtypes("compute_dtypes")?);
+
+        // Every group's resident layers follow one another.
+        let mut layers = names("layers")?.into_iter();
+        let mut layer_ids = counts("layer_ids")?.into_iter();
+        let groups = counts("layer_counts")?
+            .into_iter()
+            .enumerate()
+            .map(|(group, layer_count)| KVGroupPlan {
+                window: u32::try_from(windows[group]).ok(),
+                page_tokens: page_tokens[group],
+                units_per_page: units_per_page[group],
+                layers: layers.by_ref().take(layer_count as usize).collect(),
+                layer_ids: layer_ids.by_ref().take(layer_count as usize).collect(),
+                axis: GroupAxis {
+                    offset: axis_offsets[group],
+                    total: axis_sizes[group],
+                },
+                num_kv_heads: num_kv_heads[group],
+                total_kv_heads: total_kv_heads[group],
+                kv_head_offset: kv_head_offsets[group],
+                head_dim: head_dims[group],
+                dtype: stored[group],
+                compute_dtype: compute[group],
+            })
+            .collect();
+
+        Ok(Self {
+            columns: count("columns")? as u32,
+            plane_bytes: count("plane_bytes")?,
+            quantized,
+            unit_bytes: count("unit_bytes")?,
+            dtype,
+            groups,
+            handle,
+        })
     }
 
     /// Whether groups store different element types: stale bytes of one type
@@ -223,84 +287,4 @@ impl KVPlan {
                 )
             })
     }
-
-    /// The plan map with the pool's unit count, as bindings receive it.
-    pub fn layout(&self, num_units: u32) -> Result<tvm_ffi::Map<tvm_ffi::String, Any>> {
-        let plan: tvm_ffi::Map<tvm_ffi::String, Any> =
-            tvm_ffi::Map::try_from(Any::from(self.record.view()))
-                .map_err(|error| Error::numerical("model.cache_plan", &error))?;
-        Ok(plan
-            .iter()
-            .chain([(
-                tvm_ffi::String::from("num_units"),
-                Any::from(i64::from(num_units)),
-            )])
-            .collect())
-    }
-}
-
-fn overflow(field: &str) -> Error {
-    Error::Interface(format!("cache plan field `{field}` overflows"))
-}
-
-fn small(record: &Record, key: &str) -> Result<u32> {
-    u32::try_from(record.count(key)?).map_err(|_| overflow(key))
-}
-
-fn decode_group(group: &Record) -> Result<KVGroupPlan> {
-    let window: i64 = group.get("window")?;
-    let ids = |key: &str| -> Result<Vec<u32>> {
-        group
-            .get::<tvm_ffi::Array<Any>>(key)?
-            .iter()
-            .map(|value| {
-                i64::try_from(value)
-                    .ok()
-                    .and_then(|value| u32::try_from(value).ok())
-                    .ok_or_else(|| overflow(key))
-            })
-            .collect()
-    };
-    let layers = group
-        .get::<tvm_ffi::Array<Any>>("layers")?
-        .iter()
-        .map(|name| {
-            tvm_ffi::String::try_from(name)
-                .map(|name| name.as_str().to_owned())
-                .map_err(|_| Error::Interface("cache plan layer names are strings".into()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let layer_ids = ids("layer_ids")?;
-    let axis_layers = ids("axis_layers")?;
-
-    // This rank's layers are one consecutive run of the group's transfer axis.
-    let offset = layer_ids
-        .first()
-        .and_then(|first| axis_layers.iter().position(|layer| layer == first))
-        .ok_or_else(|| {
-            Error::Interface("cache group layers are missing from their transfer axis".into())
-        })?;
-    if axis_layers.get(offset..offset + layer_ids.len()) != Some(layer_ids.as_slice()) {
-        return Err(Error::Interface(
-            "cache group layers must be one consecutive transfer run".into(),
-        ));
-    }
-
-    Ok(KVGroupPlan {
-        window: u32::try_from(window).ok(),
-        page_tokens: small(group, "page_tokens")?,
-        units_per_page: small(group, "units_per_page")?,
-        layers,
-        layer_ids,
-        axis: GroupAxis {
-            offset: offset as u32,
-            total: axis_layers.len() as u32,
-        },
-        num_kv_heads: small(group, "num_kv_heads")?,
-        total_kv_heads: small(group, "total_kv_heads")?,
-        kv_head_offset: small(group, "kv_head_offset")?,
-        head_dim: small(group, "head_dim")?,
-        dtype: parse_dtype(&group.string("dtype")?)?,
-        compute_dtype: parse_dtype(&group.string("compute_dtype")?)?,
-    })
 }

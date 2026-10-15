@@ -5,20 +5,11 @@ walks the tree, creates a binding (prepared operator, plan and workspace) for
 every numerical call site, and installs those bindings into the
 ``uniserve_models.nn._binding`` context variables while a call runs.
 
-Workspace backing comes from a provider:
-
-* :class:`StandaloneWorkspace` (the default) allocates with ``torch.empty``,
-  for direct library use.
-* :class:`DeclaredWorkspace` records every request without allocating. The
-  worker uses it to learn a binding's requirements, allocates them itself and
-  hands them back as tensors.
-* :class:`BoundWorkspace` serves the same requests, in the same order and by
-  the same names, from tensors the caller supplies.
-
-A preparation walk is deterministic for one module and size, so a declared
-walk and a bound walk issue identical requests. Shared scratch requests are
-named ``"{role}/{field}"``; persistent allocations ``"{sequence:04d}/{field}"``
-in request order.
+Workspace backing comes from a :class:`Workspace`: it allocates with
+``torch.empty``, borrows the shared scratch of its stream from a
+:class:`Scratch`, and takes memory torch cannot allocate, the peer-mapped
+storage of a symmetric field, from the allocation function it is constructed
+with.
 """
 
 from __future__ import annotations
@@ -260,39 +251,6 @@ class Scratch:
         self._backings.clear()
 
 
-def role_name(role: object) -> str:
-    """The stable name of a scratch role (``("vsa", 0)`` -> ``"vsa.0"``)."""
-    if isinstance(role, tuple):
-        return ".".join(str(part) for part in role)
-    return str(role)
-
-
-@dataclass(frozen=True)
-class Requirement:
-    """One workspace field a binding needs.
-
-    ``role`` names a shared scratch area (one backing per stream, sized for
-    every binding prepared on it); ``None`` marks persistent storage owned
-    by this binding alone. ``symmetric`` lists the group members (process
-    ranks, in member order) across which a persistent field must be
-    peer-mapped; ``None`` for local storage.
-    """
-
-    name: str
-    role: str | None
-    dtype: torch.dtype
-    shape: tuple[int, ...]
-    host: bool
-    device: torch.device
-    symmetric: tuple[int, ...] | None = None
-
-
-# Peer views of a symmetric field ``{prefix}/{field}`` are served as
-# ``{prefix}/{field}.peer{index}``, one per group member in member order.
-def _peer_name(name: str, index: int) -> str:
-    return f"{name}.peer{index}"
-
-
 def _split(requirement) -> tuple[dict, dict]:
     """Local and symmetric fields of an attention storage requirement."""
     local = {
@@ -306,12 +264,34 @@ def _split(requirement) -> tuple[dict, dict]:
     return local, symmetric
 
 
-class StandaloneWorkspace:
-    """Allocate workspace with the caching allocator, for library calls."""
+class Workspace:
+    """The workspace of an execution context, in torch memory.
 
-    def __init__(self, scratch: Scratch | None = None) -> None:
+    Shared scratch is grown and kept by a :class:`Scratch`; persistent
+    fields are tensors of their own. A symmetric field, which every member
+    of a group maps, is memory torch cannot allocate and comes from
+    ``allocate``.
+
+    Args:
+        scratch: The shared :class:`Scratch` contexts serialized on one
+            stream borrow; ``None`` creates one this workspace owns.
+        allocate: ``allocate(ranks, dtype, shape)`` returns
+            ``[local, peer_0, ...]``: this rank's tensor of one symmetric
+            field and every member's peer-mapped view of it, in member
+            order. ``ranks`` are the members' process ranks and ``dtype``
+            the element type's name (``"float32"``). The call is collective:
+            every member makes it at the same point. ``None`` maps the field
+            over the torch process group of its communicator.
+    """
+
+    def __init__(
+        self,
+        scratch: Scratch | None = None,
+        allocate: Callable[..., Any] | None = None,
+    ) -> None:
         self._owns_scratch = scratch is None
         self._scratch = Scratch() if scratch is None else scratch
+        self._allocate = allocate
         self._allocations: list[TensorBuffers] = []
         # Peer-mapped allocations, retained until release.
         self._symmetric: list[Any] = []
@@ -333,20 +313,30 @@ class StandaloneWorkspace:
         local, symmetric = _split(requirement)
         tensors = dict(self.allocate(local, requirement.group.device))
         peers = {}
-        if symmetric:
-            # Library use maps peers over the torch process group; the
-            # worker binds its own peer-mapped storage instead.
-            from uniserve_models.distributed.symmetric import (
-                allocate_symmetric_storage,
-            )
+        for name, config in symmetric.items():
+            if self._allocate is None:
+                from uniserve_models.distributed.symmetric import (
+                    allocate_symmetric_storage,
+                )
 
-            for name, config in symmetric.items():
                 shared = allocate_symmetric_storage(
                     requirement.group, config.shape, config.dtype
                 )
                 self._symmetric.append(shared)
                 tensors[name] = shared.local
                 peers[name] = tuple(shared.peers)
+            else:
+                views = [
+                    torch.from_dlpack(view)
+                    for view in self._allocate(
+                        list(requirement.group.ranks),
+                        str(config.dtype).removeprefix("torch."),
+                        list(config.shape),
+                    )
+                ]
+                self._symmetric.append(views)
+                tensors[name] = views[0]
+                peers[name] = tuple(views[1:])
         return tensors, peers
 
     def release(self) -> None:
@@ -362,156 +352,6 @@ class StandaloneWorkspace:
         self.release()
         if self._owns_scratch:
             self._scratch.close()
-
-
-class DeclaredWorkspace:
-    """Record workspace requests and serve meta-device placeholders.
-
-    Nothing is allocated. Repeated requests for one shared field record its
-    elementwise largest extent; persistent requests are numbered in order.
-    """
-
-    def __init__(self) -> None:
-        self._requirements: dict[str, Requirement] = {}
-        self._sequence = 0
-
-    @property
-    def requirements(self) -> tuple[Requirement, ...]:
-        return tuple(self._requirements.values())
-
-    def scratch(self, role, requirements, device):
-        prefix = role_name(role)
-        return self._record(prefix, prefix, requirements, device)
-
-    def allocate(self, requirements, device):
-        prefix = f"{self._sequence:04d}"
-        self._sequence += 1
-        return self._record(prefix, None, requirements, device)
-
-    def storage(self, requirement):
-        """Record an attention storage requirement as persistent fields.
-
-        Symmetric fields carry the group's members, so the allocator maps
-        each member's allocation into every other member.
-        """
-        prefix = f"{self._sequence:04d}"
-        self._sequence += 1
-        members = tuple(requirement.group.ranks)
-        tensors = dict(
-            self._record(
-                prefix, None, requirement.fields, requirement.group.device
-            )
-        )
-        peers = {}
-        for name in requirement.symmetric:
-            key = f"{prefix}/{name}"
-            self._requirements[key] = dataclasses.replace(
-                self._requirements[key], symmetric=members
-            )
-            peers[name] = tuple(tensors[name] for _ in members)
-        return tensors, peers
-
-    def _record(self, prefix, role, requirements, device):
-        device = torch.device(device)
-        views = {}
-        for field, config in requirements.items():
-            name = f"{prefix}/{field}"
-            shape = tuple(config.capacity_shape or config.shape)
-            previous = self._requirements.get(name)
-            if previous is not None:
-                if (
-                    previous.dtype != config.dtype
-                    or len(previous.shape) != len(shape)
-                    or previous.host != config.host
-                ):
-                    raise ValueError(
-                        f"workspace field {name} changes its representation"
-                    )
-                shape = tuple(
-                    max(old, new)
-                    for old, new in zip(previous.shape, shape, strict=True)
-                )
-            self._requirements[name] = Requirement(
-                name, role, config.dtype, shape, config.host, device
-            )
-            views[field] = torch.empty(
-                config.shape, dtype=config.dtype, device="meta"
-            )
-        return MappingProxyType(views)
-
-    def release(self) -> None:
-        self._requirements.clear()
-        self._sequence = 0
-
-    def close(self) -> None:
-        self.release()
-
-
-class BoundWorkspace:
-    """Serve declared requests from caller-owned tensors.
-
-    The tensors are borrowed (for example Rust allocations exported through
-    DLPack) and never released here. A shared field's tensor may exceed one
-    request; requests take compact leading-element views.
-    """
-
-    def __init__(self, tensors: Mapping[str, torch.Tensor]) -> None:
-        self._buffers = TensorBuffers.from_tensors(tensors)
-        self._sequence = 0
-
-    def scratch(self, role, requirements, device):
-        return self._serve(role_name(role), requirements)
-
-    def allocate(self, requirements, device):
-        prefix = f"{self._sequence:04d}"
-        self._sequence += 1
-        return self._serve(prefix, requirements)
-
-    def storage(self, requirement):
-        """Serve an attention storage requirement from its declared names.
-
-        A symmetric field's peer views are served as
-        ``{prefix}/{field}.peer{index}`` in member order.
-        """
-        prefix = f"{self._sequence:04d}"
-        self._sequence += 1
-        tensors = dict(self._serve(prefix, requirement.fields))
-        peers = {}
-        for name in requirement.symmetric:
-            config = requirement.fields[name]
-            named = {
-                _peer_name(f"{prefix}/{name}", index): config
-                for index in range(requirement.group.size)
-            }
-            try:
-                views = self._buffers.view(named)
-            except ValueError as error:
-                raise ValueError(
-                    f"bound workspace has no peer views of {prefix}/{name}"
-                ) from error
-            peers[name] = tuple(views[key] for key in named)
-        return tensors, peers
-
-    def _serve(self, prefix, requirements):
-        named = {
-            f"{prefix}/{field}": config
-            for field, config in requirements.items()
-        }
-        try:
-            views = self._buffers.view(named)
-        except ValueError as error:
-            raise ValueError(
-                f"bound workspace does not serve {sorted(named)}: {error}"
-            ) from error
-        return MappingProxyType(
-            {name.split("/", 1)[1]: tensor for name, tensor in views.items()}
-        )
-
-    def release(self) -> None:
-        self._sequence = 0
-
-    def close(self) -> None:
-        self._buffers.close()
 
 
 class GatherPool:
@@ -842,12 +682,12 @@ class ExecutionContext:
         moe: Routed-expert backend name.
         groups: Communicators the bound modules use; defaults to every
             communicator in the module tree.
-        scratch: A shared :class:`Scratch` (standalone workspace only).
+        scratch: A shared :class:`Scratch` (default workspace only).
         derive_host_lengths: Plans may read missing host lengths from the
             device.
         experts: The expert exchange routed experts communicate through.
         weights: Expert weight prefetch.
-        workspace: Workspace provider; defaults to a standalone provider.
+        workspace: Workspace provider; defaults to a :class:`Workspace`.
         collectives: Stream-bound collective bindings selected during an
             activation (the parallel runtime supplies them for its streams);
             ``None`` uses the process groups directly.
@@ -911,9 +751,7 @@ class ExecutionContext:
         }
         self.derive_host_lengths = derive_host_lengths
         self.collectives = collectives
-        self.workspace = (
-            StandaloneWorkspace(scratch) if workspace is None else workspace
-        )
+        self.workspace = Workspace(scratch) if workspace is None else workspace
         self.constants: Mapping[str, torch.Tensor] = _empty()
         self.workspace_views: Mapping[str, torch.Tensor] = _empty()
         self.graph_streams: set[torch.cuda.Stream] = set()
@@ -1325,7 +1163,7 @@ class ExecutionContext:
         self._chunks[id(layer)] = functools.partial(
             pool.borrow, capacity=capacity
         )
-        if capacity and not isinstance(self.workspace, DeclaredWorkspace):
+        if capacity:
             with pool.borrow(capacity, device):
                 pass
 

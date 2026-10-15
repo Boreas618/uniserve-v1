@@ -21,9 +21,10 @@ use uniserve_ipc::{
 
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::Device;
+use crate::lane::{Completion, Recorder};
 use crate::request::RequestPool;
 use crate::storage::{OutputBuffer, OutputLease, TensorStore};
-use crate::stream::EventPool;
+use crate::stream::{EventPool, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
 
@@ -118,42 +119,28 @@ pub(crate) fn failed_output(
     })
 }
 
-/// Read a host-gated (U8) predicate after its producer's fence.
-pub(crate) fn read_flag(
+/// Record the read of a host-gated (U8) predicate after its producer's
+/// fence: the job's completion carries its byte, which [`flag`] decodes.
+pub(crate) fn request_flag(
     tensors: &TensorStore,
     call: &Call,
     predicate: &TensorRef,
     device: Option<i32>,
-    stream: Option<&Stream>,
-) -> Result<bool> {
-    let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), stream)?;
-    let mut value = [0_u8; 1];
-    let copied = (|| -> Result<()> {
-        match stream {
-            Some(stream) => {
-                // SAFETY: one byte of a committed product, read after the
-                // stream waited on its producer; the host byte outlives the
-                // synchronized copy.
-                unsafe {
-                    uniserve_cuda::memcpy_async(
-                        value.as_mut_ptr() as u64,
-                        read.value().address(),
-                        1,
-                        stream,
-                    )
-                }?;
-                stream.synchronize()?;
-            }
-            // SAFETY: a host product byte.
-            None => value[0] = unsafe { *(read.value().address() as *const u8) },
-        }
-        Ok(())
-    })();
-    tensors.complete_reads(&[read], stream, &[])?;
-    copied?;
-    match value[0] {
-        0 => Ok(false),
-        1 => Ok(true),
+    job: Recorder<'_>,
+) -> Result<()> {
+    let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), job)?;
+    // One byte of a committed product, which the read lease keeps until
+    // the reader's fence that ends it below.
+    job.read(read.value().address(), 1);
+    tensors.complete_reads(&[read], job, &[])
+}
+
+/// The predicate the next read of `completion` carries
+/// ([`request_flag`]).
+pub(crate) fn flag(completion: &mut Completion) -> Result<bool> {
+    match completion.read()?[..] {
+        [0] => Ok(false),
+        [1] => Ok(true),
         _ => Err(Error::Invalid(
             "call predicate is not a canonical boolean".into(),
         )),
@@ -161,23 +148,27 @@ pub(crate) fn read_flag(
 }
 
 /// Seal the lease on `stream` and complete `retirement` (the physical end
-/// of the batch's storage accesses) once its fences complete; wake the
-/// service when they do.
+/// of the batch's storage accesses) once its fences complete. The batch's
+/// executor learns of their completion from the job it submits for them
+/// ([`crate::executor::Backend::await_outputs`]), which also wakes the
+/// service.
 pub(crate) fn seal(
     events: &EventPool,
     buffer: &OutputLease,
-    stream: Option<&Stream>,
+    stream: impl Issue,
     retirement: &Arc<Retirement>,
 ) -> Result<()> {
-    let streams: Vec<&Stream> = stream.into_iter().collect();
+    // A lease of host storage is sealed on no stream.
+    let streams = if stream.stream().is_some() {
+        vec![stream]
+    } else {
+        Vec::new()
+    };
     let fences = lock(buffer).seal(&streams, events)?.unwrap_or_default();
-    let notify: Vec<_> = lock(buffer).fences().cloned().collect();
-    for event in &notify {
-        events.wake_after(event)?;
-    }
     let lease = Arc::clone(buffer);
     let retirement = Arc::clone(retirement);
-    events.defer(
+    stream.defer(
+        events,
         fences,
         Box::new(move || {
             lock(&lease).copies_finished();
@@ -195,7 +186,7 @@ pub(crate) fn materialize(
     plan: &BatchPlan,
     launched: &mut Launched,
 ) -> Result<Option<BatchResult>> {
-    if lock(&launched.buffer).ready_at()?.is_none() {
+    if lock(&launched.buffer).ready_at().is_none() {
         return Ok(None);
     }
     if let Some(host) = &mut launched.host {
@@ -279,34 +270,36 @@ pub(crate) fn abandon(requests: &mut RequestPool, mut launched: Launched) -> Res
 /// each batch waits for the previous batch recorded on another stream.
 #[derive(Default)]
 pub(crate) struct StreamOrder {
-    last: Option<(usize, uniserve_cuda::Event)>,
+    last: Option<(usize, Arc<uniserve_cuda::Event>)>,
 }
 
 impl StreamOrder {
     /// Order `stream` after the previous batch on another stream.
-    pub(crate) fn wait(&self, stream: Option<&Stream>) -> Result<()> {
-        let Some(stream) = stream else {
+    pub(crate) fn wait(&self, stream: impl Issue) -> Result<()> {
+        let Some(raw) = stream.stream().map(Stream::raw) else {
             return Ok(());
         };
         if let Some((previous, event)) = &self.last
-            && *previous != stream.raw()
+            && *previous != raw
         {
-            stream.wait_event(event)?;
+            stream.wait(event)?;
         }
         Ok(())
     }
 
     /// Record the end of this batch's work on `stream` for other streams.
-    pub(crate) fn record(&mut self, stream: Option<&Stream>) -> Result<()> {
-        let Some(stream) = stream else {
+    pub(crate) fn record(&mut self, stream: impl Issue) -> Result<()> {
+        let Some(raw) = stream.stream().map(Stream::raw) else {
             return Ok(());
         };
         let event = match self.last.take() {
             Some((_, event)) => event,
-            None => uniserve_cuda::Event::new(uniserve_cuda::EventFlags::default()),
+            None => Arc::new(uniserve_cuda::Event::new(
+                uniserve_cuda::EventFlags::default(),
+            )),
         };
-        event.record(stream)?;
-        self.last = Some((stream.raw(), event));
+        stream.record(&event)?;
+        self.last = Some((raw, event));
         Ok(())
     }
 }

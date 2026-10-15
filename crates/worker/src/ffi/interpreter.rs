@@ -5,8 +5,17 @@
 //! library's `main` on: it becomes the [`Interpreter`] and serves the calls
 //! every other thread makes through [`super::Function`], one at a time, in
 //! arrival order. A caller waits for its call's result; while it waits, the
-//! values it passed stay borrowed on its stack. The last use of a Python
-//! object ([`super::Handle`]'s drop) is handed over the same way.
+//! values it passed stay borrowed on its stack.
+//!
+//! The control thread does not wait: it submits work that owns what it uses
+//! ([`Interpreter::submit`]) and hears of it through what the work posts
+//! when it ran. Submitted work is served in the same queue, in arrival
+//! order with every other thread's calls. Giving up a Python object
+//! ([`super::Handle`]'s drop) is such work on every thread: the reference
+//! is dropped by the Python thread, in the order of the queue, and nobody
+//! waits for it. An owner whose next step needs the releases made (closing
+//! the streams or the context that released objects use) waits for the
+//! queue once ([`Interpreter::synchronize`]).
 //!
 //! Three cases make a call on the calling thread instead:
 //!
@@ -33,13 +42,21 @@ thread_local! {
     static CALLS_HERE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// One entry of the Python thread's queue.
+enum Request {
+    /// Work that borrows its submitter, which is parked until it ran.
+    Handed(Handoff),
+    /// Work that owns what it uses; nobody waits for it.
+    Submitted(Box<dyn FnOnce() + Send>),
+}
+
 /// The queue of the started interpreter. It outlives the interpreter: once
 /// the interpreter has stopped, sends fail and callers call directly.
-static REQUESTS: OnceLock<Sender<Handoff>> = OnceLock::new();
+static REQUESTS: OnceLock<Sender<Request>> = OnceLock::new();
 
 /// The thread that executes Python.
 pub struct Interpreter {
-    requests: Receiver<Handoff>,
+    requests: Receiver<Request>,
 }
 
 impl Interpreter {
@@ -67,11 +84,42 @@ impl Interpreter {
         loop {
             select! {
                 recv(self.requests) -> request => {
-                    request.expect("the request queue is never closed").run();
+                    match request.expect("the request queue is never closed") {
+                        Request::Handed(handoff) => handoff.run(),
+                        Request::Submitted(work) => work(),
+                    }
                 }
                 recv(finished) -> outcome => return outcome.ok(),
             }
         }
+    }
+
+    /// Submit `work` to the Python thread and return without waiting for
+    /// it. The work owns everything it uses and reports by a message of its
+    /// own (a completion it posts), so its submitter goes on at once. Where
+    /// the calling thread is the one its Python runs on (see the module
+    /// documentation), the work runs before this returns.
+    pub fn submit(work: impl FnOnce() + Send + 'static) {
+        let work: Box<dyn FnOnce() + Send> = Box::new(work);
+        let Some(requests) = REQUESTS.get().filter(|_| !CALLS_HERE.get()) else {
+            work();
+            return;
+        };
+
+        // The interpreter has stopped: the work comes back unsent.
+        if let Err(unsent) = requests.send(Request::Submitted(work))
+            && let Request::Submitted(work) = unsent.into_inner()
+        {
+            work();
+        }
+    }
+
+    /// Wait until the Python thread has run everything submitted or handed
+    /// to it before this call: every released object is released when this
+    /// returns. For an owner about to close what released objects use; not
+    /// for a thread that serves.
+    pub fn synchronize() {
+        on_python_thread(&mut || {});
     }
 }
 
@@ -81,7 +129,7 @@ fn on_python_thread(work: &mut dyn FnMut()) {
     let handed = REQUESTS
         .get()
         .filter(|_| !CALLS_HERE.get())
-        .is_some_and(|requests| hand(requests, |handoff| handoff, work));
+        .is_some_and(|requests| hand(requests, Request::Handed, work));
     if !handed {
         work();
     }
@@ -98,15 +146,32 @@ pub(super) fn call(function: &tvm_ffi::Function, args: &[AnyView<'_>]) -> tvm_ff
     result.expect("a finished call has a result")
 }
 
-/// Give up a reference to a Python object: drop it on the Python thread.
+/// Give up a reference to a Python object: the Python thread drops it, in
+/// the order of its queue, and the caller does not wait.
 ///
-/// The caller waits, so the object is released at this point of the
-/// caller's teardown order. A Python object can own device resources (a
-/// graph pool frees its blocks and synchronizes the streams they were used
-/// on), which must go before the streams they refer to.
+/// A Python object can own device resources (a graph pool frees its blocks
+/// and synchronizes the streams they were used on), which must go before
+/// the streams they refer to: whoever closes those waits for the queue
+/// first ([`Interpreter::synchronize`]). A call made after a release runs
+/// after it.
 pub(super) fn release(value: Any) {
-    let mut value = Some(value);
-    on_python_thread(&mut || drop(value.take()));
+    let released = Released(value);
+    Interpreter::submit(move || released.release());
+}
+
+/// A reference on its way to the Python thread.
+struct Released(Any);
+
+// SAFETY: the value is an immutable reference-counted TVM-FFI object with
+// atomic counts, which Rust never dereferences; it is only moved to the
+// Python thread and dropped there. A handle never holds a tensor.
+unsafe impl Send for Released {}
+
+impl Released {
+    /// Drop the reference, on the thread that executes Python.
+    fn release(self) {
+        drop(self.0);
+    }
 }
 
 /// Run `body` with this thread's Python calls made on this thread.

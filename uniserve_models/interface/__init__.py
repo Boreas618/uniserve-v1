@@ -2,9 +2,8 @@
 
 ``table()`` maps ``<area>.<verb>`` names to plain functions. Each area module
 exposes ``functions()`` with its entries; a capability runtime adds its
-module to ``_AREAS``. Every entry is wrapped by ``errors.translate``, and
-every map of functions a ``*.bind`` entry returns by ``errors.binding``, so
-a failure crosses the interface with a fixed error kind.
+module to ``_AREAS``. Every entry is wrapped by ``errors.translate``, so a
+failure crosses the interface with a fixed error kind.
 
 Building the table imports the numerical library but never initializes
 CUDA: the worker selects devices and contexts before any CUDA call.
@@ -20,17 +19,8 @@ from .errors import translate
 
 # Interface modules in this package, each exposing ``functions()``.
 _AREAS = (
-    "loading",
-    "cache",
-    "binding",
     "distributed",
-    "experts",
     "graphs",
-    "image",
-    "encoder",
-    "decoder",
-    "denoiser",
-    "memory",
     "kernels",
     "profiling",
     "runtime",

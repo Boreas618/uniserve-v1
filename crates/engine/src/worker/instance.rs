@@ -851,6 +851,13 @@ impl WorkerGroup {
     /// not the replacement group started; a failed replacement also closes
     /// this group.
     fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Error {
+        // The returned failure reaches its reader only once the replacement
+        // group has started, so the cause is logged before the relaunch.
+        tracing::warn!(
+            worker = %self.process_args.worker_id,
+            "replacing the rank group: {cause:#}"
+        );
+
         if let Some(domain) = &self.failure_domain {
             domain.fail(&self.process_args.worker_id, cause);
         }

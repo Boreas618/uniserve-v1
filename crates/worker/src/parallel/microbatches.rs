@@ -3,6 +3,11 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
+use uniserve_cuda::Stream;
+
+use super::expert_union::ExpertUnion;
+use crate::ffi::{Handle, cooperative};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 thread_local! {
@@ -395,5 +400,122 @@ impl Drop for MicrobatchLanes {
         for lane in &mut self.threads {
             drop(lane.jobs.take());
         }
+    }
+}
+
+/// One microbatch's forward in an expert step.
+pub(crate) struct MicrobatchForward {
+    /// The forward's operations on the microbatch's stream: a graph launch
+    /// or a runner method call, and what follows it. Its microbatch thread
+    /// performs them in its turn.
+    pub(crate) job: crate::lane::Job,
+    /// Whether the forward passes the host turn at its expert dispatch
+    /// points: an eager forward does and stays suspended in Python
+    /// meanwhile; a captured forward submits its whole step at once.
+    pub(crate) yields: bool,
+}
+
+impl MicrobatchForward {
+    /// The forward as the call of its microbatch.
+    fn call(self) -> MicrobatchCall<()> {
+        Box::new(move || match self.job.perform().check() {
+            Ok(_) => Ok(()),
+            Err(failure) => Err(failure.error),
+        })
+    }
+}
+
+/// Make `call` a cooperative turn of its microbatch thread: the thread
+/// calls Python itself, because a call that yields at a dispatch point
+/// keeps its Python frames on that thread until the rotation returns to it.
+/// Only eager forwards and eager joins are turns; a captured forward or
+/// join launches its graph and enters no Python on a microbatch thread.
+pub(super) fn turn(call: MicrobatchCall<()>) -> MicrobatchCall<()> {
+    Box::new(move || cooperative(call))
+}
+
+impl ExpertUnion {
+    /// Microbatches; one without microbatch execution.
+    pub(crate) fn microbatches(&self) -> usize {
+        self.microbatches.len()
+    }
+
+    /// The exchange of microbatch `peer`.
+    pub(crate) fn transport(&self, peer: usize) -> &Handle {
+        &self.microbatches[peer].exchange
+    }
+
+    /// The stream of microbatch `peer`.
+    pub(crate) fn stream(&self, peer: usize) -> &Stream {
+        &self.microbatches[peer].stream
+    }
+
+    /// Order every microbatch stream after the work `job` holds for
+    /// `parent`, before the job takes the microbatches' inputs.
+    pub(crate) fn fork(&self, job: &crate::lane::Job, parent: &Stream) -> Result<()> {
+        if self.microbatches.len() < 2 {
+            return Ok(());
+        }
+        let event = Arc::new(uniserve_cuda::Event::new(
+            uniserve_cuda::EventFlags::default(),
+        ));
+        job.on(Some(parent)).record(&event)?;
+        for peer in &self.microbatches[1..] {
+            job.on(Some(&peer.stream)).wait(&event)?;
+        }
+        Ok(())
+    }
+
+    /// Order `parent` after the work `job` holds for every microbatch
+    /// stream.
+    pub(crate) fn join_streams(&self, job: &crate::lane::Job, parent: &Stream) -> Result<()> {
+        for peer in &self.microbatches[1..] {
+            let event = Arc::new(uniserve_cuda::Event::new(
+                uniserve_cuda::EventFlags::default(),
+            ));
+            job.on(Some(&peer.stream)).record(&event)?;
+            job.on(Some(parent)).wait(&event)?;
+        }
+        Ok(())
+    }
+
+    /// Run one expert step of `capacity`: every populated microbatch's
+    /// forward and every empty microbatch's join. With microbatches, they
+    /// run in rotation on the microbatch threads, and `parent` waits on
+    /// every microbatch stream before this returns.
+    pub(crate) fn run(
+        &self,
+        parent: &Stream,
+        forwards: Vec<Option<MicrobatchForward>>,
+        capacity: usize,
+    ) -> Result<()> {
+        if forwards.len() != self.microbatches.len() {
+            return Err(Error::Invariant(
+                "an expert step has one call per microbatch".into(),
+            ));
+        }
+        let Some(lanes) = &self.lanes else {
+            return match forwards.into_iter().next().flatten() {
+                Some(forward) => forward.call()(),
+                None => self.peer_join(0, capacity)?(),
+            };
+        };
+        let calls = forwards
+            .into_iter()
+            .enumerate()
+            .map(|(peer, forward)| match forward {
+                Some(forward) if forward.yields => Ok(turn(forward.call())),
+                Some(forward) => Ok(forward.call()),
+                None => self.peer_join(peer, capacity),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        lanes.run(parent, &self.streams(), calls).map(drop)
+    }
+
+    pub(super) fn streams(&self) -> Vec<Stream> {
+        self.microbatches
+            .iter()
+            .map(|peer| peer.stream.clone())
+            .collect()
     }
 }

@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use uniserve_core::SharedMemory;
 use uniserve_cuda::{DeviceGuard, Event, EventFlags, HostRegistration, Stream};
 
+use super::{DRAIN_LIMIT, drain_event};
 use crate::ffi::{Backing, Device};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 pub const SHM_HEADER_BYTES: usize = 512;
@@ -117,7 +119,7 @@ pub struct SharedBuffer {
     producer: Option<Stream>,
     bytes: usize,
     submitted: bool,
-    completion: Option<Event>,
+    completion: Option<Arc<Event>>,
 }
 
 impl SharedBuffer {
@@ -186,26 +188,27 @@ impl SharedBuffer {
         self.producer.is_some()
     }
 
-    /// Announce bytes after their last write, either immediately for a CPU
-    /// copy or in the producer's CUDA stream. The callback touches only host
-    /// memory; it neither enters Python nor calls CUDA.
-    /// The caller submits exactly one copy sequence per buffer and must not
-    /// modify its payload after announcing readiness.
-    pub fn mark_ready(&mut self) -> Result<()> {
+    /// Announce bytes after their last write: behind the copies `issue`
+    /// issued on the producer's stream, or in the order of its host writes
+    /// for a CPU copy. The callback touches only host memory; it neither
+    /// enters Python nor calls CUDA.
+    /// The caller issues exactly one copy sequence per buffer, to `issue`,
+    /// and must not modify its payload after announcing readiness.
+    pub fn mark_ready(&mut self, issue: impl Issue) -> Result<()> {
         let mapping = self.mapping()?;
+        let ready = Box::new(move || mapping.word(0).store(READY, Ordering::Release));
 
         if let Some(stream) = &self.producer {
             // A default-stream handle resolves against the current context.
             let _device = DeviceGuard::new(stream.device())?;
-            stream.launch_host_fn(move || mapping.word(0).store(READY, Ordering::Release))?;
+            issue.launch_host_fn(ready)?;
 
-            let completion = Event::new(EventFlags::default());
-            completion.record(stream)?;
+            let completion = Arc::new(Event::new(EventFlags::default()));
+            issue.record(&completion)?;
             self.completion = Some(completion);
             Ok(())
         } else {
-            mapping.word(0).store(READY, Ordering::Release);
-            Ok(())
+            issue.host().launch_host_fn(ready)
         }
     }
 
@@ -227,31 +230,49 @@ impl SharedBuffer {
                 }))
     }
 
-    /// Shutdown and failed submission must finish DMA even if readiness was
-    /// never scheduled. Normal retirement observes READY and does not wait.
+    /// Shutdown and a close before readiness must see the producer's DMA
+    /// finished even if readiness was never scheduled: wait on the host for
+    /// it, at most [`DRAIN_LIMIT`]. Normal retirement observes READY and
+    /// does not wait.
     pub fn synchronize(&self) -> Result<()> {
         if self.submitted
             && let Some(stream) = &self.producer
             && self.mapping.word(0).load(Ordering::Acquire) == PENDING
         {
-            if let Some(completion) = &self.completion {
-                completion.synchronize()?;
-            } else {
-                // Submission failed before its completion event was recorded.
-                let _device = DeviceGuard::new(stream.device())?;
-                stream.synchronize()?;
+            let deadline = Instant::now() + DRAIN_LIMIT;
+            match &self.completion {
+                Some(completion) => drain_event(completion, deadline)?,
+                None => {
+                    // Submission failed before its completion event was
+                    // recorded: fence what the stream holds now.
+                    let _device = DeviceGuard::new(stream.device())?;
+                    let fence = Event::new(EventFlags::default());
+                    fence.record(stream)?;
+                    drain_event(&fence, deadline)?;
+                }
             }
         }
 
         Ok(())
     }
 
+    /// Unregister and release the buffer once its producer's DMA finished.
     pub fn close(&mut self) -> Result<()> {
         if self.storage.is_none() {
             return Ok(());
         }
 
         self.synchronize()?;
+        self.release()
+    }
+
+    /// Unregister and release the buffer without waiting for its producer:
+    /// for a buffer whose copies are known complete or were never issued.
+    pub fn release(&mut self) -> Result<()> {
+        if self.storage.is_none() {
+            return Ok(());
+        }
+
         if let Some(registration) = self.registration.take() {
             // Producer DMA has stopped and the mapping is still live.
             registration.unregister()?;

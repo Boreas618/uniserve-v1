@@ -19,19 +19,19 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
 use uniserve_ipc::{Call, ForwardBatch};
 
 use crate::executor::PendingOutput;
-use crate::executor::forward::image::ImageRuntime;
-use crate::ffi::{Device, Region};
-use crate::model::image::ROPE_ADVANCE;
+use crate::executor::forward::batch::image::ImageParts;
+use crate::ffi::Device;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};
-use crate::runner::diffusion::image::ConditionRow;
+use crate::runner::denoiser::image::ConditionRow;
+use crate::runner::denoiser::image_model::ROPE_ADVANCE;
 use crate::runner::vision::{BlockPositions, PositionLayout};
 use crate::storage::memory::StorageView;
 use crate::storage::{BlockTables, Metadata, ProductRead, TensorStore};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// How a media call's rows advance its request.
@@ -55,17 +55,19 @@ pub(super) struct Media {
 }
 
 /// What a media call borrows from the rank.
-pub(super) struct Sources<'a> {
+pub(super) struct Sources<'a, I> {
     pub(super) tensors: &'a TensorStore,
-    pub(super) image: Option<&'a ImageRuntime>,
+    pub(super) image: Option<&'a ImageParts<'a>>,
     pub(super) tables: &'a BlockTables,
     pub(super) device: Option<i32>,
-    pub(super) stream: Option<&'a Stream>,
+    /// What the batch issues its stream work to: the stream that consumes
+    /// the features waits on their producers.
+    pub(super) stream: I,
     /// The request's admitted input images.
     pub(super) input_images: u32,
 }
 
-impl Sources<'_> {
+impl<I> Sources<'_, I> {
     /// Whether rows carry three rotary axes: models with an image denoiser
     /// (whose sequences place latent images spatially) and models placing
     /// vision features spatially. Others read one temporal axis.
@@ -88,7 +90,12 @@ struct Feature {
     width: u32,
 }
 
-fn consume(sources: &Sources<'_>, call: &Call, index: usize, latent: bool) -> Result<Feature> {
+fn consume(
+    sources: &Sources<'_, impl Issue>,
+    call: &Call,
+    index: usize,
+    latent: bool,
+) -> Result<Feature> {
     let reference = if latent {
         call.latent_feature_input.as_ref()
     } else {
@@ -162,7 +169,7 @@ fn narrow(value: u64) -> Result<u32> {
 /// A vision block row of `feature` at `position` after `prefix` visible
 /// tokens; returns the row and the block's features.
 fn vision_row(
-    sources: &Sources<'_>,
+    sources: &Sources<'_, impl Issue>,
     feature: &Feature,
     slot: u32,
     prefix: u64,
@@ -197,6 +204,12 @@ fn vision_row(
             "vision features must have shape [tokens, hidden]".into(),
         ));
     };
+    // FIXME: a call of the library made while the batch is recorded: the
+    // control thread waits for the Python thread here. The grid of an
+    // image's size is a fact of the model, to be read where the image's
+    // features are produced and carried with them. It belongs to the
+    // feature product's metadata, a message type that changes with the
+    // channel's integration, so the call stays until then.
     let grid = image
         .policy()
         .patch_grid(
@@ -243,7 +256,7 @@ fn vision_row(
 /// of the call, which must match its rows. A call that `scores` its prompt
 /// projects every text token and each block's last token.
 pub(super) fn context(
-    sources: &Sources<'_>,
+    sources: &Sources<'_, impl Issue>,
     call: &Call,
     output: &PendingOutput,
     slot: u32,
@@ -350,7 +363,7 @@ pub(super) fn context(
 /// The row of a visual-state prefill: one vision block closing an image,
 /// or a latent feature's conditioning.
 pub(super) fn visual(
-    sources: &Sources<'_>,
+    sources: &Sources<'_, impl Issue>,
     call: &Call,
     output: &PendingOutput,
     slot: u32,
@@ -409,7 +422,7 @@ pub(super) fn visual(
                 "image state query span exceeds the call token bound".into(),
             ));
         }
-        let features = Region::within(image.arena(diffusion_device(diffusion))?, read.value())?;
+        let features = read.value().clone();
         let row = TokenRow {
             slot,
             source: RowSource::Placed {
@@ -464,11 +477,4 @@ pub(super) fn visual(
             latent: None,
         },
     ))
-}
-
-fn diffusion_device(diffusion: &crate::runner::diffusion::image::ImageDiffusion) -> Device {
-    match diffusion.device() {
-        crate::config::Device::Cuda(index) => Device::Cuda(index),
-        crate::config::Device::Cpu => Device::Cpu,
-    }
 }

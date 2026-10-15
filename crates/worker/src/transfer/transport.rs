@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use uniserve_cuda::{SourceOrder, Stream};
+use uniserve_cuda::{Event, SourceOrder, Stream};
 use uniserve_ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
 
 use super::cuda_vmm::{CudaExports, CudaRead, Exported};
@@ -29,10 +29,11 @@ use super::read::{self, BorrowedReads, NativeRead, Read, ReadCall, ReadContext, 
 use super::source::TransportBuffer;
 use super::{
     Capacity, Notify, ReadReservation, Retirement, SHM_HEADER_BYTES, SharedBuffer, SharedRead,
-    Spans, copy_on_host, copy_planner, notify,
+    Spans, copy_planner, notify,
 };
 use crate::ffi::{Backing, Device};
 use crate::storage::memory::{Memory, StorageView, device_name, dtype_name, parse_dtype};
+use crate::stream::Issue;
 use crate::{Error, EventPool, Result};
 
 /// How long a shared-memory borrower waits for its producer's readiness.
@@ -168,6 +169,34 @@ impl<'a> ExportView<'a> {
     }
 }
 
+/// An export whose location is complete once the work it issued was
+/// performed. Its transport completes it ([`Transport::locate`]) or gives
+/// it up ([`Transport::discard`]); the caller keeps it until one of them,
+/// called only then: at once after a stream, from the job's completion on
+/// after a recorder.
+pub(crate) enum Staged {
+    /// A channel export whose bytes are staged on the host. They travel in
+    /// the location itself, so it exists once they were copied.
+    Channel {
+        /// The location without its payload.
+        locator: Locator,
+        staging: Arc<Memory>,
+        bytes: usize,
+    },
+    /// A CUDA VMM export fenced by a readiness event. A same-host reader
+    /// waits on the event through its interprocess handle, which exists
+    /// once the event was recorded, and reads the export through its
+    /// endpoint's registration, made with the complete location.
+    Fenced {
+        /// The location without its event handle.
+        locator: Locator,
+        /// The readiness event whose handle the location carries; `None`
+        /// when readers on other hosts do not wait on it.
+        ready: Option<Arc<Event>>,
+        buffer: Arc<TransportBuffer>,
+    },
+}
+
 /// The producer stream a device export is ordered on.
 fn producer<'s>(spans: &Spans, stream: Option<&'s Stream>) -> Result<Option<(i32, &'s Stream)>> {
     let Device::Cuda(device) = spans.device() else {
@@ -291,28 +320,38 @@ impl Transport {
         }
     }
 
-    /// Export `source` (produced on `stream` when it is device memory) at
-    /// `offset` in its logical tensor, for `consumers`' acknowledgment slots.
+    /// Export `source` (produced on `stream`'s stream when it is device
+    /// memory) at `offset` in its logical tensor, for `consumers`'
+    /// acknowledgment slots.
     ///
     /// The export reserves its bytes before preparing backing; a successful
     /// registration holds them until producer and consumer accesses retired.
+    ///
+    /// `stream` is what the export's device work is issued to: its fence,
+    /// its copies into shared or pooled storage with the readiness mark
+    /// behind them, and the wait a mechanism needs before its bytes or
+    /// handle leave the process. A job's recorder defers all of it to the
+    /// job, so a location is published only from the job's completion on,
+    /// and a channel export, whose bytes travel in the location, is
+    /// [`Exported::Staged`] until then. This releases its storage when it
+    /// fails, so its caller issues it inside an attempt
+    /// ([`Issue::attempt`]), which keeps a job from performing the copies
+    /// a failed export recorded.
     pub(crate) fn export(
         &self,
         source: &Spans,
         offset: Option<&[u64]>,
         consumers: &[usize],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Exported> {
         let view = ExportView::new(source, offset)?;
         match &self.backend {
             Backend::Cuda(cuda) => {
                 cuda.check()?;
                 CudaExports::validate(source)?;
-                self.events.reap()?;
             }
-            Backend::Local { .. } => self.events.reap()?,
             Backend::Shared { endpoint, .. } => endpoint.reap()?,
-            Backend::Channel { .. } => {}
+            Backend::Local { .. } | Backend::Channel { .. } => {}
         }
         self.capacity.acquire(view.nbytes)?;
 
@@ -324,10 +363,7 @@ impl Transport {
                 .export_shared(&view, endpoint, consumers, stream)
                 .map(|locator| Exported::Located(Box::new(locator))),
             Backend::Cuda(cuda) => {
-                let stream = stream.ok_or_else(|| {
-                    Error::Invalid("a device export requires its producer stream".into())
-                });
-                let exported = stream.and_then(|stream| {
+                let exported = if stream.stream().is_some() {
                     cuda.export(
                         source,
                         stream,
@@ -336,13 +372,17 @@ impl Transport {
                         &self.events,
                         |transport| Ok(view.locator(&self.source, transport)),
                     )
-                });
+                } else {
+                    Err(Error::Invalid(
+                        "a device export requires its producer stream".into(),
+                    ))
+                };
                 match exported {
-                    Ok(Exported::Located(locator)) => Ok(Exported::Located(locator)),
                     Ok(Exported::PoolExhausted) => {
                         self.capacity.release(view.nbytes)?;
                         Ok(Exported::PoolExhausted)
                     }
+                    Ok(exported) => Ok(exported),
                     // A failure retains its bytes only when its backing was
                     // registered (which retires them) or could not drain.
                     Err(error) => Err(error),
@@ -351,7 +391,7 @@ impl Transport {
             Backend::Channel { name, .. } => {
                 let result = self.export_channel(&view, name, stream);
                 self.capacity.release(view.nbytes)?;
-                result.map(|locator| Exported::Located(Box::new(locator)))
+                result.map(|staged| Exported::Staged(Box::new(staged)))
             }
         }
     }
@@ -361,10 +401,10 @@ impl Transport {
         view: &ExportView<'_>,
         endpoint: &Arc<Endpoint>,
         next: &AtomicU64,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Locator> {
-        let event = match producer(view.spans, stream) {
-            Ok(Some((_, stream))) => self.events.fence(stream, false).map(Some),
+        let event = match producer(view.spans, stream.stream()) {
+            Ok(Some(_)) => self.events.fence(stream, false).map(Some),
             Ok(None) => Ok(None),
             Err(error) => Err(error),
         };
@@ -400,15 +440,17 @@ impl Transport {
         view: &ExportView<'_>,
         endpoint: &Arc<Endpoint>,
         consumers: &[usize],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Locator> {
-        let producer = match producer(view.spans, stream) {
+        let producer = match producer(view.spans, stream.stream()) {
             Ok(producer) => producer,
             Err(error) => {
                 self.capacity.release(view.nbytes)?;
                 return Err(error);
             }
         };
+        // The buffer keeps the producer's stream for its own lifetime: it
+        // drains the stream before it unregisters or releases its bytes.
         let shared = producer.as_ref().map(|(_, stream)| (*stream).clone());
         let mut storage = match SharedBuffer::new(view.nbytes as usize, consumers.to_vec(), shared)
         {
@@ -436,7 +478,7 @@ impl Transport {
                 &shape,
             )?)?;
             match &producer {
-                Some((device, stream)) => {
+                Some((device, _)) => {
                     // Mark in-flight storage before the first copy: a failed
                     // copy must drain before unregistration or byte reuse.
                     storage.begin_copy();
@@ -444,22 +486,28 @@ impl Transport {
                     payload.plan_copy(view.spans, &mut plan)?;
                     // SAFETY: the registered mapping stays mapped until the
                     // buffer closes, which drains this stream first.
-                    unsafe { plan.submit(stream) }?;
+                    unsafe { stream.copy_strided(&plan) }?;
                 }
                 None => {
                     let mut plan = copy_planner(None, SourceOrder::Stream)?;
                     payload.plan_copy(view.spans, &mut plan)?;
-                    // SAFETY: host operands; no reader maps the segment yet.
-                    unsafe { copy_on_host(&plan) };
+                    // SAFETY: host operands, written in the producer's
+                    // order; no reader maps the segment yet.
+                    unsafe { stream.host().copy_strided(&plan) }?;
                 }
             }
-            storage.mark_ready()?;
+            storage.mark_ready(stream)?;
             Ok(locator)
         })();
         let locator = match written {
             Ok(locator) => locator,
             Err(error) => {
-                storage.close()?;
+                // The attempt failed: a stream issued its copies at once
+                // and drains them here; a job gives up the copies and this
+                // wait with the rest of the failed attempt. Either way no
+                // DMA into the mapping is outstanding when it is released.
+                stream.synchronize()?;
+                storage.release()?;
                 self.capacity.release(view.nbytes)?;
                 return Err(error);
             }
@@ -473,59 +521,126 @@ impl Transport {
         Ok(locator)
     }
 
+    /// Complete a staged export of this transport: the location with the
+    /// channel bytes its copy staged, or with the handle of the readiness
+    /// event its work recorded, registered with the endpoint.
+    pub(crate) fn locate(&self, staged: Staged) -> Result<Locator> {
+        match staged {
+            Staged::Channel {
+                mut locator,
+                staging,
+                bytes,
+            } => {
+                // SAFETY: the export's copy and the wait behind it were
+                // performed, so nothing writes the staging any more.
+                let payload = unsafe { staging.host_bytes() }
+                    .ok_or_else(|| Error::Invariant("channel staging is host memory".into()))?
+                    [..bytes]
+                    .to_vec();
+                match &mut locator.transport {
+                    TransferTransport::Channel {
+                        payload: carried, ..
+                    } => *carried = payload,
+                    _ => {
+                        return Err(Error::Invariant(
+                            "a staged channel export has a channel location".into(),
+                        ));
+                    }
+                }
+                Ok(locator)
+            }
+            Staged::Fenced {
+                mut locator,
+                ready,
+                buffer,
+            } => {
+                let registered = (|| -> Result<()> {
+                    let Backend::Cuda(cuda) = &self.backend else {
+                        return Err(Error::Invariant(
+                            "a fenced export belongs to a CUDA VMM transport".into(),
+                        ));
+                    };
+                    if let Some(ready) = &ready {
+                        match &mut locator.transport {
+                            TransferTransport::CudaVmm {
+                                ready_event_handle, ..
+                            } => *ready_event_handle = ready.ipc_handle()?.0.to_vec(),
+                            _ => {
+                                return Err(Error::Invariant(
+                                    "a fenced export has a CUDA VMM location".into(),
+                                ));
+                            }
+                        }
+                    }
+                    cuda.endpoint.register(locator.clone(), Arc::clone(&buffer))
+                })();
+                if let Err(error) = registered {
+                    TransportBuffer::reclaim(buffer, &self.events, None)?;
+                    return Err(error);
+                }
+                Ok(locator)
+            }
+        }
+    }
+
+    /// Give up a staged export of this transport that is not published:
+    /// its backing retires through the event pool.
+    pub(crate) fn discard(&self, staged: Staged) -> Result<()> {
+        match staged {
+            // The staging is dropped; its bytes were never sent.
+            Staged::Channel { .. } => Ok(()),
+            Staged::Fenced { buffer, .. } => TransportBuffer::reclaim(buffer, &self.events, None),
+        }
+    }
+
     fn export_channel(
         &self,
         view: &ExportView<'_>,
         name: &str,
-        stream: Option<&Stream>,
-    ) -> Result<Locator> {
+        stream: impl Issue,
+    ) -> Result<Staged> {
         let shape: Vec<i64> = view.shape.iter().map(|&extent| extent as i64).collect();
         let bytes = view.nbytes as usize;
-        let staging = match producer(view.spans, stream)? {
-            Some((device, stream)) => {
-                let staging = Memory::pinned(device, bytes.max(1))?;
-                let target = Spans::single(StorageView::contiguous(
-                    Arc::clone(&staging) as Arc<dyn Backing>,
-                    0,
-                    view.spans.dtype(),
-                    &shape,
-                )?)?;
-                let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
-                target.plan_copy(view.spans, &mut plan)?;
-                // SAFETY: the staging stays alive until the stream drains below.
-                unsafe { plan.submit(stream) }?;
+        let producer = producer(view.spans, stream.stream())?.map(|(device, _)| device);
+        let staging = match producer {
+            Some(device) => Memory::pinned(device, bytes.max(1))?,
+            None => Memory::host(bytes.max(1)),
+        };
+        let target = Spans::single(StorageView::contiguous(
+            Arc::clone(&staging) as Arc<dyn Backing>,
+            0,
+            view.spans.dtype(),
+            &shape,
+        )?)?;
+        let mut plan = copy_planner(producer, SourceOrder::Stream)?;
+        target.plan_copy(view.spans, &mut plan)?;
+
+        match producer {
+            Some(_) => {
+                // SAFETY: the staged export keeps the staging alive until
+                // its bytes are read, behind the wait below.
+                unsafe { stream.copy_strided(&plan) }?;
                 // The bytes leave with the result: a downstream reader cannot
                 // wait on this stream.
                 let _range = crate::profiling::range(c"channel_export_synchronize", None);
                 stream.synchronize()?;
-                staging
             }
-            None => {
-                let staging = Memory::host(bytes.max(1));
-                let target = Spans::single(StorageView::contiguous(
-                    Arc::clone(&staging) as Arc<dyn Backing>,
-                    0,
-                    view.spans.dtype(),
-                    &shape,
-                )?)?;
-                let mut plan = copy_planner(None, SourceOrder::Stream)?;
-                target.plan_copy(view.spans, &mut plan)?;
-                // SAFETY: host operands owned by this export.
-                unsafe { copy_on_host(&plan) };
-                staging
-            }
-        };
-        // SAFETY: no copy writes the staging any more.
-        let payload = unsafe { staging.host_bytes() }
-            .ok_or_else(|| Error::Invariant("channel staging is host memory".into()))?[..bytes]
-            .to_vec();
-        Ok(view.locator(
-            &self.source,
-            TransferTransport::Channel {
-                endpoint: name.to_owned(),
-                payload,
-            },
-        ))
+            // SAFETY: host operands owned by this export, written in the
+            // producer's order.
+            None => unsafe { stream.host().copy_strided(&plan) }?,
+        }
+
+        Ok(Staged::Channel {
+            locator: view.locator(
+                &self.source,
+                TransferTransport::Channel {
+                    endpoint: name.to_owned(),
+                    payload: Vec::new(),
+                },
+            ),
+            staging,
+            bytes,
+        })
     }
 
     /// Read `region` (in the locator's own coordinates, the whole export by
@@ -536,6 +651,9 @@ impl Transport {
     /// that orders the destination's earlier writes; transport copies start
     /// after it. `reservation` supplies the read's credit when the read is
     /// part of a planned fan-out.
+    ///
+    /// The read is issued on `stream` and started at once
+    /// ([`Self::issue_fetch`], [`Read::start`]).
     pub fn fetch(
         &self,
         locator: &Locator,
@@ -544,6 +662,25 @@ impl Transport {
         region: Option<&[Range<u64>]>,
         reservation: Option<&ReadReservation<Notify>>,
         stream: Option<&Stream>,
+    ) -> Result<Arc<Read>> {
+        let read = self.issue_fetch(locator, device, destination, region, reservation, stream)?;
+        read.start()?;
+        Ok(read)
+    }
+
+    /// Issue a read as [`Self::fetch`] describes it, with its handoff fence
+    /// issued to `stream`. The caller starts the read ([`Read::start`])
+    /// once that issuer performed its work, so the fence's record is made
+    /// before the read reaches its transport thread: at once after a
+    /// stream, from the job's completion on after a recorder.
+    pub fn issue_fetch(
+        &self,
+        locator: &Locator,
+        device: Device,
+        destination: Option<&Spans>,
+        region: Option<&[Range<u64>]>,
+        reservation: Option<&ReadReservation<Notify>>,
+        stream: impl Issue,
     ) -> Result<Arc<Read>> {
         if TransportKind::of(locator) != self.kind() {
             return Err(Error::Invalid(format!(
@@ -630,7 +767,7 @@ impl Transport {
         &self,
         call: ReadCall,
         nbytes: u64,
-        stream: Option<&Stream>,
+        stream: impl Issue,
         reservation: Option<&ReadReservation<Notify>>,
     ) -> Result<Arc<Read>> {
         let backend = NativeRead {
@@ -648,7 +785,7 @@ impl Transport {
         destination: Option<&Spans>,
         region: Option<&[Range<u64>]>,
         reservation: Option<&ReadReservation<Notify>>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<Arc<Read>> {
         if let Some(error) = self.reads.error() {
             return Err(Error::Shared(error));

@@ -1,218 +1,99 @@
 """Describing, loading and planning the stub model through the interface."""
 
 import pytest
-import torch
-import tvm_ffi
 
+from tests.python.fixtures.stub import load_model, read_config
 from uniserve_models import interface
+from uniserve_models.interface import cache, loading
 from uniserve_models.interface.errors import UnsupportedSetup
+from uniserve_models.runner import causal_lm
 
 pytestmark = pytest.mark.unit
-
-LOCAL = {
-    "ranks": [0],
-    "parallel_config": {
-        "tensor_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "sequence_parallel": {"kind": "local"},
-    },
-    "units_per_rank": 1,
-}
-IO = {
-    "format": "auto",
-    "mode": "eager",
-    "download_dir": None,
-    "num_threads": None,
-    "checksum_manifest": None,
-}
-ATTENTION = {
-    "workspace_size": 1 << 20,
-    "decode_backend": "fa2",
-    "prefill_backend": "auto",
-    "disable_split_kv": False,
-    "decode_split_tile_size": None,
-    "prefill_split_tile_size": None,
-    "use_tensor_core": None,
-}
-
-
-def describe(table, **overrides):
-    # Requests arrive as TVM-FFI containers, as the worker sends them.
-    request = {
-        "stub": True,
-        "path": None,
-        "base_model": None,
-        "io": IO,
-        "device": "cpu",
-        "generation_device": None,
-        "components": {"model": LOCAL},
-        "rank": 0,
-        "role": "model",
-        "expert_split": False,
-        **overrides,
-    }
-    return table["model.describe"](tvm_ffi.convert(request))
 
 
 @pytest.fixture(scope="module")
 def loaded():
     table = interface.table()
-    description, _ = describe(table)
-    resolved = table["model.resolve"](
-        description,
-        {
-            "modules": [],
-            "exclude_modules": [],
-            "quantization": "{}",
-            "model_dtype": "bfloat16",
-        },
-    )
-    return table, table["model.load"](
-        resolved,
-        tvm_ffi.convert(
-            {
-                "device": "cpu",
-                "generation_device": None,
-                "role": "model",
-                "host_only": False,
-                "meshes": [],
-                "experts": None,
-                "attention_backend": "auto",
-                "attention": ATTENTION,
-            }
-        ),
-    )
+    return table, load_model(read_config())
 
 
 def test_description_reports_calls_with_capability_tags():
-    _, info = describe(interface.table())
-    assert info["model_name"] == "uniserve_models.stub.model.Model"
-    entries = {entry["name"]: entry["calls"] for entry in info["entries"]}
-    assert set(entries) == {"model", "vision_encoder"}
-    forward = entries["model"][0]
-    assert (forward["path"], forward["method"], forward["stage"]) == (
-        "",
+    description = read_config()
+    assert description.model_name() == "uniserve_models.stub.model.Model"
+    assert description.components() == ["model", "vision_encoder"]
+    assert description.call_paths("model")[:2] == ["", ""]
+    assert description.call_methods("model")[:2] == [
         "forward",
-        "all",
-    )
-    assert forward["capabilities"] == ["causal_lm"]
-    assert forward["axes"] == []
-    vision = entries["vision_encoder"][0]
-    assert set(vision["capabilities"]) == {"patch_encoder", "encoder"}
-    assert info["expert_paths"] == []
-    assert info["video_decoder"] is False
+        "embed_input_ids",
+    ]
+    assert set(description.call_stages("model")) == {"all"}
+    # The first call's tags lead the concatenated column.
+    assert description.capability_counts("model")[0] == 1
+    assert description.capabilities("model")[0] == "causal_lm"
+    assert description.call_paths("vision_encoder") == ["vision_encoder"]
+    assert description.capability_counts("vision_encoder") == [2]
+    assert set(description.capabilities("vision_encoder")) == {
+        "patch_encoder",
+        "encoder",
+    }
+    # The stub's modules communicate over no mesh axis.
+    assert description.selection_sizes("model") == []
+    assert description.selection_axes("model") == []
+    assert description.routed_experts() == []
+    assert description.decodes_video() is False
 
 
 def test_a_generation_device_places_the_flow_route():
     # The stub's image denoiser and decoder form a flow route to place.
-    _, info = describe(interface.table(), generation_device="cpu")
-    assert info["entries"]
+    assert read_config(generation_device="cpu").components()
 
 
 def test_split_experts_require_routed_expert_layers():
     with pytest.raises(UnsupportedSetup, match="routed expert layers"):
-        describe(interface.table(), expert_split=True)
+        read_config(expert_split=True)
 
 
-def test_facts_report_text_geometry_and_formats(loaded):
-    table, model = loaded
-    facts = table["model.facts"](
-        model,
-        {
-            "max_sequence_tokens": 64,
-            "model_dtype": "bfloat16",
-            "kv_cache_dtype": None,
-            "role": "model",
-            "deployment_components": ["model"],
-            "max_condition_rows": 0,
-        },
-    )
-    assert facts["attention_backend"] == "torch"
-    assert facts["vocab_size"] == 151671
-    assert facts["hidden_size"] == 4
-    assert facts["weight_formats"] == ["dense"]
-    assert facts["outputs"] == {}
-    assert facts["image_flow"] == {
-        "max_tokens": 1024,
-        "latent_channels": 3,
-        "patch_size": 16,
-    }
+def test_a_loaded_model_reports_its_backend_sizes_and_formats(loaded):
+    _, model = loaded
+    assert loading.attention_backend(model) == "torch"
+    assert causal_lm.vocab_size(model) == 151671
+    assert causal_lm.hidden_size(model) == 4
+    assert loading.weight_formats(model) == ["dense"]
+    # The stub has no quantizable linear layer.
+    assert loading.activation_formats(model) == []
 
 
 def test_cache_plan_describes_pages_of_the_requested_size(loaded):
-    table, model = loaded
-    plan = table["model.cache_plan"](model, 32, "")
-    assert table["model.reads_pages"](model, "torch", plan) is True
-    assert plan["dtype"] == "bfloat16"
-    (group,) = plan["groups"]
-    assert group["page_tokens"] == 32
-    assert group["layers"] == ["backbone.layers.0.attention"]
-    assert group["layer_ids"] == [0]
-    assert group["window"] == -1
+    _, model = loaded
+    plan = cache.cache_plan(model, 32, "")
+    assert cache.reads_pages(model, "torch", plan) is True
+    assert plan.dtype() == "bfloat16"
+    assert plan.page_tokens() == [32]
+    assert plan.layers() == ["backbone.layers.0.attention"]
+    assert plan.layer_ids() == [0]
+    assert plan.windows() == [-1]
     # One column holds key and value planes of 32 one-element BF16 rows,
     # plus one initialization flag per plane.
-    assert plan["unit_bytes"] == 2 * (32 * 2 + 1)
-
-
-def test_component_binding_serves_its_declared_workspace(loaded):
-    table, model = loaded
-    prepared, requirements = table["component.prepare"](
-        model,
-        {
-            "component": "model",
-            "path": "",
-            "device": -1,
-            "stream": 0,
-            "size": {"tokens": 16, "rows": 2},
-            "attention": "auto",
-            "vsa": "auto",
-            "matmul": "auto",
-            "moe": "auto",
-            "derive_host_lengths": True,
-            "experts": None,
-            "weights": None,
-            "cache": None,
-        },
-    )
-    tensors = {
-        item["name"]: torch.zeros(
-            item["shape"], dtype=getattr(torch, item["dtype"])
-        )
-        for item in requirements["workspaces"]
-    }
-    functions = table["component.bind"](prepared, {"workspaces": tensors})
-    paths = {record["path"] for record in functions["kernels"]()}
-    assert "backbone.layers.0.attention" in paths
-    assert prepared.context is not None
-    functions["close"](False)
-    assert prepared.context is None
+    assert plan.unit_bytes() == 2 * (32 * 2 + 1)
 
 
 def test_a_single_rank_world_binds_local_communicators():
     table = interface.table()
+    # One CPU rank outside a union: no backend choice, store or union.
     world = table["distributed.initialize"](
-        {
-            "rank": 0,
-            "local_rank": 0,
-            "world_size": 1,
-            "device": "cpu",
-            "backend": None,
-            "store": None,
-            "union": None,
-        }
+        0, 0, 1, "cpu", None, None, None, None, None, None
     )
-    assert table["distributed.create_groups"](world, []) == []
+    assert table["distributed.create_groups"](world, [], [], [], []) == []
     mesh = table["distributed.mesh"](
         world,
-        tvm_ffi.convert(
-            {
-                "ranks": [0],
-                "shape": [1, 1, 1, 1],
-                "axes": ["pp", "cp", "tp", "ulysses"],
-                "rank": 0,
-                "groups": {"tp": {"members": [0], "group": None}},
-            }
-        ),
+        [0],
+        [1, 1, 1, 1],
+        ["pp", "cp", "tp", "ulysses"],
+        0,
+        ["tp"],
+        [1],
+        [0],
+        [None],
     )
     group = mesh.get_group("tp")
     assert (group.name, group.ranks, group.rank) == ("tp", (0,), 0)

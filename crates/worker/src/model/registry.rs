@@ -1,20 +1,17 @@
-//! The components this rank holds and their bindings, by capability.
+//! The components this rank holds, by capability.
 //!
-//! Capability runtimes (text, diffusion LM, image, video, media, experts) look up
-//! the components serving a call kind or runner family here, create their
-//! bindings through [`crate::model::bind`] and register them, so startup
-//! closes every binding in one place and kernel reports cover all of them.
+//! Capability runtimes (text, diffusion LM, image, video, media, experts)
+//! look up the components serving a call kind or runner family here and
+//! construct their runners for them.
 
 use std::collections::BTreeSet;
 
 use uniserve_core::ComponentConfig;
 use uniserve_ipc::CallKind;
 
-use crate::Result;
 use crate::config::Device;
 use crate::ffi::Handle;
 
-use super::bind::ComponentBinding;
 use super::components::{CallDecl, Capability, Declarations, RunnerKind, host_kinds};
 use crate::parallel::topology::is_host_component;
 
@@ -50,11 +47,10 @@ impl Placed {
     }
 }
 
-/// Placed components and their bindings.
+/// The components placed on this rank.
 #[derive(Default)]
 pub struct Components {
     placed: Vec<Placed>,
-    bindings: Vec<ComponentBinding>,
 }
 
 impl Components {
@@ -84,10 +80,7 @@ impl Components {
                 }
             })
             .collect();
-        Self {
-            placed,
-            bindings: Vec::new(),
-        }
+        Self { placed }
     }
 
     pub fn placed(&self) -> &[Placed] {
@@ -126,26 +119,5 @@ impl Components {
         self.placed
             .iter()
             .all(|placed| placed.host() || placed.calls.is_empty())
-    }
-
-    /// Register bindings a capability runtime created.
-    pub fn add_bindings(&mut self, bindings: Vec<ComponentBinding>) {
-        self.bindings.extend(bindings);
-    }
-
-    pub fn bindings(&self) -> &[ComponentBinding] {
-        &self.bindings
-    }
-
-    /// Close every binding, newest first, attempting all before returning
-    /// the first failure.
-    pub fn close(&mut self, aborted: bool) -> Result<()> {
-        let mut failure = None;
-        while let Some(mut binding) = self.bindings.pop() {
-            if let Err(error) = binding.close(aborted) {
-                failure.get_or_insert(error);
-            }
-        }
-        failure.map_or(Ok(()), Err)
     }
 }

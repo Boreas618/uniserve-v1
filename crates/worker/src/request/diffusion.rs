@@ -2,7 +2,7 @@
 //! prefixes each guidance branch conditions on.
 //!
 //! An image request denoises one trajectory per generated image. When its
-//! latent is prepared, the image runtime opens an [`ImageTrajectory`]: the
+//! latent is prepared, its batch opens an [`ImageTrajectory`]: the
 //! guidance plan the model's schedules and guidance select per step (built
 //! by Python once per trajectory and kept as an opaque handle the solver
 //! update receives back), and the request's guidance prefixes.
@@ -12,9 +12,10 @@
 //! scheduler placed in other request slots, which the runtime prefills the
 //! first time a branch is evaluated. A prefix's tokens are resolved once
 //! per source (`image.guidance_prefix`, the model's prompt framing and
-//! tokenizer) and kept for the trajectory; its physical coordinates are
-//! resolved again for every submitted denoising call, because the scheduler
-//! may place a later interval's prefixes in other slots.
+//! tokenizer) when the trajectory opens and kept with it; its physical
+//! coordinates are resolved again for every submitted denoising call,
+//! because the scheduler may place a later interval's prefixes in other
+//! slots.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -181,7 +182,7 @@ pub struct PrefixFill {
 /// combines predictions with.
 #[derive(Clone, Debug)]
 pub struct GuidancePlan {
-    /// Opaque schedules and guidance (`interface.denoiser` plan).
+    /// Opaque schedules and guidance (`DenoiserRunner.plan`).
     pub handle: Handle,
     /// The model timestep of each solver step.
     pub timesteps: Vec<f32>,
@@ -213,7 +214,8 @@ pub struct ImageTrajectory {
     /// Image height and width in pixels.
     pub size: (u32, u32),
     pub plan: GuidancePlan,
-    /// Resolved prefix tokens by source, kept across intervals.
+    /// The prefix tokens of each source a branch may condition on,
+    /// resolved when the trajectory opened.
     prefixes: HashMap<BranchSource, Prefix>,
     /// The request's own conditioning coordinates for the current call.
     pub conditioning: Coordinates,
@@ -222,12 +224,19 @@ pub struct ImageTrajectory {
 }
 
 impl ImageTrajectory {
-    pub fn new(key: RequestKey, size: (u32, u32), plan: GuidancePlan) -> Self {
+    /// A trajectory of `plan` whose guidance branches condition on
+    /// `prefixes`, by source.
+    pub fn new(
+        key: RequestKey,
+        size: (u32, u32),
+        plan: GuidancePlan,
+        prefixes: HashMap<BranchSource, Prefix>,
+    ) -> Self {
         Self {
             key,
             size,
             plan,
-            prefixes: HashMap::new(),
+            prefixes,
             conditioning: Coordinates::default(),
             branches: HashMap::new(),
         }
@@ -249,15 +258,14 @@ impl ImageTrajectory {
     /// denoising descriptor's slot; it is empty (visible length zero) when
     /// the call also carries a prefill of exactly the prefix's tokens for
     /// that slot, else its visible length is the descriptor's context.
-    /// `resolve` tokenizes a source's prefix once per trajectory;
     /// `coordinates` reads a slot's allocated coordinates. Branches sharing
-    /// a physical prefix submit one prefill.
+    /// a physical prefix submit one prefill. A branch whose source the
+    /// trajectory was opened without is refused.
     pub fn resolve_branches(
         &mut self,
         set: BranchSet,
         image_unconditional: BranchSource,
         descriptors: &[ForwardSlot],
-        mut resolve: impl FnMut(BranchSource) -> Result<Prefix>,
         coordinates: impl Fn(u32, u64) -> Result<Coordinates>,
     ) -> Result<Vec<PrefixFill>> {
         let count = set.len();
@@ -274,14 +282,12 @@ impl ImageTrajectory {
                 continue;
             }
             let source = branch.source(image_unconditional);
-            let prefix = match self.prefixes.get(&source) {
-                Some(prefix) => prefix.clone(),
-                None => {
-                    let prefix = resolve(source)?;
-                    self.prefixes.insert(source, prefix.clone());
-                    prefix
-                }
-            };
+            let prefix = self.prefixes.get(&source).cloned().ok_or_else(|| {
+                Error::Invariant(format!(
+                    "an image trajectory was opened without its {} prefix",
+                    source.name()
+                ))
+            })?;
 
             let (located, length) = if prefix.reuses_conditioning {
                 (self.conditioning, self.conditioning.visible)
@@ -384,6 +390,57 @@ impl Trajectories {
     }
 }
 
+impl crate::executor::lifecycle::RequestStorage for Trajectories {
+    fn admit_slots(
+        &mut self,
+        slots: &[usize],
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
+        // A reused slot never continues an earlier request's trajectory.
+        self.release(slots);
+        Ok(())
+    }
+
+    fn release_buffers(
+        &mut self,
+        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_requests(
+        &mut self,
+        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
+        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn retirement_ready(
+        &mut self,
+        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
+        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn retire_slots(
+        &mut self,
+        slots: &[usize],
+        _jobs: &crate::executor::lifecycle::LaneJobs,
+    ) -> Result<()> {
+        self.release(slots);
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use uniserve_core::RequestId;
@@ -402,8 +459,20 @@ mod tests {
     }
 
     fn trajectory(masks: &[u8]) -> ImageTrajectory {
-        let mut trajectory =
-            ImageTrajectory::new(RequestKey::new(1, RequestId(7), 1), (64, 64), plan(masks));
+        let sources = [
+            BranchSource::Conditioning,
+            BranchSource::NegativeOrStart,
+            BranchSource::Start,
+        ];
+        let mut trajectory = ImageTrajectory::new(
+            RequestKey::new(1, RequestId(7), 1),
+            (64, 64),
+            plan(masks),
+            sources
+                .into_iter()
+                .map(|source| (source, prefix(source)))
+                .collect(),
+        );
         trajectory.begin_call(Coordinates {
             slot: 3,
             visible: 40,
@@ -412,8 +481,8 @@ mod tests {
         trajectory
     }
 
-    fn prefixes(source: BranchSource) -> Result<Prefix> {
-        Ok(match source {
+    fn prefix(source: BranchSource) -> Prefix {
+        match source {
             BranchSource::Conditioning => Prefix {
                 tokens: Arc::from(Vec::new()),
                 reuses_conditioning: true,
@@ -426,7 +495,7 @@ mod tests {
                 tokens: Arc::from(vec![1]),
                 reuses_conditioning: false,
             },
-        })
+        }
     }
 
     fn table(slot: u32, visible: u64) -> Result<Coordinates> {
@@ -478,8 +547,7 @@ mod tests {
                 query_len: 1,
             },
         ];
-        let fills =
-            trajectory.resolve_branches(set, BranchSource::Start, &descriptors, prefixes, table)?;
+        let fills = trajectory.resolve_branches(set, BranchSource::Start, &descriptors, table)?;
         assert_eq!(
             fills,
             vec![
@@ -530,8 +598,7 @@ mod tests {
                 query_len: 0,
             },
         ];
-        let fills =
-            trajectory.resolve_branches(set, BranchSource::Start, &descriptors, prefixes, table)?;
+        let fills = trajectory.resolve_branches(set, BranchSource::Start, &descriptors, table)?;
         assert!(fills.is_empty());
         assert_eq!(trajectory.branch_rows(set, 41)?[1].1.visible, 3);
 
@@ -548,7 +615,7 @@ mod tests {
         ];
         assert!(
             trajectory
-                .resolve_branches(set, BranchSource::Start, &stale, prefixes, table)
+                .resolve_branches(set, BranchSource::Start, &stale, table)
                 .is_err()
         );
         Ok(())
@@ -565,7 +632,7 @@ mod tests {
         }];
         assert!(
             trajectory
-                .resolve_branches(set, BranchSource::Start, &descriptors, prefixes, table)
+                .resolve_branches(set, BranchSource::Start, &descriptors, table)
                 .is_err()
         );
         let small = |slot, visible| {
@@ -585,7 +652,7 @@ mod tests {
         ];
         assert!(
             trajectory
-                .resolve_branches(set, BranchSource::Start, &descriptors, prefixes, small)
+                .resolve_branches(set, BranchSource::Start, &descriptors, small)
                 .is_err()
         );
     }
@@ -594,7 +661,10 @@ mod tests {
     fn reused_slots_never_see_an_earlier_requests_trajectory() {
         let mut trajectories = Trajectories::default();
         let first = RequestKey::new(1, RequestId(7), 1);
-        trajectories.open(3, ImageTrajectory::new(first, (64, 64), plan(&[1])));
+        trajectories.open(
+            3,
+            ImageTrajectory::new(first, (64, 64), plan(&[1]), HashMap::new()),
+        );
         assert!(trajectories.get(3, first).is_some());
         assert!(
             trajectories

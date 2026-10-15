@@ -1,31 +1,34 @@
 //! Encoder runners: vision patch encoders, latent encoders, text encoders
-//! and a video model's condition latent encoders ([`LatentEncoding`]).
+//! and a video model's condition latent encoders.
 //!
 //! An [`EncoderRunner`] serves one encoder call of a bound component: the
-//! module at a path within the binding's root (the root itself, or a nested
+//! module at a path of the loaded model (a component's root, or a nested
 //! encoder such as a text encoder's vision tower bound with it). It owns the
 //! encoder's Rust buffers, its graph table and its call policy.
 //!
 //! A text encoder and the vision tower that encodes its prompt's packed
 //! vision blocks compute through the Python half,
-//! `uniserve_models.runner.encoder.EncoderRunner` ([`EncoderRunner::over`]):
-//! its `encode` takes the tensors of one forward as arguments.
+//! `uniserve_models.runner.encoder.EncoderRunner`, constructed directly
+//! with its stream's shared scratch ([`EncoderRunner::text`]): the text
+//! encoder's half owns the execution context, its tower borrows it, and
+//! `encode` takes the tensors of one forward as arguments.
 //!
-//! An image model's vision and latent encoders compute through the binding
-//! functions of `uniserve_models.interface.encoder`, created once over the
-//! buffers ([`EncoderRunner::bind`]):
+//! An image model's vision and latent encoders compute through the same
+//! Python class, constructed over a bound component by
+//! `EncoderRunner.bound` ([`EncoderRunner::bind`]):
 //!
-//! | kind | module | calls |
+//! | kind | module | methods |
 //! | --- | --- | --- |
-//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `prepare_resident`; packed: `encode_packed`, `capture_packed`, `release` |
-//! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident` |
+//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `prepare_resident`, `warm`; packed: `encode` over the slot tensors, `pack_images` |
+//! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident`, `warm` |
 //!
-//! Such a binding receives its device's product arena once; results are
-//! written into product [`Region`]s of it, in the product's dtype, and each
-//! call returns the results' shapes, which the caller publishes.
+//! Such a runner receives its device's product arena once; an unpacked
+//! `encode` writes its results into product [`Region`]s of it, in the
+//! product's dtype, and returns the results' shapes, which the caller
+//! publishes.
 //!
 //! **Images.** Inline request images are decoded and transformed on a host
-//! lane by `image.prepare_input` ([`prepare_input`]), which returns an
+//! lane by `EncoderRunner.prepare_image` ([`prepare_input`]), which returns an
 //! opaque [`PreparedImage`] in page-locked memory; resident image products
 //! are transformed on the device by `prepare_resident`. Both reach `encode`
 //! as handles. Unpacked encoders encode images of one pixel shape per
@@ -54,30 +57,42 @@
 //! that stream after the producers of its inputs and records the producer
 //! fence of its outputs on it.
 
+pub(crate) mod inputs;
+pub(crate) mod runners;
+mod start;
+pub(crate) mod warmup;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, VideoCondition};
-use uniserve_cuda::{Stream, memcpy_async};
-use uniserve_ipc::Batch as BatchPlan;
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_ipc::{Batch as BatchPlan, CallKind, ForwardStats, MediaCall};
 
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
-use crate::cuda_graph::{CUDAGraph, GraphMode, GraphTable, Lookup};
+use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::MediaBatch;
+use crate::executor::forward::batch::image::ImageParts;
+use crate::executor::forward::batch::image::{ImageBatch, Progress, Resume, allocations};
+use crate::executor::forward::batch::{
+    Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
+};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::executor::forward::video::{
-    Parts, bind_rows, decode_range, publish, publish_bound, row_width, stream_of,
-};
-use crate::ffi::{
-    Backing, DType, Fields, Function, Functions, Handle, Record, Region, integer_list, list,
-};
-use crate::model::bind::{Backends, BindingRequest, ComponentBinding, StreamWorkspaces, TextSize};
+use crate::executor::forward::products::Publications;
+use crate::ffi::{Backing, DType, Function, Handle, integer_list};
+use crate::lane::{Completion, Job};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
-use crate::runner::{Methods, RunnerSetup};
+use crate::profiling::kernels::KernelRecord;
+use crate::runner::methods::{
+    Argument, MethodCall, Methods, RunnerClass, kernels_call, list_kernels,
+};
+use crate::runner::{ImageSetup, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
+use crate::storage::{Metadata, OutputPlacement, ProductBuffer, ValueRange};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
@@ -122,33 +137,48 @@ pub struct PreparedImage {
 }
 
 impl PreparedImage {
-    fn from_value(owner: &str, value: Any) -> Result<Self> {
-        let record = Record::new(owner, value)?;
-        let grid = record
-            .optional_value("grid")?
-            .map(|grid| -> Result<[u32; 2]> {
-                let values =
-                    crate::ffi::integers(grid).map_err(|error| Error::numerical(owner, &error))?;
-                match values[..] {
-                    [rows, columns] if rows > 0 && columns > 0 => Ok([rows as u32, columns as u32]),
-                    _ => Err(Error::Interface(format!(
-                        "{owner} reports a grid that is not two positive extents"
-                    ))),
-                }
-            })
-            .transpose()?;
-        let dimension = |key: &str| -> Result<u32> {
-            u32::try_from(record.count(key)?)
+    /// The image `value` a preparation returned, with what `facts`
+    /// (`EncoderRunner.image_facts`) reports of it.
+    fn from_value(facts: &Function, value: Any) -> Result<Self> {
+        let image = Handle::new(value)?;
+        let values = crate::ffi::integers(facts.call_values(&[image.to_any()])?)
+            .map_err(|error| Error::numerical(facts.name(), &error))?;
+        Self::from_facts(facts, image, &values)
+    }
+
+    /// The prepared `image` with the `values` that `facts` reported of it.
+    fn from_facts(facts: &Function, image: Handle, values: &[i64]) -> Result<Self> {
+        let [height, width, rows, columns, ref shape @ ..] = values[..] else {
+            return Err(Error::Interface(format!(
+                "{} reports a canvas, a grid and a pixel shape",
+                facts.name()
+            )));
+        };
+        let dimension = |extent: i64, name: &str| -> Result<u32> {
+            u32::try_from(extent)
                 .ok()
                 .filter(|&extent| extent > 0)
-                .ok_or_else(|| Error::Interface(format!("{owner} reports an invalid {key}")))
+                .ok_or_else(|| {
+                    Error::Interface(format!("{} reports an invalid {name}", facts.name()))
+                })
+        };
+        // A patch tower reports its grid; other towers report zeros.
+        let grid = match (rows, columns) {
+            (0, 0) => None,
+            (rows, columns) if rows > 0 && columns > 0 => Some([rows as u32, columns as u32]),
+            _ => {
+                return Err(Error::Interface(format!(
+                    "{} reports a grid that is not two positive extents",
+                    facts.name()
+                )));
+            }
         };
         Ok(Self {
-            value: Handle::new(record.value("image")?)?,
-            shape: record.shape("shape")?,
+            value: image,
+            shape: shape.to_vec(),
             grid,
-            height: dimension("height")?,
-            width: dimension("width")?,
+            height: dimension(height, "height")?,
+            width: dimension(width, "width")?,
         })
     }
 
@@ -166,6 +196,7 @@ impl PreparedImage {
 /// asynchronous copy to a CUDA device.
 pub fn prepare_input(
     function: &Function,
+    facts: &Function,
     loaded: &Handle,
     tower: Tower,
     payload: &str,
@@ -184,7 +215,14 @@ pub fn prepare_input(
         Any::from(i64::from(input_images)),
         Any::from(pin),
     ])?;
-    PreparedImage::from_value(function.name(), value)
+    PreparedImage::from_value(facts, value)
+}
+
+/// The text workload an encoder's execution context is prepared for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSize {
+    pub tokens: usize,
+    pub rows: usize,
 }
 
 /// A vision patch encoder (`PatchEncoder`).
@@ -232,12 +270,15 @@ pub struct TextEncoder {
     pub positions: bool,
 }
 
-/// What an encoder computes, as `encoder.describe` reports it.
+/// What an encoder computes, as the `EncoderRunner` fact methods report it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderInfo {
     Vision(VisionEncoder),
     Latent(LatentEncoder),
     Text(TextEncoder),
+    /// A video model's condition latent encoders (`VideoEncoder` and
+    /// `AudioEncoder`), whose Python runners serve one input shape each.
+    Condition,
 }
 
 impl EncoderInfo {
@@ -249,22 +290,77 @@ impl EncoderInfo {
         path: &str,
         dtype: DType,
     ) -> Result<Self> {
-        let function = interface.function("encoder.describe")?;
-        let record = Record::new(
-            function.name(),
-            function.call_values(&[
-                loaded.to_any(),
-                Any::from(tvm_ffi::String::from(path)),
-                Any::from(tvm_ffi::String::from(dtype.name())),
-            ])?,
-        )?;
-        Self::from_record(&record)
+        let path = Any::from(tvm_ffi::String::from(path));
+        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let extent = |name: &str| -> Result<u32> {
+            let function = method(name)?;
+            let value: i64 = function.call_as(&[loaded.view(), (&path).into()])?;
+            u32::try_from(value)
+                .map_err(|_| Error::Interface(format!("{} is out of range", function.name())))
+        };
+        let dtype_named = |function: &Function, name: tvm_ffi::String| -> Result<DType> {
+            DType::from_name(name.as_str()).ok_or_else(|| {
+                Error::Interface(format!(
+                    "{} reports the unknown dtype {:?}",
+                    function.name(),
+                    name.as_str()
+                ))
+            })
+        };
+        let output_dtype = || -> Result<DType> {
+            let function = method("output_dtype")?;
+            let name = function.call_as(&[loaded.view(), (&path).into()])?;
+            dtype_named(&function, name)
+        };
+        let kind: tvm_ffi::String = method("kind")?.call_as(&[loaded.view(), (&path).into()])?;
+        Ok(match kind.as_str() {
+            "vision" => {
+                let patch_size = extent("patch_size")?;
+                let max_patches = extent("max_patches")?;
+                let downsample = extent("downsample")?;
+                if downsample == 0 || max_patches % (downsample * downsample) != 0 {
+                    return Err(Error::Interface(
+                        "packed vision slots must hold whole output features".into(),
+                    ));
+                }
+                let pixels = method("pixel_dtype")?;
+                let pixel_dtype = dtype_named(&pixels, pixels.call_as(&[loaded.view()])?)?;
+                Self::Vision(VisionEncoder {
+                    patch_size,
+                    downsample,
+                    output_size: extent("output_width")?,
+                    output_dtype: output_dtype()?,
+                    max_patches: (max_patches > 0).then_some(max_patches),
+                    image_patches: extent("image_patches")?,
+                    // A patch row holds the RGB values of one patch.
+                    row_width: 3 * patch_size * patch_size,
+                    pixel_dtype,
+                })
+            }
+            "latent" => Self::Latent(LatentEncoder {
+                downsample: extent("downsample")?,
+                width: extent("output_width")?,
+                output_dtype: output_dtype()?,
+            }),
+            "text" => Self::Text(TextEncoder {
+                hidden_size: extent("output_width")?,
+                // A text encoder's hidden states carry the model dtype.
+                output_dtype: dtype,
+                positions: method("places_vision")?
+                    .call_as::<bool>(&[loaded.view(), (&path).into()])?,
+            }),
+            other => {
+                return Err(Error::Interface(format!(
+                    "{ENCODER}.kind reports the unknown encoder kind {other:?}"
+                )));
+            }
+        })
     }
 
-    /// The text size the encoder's component binding prepares its
+    /// The text size the encoder's execution context prepares its
     /// operators for: the most rows one numerical call passes through its
     /// projections. A latent encoder's convolutions need none.
-    pub fn binding_size(&self, config: &EncoderConfig) -> Option<TextSize> {
+    pub fn context_size(&self, config: &EncoderConfig) -> Option<TextSize> {
         match self {
             Self::Vision(vision) => Some(match vision.max_patches {
                 Some(max_patches) => {
@@ -281,7 +377,6 @@ impl EncoderInfo {
                     rows: config.max_images.max(1),
                 },
             }),
-            Self::Latent(_) => None,
             Self::Text(_) => Some(TextSize {
                 tokens: config
                     .text_capacities
@@ -292,60 +387,8 @@ impl EncoderInfo {
                     .max(1),
                 rows: 1,
             }),
+            Self::Latent(_) | Self::Condition => None,
         }
-    }
-
-    fn from_record(record: &Record) -> Result<Self> {
-        let dtype = |key: &str| -> Result<DType> {
-            let name = record.string(key)?;
-            DType::from_name(&name).ok_or_else(|| {
-                Error::Interface(format!(
-                    "{} reports the unknown dtype {name:?}",
-                    record.owner()
-                ))
-            })
-        };
-        let extent = |key: &str| -> Result<u32> {
-            u32::try_from(record.count(key)?)
-                .map_err(|_| Error::Interface(format!("{} {key} overflows", record.owner())))
-        };
-        Ok(match record.string("kind")?.as_str() {
-            "vision" => {
-                let max_patches = extent("max_patches")?;
-                let downsample = extent("downsample")?;
-                if downsample == 0 || max_patches % (downsample * downsample) != 0 {
-                    return Err(Error::Interface(
-                        "packed vision slots must hold whole output features".into(),
-                    ));
-                }
-                Self::Vision(VisionEncoder {
-                    patch_size: extent("patch_size")?,
-                    downsample,
-                    output_size: extent("output_size")?,
-                    output_dtype: dtype("output_dtype")?,
-                    max_patches: (max_patches > 0).then_some(max_patches),
-                    image_patches: extent("image_patches")?,
-                    row_width: extent("row_width")?,
-                    pixel_dtype: dtype("pixel_dtype")?,
-                })
-            }
-            "latent" => Self::Latent(LatentEncoder {
-                downsample: extent("downsample")?,
-                width: extent("width")?,
-                output_dtype: dtype("output_dtype")?,
-            }),
-            "text" => Self::Text(TextEncoder {
-                hidden_size: extent("hidden_size")?,
-                output_dtype: dtype("output_dtype")?,
-                positions: record.flag("positions")?,
-            }),
-            other => {
-                return Err(Error::Interface(format!(
-                    "{} reports the unknown encoder kind {other:?}",
-                    record.owner()
-                )));
-            }
-        })
     }
 }
 
@@ -483,6 +526,59 @@ pub struct Encoded {
     pub eager: u64,
 }
 
+/// A recorded encode: what is known of its result when it is recorded,
+/// and the calls whose shapes the job's completion returns.
+pub(crate) struct Recorded {
+    encoded: Encoded,
+    /// The inputs of each returning call, in call order.
+    returning: Vec<Vec<usize>>,
+    /// The method the returning calls call, for its errors.
+    method: String,
+}
+
+impl Recorded {
+    /// The encode's result, from the completion of the job that performed
+    /// it: each returning call's shapes fill its inputs' places.
+    /// Whether a call of the encode returns shapes, so that its result
+    /// needs the completion of the job that performed it.
+    pub(crate) fn returns(&self) -> bool {
+        !self.returning.is_empty()
+    }
+
+    pub(crate) fn finish(self, completion: &mut Completion) -> Result<Encoded> {
+        let Self {
+            mut encoded,
+            returning,
+            method,
+        } = self;
+        for group in returning {
+            // One shape per input: each as its length, then its extents.
+            let returned = completion.returned()?;
+            let mut values = returned.iter().copied();
+            for &index in &group {
+                let rank = values.next().and_then(|rank| usize::try_from(rank).ok());
+                let shape: Option<Vec<i64>> = rank.map(|rank| values.by_ref().take(rank).collect());
+                match (rank, shape) {
+                    (Some(rank), Some(shape)) if shape.len() == rank => {
+                        encoded.shapes[index] = shape;
+                    }
+                    _ => {
+                        return Err(Error::Interface(format!(
+                            "{method} returns one shape per input"
+                        )));
+                    }
+                }
+            }
+            if values.next().is_some() {
+                return Err(Error::Interface(format!(
+                    "{method} returns one shape per input"
+                )));
+            }
+        }
+        Ok(encoded)
+    }
+}
+
 impl Encoded {
     fn record(&mut self, mode: GraphMode) {
         match mode {
@@ -498,31 +594,45 @@ impl Encoded {
 /// leading rows).
 struct PackedVision {
     capacity: usize,
+    pixels: StorageView,
     grids: StorageView,
+    features: StorageView,
 }
 
-/// The binding functions of one encoder kind.
-enum Steps {
-    Vision {
-        encode: Function,
-        prepare_resident: Function,
-        warm: Function,
-        packed: Option<(Function, Function)>,
-    },
-    Latent {
-        encode: Function,
-        prepare_resident: Function,
-        warm: Function,
-    },
-    /// The Python half of a text encoder or of the vision tower bound
-    /// with it: the runner and its methods, each called with it first.
-    Runner {
-        runner: Handle,
-        encode: Function,
-        position_ids: Function,
-        /// Captures a forward between its begin and end.
-        capture: GraphFunctions,
-    },
+/// The Python half (`uniserve_models.runner.encoder.EncoderRunner`) and its
+/// methods, each called with the runner first.
+struct EncoderMethods {
+    runner: Handle,
+    encode: Function,
+    position_ids: Function,
+    prepare_resident: Function,
+    image_facts: Function,
+    warm: Function,
+    pack_images: Function,
+    /// Captures a forward between its begin and end.
+    capture: GraphFunctions,
+}
+
+impl EncoderMethods {
+    fn new(interface: &Interface, runner: Handle) -> Result<Self> {
+        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        Ok(Self {
+            runner,
+            encode: method("encode")?,
+            position_ids: method("position_ids")?,
+            prepare_resident: method("prepare_resident")?,
+            image_facts: method("image_facts")?,
+            warm: method("warm")?,
+            pack_images: method("pack_images")?,
+            capture: GraphFunctions::from_interface(interface)?,
+        })
+    }
+}
+
+/// The methods of a Python half that owns its execution context.
+struct OwnedContext {
+    kernels: Function,
+    close: Function,
 }
 
 /// The buffers of a text encoder's forward.
@@ -543,23 +653,24 @@ pub struct EncoderRunner {
     owner: String,
     info: EncoderInfo,
     device: Device,
-    /// The binding's stream, shared with its lane; `None` on the host.
+    /// The runner's stream, shared with its lane; `None` on the host.
     stream: Option<Stream>,
-    steps: Steps,
-    /// The device's product arena, as an image encoder's binding received
-    /// it.
-    products: Option<StorageView>,
+    methods: EncoderMethods,
     packed: Option<PackedVision>,
     text: Option<TextBuffers>,
     text_capacities: Vec<usize>,
     config: EncoderConfig,
     graphs: Option<GraphTable<EncoderGraph>>,
-    /// Releases a captured graph the storage check refused.
-    release: Option<Function>,
     /// Capture is enabled: graph pools were supplied at startup.
     capturing: bool,
-    /// Buffers bound to the Python binding, retained for its lifetime.
-    _buffers: Vec<StorageView>,
+    /// The component binding a video model's text encoder owns, with its
+    /// workspaces; its vision tower computes with the same binding.
+    /// The methods releasing the execution context this runner's Python
+    /// half constructed (an image encoder, or a text encoder whose vision
+    /// tower computes with the same context).
+    context: Option<OwnedContext>,
+    /// The Python runners of condition latent encoders.
+    conditions: Option<Box<Conditions>>,
 }
 
 fn allocate(device: Device, dtype: DType, shape: &[i64]) -> Result<StorageView> {
@@ -572,43 +683,24 @@ fn allocate(device: Device, dtype: DType, shape: &[i64]) -> Result<StorageView> 
 }
 
 impl EncoderRunner {
-    /// Allocate the buffers of the encoder `info` describes and bind them
-    /// to the encoder at `path` of `binding` (relative to the binding's
-    /// root, which was prepared for [`EncoderInfo::binding_size`]).
-    /// `products` is the binding device's product arena (a `uint8` view);
-    /// `stream` borrows the binding's stream.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the binding's complete resources"
-    )]
-    pub fn bind(
-        interface: &Interface,
-        binding: &ComponentBinding,
-        loaded: &Handle,
-        path: &str,
+    /// The runner of an image model's vision or latent encoder: allocate
+    /// the buffers of the encoder `info` describes and construct its Python
+    /// half, whose execution context is prepared for
+    /// [`EncoderInfo::context_size`].
+    pub fn image(
+        setup: &ImageSetup<'_>,
         info: EncoderInfo,
         config: &EncoderConfig,
-        products: StorageView,
-        stream: Option<Stream>,
     ) -> Result<Self> {
-        let owner = if path.is_empty() {
-            binding.component.clone()
-        } else {
-            format!("{}.{path}", binding.component)
-        };
-        let device = binding.device;
-        if products.dtype() != DType::U8 || products.shape().len() != 1 {
-            return Err(Error::Invariant(
-                "a product arena is bound as one uint8 dimension".into(),
-            ));
-        }
+        let interface = setup.interface;
+        let owner = setup.owner();
+        let (device, stream) = (setup.device, setup.stream.clone());
         if device.is_cuda() != stream.is_some() {
             return Err(Error::Invariant(
                 "an encoder runs on a stream exactly on a CUDA device".into(),
             ));
         }
 
-        let mut buffers = vec![("products", products.clone())];
         let mut packed = None;
         match info {
             EncoderInfo::Vision(vision) => {
@@ -627,30 +719,25 @@ impl EncoderRunner {
                     // Rows past an image keep earlier values, which only
                     // padding reads; they start finite.
                     pixels.zero(stream.as_ref())?;
-                    let grids = allocate(device, DType::I64, &[2 * capacity, 2])?;
-                    let features = allocate(
-                        device,
-                        vision.output_dtype,
-                        &[
-                            capacity * i64::from(slot_tokens),
-                            i64::from(vision.output_size),
-                        ],
-                    )?;
-                    buffers.extend([
-                        ("pixels", pixels),
-                        ("grids", grids.clone()),
-                        ("features", features),
-                    ]);
                     packed = Some(PackedVision {
                         capacity: capacity as usize,
-                        grids,
+                        pixels,
+                        grids: allocate(device, DType::I64, &[2 * capacity, 2])?,
+                        features: allocate(
+                            device,
+                            vision.output_dtype,
+                            &[
+                                capacity * i64::from(slot_tokens),
+                                i64::from(vision.output_size),
+                            ],
+                        )?,
                     });
                 }
             }
             EncoderInfo::Latent(_) => {}
-            EncoderInfo::Text(_) => {
+            EncoderInfo::Text(_) | EncoderInfo::Condition => {
                 return Err(Error::Invariant(
-                    "a text encoder computes through its Python runner".into(),
+                    "only an image model's vision or latent encoder is constructed here".into(),
                 ));
             }
         }
@@ -659,108 +746,63 @@ impl EncoderRunner {
             stream.synchronize()?;
         }
 
-        let mut tensors = Fields::new();
-        for (name, view) in &buffers {
-            tensors = tensors.with(name, view.to_tensor()?);
-        }
-        let function = interface.function("encoder.bind")?;
-        let functions = Functions::new(
-            function.name(),
-            function.call_values(&[
-                binding.prepared().to_any(),
-                loaded.to_any(),
-                Any::from(tvm_ffi::String::from(path)),
-                tensors.into_any(),
-            ])?,
-        )?;
-        let (steps, release) = match info {
-            EncoderInfo::Vision(_) => {
-                let packed_steps = packed
-                    .as_ref()
-                    .map(|_| -> Result<_> {
-                        Ok((
-                            functions.get("encode_packed")?,
-                            functions.get("capture_packed")?,
-                        ))
-                    })
-                    .transpose()?;
-                let release = packed
-                    .as_ref()
-                    .map(|_| functions.get("release"))
-                    .transpose()?;
-                (
-                    Steps::Vision {
-                        encode: functions.get("encode")?,
-                        prepare_resident: functions.get("prepare_resident")?,
-                        warm: functions.get("warm")?,
-                        packed: packed_steps,
-                    },
-                    release,
-                )
-            }
-            EncoderInfo::Latent(_) => (
-                Steps::Latent {
-                    encode: functions.get("encode")?,
-                    prepare_resident: functions.get("prepare_resident")?,
-                    warm: functions.get("warm")?,
-                },
-                None,
-            ),
-            EncoderInfo::Text(_) => {
-                return Err(Error::Invariant(
-                    "a text encoder computes through its Python runner".into(),
-                ));
-            }
+        let size = info.context_size(config);
+        let mut arguments = setup.arguments();
+        arguments.push(Any::from(integer_list(
+            size.iter()
+                .flat_map(|size| [size.tokens as i64, size.rows as i64]),
+        )));
+        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let runner = Handle::new(method("image")?.call_values(&arguments)?)?;
+        let context = OwnedContext {
+            kernels: method("kernels")?,
+            close: method("close")?,
         };
+        let methods = EncoderMethods::new(interface, runner)?;
         Ok(Self {
-            graphs: release
-                .clone()
-                .map(|release| GraphTable::new(owner.clone(), release)),
-            release,
+            graphs: packed
+                .as_ref()
+                .map(|_| GraphTable::new(owner.clone(), methods.capture.release.clone())),
             owner,
             info,
             device,
             stream,
-            steps,
-            products: Some(products),
+            methods,
             packed,
             text: None,
             text_capacities: Vec::new(),
             config: config.clone(),
             capturing: false,
-            _buffers: buffers.into_iter().map(|(_, view)| view).collect(),
+            context: Some(context),
+            conditions: None,
         })
     }
 
-    /// The runner of a text encoder (`path` `""`) or of the vision tower
-    /// bound with it (`"vision"`) over the Python half
-    /// `uniserve_models.runner.encoder.EncoderRunner`, which computes with
-    /// `binding`'s execution context. A text encoder's token, feature and
-    /// position buffers are allocated here for the largest prompt capacity.
-    pub fn over(
+    /// The runner of a text encoder (`path` `""`) or of its vision tower
+    /// (`"vision"`) over its constructed Python half `runner`
+    /// (`uniserve_models.runner.encoder.EncoderRunner`). A text encoder's
+    /// token, feature and position buffers are allocated here for the
+    /// largest prompt capacity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the Python half and what its buffers are built from"
+    )]
+    fn over(
         interface: &Interface,
-        binding: &ComponentBinding,
+        component: &str,
+        device: Device,
+        runner: Handle,
         path: &str,
         info: EncoderInfo,
         config: &EncoderConfig,
         stream: Stream,
     ) -> Result<Self> {
-        const RUNNER: &str = "uniserve_models.runner.encoder.EncoderRunner";
         let owner = if path.is_empty() {
-            binding.component.clone()
+            component.to_owned()
         } else {
-            format!("{}.{path}", binding.component)
+            format!("{component}.{path}")
         };
-        let device = binding.device;
-        let runner = Handle::new(
-            interface
-                .import(&format!("{RUNNER}.bound"))?
-                .call_values(&[
-                    binding.prepared().to_any(),
-                    Any::from(tvm_ffi::String::from(path)),
-                ])?,
-        )?;
-        let capture = GraphFunctions::from_interface(interface)?;
+        let methods = EncoderMethods::new(interface, runner)?;
 
         let mut text_capacities = config.text_capacities.clone();
         text_capacities.sort_unstable();
@@ -773,8 +815,8 @@ impl EncoderRunner {
                     .unwrap_or(config.max_text_tokens)
                     .max(1) as i64;
                 let final_stage = interface
-                    .import(&format!("{RUNNER}.final_stage"))?
-                    .call_as::<bool>(&[runner.view()])?;
+                    .import(&format!("{ENCODER}.final_stage"))?
+                    .call_as::<bool>(&[methods.runner.view()])?;
                 let buffers = TextBuffers {
                     tokens: allocate(device, DType::I64, &[capacity])?,
                     features: allocate(
@@ -790,36 +832,33 @@ impl EncoderRunner {
                 };
                 (
                     Some(buffers),
-                    Some(GraphTable::new(owner.clone(), capture.release.clone())),
+                    Some(GraphTable::new(
+                        owner.clone(),
+                        methods.capture.release.clone(),
+                    )),
                 )
             }
             EncoderInfo::Vision(_) => (None, None),
-            EncoderInfo::Latent(_) => {
+            EncoderInfo::Latent(_) | EncoderInfo::Condition => {
                 return Err(Error::Invariant(
-                    "a latent encoder computes through its binding".into(),
+                    "only a text encoder and its vision tower share a context".into(),
                 ));
             }
         };
         Ok(Self {
             graphs,
-            release: Some(capture.release.clone()),
             owner,
             info,
             device,
             stream: Some(stream),
-            steps: Steps::Runner {
-                runner,
-                encode: interface.import(&format!("{RUNNER}.encode"))?,
-                position_ids: interface.import(&format!("{RUNNER}.position_ids"))?,
-                capture,
-            },
-            products: None,
+            methods,
             packed: None,
             text,
             text_capacities,
             config: config.clone(),
             capturing: false,
-            _buffers: Vec::new(),
+            context: None,
+            conditions: None,
         })
     }
 
@@ -834,13 +873,6 @@ impl EncoderRunner {
     /// The runner's stream; `None` on the host.
     pub fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
-    }
-
-    /// The product arena an image encoder's regions name.
-    pub fn products(&self) -> Result<&StorageView> {
-        self.products
-            .as_ref()
-            .ok_or_else(|| Error::Invariant(format!("{} names no products by region", self.owner)))
     }
 
     /// Images one packed numerical call encodes; `None` when unpacked.
@@ -861,40 +893,57 @@ impl EncoderRunner {
     /// encoder (packed vision encoders warm by capturing). A latent encoder
     /// sampling its posterior draws from the device's default generator.
     pub fn warm(&self, side: u32) -> Result<()> {
-        match &self.steps {
-            Steps::Vision { warm, packed, .. } if packed.is_none() => {
-                warm.invoke(&[(&Any::from(i64::from(side))).into()])
+        match (&self.info, &self.packed) {
+            (EncoderInfo::Vision(_), None) | (EncoderInfo::Latent(_), _) => {
+                self.methods.warm.invoke(&[
+                    self.methods.runner.view(),
+                    (&Any::from(i64::from(side))).into(),
+                ])
             }
-            Steps::Latent { warm, .. } => warm.invoke(&[(&Any::from(i64::from(side))).into()]),
             _ => Ok(()),
         }
     }
 
-    /// Prepare a resident image product for this encoder on its stream.
-    /// `signed_unit` declares pixel values in `[-1, 1]` rather than `[0, 1]`.
-    pub fn prepare_resident(
+    /// Record the preparation of a resident image product for this encoder
+    /// into `job`; `signed_unit` declares pixel values in `[-1, 1]` rather
+    /// than `[0, 1]`. The job's completion carries the prepared image
+    /// ([`Completion::handle`]), of which [`Self::image_facts`] records what
+    /// planning needs.
+    pub(crate) fn prepare_resident(
         &self,
-        image: &Region,
+        image: &StorageView,
         tower: Tower,
         signed_unit: bool,
-    ) -> Result<PreparedImage> {
-        let function = match &self.steps {
-            Steps::Vision {
-                prepare_resident, ..
-            }
-            | Steps::Latent {
-                prepare_resident, ..
-            } => prepare_resident,
-            Steps::Runner { .. } => {
-                return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
-            }
-        };
-        let value = function.call_values(&[
-            image.to_any(),
-            Any::from(tvm_ffi::String::from(tower.name())),
-            Any::from(signed_unit),
-        ])?;
-        PreparedImage::from_value(function.name(), value)
+        job: &Job,
+    ) -> Result<()> {
+        if matches!(self.info, EncoderInfo::Text(_)) {
+            return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
+        }
+        job.call_handle(MethodCall::new(
+            &self.methods.prepare_resident,
+            vec![
+                Argument::Handle(self.methods.runner.clone()),
+                Argument::Tensor(image.clone()),
+                Argument::Text(tower.name().to_owned()),
+                Argument::Bool(signed_unit),
+            ],
+        ));
+        Ok(())
+    }
+
+    /// Record the call that reports the facts of a prepared `image` into
+    /// `job`; the job's completion carries them ([`Completion::returned`])
+    /// and [`Self::prepared`] reads them.
+    pub(crate) fn image_facts(&self, image: &Handle, job: &Job) {
+        job.call_returning(MethodCall::new(
+            &self.methods.image_facts,
+            vec![Argument::Handle(image.clone())],
+        ));
+    }
+
+    /// The prepared `image` with the `facts` its facts call returned.
+    pub(crate) fn prepared(&self, image: Handle, facts: &[i64]) -> Result<PreparedImage> {
+        PreparedImage::from_facts(&self.methods.image_facts, image, facts)
     }
 
     /// Encode images, writing image `i`'s result into `out[i]`.
@@ -902,25 +951,52 @@ impl EncoderRunner {
     /// Unpacked encoders run one numerical call per pixel shape, in first
     /// appearance order; packed vision runs chunks of the packed capacity.
     /// Returns each image's result shape.
-    pub fn encode(&mut self, images: &[&PreparedImage], out: &[Region]) -> Result<Encoded> {
+    ///
+    /// FIXME: unpacked vision and latent encoding are eager Python calls
+    /// over Python-held pixels of request-chosen shapes, and a latent
+    /// encoder's posterior draws from the device's default generator
+    /// inside the call instead of reading noise the caller supplies.
+    pub fn encode(&mut self, images: &[&PreparedImage], out: &[StorageView]) -> Result<Encoded> {
+        // At once: the recorded encode, performed here.
+        let job = Job::new();
+        let recorded = self.record(images, out, &job)?;
+        let mut completion = job.perform().check().map_err(|failure| failure.error)?;
+        recorded.finish(&mut completion)
+    }
+
+    /// Record the encoding of `images` into `job`, image `i`'s result into
+    /// `out[i]`: a packed encoder's grid upload, packing call, graph launch
+    /// or eager call and feature copies per chunk; an unpacked encoder's
+    /// eager call per group of one pixel shape. The job's completion gives
+    /// the result ([`Recorded::finish`]): an unpacked call returns the
+    /// shapes it wrote.
+    pub(crate) fn record(
+        &mut self,
+        images: &[&PreparedImage],
+        out: &[StorageView],
+        job: &Job,
+    ) -> Result<Recorded> {
         if images.len() != out.len() {
             return Err(Error::Invariant(
                 "encoder images and products must align".into(),
             ));
         }
-        let mut result = Encoded {
-            shapes: vec![Vec::new(); images.len()],
-            ..Encoded::default()
+        let mut result = Recorded {
+            encoded: Encoded {
+                shapes: vec![Vec::new(); images.len()],
+                ..Encoded::default()
+            },
+            returning: Vec::new(),
+            method: self.methods.encode.name().to_owned(),
         };
         if images.is_empty() {
             return Ok(result);
         }
-        match &self.steps {
-            Steps::Vision {
-                packed: Some(_), ..
-            } => self.encode_packed(images, out, &mut result)?,
-            Steps::Vision { encode, .. } | Steps::Latent { encode, .. } => {
-                let encode = encode.clone();
+        match (&self.info, &self.packed) {
+            (EncoderInfo::Vision(_), Some(_)) => {
+                self.encode_packed(images, out, &mut result.encoded, job)?
+            }
+            (EncoderInfo::Vision(_) | EncoderInfo::Latent(_), _) => {
                 let groups = match self.info {
                     EncoderInfo::Vision(vision) => {
                         // Each call stays within the rows its projections
@@ -938,47 +1014,70 @@ impl EncoderRunner {
                     _ => shape_groups(images),
                 };
                 for group in groups {
-                    let shapes = call_shapes(
-                        &encode,
-                        &[
-                            image_list(group.iter().map(|&index| images[index])),
-                            region_list(group.iter().map(|&index| &out[index])),
-                        ],
-                        group.len(),
-                    )?;
-                    for (index, shape) in group.into_iter().zip(shapes) {
-                        result.shapes[index] = shape;
-                    }
-                    result.record(GraphMode::Eager);
+                    // Each image's product follows the images as a tensor
+                    // of its own.
+                    let mut arguments = vec![
+                        Argument::Handle(self.methods.runner.clone()),
+                        Argument::Handles(
+                            group
+                                .iter()
+                                .map(|&index| images[index].value.clone())
+                                .collect(),
+                        ),
+                    ];
+                    arguments.extend(
+                        group
+                            .iter()
+                            .map(|&index| Argument::Tensor(out[index].clone())),
+                    );
+                    job.call_returning(MethodCall::new(&self.methods.encode, arguments));
+                    result.returning.push(group);
+                    result.encoded.record(GraphMode::Eager);
                 }
             }
-            Steps::Runner { .. } => {
+            (EncoderInfo::Text(_) | EncoderInfo::Condition, _) => {
                 return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
             }
         }
         Ok(result)
     }
 
+    /// The arguments of the Python half's `encode` of `slots` packed slots.
+    fn packed_arguments(&self, slots: usize) -> Result<Vec<Argument>> {
+        let (EncoderInfo::Vision(vision), Some(packed)) = (&self.info, &self.packed) else {
+            return Err(Error::Invariant("encoder packs no images".into()));
+        };
+        let slots = slots as i64;
+        let patches = i64::from(vision.max_patches.unwrap_or_default());
+        let tokens = i64::from(vision.slot_tokens().unwrap_or_default());
+        Ok(vec![
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Tensor(packed.pixels.prefix(slots * patches)?),
+            Argument::Tensor(packed.grids.prefix(2 * slots)?),
+            Argument::Tensor(packed.features.prefix(slots * tokens)?),
+        ])
+    }
+
     fn encode_packed(
         &mut self,
         images: &[&PreparedImage],
-        out: &[Region],
+        out: &[StorageView],
         result: &mut Encoded,
+        job: &Job,
     ) -> Result<()> {
-        let (
-            EncoderInfo::Vision(vision),
-            Some(packed),
-            Steps::Vision {
-                packed: Some((encode, _)),
-                ..
-            },
-        ) = (&self.info, &self.packed, &self.steps)
-        else {
+        let (EncoderInfo::Vision(vision), Some(packed)) = (&self.info, &self.packed) else {
             return Err(Error::Invariant("encoder packs no images".into()));
         };
-        let (vision, encode) = (*vision, encode.clone());
-        let (capacity, grids) = (packed.capacity, packed.grids.clone());
+        let vision = *vision;
+        let (capacity, pixels, grids, features) = (
+            packed.capacity,
+            packed.pixels.clone(),
+            packed.grids.clone(),
+            packed.features.clone(),
+        );
         let max_patches = vision.max_patches.unwrap_or_default();
+        let slot_tokens = u64::from(vision.slot_tokens().unwrap_or_default());
+        let row_bytes = u64::from(vision.output_size) * vision.output_dtype.bytes() as u64;
         let shapes = images
             .iter()
             .map(|image| {
@@ -992,27 +1091,61 @@ impl EncoderRunner {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
+        let stream = self.stream.clone();
+        let issue = job.on(stream.as_ref());
         let mut offset = 0;
         for chunk in shapes.chunks(capacity) {
             let slots = chunk.len();
             let layout = packed_grids(chunk, slots, max_patches, vision.downsample)?;
             grids
                 .prefix(2 * slots as i64)?
-                .upload(grid_bytes(&layout).as_slice(), self.stream.as_ref())?;
-            let (graph, mode) = self.packed_graph(EncoderGraph::Packed { slots })?;
-            let shapes = call_shapes(
-                &encode,
-                &[
-                    image_list(images[offset..offset + slots].iter().copied()),
-                    Any::from(slots as i64),
-                    graph.map_or_else(Any::default, |graph| graph.to_any()),
-                    region_list(out[offset..offset + slots].iter()),
-                ],
-                slots,
-            )?;
-            for (index, shape) in shapes.into_iter().enumerate() {
-                result.shapes[offset + index] = shape;
+                .upload(grid_bytes(&layout).as_slice(), issue)?;
+
+            // FIXME: prepared images are Python-held, so their patch rows
+            // reach the slots through one call on the Python thread.
+            let mut pack = vec![
+                Argument::Handle(self.methods.runner.clone()),
+                Argument::Tensor(pixels.clone()),
+            ];
+            pack.extend(
+                images[offset..offset + slots]
+                    .iter()
+                    .map(|image| Argument::Handle(image.value.clone())),
+            );
+            job.call(MethodCall::new(&self.methods.pack_images, pack));
+
+            let arguments = self.packed_arguments(slots)?;
+            let mode = match (self.graph(EncoderGraph::Packed { slots })?, &stream) {
+                (Some(graph), Some(_)) => {
+                    issue.launch(graph)?;
+                    GraphMode::Replay
+                }
+                _ => {
+                    job.call(MethodCall::new(&self.methods.encode, arguments));
+                    GraphMode::Eager
+                }
+            };
+            if let Some(table) = &mut self.graphs {
+                table.record(mode);
             }
+
+            // Slot `i` holds image `i`'s features in its leading rows; the
+            // features and the product share their dtype, so the rows are
+            // copied as they are.
+            let mut rows_out = CopyBatch::new(SourceOrder::Stream);
+            for (index, &[rows, columns]) in chunk.iter().enumerate() {
+                let count =
+                    u64::from(rows) * u64::from(columns) / u64::from(vision.downsample).pow(2);
+                let target = out[offset + index].address();
+                let source = features.address() + index as u64 * slot_tokens * row_bytes;
+                rows_out.push(target, source, (count * row_bytes) as usize);
+                result.shapes[offset + index] = vec![count as i64, i64::from(vision.output_size)];
+            }
+            // SAFETY: each image's rows lie in its slot's features and its
+            // target is the product the caller reserved, both alive until
+            // the batch commits; the copies follow the encode in the
+            // issuer's order, on the stream or in host memory.
+            unsafe { issue.copy(&rows_out) }?;
             result.record(mode);
             offset += slots;
         }
@@ -1027,68 +1160,71 @@ impl EncoderRunner {
     /// product is the block's row count. The blocks' features fill `out`'s
     /// rows in block order. Each block is one sample of one numerical call,
     /// so a block's features do not depend on the other blocks.
-    pub fn encode_patches(
+    pub(crate) fn encode_patches(
         &mut self,
         rows: &StorageView,
         grids: &[[u32; 3]],
         out: &StorageView,
+        job: &Job,
     ) -> Result<()> {
-        let (Steps::Runner { runner, encode, .. }, EncoderInfo::Vision(_)) =
-            (&self.steps, &self.info)
-        else {
+        if !matches!(self.info, EncoderInfo::Vision(_)) {
             return Err(Error::Invalid(format!(
                 "{} encodes no vision blocks",
                 self.owner
             )));
-        };
-        encode.call_values(&[
-            runner.to_any(),
-            Any::from(rows.to_tensor()?),
-            Any::from(out.to_tensor()?),
-            Any::from(integer_list(
-                grids.iter().flatten().map(|&extent| i64::from(extent)),
-            )),
-        ])?;
+        }
+        job.call(MethodCall::new(
+            &self.methods.encode,
+            vec![
+                Argument::Handle(self.methods.runner.clone()),
+                Argument::Tensor(rows.clone()),
+                Argument::Tensor(out.clone()),
+                Argument::Integers(
+                    grids
+                        .iter()
+                        .flatten()
+                        .map(|&extent| i64::from(extent))
+                        .collect(),
+                ),
+            ],
+        ));
         Ok(())
     }
 
     /// The arguments of the Python half's `encode` of a prompt padded to
     /// `capacity`, without vision tokens.
-    fn text_arguments(&self, capacity: usize) -> Result<Vec<Any>> {
-        let (Steps::Runner { runner, .. }, Some(text)) = (&self.steps, &self.text) else {
+    fn text_arguments(&self, capacity: usize) -> Result<Vec<Argument>> {
+        let Some(text) = &self.text else {
             return Err(Error::Invalid(format!("{} encodes no text", self.owner)));
         };
         Ok(vec![
-            runner.to_any(),
-            Any::from(text.tokens.prefix(capacity as i64)?.to_tensor()?),
-            Any::from(text.features.prefix(capacity as i64)?.to_tensor()?),
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Tensor(text.tokens.prefix(capacity as i64)?),
+            Argument::Tensor(text.features.prefix(capacity as i64)?),
         ])
     }
 
-    /// Encode one prompt of `tokens` ids into `out`, its `[tokens, hidden]`
-    /// feature rows in the product's dtype.
+    /// Record the encoding of one prompt of `tokens` ids into `out`, its
+    /// `[tokens, hidden]` feature rows in the product's dtype, as operations
+    /// of `job` on the encoder's stream: the token upload, the launch of
+    /// the prompt capacity's graph or the eager call, and the copy of the
+    /// prompt's rows. Returns the mode the forward runs in.
     ///
     /// `vision` carries the prompt's vision tokens, for an encoder that
     /// places them. A pipeline stage that emits no features writes nothing.
-    pub fn encode_text(
+    pub(crate) fn encode_text(
         &mut self,
         tokens: &[i64],
         out: &StorageView,
         vision: Option<PromptVision<'_>>,
+        job: &Job,
     ) -> Result<GraphMode> {
-        let (
-            Steps::Runner {
-                encode,
-                position_ids,
-                ..
-            },
-            Some(text),
-            Some(stream),
-        ) = (&self.steps, &self.text, &self.stream)
-        else {
+        let (encode, position_ids) = (&self.methods.encode, &self.methods.position_ids);
+        let (Some(text), Some(stream)) = (&self.text, &self.stream) else {
             return Err(Error::Invalid(format!("{} encodes no text", self.owner)));
         };
         let (encode, position_ids, stream) = (encode.clone(), position_ids.clone(), stream.clone());
+        let issue = job.on(Some(&stream));
         let capacity = text_capacity(&self.text_capacities, tokens.len())?;
         if capacity as i64 > text.tokens.shape()[0] {
             return Err(Error::Invalid(
@@ -1102,9 +1238,10 @@ impl EncoderRunner {
             .iter()
             .flat_map(|token| token.to_ne_bytes())
             .collect();
-        text.tokens.upload(&bytes, Some(&stream))?;
+        text.tokens.upload(&bytes, issue)?;
         let (features, final_stage) = (text.features.clone(), text.final_stage);
 
+        let runner = Argument::Handle(self.methods.runner.clone());
         let mut arguments = self.text_arguments(capacity)?;
         let mode = match vision {
             Some(PromptVision {
@@ -1120,35 +1257,42 @@ impl EncoderRunner {
                         Error::Invalid(format!("{} places no vision tokens", self.owner))
                     })?;
                 let grids = |grids: &[[u32; 3]]| {
-                    Any::from(integer_list(
-                        grids.iter().flatten().map(|&extent| i64::from(extent)),
-                    ))
+                    Argument::Integers(
+                        grids
+                            .iter()
+                            .flatten()
+                            .map(|&extent| i64::from(extent))
+                            .collect(),
+                    )
                 };
-                position_ids.call_values(&[
-                    arguments[0].clone(),
-                    Any::from(integer_list(padded.iter().copied())),
-                    grids(image_grids),
-                    grids(video_grids),
-                    Any::from(positions.to_tensor()?),
-                ])?;
-                arguments.push(Any::from(positions.to_tensor()?));
-                arguments.push(Any::from(rows.to_tensor()?));
-                encode.call_values(&arguments)?;
+                job.call(MethodCall::new(
+                    &position_ids,
+                    vec![
+                        runner,
+                        Argument::Integers(padded.clone()),
+                        grids(image_grids),
+                        grids(video_grids),
+                        Argument::Tensor(positions.clone()),
+                    ],
+                ));
+                arguments.push(Argument::Tensor(positions.clone()));
+                arguments.push(Argument::Tensor(rows.clone()));
+                job.call(MethodCall::new(&encode, arguments));
                 GraphMode::Eager
             }
             // Without configured capacities a prompt is encoded at its
             // exact length, which no graph serves.
             None if self.text_capacities.is_empty() => {
-                encode.call_values(&arguments)?;
+                job.call(MethodCall::new(&encode, arguments));
                 GraphMode::Eager
             }
             None => match self.graph(EncoderGraph::Text { capacity })? {
                 Some(graph) => {
-                    graph.launch(&stream)?;
+                    issue.launch(graph)?;
                     GraphMode::Replay
                 }
                 None => {
-                    encode.call_values(&arguments)?;
+                    job.call(MethodCall::new(&encode, arguments));
                     GraphMode::Eager
                 }
             },
@@ -1160,10 +1304,12 @@ impl EncoderRunner {
             // The features and the product share the model dtype, so the
             // prompt's rows are copied as they are.
             let count = out.numel() * out.dtype().bytes() as u64;
+            let mut rows = CopyBatch::new(SourceOrder::Stream);
+            rows.push(out.address(), features.address(), count as usize);
             // SAFETY: the features hold at least the prompt's rows, the
-            // caller bound `out` for them, and the copy follows the encode
-            // on the stream.
-            unsafe { memcpy_async(out.address(), features.address(), count as usize, &stream)? };
+            // caller bound `out` for them, both outlive the batch, and the
+            // copy follows the encode on the stream.
+            unsafe { issue.copy(&rows) }?;
         }
         Ok(mode)
     }
@@ -1182,27 +1328,16 @@ impl EncoderRunner {
         })
     }
 
-    /// The resident graph handle of a packed vision encode of `key`, which
-    /// its binding replays, or eager execution when capture is disabled.
-    /// After seal a missing graph is an error.
-    fn packed_graph(&mut self, key: EncoderGraph) -> Result<(Option<Handle>, GraphMode)> {
-        let found = self.graph(key)?.map(|graph| graph.handle().clone());
-        let mode = if found.is_some() {
-            GraphMode::Replay
-        } else {
-            GraphMode::Eager
-        };
-        if let Some(table) = &mut self.graphs {
-            table.record(mode);
-        }
-        Ok((found, mode))
-    }
-
-    /// Warm and, with `pool`, capture every graph this encoder replays:
+    /// Warm and, with `pool`, capture every graph this encoder launches:
     /// packed slot counts `capacity..=1` and text capacities, largest
     /// first. `check` runs after each capture (the graph storage budget);
-    /// a failed check releases that graph. Without a pool the same calls
-    /// run eagerly once, so lazy initialization precedes serving.
+    /// a failed check releases that graph. Without a pool the same
+    /// forwards run once on the Python thread, so lazy initialization
+    /// precedes serving.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub fn capture(
         &mut self,
         pool: Option<&Arc<GraphPool<Handle>>>,
@@ -1215,17 +1350,10 @@ impl EncoderRunner {
                 "an encoder captures into a pool of its device".into(),
             ));
         }
-        let pool_value = pool.map_or_else(Any::default, |pool| pool.value.to_any());
-        let mut captured = Vec::new();
-        match (&self.info, &self.packed, &self.steps) {
-            (
-                EncoderInfo::Vision(vision),
-                Some(packed),
-                Steps::Vision {
-                    packed: Some((_, capture)),
-                    ..
-                },
-            ) => {
+        // The forwards to capture, largest first, each with its arguments.
+        let mut forwards = Vec::new();
+        match (&self.info, &self.packed, &self.text) {
+            (EncoderInfo::Vision(vision), Some(packed), _) => {
                 for slots in (1..=packed.capacity).rev() {
                     let layout = packed_grids(
                         &[],
@@ -1233,87 +1361,60 @@ impl EncoderRunner {
                         vision.max_patches.unwrap_or_default(),
                         vision.downsample,
                     )?;
-                    packed
-                        .grids
-                        .prefix(2 * slots as i64)?
-                        .upload(grid_bytes(&layout).as_slice(), self.stream.as_ref())?;
-                    let graph =
-                        capture.call_values(&[Any::from(slots as i64), pool_value.clone()])?;
-                    captured.push((EncoderGraph::Packed { slots }, graph));
+                    forwards.push((
+                        EncoderGraph::Packed { slots },
+                        Some(grid_bytes(&layout)),
+                        self.packed_arguments(slots)?,
+                    ));
                 }
             }
-            (
-                EncoderInfo::Text(_),
-                _,
-                Steps::Runner {
-                    encode, capture, ..
-                },
-            ) => {
-                let (encode, capture) = (encode.clone(), capture.clone());
-                let (Some(text), Some(stream), Device::Cuda(device)) =
-                    (&self.text, self.stream.clone(), self.device)
-                else {
-                    return Err(Error::Invariant(
-                        "a text encoder captures on its CUDA stream".into(),
+            (EncoderInfo::Text(_), _, Some(text)) => {
+                text.tokens.zero(self.stream.as_ref())?;
+                for &capacity in self.text_capacities.iter().rev() {
+                    forwards.push((
+                        EncoderGraph::Text { capacity },
+                        None,
+                        self.text_arguments(capacity)?,
                     ));
-                };
-                text.tokens.zero(Some(&stream))?;
-                for &capacity in self.text_capacities.clone().iter().rev() {
-                    // An eager forward first, so kernels compile outside the
-                    // capture.
-                    let arguments = self.text_arguments(capacity)?;
-                    encode.call_values(&arguments)?;
-                    let Some(pool) = pool else {
-                        continue;
-                    };
-                    let graph = capture.capture(&pool.value, stream.raw(), device, || {
-                        encode.call_values(&arguments).map(drop)
-                    })?;
-                    if let Err(error) = check() {
-                        if let Err(cleanup) = capture.release.invoke(&[graph.handle().view()]) {
-                            tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
-                        }
-                        return Err(error);
-                    }
-                    self.graphs
-                        .as_mut()
-                        .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
-                        .insert(EncoderGraph::Text { capacity }, None, graph)?;
                 }
             }
             _ => {}
         }
-        for (key, graph) in captured {
-            self.keep(key, graph, check)?;
+        for (key, grids, arguments) in forwards {
+            if let (EncoderGraph::Packed { slots }, Some(grids), Some(packed)) =
+                (key, &grids, &self.packed)
+            {
+                packed
+                    .grids
+                    .prefix(2 * slots as i64)?
+                    .upload(grids, self.stream.as_ref())?;
+            }
+            // An eager forward first, so kernels compile outside the
+            // capture.
+            MethodCall::new(&self.methods.encode, arguments.clone()).invoke()?;
+            let (Some(pool), Some(stream), Device::Cuda(device)) =
+                (pool, &self.stream, self.device)
+            else {
+                continue;
+            };
+            let capture = &self.methods.capture;
+            let encode = MethodCall::new(&self.methods.encode, arguments);
+            let graph = capture.capture(&pool.value, stream.raw(), device, || {
+                encode.invoke().map(drop)
+            })?;
+            if let Err(error) = check() {
+                if let Err(cleanup) = capture.release.invoke(&[graph.handle().view()]) {
+                    tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
+                }
+                return Err(error);
+            }
+            self.graphs
+                .as_mut()
+                .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
+                .insert(key, None, graph)?;
         }
         self.capturing = pool.is_some();
         Ok(())
-    }
-
-    /// Record one captured graph after the storage check; a warm call
-    /// without a pool returns no graph.
-    fn keep(
-        &mut self,
-        key: EncoderGraph,
-        graph: Any,
-        check: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
-        if crate::ffi::is_none(&graph) {
-            return Ok(());
-        }
-        let graph = CUDAGraph::captured(graph)?;
-        if let Err(error) = check() {
-            if let Some(release) = &self.release
-                && let Err(cleanup) = release.invoke(&[graph.handle().view()])
-            {
-                tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
-            }
-            return Err(error);
-        }
-        self.graphs
-            .as_mut()
-            .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
-            .insert(key, None, graph)
     }
 
     /// Refuse further captures: serving replays what startup captured.
@@ -1323,12 +1424,27 @@ impl EncoderRunner {
         }
     }
 
-    /// Release the runner's graphs; the caller drained its stream. An
-    /// aborted close keeps them until the process exits.
+    /// Release the runner's graphs, then what it owns: the Python runners
+    /// of condition encoders and the execution context it owns. The
+    /// caller drained its stream. An aborted close keeps everything until
+    /// the process exits.
     pub fn close(&mut self, aborted: bool) -> Result<()> {
-        self.graphs
+        let mut result = self
+            .graphs
             .as_mut()
-            .map_or(Ok(()), |table| table.close(aborted))
+            .map_or(Ok(()), |table| table.close(aborted));
+        if let Some(conditions) = &mut self.conditions {
+            result = result.and(conditions.close(aborted));
+        }
+        if let Some(context) = &self.context {
+            let flag = Any::from(aborted);
+            result = result.and(
+                context
+                    .close
+                    .invoke(&[self.methods.runner.view(), (&flag).into()]),
+            );
+        }
+        result
     }
 }
 
@@ -1366,32 +1482,6 @@ fn shape_groups(images: &[&PreparedImage]) -> Vec<Vec<usize>> {
     groups.into_iter().map(|(_, members)| members).collect()
 }
 
-fn image_list<'a>(images: impl Iterator<Item = &'a PreparedImage>) -> Any {
-    Any::from(list(images.map(|image| image.value.to_any())))
-}
-
-fn region_list<'a>(regions: impl Iterator<Item = &'a Region>) -> Any {
-    Any::from(list(regions.map(Region::to_any)))
-}
-
-/// Call an encode function and read one result shape per input.
-fn call_shapes(function: &Function, args: &[Any], count: usize) -> Result<Vec<Vec<i64>>> {
-    let value: tvm_ffi::Array<Any> = tvm_ffi::Array::try_from(function.call_values(args)?)
-        .map_err(|error| Error::numerical(function.name(), &error))?;
-    if value.len() != count {
-        return Err(Error::Interface(format!(
-            "{} returns one shape per input",
-            function.name()
-        )));
-    }
-    value
-        .iter()
-        .map(|shape| {
-            crate::ffi::integers(shape).map_err(|error| Error::numerical(function.name(), &error))
-        })
-        .collect()
-}
-
 /// Native-endian int64 words of a grid layout, as the device reads them.
 fn grid_bytes(layout: &[[i64; 2]]) -> Vec<u8> {
     layout
@@ -1401,105 +1491,236 @@ fn grid_bytes(layout: &[[i64; 2]]) -> Vec<u8> {
         .collect()
 }
 
-/// One rank's condition latent encoders.
-pub(crate) struct LatentEncoding {
-    video: Methods,
-    audio: Methods,
+/// A condition encoding was recorded before the job that constructs its
+/// encoder completed.
+const MISSING_ENCODER: Error =
+    Error::State("a condition encoding was recorded before its encoder was constructed");
+
+/// The condition latent encoders of a video model: the Python runners of
+/// its video encoder and of its audio encoder, one per input shapes.
+struct Conditions {
+    video: RunnerClass,
+    audio: RunnerClass,
+    loaded: Handle,
     /// Frames of each visual unit of a condition of some frame count.
     unit_frames: Function,
-    /// The runner of each call's input shapes, created at its first call.
-    video_runners: HashMap<Vec<i64>, Handle>,
-    audio_runners: HashMap<Vec<i64>, Handle>,
+    /// What `unit_frames` answered, by frame count.
+    frames: HashMap<i64, Vec<i64>>,
+    /// The runner of each call's input shapes, constructed by the job
+    /// before the first call's ([`Self::setup`]).
+    video_runners: HashMap<Vec<i64>, Methods>,
+    audio_runners: HashMap<Vec<i64>, Methods>,
 }
 
-impl LatentEncoding {
-    /// `video` and `audio` are the encoders' module paths; the other
-    /// fields of the setups agree.
-    pub(crate) fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
+/// The encoder of a condition's medium.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConditionMedium {
+    Video,
+    Audio,
+}
+
+/// What a condition encoding call encodes on this rank.
+pub(crate) enum ConditionInput {
+    /// Visual units, each `[pixel_offset, frames, width, height, unit]`,
+    /// written to rows `region` of the round's `rows`.
+    Units {
+        units: Vec<[i64; 5]>,
+        rows: u64,
+        region: std::ops::Range<u64>,
+    },
+    /// Audio tracks of these sample counts, written to `rows` rows.
+    Tracks { lengths: Vec<u64>, rows: u64 },
+}
+
+/// What the job on the lane asks the library for before a batch's
+/// condition encodings are recorded.
+pub(crate) enum ConditionSetup {
+    /// The frames of each visual unit of conditions of these frame counts.
+    Frames(Vec<i64>),
+    /// The encoders of these input shapes.
+    Runners(Vec<(ConditionMedium, Vec<i64>)>),
+}
+
+impl Conditions {
+    fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
         Ok(Self {
             unit_frames: video.interface.import(&format!("{ENCODER}.unit_frames"))?,
-            video: Methods::new(&video, ENCODER, "encode")?,
-            audio: Methods::new(&audio, ENCODER, "encode")?,
+            loaded: video.loaded.clone(),
+            video: RunnerClass::new(video.interface, ENCODER, "encode", video.arguments())?,
+            audio: RunnerClass::new(audio.interface, ENCODER, "encode", audio.arguments())?,
+            frames: HashMap::new(),
             video_runners: HashMap::new(),
             audio_runners: HashMap::new(),
         })
     }
 
-    pub(crate) fn stream(&self) -> &Stream {
-        &self.video.stream
-    }
-
-    /// Encode visual units, each `[pixel_offset, frames, width, height,
-    /// unit]`, into consecutive rows of `out`.
-    pub(crate) fn encode_video(
-        &mut self,
-        pixels: &StorageView,
-        units: &[[i64; 5]],
-        out: &StorageView,
-    ) -> Result<()> {
-        // The call's input shapes: each unit's frames at its raster.
+    /// The input shapes of a call encoding `units`: each unit's frames at
+    /// its raster. `None` while the unit frames of one of the conditions
+    /// were not asked for.
+    fn unit_shapes(&self, units: &[[i64; 5]]) -> Result<Option<Vec<i64>>> {
         let mut shapes = Vec::with_capacity(units.len() * 4);
         for &[_, frames, width, height, unit] in units {
-            let value = self
-                .unit_frames
-                .call_values(&[self.video.loaded.to_any(), Any::from(frames)])?;
-            let lengths = crate::ffi::integers(value)
-                .map_err(|error| Error::numerical(self.unit_frames.name(), &error))?;
+            let Some(lengths) = self.frames.get(&frames) else {
+                return Ok(None);
+            };
             let length = lengths.get(unit as usize).copied().ok_or_else(|| {
                 Error::Invalid("a condition unit lies outside its condition".into())
             })?;
             shapes.extend([length, height, width, 3]);
         }
-        let runner = match self.video_runners.get(&shapes) {
-            Some(runner) => runner.clone(),
-            None => {
-                let runner = self.video.runner(shapes.iter().copied())?;
-                self.video_runners.insert(shapes, runner.clone());
-                runner
+        Ok(Some(shapes))
+    }
+
+    /// The input shapes of a call encoding tracks of `lengths` samples.
+    fn track_shapes(lengths: &[u64]) -> Vec<i64> {
+        lengths
+            .iter()
+            .flat_map(|&length| [length as i64, 2])
+            .collect()
+    }
+
+    /// Record into `job` what the encodings of `inputs` lack: the unit
+    /// frames of conditions whose frame count is new, and once those are
+    /// known the construction of the encoders of new input shapes. `None`
+    /// when the encodings can be recorded.
+    ///
+    /// Both are calls of the library, so the job makes them; a constructed
+    /// encoder is an argument of its forward, which is why the forward is
+    /// recorded only from the job's completion ([`Self::accept`]).
+    fn setup(&self, inputs: &[ConditionInput], job: &Job) -> Result<Option<ConditionSetup>> {
+        let mut frames: Vec<i64> = inputs
+            .iter()
+            .filter_map(|input| match input {
+                ConditionInput::Units { units, .. } => Some(units),
+                ConditionInput::Tracks { .. } => None,
+            })
+            .flatten()
+            .map(|unit| unit[1])
+            .filter(|count| !self.frames.contains_key(count))
+            .collect();
+        frames.sort_unstable();
+        frames.dedup();
+        if !frames.is_empty() {
+            for &count in &frames {
+                job.call_returning(MethodCall::new(
+                    &self.unit_frames,
+                    vec![
+                        Argument::Handle(self.loaded.clone()),
+                        Argument::Integer(count),
+                    ],
+                ));
             }
-        };
-        self.video.forward.call_values(&[
-            runner.to_any(),
-            Any::from(pixels.to_tensor()?),
-            Any::from(out.to_tensor()?),
-            Any::from(integer_list(units.iter().flatten().copied())),
-        ])?;
+            return Ok(Some(ConditionSetup::Frames(frames)));
+        }
+
+        let mut runners: Vec<(ConditionMedium, Vec<i64>)> = Vec::new();
+        for input in inputs {
+            let (medium, shapes) = match input {
+                ConditionInput::Units { units, .. } => {
+                    let shapes = self.unit_shapes(units)?.ok_or_else(|| {
+                        Error::Invariant("a condition's unit frames were not asked for".into())
+                    })?;
+                    (ConditionMedium::Video, shapes)
+                }
+                ConditionInput::Tracks { lengths, .. } => {
+                    (ConditionMedium::Audio, Self::track_shapes(lengths))
+                }
+            };
+            let (class, constructed) = match medium {
+                ConditionMedium::Video => (&self.video, &self.video_runners),
+                ConditionMedium::Audio => (&self.audio, &self.audio_runners),
+            };
+            let recorded = runners
+                .iter()
+                .any(|(other, known)| *other == medium && *known == shapes);
+            if constructed.contains_key(&shapes) || recorded {
+                continue;
+            }
+            job.call_handle(class.construction(vec![Argument::Integers(shapes.clone())]));
+            runners.push((medium, shapes));
+        }
+        Ok((!runners.is_empty()).then_some(ConditionSetup::Runners(runners)))
+    }
+
+    /// Keep what the job of `setup` returned.
+    fn accept(&mut self, setup: ConditionSetup, completion: &mut Completion) -> Result<()> {
+        match setup {
+            ConditionSetup::Frames(frames) => {
+                for count in frames {
+                    self.frames.insert(count, completion.returned()?);
+                }
+            }
+            ConditionSetup::Runners(runners) => {
+                for (medium, shapes) in runners {
+                    let runner = completion.handle()?;
+                    match medium {
+                        ConditionMedium::Video => self
+                            .video_runners
+                            .insert(shapes, self.video.constructed(runner)),
+                        ConditionMedium::Audio => self
+                            .audio_runners
+                            .insert(shapes, self.audio.constructed(runner)),
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode visual units, each `[pixel_offset, frames, width, height,
+    /// unit]`, into consecutive rows of `out`.
+    fn encode_video(
+        &mut self,
+        pixels: &StorageView,
+        units: &[[i64; 5]],
+        out: &StorageView,
+        job: &Job,
+    ) -> Result<()> {
+        let runner = self
+            .unit_shapes(units)?
+            .and_then(|shapes| self.video_runners.get(&shapes))
+            .ok_or(MISSING_ENCODER)?;
+        job.call(MethodCall::new(
+            &self.video.forward,
+            vec![
+                Argument::Handle(runner.runner().clone()),
+                Argument::Tensor(pixels.clone()),
+                Argument::Tensor(out.clone()),
+                Argument::Integers(units.iter().flatten().copied().collect()),
+            ],
+        ));
         Ok(())
     }
 
     /// Encode audio tracks of `lengths` samples into consecutive rows of
     /// `out`.
-    pub(crate) fn encode_audio(
+    fn encode_audio(
         &mut self,
         samples: &StorageView,
         lengths: &[u64],
         out: &StorageView,
+        job: &Job,
     ) -> Result<()> {
-        let shapes: Vec<i64> = lengths
-            .iter()
-            .flat_map(|&length| [length as i64, 2])
-            .collect();
-        let runner = match self.audio_runners.get(&shapes) {
-            Some(runner) => runner.clone(),
-            None => {
-                let runner = self.audio.runner(shapes.iter().copied())?;
-                self.audio_runners.insert(shapes, runner.clone());
-                runner
-            }
-        };
-        self.audio.forward.call_values(&[
-            runner.to_any(),
-            Any::from(samples.to_tensor()?),
-            Any::from(out.to_tensor()?),
-            Any::from(integer_list(lengths.iter().map(|&length| length as i64))),
-        ])?;
+        let runner = self
+            .audio_runners
+            .get(&Self::track_shapes(lengths))
+            .ok_or(MISSING_ENCODER)?;
+        job.call(MethodCall::new(
+            &self.audio.forward,
+            vec![
+                Argument::Handle(runner.runner().clone()),
+                Argument::Tensor(samples.clone()),
+                Argument::Tensor(out.clone()),
+                Argument::Integers(lengths.iter().map(|&length| length as i64).collect()),
+            ],
+        ));
         Ok(())
     }
 
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
-        let mut records = self.video.kernels(label, self.video_runners.values())?;
-        records.extend(self.audio.kernels(label, self.audio_runners.values())?);
-        Ok(records)
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        let mut calls = self.video.kernel_calls(self.video_runners.values());
+        calls.extend(self.audio.kernel_calls(self.audio_runners.values()));
+        calls
     }
 
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -1517,6 +1738,8 @@ pub(crate) struct TextSetup<'a> {
     pub(crate) path: &'a str,
     pub(crate) device: i32,
     pub(crate) stream: Stream,
+    /// The stream's shared work areas, a Python `Scratch`.
+    pub(crate) scratch: Handle,
     pub(crate) attention: String,
     /// Prompt capacities, the longest admitted prompt and, as the row
     /// budget, the most vision patch rows one request carries.
@@ -1528,20 +1751,11 @@ pub(crate) struct TextSetup<'a> {
     pub(crate) dtype: DType,
 }
 
-/// One rank's text encoder: the component binding, the prompt encoder and,
-/// for conditioned tasks, the vision tower bound with it. The encoders
-/// write prompt features and vision features into their products.
-pub(crate) struct TextEncoding {
-    binding: ComponentBinding,
-    /// The binding's workspaces; sealed once graphs captured them.
-    workspaces: StreamWorkspaces,
-    pub(crate) text: EncoderRunner,
-    pub(crate) vision: Option<EncoderRunner>,
-    stream: Stream,
-}
-
-impl TextEncoding {
-    pub(crate) fn new(setup: TextSetup<'_>) -> Result<Self> {
+impl EncoderRunner {
+    /// The runners of a video model's text encoder component: the prompt
+    /// encoder, which owns the execution context, and, for conditioned
+    /// tasks, the vision tower bound with it.
+    pub(crate) fn text(setup: TextSetup<'_>) -> Result<(Self, Option<Self>)> {
         let TextSetup {
             interface,
             loaded,
@@ -1549,6 +1763,7 @@ impl TextEncoding {
             path,
             device,
             stream,
+            scratch,
             attention,
             config,
             vision,
@@ -1575,97 +1790,141 @@ impl TextEncoding {
             },
             _ => config,
         };
-        let prepared = crate::model::bind::prepare(
-            interface,
-            loaded,
-            BindingRequest {
-                component: component.to_owned(),
-                path: path.to_owned(),
-                device: crate::config::Device::Cuda(device),
-                stream: stream.raw(),
-                // The binding serves both encoders, so its operators are
-                // declared for the larger of their workloads: a prompt
-                // padded to the largest capacity, and a request's vision
-                // blocks.
-                size: [
-                    text_info.binding_size(&config),
-                    vision_info.and_then(|info| info.binding_size(&config)),
-                ]
-                .into_iter()
-                .flatten()
-                .reduce(|left, right| TextSize {
-                    tokens: left.tokens.max(right.tokens),
-                    rows: left.rows.max(right.rows),
-                }),
-                backends: Backends {
-                    attention,
-                    ..Backends::default()
-                },
-                derive_host_lengths: false,
-                experts: None,
-                weights: None,
-                cache: None,
-            },
-        )?;
-        let mut workspaces = StreamWorkspaces::default();
-        // The encoders declare no symmetric workspace, so none is
-        // allocated over the worker's ranks.
-        let binding = crate::model::bind::bind(interface, &mut workspaces, vec![prepared], None)?
-            .pop()
-            .ok_or_else(|| Error::Invariant("the text encoder was not bound".into()))?;
-        let text =
-            EncoderRunner::over(interface, &binding, "", text_info, &config, stream.clone())?;
+        // The context serves both encoders, so its operators are prepared
+        // for the larger of their workloads: a prompt padded to the largest
+        // capacity, and a request's vision blocks.
+        let size = [
+            text_info.context_size(&config),
+            vision_info.and_then(|info| info.context_size(&config)),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|left, right| TextSize {
+            tokens: left.tokens.max(right.tokens),
+            rows: left.rows.max(right.rows),
+        })
+        .ok_or_else(|| Error::Invariant("a text encoder declares its size".into()))?;
+        let method = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
+        let runner = Handle::new(interface.import(ENCODER)?.call_values(&[
+            loaded.to_any(),
+            Any::from(tvm_ffi::String::from(path)),
+            Any::from(stream.raw() as i64),
+            Any::from(tvm_ffi::String::from(attention.as_str())),
+            scratch.to_any(),
+            Any::from(integer_list([size.tokens as i64, size.rows as i64])),
+        ])?)?;
+        let device = Device::Cuda(device);
         let vision = vision_info
             .map(|info| {
-                EncoderRunner::over(interface, &binding, "vision", info, &config, stream.clone())
+                let tower = Handle::new(method("tower")?.call_values(&[
+                    runner.to_any(),
+                    Any::from(tvm_ffi::String::from("vision")),
+                ])?)?;
+                EncoderRunner::over(
+                    interface,
+                    component,
+                    device,
+                    tower,
+                    "vision",
+                    info,
+                    &config,
+                    stream.clone(),
+                )
             })
             .transpose()?;
+        let mut text = EncoderRunner::over(
+            interface, component, device, runner, "", text_info, &config, stream,
+        )?;
+        text.context = Some(OwnedContext {
+            kernels: method("kernels")?,
+            close: method("close")?,
+        });
+        Ok((text, vision))
+    }
+
+    /// The runner of a video model's condition latent encoders. `video`
+    /// and `audio` name the encoders' module paths; the other fields of
+    /// the setups agree.
+    pub(crate) fn conditions(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
+        let interface = video.interface;
         Ok(Self {
-            binding,
-            workspaces,
-            text,
-            vision,
-            stream,
+            owner: video.path.to_owned(),
+            info: EncoderInfo::Condition,
+            device: Device::Cuda(video.device),
+            stream: Some(video.stream.clone()),
+            methods: EncoderMethods::new(interface, Handle::none())?,
+            packed: None,
+            text: None,
+            text_capacities: Vec::new(),
+            config: EncoderConfig::default(),
+            graphs: None,
+            capturing: false,
+            context: None,
+            conditions: Some(Box::new(Conditions::new(video, audio)?)),
         })
     }
 
-    pub(crate) fn stream(&self) -> &Stream {
-        &self.stream
+    fn condition_encoders(&mut self) -> Result<&mut Conditions> {
+        self.conditions
+            .as_deref_mut()
+            .ok_or_else(|| Error::Invalid(format!("{} encodes no conditions", self.owner)))
     }
 
-    /// Warm the prompt capacities and, with `pool`, capture one graph per
-    /// capacity; `check` bounds graph storage after each capture.
-    pub(crate) fn capture(
+    /// Record into `job` what the condition encodings of `inputs` lack
+    /// before they can be recorded; see [`Conditions::setup`].
+    fn condition_setup(
         &mut self,
-        pool: Option<&Arc<GraphPool<Handle>>>,
-        check: &mut dyn FnMut() -> Result<()>,
+        inputs: &[ConditionInput],
+        job: &Job,
+    ) -> Result<Option<ConditionSetup>> {
+        self.condition_encoders()?.setup(inputs, job)
+    }
+
+    /// Keep what the job of `setup` returned.
+    fn accept_setup(&mut self, setup: ConditionSetup, completion: &mut Completion) -> Result<()> {
+        self.condition_encoders()?.accept(setup, completion)
+    }
+
+    /// Encode a condition's visual units, each `[pixel_offset, frames,
+    /// width, height, unit]`, into consecutive rows of `out`.
+    pub(crate) fn encode_condition_units(
+        &mut self,
+        pixels: &StorageView,
+        units: &[[i64; 5]],
+        out: &StorageView,
+        job: &Job,
     ) -> Result<()> {
-        self.text.capture(pool, check)?;
-        self.stream.synchronize()?;
-        Ok(())
+        self.condition_encoders()?
+            .encode_video(pixels, units, out, job)
     }
 
-    /// Refuse further captures and workspace growth.
-    pub(crate) fn seal(&mut self) {
-        self.text.seal();
-        if let Some(vision) = &mut self.vision {
-            vision.seal();
+    /// Encode condition audio tracks of `lengths` samples into consecutive
+    /// rows of `out`.
+    pub(crate) fn encode_condition_tracks(
+        &mut self,
+        samples: &StorageView,
+        lengths: &[u64],
+        out: &StorageView,
+        job: &Job,
+    ) -> Result<()> {
+        self.condition_encoders()?
+            .encode_audio(samples, lengths, out, job)
+    }
+
+    /// The calls that list the kernels the operators of the runner's
+    /// execution context or of the condition encoders selected.
+    pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
+        match (&self.context, &self.conditions) {
+            (Some(context), _) => vec![kernels_call(&context.kernels, &self.methods.runner)],
+            (_, Some(conditions)) => conditions.kernel_calls(),
+            _ => Vec::new(),
         }
-        self.workspaces.seal();
     }
 
-    /// The binding's selected kernels.
-    pub(crate) fn kernels(&self) -> Result<Vec<crate::ffi::Record>> {
-        self.binding.kernels()
-    }
-
-    /// Release the encoders' graphs, then the binding.
-    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
-        let mut result = self.text.close(aborted);
-        if let Some(vision) = &mut self.vision {
-            result = result.and(vision.close(aborted));
-        }
-        result.and(self.binding.close(aborted))
+    /// The kernels the operators of the runner's execution context or of the
+    /// condition encoders selected.
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
+        list_kernels(self.kernel_calls())
     }
 }
 
@@ -1698,6 +1957,7 @@ pub(crate) fn encode_text(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.outputs.len() != 1 || call.inputs.len() > 1 {
@@ -1716,6 +1976,7 @@ pub(crate) fn encode_text(
     }
     let width = row_width(&call.outputs[0])?;
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let visual = call
         .inputs
         .first()
@@ -1725,7 +1986,7 @@ pub(crate) fn encode_text(
                 input,
                 call.call_id,
                 batch.device,
-                Some(&stream),
+                issue,
             )
         })
         .transpose()?;
@@ -1739,7 +2000,7 @@ pub(crate) fn encode_text(
     )?;
 
     let text = &mut parts
-        .video
+        .encoders
         .text
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?
@@ -1750,7 +2011,8 @@ pub(crate) fn encode_text(
         video_grids: &video_grids,
         rows: read.value(),
     });
-    text.text.encode_text(&tokens, &write.view(), vision)?;
+    let mode = text.encode_text(&tokens, &write.view(), vision, job)?;
+    batch.record(mode);
     publish(
         parts,
         batch,
@@ -1758,6 +2020,7 @@ pub(crate) fn encode_text(
         index,
         &write,
         &[tokens.len() as u64, width],
+        issue,
     )
 }
 
@@ -1770,6 +2033,7 @@ pub(crate) fn encode_vision(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
@@ -1796,12 +2060,13 @@ pub(crate) fn encode_vision(
     let width = row_width(&call.outputs[0])?;
     let tokens: u64 = blocks.iter().map(|block| block.1).sum();
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let patches = batch.inputs.read(
         parts.owners().store,
         &call.inputs[0],
         call.call_id,
         batch.device,
-        Some(&stream),
+        issue,
     )?;
     let write = bind_rows(
         parts,
@@ -1812,55 +2077,44 @@ pub(crate) fn encode_vision(
         placement,
     )?;
 
-    let text = &mut parts
-        .video
-        .text
-        .as_mut()
-        .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?
-        .runner;
-    let vision = text
+    let vision = parts
+        .encoders
         .vision
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank's text encoder reads no vision".into()))?;
     // Each block's features are consecutive rows of the product.
     let grids: Vec<[u32; 3]> = blocks.iter().map(|block| block.0).collect();
-    vision.encode_patches(patches.value(), &grids, &write.view())?;
-    publish(parts, batch, call, index, &write, &[tokens, width])
+    vision.encode_patches(patches.value(), &grids, &write.view(), job)?;
+    publish(parts, batch, call, index, &write, &[tokens, width], issue)
 }
 
-/// Encode a request's conditions into denoiser rows: a round of visual
-/// units, this rank's of them, or every audio track.
-pub(crate) fn encode_conditions(
-    parts: &mut Parts<'_>,
+/// What condition encoding `call` encodes on this rank: a round of visual
+/// units, this rank's of them, or every audio track. `None` for an audio
+/// call on a rank that is not the component's first.
+fn condition_input(
+    parts: &Parts<'_>,
     plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    index: usize,
+    call: &uniserve_ipc::Call,
     slot: usize,
-    placement: &Placement<'_>,
-) -> Result<()> {
-    let call = &plan.calls[index];
+) -> Result<Option<ConditionInput>> {
     if call.inputs.len() != 1 || call.outputs.len() != 1 {
         return Err(Error::Invalid(
             "condition encoding requires one input and one output".into(),
         ));
     }
-    let name = parts.video.product_name(call, &call.outputs[0])?.to_owned();
-    let conditions = Arc::clone(&parts.video.request(slot, call.request_key)?.conditions);
+    let name = product_name(parts.info, call, &call.outputs[0])?;
+    let conditions = &parts.video.request(slot, call.request_key)?.conditions;
     if conditions.is_empty() {
         return Err(Error::Invalid(
             "condition encoding requires admitted conditions".into(),
         ));
     }
-    let rank = parts.video.rank;
-    let owners = parts.owners();
     let latent = parts
-        .video
+        .encoders
         .latent
-        .as_mut()
+        .as_ref()
         .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
-    let stream = stream_of(batch)?;
-    let width = row_width(&call.outputs[0])?;
-    match name.as_str() {
+    match name {
         "condition_video_latents" => {
             let range = decode_range(plan, call)?;
             // Every visual unit as (condition, unit, rows), in encoding order.
@@ -1882,7 +2136,7 @@ pub(crate) fn encode_conditions(
                 ));
             }
             let round = &all[cursor..cursor + count];
-            let run = latent.units(rank, 0, count as u32)?;
+            let run = latent.units(parts.rank, 0, count as u32)?;
             if run.is_empty() {
                 return Err(Error::Invalid(
                     "condition encoding assigns this rank no unit".into(),
@@ -1891,13 +2145,6 @@ pub(crate) fn encode_conditions(
             let rows: u64 = round.iter().map(|unit| unit.2).sum();
             let first: u64 = round[..run.start as usize].iter().map(|unit| unit.2).sum();
             let last: u64 = round[..run.end as usize].iter().map(|unit| unit.2).sum();
-            let pixels = batch.inputs.read(
-                owners.store,
-                &call.inputs[0],
-                call.call_id,
-                batch.device,
-                Some(&stream),
-            )?;
             let mut offsets = Vec::new();
             let mut cursor_pixels = 0u64;
             for condition in conditions.iter() {
@@ -1923,30 +2170,16 @@ pub(crate) fn encode_conditions(
                     ]
                 })
                 .collect();
-            let write = bind_outputs(
-                owners.store,
-                &[OutputShape {
-                    product: call.outputs[0].clone(),
-                    shape: vec![rows, width],
-                    region: Some(vec![first..last, 0..width]),
-                }],
-                batch.device,
-                placement,
-            )?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
-            batch.calls[index].writes.push(write.clone());
-            latent
-                .runner
-                .encode_video(pixels.value(), &units, &write.view())?;
-            publish_bound(parts, batch, call, index, &write, false)?;
+            Ok(Some(ConditionInput::Units {
+                units,
+                rows,
+                region: first..last,
+            }))
         }
         "condition_audio_latents" => {
             // The audio call is one unit, the component's first rank's.
-            let run = latent.units(rank, 0, 1)?;
-            if run.is_empty() {
-                return Ok(());
+            if latent.units(parts.rank, 0, 1)?.is_empty() {
+                return Ok(None);
             }
             let lengths: Vec<u64> = conditions
                 .iter()
@@ -1956,39 +2189,473 @@ pub(crate) fn encode_conditions(
                 .iter()
                 .map(|condition| u64::from(condition.audio_rows))
                 .sum();
-            let samples = batch.inputs.read(
-                owners.store,
-                &call.inputs[0],
-                call.call_id,
-                batch.device,
-                Some(&stream),
-            )?;
-            let write = bind_outputs(
-                owners.store,
-                &[OutputShape {
-                    product: call.outputs[0].clone(),
-                    shape: vec![rows, width],
-                    region: None,
-                }],
-                batch.device,
-                placement,
-            )?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
-            batch.calls[index].writes.push(write.clone());
+            Ok(Some(ConditionInput::Tracks { lengths, rows }))
+        }
+        other => Err(Error::Invalid(format!(
+            "latent encoding does not produce {other}"
+        ))),
+    }
+}
+
+/// Record into `job` what the batch's condition encodings lack before
+/// their forwards can be recorded: answers and encoders the library gives
+/// for input shapes this rank has not encoded before. `None` when the
+/// batch's forwards can be recorded; otherwise the job ends here and
+/// [`accept_conditions`] takes its completion.
+pub(crate) fn setup_conditions(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    batch: &MediaBatch,
+    slots: &HashMap<uniserve_ipc::RequestKey, usize>,
+    job: &Job,
+) -> Result<Option<ConditionSetup>> {
+    let mut inputs = Vec::new();
+    for (index, call) in plan.calls.iter().enumerate() {
+        if call.code != CallKind::Media(MediaCall::LatentEncoding) || batch.calls[index].skipped {
+            continue;
+        }
+        inputs.extend(condition_input(
+            parts,
+            plan,
+            call,
+            slots[&call.request_key],
+        )?);
+    }
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    let latent = parts
+        .encoders
+        .latent
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
+    latent.runner.condition_setup(&inputs, job)
+}
+
+/// Keep what the job of `setup` returned for the batch's condition
+/// encodings.
+pub(crate) fn accept_conditions(
+    parts: &mut Parts<'_>,
+    setup: ConditionSetup,
+    completion: &mut Completion,
+) -> Result<()> {
+    let latent = parts
+        .encoders
+        .latent
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
+    latent.runner.accept_setup(setup, completion)
+}
+
+/// Encode a request's conditions into denoiser rows: a round of visual
+/// units, this rank's of them, or every audio track.
+pub(crate) fn encode_conditions(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    batch: &mut MediaBatch,
+    index: usize,
+    slot: usize,
+    placement: &Placement<'_>,
+    job: &Job,
+) -> Result<()> {
+    let call = &plan.calls[index];
+    let Some(input) = condition_input(parts, plan, call, slot)? else {
+        return Ok(());
+    };
+    let owners = parts.owners();
+    let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
+    let width = row_width(&call.outputs[0])?;
+    let (rows, region) = match &input {
+        ConditionInput::Units { rows, region, .. } => (*rows, Some(vec![region.clone(), 0..width])),
+        ConditionInput::Tracks { rows, .. } => (*rows, None),
+    };
+    let read = batch.inputs.read(
+        owners.store,
+        &call.inputs[0],
+        call.call_id,
+        batch.device,
+        issue,
+    )?;
+    let write = bind_outputs(
+        owners.store,
+        &[OutputShape {
+            product: call.outputs[0].clone(),
+            shape: vec![rows, width],
+            region,
+        }],
+        batch.device,
+        placement,
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| Error::Invariant("condition rows were not bound".into()))?;
+    batch.calls[index].writes.push(write.clone());
+
+    let latent = parts
+        .encoders
+        .latent
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("this rank holds no latent encoder".into()))?;
+    match &input {
+        ConditionInput::Units { units, .. } => {
             latent
                 .runner
-                .encode_audio(samples.value(), &lengths, &write.view())?;
-            publish_bound(parts, batch, call, index, &write, false)?;
+                .encode_condition_units(read.value(), units, &write.view(), job)?;
         }
-        other => {
-            return Err(Error::Invalid(format!(
-                "latent encoding does not produce {other}"
-            )));
+        ConditionInput::Tracks { lengths, .. } => {
+            latent
+                .runner
+                .encode_condition_tracks(read.value(), lengths, &write.view(), job)?;
         }
     }
-    Ok(())
+    publish_bound(parts, batch, call, index, &write, false, issue)
+}
+
+// Image vision and latent encoding batches (`VisionEncoding`,
+// `LatentEncoding`): each active call encodes one image into its
+// `encoder_output` feature product, an inline request image the host lane
+// prepared before the batch launched, or a resident image product (feedback
+// of a generated image), which the encoder prepares on its stream. Features
+// are written in place into the product's reserved storage and published
+// with the image's canvas dimensions (`Metadata::Feature`).
+
+/// The tower an encoding kind runs.
+pub(crate) fn tower(call: MediaCall) -> Result<Tower> {
+    match call {
+        MediaCall::VisionEncoding => Ok(Tower::Vit),
+        MediaCall::LatentEncoding => Ok(Tower::Vae),
+        other => Err(Error::Invalid(format!(
+            "{} is not an image encoding",
+            other.as_str()
+        ))),
+    }
+}
+
+/// The encoder serving a batch, with its device and stream.
+pub(crate) fn image_placement(
+    image: &ImageParts<'_>,
+    plan: &BatchPlan,
+) -> Result<(Option<i32>, Option<Stream>, usize)> {
+    let first = plan
+        .calls
+        .first()
+        .ok_or_else(|| Error::Invariant("an image batch has calls".into()))?;
+    let runner = &image.encoders.image[image.encoders.route(&first.component, first.code)?];
+    let stream = runner.stream().cloned();
+    Ok((runner.device().cuda_index(), stream, 0))
+}
+
+/// An image encoding between two of its jobs.
+pub(crate) enum EncodeResume {
+    /// The job on the lane prepares the resident images: its completion
+    /// carries the prepared images.
+    Handles {
+        call: MediaCall,
+        /// Each active call's image; none yet for a resident one.
+        images: Vec<Option<PreparedImage>>,
+        /// The positions of the resident images in `images`.
+        resident: Vec<usize>,
+    },
+    /// The job on the lane reads the prepared resident images' facts.
+    Facts {
+        call: MediaCall,
+        images: Vec<Option<PreparedImage>>,
+        resident: Vec<usize>,
+        handles: Vec<Handle>,
+    },
+    /// The job on the lane holds an unpacked encoder's calls: its
+    /// completion carries the shapes they wrote.
+    Shapes {
+        images: Vec<PreparedImage>,
+        writes: Vec<ProductBuffer>,
+        recorded: Recorded,
+    },
+}
+
+impl ImageBatch<'_> {
+    /// Record the encoding of every active call's image into its feature
+    /// product, up to its first job boundary. `prepared` holds the
+    /// host-prepared inline images by call index.
+    ///
+    /// The encoding's jobs: the preparation of the resident images and then
+    /// the read of their facts, when the batch has any; the encode calls;
+    /// and, after an unpacked encoder's calls returned the shapes they
+    /// wrote, the features' fences and exports.
+    pub(crate) fn encode(
+        &mut self,
+        call: MediaCall,
+        prepared: HashMap<usize, PreparedImage>,
+    ) -> Result<Progress> {
+        // The forward records into the batch's job, taken for its length so
+        // that the batch's owners stay borrowable beside it.
+        let job = std::mem::take(&mut self.job);
+        let progress = self.prepare_images(&job, call, prepared);
+        self.job = job;
+        progress
+    }
+
+    /// Continue the encoding from the `completion` of the job its last
+    /// boundary ended.
+    pub(crate) fn resume_encode(
+        &mut self,
+        resume: EncodeResume,
+        completion: &mut Completion,
+    ) -> Result<Progress> {
+        let job = std::mem::take(&mut self.job);
+        let progress = self.continue_encode(&job, resume, completion);
+        self.job = job;
+        progress
+    }
+
+    fn continue_encode(
+        &mut self,
+        job: &Job,
+        resume: EncodeResume,
+        completion: &mut Completion,
+    ) -> Result<Progress> {
+        match resume {
+            EncodeResume::Handles {
+                call,
+                images,
+                resident,
+            } => {
+                // The prepared images came back; their facts are calls of
+                // the next job.
+                let route = self.encoder_route(call)?;
+                let runner = &self.parts.encoders.image[route];
+                let handles = resident
+                    .iter()
+                    .map(|_| completion.handle())
+                    .collect::<Result<Vec<_>>>()?;
+                for handle in &handles {
+                    runner.image_facts(handle, job);
+                }
+                Ok(Progress::Boundary(Resume::Encode(EncodeResume::Facts {
+                    call,
+                    images,
+                    resident,
+                    handles,
+                })))
+            }
+            EncodeResume::Facts {
+                call,
+                mut images,
+                resident,
+                handles,
+            } => {
+                let route = self.encoder_route(call)?;
+                let runner = &self.parts.encoders.image[route];
+                for (&position, handle) in resident.iter().zip(handles) {
+                    images[position] = Some(runner.prepared(handle, &completion.returned()?)?);
+                }
+                self.encode_images(job, call, images)
+            }
+            EncodeResume::Shapes {
+                images,
+                writes,
+                recorded,
+            } => {
+                let encoded = recorded.finish(completion)?;
+                self.publish_features(job, &images, &writes, &encoded)
+                    .map(Progress::done)
+            }
+        }
+    }
+
+    /// The image encoder serving the batch's calls of `call`.
+    fn encoder_route(&self, call: MediaCall) -> Result<usize> {
+        let first = self
+            .active()
+            .first()
+            .copied()
+            .ok_or_else(|| Error::Invariant("an encoding batch lost its calls".into()))?;
+        self.parts
+            .encoders
+            .route(&self.plan.calls[first].component, CallKind::Media(call))
+    }
+
+    /// Lease the resident images and record their preparation, then go on
+    /// to the encode when every image is prepared already.
+    fn prepare_images(
+        &mut self,
+        job: &Job,
+        call: MediaCall,
+        mut prepared: HashMap<usize, PreparedImage>,
+    ) -> Result<Progress> {
+        let tower = tower(call)?;
+        let plan = self.plan;
+        let active = self.active();
+        if active.is_empty() {
+            return Ok(Progress::done(ForwardStats::default()));
+        }
+        let route = self.encoder_route(call)?;
+        let target = self.target();
+        let stream = self.stream.clone();
+
+        // Every image, inline or resident, prepared for the encoder. A
+        // resident image is prepared by a call of the job.
+        let mut images: Vec<Option<PreparedImage>> = Vec::with_capacity(active.len());
+        let mut resident = Vec::new();
+        for (position, &index) in active.iter().enumerate() {
+            let call = &plan.calls[index];
+            if call.encoder_output.is_none() {
+                return Err(Error::Invalid(
+                    "image encoding requires an encoder output".into(),
+                ));
+            }
+            match (call.input_image.is_some(), &call.image_input) {
+                (true, None) => {
+                    images.push(Some(prepared.remove(&index).ok_or_else(|| {
+                        Error::Invariant("an inline image was not prepared".into())
+                    })?))
+                }
+                (false, Some(reference)) => {
+                    let read = self.storage.tensors.consume(
+                        reference,
+                        call.call_id,
+                        Some(target),
+                        job.on(stream.as_ref()),
+                    )?;
+                    let range = match read.metadata() {
+                        Some(Metadata::Image {
+                            value_range: Some(range),
+                            ..
+                        }) => range,
+                        _ => {
+                            self.reads.push(read);
+                            return Err(Error::Invalid(
+                                "resident image encoding requires an image value range".into(),
+                            ));
+                        }
+                    };
+                    let runner = &self.parts.encoders.image[route];
+                    let value = read.value().clone();
+                    self.reads.push(read);
+                    runner.prepare_resident(&value, tower, range == ValueRange::SignedUnit, job)?;
+                    resident.push(position);
+                    images.push(None);
+                }
+                _ => {
+                    return Err(Error::Invalid(
+                        "image encoding requires exactly one inline or resident image".into(),
+                    ));
+                }
+            }
+        }
+        if resident.is_empty() {
+            return self.encode_images(job, call, images);
+        }
+
+        // The prepared images come back with the job that prepared them.
+        Ok(Progress::Boundary(Resume::Encode(EncodeResume::Handles {
+            call,
+            images,
+            resident,
+        })))
+    }
+
+    /// Reserve the feature products and record the encode of the prepared
+    /// `images`, then the features' publication when their shapes are
+    /// known already.
+    fn encode_images(
+        &mut self,
+        job: &Job,
+        call: MediaCall,
+        images: Vec<Option<PreparedImage>>,
+    ) -> Result<Progress> {
+        let plan = self.plan;
+        let active = self.active();
+        let route = self.encoder_route(call)?;
+        let target = self.target();
+        let images: Vec<PreparedImage> = images
+            .into_iter()
+            .map(|image| image.ok_or_else(|| Error::Invariant("an image was not prepared".into())))
+            .collect::<Result<_>>()?;
+
+        // The feature products, reserved in their scheduler allocations.
+        let allocations = allocations(plan);
+        let bindings: Vec<_> = active
+            .iter()
+            .filter_map(|&index| plan.calls[index].encoder_output.clone())
+            .map(|reference| (reference, target))
+            .collect();
+        let writes = self.storage.tensors.reserve_features(
+            &bindings,
+            &allocations,
+            OutputPlacement::default(),
+        )?;
+        self.writes.extend(writes.iter().cloned());
+        let runner = &mut self.parts.encoders.image[route];
+        let products: Vec<StorageView> = writes.iter().map(|write| write.view()).collect();
+        let borrowed: Vec<&PreparedImage> = images.iter().collect();
+        let recorded = runner.record(&borrowed, &products, job)?;
+
+        // An unpacked encoder's calls return the shapes they wrote, which
+        // the features are fenced and exported with: the next job's work.
+        if recorded.returns() {
+            return Ok(Progress::Boundary(Resume::Encode(EncodeResume::Shapes {
+                images,
+                writes,
+                recorded,
+            })));
+        }
+        let encoded = recorded.finish(&mut Completion::default())?;
+        self.publish_features(job, &images, &writes, &encoded)
+            .map(Progress::done)
+    }
+
+    /// Fence each feature at the shape its encode wrote and issue its
+    /// export; the batch's commit locates the exports.
+    fn publish_features(
+        &mut self,
+        job: &Job,
+        images: &[PreparedImage],
+        writes: &[ProductBuffer],
+        encoded: &Encoded,
+    ) -> Result<ForwardStats> {
+        let plan = self.plan;
+        let active = self.active();
+        let stream = self.stream.clone();
+        let issue = job.on(stream.as_ref());
+        for (((write, image), shape), &index) in
+            writes.iter().zip(images).zip(&encoded.shapes).zip(&active)
+        {
+            let shape: Vec<u64> = shape.iter().map(|&extent| extent as u64).collect();
+            self.storage.tensors.produced(
+                write,
+                &shape,
+                issue,
+                Some(Metadata::Feature {
+                    height: image.height,
+                    width: image.width,
+                }),
+            )?;
+            // Other ranks and workers import the feature from its export,
+            // located when the batch's commit is applied.
+            let export = Publications::issue_feature(
+                &self.storage.tensors,
+                &self.storage.transports,
+                &plan.calls[index],
+                write,
+                self.reports,
+                issue,
+            )?;
+            if let Some(export) = export {
+                self.features.push((index, write.clone(), export));
+            }
+        }
+
+        let mut stats = ForwardStats::default();
+        stats.cuda_graph_replays += encoded.replays;
+        if encoded.replays > 0 {
+            *stats.mode_counts.entry("graph_replay".into()).or_default() += encoded.replays;
+        }
+        if encoded.eager > 0 {
+            *stats.mode_counts.entry("eager".into()).or_default() += encoded.eager;
+        }
+        Ok(stats)
+    }
 }
 
 #[cfg(test)]
@@ -2052,51 +2719,29 @@ mod tests {
     }
 
     #[test]
-    fn encoder_descriptions_are_validated() -> Result<()> {
-        let record = |fields: Fields| Record::new("encoder.describe", fields.into_any());
-        let vision = Fields::new()
-            .text("kind", "vision")
-            .with("patch_size", 16_i64)
-            .with("downsample", 3_i64)
-            .with("output_size", 32_i64)
-            .text("output_dtype", "bfloat16")
-            .with("max_patches", 2520_i64)
-            .with("image_patches", 2520_i64)
-            .with("row_width", 768_i64)
-            .text("pixel_dtype", "float32");
-        let described = EncoderInfo::from_record(&record(vision)?)?;
-        let EncoderInfo::Vision(info) = described else {
-            panic!("vision encoder");
+    fn a_packed_context_covers_every_slot_of_its_capacity() {
+        let info = VisionEncoder {
+            patch_size: 16,
+            downsample: 3,
+            output_size: 32,
+            output_dtype: DType::BF16,
+            max_patches: Some(2520),
+            image_patches: 2520,
+            row_width: 768,
+            pixel_dtype: DType::F32,
         };
         assert_eq!(info.slot_tokens(), Some(280));
-        assert_eq!(info.pixel_dtype, DType::F32);
-        // A packed binding covers every slot of its capacity, two segments
-        // per slot.
+        // Two segments per slot.
         let config = EncoderConfig {
             max_images: 40,
             ..EncoderConfig::default()
         };
         assert_eq!(
-            described.binding_size(&config),
+            EncoderInfo::Vision(info).context_size(&config),
             Some(TextSize {
                 tokens: 16 * 2520,
                 rows: 32,
             })
         );
-
-        let unaligned = Fields::new()
-            .text("kind", "vision")
-            .with("patch_size", 16_i64)
-            .with("downsample", 3_i64)
-            .with("output_size", 32_i64)
-            .text("output_dtype", "bfloat16")
-            .with("max_patches", 100_i64)
-            .with("image_patches", 100_i64)
-            .with("row_width", 768_i64)
-            .text("pixel_dtype", "float32");
-        assert!(EncoderInfo::from_record(&record(unaligned)?).is_err());
-        let unknown = Fields::new().text("kind", "audio");
-        assert!(EncoderInfo::from_record(&record(unknown)?).is_err());
-        Ok(())
     }
 }

@@ -38,7 +38,7 @@ use uniserve_core::{EngineCoreOutput, FinishReason};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
     ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    ImageTrigger, MultimodalInputs, RequestId, SamplingParams,
+    ImageTrigger, MultimodalInputs, RejectionKind, RequestId, SamplingParams,
 };
 use uniserve_engine::{
     BatchEvent, BatchResult, EVENT_BUFFER_CAPACITY, EngineHandle, ExecutionBatch, Executor,
@@ -1918,6 +1918,69 @@ fn a_latent_image_block_is_written_by_its_own_call() {
     assert_eq!(
         Some(context[4].vision_inputs[0].feature.clone()),
         context[3].encoder_output
+    );
+}
+
+/// A context prefill writes a vision block whole, so a block longer than the
+/// step budget can never be scheduled: its request is refused at submission.
+/// A block of exactly the step budget is served.
+#[test]
+fn a_vision_block_beyond_the_step_budget_is_refused() {
+    const STEP_BUDGET: u32 = 16;
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(2);
+    let mut sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32).unwrap();
+    sched.set_token_budget(STEP_BUDGET as usize);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    // The first terminal event of a request whose image has one vision
+    // block of `block_tokens` KV tokens.
+    let terminal = |request_id: u64, block_tokens: u32| {
+        let request = generation_request(
+            RequestId(request_id),
+            image_input(vec![1, 2], vec![3, 4], request_id, 1, block_tokens),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            4,
+        );
+        let mut events = handle.submit(request).expect("submit request");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(
+                    event @ (EngineCoreOutput::Rejected { .. } | EngineCoreOutput::Finished { .. }),
+                ) => return Some(event),
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        None
+    };
+    let oversized = terminal(96, STEP_BUDGET + 1);
+    let fitting = terminal(97, STEP_BUDGET);
+    handle.shutdown();
+    let _ = jh.join();
+
+    assert!(
+        matches!(
+            oversized,
+            Some(EngineCoreOutput::Rejected {
+                kind: RejectionKind::Invalid,
+                ..
+            })
+        ),
+        "{oversized:?}"
+    );
+    assert!(
+        matches!(
+            &fitting,
+            Some(EngineCoreOutput::Finished { reason, .. }) if *reason != FinishReason::Error
+        ),
+        "{fitting:?}"
     );
 }
 
