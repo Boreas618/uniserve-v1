@@ -694,15 +694,18 @@ impl DwdpManager {
         drop(shards);
         let bind = Interpreter::import(&format!("{MODULE}.bind_weights"))?;
         for (layer, (fields, views)) in layers.iter().zip(views).enumerate() {
-            let mut arguments = vec![
-                model.handle().to_any(),
-                Any::from(layer as i64),
-                Any::from(crate::ffi::strings(fields.iter().map(|field| &field.name))),
-            ];
-            for view in views {
-                arguments.push(Any::from(view.to_tensor()?));
-            }
-            bind.call_values(&arguments)?;
+            // The views' wrappings and the call take one handoff.
+            Interpreter::execute(|| -> Result<()> {
+                let mut arguments = vec![
+                    model.handle().to_any(),
+                    Any::from(layer as i64),
+                    Any::from(crate::ffi::strings(fields.iter().map(|field| &field.name))),
+                ];
+                for view in &views {
+                    arguments.push(view.handle()?.to_any());
+                }
+                bind.call_values(&arguments).map(drop)
+            })?;
         }
         tracing::info!(
             target: "uniserve_worker.launch",

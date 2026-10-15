@@ -76,7 +76,7 @@ impl ImportWorkspace {
         let mut arguments = vec![
             planes.plan().handle.to_any(),
             Any::from(i64::from(planes.num_units())),
-            Any::from(scratch_view.to_tensor()?),
+            scratch_view.handle()?.to_any(),
             Any::from(elements as i64),
             Any::from(scales as i64),
             Any::from(stream.as_ref().map_or(0, |stream| stream.raw() as i64)),

@@ -6,7 +6,8 @@ use super::{interpreter, is_none};
 use crate::{Error, Result};
 
 /// An opaque value produced by Python (a loaded model, a process group, a
-/// captured graph) that Rust only stores and passes back.
+/// captured graph, the torch tensor wrapping a view of Rust's storage) that
+/// Rust only stores and passes back.
 ///
 /// Dropping the last reference releases the Python object, which runs
 /// Python. A handle dropped on another thread therefore submits its
@@ -33,10 +34,11 @@ unsafe impl Sync for Handle {}
 impl Handle {
     /// Hold `value` as an opaque handle.
     ///
-    /// A handle may move to and be shared with other threads, so a tensor is
-    /// refused with [`Error::TensorHandle`]: a TVM-FFI tensor stays on the
-    /// thread that received it, and tensor data crosses threads only as
-    /// Rust-owned storage.
+    /// A handle may move to and be shared with other threads, so a TVM-FFI
+    /// tensor is refused with [`Error::TensorHandle`]: it stays on the thread
+    /// that received it, and tensor data crosses threads only as Rust-owned
+    /// storage. A torch tensor returned through the import path arrives as
+    /// an opaque Python object and is held like any other.
     pub fn new(value: Any) -> Result<Self> {
         if value.type_index() == tvm_ffi::TypeIndex::kTVMFFITensor as i32 {
             return Err(Error::TensorHandle);
@@ -79,7 +81,7 @@ mod tests {
     use crate::storage::memory::{Memory, StorageView};
 
     #[test]
-    fn a_tensor_is_refused_as_an_opaque_handle() -> Result<()> {
+    fn a_tvm_ffi_tensor_is_refused_as_an_opaque_handle() -> Result<()> {
         let memory: Arc<dyn Backing> = Memory::host(16);
         let tensor = StorageView::contiguous(memory, 0, DType::F32, &[4])?.to_tensor()?;
 

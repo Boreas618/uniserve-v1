@@ -1,11 +1,14 @@
-//! Rust-owned allocations and the typed views exported to Python.
+//! Rust-owned allocations and the typed views Python receives as torch
+//! tensors.
 //!
 //! Runtime storage (cache planes, graph inputs and outputs, workspaces, staging)
-//! is allocated here and handed to Python as DLPack tensors. A [`Memory`]
-//! value owns one allocation; a [`StorageView`] is a typed, strided window
-//! into it that retains the allocation. Dropping the last Rust and Python
-//! reference releases the memory through `uniserve-cuda`'s reclaimer, which
-//! never waits for device work: owners must retire all device accesses to an
+//! is allocated here. A [`Memory`] value owns one allocation; a
+//! [`StorageView`] is a typed, strided window into it that retains the
+//! allocation. Python receives a view as one torch tensor, made once from
+//! the view's DLPack export and passed by every call that takes the view
+//! ([`StorageView::handle`]). Dropping the last Rust and Python reference
+//! releases the memory through `uniserve-cuda`'s reclaimer, which never
+//! waits for device work: owners must retire all device accesses to an
 //! allocation before dropping it.
 //!
 //! Exportable device allocations (`cuMemCreate` with a shareable handle) are
@@ -14,13 +17,16 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
+use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{
     CopyBatch, DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, SourceOrder, Stream, Strided,
 };
 
-use crate::ffi::{Backing, DType, Device, Tensor, contiguous_strides, export};
+use crate::ffi::{
+    Backing, DType, Device, Function, Handle, Interpreter, Tensor, contiguous_strides, export,
+};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -251,6 +257,11 @@ pub fn device_name(device: Device) -> String {
 ///
 /// `offset` is in bytes; `shape` and `strides` are in elements. Construction
 /// checks that the window lies inside its allocation.
+///
+/// A view and its clones are one tensor to Python: they share the torch
+/// tensor the view is wrapped as ([`Self::handle`]). A view derived from it
+/// (a prefix, a row, a region, a reshape) is another tensor, wrapped on its
+/// own; narrowing an axis to its whole extent returns the view itself.
 #[derive(Clone)]
 pub struct StorageView {
     memory: Arc<dyn Backing>,
@@ -258,6 +269,9 @@ pub struct StorageView {
     dtype: DType,
     shape: Vec<i64>,
     strides: Vec<i64>,
+    /// The torch tensor of the view, made by the first call that passes it.
+    /// Its last clone's drop releases it on the Python thread.
+    tensor: Arc<OnceLock<Handle>>,
 }
 
 /// An owned copy operand: a view's address, element width, shape and
@@ -309,9 +323,23 @@ impl StorageView {
             dtype,
             shape: shape.to_vec(),
             strides: strides.to_vec(),
+            tensor: Arc::default(),
         };
         view.byte_len()?;
         Ok(view)
+    }
+
+    /// Another window of the same allocation and dtype, inside this one:
+    /// a different tensor, wrapped on its own.
+    fn derive(&self, offset: usize, shape: Vec<i64>, strides: Vec<i64>) -> Self {
+        Self {
+            memory: Arc::clone(&self.memory),
+            offset,
+            dtype: self.dtype,
+            shape,
+            strides,
+            tensor: Arc::default(),
+        }
     }
 
     /// A whole allocation viewed as `[len / dtype.bytes()]` elements.
@@ -411,7 +439,8 @@ impl StorageView {
         self.narrow(0, 0, count)
     }
 
-    /// Elements `[start, start + length)` of `axis`.
+    /// Elements `[start, start + length)` of `axis`. The whole axis is this
+    /// view itself.
     pub fn narrow(&self, axis: usize, start: i64, length: i64) -> Result<Self> {
         let extent = *self
             .shape
@@ -423,18 +452,22 @@ impl StorageView {
                 start + length
             )));
         }
-        let mut view = self.clone();
-        view.offset += (start * self.strides[axis]) as usize * self.dtype.bytes();
-        view.shape[axis] = length;
-        Ok(view)
+        if start == 0 && length == extent {
+            return Ok(self.clone());
+        }
+        let offset = self.offset + (start * self.strides[axis]) as usize * self.dtype.bytes();
+        let mut shape = self.shape.clone();
+        shape[axis] = length;
+        Ok(self.derive(offset, shape, self.strides.clone()))
     }
 
     /// The view at `index` of `axis`, with that axis removed.
     pub fn select(&self, axis: usize, index: i64) -> Result<Self> {
-        let mut view = self.narrow(axis, index, 1)?;
-        view.shape.remove(axis);
-        view.strides.remove(axis);
-        Ok(view)
+        let row = self.narrow(axis, index, 1)?;
+        let (mut shape, mut strides) = (row.shape, row.strides);
+        shape.remove(axis);
+        strides.remove(axis);
+        Ok(self.derive(row.offset, shape, strides))
     }
 
     /// The per-axis `[start, end)` region of this view.
@@ -467,10 +500,11 @@ impl StorageView {
                 "a permutation names every axis once".to_owned(),
             ));
         }
-        let mut view = self.clone();
-        view.shape = order.iter().map(|&axis| self.shape[axis]).collect();
-        view.strides = order.iter().map(|&axis| self.strides[axis]).collect();
-        Ok(view)
+        Ok(self.derive(
+            self.offset,
+            order.iter().map(|&axis| self.shape[axis]).collect(),
+            order.iter().map(|&axis| self.strides[axis]).collect(),
+        ))
     }
 
     /// The same bytes reinterpreted as a contiguous `shape` of `dtype`.
@@ -544,7 +578,6 @@ impl StorageView {
         intervals
     }
 
-    /// Export to Python as a DLPack tensor retaining the allocation.
     /// Write `bytes` into the leading bytes of this contiguous view, after
     /// the work `stream` issued before (it has a stream exactly for device
     /// memory). The source is read before the call returns, so the caller
@@ -596,6 +629,10 @@ impl StorageView {
         }
     }
 
+    /// The view as a TVM-FFI tensor: a DLPack export retaining the
+    /// allocation. Python callables receive the view's torch tensor instead
+    /// ([`Self::handle`]); a harness returns this export to its Python
+    /// caller.
     pub fn to_tensor(&self) -> Result<Tensor> {
         export(
             Arc::clone(&self.memory),
@@ -605,6 +642,40 @@ impl StorageView {
             &self.strides,
         )
     }
+
+    /// The view as the torch tensor every call that takes it passes.
+    ///
+    /// The first call that passes the view wraps its DLPack export with
+    /// `torch.from_dlpack`, called as it is; every later call through any
+    /// clone of the view passes that same Python object, which costs no
+    /// conversion. The tensor retains the allocation through its DLPack
+    /// deleter, so the memory outlives every Python reference to it; the
+    /// view releases its reference with its last clone.
+    ///
+    /// The first wrapping calls Python, a handoff of its own from another
+    /// thread; a serving path makes it inside the [`Interpreter::execute`]
+    /// of the call that passes the view, so the two take one handoff. A
+    /// caller drops the references it makes for a call ([`Handle::to_any`])
+    /// before the view or on the Python thread, so that the view's own
+    /// reference is the last one and is released on the Python thread.
+    pub fn handle(&self) -> Result<&Handle> {
+        if let Some(handle) = self.tensor.get() {
+            return Ok(handle);
+        }
+        let export = Any::from(self.to_tensor()?);
+        let handle = Handle::new(from_dlpack()?.call(&[AnyView::from(&export)])?)?;
+        Ok(self.tensor.get_or_init(|| handle))
+    }
+}
+
+/// `torch.from_dlpack`, resolved once per process.
+fn from_dlpack() -> Result<&'static Function> {
+    static FROM_DLPACK: OnceLock<Function> = OnceLock::new();
+    if let Some(function) = FROM_DLPACK.get() {
+        return Ok(function);
+    }
+    let function = Interpreter::import("torch.from_dlpack")?;
+    Ok(FROM_DLPACK.get_or_init(|| function))
 }
 
 impl std::fmt::Debug for StorageView {

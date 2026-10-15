@@ -382,8 +382,8 @@ impl ImageDecoder {
         let staging = StorageView::contiguous(memory, 0, DType::U8, &[staging_bytes as i64])?;
         let method = |name: &str| Interpreter::import(&format!("{DECODER}.{name}"));
         let mut arguments = setup.arguments();
-        arguments.push(Any::from(latents.to_tensor()?));
-        arguments.push(Any::from(staging.to_tensor()?));
+        arguments.push(latents.handle()?.to_any());
+        arguments.push(staging.handle()?.to_any());
         let runner = Handle::new(method("image")?.call_values(&arguments)?)?;
         Ok(Self {
             owner,

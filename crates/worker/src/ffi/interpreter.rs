@@ -159,6 +159,27 @@ impl Interpreter {
     pub fn synchronize() {
         on_python_thread(&mut || {});
     }
+
+    /// Run `work` on the Python thread and wait for its result, or on the
+    /// calling thread when that is where its Python runs (see the module
+    /// documentation).
+    ///
+    /// Every call `work` makes runs where `work` runs, without a handoff of
+    /// its own. A call together with the Python work its arguments need,
+    /// such as a view's first wrapping as a torch tensor
+    /// ([`crate::storage::memory::StorageView::handle`]), therefore costs
+    /// one handoff, and every reference to a Python object that `work`
+    /// drops is dropped on the Python thread.
+    #[expect(
+        clippy::expect_used,
+        reason = "the work stores its result before the handoff completes"
+    )]
+    pub fn execute<T>(work: impl FnOnce() -> T) -> T {
+        let mut work = Some(work);
+        let mut result = None;
+        on_python_thread(&mut || result = work.take().map(|work| work()));
+        result.expect("a finished handoff ran its work")
+    }
 }
 
 /// Run `work` on the Python thread and wait for it, or on the calling
@@ -174,14 +195,8 @@ fn on_python_thread(work: &mut dyn FnMut()) {
 }
 
 /// Call `function` on the Python thread and wait for its result.
-#[expect(
-    clippy::expect_used,
-    reason = "the work stores the result before the handoff completes"
-)]
 pub(super) fn call(function: &tvm_ffi::Function, args: &[AnyView<'_>]) -> tvm_ffi::Result<Any> {
-    let mut result = None;
-    on_python_thread(&mut || result = Some(function.call_packed(args)));
-    result.expect("a finished call has a result")
+    Interpreter::execute(|| function.call_packed(args))
 }
 
 /// Give up a reference to a Python object: the Python thread drops it, in
@@ -202,7 +217,8 @@ struct Released(Any);
 
 // SAFETY: the value is an immutable reference-counted TVM-FFI object with
 // atomic counts, which Rust never dereferences; it is only moved to the
-// Python thread and dropped there. A handle never holds a tensor.
+// Python thread and dropped there. A handle never holds a TVM-FFI tensor:
+// a torch tensor it holds is an opaque Python object.
 unsafe impl Send for Released {}
 
 impl Released {

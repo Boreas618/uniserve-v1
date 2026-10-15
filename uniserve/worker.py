@@ -34,10 +34,13 @@ def import_path(path: str) -> Callable[..., Any]:
     The rank runtime reaches the library by import path, for example
     ``uniserve.runner.causal_lm.CausalLMRunner.decode``: a function, a class
     (called to construct it) or a method (called with the object first).
-    The runtime's storage arrives as DLPack tensors, which the callable
-    receives as torch tensors aliasing the same memory, as a Python caller
-    would pass them. A failure of the callable crosses with the error kinds
-    of :mod:`uniserve.errors`.
+    A torch tensor the callable returns crosses as an opaque Python object,
+    which the runtime holds as a handle and passes back as that same tensor.
+    The runtime wraps each view of its storage this way once, by calling
+    ``torch.from_dlpack`` through this function, so every call that takes
+    the view receives one torch tensor aliasing the runtime's memory, as a
+    Python caller would pass it. A failure of the callable crosses with the
+    error kinds of :mod:`uniserve.errors`.
 
     Resolving a path imports its module and never initializes CUDA: the
     runtime selects devices and contexts before any CUDA call.
@@ -46,18 +49,16 @@ def import_path(path: str) -> Callable[..., Any]:
 
     @functools.wraps(function)
     def call(*arguments: Any) -> Any:
-        # FIXME: every call converts its tensor arguments. TVM-FFI turns a
-        # torch tensor returned to the runtime back into an FFI tensor, so
-        # the runtime cannot hold the converted tensor as a handle and pass
-        # it again.
-        return function(
-            *(
-                torch.from_dlpack(argument)
-                if isinstance(argument, tvm_ffi.Tensor)
-                else argument
-                for argument in arguments
-            )
-        )
+        result = function(*arguments)
+        if isinstance(result, torch.Tensor):
+            # Returned as is, the tensor would cross as a TVM-FFI tensor, a
+            # DLPack import that every later call would convert back into a
+            # new torch tensor. An opaque Python object
+            # (kTVMFFIOpaquePyObject) crosses unconverted: a callable it is
+            # passed to receives this tensor itself. tvm_ffi.convert makes
+            # the same object for values TVM-FFI has no type of its own for.
+            return tvm_ffi.core._convert_to_opaque_object(result)
+        return result
 
     return translate(call)
 

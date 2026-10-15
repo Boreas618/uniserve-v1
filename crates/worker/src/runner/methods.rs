@@ -56,8 +56,8 @@ impl From<&StorageView> for Argument {
 
 /// A method or library function and its owned arguments, called later,
 /// possibly on another thread (a microbatch's forward, the Python thread's
-/// own work). Tensors are exported when the call is made, on the calling
-/// thread.
+/// own work). A view crosses as its torch tensor
+/// ([`StorageView::handle`]), wrapped by the first call that passes it.
 pub(crate) struct MethodCall {
     function: Function,
     arguments: Vec<Argument>,
@@ -78,29 +78,36 @@ impl MethodCall {
         self.function.name()
     }
 
-    /// Make the call.
+    /// Make the call. The arguments' values, the first wrapping of a view
+    /// no earlier call passed and the call itself take one handoff to the
+    /// Python thread, where the call's references to Python objects are
+    /// dropped too.
     pub(crate) fn invoke(self) -> Result<Any> {
-        let values = self
-            .arguments
-            .into_iter()
-            .map(|argument| {
-                Ok(match argument {
-                    Argument::Bool(value) => Any::from(value),
-                    Argument::Integer(value) => Any::from(value),
-                    Argument::Float(value) => Any::from(value),
-                    Argument::Integers(values) => Any::from(Shape::from(values.as_slice())),
-                    Argument::Floats(values) => {
-                        Any::from(crate::ffi::list(values.into_iter().map(Any::from)))
-                    }
-                    Argument::Tensor(view) => Any::from(view.to_tensor()?),
-                    Argument::Text(text) => Any::from(tvm_ffi::String::from(text.as_str())),
-                    Argument::Texts(texts) => Any::from(crate::ffi::strings(&texts)),
-                    Argument::Handle(handle) => handle.to_any(),
-                    Argument::None => Any::default(),
+        Interpreter::execute(move || {
+            // The values reference the arguments' handles, which outlive
+            // them: `self` drops after this closure's locals.
+            let values = self
+                .arguments
+                .iter()
+                .map(|argument| {
+                    Ok(match argument {
+                        Argument::Bool(value) => Any::from(*value),
+                        Argument::Integer(value) => Any::from(*value),
+                        Argument::Float(value) => Any::from(*value),
+                        Argument::Integers(values) => Any::from(Shape::from(values.as_slice())),
+                        Argument::Floats(values) => {
+                            Any::from(crate::ffi::list(values.iter().copied().map(Any::from)))
+                        }
+                        Argument::Tensor(view) => view.handle()?.to_any(),
+                        Argument::Text(text) => Any::from(tvm_ffi::String::from(text.as_str())),
+                        Argument::Texts(texts) => Any::from(crate::ffi::strings(texts)),
+                        Argument::Handle(handle) => handle.to_any(),
+                        Argument::None => Any::default(),
+                    })
                 })
-            })
-            .collect::<Result<Vec<Any>>>()?;
-        self.function.call_values(&values)
+                .collect::<Result<Vec<Any>>>()?;
+            self.function.call_values(&values)
+        })
     }
 }
 

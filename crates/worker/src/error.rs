@@ -47,9 +47,11 @@ pub enum Error {
     /// It reports and classifies as the failure it shares.
     #[error(transparent)]
     Shared(std::sync::Arc<Error>),
-    /// Python returned a tensor where the worker expects an opaque
-    /// object. Handles cross threads; a tensor handle must not.
-    #[error("a tensor cannot be held as an opaque handle")]
+    /// Python returned a TVM-FFI tensor where the worker expects an opaque
+    /// object. Handles cross threads; a TVM-FFI tensor, a DLPack import of
+    /// memory its producer owns, must not. A torch tensor returned through
+    /// the import path crosses as an opaque handle instead.
+    #[error("a TVM-FFI tensor cannot be held as an opaque handle")]
     TensorHandle,
     /// The host's node name cannot identify this rank's node to transfer
     /// peers: it is empty or not UTF-8.

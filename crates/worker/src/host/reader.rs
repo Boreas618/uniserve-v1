@@ -100,8 +100,8 @@ fn take(
     Ok(view)
 }
 
-/// A host tensor over `bytes`.
-fn host_bytes(bytes: Vec<u8>) -> Result<Any> {
+/// A host view over `bytes`.
+fn host_bytes(bytes: Vec<u8>) -> Result<StorageView> {
     let length = bytes.len() as i64;
     let memory = Memory::host(bytes.len().max(1));
     if !bytes.is_empty() {
@@ -111,8 +111,7 @@ fn host_bytes(bytes: Vec<u8>) -> Result<Any> {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), memory.address() as *mut u8, bytes.len());
         }
     }
-    let view = StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::U8, &[length])?;
-    Ok(Any::from(view.to_tensor()?))
+    StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::U8, &[length])
 }
 
 /// The published bytes of a condition.
@@ -178,14 +177,16 @@ impl ConditionReader {
                     let resized =
                         integer_list([fit.resized.width, fit.resized.height].map(i64::from));
                     let window = integer_list([fit.left, fit.top, width, height].map(i64::from));
-                    let target = Any::from(pixels.to_tensor()?);
-                    self.functions.read_image.invoke(&[
-                        AnyView::from(&data),
-                        AnyView::from(&Any::from(resized)),
-                        AnyView::from(&Any::from(window)),
-                        AnyView::from(&target),
-                    ])?;
-                    self.pack(condition, &target, products, &mut cursor)?;
+                    // The views' wrappings and the call take one handoff.
+                    Interpreter::execute(|| {
+                        self.functions.read_image.invoke(&[
+                            data.handle()?.view(),
+                            AnyView::from(&Any::from(resized)),
+                            AnyView::from(&Any::from(window)),
+                            pixels.handle()?.view(),
+                        ])
+                    })?;
+                    self.pack(condition, &pixels, products, &mut cursor)?;
                 }
                 ConditionMedia::Video { clip, soundtrack } => {
                     let frames = self.read_video(&condition.source, clip)?;
@@ -199,12 +200,7 @@ impl ConditionReader {
                     // The video encoder encodes the leading kept frames.
                     let encoded = frames.narrow(0, 0, i64::from(clip.vae_frames))?;
                     copy_host(&encoded, &pixels)?;
-                    self.pack(
-                        condition,
-                        &Any::from(frames.to_tensor()?),
-                        products,
-                        &mut cursor,
-                    )?;
+                    self.pack(condition, &frames, products, &mut cursor)?;
                     if let Some(track) = soundtrack {
                         self.read_track(&condition.source, track, products, &mut cursor)?;
                     }
@@ -231,11 +227,12 @@ impl ConditionReader {
         Ok(())
     }
 
-    /// Pack the conditioner's patch rows of a condition it reads.
+    /// Pack the conditioner's patch rows of a condition it reads from its
+    /// decoded `frames`.
     fn pack(
         &self,
         condition: &VideoCondition,
-        frames: &Any,
+        frames: &StorageView,
         products: &ConditionProducts,
         cursor: &mut Cursor,
     ) -> Result<()> {
@@ -250,13 +247,15 @@ impl ConditionReader {
         )?;
         let indices = integer_list(vision.frame_indices.iter().map(|&index| i64::from(index)));
         let grid = integer_list([vision.grid.t, vision.grid.h, vision.grid.w].map(i64::from));
-        self.functions.pack_vision.invoke(&[
-            self.functions.loaded.view(),
-            AnyView::from(frames),
-            AnyView::from(&Any::from(indices)),
-            AnyView::from(&Any::from(grid)),
-            AnyView::from(&Any::from(patches.to_tensor()?)),
-        ])
+        Interpreter::execute(|| {
+            self.functions.pack_vision.invoke(&[
+                self.functions.loaded.view(),
+                frames.handle()?.view(),
+                AnyView::from(&Any::from(indices)),
+                AnyView::from(&Any::from(grid)),
+                patches.handle()?.view(),
+            ])
+        })
     }
 
     fn read_track(
@@ -273,15 +272,17 @@ impl ConditionReader {
             "samples",
         )?;
         let data = host_bytes(read_bytes(source)?)?;
-        self.functions.read_audio.invoke(&[
-            AnyView::from(&data),
-            AnyView::from(&Any::from(i64::from(track.sample_rate))),
-            AnyView::from(&Any::from(track.start_sample as i64)),
-            AnyView::from(&Any::from(track.source_samples as i64)),
-            AnyView::from(&Any::from(track.samples as i64)),
-            AnyView::from(&Any::from(i64::from(self.functions.sample_rate))),
-            AnyView::from(&Any::from(samples.to_tensor()?)),
-        ])
+        Interpreter::execute(|| {
+            self.functions.read_audio.invoke(&[
+                data.handle()?.view(),
+                AnyView::from(&Any::from(i64::from(track.sample_rate))),
+                AnyView::from(&Any::from(track.start_sample as i64)),
+                AnyView::from(&Any::from(track.source_samples as i64)),
+                AnyView::from(&Any::from(track.samples as i64)),
+                AnyView::from(&Any::from(i64::from(self.functions.sample_rate))),
+                samples.handle()?.view(),
+            ])
+        })
     }
 
     /// Decode a reference video's kept frames on its planned canvas with one
