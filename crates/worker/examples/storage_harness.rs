@@ -12,15 +12,19 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "harness/config.rs"]
+mod config;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use config::Config;
 use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};
 use uniserve_core::{CallId, RequestId, UnitId};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, CallKind, ForwardMode, RequestKey, WorkerEndpoint};
-use uniserve_worker::ffi::{Function, Handle, Interpreter, Record};
+use uniserve_worker::ffi::{Function, Handle, Interpreter};
 use uniserve_worker::lane::JobQueues;
 use uniserve_worker::storage::memory::StorageView;
 use uniserve_worker::storage::{CachePlan, PrefixCache};
@@ -114,7 +118,7 @@ fn cache_transfer(
 }
 
 fn run(config: Any) -> Result<Map<FfiString, Any>> {
-    let config = Record::new("cache_transfer", config)?;
+    let config = Config::new("cache_transfer", config)?;
     Interpreter::install_import(config.get("import")?);
     let plan = |key: &str| -> Result<Arc<CachePlan>> {
         CachePlan::read(Handle::new(config.value(key)?)?).map(Arc::new)

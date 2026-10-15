@@ -11,12 +11,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "harness/config.rs"]
+mod config;
+
 use std::sync::Arc;
 
+use config::Config;
 use tvm_ffi::{Any, Array, Map, String as FfiString, Tensor};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_worker::config::Device;
-use uniserve_worker::ffi::{Backing, DType, Handle, Interpreter, Record};
+use uniserve_worker::ffi::{Backing, DType, Handle, Interpreter};
 use uniserve_worker::storage::memory::{Memory, StorageView};
 use uniserve_worker::{
     DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool, ImageSetup,
@@ -83,7 +87,7 @@ fn view(product: &StorageView, shape: &[i64]) -> Result<Tensor> {
 /// result and the batch's invocation counts `[replays, eager]`.
 fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ffi::Error> {
     (|| -> Result<Array<Any>> {
-        let config = Record::new("encode", Any::from(config))?;
+        let config = Config::new("encode", Any::from(config))?;
         Interpreter::install_import(config.get("import")?);
         let loaded = Handle::new(config.value("loaded")?)?;
         let path = config.string("path")?;
@@ -221,7 +225,7 @@ fn pool(device: i32) -> Result<Arc<GraphPool<Handle>>> {
 /// `staging_bytes`. Returns each image's staged pixels and its product.
 fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ffi::Error> {
     (|| -> Result<Array<Any>> {
-        let config = Record::new("decode", Any::from(config))?;
+        let config = Config::new("decode", Any::from(config))?;
         Interpreter::install_import(config.get("import")?);
         let loaded = Handle::new(config.value("loaded")?)?;
         let path = config.string("path")?;
