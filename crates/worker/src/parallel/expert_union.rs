@@ -58,8 +58,9 @@ use crate::config::{Device, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::ffi::{Backing, Function, Handle, Interpreter, integer_list};
-use crate::lane::{Job, Lanes};
+use crate::lane::Job;
 use crate::runner::scratch::Scratches;
+use crate::stream::Streams;
 use crate::transfer::PeerStorage;
 use crate::warmup::WarmupHooks;
 use crate::worker::LoadedModel;
@@ -302,7 +303,7 @@ pub(crate) struct ExpertStart<'a> {
     pub(crate) launch: &'a WorkerLaunch,
     pub(crate) world: &'a World,
     pub(crate) model: &'a LoadedModel,
-    pub(crate) lanes: &'a mut Lanes,
+    pub(crate) streams: &'a mut Streams,
     /// Tokens one of this rank's forwards sends per expert step at most,
     /// graph padding included. Dedicated expert ranks receive the sources'
     /// bound instead.
@@ -313,9 +314,9 @@ pub(crate) struct ExpertStart<'a> {
 
 /// The stream the rank's forwards (and the first microbatch) run on: its
 /// only execution lane, or the device stream.
-fn primary_stream(lanes: &Lanes, device: i32) -> Result<Stream> {
-    let stream = match lanes.lanes() {
-        [] => lanes
+fn primary_stream(streams: &Streams, device: i32) -> Result<Stream> {
+    let stream = match streams.lanes() {
+        [] => streams
             .stream_for(
                 uniserve_ipc::CallKind::Forward(uniserve_ipc::ForwardMode::Prefill),
                 DeviceId(device),
@@ -410,9 +411,9 @@ impl ExpertUnion {
         let max_tokens = parallel.max_tokens();
         let (rank, size) = parallel.member();
 
-        let mut streams = vec![primary_stream(start.lanes, device)?];
+        let mut streams = vec![primary_stream(start.streams, device)?];
         for _ in 1..microbatches {
-            let fork = start.lanes.fork_microbatch()?;
+            let fork = start.streams.fork_microbatch()?;
             streams.push(fork.stream()?.clone());
         }
         let yield_turn = (microbatches > 1).then(|| {

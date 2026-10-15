@@ -51,7 +51,7 @@ use crate::executor::backend::WorkerBackend;
 use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Interpreter};
-use crate::lane::{BLOCK_ON_TIMEOUT, Lanes};
+use crate::lane::BLOCK_ON_TIMEOUT;
 use crate::parallel::world::{World, startup_timeout};
 use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, PeerGroup};
 use crate::profiling::kernels::{KernelRecords, KernelWatch};
@@ -75,7 +75,7 @@ use crate::runner::start::{
 };
 use crate::service::Service;
 use crate::storage::{BufferPool, CachePlan, GroupShape, PrefixCache, TensorStore};
-use crate::stream::{CUDAStream, EventPool};
+use crate::stream::{CUDAStream, EventPool, Streams};
 use crate::transfer::{Capacity, TransportKind, TransportOptions, Transports};
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
@@ -121,7 +121,7 @@ pub struct Worker {
     model: Option<LoadedModel>,
     world: Option<World>,
     budget: Option<DeviceBudget>,
-    lanes: Lanes,
+    streams: Streams,
     graphs: GraphStorage<String, Handle>,
     /// The shared work areas of every stream runners construct their
     /// execution contexts on.
@@ -219,7 +219,7 @@ impl Worker {
         drop(loading);
 
         let devices: Vec<Device> = config.devices().collect();
-        let mut lanes = Lanes::create(&config, &devices).map_err(phase("streams"))?;
+        let mut streams = Streams::create(&config, &devices).map_err(phase("streams"))?;
         let node = host_name().map_err(phase("host"))?;
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.
@@ -227,13 +227,13 @@ impl Worker {
             launch: &launch,
             world: &world,
             model: &model,
-            lanes: &mut lanes,
+            streams: &mut streams,
             max_tokens: expert_tokens(&config),
             node: &node,
         })
         .map_err(phase("experts"))?;
-        let weights =
-            DwdpManager::start(&launch, &world, &model, &lanes, &node).map_err(phase("experts"))?;
+        let weights = DwdpManager::start(&launch, &world, &model, &streams, &node)
+            .map_err(phase("experts"))?;
         let budget = match device {
             Device::Cuda(_) => Some(
                 DeviceBudget::new(
@@ -254,7 +254,7 @@ impl Worker {
             &world,
             budget.as_ref(),
             &components,
-            lanes.lanes().len().max(1),
+            streams.lanes().len().max(1),
             video.as_ref(),
         )
         .map_err(phase("capacity"))?;
@@ -283,11 +283,11 @@ impl Worker {
         let mut scratches = Scratches::default();
 
         let storage =
-            allocate_storage(&launch, &config, &plan, &lanes).map_err(phase("storage"))?;
+            allocate_storage(&launch, &config, &plan, &streams).map_err(phase("storage"))?;
         let mut components = components;
         let preparation = device
             .cuda_index()
-            .and_then(|index| lanes.preparation(DeviceId(index)));
+            .and_then(|index| streams.preparation(DeviceId(index)));
         let preparation = preparation
             .map(CUDAStream::stream)
             .transpose()
@@ -313,7 +313,7 @@ impl Worker {
             max_payload_bytes: launch.ipc.max_payload_bytes,
             model: &model,
             image_processor: image.processing.is_some(),
-            lanes: &lanes,
+            streams: &streams,
             prefix_cache: storage.prefix_cache.as_ref(),
             components: &components,
             scratches: &mut scratches,
@@ -334,7 +334,7 @@ impl Worker {
                 queue_depth: launch.ipc.queue_depth,
                 host_capacity: info.host_lane_capacity as usize,
                 model: &model,
-                lanes: &lanes,
+                streams: &streams,
                 storage: &storage,
                 latent: plan.latent,
                 components: &components,
@@ -351,7 +351,7 @@ impl Worker {
             max_payload_bytes: launch.ipc.max_payload_bytes,
             model: &model,
             experts: expert_exchange(&launch),
-            lanes: &lanes,
+            streams: &streams,
             prefix_cache: storage.prefix_cache.as_ref(),
             components: &mut components,
             scratches: &mut scratches,
@@ -370,7 +370,7 @@ impl Worker {
             }
             reserve_join_pools(&config, experts, &mut graphs).map_err(phase("bind"))?;
         }
-        let mut lanes = lanes;
+        let mut streams = streams;
         let video_owners = match (video, video_capacity) {
             (Some(video), Some(capacity)) => {
                 let (encoders, denoisers, decoders, media) = start_video(
@@ -380,7 +380,7 @@ impl Worker {
                         capacity: &capacity,
                         info: &info,
                         config: &config,
-                        lanes: &mut lanes,
+                        streams: &mut streams,
                         graphs: &mut graphs,
                         attention: model.attention_backend.clone(),
                     },
@@ -407,7 +407,7 @@ impl Worker {
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
         backend.set_rank_storage(storage);
-        backend.set_job_queues(lanes.job_queues());
+        backend.set_job_queues(streams.job_queues());
         let text_warmup = text.is_some();
         let video_warmup = video_owners.is_some();
         if let Some((requests, encoders, denoisers, decoders, media, outputs)) = video_owners {
@@ -437,7 +437,7 @@ impl Worker {
             .collect();
         backend.set_transfer(
             TransferRuntime::start(
-                &lanes,
+                &streams,
                 &cuda,
                 &CallKind::ALL,
                 launch.ipc.queue_depth,
@@ -504,7 +504,7 @@ impl Worker {
             model: Some(model),
             world: Some(world),
             budget,
-            lanes,
+            streams,
             graphs,
             _scratches: scratches,
             executor: Some(executor),
@@ -531,8 +531,8 @@ impl Worker {
         self.world.as_ref()
     }
 
-    pub fn lanes_mut(&mut self) -> &mut Lanes {
-        &mut self.lanes
+    pub fn streams_mut(&mut self) -> &mut Streams {
+        &mut self.streams
     }
 
     pub fn backend_mut(&mut self) -> Option<&mut WorkerBackend> {
@@ -672,7 +672,7 @@ impl Worker {
                 let drained = executor.backend().job_queues().drain(BLOCK_ON_TIMEOUT);
                 record(drained.map_err(WorkerError::from));
             }
-            for stream in self.lanes.streams() {
+            for stream in self.streams.iter() {
                 record(stream.synchronize().map_err(WorkerError::from));
             }
         }
@@ -703,7 +703,7 @@ impl Worker {
             // released, so the releases are made before the streams close.
             Interpreter::synchronize();
         }
-        record(self.lanes.close(aborted).map_err(WorkerError::from));
+        record(self.streams.close(aborted).map_err(WorkerError::from));
         if let Some(mut world) = self.world.take() {
             record(world.close(aborted).map_err(WorkerError::from));
         }
@@ -888,7 +888,7 @@ fn allocate_storage(
     launch: &WorkerLaunch,
     config: &WorkerConfig,
     plan: &Plan,
-    lanes: &Lanes,
+    streams: &Streams,
 ) -> Result<RankStorage> {
     let events = EventPool::new();
     let kinds = launch
@@ -946,7 +946,7 @@ fn allocate_storage(
     )?;
 
     let device = config.device.cuda_index();
-    let preparation = device.and_then(|index| lanes.preparation(DeviceId(index)));
+    let preparation = device.and_then(|index| streams.preparation(DeviceId(index)));
     let prefix_cache = match (&plan.cache, &plan.info.prefix_cache) {
         (Some(cache), Some(info)) => Some(PrefixCache::new(
             Arc::clone(cache),
@@ -964,7 +964,7 @@ fn allocate_storage(
     }
     // Slot releases order after the token batches that read them.
     let release_stream = match device {
-        Some(index) => lanes
+        Some(index) => streams
             .stream_for(CallKind::Forward(ForwardMode::Decode), DeviceId(index))
             .map(|stream| stream.stream().cloned())
             .transpose()?,
