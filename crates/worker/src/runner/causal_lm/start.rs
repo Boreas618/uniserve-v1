@@ -20,7 +20,7 @@ use crate::config::{Device, PREFILL_ROW_BUCKETS, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
-use crate::executor::forward::launch::StreamOrder;
+use crate::executor::batch::StreamOrder;
 use crate::ffi::{DType, Handle, Interpreter};
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::{

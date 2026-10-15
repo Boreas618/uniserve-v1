@@ -22,8 +22,8 @@ use uniserve_ipc::{Batch as BatchPlan, CallStatus, DType, ForwardMode, RequestKe
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, CausalLMRunners};
 use crate::executor::PendingOutput;
-use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::launch::{lock, reports_output, seal};
+use crate::executor::batch::{lock, reports_output, seal};
+use crate::executor::image::ImageParts;
 use crate::ffi::Device;
 use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;

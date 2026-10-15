@@ -30,12 +30,12 @@ use uniserve_ipc::{
     Batch as BatchPlan, BufferId, CallStatus, DType, ForwardStats, RequestKey, TensorRef,
 };
 
-use super::super::launch::{Launched, flag, lock, reports_output, request_flag, seal};
-use super::super::products::Publications;
 use super::latents::{self, PendingExport};
 use super::prefix_cache::{self, Exporting, Installation, Published};
 use crate::executor::PendingOutput;
-use crate::executor::forward::batch::image::ImageParts;
+use crate::executor::batch::{Launched, flag, lock, reports_output, request_flag, seal};
+use crate::executor::image::ImageParts;
+use crate::executor::products::Publications;
 use crate::ffi::Device;
 use crate::lane::{Completion, Job, Recorder};
 use crate::request::RequestPool;

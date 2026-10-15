@@ -22,7 +22,7 @@ use uniserve_ipc::{BufferAllocation, BufferId, DType as ProductDType, TensorRef}
 
 use super::batch::TransferBatch;
 use super::latents;
-use crate::executor::forward::batch::image::ImageParts;
+use crate::executor::image::ImageParts;
 use crate::ffi::Device;
 use crate::storage::memory::parse_dtype;
 use crate::storage::{OutputPlacement, ProductBuffer};
