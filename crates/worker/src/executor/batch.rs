@@ -39,7 +39,8 @@
 //! rank serves is reported unsupported ([`unsupported`]), which fails the
 //! batch with `UnsupportedSetup` and leaves the rank serving. A capability
 //! whose results need host work after the device finished (encoding
-//! decoded images) attaches it to its launch as a [`HostStage`].
+//! decoded images, publishing what host media tasks wrote) attaches it to
+//! its launch as a [`HostStage`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, MutexGuard, PoisonError};
@@ -55,6 +56,7 @@ use uniserve_ipc::{
 use crate::config::placement::Capability;
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
+use crate::executor::products::ProductOwners;
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::Device;
 use crate::lane::{Completion, Job, Recorder};
@@ -540,15 +542,23 @@ pub(crate) struct Launched {
 }
 
 /// Host work a launched batch finishes once its output fences completed,
-/// such as encoding generated media read back into its output lease.
+/// such as encoding generated media read back into its output lease, or
+/// publishing the products host tasks wrote.
 pub(crate) trait HostStage {
     /// Advance the work after the fences completed; whether every call's
     /// host result is ready.
     fn poll(&mut self) -> Result<bool>;
 
-    /// Attach the finished host results to the calls' outputs (before they
-    /// resolve).
-    fn finish(&mut self, outputs: &mut [PendingOutput]) -> Result<()>;
+    /// Attach the finished host results to the outputs of `plan`'s calls
+    /// (before they resolve). What the host work wrote is published through
+    /// `products`: the batch committed, so such a product is committed and
+    /// its exports registered at once.
+    fn finish(
+        &mut self,
+        plan: &BatchPlan,
+        products: ProductOwners<'_>,
+        outputs: &mut [PendingOutput],
+    ) -> Result<()>;
 
     /// Withdraw work of a batch that will not be materialized.
     fn cancel(&mut self);
@@ -670,11 +680,13 @@ pub(crate) fn unsupported(kind: CallKind, capability: &str) -> WorkerError {
     )
 }
 
-/// Materialize a launched batch once its output fences completed: decode
-/// every call's result and accept or cancel its pending state. Returns
-/// `None` while the device is still producing.
+/// Materialize a launched batch once its output fences completed: finish
+/// its host work, decode every call's result and accept or cancel its
+/// pending state. Returns `None` while the device or the host work is still
+/// producing.
 pub(crate) fn materialize(
     requests: &mut RequestPool,
+    products: ProductOwners<'_>,
     plan: &BatchPlan,
     launched: &mut Launched,
 ) -> Result<Option<BatchResult>> {
@@ -685,7 +697,7 @@ pub(crate) fn materialize(
         if !host.poll()? {
             return Ok(None);
         }
-        host.finish(&mut launched.outputs)?;
+        host.finish(plan, products, &mut launched.outputs)?;
         launched.host = None;
     }
     lock(&launched.buffer).readback()?;
@@ -803,7 +815,16 @@ pub(crate) fn poll(
     plan: &BatchPlan,
     launched: &mut Launched,
 ) -> std::result::Result<Option<BatchResult>, WorkerError> {
-    Ok(materialize(backend.requests_mut(), plan, launched)?)
+    let parts = backend.parts();
+    // A batch launches only on a rank whose storage owners it opened on.
+    let storage = parts
+        .storage
+        .ok_or_else(|| Error::Invariant("the rank has no storage owners".into()))?;
+    let products = ProductOwners {
+        store: &storage.tensors,
+        transports: &storage.transports,
+    };
+    Ok(materialize(parts.requests, products, plan, launched)?)
 }
 
 /// Cancel launched work that will not be materialized.
@@ -839,13 +860,7 @@ pub(crate) fn forward(
                 crate::runner::diffusion_lm::forward(backend, batch, kind)
             }
             CallKind::Transfer(_) => crate::executor::transfer::forward(backend, batch, kind),
-            _ if records(backend, kind) => {
-                let (plan, borrowed, state) = batch.media_parts();
-                let mut parts = backend.media_parts()?;
-                Ok(Some(crate::executor::video::forward(
-                    &mut parts, plan, borrowed, state,
-                )?))
-            }
+            _ if records(backend, kind) => crate::executor::video::forward(backend, batch),
             // A video model's rank records its media calls ([`records`]);
             // no other rank serves these kinds.
             CallKind::Media(
@@ -889,24 +904,14 @@ pub(crate) fn complete(
             crate::runner::diffusion_lm::complete(backend, batch, completion)
         }
         CallKind::Transfer(_) => crate::executor::transfer::complete(backend, batch, completion),
-        _ if records(backend, kind) => {
-            let done = {
-                let (_, _, state) = batch.media_parts();
-                let mut parts = backend.media_parts()?;
-                crate::executor::video::complete(&mut parts, state, completion)?
-            };
-            if done {
-                batch.set_stage(Stage::Done);
-            }
-            Ok(())
-        }
+        _ if records(backend, kind) => crate::executor::video::complete(backend, batch, completion),
         _ => crate::executor::image::complete(backend, batch, kind, completion),
     }
 }
 
-/// Whether the forwards of `kind` on this rank are recorded into jobs
-/// ([`crate::executor::video::forward`]): a video model's media calls, on its devices and
-/// on its host lane. The others issue their own stream work.
+/// Whether `kind` is served by a video model's media batches on this rank
+/// ([`crate::executor::video::forward`]): its media calls, on its devices
+/// and on its host lane.
 fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
     use MediaCall::*;
 
