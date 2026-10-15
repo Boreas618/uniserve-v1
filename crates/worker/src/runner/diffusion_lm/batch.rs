@@ -50,7 +50,7 @@ use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
-use crate::storage::{PrefixCache, ProductBuffer, TensorStore};
+use crate::storage::{PrefixCache, ProductBuffer, ProductStore};
 use crate::stream::EventPool;
 use crate::worker::RankStorage;
 use crate::{Error, Result};
@@ -62,7 +62,7 @@ struct Context<'a> {
     runner: &'a mut DiffusionLMRunner,
     requests: &'a mut RequestPool,
     prefix_cache: &'a mut PrefixCache,
-    tensors: &'a TensorStore,
+    tensors: &'a ProductStore,
     events: &'a Arc<EventPool>,
     plan: &'a BatchPlan,
     /// The text runtime's batch order: these forwards read the prefix
@@ -227,7 +227,7 @@ impl Committing {
         mut self,
         runner: &mut DiffusionLMRunner,
         requests: &mut RequestPool,
-        tensors: &TensorStore,
+        tensors: &ProductStore,
         plan: &BatchPlan,
         completed: Result<Completion>,
     ) -> std::result::Result<Launched, Failure> {
@@ -313,7 +313,7 @@ struct Owners<'a> {
     experts: Option<&'a Arc<ExpertUnion>>,
     requests: &'a mut RequestPool,
     prefix_cache: &'a mut PrefixCache,
-    tensors: &'a TensorStore,
+    tensors: &'a ProductStore,
     events: &'a Arc<EventPool>,
     plan: &'a BatchPlan,
     stream: Option<&'a Stream>,

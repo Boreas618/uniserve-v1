@@ -60,8 +60,8 @@ use crate::ffi::Device;
 use crate::lane::{Completion, Job, Recorder};
 use crate::request::RequestPool;
 use crate::storage::{
-    OutputBuffer, OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead, Scalar,
-    TensorStore,
+    OutputBuffer, OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead,
+    ProductStore, Scalar,
 };
 use crate::stream::{EventPool, Issue};
 use crate::transfer::Retirement;
@@ -141,7 +141,7 @@ impl<F: Default> Opening<F> {
     #[expect(clippy::too_many_arguments, reason = "the owners a batch opens on")]
     pub(crate) fn open(
         requests: &mut RequestPool,
-        tensors: &TensorStore,
+        tensors: &ProductStore,
         info: &WorkerInfo,
         rank: usize,
         plan: &BatchPlan,
@@ -315,7 +315,7 @@ impl<F> Batch<F> {
     pub(crate) fn bind_flags(
         &mut self,
         plan: &BatchPlan,
-        tensors: &TensorStore,
+        tensors: &ProductStore,
         job: &Job,
     ) -> Result<()> {
         let target = self.target();
@@ -361,7 +361,7 @@ impl<F> Batch<F> {
     /// otherwise at a reader fence.
     pub(crate) fn end_reads(
         &mut self,
-        tensors: &TensorStore,
+        tensors: &ProductStore,
         job: &Job,
         after: &[ProductBuffer],
     ) -> Result<()> {
@@ -375,7 +375,7 @@ impl<F> Batch<F> {
     }
 
     /// Record the completion flags of the executed calls: they become true.
-    pub(crate) fn set_flags(&self, tensors: &TensorStore, job: &Job) -> Result<()> {
+    pub(crate) fn set_flags(&self, tensors: &ProductStore, job: &Job) -> Result<()> {
         for state in self.calls.iter().filter(|state| state.active) {
             if let Some(write) = &state.completion_write {
                 tensors.write_scalar(write, Scalar::Int(1), job.on(self.stream.as_ref()))?;
@@ -386,7 +386,7 @@ impl<F> Batch<F> {
 
     /// Check every call's captured output and the batch's writes before
     /// the commit point.
-    pub(crate) fn validate(&self, plan: &BatchPlan, tensors: &TensorStore) -> Result<()> {
+    pub(crate) fn validate(&self, plan: &BatchPlan, tensors: &ProductStore) -> Result<()> {
         {
             let output = lock(&self.buffer);
             for (state, call) in self.calls.iter().zip(&plan.calls) {
@@ -440,7 +440,7 @@ impl<F> Batch<F> {
     pub(crate) fn commit(
         &mut self,
         plan: &BatchPlan,
-        tensors: &TensorStore,
+        tensors: &ProductStore,
         requests: &mut RequestPool,
     ) -> std::result::Result<(), Failure> {
         let fatal = Failure::fatal("batch commit");
@@ -457,7 +457,7 @@ impl<F> Batch<F> {
     /// those fences complete.
     pub(crate) fn discard(
         &mut self,
-        tensors: &TensorStore,
+        tensors: &ProductStore,
         events: &EventPool,
         job: &Job,
     ) -> Result<()> {
@@ -497,7 +497,7 @@ impl<F> Batch<F> {
 /// Record the read of a host-gated (U8) predicate after its producer's
 /// fence: the job's completion carries its byte, which [`flag`] decodes.
 pub(crate) fn request_flag(
-    tensors: &TensorStore,
+    tensors: &ProductStore,
     call: &Call,
     predicate: &TensorRef,
     device: Option<i32>,

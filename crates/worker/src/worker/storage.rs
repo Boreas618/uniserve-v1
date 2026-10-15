@@ -15,7 +15,7 @@ use uniserve_ipc::{BufferId, CallKind, ForwardMode, RequestKey, Wake};
 
 use crate::Result;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
-use crate::storage::{PrefixCache, TensorStore};
+use crate::storage::{PrefixCache, ProductStore};
 use crate::stream::EventPool;
 use crate::transfer::{Notify, Transports};
 
@@ -33,7 +33,7 @@ const RELEASE: CallKind = CallKind::Forward(ForwardMode::Decode);
 /// The storage owners of a rank.
 pub struct RankStorage {
     pub events: Arc<EventPool>,
-    pub tensors: TensorStore,
+    pub tensors: ProductStore,
     /// Shared with the cache import copy tasks that read through them.
     pub transports: Arc<Transports>,
     pub prefix_cache: Option<PrefixCache>,
@@ -50,7 +50,7 @@ pub struct RankStorage {
 impl RankStorage {
     pub fn new(
         events: Arc<EventPool>,
-        tensors: TensorStore,
+        tensors: ProductStore,
         transports: Arc<Transports>,
         prefix_cache: Option<PrefixCache>,
         release_stream: Option<Stream>,

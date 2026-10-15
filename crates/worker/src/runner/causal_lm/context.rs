@@ -30,7 +30,7 @@ use crate::runner::denoiser::image::ConditionRow;
 use crate::runner::denoiser::image_model::ROPE_ADVANCE;
 use crate::runner::vision::{BlockPositions, PositionLayout};
 use crate::storage::memory::StorageView;
-use crate::storage::{BlockTables, Metadata, ProductRead, TensorStore};
+use crate::storage::{BlockTables, Metadata, ProductRead, ProductStore};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -56,7 +56,7 @@ pub(super) struct Media {
 
 /// What a media call borrows from the rank.
 pub(super) struct Sources<'a, I> {
-    pub(super) tensors: &'a TensorStore,
+    pub(super) tensors: &'a ProductStore,
     pub(super) image: Option<&'a ImageParts<'a>>,
     pub(super) tables: &'a BlockTables,
     pub(super) device: Option<i32>,

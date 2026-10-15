@@ -148,7 +148,7 @@ impl CallState {
 
     /// Publish the exports the call's forward issued, once their work was
     /// performed: each joins the call's completion products.
-    fn locate(&mut self, store: &crate::TensorStore) -> Result<()> {
+    fn locate(&mut self, store: &crate::ProductStore) -> Result<()> {
         for (write, export) in std::mem::take(&mut self.exports) {
             let (export, locations) = store.located(&write, export)?;
             self.publish(write.id(), locations, export)?;

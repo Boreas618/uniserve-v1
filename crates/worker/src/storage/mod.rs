@@ -7,9 +7,8 @@ pub(crate) mod latent;
 pub mod memory;
 mod output;
 mod prefix_cache;
+pub(crate) mod products;
 mod request_slots;
-pub mod tensor;
-mod tensor_store;
 
 pub use buffer::{BufferBinding, BufferPool};
 pub use host_buffers::HostBuffers;
@@ -24,8 +23,8 @@ pub use prefix_cache::manager::PrefixCacheManager;
 pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, GroupAxis};
 pub use prefix_cache::planes::{CachePlanes, FIELDS, UnitColumn, UnitSnapshot};
 pub use prefix_cache::{PendingImport, PrefixCache, ScratchUnits};
-pub use request_slots::{RequestSlots, SlotField};
-pub use tensor_store::{
-    Metadata, OutputPlacement, ProductBuffer, ProductExport, ProductRead, Scalar, TensorStore,
+pub use products::{
+    Metadata, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore, Scalar,
     ValueRange,
 };
+pub use request_slots::{RequestSlots, SlotField};
