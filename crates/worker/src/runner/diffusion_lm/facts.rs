@@ -8,8 +8,7 @@
 
 use tvm_ffi::Any;
 
-use crate::ffi::{DType, Handle};
-use crate::model::interface::Interface;
+use crate::ffi::{DType, Handle, Interpreter};
 use crate::{Error, Result};
 
 const MODULE: &str = "uniserve.runner.diffusion_lm";
@@ -54,7 +53,6 @@ impl Facts {
     /// `attention_ranks` counts the attention ranks of a disaggregated
     /// expert union (zero when every rank holds its experts).
     pub(crate) fn read(
-        interface: &Interface,
         loaded: &Handle,
         path: &str,
         exchange: bool,
@@ -63,9 +61,7 @@ impl Facts {
         let call = |name: &str, more: &[Any]| -> Result<Any> {
             let mut arguments = vec![loaded.to_any(), text(path)];
             arguments.extend_from_slice(more);
-            interface
-                .import(&format!("{MODULE}.{name}"))?
-                .call_values(&arguments)
+            Interpreter::import(&format!("{MODULE}.{name}"))?.call_values(&arguments)
         };
         let count = |name: &str| -> Result<usize> {
             let value = i64::try_from(call(name, &[])?).map_err(mismatch(name))?;
@@ -111,14 +107,9 @@ impl Facts {
 
     /// Device bytes of the sampler workspace the Python runner allocates to
     /// step `chunk_rows` blocks at a time, on CUDA or the host.
-    pub(crate) fn workspace_bytes(
-        &self,
-        interface: &Interface,
-        chunk_rows: usize,
-        cuda: bool,
-    ) -> Result<u64> {
+    pub(crate) fn workspace_bytes(&self, chunk_rows: usize, cuda: bool) -> Result<u64> {
         let function = format!("{MODULE}.workspace_bytes");
-        let bytes = interface.import(&function)?.call_values(&[
+        let bytes = Interpreter::import(&function)?.call_values(&[
             Any::from(chunk_rows as i64),
             Any::from(self.sequence_length as i64),
             Any::from(self.vocab_size as i64),

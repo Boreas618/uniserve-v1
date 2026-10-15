@@ -21,7 +21,7 @@ impl DecoderRunners {
         setup: &mut VideoSetup<'_>,
         placed: &Placed,
     ) -> Result<()> {
-        let (interface, loaded, model) = (setup.interface, setup.loaded, setup.model);
+        let (loaded, model) = (setup.loaded, setup.model);
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
         let device = placed_device(placed);
@@ -58,7 +58,6 @@ impl DecoderRunners {
         }
         let runner = DecoderRunner::video(
             RunnerSetup {
-                interface,
                 loaded,
                 path: call_path(placed, Capability::VideoDecoder)?,
                 stream,
@@ -85,7 +84,7 @@ impl DecoderRunners {
         setup: &mut VideoSetup<'_>,
         placed: &Placed,
     ) -> Result<()> {
-        let (interface, loaded, model) = (setup.interface, setup.loaded, setup.model);
+        let (loaded, model) = (setup.loaded, setup.model);
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
         let device = placed_device(placed);
@@ -103,7 +102,6 @@ impl DecoderRunners {
         };
         let runner = DecoderRunner::audio(
             RunnerSetup {
-                interface,
                 loaded,
                 path: call_path(placed, Capability::AudioDecoder)?,
                 stream,

@@ -31,6 +31,7 @@ from torch import nn
 
 from uniserve import loading as library
 from uniserve.distributed import Communicator, communication_axes
+from uniserve.errors import SetupError
 from uniserve.loading.precision import weight_config
 from uniserve.models import (
     CausalLM,
@@ -40,11 +41,7 @@ from uniserve.models import (
     VideoPostprocessor,
     registry,
 )
-from uniserve.nn.attention.vsa import BlockAttention
-from uniserve.nn.moe import FusedMoE
-from uniserve.nn.vae.patch import PatchAutoencoder
-
-from .components import (
+from uniserve.models.components import (
     Call,
     Placement,
     attention_parallel,
@@ -52,7 +49,9 @@ from .components import (
     describe_components,
     placements,
 )
-from .errors import SetupError
+from uniserve.nn.attention.vsa import BlockAttention
+from uniserve.nn.moe import FusedMoE
+from uniserve.nn.vae.patch import PatchAutoencoder
 
 logger = logging.getLogger(__name__)
 

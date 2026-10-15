@@ -8,7 +8,6 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from tests.python.fixtures.stub import load_stub
-from uniserve import interface
 from uniserve.bindings.context import Scratch
 from uniserve.media import image
 from uniserve.media.pixels import quantize_image_hwc
@@ -22,12 +21,11 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(scope="module")
 def loaded():
-    table = interface.table()
-    return table, load_stub()
+    return load_stub()
 
 
 def test_the_stub_reports_its_image_facts(loaded):
-    _, model = loaded
+    model = loaded
     assert EncoderRunner.processes_images(model)
     assert EncoderRunner.image_towers(model) == ["vit", "vae"]
     assert EncoderRunner.packs_patches(model) is True
@@ -47,7 +45,7 @@ def test_the_stub_reports_its_image_facts(loaded):
 
 
 def test_patch_grids_follow_the_shared_pixel_budget(loaded):
-    _, model = loaded
+    model = loaded
     assert EncoderRunner.patch_grid(model, 48, 64, 1) == [3, 4]
     with pytest.raises(Exception, match="aspect"):
         EncoderRunner.patch_grid(model, 16, 16 * 400, 1)
@@ -105,7 +103,7 @@ def test_prefixes_frame_their_source_text(source, positive, negative, expected):
 
 
 def test_unframed_models_reuse_their_context_and_refuse_overrides(loaded):
-    _, model = loaded
+    model = loaded
     # ``[reuses, *tokens]``: no tokens either way.
     assert DenoiserRunner.guidance_prefix(model, "conditioning", "", "") == [1]
     assert DenoiserRunner.guidance_prefix(model, "start", "", "") == [0]
@@ -114,7 +112,7 @@ def test_unframed_models_reuse_their_context_and_refuse_overrides(loaded):
 
 
 def test_decoded_images_fill_their_products_and_staging(loaded):
-    table, model = loaded
+    model = loaded
     latents = torch.linspace(-1.2, 1.2, 8 * 768).reshape(8, 768)
     latents = latents.to(torch.bfloat16)
     staging = torch.zeros(4 * 32 * 32 * 3, dtype=torch.uint8)

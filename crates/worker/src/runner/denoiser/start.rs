@@ -6,7 +6,7 @@ use uniserve_ipc::MediaCall;
 use super::runners::DenoiserRunners;
 use super::{Conditioning, DenoiserRunner};
 use crate::executor::forward::batch::extent;
-use crate::ffi::{DType, Device};
+use crate::ffi::{DType, Device, Interpreter};
 use crate::model::registry::Placed;
 use crate::runner::component::{Component, DENOISER_GRAPHS, VideoSetup, placed_device};
 use crate::{Error, Result};
@@ -19,8 +19,7 @@ impl DenoiserRunners {
         placed: &Placed,
     ) -> Result<()> {
         let info = setup.info;
-        let (interface, loaded, model, config) =
-            (setup.interface, setup.loaded, setup.model, setup.config);
+        let (loaded, model, config) = (setup.loaded, setup.model, setup.config);
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
         let device = placed_device(placed);
@@ -52,7 +51,7 @@ impl DenoiserRunners {
         let graph_pool = setup.graph_pool(DENOISER_GRAPHS, &placed.name, device)?;
         // The conditioner's call runs on one pipeline stage; only a rank of
         // that stage holds its module and constructs its runners.
-        let holds = interface.import("uniserve.runner.encoder.EncoderRunner.holds")?;
+        let holds = Interpreter::import("uniserve.runner.encoder.EncoderRunner.holds")?;
         let mut conditioner = None;
         for call in &placed.calls {
             let encodes =
@@ -83,7 +82,6 @@ impl DenoiserRunners {
             ));
         };
         let runner = DenoiserRunner::new(crate::runner::denoiser::DenoiserSetup {
-            interface,
             loaded,
             component: &placed.name,
             stream,

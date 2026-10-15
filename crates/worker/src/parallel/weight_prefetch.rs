@@ -13,10 +13,9 @@ use tvm_ffi::{Any, AnyView};
 use super::world::World;
 use crate::config::{Device, WorkerLaunch};
 use crate::cuda_graph::GraphBreaks;
-use crate::ffi::{Function, Handle};
+use crate::ffi::{Function, Handle, Interpreter};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
-use crate::model::interface::Interface;
 use crate::{Error, Result};
 
 #[derive(Default)]
@@ -637,7 +636,6 @@ impl DwdpManager {
     /// Set up the rank's distributed expert weights, collectively over the
     /// expert union. `None` unless the union prefetches weights.
     pub(crate) fn start(
-        interface: &Interface,
         launch: &WorkerLaunch,
         world: &World,
         model: &LoadedModel,
@@ -673,9 +671,8 @@ impl DwdpManager {
         // shard, the layers back to back.
         let function = format!("{MODULE}.weight_fields");
         let mismatch = |error: tvm_ffi::Error| Error::numerical(&function, &error);
-        let listed: tvm_ffi::Array<Any> = interface
-            .import(&function)?
-            .call_as(&[model.handle().view()])?;
+        let listed: tvm_ffi::Array<Any> =
+            Interpreter::import(&function)?.call_as(&[model.handle().view()])?;
         let part = |index: usize| listed.get(index).map_err(mismatch);
         let counts = crate::ffi::integers(part(0)?).map_err(mismatch)?;
         let names = tvm_ffi::Array::<tvm_ffi::String>::try_from(part(1)?).map_err(mismatch)?;
@@ -695,7 +692,7 @@ impl DwdpManager {
             .collect();
         let (weights, views) = ExpertWeights::build(union_group, device, node, &layers, &stream)?;
         drop(shards);
-        let bind = interface.import(&format!("{MODULE}.bind_weights"))?;
+        let bind = Interpreter::import(&format!("{MODULE}.bind_weights"))?;
         for (layer, (fields, views)) in layers.iter().zip(views).enumerate() {
             let mut arguments = vec![
                 model.handle().to_any(),
@@ -718,15 +715,13 @@ impl DwdpManager {
 
         let weights = Arc::new(weights);
         let breaks = GraphBreaks::default();
-        let break_graph = interface.import("uniserve.cuda_graph.break_graph")?;
+        let break_graph = Interpreter::import("uniserve.cuda_graph.break_graph")?;
         let prefetch = Handle::new(
-            interface
-                .import(&format!("{MODULE}.bind_prefetch"))?
-                .call_values(
-                    &std::iter::once(model.handle().to_any())
-                        .chain(hooks(&weights, &break_graph, &breaks))
-                        .collect::<Vec<_>>(),
-                )?,
+            Interpreter::import(&format!("{MODULE}.bind_prefetch"))?.call_values(
+                &std::iter::once(model.handle().to_any())
+                    .chain(hooks(&weights, &break_graph, &breaks))
+                    .collect::<Vec<_>>(),
+            )?,
         )?;
         Ok(Some(Self {
             weights,

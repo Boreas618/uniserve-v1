@@ -1,6 +1,7 @@
 //! A TVM-FFI test harness that drives the image runners with the real
-//! numerical interface: Python loads this library with
-//! `tvm_ffi.load_module`, passes the interface table and a loaded model,
+//! numerical library: Python loads this library with
+//! `tvm_ffi.load_module`, passes the rank's import function
+//! (`uniserve.worker.import_path`) and a loaded model,
 //! and compares the Rust-owned results with direct library computation
 //! (`tests/python/integration/runtime/test_image_runners.py`).
 //!
@@ -15,8 +16,7 @@ use std::sync::Arc;
 use tvm_ffi::{Any, Array, Map, String as FfiString, Tensor};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_worker::config::Device;
-use uniserve_worker::ffi::{Backing, DType, Handle, Record};
-use uniserve_worker::model::interface::Interface;
+use uniserve_worker::ffi::{Backing, DType, Handle, Interpreter, Record};
 use uniserve_worker::storage::memory::{Memory, StorageView};
 use uniserve_worker::{
     DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool, ImageSetup,
@@ -33,12 +33,8 @@ fn failure(error: impl std::fmt::Display) -> tvm_ffi::Error {
 }
 
 /// The shared work areas of one stream, as the worker holds them.
-fn scratch(interface: &Interface) -> Result<Handle> {
-    Handle::new(
-        interface
-            .import("uniserve.bindings.context.Scratch")?
-            .call_values(&[])?,
-    )
+fn scratch() -> Result<Handle> {
+    Handle::new(Interpreter::import("uniserve.bindings.context.Scratch")?.call_values(&[])?)
 }
 
 /// The module path `path` below `root`.
@@ -88,7 +84,7 @@ fn view(product: &StorageView, shape: &[i64]) -> Result<Tensor> {
 fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ffi::Error> {
     (|| -> Result<Array<Any>> {
         let config = Record::new("encode", Any::from(config))?;
-        let interface = Interface::from_table(config.get("table")?)?;
+        Interpreter::install_import(config.get("import")?);
         let loaded = Handle::new(config.value("loaded")?)?;
         let path = config.string("path")?;
         let tower = config.string("tower")?;
@@ -115,20 +111,19 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         };
         let root = config.string("root")?;
         let module = module_path(&root, &path);
-        let info = EncoderInfo::describe(&interface, &loaded, &module, DType::BF16)?;
+        let info = EncoderInfo::describe(&loaded, &module, DType::BF16)?;
         let settings = EncoderConfig {
             max_images: orders.iter().map(Vec::len).max().unwrap_or(1),
             ..EncoderConfig::default()
         };
         let component = config.string("component")?;
         let setup = ImageSetup {
-            interface: &interface,
             loaded: &loaded,
             component: &component,
             path: &module,
             device,
             stream: stream.clone(),
-            scratch: scratch(&interface)?,
+            scratch: scratch()?,
         };
         let products = arena(device)?;
         let mut runner = EncoderRunner::image(&setup, info, &settings)?;
@@ -138,7 +133,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
                     "capture requires a CUDA device".into(),
                 ));
             };
-            let pool = pool(&interface, index)?;
+            let pool = pool(index)?;
             runner.capture(Some(&pool), &mut || Ok(()))?;
         }
         runner.seal();
@@ -147,8 +142,8 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         } else {
             Tower::Vae
         };
-        let function = interface.import("uniserve.runner.encoder.EncoderRunner.prepare_image")?;
-        let facts = interface.import("uniserve.runner.encoder.EncoderRunner.image_facts")?;
+        let function = Interpreter::import("uniserve.runner.encoder.EncoderRunner.prepare_image")?;
+        let facts = Interpreter::import("uniserve.runner.encoder.EncoderRunner.image_facts")?;
         let images = payloads
             .iter()
             .map(|payload| {
@@ -199,27 +194,24 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
     .map_err(failure)
 }
 
-/// A graph allocator pool on CUDA `device` (`graphs.pool`).
-fn pool(interface: &Interface, device: i32) -> Result<Arc<GraphPool<Handle>>> {
-    let value: Array<Any> = interface
-        .function("graphs.pool")?
+/// A graph allocator pool on CUDA `device` (`uniserve.cuda_graph.pool`).
+fn pool(device: i32) -> Result<Arc<GraphPool<Handle>>> {
+    let value: Array<Any> = Interpreter::import("uniserve.cuda_graph.pool")?
         .call_as(&[(&Any::from(i64::from(device))).into()])?;
     let number = |index: usize| -> Result<u64> {
-        let value = value
-            .get(index)
-            .map_err(|error| uniserve_worker::Error::numerical("graphs.pool", &error))?;
+        let value = value.get(index).map_err(|error| {
+            uniserve_worker::Error::numerical("uniserve.cuda_graph.pool", &error)
+        })?;
         i64::try_from(value)
             .map(|value| value as u64)
-            .map_err(|error| uniserve_worker::Error::numerical("graphs.pool", &error))
+            .map_err(|error| uniserve_worker::Error::numerical("uniserve.cuda_graph.pool", &error))
     };
     Ok(Arc::new(GraphPool {
         device,
         id: (number(1)?, number(2)?),
-        value: Handle::new(
-            value
-                .get(0)
-                .map_err(|error| uniserve_worker::Error::numerical("graphs.pool", &error))?,
-        )?,
+        value: Handle::new(value.get(0).map_err(|error| {
+            uniserve_worker::Error::numerical("uniserve.cuda_graph.pool", &error)
+        })?)?,
     }))
 }
 
@@ -230,7 +222,7 @@ fn pool(interface: &Interface, device: i32) -> Result<Arc<GraphPool<Handle>>> {
 fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ffi::Error> {
     (|| -> Result<Array<Any>> {
         let config = Record::new("decode", Any::from(config))?;
-        let interface = Interface::from_table(config.get("table")?)?;
+        Interpreter::install_import(config.get("import")?);
         let loaded = Handle::new(config.value("loaded")?)?;
         let path = config.string("path")?;
         let latents: Tensor = config.get("latents")?;
@@ -239,13 +231,12 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let component = config.string("component")?;
         let module = module_path(&config.string("root")?, &path);
         let setup = ImageSetup {
-            interface: &interface,
             loaded: &loaded,
             component: &component,
             path: &module,
             device: Device::Cpu,
             stream: None,
-            scratch: scratch(&interface)?,
+            scratch: scratch()?,
         };
         let products = arena(Device::Cpu)?;
         let [units, width] = latents.shape()[..] else {

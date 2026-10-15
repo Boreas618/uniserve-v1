@@ -17,9 +17,8 @@ from typing import Any, cast
 import torch
 
 from uniserve.bindings.context import ExecutionContext
-from uniserve.interface import calls
-from uniserve.interface.errors import SetupError
-from uniserve.interface.loading import capability
+from uniserve.errors import SetupError
+from uniserve.loading.rank import capability
 from uniserve.media.pixels import (
     PreparedImage,
     Tower,
@@ -41,6 +40,7 @@ from uniserve.runner.context import (
     execution_context,
     held_module,
     kernel_records,
+    write,
 )
 
 __all__ = ["EncoderRunner"]
@@ -783,7 +783,7 @@ class EncoderRunner:
         if len(images) != len(out):
             raise ValueError("images and products must align")
         return [
-            calls.write(product, value)
+            write(product, value)
             for value, product in zip(
                 self._run_images(images), out, strict=True
             )

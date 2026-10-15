@@ -1,31 +1,33 @@
-"""Prefix cache description, unit operations and import conversion bindings.
+"""The prefix cache's unit pool as a loaded model needs it.
 
 The Rust worker owns the K/V unit pool: it allocates the planes, flags and
 scales, assigns units, and copies imported pages. These functions supply
 what only the numerical library knows: the pool's layout for a loaded model
 (``cache_plan``, a :class:`CachePlan` the worker reads column by column and
 passes back unchanged), whether an attention backend reads a page shape
-(``reads_pages``), the attention layers' view of the pool (``pool``), the
-scattered unit resets (:class:`UnitResets`) and the dtype/FP8 conversion of
-imported pages (:class:`PageConversion`).
-
-The two classes are constructed once over Rust-owned tensors and a
-Rust-owned stream; their methods take only integers and names. Importing
-this module does not initialize CUDA.
+(``reads_pages``) and the attention layers' view of the pool (``pool``).
+The scattered unit resets are :class:`uniserve.prefix_cache.units.UnitResets`
+and the dtype/FP8 conversion of imported pages is
+:class:`uniserve.prefix_cache.conversion.PageConversion`. Importing this
+module does not initialize CUDA.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from math import prod
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from uniserve.prefix_cache import mha
-from uniserve.prefix_cache.units import Planes, UnitPool, plan_units
+from uniserve.prefix_cache.units import (
+    Planes,
+    UnitPool,
+    named_fields,
+    plan_units,
+)
 from uniserve.quantization import Quantizer
 
 if TYPE_CHECKING:
@@ -33,8 +35,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CachePlan",
-    "PageConversion",
-    "UnitResets",
     "cache_plan",
     "pool",
     "reads_pages",
@@ -338,196 +338,6 @@ def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
     return True
 
 
-def _stream_scope(stream: int, device: torch.device) -> Callable:
-    """Return a factory of scopes enqueuing on the Rust-owned ``stream``.
-
-    Host tensors need no stream. The external stream is wrapped once, at
-    bind time; each call enters a fresh scope.
-    """
-    from contextlib import nullcontext
-
-    if device.type != "cuda":
-        return nullcontext
-    external = torch.cuda.ExternalStream(stream, device=device)
-    return lambda: torch.cuda.stream(external)
-
-
-def _named(
-    names: Sequence[str], fields: Sequence[torch.Tensor]
-) -> dict[str, torch.Tensor]:
-    """The pool's unit fields by name."""
-    return {str(name): field for name, field in zip(names, fields, strict=True)}
-
-
-class UnitResets:
-    """Scattered unit resets over Rust-owned unit fields, on one stream.
-
-    Args:
-        units: An int64 ``[num_units]`` column on the pool's device. Rust
-            writes the unit ids into ``units[:count]`` before each call.
-        stream: The stream handle every reset is enqueued on.
-        names: The name of each of ``fields``: ``{key,value}.values``,
-            ``{key,value}.initialized`` and, for FP8, ``{key,value}.scale``.
-        fields: The pool's unit fields, each with a ``[columns, num_units]``
-            leading layout.
-
-    Each method takes ``count`` and is one indexed fill per field, without
-    a host read.
-    """
-
-    def __init__(
-        self,
-        units: torch.Tensor,
-        stream: int,
-        names: Sequence[str],
-        *fields: torch.Tensor,
-    ) -> None:
-        named = _named(names, fields)
-        for name in ("key.values", "value.values"):
-            if name not in named:
-                raise ValueError(f"the unit fields lack {name!r}")
-        self._fields = named
-        self._units = units
-        self._scope = _stream_scope(int(stream), units.device)
-        self._values = [name for name in named if name.endswith(".values")]
-        self._flags = [name for name in named if name.endswith(".initialized")]
-        self._scales = [name for name in named if name.endswith(".scale")]
-
-    def _fill(self, count: int, selected: Sequence[str], value) -> None:
-        index = self._units[: int(count)]
-        with self._scope():
-            for name in selected:
-                self._fields[name].index_fill_(1, index, value)
-
-    def zero(self, count: int) -> None:
-        """Clear values and flags and reset scales to one."""
-        self._fill(count, self._values + self._flags, 0)
-        self._fill(count, self._scales, 1)
-
-    def recycle(self, count: int) -> None:
-        """Clear flags and reset scales.
-
-        The reset of a quantized pool of one element type; Rust zeroes
-        mixed-type pools and skips dense pools of one type.
-        """
-        self._fill(count, self._flags, 0)
-        self._fill(count, self._scales, 1)
-
-    def mark_initialized(self, count: int) -> None:
-        """Set both fields' flags."""
-        self._fill(count, self._flags, 1)
-
-
-class PageConversion:
-    """The dtype and FP8 conversion of imported pages, on one stream.
-
-    Args:
-        plan: The ``cache_plan`` result.
-        num_units: The units the fields hold, sentinel included.
-        scratch: uint8 ``[20 * elements + 8 * scales]``: raw keys at bytes
-            ``[0, 8E)``, raw values at ``[8E, 16E)``, the FP32 conversion
-            scratch at ``[16E, 20E)`` and FP32 source scales at ``[20E, 20E +
-            8S)``, where ``E`` is ``elements`` (the largest group page's
-            elements) and ``S`` is ``scales`` (its scale entries).
-        elements: ``E`` above.
-        scales: ``S`` above.
-        stream: The stream conversions are enqueued on.
-        names, fields: The pool's unit fields, as :class:`UnitResets` takes
-            them.
-
-    Raises:
-        ValueError: The scratch disagrees with its layout.
-    """
-
-    def __init__(
-        self,
-        plan: CachePlan,
-        num_units: int,
-        scratch: torch.Tensor,
-        elements: int,
-        scales: int,
-        stream: int,
-        names: Sequence[str],
-        *fields: torch.Tensor,
-    ) -> None:
-        elements, scales = int(elements), int(scales)
-        if scratch.dtype != torch.uint8 or scratch.numel() < (
-            20 * elements + 8 * scales
-        ):
-            raise ValueError("the conversion scratch disagrees with its layout")
-        self._pool = UnitPool(
-            plan.planes,
-            _named(names, fields),
-            plan.configs,
-            num_units=int(num_units),
-        )
-        self._raw = scratch[: 16 * elements].view(2, 8 * elements)
-        self._values = scratch[16 * elements : 20 * elements].view(
-            torch.float32
-        )
-        self._scales = scratch[20 * elements : 20 * elements + 8 * scales].view(
-            torch.float32
-        )
-        self._scope = _stream_scope(int(stream), scratch.device)
-
-    def convert(
-        self,
-        group: int,
-        source_dtype: str,
-        compute_dtype: str,
-        count: int,
-        offset: int,
-        source_offset: int,
-        source_page_tokens: int,
-        scale_heads: int,
-        pages: int,
-        units: Sequence[int],
-    ) -> None:
-        """Write one imported span into the destination page's units.
-
-        Reads ``[count, layers, heads, dim]`` raw keys and values of
-        ``source_dtype`` from the scratch (with FP8, also ``[pages, 2,
-        layers, scale groups]`` scales) and writes the destination page's
-        ``units`` at token ``offset`` with ``copy_converted``.
-        """
-        from uniserve.prefix_cache.conversion import copy_converted
-
-        pool, raw = self._pool, self._raw
-        cache_group = pool.groups[int(group)]
-        dtype = getattr(torch, source_dtype)
-        layers, heads = len(cache_group.layers), cache_group.num_kv_heads
-        shape = (int(count), layers, heads, cache_group.head_dim)
-        nbytes = prod(shape) * dtype.itemsize
-        source = (
-            raw[0, :nbytes].view(dtype).view(shape),
-            raw[1, :nbytes].view(dtype).view(shape),
-        )
-        source_scales = None
-        if int(scale_heads) > 0:
-            first = pool.head_offset(cache_group.layers[0])
-            groups = -(-(first + heads) // int(scale_heads)) - first // int(
-                scale_heads
-            )
-            source_scales = self._scales[
-                : int(pages) * 2 * layers * groups
-            ].view(int(pages), 2, layers, groups)
-        with self._scope():
-            copy_converted(
-                pool,
-                int(group),
-                source,
-                source_scales,
-                self._values,
-                (raw[0], raw[1]),
-                tuple(int(unit) for unit in units),
-                int(offset),
-                int(source_offset),
-                int(source_page_tokens),
-                int(scale_heads),
-                getattr(torch, compute_dtype),
-            )
-
-
 def pool(
     plan: CachePlan, num_units: int, names: Sequence[str], *fields: torch.Tensor
 ) -> UnitPool:
@@ -550,7 +360,7 @@ def pool(
     """
     return UnitPool(
         plan.planes,
-        _named(names, fields),
+        named_fields(names, fields),
         plan.configs,
         num_units=int(num_units),
     )

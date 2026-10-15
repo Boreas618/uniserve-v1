@@ -45,10 +45,9 @@ use crate::executor::forward::batch::{MediaBatch, Trajectories};
 use crate::executor::forward::batch::{Parts, latent_params, product_name, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::executor::forward::transfer::latents::Pool;
-use crate::ffi::{Backing, DType, Function, Handle, integer_list, integers};
+use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list, integers};
 use crate::lane::{Completion, Job};
 use crate::model::components::{Capability, Declarations};
-use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};
@@ -404,7 +403,6 @@ pub(crate) struct Conditioning {
 
 /// What [`DenoiserRunner::new`] is built from.
 pub(crate) struct DenoiserSetup<'a> {
-    pub(crate) interface: &'a Interface,
     pub(crate) loaded: &'a Handle,
     pub(crate) component: &'a str,
     pub(crate) stream: Stream,
@@ -472,11 +470,10 @@ impl DenoiserRunner {
         )?;
 
         const RUNNER: &str = "uniserve.runner.denoiser.DenoiserRunner";
-        let interface = setup.interface;
-        let method = |name: &str| interface.import(&format!("{RUNNER}.{name}"));
+        let method = |name: &str| Interpreter::import(&format!("{RUNNER}.{name}"));
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));
         let stream = Any::from(setup.stream.raw() as i64);
-        let runner = interface.import(RUNNER)?.call_values(&[
+        let runner = Interpreter::import(RUNNER)?.call_values(&[
             setup.loaded.to_any(),
             text(setup.component),
             stream.clone(),
@@ -494,7 +491,7 @@ impl DenoiserRunner {
             kernels: method("kernels")?,
             close: method("close")?,
         };
-        let capture = GraphFunctions::from_interface(interface)?;
+        let capture = GraphFunctions::import()?;
 
         let conditioner = match setup.conditioning {
             Some(conditioning) => {
@@ -505,7 +502,7 @@ impl DenoiserRunner {
                     dtype,
                 } = conditioning;
                 let rows = i64::from(capacities.iter().copied().max().unwrap_or(0));
-                let construct = interface.import(ENCODER)?;
+                let construct = Interpreter::import(ENCODER)?;
                 // The largest capacity is prepared first, so it sizes the
                 // workspace the capacities share.
                 capacities.sort_unstable_by(|left, right| right.cmp(left));
@@ -541,9 +538,9 @@ impl DenoiserRunner {
                         &[rows, setup.conditioning_width as i64],
                     )?,
                     runners,
-                    encode: interface.import(&format!("{ENCODER}.encode"))?,
-                    kernels: interface.import(&format!("{ENCODER}.kernels"))?,
-                    close: interface.import(&format!("{ENCODER}.close"))?,
+                    encode: Interpreter::import(&format!("{ENCODER}.encode"))?,
+                    kernels: Interpreter::import(&format!("{ENCODER}.kernels"))?,
+                    close: Interpreter::import(&format!("{ENCODER}.close"))?,
                     graphs: GraphTable::new(
                         format!("{}.conditioner", setup.component),
                         capture.release.clone(),
@@ -1873,9 +1870,9 @@ fn layout_arguments(layout: &VideoLayout) -> Any {
 impl VideoModel {
     /// Resolve the sizing methods and read the facts of `loaded` for the
     /// `denoiser` component.
-    pub(crate) fn new(interface: &Interface, loaded: &Handle, denoiser: String) -> Result<Self> {
-        let of_denoiser = |name: &str| interface.import(&format!("{DENOISER}.{name}"));
-        let of_decoder = |name: &str| interface.import(&format!("{DECODER}.{name}"));
+    pub(crate) fn new(loaded: &Handle, denoiser: String) -> Result<Self> {
+        let of_denoiser = |name: &str| Interpreter::import(&format!("{DENOISER}.{name}"));
+        let of_decoder = |name: &str| Interpreter::import(&format!("{DECODER}.{name}"));
         let methods = SizingMethods {
             legal_frame_count: of_denoiser("legal_frame_count")?,
             condition_rows: of_denoiser("condition_rows")?,
@@ -1902,7 +1899,7 @@ impl VideoModel {
                 "variable_axes",
                 "raster_axes",
             ]
-            .map(|column| interface.import(&format!("{OUTPUTS}.{column}")))
+            .map(|column| Interpreter::import(&format!("{OUTPUTS}.{column}")))
             .into_iter()
             .collect::<Result<Vec<_>>>()?
             .try_into()

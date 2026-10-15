@@ -547,7 +547,7 @@ def test_disagreeing_layer_scalars_are_rejected(tmp_path):
 def _pipeline_stage(rank, rendezvous, root):
     import torch.distributed as dist
 
-    from uniserve.interface import distributed
+    from uniserve.distributed import world as distributed
 
     dist.init_process_group(
         "gloo", init_method=rendezvous, rank=rank, world_size=2

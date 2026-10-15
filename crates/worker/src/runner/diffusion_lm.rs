@@ -66,7 +66,6 @@ use crate::ffi::{Backing, DType, Handle};
 use crate::lane::{
     BLOCK_ON_TIMEOUT, Capture, Completion, ExpertStep, ExpertVariant, Job, JobQueues,
 };
-use crate::model::interface::Interface;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::{Memory, StorageView};
@@ -112,8 +111,8 @@ struct Functions {
 
 impl Functions {
     /// Resolve the methods of `methods`' runner.
-    fn resolve(interface: &Interface, methods: &Methods) -> Result<Self> {
-        let method = |name: &str| methods.method(interface, name);
+    fn resolve(methods: &Methods) -> Result<Self> {
+        let method = |name: &str| methods.method(name);
         Ok(Self {
             attend: method("attend")?,
             readout: method("readout")?,

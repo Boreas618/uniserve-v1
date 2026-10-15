@@ -85,8 +85,8 @@ from uniserve.diffusion import (
     advance_,
     normal_noise,
 )
-from uniserve.interface.errors import SetupError
-from uniserve.interface.loading import capability
+from uniserve.errors import SetupError
+from uniserve.loading.rank import capability
 from uniserve.media import image, video
 from uniserve.models import (
     AudioDecoder,

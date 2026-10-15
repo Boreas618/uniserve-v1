@@ -5,7 +5,8 @@ use tvm_ffi::{Any, AnyView};
 use super::interpreter;
 use crate::{Error, Result};
 
-/// A function from the interface table or a binding map.
+/// A library function the worker imported by path, or one a library call
+/// returned.
 ///
 /// A function may be held and called by any thread. The call itself runs on
 /// the rank's Python thread (see [`super::Interpreter`]) while the caller

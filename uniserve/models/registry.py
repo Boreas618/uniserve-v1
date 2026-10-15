@@ -6,7 +6,7 @@ configuration, fetches the payload files the selected modules need (plus the
 tensor headers the package reads to build its configuration), and returns an
 immutable ``Config``. ``load_model`` then materializes the model
 through ``uniserve.loading.load_model``. The worker's loading
-interface (``uniserve.interface``) and direct Python callers use the
+(``uniserve.loading.rank``) and direct Python callers use the
 same two calls.
 
 A model package provides ``config_sources``, ``read_config``, ``Model``,

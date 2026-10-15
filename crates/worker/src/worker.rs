@@ -49,7 +49,6 @@ use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Interpreter};
 use crate::lane::{BLOCK_ON_TIMEOUT, Lanes};
 use crate::model::components::Capability;
-use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::model::{ComponentMesh, Description, ExpertPartition, LoadedModel, sequence_kind};
 use crate::parallel::world::{World, startup_timeout};
@@ -114,7 +113,6 @@ fn phase(phase: &'static str) -> impl Fn(Error) -> WorkerError {
 
 /// A rank.
 pub struct Worker {
-    interface: Interface,
     config: WorkerConfig,
     info: WorkerInfo,
     plan: Plan,
@@ -139,10 +137,7 @@ impl Worker {
     /// Build the rank. On failure, everything built so far is released;
     /// the process world is abandoned, because peers may still be inside a
     /// collective.
-    pub fn start(
-        launch: WorkerLaunch,
-        interface: Interface,
-    ) -> std::result::Result<Self, WorkerError> {
+    pub fn start(launch: WorkerLaunch) -> std::result::Result<Self, WorkerError> {
         let device = launch.device();
         let context = match device {
             Device::Cuda(index) => {
@@ -161,15 +156,15 @@ impl Worker {
         };
 
         let describing = range(c"uniserve.worker.describe", None);
-        let description = Description::describe(&interface, &launch).map_err(phase("describe"))?;
+        let description = Description::describe(&launch).map_err(phase("describe"))?;
 
         drop(describing);
-        let mut world = World::initialize(&interface, &launch, startup_timeout())
-            .map_err(phase("process groups"))?;
+        let mut world =
+            World::initialize(&launch, startup_timeout()).map_err(phase("process groups"))?;
         let dedicated = launch.execution.role == "experts";
         if !dedicated {
             world
-                .bind_components(&interface, &launch, &description.declarations)
+                .bind_components(&launch, &description.declarations)
                 .map_err(phase("process groups"))?;
         }
 
@@ -209,13 +204,13 @@ impl Worker {
                 .map_err(phase("load"))?;
         }
         let loading = range(c"uniserve.worker.load", None);
-        let model = LoadedModel::load(&interface, description, &launch, meshes, experts, host_only)
+        let model = LoadedModel::load(description, &launch, meshes, experts, host_only)
             .map_err(phase("load"))?;
-        let image = ImageModel::describe(&interface, model.handle()).map_err(phase("load"))?;
+        let image = ImageModel::describe(model.handle()).map_err(phase("load"))?;
         let video = if model.video_decoder {
             let denoiser = placed_denoiser(&model.declarations, &config.deployment_components)
                 .map_err(phase("load"))?;
-            Some(VideoModel::new(&interface, model.handle(), denoiser).map_err(phase("load"))?)
+            Some(VideoModel::new(model.handle(), denoiser).map_err(phase("load"))?)
         } else {
             None
         };
@@ -227,7 +222,6 @@ impl Worker {
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.
         let mut experts = ExpertUnion::start(ExpertStart {
-            interface: &interface,
             launch: &launch,
             world: &world,
             model: &model,
@@ -236,17 +230,13 @@ impl Worker {
             node: &node,
         })
         .map_err(phase("experts"))?;
-        let weights = DwdpManager::start(&interface, &launch, &world, &model, &lanes, &node)
-            .map_err(phase("experts"))?;
+        let weights =
+            DwdpManager::start(&launch, &world, &model, &lanes, &node).map_err(phase("experts"))?;
         let budget = match device {
             Device::Cuda(_) => Some(
                 DeviceBudget::new(
-                    interface
-                        .import("torch.cuda.synchronize")
-                        .map_err(phase("capacity"))?,
-                    interface
-                        .import("torch.cuda.empty_cache")
-                        .map_err(phase("capacity"))?,
+                    Interpreter::import("torch.cuda.synchronize").map_err(phase("capacity"))?,
+                    Interpreter::import("torch.cuda.empty_cache").map_err(phase("capacity"))?,
                 )
                 .map_err(phase("capacity"))?,
             ),
@@ -256,7 +246,6 @@ impl Worker {
         let planning = range(c"uniserve.worker.plan", None);
         let (plan, video_capacity) = plan(
             &launch,
-            &interface,
             &mut config,
             &model,
             &image,
@@ -291,8 +280,8 @@ impl Worker {
         let mut graphs = GraphStorage::new(budgets);
         let mut scratches = Scratches::default();
 
-        let storage = allocate_storage(&launch, &interface, &config, &plan, &lanes)
-            .map_err(phase("storage"))?;
+        let storage =
+            allocate_storage(&launch, &config, &plan, &lanes).map_err(phase("storage"))?;
         let mut components = components;
         let preparation = device
             .cuda_index()
@@ -316,7 +305,6 @@ impl Worker {
                 .collect(),
         };
         let text = CausalLMRunners::start(Startup {
-            interface: &interface,
             config: &config,
             request_slots: info.request_slots as usize,
             queue_depth: launch.ipc.queue_depth,
@@ -339,7 +327,6 @@ impl Worker {
             None
         } else {
             ImageOwners::start(ImageStartup {
-                interface: &interface,
                 config: &config,
                 request_slots: info.request_slots as usize,
                 queue_depth: launch.ipc.queue_depth,
@@ -356,7 +343,6 @@ impl Worker {
             .map_err(phase("bind"))?
         };
         let diffusion_lm = DiffusionLMRunner::start(diffusion_lm::Startup {
-            interface: &interface,
             config: &config,
             request_slots: info.request_slots as usize,
             queue_depth: launch.ipc.queue_depth,
@@ -377,17 +363,16 @@ impl Worker {
         if let Some(experts) = experts.as_mut() {
             if dedicated {
                 experts
-                    .bind_experts(&interface, &model, &mut scratches)
+                    .bind_experts(&model, &mut scratches)
                     .map_err(phase("bind"))?;
             }
-            reserve_join_pools(&interface, &config, experts, &mut graphs).map_err(phase("bind"))?;
+            reserve_join_pools(&config, experts, &mut graphs).map_err(phase("bind"))?;
         }
         let mut lanes = lanes;
         let video_owners = match (video, video_capacity) {
             (Some(video), Some(capacity)) => {
                 let (encoders, denoisers, decoders, media) = start_video(
                     VideoSetup {
-                        interface: &interface,
                         loaded: model.handle(),
                         model: &video,
                         capacity: &capacity,
@@ -461,13 +446,15 @@ impl Worker {
         let profiler = ProfileConfig::from_env(|name| std::env::var(name).ok())
             .map_err(phase("profiling"))?
             .map(|profile| {
-                Profiler::new(
+                Ok::<_, Error>(Profiler::new(
                     profile,
-                    interface.profiler_start.clone(),
-                    interface.profiler_stop.clone(),
+                    Interpreter::import("uniserve.profiling.start_profiler")?,
+                    Interpreter::import("uniserve.profiling.stop_profiler")?,
                     device.cuda_index(),
-                )
-            });
+                ))
+            })
+            .transpose()
+            .map_err(phase("profiling"))?;
         backend.set_profiler(profiler);
         let collective = world
             .components
@@ -509,7 +496,6 @@ impl Worker {
 
         tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", model.model_name);
         Ok(Self {
-            interface,
             config,
             info,
             plan,
@@ -537,10 +523,6 @@ impl Worker {
 
     pub fn plan(&self) -> &Plan {
         &self.plan
-    }
-
-    pub fn interface(&self) -> &Interface {
-        &self.interface
     }
 
     pub fn model(&self) -> Option<&LoadedModel> {
@@ -636,12 +618,16 @@ impl Worker {
             )
             .map_err(phase("warmup"))?;
         }
-        // Serving runs Python only inside interface calls; collection pauses
-        // there would stall steps, so the heap built so far is frozen.
-        self.interface
-            .freeze_gc
-            .invoke(&[])
-            .map_err(phase("warmup"))?;
+        // Serving runs Python only inside library calls; collection pauses
+        // there would stall steps, so the heap built so far is collected and
+        // frozen and the cyclic collector is disabled: resident models and
+        // graphs are permanent, and a collection inside a serving step would
+        // traverse them.
+        for path in ["gc.collect", "gc.freeze", "gc.disable"] {
+            Interpreter::import(path)
+                .and_then(|function| function.invoke(&[]))
+                .map_err(phase("warmup"))?;
+        }
         self.warmed = true;
         Ok(())
     }
@@ -777,10 +763,7 @@ impl Worker {
     /// Bytes the caching allocator holds in each of its pools on `device`.
     fn segments(&self, device: i32) -> Result<Vec<Segment>> {
         let function = "uniserve.cuda_graph.pool_bytes";
-        let pools = self
-            .interface
-            .import(function)?
-            .call_values(&[Any::from(i64::from(device))])?;
+        let pools = Interpreter::import(function)?.call_values(&[Any::from(i64::from(device))])?;
         let pools =
             crate::ffi::integers(pools).map_err(|error| Error::numerical(function, &error))?;
         Ok(pools
@@ -792,8 +775,7 @@ impl Worker {
     }
 
     fn require_codecs(&self) -> std::result::Result<(), WorkerError> {
-        self.interface
-            .import("uniserve.media.codec.require_codecs")
+        Interpreter::import("uniserve.media.codec.require_codecs")
             .and_then(|function| function.invoke(&[]))
             .map_err(phase("warmup"))
     }
@@ -824,9 +806,7 @@ impl Worker {
             self.graphs.check(&residency).map_err(phase("warmup"))?;
             for &device in &cuda_devices {
                 let process = budget.process_bytes(device).map_err(phase("warmup"))?;
-                let reserved: i64 = self
-                    .interface
-                    .import("torch.cuda.memory_reserved")
+                let reserved: i64 = Interpreter::import("torch.cuda.memory_reserved")
                     .and_then(|reserved| {
                         reserved.call_as(&[(&Any::from(i64::from(device))).into()])
                     })
@@ -846,7 +826,7 @@ impl Worker {
             .executor
             .as_mut()
             .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
-        let mut records = KernelRecords::new(&self.interface).map_err(phase("warmup"))?;
+        let mut records = KernelRecords::new().map_err(phase("warmup"))?;
         for (label, device, kernels) in executor.backend().kernels().map_err(phase("warmup"))? {
             records.add(&label, &device, &kernels);
         }
@@ -880,13 +860,11 @@ impl Worker {
             image.encoders.seal_image();
             image.denoisers.seal_image();
         }
-        let choices: i64 = self
-            .interface
-            .kernel_choices
-            .call_as(&[])
-            .map_err(phase("warmup"))?;
+        let kernel_choices =
+            Interpreter::import("uniserve.backends.kernel_choices").map_err(phase("warmup"))?;
+        let choices: i64 = kernel_choices.call_as(&[]).map_err(phase("warmup"))?;
         executor.backend_mut().watch_kernels(KernelWatch::new(
-            self.interface.kernel_choices.clone(),
+            kernel_choices,
             choices,
             records,
             self.config.rank,
@@ -910,7 +888,6 @@ impl Drop for Worker {
 /// the device's preparation stream.
 fn allocate_storage(
     launch: &WorkerLaunch,
-    interface: &Interface,
     config: &WorkerConfig,
     plan: &Plan,
     lanes: &Lanes,
@@ -981,7 +958,6 @@ fn allocate_storage(
             plan.info.max_unresolved_calls as usize,
             device,
             preparation.map(CUDAStream::stream).transpose()?,
-            interface,
         )?),
         _ => None,
     };
@@ -1060,7 +1036,6 @@ fn host_name() -> Result<String> {
 /// Graph pools for an expert union member's captured joins, one per microbatch,
 /// when no text runner shares its pools on the microbatch streams.
 fn reserve_join_pools(
-    interface: &Interface,
     config: &WorkerConfig,
     experts: &mut ExpertUnion,
     graphs: &mut GraphStorage<String, Handle>,
@@ -1071,7 +1046,7 @@ fn reserve_join_pools(
     let Device::Cuda(device) = config.device else {
         return Ok(());
     };
-    let create = interface.function("graphs.pool")?;
+    let create = Interpreter::import("uniserve.cuda_graph.pool")?;
     let mut pools = Vec::new();
     for peer in 0..experts.microbatches() {
         let stream = experts.stream(peer).raw();
@@ -1103,11 +1078,7 @@ fn endpoint(worker_id: &str, rank: usize) -> Result<WorkerEndpoint> {
 /// Bytes of the largest vision feature product the image policy admits: the
 /// feature rows of its largest image at the vision encoder's output width.
 /// Zero for a model without a vision encoder or an understanding transform.
-fn vision_feature_bytes(
-    interface: &Interface,
-    model: &LoadedModel,
-    model_dtype: &str,
-) -> Result<u64> {
+fn vision_feature_bytes(model: &LoadedModel, model_dtype: &str) -> Result<u64> {
     let declarations = &model.declarations;
     let Some(call) = declarations
         .names()
@@ -1118,8 +1089,7 @@ fn vision_feature_bytes(
     };
     let dtype = DType::from_name(model_dtype)
         .ok_or_else(|| Error::Unsupported(format!("unsupported model dtype {model_dtype:?}")))?;
-    let EncoderInfo::Vision(vision) =
-        EncoderInfo::describe(interface, model.handle(), &call.path, dtype)?
+    let EncoderInfo::Vision(vision) = EncoderInfo::describe(model.handle(), &call.path, dtype)?
     else {
         return Ok(0);
     };
@@ -1133,7 +1103,6 @@ fn vision_feature_bytes(
 #[allow(clippy::too_many_arguments)]
 fn plan(
     launch: &WorkerLaunch,
-    interface: &Interface,
     config: &mut WorkerConfig,
     model: &LoadedModel,
     image: &ImageModel,
@@ -1160,7 +1129,6 @@ fn plan(
         |size| {
             if text {
                 CachePlan::reads_pages(
-                    interface,
                     model.handle(),
                     &model.attention_backend,
                     size,
@@ -1242,8 +1210,8 @@ fn plan(
         supported_calls: supported,
         media_components,
         components: infos,
-        weight_formats: model.weight_formats(interface)?,
-        activation_formats: model.activation_formats(interface)?,
+        weight_formats: model.weight_formats()?,
+        activation_formats: model.activation_formats()?,
     };
     if let (Some(video), Some(capacity)) = (video, capacity) {
         let plan = video_layout(
@@ -1281,7 +1249,7 @@ fn plan(
     });
     let token_facts = TokenFacts {
         image_processor: image.processing.is_some(),
-        vision_feature_bytes: vision_feature_bytes(interface, model, &config.model_dtype)?,
+        vision_feature_bytes: vision_feature_bytes(model, &config.model_dtype)?,
         latent_feature_bytes: latent.map_or(0, |plan| {
             image_tokens as u64 * plan.latent_width as u64 * element_bytes as u64
         }),
@@ -1299,12 +1267,7 @@ fn plan(
             .any(|call| call.is(Capability::CausalLm))
     });
     let cache = if text && !dedicated && holds_text {
-        let cache = CachePlan::plan(
-            interface,
-            model.handle(),
-            block_size,
-            prefix_cache_dtype.as_deref(),
-        )?;
+        let cache = CachePlan::plan(model.handle(), block_size, prefix_cache_dtype.as_deref())?;
         let total = match device {
             Device::Cuda(index) => total_bytes(index)?,
             Device::Cpu => 0,
@@ -1327,7 +1290,6 @@ fn plan(
         layout.reserve(
             config.device,
             reserved_bytes(
-                interface,
                 model,
                 config,
                 layout.info().request_slots as usize,
@@ -1351,7 +1313,6 @@ fn plan(
         layout.reserve(
             config.device,
             diffusion_lm::reserved_bytes(
-                interface,
                 model,
                 components,
                 expert_exchange(launch),

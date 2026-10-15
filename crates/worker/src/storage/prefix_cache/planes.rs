@@ -26,8 +26,7 @@ use tvm_ffi::Any;
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
 use super::plan::CachePlan;
-use crate::ffi::{Backing, DType, DeferredCall, Device, Function, Handle, strings};
-use crate::model::interface::Interface;
+use crate::ffi::{Backing, DType, DeferredCall, Device, Function, Handle, Interpreter, strings};
 use crate::storage::memory::{Memory, StorageView};
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
@@ -431,16 +430,12 @@ pub struct UnitColumn {
 }
 
 /// The library class of the scattered unit resets.
-const UNIT_RESETS: &str = "uniserve.interface.cache.UnitResets";
+const UNIT_RESETS: &str = "uniserve.prefix_cache.units.UnitResets";
 
 impl UnitColumn {
     /// Allocate a column for `planes` and construct the library's
     /// `UnitResets` over it on `stream` (`None` for a CPU pool).
-    pub fn bind(
-        planes: &CachePlanes,
-        interface: &Interface,
-        stream: Option<&Stream>,
-    ) -> Result<Self> {
+    pub fn bind(planes: &CachePlanes, stream: Option<&Stream>) -> Result<Self> {
         let count = i64::from(planes.num_units);
         let memory = allocate(planes.device, planes.num_units as usize * 8)?;
         let units = StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[count])?;
@@ -450,8 +445,8 @@ impl UnitColumn {
             Any::from(stream.map_or(0, |stream| stream.raw() as i64)),
         ];
         arguments.extend(planes.field_arguments()?);
-        let resets = Handle::new(interface.import(UNIT_RESETS)?.call_values(&arguments)?)?;
-        let method = |name: &str| interface.import(&format!("{UNIT_RESETS}.{name}"));
+        let resets = Handle::new(Interpreter::import(UNIT_RESETS)?.call_values(&arguments)?)?;
+        let method = |name: &str| Interpreter::import(&format!("{UNIT_RESETS}.{name}"));
         Ok(Self {
             units,
             stream: stream.map(Stream::raw),

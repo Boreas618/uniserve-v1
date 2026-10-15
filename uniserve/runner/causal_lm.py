@@ -84,7 +84,7 @@ __all__ = ["CausalLMRunner"]
 
 def _causal_lm(loaded):
     """The causal LM of a loaded model, or ``None`` on a rank without one."""
-    from uniserve.interface.loading import capability
+    from uniserve.loading.rank import capability
     from uniserve.models import CausalLM
 
     return capability(loaded.module, CausalLM)

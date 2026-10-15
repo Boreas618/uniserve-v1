@@ -16,9 +16,8 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 
-use crate::ffi::{DType, Function, Handle, integers};
+use crate::ffi::{DType, Function, Handle, Interpreter, integers};
 use crate::lane::Job;
-use crate::model::interface::Interface;
 use crate::request::diffusion::{BranchSource, Prefix};
 use crate::runner::methods::{Argument, MethodCall};
 use crate::runner::vision::{FeatureInjection, FeatureLayout, PositionLayout};
@@ -151,9 +150,9 @@ impl ImageModel {
     /// Read a loaded model's image facts from the runners that own them:
     /// the image policy from `EncoderRunner`, the latent layout from
     /// `DenoiserRunner` and the pixel range from `DecoderRunner`.
-    pub(crate) fn describe(interface: &Interface, loaded: &Handle) -> Result<Self> {
-        let encoder = |name: &str| interface.import(&format!("{ENCODER}.{name}"));
-        let denoiser = |name: &str| interface.import(&format!("{DENOISER}.{name}"));
+    pub(crate) fn describe(loaded: &Handle) -> Result<Self> {
+        let encoder = |name: &str| Interpreter::import(&format!("{ENCODER}.{name}"));
+        let denoiser = |name: &str| Interpreter::import(&format!("{DENOISER}.{name}"));
         let model = [loaded.view()];
 
         let processing = if encoder("processes_images")?.call_as::<bool>(&model)? {
@@ -263,9 +262,8 @@ impl ImageModel {
             }
         };
 
-        let range: tvm_ffi::Array<f64> = interface
-            .import(&format!("{DECODER}.value_range"))?
-            .call_as(&model)?;
+        let range: tvm_ffi::Array<f64> =
+            Interpreter::import(&format!("{DECODER}.value_range"))?.call_as(&model)?;
         let range: Vec<f64> = range.iter().collect();
         let decoder_range = match range[..] {
             [] => None,
@@ -295,13 +293,13 @@ pub(crate) struct ImagePolicy {
 }
 
 impl ImagePolicy {
-    pub(crate) fn new(interface: &Interface, loaded: Handle) -> Result<Self> {
+    pub(crate) fn new(loaded: Handle) -> Result<Self> {
         Ok(Self {
             loaded,
-            prepare_input: interface.import(&format!("{ENCODER}.prepare_image"))?,
-            image_facts: interface.import(&format!("{ENCODER}.image_facts"))?,
-            patch_grid: interface.import(&format!("{ENCODER}.patch_grid"))?,
-            guidance_prefix: interface.import(&format!("{DENOISER}.guidance_prefix"))?,
+            prepare_input: Interpreter::import(&format!("{ENCODER}.prepare_image"))?,
+            image_facts: Interpreter::import(&format!("{ENCODER}.image_facts"))?,
+            patch_grid: Interpreter::import(&format!("{ENCODER}.patch_grid"))?,
+            guidance_prefix: Interpreter::import(&format!("{DENOISER}.guidance_prefix"))?,
         })
     }
 

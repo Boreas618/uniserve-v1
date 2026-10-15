@@ -17,11 +17,11 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve import interface
-from uniserve.interface import cache
 from uniserve.models import CausalLM, TransformerDecoder
 from uniserve.nn.attention import Attention
+from uniserve.prefix_cache import plan as cache
 from uniserve.prefix_cache.units import UnitPool
+from uniserve.worker import import_path
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -144,7 +144,7 @@ def _transfer(transport, source_dtype, destination_dtype, block_sizes, devices):
     destination_units = _units(destination_plan, 3)
     result = _harness()["cache_transfer"](
         {
-            "interface": interface.table(),
+            "import": import_path,
             "source_plan": source_plan,
             "destination_plan": destination_plan,
             "num_units": NUM_UNITS,

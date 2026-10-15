@@ -32,7 +32,7 @@ the lifetime of the backing belong to its owner.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import gcd
 
@@ -491,3 +491,83 @@ class UnitPool:
             return
         for field in _FIELDS:
             self._fields[f"{field}.initialized"].index_fill_(1, index, True)
+
+
+def stream_scope(stream: int, device: torch.device) -> Callable:
+    """Return a factory of scopes enqueuing on the Rust-owned ``stream``.
+
+    Host tensors need no stream. The external stream is wrapped once, at
+    bind time; each call enters a fresh scope.
+    """
+    from contextlib import nullcontext
+
+    if device.type != "cuda":
+        return nullcontext
+    external = torch.cuda.ExternalStream(stream, device=device)
+    return lambda: torch.cuda.stream(external)
+
+
+def named_fields(
+    names: Sequence[str], fields: Sequence[torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """The pool's unit fields by name."""
+    return {str(name): field for name, field in zip(names, fields, strict=True)}
+
+
+class UnitResets:
+    """Scattered unit resets over Rust-owned unit fields, on one stream.
+
+    Args:
+        units: An int64 ``[num_units]`` column on the pool's device. Rust
+            writes the unit ids into ``units[:count]`` before each call.
+        stream: The stream handle every reset is enqueued on.
+        names: The name of each of ``fields``: ``{key,value}.values``,
+            ``{key,value}.initialized`` and, for FP8, ``{key,value}.scale``.
+        fields: The pool's unit fields, each with a ``[columns, num_units]``
+            leading layout.
+
+    Each method takes ``count`` and is one indexed fill per field, without
+    a host read.
+    """
+
+    def __init__(
+        self,
+        units: torch.Tensor,
+        stream: int,
+        names: Sequence[str],
+        *fields: torch.Tensor,
+    ) -> None:
+        named = named_fields(names, fields)
+        for name in ("key.values", "value.values"):
+            if name not in named:
+                raise ValueError(f"the unit fields lack {name!r}")
+        self._fields = named
+        self._units = units
+        self._scope = stream_scope(int(stream), units.device)
+        self._values = [name for name in named if name.endswith(".values")]
+        self._flags = [name for name in named if name.endswith(".initialized")]
+        self._scales = [name for name in named if name.endswith(".scale")]
+
+    def _fill(self, count: int, selected: Sequence[str], value) -> None:
+        index = self._units[: int(count)]
+        with self._scope():
+            for name in selected:
+                self._fields[name].index_fill_(1, index, value)
+
+    def zero(self, count: int) -> None:
+        """Clear values and flags and reset scales to one."""
+        self._fill(count, self._values + self._flags, 0)
+        self._fill(count, self._scales, 1)
+
+    def recycle(self, count: int) -> None:
+        """Clear flags and reset scales.
+
+        The reset of a quantized pool of one element type; Rust zeroes
+        mixed-type pools and skips dense pools of one type.
+        """
+        self._fill(count, self._flags, 0)
+        self._fill(count, self._scales, 1)
+
+    def mark_initialized(self, count: int) -> None:
+        """Set both fields' flags."""
+        self._fill(count, self._flags, 1)

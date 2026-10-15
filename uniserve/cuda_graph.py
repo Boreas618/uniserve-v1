@@ -11,14 +11,14 @@ on; a binding whose step does work around its graph replays it with
 binding's fixed buffers, so running it needs no copies. A binding's
 ``release(graph)`` calls :meth:`BreakableCUDAGraph.release`.
 
-The interface entry ``graphs.pool`` creates the allocator pools Rust
-assigns to graph owners. ``graphs.capture_begin`` and ``graphs.capture_end``
+:func:`pool` creates the allocator pools Rust assigns to graph owners.
+:func:`capture_begin` and :func:`capture_end`
 let Rust capture the work between them: runner methods it calls, or work it
 submits itself, possibly from several host threads on streams forked from
 the capturing one (expert joins of all microbatches). Where such a forward
 reaches work a graph cannot record, :func:`break_graph` ends the segment and
 begins the next, and Rust performs the work between the two at every
-launch. ``graphs.release`` releases such a graph. Importing this module does
+launch. :func:`release` releases such a graph. Importing this module does
 not initialize CUDA.
 """
 
@@ -41,22 +41,12 @@ __all__ = [
     "break_graph",
     "capture",
     "export",
-    "functions",
     "pool",
     "pool_bytes",
 ]
 
 # The capture begun by ``capture_begin`` and not yet ended.
 _capturing: Capture | None = None
-
-
-def functions() -> dict[str, Callable[..., Any]]:
-    return {
-        "graphs.pool": pool,
-        "graphs.capture_begin": capture_begin,
-        "graphs.capture_end": capture_end,
-        "graphs.release": release,
-    }
 
 
 def pool(device: int) -> list[Any]:

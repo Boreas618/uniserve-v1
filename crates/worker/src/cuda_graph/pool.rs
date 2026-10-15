@@ -188,7 +188,7 @@ pub fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
 ///
 /// With `share`, the owner borrows that registered owner's pools (owners on
 /// one stream run serially, so they can share intermediates); devices it
-/// has no pool on get a new one. `create` is the interface's `graphs.pool`,
+/// has no pool on get a new one. `create` is `uniserve.cuda_graph.pool`,
 /// returning `[pool, id_a, id_b, total_bytes]`. The owner is registered only
 /// after every pool exists, so a failure leaves the storage unchanged.
 pub fn reserve_pools(

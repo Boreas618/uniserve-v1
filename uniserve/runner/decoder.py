@@ -22,9 +22,8 @@ from typing import Any, Protocol, cast
 import torch
 
 from uniserve.bindings.context import ExecutionContext, TensorBuffers
-from uniserve.interface import calls
-from uniserve.interface.errors import SetupError
-from uniserve.interface.loading import capability
+from uniserve.errors import SetupError
+from uniserve.loading.rank import capability
 from uniserve.media import image, video
 from uniserve.media.pixels import quantize_image_hwc
 from uniserve.models import (
@@ -33,7 +32,13 @@ from uniserve.models import (
     VideoDecoder,
     VideoPostprocessor,
 )
-from uniserve.runner.context import execution_context, kernel_records
+from uniserve.runner.context import (
+    execution_context,
+    kernel_records,
+    local,
+    scope,
+    write,
+)
 from uniserve.tensors import BufferConfig
 
 __all__ = ["DecoderRunner"]
@@ -375,7 +380,7 @@ class DecoderRunner:
         ``image`` holds values in ``[low, high]``; its HWC pixels land at
         ``offset`` of the staging bytes. Returns their byte count.
         """
-        with calls.scope(self._context):
+        with scope(self._context):
             return self._stage(
                 image,
                 float(low),
@@ -393,7 +398,7 @@ class DecoderRunner:
         if offset < 0 or offset + count > staging.numel():
             raise ValueError("image pixels exceed the decoder staging")
         staging[offset : offset + count].copy_(
-            calls.local(pixels.reshape(-1), staging.device)
+            local(pixels.reshape(-1), staging.device)
         )
         return count
 
@@ -408,7 +413,7 @@ class DecoderRunner:
         if len(described) != len(images):
             raise ValueError("decoder rows and image products must align")
         low, high = (float(value) for value in decoder.decoder.value_range)
-        with calls.scope(context):
+        with scope(context):
             # A decoder placed on a generation tower reads its latents there.
             values = decoder.decode(
                 tuple(
@@ -427,7 +432,7 @@ class DecoderRunner:
                 values, described, images, strict=True
             ):
                 if product is not None:
-                    calls.write(product, value)
+                    write(product, value)
                 counts.append(self._stage(value, low, high, row[4]))
             return counts
 
