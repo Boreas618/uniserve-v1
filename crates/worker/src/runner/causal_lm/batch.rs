@@ -28,7 +28,7 @@ use crate::ffi::Device;
 use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
-use crate::sampling::SamplingMetadata;
+use crate::sampling::SamplingControls;
 use crate::storage::{OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar};
 use crate::transfer::Retirement;
 use crate::worker::RankStorage;
@@ -48,7 +48,7 @@ pub(super) struct CallState {
     pub(super) microbatch: usize,
     /// The call's input index among its invocation's sampled tasks.
     pub(super) task: Option<usize>,
-    pub(super) metadata: Option<SamplingMetadata>,
+    pub(super) controls: Option<SamplingControls>,
     /// The call's prompt chunks, in order.
     pub(super) prompt: Vec<super::step::PromptScore>,
 }
@@ -184,7 +184,7 @@ impl Opening {
                 completion_write: None,
                 microbatch: lane,
                 task: None,
-                metadata: None,
+                controls: None,
                 prompt: Vec::new(),
             });
         }

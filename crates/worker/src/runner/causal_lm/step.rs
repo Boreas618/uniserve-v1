@@ -10,7 +10,7 @@
 //! projects all of its rows; they score its tokens, its last row also
 //! samples. A decode invocation whose calls all qualify uses the decode
 //! forward's greedy selections, made with each call's finish tokens;
-//! otherwise the tasks form a [`SamplingPlan`].
+//! otherwise the tasks form the forward's [`SamplingMetadata`].
 
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
@@ -26,8 +26,9 @@ use crate::runner::causal_lm::{
     Embeddings, FINISH_IDS, PromptChunks, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };
 use crate::runner::denoiser::image::ConditionRow;
-use crate::sampling::SamplingMetadata;
-use crate::sampling::plan::{SampleTask, SamplingPlan, logprob_request, logprob_words};
+use crate::sampling::{
+    SampleTask, SamplingControls, SamplingMetadata, logprob_request, logprob_words,
+};
 use crate::storage::LogprobLayout;
 use crate::storage::memory::StorageView;
 use crate::worker::RankStorage;
@@ -59,7 +60,7 @@ pub(super) struct Invoked {
     /// The runner that ran it.
     pub(super) runner: usize,
     /// The tasks' plan; absent for greedy decode and unsampled calls.
-    pub(super) sampling: Option<SamplingPlan>,
+    pub(super) sampling: Option<SamplingMetadata>,
     pub(super) tasks: usize,
 }
 
@@ -133,7 +134,7 @@ struct Planned {
     /// Each row's finish tokens when the decode forward's greedy
     /// selections are final; empty otherwise.
     finish_ids: Vec<[i64; FINISH_IDS]>,
-    sampling: Option<SamplingPlan>,
+    sampling: Option<SamplingMetadata>,
     prompt: PromptChunks,
     tasks: usize,
 }
@@ -144,12 +145,12 @@ impl Planned {
             mode,
             rows: &self.rows,
             finish_ids: &self.finish_ids,
-            sampling: self.sampling.as_ref().map(|plan| SamplingColumns {
-                groups: &plan.groups,
-                draws: &plan.draws,
-                params: &plan.params,
-                slots: &plan.slots,
-                gates: &plan.gates,
+            sampling: self.sampling.as_ref().map(|metadata| SamplingColumns {
+                groups: &metadata.groups,
+                draws: &metadata.draws,
+                params: &metadata.params,
+                slots: &metadata.slots,
+                gates: &metadata.gates,
             }),
             prompt: &self.prompt,
             embeddings: &self.embeddings,
@@ -338,7 +339,7 @@ impl Batch<'_> {
             )?)
         };
         for (index, controls) in metadata {
-            self.calls[index].metadata = Some(controls);
+            self.calls[index].controls = Some(controls);
         }
 
         let invocations = planned
@@ -370,7 +371,7 @@ impl Batch<'_> {
         runner: usize,
         inputs: &[CallRows],
         params: &[Option<(SamplingParams, Vec<u32>)>],
-        metadata: &mut Vec<(usize, SamplingMetadata)>,
+        metadata: &mut Vec<(usize, SamplingControls)>,
     ) -> Result<Planned> {
         let plan = self.plan;
         // Each call's rows in the invocation (first and count) and its
@@ -415,7 +416,7 @@ impl Batch<'_> {
                 greedy = false;
                 continue;
             };
-            let (controls, draws) = calls::metadata(
+            let (controls, draws) = calls::controls(
                 call,
                 admitted,
                 finish,
@@ -501,7 +502,7 @@ impl Batch<'_> {
                         .as_ref()
                         .ok_or_else(|| Error::Invariant("sampled call lost its parameters".into()))?
                         .0,
-                    metadata: controls.clone(),
+                    controls: controls.clone(),
                     draws: draws.clone(),
                     slot: self.calls[*index].slot as u32,
                     row: *row,
@@ -518,7 +519,7 @@ impl Batch<'_> {
         let sampling = if tasks.is_empty() || greedy {
             None
         } else {
-            Some(SamplingPlan::build(
+            Some(SamplingMetadata::build(
                 &tasks,
                 vocab,
                 self.device.is_some(),
@@ -530,7 +531,7 @@ impl Batch<'_> {
         // Prompt words follow the sampled tasks' logprobs.
         let mut cursor = sampling
             .as_ref()
-            .and_then(SamplingPlan::logprob_end)
+            .and_then(SamplingMetadata::logprob_end)
             .unwrap_or(0);
         let mut prompt_chunks = PromptChunks::default();
         for (tail, &(index, span, token, continued)) in prompts.iter().enumerate() {

@@ -194,7 +194,7 @@ impl Batch<'_> {
                 prepared,
                 tables,
                 position,
-                state.metadata.as_ref(),
+                state.controls.as_ref(),
                 penalties,
             )?);
             if !state.prompt.is_empty() {

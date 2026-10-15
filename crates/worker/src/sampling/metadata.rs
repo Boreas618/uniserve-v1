@@ -1,6 +1,7 @@
-//! One forward's sampling tasks, grouped by sampler.
+//! The sampling metadata of one forward: its sampled calls, grouped by
+//! sampler.
 //!
-//! [`SamplingPlan::build`] validates every task on the host, groups tasks by
+//! [`SamplingMetadata::build`] validates every task on the host, groups tasks by
 //! [`SamplingPath`] in first-appearance order and produces:
 //!
 //! - one [`SamplingGroup`] per sampler: what the runner's sampling method
@@ -9,7 +10,7 @@
 //!   the runner's input tensors, with each task's slot and gate;
 //! - each group's logprob layout, so readback decodes the packed words.
 //!
-//! Tasks are reordered into groups; [`SamplingPlan::position`] maps an input
+//! Tasks are reordered into groups; [`SamplingMetadata::position`] maps an input
 //! task to its output position (its column in the selection outputs).
 //!
 //! A token set crosses in the form the sampler indexes with. A per-task set
@@ -23,7 +24,7 @@
 use indexmap::IndexMap;
 use uniserve_core::SamplingParams;
 
-use super::{SamplingMetadata, SamplingPath, TOKEN_VALUE_MASK};
+use super::{SamplingControls, SamplingPath, TOKEN_VALUE_MASK};
 use crate::storage::LogprobLayout;
 use crate::{Error, Result};
 
@@ -34,7 +35,7 @@ pub(crate) const PARAMETER_COLUMNS: usize = 8;
 /// One sampled call of an invocation.
 pub(crate) struct SampleTask<'a> {
     pub(crate) params: &'a SamplingParams,
-    pub(crate) metadata: SamplingMetadata,
+    pub(crate) controls: SamplingControls,
     /// Per candidate row; absent for the unshaped greedy path.
     pub(crate) draws: Option<Vec<f32>>,
     pub(crate) slot: u32,
@@ -46,7 +47,7 @@ pub(crate) struct SampleTask<'a> {
 
 impl SampleTask<'_> {
     fn rows(&self) -> usize {
-        self.metadata.allowed.len()
+        self.controls.allowed.len()
     }
 }
 
@@ -179,17 +180,17 @@ impl SamplingGroup {
     /// Add `task`, whose candidate rows follow the group's so far.
     fn push(&mut self, task: &SampleTask<'_>, vocab: usize) {
         let params = task.params;
-        let metadata = &task.metadata;
+        let controls = &task.controls;
         let index = self.rows.len() as i64;
         let first_row = self.top_ks.len();
         let rows = task.rows();
         self.rows.push(task.row as i64);
         self.row_counts.push(rows as i64);
-        self.force_finish.push(i64::from(metadata.force_finish));
+        self.force_finish.push(i64::from(controls.force_finish));
         self.drafts
-            .extend(metadata.draft_token_ids.iter().map(|&id| i64::from(id)));
+            .extend(controls.draft_token_ids.iter().map(|&id| i64::from(id)));
         self.terminal_prefixes
-            .push(metadata.terminal_draft_prefix.unwrap_or(0) as i64);
+            .push(controls.terminal_draft_prefix.unwrap_or(0) as i64);
         if params.generated_logprobs_requested() {
             self.logprob_tasks.push(index);
         }
@@ -197,7 +198,7 @@ impl SamplingGroup {
         let top_k = params.top_k as usize;
         let top_k = if top_k < vocab { top_k } else { 0 };
         let penalized = params.uses_penalties();
-        for (offset, allowed) in metadata.allowed.iter().enumerate() {
+        for (offset, allowed) in controls.allowed.iter().enumerate() {
             let row = first_row + offset;
             self.top_ks.push(top_k as i64);
             if top_k == 0 && params.top_p > 0.0 && params.top_p < 1.0 {
@@ -214,14 +215,14 @@ impl SamplingGroup {
                 self.allowed.extend(scatter(row, tokens, vocab));
             }
             self.suppressed
-                .extend(scatter(row, &metadata.suppress, vocab));
+                .extend(scatter(row, &controls.suppress, vocab));
             if penalized {
                 // A row's counts include the draft tokens before it.
                 let counted = self.penalty_rows.len();
                 self.penalty_rows.push(row as i64);
                 self.penalty_slots.push(i64::from(task.slot));
                 self.penalty_drafts.extend(
-                    metadata.draft_token_ids[..offset]
+                    controls.draft_token_ids[..offset]
                         .iter()
                         .map(|&token| (counted * vocab + token as usize) as i64),
                 );
@@ -236,8 +237,10 @@ impl SamplingGroup {
     }
 }
 
-/// The sampling inputs of one forward.
-pub(crate) struct SamplingPlan {
+/// The sampling metadata of one forward: its sampled calls grouped by
+/// sampler, and the per-row parameters and draws it fills into the
+/// runner's parameter tensors.
+pub(crate) struct SamplingMetadata {
     pub(crate) groups: Vec<SamplingGroup>,
     pub(crate) draws: Vec<f32>,
     pub(crate) params: Vec<f32>,
@@ -250,7 +253,7 @@ pub(crate) struct SamplingPlan {
     pub(crate) logprobs: Vec<Option<GroupLogprobs>>,
 }
 
-impl SamplingPlan {
+impl SamplingMetadata {
     /// Validate and group `tasks`. `vocab` is the global vocabulary,
     /// `logprob_base` the first free word of the logprob tensor and
     /// `logprob_capacity` its size.
@@ -270,7 +273,7 @@ impl SamplingPlan {
         for (index, task) in tasks.iter().enumerate() {
             validate(task, vocab)?;
             paths
-                .entry(task.metadata.path(task.params, vocab, cuda))
+                .entry(task.controls.path(task.params, vocab, cuda))
                 .or_default()
                 .push(index);
         }
@@ -304,9 +307,9 @@ impl SamplingPlan {
                 slots.push(i64::from(task.slot));
                 gates.push(i64::from(task.gated));
                 group.push(task, vocab);
-                finish.push(task.metadata.finish_token_ids.as_slice());
-                transitions.push(if task.metadata.return_transition {
-                    task.metadata.transition_token_ids.as_slice()
+                finish.push(task.controls.finish_token_ids.as_slice());
+                transitions.push(if task.controls.return_transition {
+                    task.controls.transition_token_ids.as_slice()
                 } else {
                     &[]
                 });
@@ -384,7 +387,7 @@ impl SamplingPlan {
             .then_some((entry.offset, entry.words, local))
     }
 
-    /// Words of the logprob column this plan writes after its base.
+    /// Words of the logprob column these tasks write after its base.
     pub(crate) fn logprob_end(&self) -> Option<usize> {
         self.logprobs
             .iter()
@@ -427,12 +430,12 @@ fn parameters(params: &SamplingParams) -> [f32; PARAMETER_COLUMNS] {
 /// Host-only checks; no device value is read.
 fn validate(task: &SampleTask<'_>, vocab: usize) -> Result<()> {
     let rows = task.rows();
-    if rows == 0 || rows != task.metadata.draft_token_ids.len() + 1 {
+    if rows == 0 || rows != task.controls.draft_token_ids.len() + 1 {
         return Err(Error::Invalid(
             "sampling rows must cover the draft chain and bonus token".into(),
         ));
     }
-    if task.metadata.device_greedy(task.params) {
+    if task.controls.device_greedy(task.params) {
         if task.draws.is_some() || rows != 1 {
             return Err(Error::Invalid(
                 "greedy sampling task has shaped metadata".into(),
@@ -444,7 +447,7 @@ fn validate(task: &SampleTask<'_>, vocab: usize) -> Result<()> {
         ));
     }
     if task
-        .metadata
+        .controls
         .draft_token_ids
         .iter()
         .any(|&token| token as usize >= vocab)
@@ -467,9 +470,9 @@ mod tests {
     fn task<'a>(params: &'a SamplingParams, row: usize, draws: Option<Vec<f32>>) -> SampleTask<'a> {
         SampleTask {
             params,
-            metadata: SamplingMetadata {
+            controls: SamplingControls {
                 allowed: vec![None],
-                ..SamplingMetadata::default()
+                ..SamplingControls::default()
             },
             draws,
             slot: 3,
@@ -490,16 +493,18 @@ mod tests {
             task(&greedy, 1, None),
             task(&stochastic, 2, Some(vec![0.5])),
         ];
-        let plan = SamplingPlan::build(&tasks, 100, false, 10, 1000)?;
+        let metadata = SamplingMetadata::build(&tasks, 100, false, 10, 1000)?;
         // Categorical tasks first (first appearance), then greedy.
         assert_eq!(
-            (0..3).map(|index| plan.position(index)).collect::<Vec<_>>(),
+            (0..3)
+                .map(|index| metadata.position(index))
+                .collect::<Vec<_>>(),
             vec![0, 2, 1]
         );
         // Categorical group: tasks 0 and 2 at output positions 0 and 1,
         // parameter rows from 0, logprobs at 10 for both tasks with the
         // explicit ids deduplicated and kept inside the vocabulary.
-        let categorical = &plan.groups[0];
+        let categorical = &metadata.groups[0];
         assert_eq!(categorical.path, SamplingPath::Categorical);
         assert_eq!((categorical.first, categorical.parameters), (0, 0));
         assert_eq!(categorical.rows, vec![0, 2]);
@@ -509,7 +514,7 @@ mod tests {
         assert_eq!(categorical.logprob_offset, 10);
         // Greedy group: task 1 at output position 2, parameter row 2, with
         // one padded column of finish and transition tokens.
-        let greedy_group = &plan.groups[1];
+        let greedy_group = &metadata.groups[1];
         assert_eq!(
             greedy_group.path,
             SamplingPath::Greedy { suppressed: false }
@@ -518,16 +523,16 @@ mod tests {
         assert_eq!(greedy_group.rows, vec![1]);
         assert_eq!(greedy_group.finish_ids, vec![-1]);
         assert_eq!(greedy_group.transition_ids, vec![-1]);
-        assert_eq!(plan.draws, vec![0.25, 0.5, 0.0]);
-        assert_eq!(plan.params.len(), 3 * PARAMETER_COLUMNS);
-        assert_eq!(plan.logprob_span(2), Some((10, 22, 1)));
-        assert_eq!(plan.logprob_span(1), None);
-        assert_eq!(plan.logprob_end(), Some(32));
-        assert_eq!(plan.slots, vec![3, 3, 3]);
+        assert_eq!(metadata.draws, vec![0.25, 0.5, 0.0]);
+        assert_eq!(metadata.params.len(), 3 * PARAMETER_COLUMNS);
+        assert_eq!(metadata.logprob_span(2), Some((10, 22, 1)));
+        assert_eq!(metadata.logprob_span(1), None);
+        assert_eq!(metadata.logprob_end(), Some(32));
+        assert_eq!(metadata.slots, vec![3, 3, 3]);
 
-        assert!(SamplingPlan::build(&tasks, 100, false, 990, 1000).is_err());
+        assert!(SamplingMetadata::build(&tasks, 100, false, 990, 1000).is_err());
         let invalid = [task(&stochastic, 0, None)];
-        assert!(SamplingPlan::build(&invalid, 100, false, 0, 1000).is_err());
+        assert!(SamplingMetadata::build(&invalid, 100, false, 0, 1000).is_err());
         Ok(())
     }
 }
