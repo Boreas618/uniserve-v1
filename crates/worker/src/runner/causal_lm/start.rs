@@ -14,6 +14,8 @@ use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::CausalLMRunners;
+use crate::config::placement::Components;
+use crate::config::placement::RunnerKind;
 use crate::config::{Device, PREFILL_ROW_BUCKETS, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
@@ -21,9 +23,6 @@ use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::{DType, Handle, Interpreter};
 use crate::lane::Lanes;
-use crate::model::LoadedModel;
-use crate::model::components::RunnerKind;
-use crate::model::registry::Components;
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::{
     CausalLMRunner, Construction, Dimensions, RunnerParts, TableShape, methods, model_dtype,
@@ -31,6 +30,7 @@ use crate::runner::causal_lm::{
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::scratch::Scratches;
 use crate::storage::{CachePlan, OutputPool, PrefixCache};
+use crate::worker::LoadedModel;
 use crate::{Error, Result};
 
 use crate::parallel::{DwdpManager, ExpertUnion, PeerGroup};

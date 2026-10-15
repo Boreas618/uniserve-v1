@@ -5,9 +5,9 @@ use uniserve_ipc::MediaCall;
 
 use super::runners::DenoiserRunners;
 use super::{Conditioning, DenoiserRunner};
+use crate::config::placement::Placed;
 use crate::executor::forward::batch::extent;
 use crate::ffi::{DType, Device, Interpreter};
-use crate::model::registry::Placed;
 use crate::runner::component::{Component, DENOISER_GRAPHS, VideoSetup, placed_device};
 use crate::{Error, Result};
 
@@ -55,7 +55,7 @@ impl DenoiserRunners {
         let mut conditioner = None;
         for call in &placed.calls {
             let encodes =
-                call.method == "encode" && call.is(crate::model::components::Capability::Encoder);
+                call.method == "encode" && call.is(crate::config::placement::Capability::Encoder);
             let path = Any::from(tvm_ffi::String::from(call.path.as_str()));
             if encodes && holds.call_as::<bool>(&[loaded.view(), (&path).into()])? {
                 conditioner = Some(call);

@@ -6,6 +6,7 @@
 
 mod device;
 mod launch;
+pub mod placement;
 
 pub use device::{Device, generation_device};
 pub use launch::{
