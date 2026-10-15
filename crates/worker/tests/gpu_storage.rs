@@ -741,7 +741,7 @@ fn cache_planes_reset_scratch_and_restore_snapshots() {
     assert_eq!(plan.info(6).unit_bytes, 276);
     let planes =
         uniserve_worker::CachePlanes::allocate(plan, Some(DEVICE), 6, Some(&stream)).unwrap();
-    let views: std::collections::HashMap<_, _> = planes.views().unwrap().into_iter().collect();
+    let views: std::collections::HashMap<_, _> = planes.views().into_iter().collect();
     assert_eq!(views["key.values"].shape(), &[2, 6, 64]);
     assert_eq!(views["key.scale"].shape(), &[2, 6]);
     assert!(

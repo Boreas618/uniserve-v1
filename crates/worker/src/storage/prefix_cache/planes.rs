@@ -45,6 +45,10 @@ pub struct CachePlanes {
     values: [Arc<Memory>; 2],
     scales: Option<[Arc<Memory>; 2]>,
     initialized: [Arc<Memory>; 2],
+    /// Each field's whole view, keyed as the numerical library reads it.
+    /// Every binding passes these views, so each field is wrapped as a
+    /// torch tensor once.
+    fields: Vec<(String, StorageView)>,
 }
 
 fn allocate(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
@@ -103,14 +107,16 @@ impl CachePlanes {
         } else {
             None
         };
-        let planes = Self {
+        let mut planes = Self {
             plan,
             device,
             num_units,
             values,
             scales,
             initialized,
+            fields: Vec::new(),
         };
+        planes.fields = planes.field_views()?;
 
         // One row spanning each allocation.
         let whole = |address: u64, value: u32, width: usize, count: usize| RowFill {
@@ -167,17 +173,22 @@ impl CachePlanes {
     /// The pool's unit fields as the library's cache classes take them: the
     /// list of their names, then one tensor per field.
     pub fn field_arguments(&self) -> Result<Vec<Any>> {
-        let fields = self.views()?;
-        let mut arguments = vec![Any::from(strings(fields.iter().map(|(name, _)| name)))];
-        for (_, view) in &fields {
-            arguments.push(Any::from(view.to_tensor()?));
+        let names = strings(self.fields.iter().map(|(name, _)| name));
+        let mut arguments = vec![Any::from(names)];
+        for (_, view) in &self.fields {
+            arguments.push(view.handle()?.to_any());
         }
         Ok(arguments)
     }
 
     /// The bound field tensors' views, keyed as the numerical library reads
     /// them (`key.values`, `key.scale`, `key.initialized`, ...).
-    pub fn views(&self) -> Result<Vec<(String, StorageView)>> {
+    pub fn views(&self) -> Vec<(String, StorageView)> {
+        self.fields.clone()
+    }
+
+    /// Each field's whole view, in storage order.
+    fn field_views(&self) -> Result<Vec<(String, StorageView)>> {
         let columns = i64::from(self.plan.columns);
         let units = i64::from(self.num_units);
         let mut views = Vec::new();
@@ -441,7 +452,7 @@ impl UnitColumn {
         let units = StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[count])?;
 
         let mut arguments = vec![
-            Any::from(units.to_tensor()?),
+            units.handle()?.to_any(),
             Any::from(stream.map_or(0, |stream| stream.raw() as i64)),
         ];
         arguments.extend(planes.field_arguments()?);

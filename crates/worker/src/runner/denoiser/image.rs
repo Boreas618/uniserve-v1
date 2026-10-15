@@ -298,7 +298,7 @@ impl ImageDiffusion {
                 .iter()
                 .find(|(table, _)| table == name)
                 .ok_or_else(|| Error::Invariant(format!("the prefix cache has no {name}")))?;
-            Ok(Any::from(view.to_tensor()?))
+            Ok(view.handle()?.to_any())
         };
         let method = |name: &str| Interpreter::import(&format!("{RUNNER}.{name}"));
         let mut arguments = setup.arguments();
@@ -310,8 +310,8 @@ impl ImageDiffusion {
             Any::from(capacity.width as i64),
             Any::from(integer_list(storage.page_tokens.iter().copied())),
             Any::from(integer_list(storage.windowed.iter().copied())),
-            Any::from(storage.samples.to_tensor()?),
-            Any::from(storage.slot_timesteps.to_tensor()?),
+            storage.samples.handle()?.to_any(),
+            storage.slot_timesteps.handle()?.to_any(),
             slot_table("unit_tables")?,
             slot_table("start_pages")?,
             slot_table("table_shapes")?,

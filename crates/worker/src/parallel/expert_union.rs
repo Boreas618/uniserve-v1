@@ -470,7 +470,7 @@ impl ExpertUnion {
             };
             // This rank's view of the mapped storage and every member's
             // address of its share; neither without mapped storage.
-            let (storage, pointers) = match &symmetric {
+            let (view, pointers) = match &symmetric {
                 Some(storage) => {
                     let view = crate::storage::memory::StorageView::whole(
                         Arc::clone(storage.local()) as Arc<dyn crate::ffi::Backing>,
@@ -479,24 +479,31 @@ impl ExpertUnion {
                     let base = storage.peers().address();
                     let pointers = (0..size)
                         .map(|member| (base + (member * storage.bytes_each()) as u64) as i64);
-                    (Any::from(view.to_tensor()?), integer_list(pointers))
+                    (Some(view), integer_list(pointers))
                 }
-                None => (Any::default(), integer_list([])),
+                None => (None, integer_list([])),
             };
-            let created = functions.create.call_values(&[
-                start.model.handle().to_any(),
-                Any::from(tvm_ffi::String::from(transport.as_str())),
-                Any::from(rank as i64),
-                Any::from(size as i64),
-                Any::from(union.attention_ranks as i64),
-                bootstrap.clone(),
-                Any::from(max_tokens as i64),
-                Any::from(i64::from(device)),
-                Any::from(stream.raw() as i64),
-                yield_turn.clone().unwrap_or_default(),
-                storage,
-                Any::from(pointers),
-            ])?;
+            // The view's wrapping and the call take one handoff.
+            let created = Interpreter::execute(|| -> Result<Any> {
+                let storage = match &view {
+                    Some(view) => view.handle()?.to_any(),
+                    None => Any::default(),
+                };
+                functions.create.call_values(&[
+                    start.model.handle().to_any(),
+                    Any::from(tvm_ffi::String::from(transport.as_str())),
+                    Any::from(rank as i64),
+                    Any::from(size as i64),
+                    Any::from(union.attention_ranks as i64),
+                    bootstrap.clone(),
+                    Any::from(max_tokens as i64),
+                    Any::from(i64::from(device)),
+                    Any::from(stream.raw() as i64),
+                    yield_turn.clone().unwrap_or_default(),
+                    storage,
+                    Any::from(pointers),
+                ])
+            })?;
             runtime.microbatches.push(Microbatch {
                 exchange: Handle::new(created)?,
                 stream,
