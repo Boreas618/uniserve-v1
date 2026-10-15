@@ -137,7 +137,8 @@ pub struct IntegrateRow {
     /// each other in evaluation order.
     pub prediction: u32,
     pub branches: BranchSet,
-    pub plan: Handle,
+    /// The image parameters its schedules and guidance are made from.
+    pub params: Arc<ImageParams>,
 }
 
 /// The rows' predictions of one evaluation.
@@ -385,26 +386,24 @@ impl ImageDiffusion {
         ));
     }
 
-    /// The guidance plan of a `steps`-step image from what its plan call
-    /// returned: the plan object, the model timestep of each solver step
-    /// and the branch mask of each step.
-    pub(crate) fn planned(&self, steps: usize, values: Vec<Value>) -> Result<GuidancePlan> {
+    /// The guidance plan of an image of `params` from what its plan call
+    /// returned: the model timestep of each solver step and the branch mask
+    /// of each step.
+    pub(crate) fn planned(
+        &self,
+        params: Arc<ImageParams>,
+        values: Vec<Value>,
+    ) -> Result<GuidancePlan> {
         let name = self.methods.plan.name();
-        let Ok([Value::Object(handle), timesteps, Value::Integers(masks)]) =
-            <[Value; 3]>::try_from(values)
-        else {
+        let steps = usize::from(params.steps);
+        let Ok([timesteps, Value::Integers(masks)]) = <[Value; 2]>::try_from(values) else {
             return Err(Error::Interface(format!(
-                "{name} returns [plan, timesteps, branches]"
+                "{name} returns [timesteps, branches]"
             )));
         };
         let timesteps: Vec<f32> = match timesteps {
             Value::Floats(times) => times.into_iter().map(|time| time as f32).collect(),
             Value::Integers(times) => times.into_iter().map(|time| time as f32).collect(),
-            Value::Object(_) => {
-                return Err(Error::Interface(format!(
-                    "{name} returns its timesteps as numbers"
-                )));
-            }
         };
         let branches = masks
             .into_iter()
@@ -421,7 +420,7 @@ impl ImageDiffusion {
             )));
         }
         Ok(GuidancePlan {
-            handle,
+            params,
             timesteps,
             branches,
         })
@@ -685,7 +684,29 @@ impl ImageDiffusion {
                     .collect(),
             ),
         ];
-        arguments.extend(rows.iter().map(|row| Argument::Handle(row.plan.clone())));
+        // Each image's parameters, from which the solver update makes its
+        // schedules and guidance as the plan call did.
+        arguments.push(Argument::Floats(
+            rows.iter()
+                .flat_map(|row| {
+                    let params = &row.params;
+                    [
+                        f64::from(params.steps),
+                        f64::from(params.timestep_shift),
+                        f64::from(params.cfg_text_scale),
+                        f64::from(params.cfg_img_scale),
+                        f64::from(params.cfg_interval.0),
+                        f64::from(params.cfg_interval.1),
+                        f64::from(params.cfg_renorm_min),
+                    ]
+                })
+                .collect(),
+        ));
+        arguments.push(Argument::Texts(
+            rows.iter()
+                .map(|row| row.params.cfg_renorm_type.as_str().to_owned())
+                .collect(),
+        ));
         job.call(MethodCall::new(&self.methods.step, arguments));
     }
 
@@ -1065,7 +1086,7 @@ impl ImageBatch<'_> {
             slot,
             key,
             size,
-            steps: usize::from(image.steps),
+            params: Arc::new(image.clone()),
             prefixes,
         })
     }
@@ -1081,14 +1102,14 @@ impl ImageBatch<'_> {
             slot,
             key,
             size,
-            steps,
+            params,
             prefixes,
         } = planned;
         let diffusion = self
             .parts
             .diffusion()
             .ok_or_else(|| Error::Unsupported("image trajectories require a denoiser".into()))?;
-        let plan = diffusion.planned(steps, completion.values()?)?;
+        let plan = diffusion.planned(params, completion.values()?)?;
         let prefixes = prefixes
             .into_iter()
             .map(|(source, given)| {
@@ -1788,7 +1809,7 @@ impl ImageBatch<'_> {
                     step,
                     prediction: predicted.offsets[first],
                     branches: set,
-                    plan: open.plan.handle.clone(),
+                    params: Arc::clone(&open.plan.params),
                 });
             }
             self.parts

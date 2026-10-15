@@ -277,17 +277,16 @@ impl Completion {
 
 const MISSING: Error = Error::State("a job's completion lacks a result its builder recorded");
 
-/// One value of the list a value call returned ([`Job::call_values`]).
+/// One value of the list a value call returned ([`Job::call_values`]): a
+/// list of numbers.
 ///
 /// The list is converted on the thread that made the call, so its reader
-/// holds plain numbers and, for each object, the handle alone.
+/// holds plain numbers.
 pub(crate) enum Value {
     /// A shape or a list of integers.
     Integers(Vec<i64>),
     /// A list of numbers that are not all integers.
     Floats(Vec<f64>),
-    /// An object the library holds.
-    Object(Handle),
 }
 
 impl Value {
@@ -300,7 +299,7 @@ impl Value {
                 .map_err(numerical);
         }
         let Ok(numbers) = tvm_ffi::Array::<tvm_ffi::Any>::try_from(value.clone()) else {
-            return Ok(Self::Object(Handle::new(value)?));
+            return Err(Error::Interface(format!("{name} returns lists of numbers")));
         };
 
         let integer = tvm_ffi::TypeIndex::kTVMFFIInt as i32;
@@ -1212,7 +1211,6 @@ mod tests {
             "test.plan",
             tvm_ffi::Function::from_packed(|_| {
                 Ok(tvm_ffi::Any::from(crate::ffi::list([
-                    tvm_ffi::Any::from(tvm_ffi::String::from("schedule")),
                     tvm_ffi::Any::from(crate::ffi::list([
                         tvm_ffi::Any::from(1.0_f64),
                         tvm_ffi::Any::from(0.5_f64),
@@ -1228,11 +1226,26 @@ mod tests {
         let values = completion.values()?;
         assert!(matches!(
             &values[..],
-            [Value::Object(_), Value::Floats(times), Value::Integers(masks)]
+            [Value::Floats(times), Value::Integers(masks)]
                 if times == &[1.0, 0.5] && masks == &[3, 1]
         ));
         assert!(completion.values().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_value_call_returning_an_object_fails_its_job() {
+        let plan = Function::new(
+            "test.plan",
+            tvm_ffi::Function::from_packed(|_| {
+                Ok(tvm_ffi::Any::from(crate::ffi::list([tvm_ffi::Any::from(
+                    tvm_ffi::String::from("schedule"),
+                )])))
+            }),
+        );
+        let job = Job::new();
+        job.call_values(MethodCall::new(&plan, Vec::new()));
+        assert!(job.perform().check().is_err());
     }
 
     #[test]
