@@ -1527,13 +1527,7 @@ pub(crate) fn decode_video(
     let owners = parts.owners();
     let stream = stream_of(batch)?;
     let issue = job.on(Some(&stream));
-    let latent = batch.inputs.read(
-        owners.store,
-        &call.inputs[0],
-        call.call_id,
-        batch.device,
-        issue,
-    )?;
+    let latent = batch.read(owners.store, &call.inputs[0], call.call_id, issue)?;
     let row = u64::from(unit - range.cursor);
     let shape = vec![
         u64::from(range.max_units),
@@ -1551,13 +1545,13 @@ pub(crate) fn decode_video(
             shape,
             region: Some(region),
         }],
-        batch.device,
+        batch.target(),
         placement,
     )?
     .into_iter()
     .next()
     .ok_or_else(|| Error::Invariant("a decoded unit row was not bound".into()))?;
-    batch.calls[index].writes.push(write.clone());
+    batch.batch.writes.push(write.clone());
     let view = write.view();
     let out = view.select(0, 0)?;
     let decoder = &mut parts
@@ -1642,13 +1636,7 @@ pub(crate) fn decode_audio(
     let owners = parts.owners();
     let stream = stream_of(batch)?;
     let issue = job.on(Some(&stream));
-    let latent = batch.inputs.read(
-        owners.store,
-        &call.inputs[0],
-        call.call_id,
-        batch.device,
-        issue,
-    )?;
+    let latent = batch.read(owners.store, &call.inputs[0], call.call_id, issue)?;
     let write = bind_outputs(
         owners.store,
         &[OutputShape {
@@ -1656,13 +1644,13 @@ pub(crate) fn decode_audio(
             shape: vec![samples, 2],
             region: Some(vec![first..last, 0..2]),
         }],
-        batch.device,
+        batch.target(),
         placement,
     )?
     .into_iter()
     .next()
     .ok_or_else(|| Error::Invariant("an audio span was not bound".into()))?;
-    batch.calls[index].writes.push(write.clone());
+    batch.batch.writes.push(write.clone());
     let audio = &mut parts
         .decoders
         .audio

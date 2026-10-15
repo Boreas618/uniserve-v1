@@ -1,38 +1,55 @@
-//! The running state of one media batch, from input readiness to its result.
+//! A video model's media batch: what its calls contribute beside the shared
+//! batch skeleton ([`VideoCall`], [`MediaBatch`]), the parts of the backend
+//! it executes with ([`Parts`]), and the dispatch of its calls to the
+//! encoder, denoiser, decoder and host media runners ([`forward`],
+//! [`complete`]).
 //!
-//! A media batch's calls run one after another on their component's stream
-//! (device calls) or as host-lane tasks (host calls). Execution then
-//! commits the batch in one step: it ends its input leases, writes each
-//! call's completion scalar, makes every produced write visible, applies
-//! trajectory commits and records the calls as pending in the request pool.
-//! The result follows once the batch's device work completed (its output
-//! fences completed) and its host tasks finished; host tasks publish
-//! the products they wrote before the result is delivered.
+//! A media batch goes through the steps of [`crate::executor::batch`] as
+//! jobs of its lane:
 //!
-//! A batch whose calls' forwards are recorded ([`forward`], [`complete`])
-//! is jobs of its lane instead: one that reads its host-gated predicates,
-//! when it has any, then one holding its calls' forwards with the device
-//! half of its commit. Its commit is applied from that job's completion.
-//! When recording fails part way, what was recorded before is still
-//! submitted and the batch fails from its completion.
+//! 1. The opening job reads the batch's host-gated predicates, when it has
+//!    any. A call whose predicate is false is skipped: it runs nothing and
+//!    forwards a false decision to its successor through its completion
+//!    flag.
+//! 2. When the batch's condition encodings lack an encoder the library
+//!    constructs for new input shapes, a job asks for it; the forwards are
+//!    recorded from its completion.
+//! 3. The last job leases the batch's output storage on the stream of its
+//!    kind, binds the completion flags and holds every active call's
+//!    forward: device calls on the component's stream, host calls as tasks
+//!    of the rank's host lane, submitted while the job is recorded. Behind
+//!    the forwards, [`MediaBatch::issue_commit`] records the device half of
+//!    the commit (the end of the input leases, the executed calls' flags,
+//!    the seal of the lease) after every owner validated its update.
+//! 4. From that job's completion, [`MediaBatch::apply_commit`] publishes
+//!    the exports the forwards issued, applies the trajectory commits
+//!    ([`Trajectories`]), makes the writes visible and the calls pending:
+//!    the commit point. A failure before it retires everything the batch
+//!    reserved in a job behind what it recorded, and the batch's calls fail;
+//!    a failure at or past it is fatal.
+//! 5. The launched batch materializes once its output fences completed and
+//!    its host tasks finished ([`HostTasks`]): what the tasks wrote is then
+//!    published as host products, after the commit point, and the output
+//!    rank delivers a finished MP4.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
-use uniserve_core::MediaSource;
+use uniserve_core::{CallId, MediaSource};
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
-    Batch as BatchPlan, BatchOutput, BufferAllocation, BufferId, Call, CallKind, CallStatus,
-    ErrorCode, ForwardStats, MediaCall, RequestKey, TensorExport, TensorRef, WorkerInfo,
+    Batch as BatchPlan, BufferAllocation, BufferId, Call, CallKind, CallStatus, ErrorCode,
+    ForwardStats, MediaCall, TensorRef, WorkerInfo,
 };
 
-use super::products::Publications;
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
-use crate::executor::batch::{flag, request_flag};
-use crate::executor::pending::{BatchResult, PendingOutput};
+use crate::executor::PendingOutput;
+use crate::executor::backend::{WorkerBackend, WorkerBatch};
+use crate::executor::batch::{Batch, Failure, HostStage, Launched, Opening, Stage, fail};
+use crate::executor::inputs::Inputs;
 use crate::executor::products::{
-    OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export,
+    OutputShape, Placement, ProductOwners, Publications, bind_outputs, export,
 };
 use crate::ffi::Device;
 use crate::host::HostTask;
@@ -45,13 +62,16 @@ use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::ConditionSetup;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
-use crate::storage::OutputLease;
 use crate::storage::ProductExport;
-use crate::storage::Scalar;
 use crate::stream::Issue;
-use crate::transfer::exports::Location;
 use crate::worker::RankStorage;
-use crate::{Error, LatentUpdate, OutputPool, ProductBuffer, Result};
+use crate::{Error, LatentUpdate, OutputPool, ProductBuffer, ProductRead, ProductStore, Result};
+
+/// The step a media batch's failure is reported in.
+const PHASE: &str = "media batch";
+
+/// The component timer name of a media batch's materialization.
+const MATERIALIZE: &str = "video_materialize";
 
 /// How a call publishes what its host tasks wrote.
 pub(crate) enum Publication {
@@ -77,51 +97,24 @@ pub(crate) trait Trajectories {
     fn apply(&mut self, updates: &[LatentUpdate]);
 }
 
-/// What a batch's issued commit leaves to apply once its work was
-/// performed: the writes to make visible, the trajectory commits and the
-/// calls to record as pending.
-pub(crate) struct Commit {
-    writes: Vec<ProductBuffer>,
-    updates: Vec<LatentUpdate>,
-    pending: Vec<(RequestKey, uniserve_core::CallId, bool)>,
-}
-
-/// One call of the batch.
-pub(crate) struct CallState {
-    pub(crate) pending: PendingOutput,
-    /// Progress before the call, restored when it fails or is skipped.
-    pub(crate) parent: crate::RequestProgress,
-    /// Writes made visible at commit.
-    pub(crate) writes: Vec<ProductBuffer>,
-    /// The completion scalar a successor's predicate reads.
-    pub(crate) completion: Option<ProductBuffer>,
-    /// The call's product exports: registered with the store at the commit
-    /// point (host products when their task wrote them), so releasing a
-    /// product revokes them; revoked when the batch fails before.
-    pub(crate) publications: Publications,
+/// What a call contributes to its media batch's forward, beside the state
+/// every batch keeps of it ([`crate::executor::batch::CallState`]).
+#[derive(Default)]
+pub(crate) struct VideoCall {
+    /// The trajectory commit the call's forward recorded, applied to the
+    /// denoiser's latent pool at the commit point.
+    pub(crate) latent: Option<LatentUpdate>,
     /// The exports the call's forward issued, located when the batch
     /// commits: their device work is performed by then.
     exports: Vec<(ProductBuffer, ProductExport)>,
-    pub(crate) latent: Option<LatentUpdate>,
+    /// The host tasks writing the call's results, submitted while the
+    /// batch's job is recorded.
     pub(crate) tasks: Vec<Arc<HostTask<MediaTask>>>,
+    /// How the call publishes what its tasks wrote once they finished.
     pub(crate) publication: Option<Publication>,
-    /// The predicate was false: the call ran nothing.
-    pub(crate) skipped: bool,
 }
 
-impl CallState {
-    /// Record an export of `buffer` and add its descriptor to the call's
-    /// completion products.
-    pub(crate) fn publish(
-        &mut self,
-        buffer: BufferId,
-        locations: Vec<Location>,
-        export: TensorExport,
-    ) -> Result<()> {
-        self.publications
-            .accept(buffer, locations, export, &mut self.pending)
-    }
-
+impl VideoCall {
     /// Issue the export of `write`, the call's output `product`, to
     /// `stream`, behind the work that produced it.
     pub(crate) fn export(
@@ -145,55 +138,20 @@ impl CallState {
         self.exports.push((write.clone(), export));
         Ok(())
     }
-
-    /// Publish the exports the call's forward issued, once their work was
-    /// performed: each joins the call's completion products.
-    fn locate(&mut self, store: &crate::ProductStore) -> Result<()> {
-        for (write, export) in std::mem::take(&mut self.exports) {
-            let (export, locations) = store.located(&write, export)?;
-            self.publish(write.id(), locations, export)?;
-        }
-        Ok(())
-    }
 }
 
-/// Where a batch whose forwards are recorded stands between its jobs.
-enum Phase {
-    /// No job of the batch was prepared.
-    Opening,
-    /// The job on the lane reads the host-gated predicates of these calls.
-    Predicates(Vec<usize>),
-    /// The predicates are known: the calls' forwards are recorded next.
-    Opened,
-    /// The job on the lane asks the library for what the batch's condition
-    /// encodings lack; the forwards are recorded from its completion.
-    Setup(ConditionSetup),
-    /// The job on the lane holds the calls' forwards and the issued commit.
-    Committing(Commit),
-    /// The commit was applied: nothing is left for the lane.
-    Committed,
-    /// Recording failed part way: the job on the lane performs what was
-    /// recorded before, and the batch then fails with this error.
-    Failed(WorkerError),
-}
-
-/// One media batch's running state.
+/// A media batch whose output storage is leased: the skeleton batch and
+/// what a media batch keeps beside it. It borrows nothing, so it waits
+/// between its jobs as it is.
 pub(crate) struct MediaBatch {
-    phase: Phase,
-    pub(crate) inputs: Reads,
-    pub(crate) calls: Vec<CallState>,
-    output: OutputLease,
-    /// The stream the batch's device work runs on, when it has any.
-    pub(crate) stream: Option<Stream>,
-    pub(crate) device: Device,
+    pub(crate) batch: Batch<VideoCall>,
+    /// The inputs host codecs read in place from their shared-memory
+    /// exports instead of leasing them from the product store.
+    borrowed: HashSet<BufferId>,
+    /// The exports the batch accepted, registered at its commit point.
+    publications: Publications,
     /// The graph modes of the batch's forwards, reported with its result.
     stats: ForwardStats,
-    committed: bool,
-    delivered: bool,
-}
-
-fn lock(lease: &OutputLease) -> std::sync::MutexGuard<'_, crate::OutputBuffer> {
-    lease.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl MediaBatch {
@@ -216,267 +174,231 @@ impl MediaBatch {
         }
     }
 
-    /// Open a batch of `calls` calls on `device` and `stream` that reads
-    /// `inputs`.
-    pub(crate) fn new(
-        device: Device,
-        stream: Option<Stream>,
-        outputs: &mut OutputPool,
-        calls: usize,
-        inputs: Reads,
-    ) -> Result<Self> {
-        let devices: Vec<i32> = match device {
-            Device::Cuda(index) => vec![index],
-            Device::Cpu | Device::CudaHost => Vec::new(),
-        };
-        let output = outputs.lease(calls.max(1), calls.max(1), &devices, false)?;
-        Ok(Self {
-            phase: Phase::Opening,
-            inputs,
-            calls: Vec::new(),
-            output,
-            stream,
-            device,
-            stats: ForwardStats::default(),
-            committed: false,
-            delivered: false,
-        })
+    /// The device the batch's products live on.
+    pub(crate) fn target(&self) -> Device {
+        self.batch.target()
     }
 
-    /// Open each call's pending result against its request's progress.
-    pub(crate) fn open_calls(
+    /// Whether an input is read in place from its export.
+    pub(crate) fn borrowed(&self, product: &TensorRef) -> bool {
+        self.borrowed.contains(&product.buffer_id())
+    }
+
+    /// Lease one input for `consumer`, whole, on the batch's device; what
+    /// `stream` issues next waits on its writer. The lease ends with the
+    /// batch's other reads, when it commits or retires.
+    pub(crate) fn read(
         &mut self,
-        plan: &BatchPlan,
-        requests: &RequestPool,
-        output_rank: impl Fn(&str) -> bool,
-    ) -> Result<()> {
-        if !self.calls.is_empty() {
-            return Ok(());
+        store: &ProductStore,
+        product: &TensorRef,
+        consumer: CallId,
+        stream: impl Issue,
+    ) -> Result<Arc<ProductRead>> {
+        let read = store.consume(product, consumer, Some(self.target()), stream)?;
+        // Kept before the check below, so a refused read still ends.
+        self.batch.reads.push(Arc::clone(&read));
+        if read.region().is_some() {
+            return Err(Error::Invalid(
+                "media computation requires complete input coverage".into(),
+            ));
         }
-        let rows: Vec<_> = plan
+        Ok(read)
+    }
+
+    /// The trajectory commits the calls' forwards recorded.
+    fn updates(&self) -> Vec<LatentUpdate> {
+        self.batch
             .calls
             .iter()
-            .map(|call| {
-                let request = requests.get(call.request_key.request_id.0)?;
-                Ok((call.request_key, call.call_id, request.slot()))
+            .filter_map(|state| state.forward.latent.clone())
+            .collect()
+    }
+
+    /// Validate every owner's update but the exports' and record the
+    /// device half of the commit in `job`, behind the forwards: the end of
+    /// the input leases, the executed calls' completion flags and the seal
+    /// of the output lease, whose fences retire the batch's storage
+    /// accesses. [`Self::apply_commit`] applies the updates once the job
+    /// was performed.
+    fn issue_commit(
+        &mut self,
+        plan: &BatchPlan,
+        storage: &RankStorage,
+        requests: &RequestPool,
+        trajectories: Option<&dyn Trajectories>,
+        job: &Job,
+    ) -> std::result::Result<(), Failure> {
+        let failed = Failure::new(PHASE);
+        let tensors = &storage.tensors;
+        self.batch.end_reads(tensors, job, &[]).map_err(&failed)?;
+        self.batch.set_flags(tensors, job).map_err(&failed)?;
+        self.batch.validate(plan, tensors).map_err(&failed)?;
+        let updates = self.updates();
+        match trajectories {
+            Some(pool) => pool.validate(&updates),
+            None if updates.is_empty() => Ok(()),
+            None => Err(Error::Invariant(
+                "a trajectory commit has no latent pool".into(),
+            )),
+        }
+        .map_err(&failed)?;
+        requests
+            .validate_pending(&Batch::<()>::pending(plan))
+            .map_err(&failed)?;
+        self.batch.seal(&storage.events, job).map_err(&failed)
+    }
+
+    /// Apply the issued commit once its job was performed: publish the
+    /// exports the forwards issued, then apply the trajectory commits to
+    /// `trajectories`, register the exports, make the writes visible and
+    /// record the calls as pending. A failure after the exports' check is
+    /// fatal.
+    fn apply_commit(
+        &mut self,
+        plan: &BatchPlan,
+        tensors: &ProductStore,
+        requests: &mut RequestPool,
+        trajectories: Option<&mut dyn Trajectories>,
+    ) -> std::result::Result<(), Failure> {
+        let failed = Failure::new(PHASE);
+        for state in &mut self.batch.calls {
+            for (write, export) in std::mem::take(&mut state.forward.exports) {
+                self.publications
+                    .locate(tensors, &write, export, &mut state.output)
+                    .map_err(&failed)?;
+            }
+        }
+        self.publications.validate(tensors).map_err(&failed)?;
+
+        // Every owner accepted its update. Any failure from here is fatal.
+        let fatal = Failure::fatal(PHASE);
+        if let Some(pool) = trajectories {
+            pool.apply(&self.updates());
+        }
+        for state in &mut self.batch.calls {
+            if let Some(update) = state.forward.latent.take() {
+                state.output.apply_latent_update(&update);
+            }
+        }
+        self.publications.register(tensors).map_err(&fatal)?;
+        self.batch.commit(plan, tensors, requests)
+    }
+
+    /// Retire every reservation after a failure before the commit point,
+    /// recording in `job` the fences that end them: withdraw the host tasks
+    /// not running yet, revoke the exports, end the reads, abandon the
+    /// writes and seal and abandon the lease. A running task keeps its
+    /// inputs and outputs to completion, so the products host tasks write
+    /// stay deferred rather than abandoned under it.
+    fn discard(&mut self, storage: &RankStorage, job: &Job) -> Result<()> {
+        for state in &mut self.batch.calls {
+            withdraw(&state.forward.tasks);
+            state
+                .forward
+                .exports
+                .drain(..)
+                .for_each(|(_, export)| export.revoke());
+        }
+        let revoked = self.publications.revoke();
+        let discarded = self.batch.discard(&storage.tensors, &storage.events, job);
+        revoked.and(discarded)
+    }
+
+    /// Hand the committed batch to materialization, with the host tasks its
+    /// calls' results wait for.
+    fn launch(self) -> Launched {
+        let Self {
+            mut batch, stats, ..
+        } = self;
+        let calls: Vec<HostCall> = batch
+            .calls
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, state)| !state.forward.tasks.is_empty())
+            .map(|(index, state)| HostCall {
+                index,
+                tasks: std::mem::take(&mut state.forward.tasks),
+                publication: state.forward.publication.take(),
             })
-            .collect::<Result<_>>()?;
-        let bound = requests.bind_calls(&rows)?;
-        for (row, (call, request)) in plan.calls.iter().zip(bound).enumerate() {
-            let parent = request.progress()?;
-            let mut pending = PendingOutput::new(call, parent, row)?;
-            pending.reports_output = output_rank(&call.component);
-            self.calls.push(CallState {
-                pending,
-                parent,
-                writes: Vec::new(),
-                completion: None,
-                publications: Publications::default(),
-                exports: Vec::new(),
-                latent: None,
-                tasks: Vec::new(),
-                publication: None,
-                skipped: false,
-            });
+            .collect();
+        let host = (!calls.is_empty()).then(|| Box::new(HostTasks { calls }) as Box<dyn HostStage>);
+        batch.launch(stats, MATERIALIZE, host)
+    }
+}
+
+/// Withdraw host tasks that are not running yet; a running task completes.
+fn withdraw(tasks: &[Arc<HostTask<MediaTask>>]) {
+    for task in tasks {
+        if let Err(error) = task.cancel(false) {
+            tracing::warn!(target: "uniserve_worker.media", "withdrawing a host media task failed: {error}");
+        }
+    }
+}
+
+/// One call's host tasks in a launched batch, with how the call publishes
+/// what they wrote.
+struct HostCall {
+    /// The call's index in the batch.
+    index: usize,
+    tasks: Vec<Arc<HostTask<MediaTask>>>,
+    publication: Option<Publication>,
+}
+
+/// The host tasks a launched media batch's results wait for. What they
+/// write is published once every task finished, after the commit point:
+/// such a product is committed and its exports registered at once.
+struct HostTasks {
+    calls: Vec<HostCall>,
+}
+
+impl HostStage for HostTasks {
+    fn poll(&mut self) -> Result<bool> {
+        // The tasks were submitted when the batch's job was recorded.
+        Ok(self
+            .calls
+            .iter()
+            .flat_map(|call| &call.tasks)
+            .all(|task| task.completion.done()))
+    }
+
+    fn finish(
+        &mut self,
+        plan: &BatchPlan,
+        products: ProductOwners<'_>,
+        outputs: &mut [PendingOutput],
+    ) -> Result<()> {
+        for host in std::mem::take(&mut self.calls) {
+            let (Some(call), Some(output)) =
+                (plan.calls.get(host.index), outputs.get_mut(host.index))
+            else {
+                return Err(Error::Invariant("a host media task names no call".into()));
+            };
+            host.finish(call, products, output)?;
         }
         Ok(())
     }
 
-    /// Mark the calls whose predicate is false as skipped.
-    pub(crate) fn skip(&mut self, skipped: &HashSet<usize>) {
-        for &index in skipped {
-            if let Some(call) = self.calls.get_mut(index) {
-                call.skipped = true;
-                call.pending.output.status = CallStatus::Predicated;
-            }
-        }
-    }
-
-    /// Issue the device half of the batch's commit to `stream`, behind its
-    /// forwards: end its leases, write completion scalars and seal its
-    /// output. Every owner but the exports checks its update first, so the
-    /// returned commit is applied once that work was performed
-    /// ([`MediaBatch::apply_commit`]).
-    pub(crate) fn issue_commit(
-        &mut self,
-        plan: &BatchPlan,
-        owners: ProductOwners<'_>,
-        requests: &RequestPool,
-        trajectories: Option<&dyn Trajectories>,
-        stream: impl Issue,
-    ) -> Result<Commit> {
-        self.inputs.complete(owners.store, stream)?;
+    fn cancel(&mut self) {
         for call in &self.calls {
-            if let Some(completion) = &call.completion {
-                // Skipped calls forward a false decision to their successor.
-                let value = Scalar::Int(i64::from(!call.skipped));
-                owners.store.write_scalar(completion, value, stream)?;
-            }
+            withdraw(&call.tasks);
         }
-
-        let writes: Vec<ProductBuffer> = self
-            .calls
-            .iter()
-            .flat_map(|call| call.writes.iter().chain(call.completion.iter()))
-            .cloned()
-            .collect();
-        owners.store.validate_writes(&writes)?;
-        let updates: Vec<LatentUpdate> = self
-            .calls
-            .iter()
-            .filter_map(|call| call.latent.clone())
-            .collect();
-        match trajectories {
-            Some(pool) => pool.validate(&updates)?,
-            None if updates.is_empty() => {}
-            None => {
-                return Err(Error::Invariant(
-                    "a trajectory commit has no latent pool".into(),
-                ));
-            }
-        }
-        let pending: Vec<_> = plan
-            .calls
-            .iter()
-            .map(|call| (call.request_key, call.call_id, call.advances_state()))
-            .collect();
-        requests.validate_pending(&pending)?;
-
-        // A lease of host storage is sealed on no stream.
-        let streams = if stream.stream().is_some() {
-            vec![stream]
-        } else {
-            Vec::new()
-        };
-        let fences = lock(&self.output)
-            .seal(&streams, owners.events)?
-            .unwrap_or_default();
-        let finished = Arc::clone(&self.output);
-        stream.defer(
-            owners.events,
-            fences,
-            Box::new(move || {
-                lock(&finished).copies_finished();
-                Ok(())
-            }),
-        )?;
-
-        Ok(Commit {
-            writes,
-            updates,
-            pending,
-        })
     }
+}
 
-    /// Apply an issued commit once its work was performed: publish the
-    /// calls' exports, make writes visible, apply trajectory commits to
-    /// `trajectories` and record the calls as pending.
-    pub(crate) fn apply_commit(
-        &mut self,
-        commit: Commit,
+impl HostCall {
+    /// Publish what the call's finished tasks wrote, or fail the call when
+    /// a task did not succeed (its host products are abandoned then).
+    fn finish(
+        self,
+        call: &Call,
         owners: ProductOwners<'_>,
-        requests: &mut RequestPool,
-        mut trajectories: Option<&mut dyn Trajectories>,
+        output: &mut PendingOutput,
     ) -> Result<()> {
-        let Commit {
-            writes,
-            updates,
-            pending,
-        } = commit;
-        for call in &mut self.calls {
-            call.locate(owners.store)?;
-            call.publications.validate(owners.store)?;
-        }
-
-        // Every owner accepted its update; failures from here on are fatal.
-        self.committed = true;
-        owners.store.commit_writes(&writes)?;
-        for call in &mut self.calls {
-            call.publications.register(owners.store)?;
-        }
-        if let Some(pool) = trajectories.as_mut() {
-            pool.apply(&updates);
-        }
-        for call in &mut self.calls {
-            if let Some(update) = call.latent.take() {
-                call.pending.apply_latent_update(&update);
-            }
-        }
-        requests.add_pending(&pending)
-    }
-
-    /// Advance completion: publish what finished host tasks wrote, then
-    /// resolve the results once every task and device fence completed.
-    /// Returns the batch's result when it is complete.
-    pub(crate) fn poll(
-        &mut self,
-        plan: &BatchPlan,
-        owners: ProductOwners<'_>,
-        requests: &mut RequestPool,
-    ) -> Result<Option<BatchResult>> {
-        if self.delivered {
-            return Ok(None);
-        }
-        for index in 0..self.calls.len() {
-            if !self.finish_tasks(index, plan, owners)? {
-                return Ok(None);
-            }
-        }
-        if lock(&self.output).ready_at().is_none() {
-            return Ok(None);
-        }
-
-        let mut completions = Vec::with_capacity(self.calls.len());
-        let mut products = Vec::new();
-        let mut media = Vec::new();
-        for call in &mut self.calls {
-            let mut output = lock(&self.output);
-            call.pending.resolve(call.parent, &mut output)?;
-            drop(output);
-            call.pending.accept(requests)?;
-            let result = call.pending.result()?;
-            if result.status == CallStatus::Ok {
-                products.extend_from_slice(call.pending.products());
-            }
-            completions.push(result.clone());
-            if let Some(source) = call.pending.take_media() {
-                media.push(source);
-            }
-        }
-        self.delivered = true;
-        Ok(Some(BatchResult {
-            output: BatchOutput {
-                batch_id: plan.batch_id,
-                completions,
-                products,
-                worker_exec_us: None,
-                forward_stats: (!self.stats.is_empty()).then(|| self.stats.clone()),
-            },
-            media,
-        }))
-    }
-
-    /// Publish a call's host results once its tasks finished. Returns
-    /// whether the call has no unfinished task.
-    fn finish_tasks(
-        &mut self,
-        index: usize,
-        plan: &BatchPlan,
-        owners: ProductOwners<'_>,
-    ) -> Result<bool> {
-        let call = &mut self.calls[index];
-        if call.tasks.is_empty() {
-            return Ok(true);
-        }
-        if call.tasks.iter().any(|task| !task.completion.done()) {
-            return Ok(false);
-        }
-        let tasks = std::mem::take(&mut call.tasks);
-        let mut outputs = Vec::with_capacity(tasks.len());
+        let mut results = Vec::with_capacity(self.tasks.len());
         let mut failure = None;
-        for task in &tasks {
+        for task in &self.tasks {
             match task.completion.outcome() {
-                Some(crate::Outcome::Success(output)) => outputs.push(output),
+                Some(crate::Outcome::Success(result)) => results.push(result),
                 Some(crate::Outcome::Failed(error)) => {
                     failure.get_or_insert(error.to_string());
                 }
@@ -485,34 +407,33 @@ impl MediaBatch {
                 }
             }
         }
-        let publication = call.publication.take();
         if let Some(message) = failure {
             tracing::error!(target: "uniserve_worker.media", "host media call failed: {message}");
-            call.pending.output.status = CallStatus::Error;
-            call.pending.output.error_code = Some(ErrorCode::ComputeError);
-            let writes: Vec<ProductBuffer> = match publication {
-                Some(Publication::Products(outputs)) => {
-                    outputs.into_iter().map(|(_, write)| write).collect()
+            output.output.status = CallStatus::Error;
+            output.output.error_code = Some(ErrorCode::ComputeError);
+            let writes: Vec<ProductBuffer> = match self.publication {
+                Some(Publication::Products(written)) => {
+                    written.into_iter().map(|(_, write)| write).collect()
                 }
                 Some(Publication::Encoded { write, .. }) => vec![write],
                 _ => Vec::new(),
             };
-            owners.store.abandon_writes(&writes)?;
-            return Ok(true);
+            return owners.store.abandon_writes(&writes);
         }
 
-        let plan_call = &plan.calls[index];
-        match publication {
+        // Written by the host after the commit point: each product is
+        // committed, exported and its exports registered at once.
+        let mut publications = Publications::default();
+        match self.publication {
             Some(Publication::Products(written)) => {
                 for (product, write) in written {
                     let view = write.view();
                     owners.store.write(&write, &view, None, None)?;
                     owners.store.commit_writes(std::slice::from_ref(&write))?;
                     let (exported, locations) =
-                        export(owners, plan_call, &product, &write, true, None, None)?;
-                    call.publish(write.id(), locations, exported)?;
-                    // Written after the commit point: registered at once.
-                    call.publications.register(owners.store)?;
+                        export(owners, call, &product, &write, true, None, None)?;
+                    publications.accept(write.id(), locations, exported, output)?;
+                    publications.register(owners.store)?;
                 }
             }
             Some(Publication::Encoded {
@@ -525,8 +446,8 @@ impl MediaBatch {
                 owners.store.commit_writes(std::slice::from_ref(&write))?;
                 let width = view.shape().get(1).copied().unwrap_or(0) as u64;
                 let mut regions = Vec::with_capacity(rows.len());
-                for (output, row) in outputs.iter().zip(&rows) {
-                    let TaskOutput::Framed(length) = **output else {
+                for (result, row) in results.iter().zip(&rows) {
+                    let TaskOutput::Framed(length) = **result else {
                         return Err(Error::Invariant(
                             "a video encoding task framed no unit".into(),
                         ));
@@ -536,91 +457,54 @@ impl MediaBatch {
                     }
                     regions.push(vec![*row..*row + 1, 0..length as u64]);
                 }
-                let (exported, locations) = export(
-                    owners,
-                    plan_call,
-                    &product,
-                    &write,
-                    true,
-                    Some(&regions),
-                    None,
-                )?;
-                call.publish(write.id(), locations, exported)?;
-                call.publications.register(owners.store)?;
+                let (exported, locations) =
+                    export(owners, call, &product, &write, true, Some(&regions), None)?;
+                publications.accept(write.id(), locations, exported, output)?;
+                publications.register(owners.store)?;
             }
-            Some(Publication::Media) if call.pending.reports_output => {
-                for output in &outputs {
-                    if let TaskOutput::Media(bytes) = &**output {
+            Some(Publication::Media) if output.reports_output => {
+                for result in &results {
+                    if let TaskOutput::Media(bytes) = &**result {
                         let source = MediaSource::publish(bytes).map_err(|error| {
                             Error::Transport(format!("publishing media failed: {error}"))
                         })?;
-                        call.pending.set_media(source)?;
+                        output.set_media(source)?;
                     }
                 }
             }
             Some(Publication::Media) | None => {}
         }
-        Ok(true)
-    }
-
-    /// Release what an undelivered batch holds: before commit, abandon its
-    /// writes; after commit, withdraw its pending calls. Exports are revoked
-    /// and queued host tasks withdrawn either way.
-    ///
-    /// A batch of recorded forwards has ended its input leases in a job by
-    /// now (its commit, or the job of its failed recording), so this ends
-    /// only the leases of a host batch, whose reads use no stream.
-    pub(crate) fn close(
-        &mut self,
-        owners: ProductOwners<'_>,
-        requests: &mut RequestPool,
-    ) -> Result<()> {
-        if self.delivered {
-            return Ok(());
-        }
-        let mut result = self.inputs.complete(owners.store, self.stream.as_ref());
-        for call in &mut self.calls {
-            for task in &call.tasks {
-                if let Err(error) = task.cancel(false) {
-                    tracing::warn!(target: "uniserve_worker.media", "withdrawing a host media task failed: {error}");
-                }
-            }
-            call.exports
-                .drain(..)
-                .for_each(|(_, export)| export.revoke());
-            result = result.and(call.publications.revoke());
-        }
-        if self.committed {
-            for call in &self.calls {
-                result = result.and(call.pending.cancel(requests));
-            }
-        } else {
-            let writes: Vec<ProductBuffer> = self
-                .calls
-                .iter()
-                .flat_map(|call| call.writes.iter().chain(call.completion.iter()))
-                .cloned()
-                .collect();
-            result = result.and(owners.store.abandon_writes(&writes));
-        }
-        lock(&self.output).abandon();
-        self.delivered = true;
-        result
+        Ok(())
     }
 }
 
-/// The request slots of a batch's calls' requests, for relay outputs.
-pub(crate) fn request_slots(
-    plan: &BatchPlan,
-    requests: &RequestPool,
-) -> Result<HashMap<RequestKey, usize>> {
-    plan.calls
-        .iter()
-        .map(|call| {
-            let request = requests.get(call.request_key.request_id.0)?;
-            Ok((call.request_key, request.slot()))
-        })
-        .collect()
+/// A media batch between two of its jobs.
+pub(crate) enum Pending {
+    /// The job on the lane reads the batch's host-gated predicates.
+    Predicates(Opening<VideoCall>),
+    /// The predicates are known: the batch records its next job.
+    Opened(Opening<VideoCall>),
+    /// The job on the lane asks the library for what the batch's condition
+    /// encodings lack; the batch goes on from its completion.
+    Setup(Opening<VideoCall>, ConditionSetup),
+    /// The job on the lane is the batch's last: its forwards and the
+    /// issued commit.
+    Committing(Box<MediaBatch>),
+    /// Recording failed, or the last job failed before the commit was
+    /// applied. What the batch had recorded is performed; it retires what
+    /// it reserved next.
+    Failing(Box<MediaBatch>, Failure),
+    /// The job on the lane retires what the failed batch reserved, or
+    /// performs what a batch that reserved nothing had recorded.
+    Discarding(Failure),
+}
+
+/// What recording a media batch's next job leaves.
+enum Step {
+    /// The job to submit, and the batch's state while it is on the lane.
+    Job(Job, Pending),
+    /// The batch failed and holds nothing.
+    Failed(Failure),
 }
 
 /// The parts of the backend a media batch executes with.
@@ -648,7 +532,6 @@ impl<'a> Parts<'a> {
         ProductOwners {
             store: &storage.tensors,
             transports: &storage.transports,
-            events: &storage.events,
         }
     }
 
@@ -724,15 +607,6 @@ pub(crate) fn product_name<'a>(
         })
 }
 
-/// Whether `rank` reports a component's host results: its first rank does.
-pub(crate) fn reports(info: &WorkerInfo, rank: usize, component: &str) -> bool {
-    info.components
-        .iter()
-        .find(|placed| placed.name == component)
-        .and_then(|placed| placed.config.ranks.first())
-        .is_none_or(|&first| first == rank)
-}
-
 fn media_kind(call: &Call) -> MediaCall {
     match call.code {
         CallKind::Media(kind) => kind,
@@ -740,115 +614,159 @@ fn media_kind(call: &Call) -> MediaCall {
     }
 }
 
-/// Begin a video batch: its output lease on the stream of its kind and its
-/// calls' pending results. `borrowed` names the inputs host codecs read in
-/// place.
-fn begin<'b>(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    borrowed: HashSet<BufferId>,
-    state: &'b mut Option<MediaBatch>,
-) -> Result<&'b mut MediaBatch> {
-    let first = plan
-        .calls
-        .first()
-        .ok_or_else(|| Error::Invariant("a video batch has calls".into()))?;
-    let (device, stream) = parts.placement(media_kind(first), &first.component)?;
-    let batch = state.insert(MediaBatch::new(
-        device,
-        stream,
-        parts.outputs,
-        plan.calls.len(),
-        Reads::new(borrowed),
-    )?);
-    let (info, rank) = (parts.info, parts.rank);
-    batch.open_calls(plan, parts.requests, |component| {
-        reports(info, rank, component)
-    })?;
-    Ok(batch)
-}
-
-/// The next job of a video batch whose calls' forwards are recorded: the
-/// reads of its host-gated predicates when it has any, then its calls'
-/// forwards with its commit behind them.
+/// The next job of a media batch: the read of its host-gated predicates
+/// when it has any, the library's setup of new condition encodings when
+/// they need it, then its forwards with the issued commit, and after a
+/// failure the retirement of what it reserved. `None` when the batch
+/// failed without needing the lane again.
 pub(crate) fn forward(
-    parts: &mut Parts<'_>,
-    plan: &BatchPlan,
-    borrowed: HashSet<BufferId>,
-    state: &mut Option<MediaBatch>,
-) -> std::result::Result<Job, WorkerError> {
-    let batch = match state {
-        Some(batch) => batch,
-        None => begin(parts, plan, borrowed, state)?,
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+) -> std::result::Result<Option<Job>, WorkerError> {
+    let failure = {
+        let mut parts = backend.media_parts()?;
+        let (plan, inputs, pending) = batch.media_parts();
+        match record(&mut parts, plan, inputs, pending.take())? {
+            Step::Job(job, state) => {
+                *pending = Some(state);
+                return Ok(Some(job));
+            }
+            Step::Failed(failure) => failure,
+        }
     };
-    let job = Job::new();
-    let error = match record(parts, plan, batch, &job) {
-        Ok(()) => return Ok(job),
-        Err(error) => error,
-    };
-
-    // The failed batch ends its input leases in this job, behind the waits
-    // their reads recorded, so closing it issues nothing on its stream.
-    let stream = batch.stream.clone();
-    let ended = batch
-        .inputs
-        .complete(parts.owners().store, job.on(stream.as_ref()));
-    if let Err(cleanup) = ended {
-        tracing::warn!(target: "uniserve_worker.media", "ending a failed batch's input leases failed: {cleanup}");
-    }
-    if job.is_empty() {
-        return Err(error);
-    }
-
-    // What the batch recorded before it failed is still performed: the
-    // events it queued are due, and storage the batch gives up is returned
-    // only behind them. An export that failed kept only its event
-    // operations ([`Issue::attempt`]).
-    batch.phase = Phase::Failed(error);
-    Ok(job)
+    fail(backend, batch, failure).map(|()| None)
 }
 
-/// Record the next job of `batch` into `job` and advance its phase.
+/// Record the batch's next job from its state between jobs.
 fn record(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
-    batch: &mut MediaBatch,
-    job: &Job,
-) -> std::result::Result<(), WorkerError> {
-    let stream = batch.stream.clone();
+    inputs: &Inputs,
+    state: Option<Pending>,
+) -> std::result::Result<Step, WorkerError> {
+    let opened = match state {
+        None => None,
+        Some(Pending::Opened(opening)) => Some(opening),
+        // What the batch recorded was performed: retire what it reserved,
+        // behind that work.
+        Some(Pending::Failing(media, failure)) => {
+            return Ok(retire(parts.storage, *media, Job::new(), failure));
+        }
+        Some(
+            Pending::Predicates(_)
+            | Pending::Setup(..)
+            | Pending::Committing(_)
+            | Pending::Discarding(_),
+        ) => {
+            return Err(WorkerError::classify(
+                Error::Invariant(
+                    "a media batch's job was prepared before its last completed".into(),
+                ),
+                Some(PHASE),
+            ));
+        }
+    };
+    let failed = Failure::new(PHASE);
+    let Some(first) = plan.calls.first() else {
+        return Ok(Step::Failed(failed(Error::Invariant(
+            "a video batch has calls".into(),
+        ))));
+    };
+    let (device, stream) = match parts.placement(media_kind(first), &first.component) {
+        Ok((device, stream)) => (device.cuda_index(), stream),
+        Err(error) => return Ok(Step::Failed(failed(error))),
+    };
 
-    if matches!(batch.phase, Phase::Opening) {
-        let mut predicated = Vec::new();
-        for (index, call) in plan.calls.iter().enumerate() {
-            let Some(predicate) = call
-                .predicate
-                .as_ref()
-                .filter(|predicate| predicate.dtype == uniserve_ipc::DType::U8)
-            else {
-                continue;
-            };
-            request_flag(
+    // The batch's first job binds its calls and reads its host-gated
+    // predicates: they decide which calls run.
+    let opening = match opened {
+        Some(opening) => opening,
+        None => {
+            let job = Job::new();
+            let opened = Opening::open(
+                parts.requests,
                 &parts.storage.tensors,
-                call,
-                predicate,
-                batch.device.cuda_index(),
+                parts.info,
+                parts.rank,
+                plan,
+                device,
                 job.on(stream.as_ref()),
-            )?;
-            predicated.push(index);
+                |_| true,
+            );
+            match opened {
+                Ok(opening) if opening.reads_predicates() => {
+                    return Ok(Step::Job(job, Pending::Predicates(opening)));
+                }
+                Ok(opening) => opening,
+                Err(error) => return Ok(ended(job, failed(error))),
+            }
         }
+    };
 
-        // The forwards wait for the predicates: they are the next job.
-        if !predicated.is_empty() {
-            batch.phase = Phase::Predicates(predicated);
-            return Ok(());
-        }
-        batch.phase = Phase::Opened;
-    }
-    if !matches!(batch.phase, Phase::Opened) {
-        return Err(Error::State("a media batch has no job to prepare").into());
+    // A condition encoding of input shapes this rank has not encoded
+    // before takes an encoder the library constructs. The job makes that
+    // call, so the batch's forwards are recorded from its completion.
+    let job = Job::new();
+    match crate::runner::encoder::setup_conditions(parts, plan, opening.calls(), &job) {
+        Ok(Some(setup)) => return Ok(Step::Job(job, Pending::Setup(opening, setup))),
+        Ok(None) => {}
+        Err(error) => return Ok(ended(job, failed(error))),
     }
 
-    let slots = request_slots(plan, parts.requests)?;
+    let leased = Batch::lease(
+        opening,
+        parts.outputs,
+        plan.calls.len(),
+        stream,
+        device,
+        &parts.storage.events,
+        &job,
+    );
+    let mut media = match leased {
+        Ok(batch) => MediaBatch {
+            batch,
+            borrowed: inputs.borrowed(),
+            publications: Publications::default(),
+            stats: ForwardStats::default(),
+        },
+        Err(error) => return Ok(ended(job, failed(error))),
+    };
+    let recorded = media
+        .batch
+        .bind_flags(plan, &parts.storage.tensors, &job)
+        .and_then(|()| record_forwards(parts, plan, &mut media, &job))
+        .map_err(&failed)
+        .and_then(|()| {
+            let trajectories = parts
+                .denoisers
+                .video
+                .as_ref()
+                .map(|denoiser| &denoiser.runner as &dyn Trajectories);
+            media.issue_commit(plan, parts.storage, parts.requests, trajectories, &job)
+        });
+    Ok(match recorded {
+        Ok(()) => Step::Job(job, Pending::Committing(Box::new(media))),
+        // Nothing was recorded that the retirement must follow.
+        Err(failure) if job.is_empty() => retire(parts.storage, media, job, failure),
+        // What the batch recorded before it failed is performed before its
+        // reservations are retired: the events it queued are due, and its
+        // writes are abandoned only behind its work. An export that failed
+        // kept only its event operations ([`Issue::attempt`]).
+        Err(failure) => Step::Job(job, Pending::Failing(Box::new(media), failure)),
+    })
+}
+
+/// Record every call's forward into `job`: a host call's tasks are
+/// submitted to the rank's host lane, and the job holds only what the
+/// batch writes for them; a device call's forward is recorded on the
+/// batch's stream, unless its predicate skipped it.
+fn record_forwards(
+    parts: &mut Parts<'_>,
+    plan: &BatchPlan,
+    media: &mut MediaBatch,
+    job: &Job,
+) -> Result<()> {
+    let slots = media.batch.slots(plan);
     let allocations: HashMap<BufferId, BufferAllocation> = plan
         .buffer_allocations
         .iter()
@@ -858,147 +776,174 @@ fn record(
         allocations: &allocations,
         slots: &slots,
     };
-
-    // A condition encoding of input shapes this rank has not encoded
-    // before takes an encoder the library constructs. The job makes that
-    // call, so the batch's forwards are recorded from its completion.
-    if let Some(setup) = crate::runner::encoder::setup_conditions(parts, plan, batch, &slots, job)?
-    {
-        batch.phase = Phase::Setup(setup);
-        return Ok(());
-    }
-    for index in 0..plan.calls.len() {
-        let call = &plan.calls[index];
-        let slot = slots[&call.request_key];
-
-        // A host call's work is tasks of the rank's host lane, submitted
-        // here; the batch's job holds only what it writes for the calls.
+    for (index, call) in plan.calls.iter().enumerate() {
+        let slot = media.batch.calls[index].slot;
         match call.code {
             CallKind::Media(MediaCall::MediaReading) => {
-                crate::runner::media::read_media(parts, batch, index, call, slot, &placement)?;
+                crate::runner::media::read_media(parts, media, index, call, slot, &placement)?;
                 continue;
             }
             CallKind::Media(MediaCall::VideoEncoding) => {
                 crate::runner::media::encode_units(
-                    parts, plan, batch, index, call, slot, &placement,
+                    parts, plan, media, index, call, slot, &placement,
                 )?;
                 continue;
             }
             CallKind::Media(MediaCall::AudioEncoding) => {
-                crate::runner::media::encode_audio(parts, batch, index, call, slot)?;
+                crate::runner::media::encode_audio(parts, media, index, call, slot)?;
                 continue;
             }
             CallKind::Media(MediaCall::Muxing) => {
-                crate::runner::media::mux(parts, plan, batch, index, call, slot)?;
+                crate::runner::media::mux(parts, plan, media, index, call, slot)?;
                 continue;
             }
             _ => {}
         }
 
-        let owners = parts.owners();
-        let completion = bind_completion(owners.store, call, batch.device, &slots)?;
-        batch.calls[index].completion = completion;
-        if batch.calls[index].skipped {
+        if !media.batch.calls[index].active {
             continue;
         }
         match call.code {
             CallKind::Media(MediaCall::TextEncoding) => crate::runner::encoder::encode_text(
-                parts, plan, batch, index, slot, &placement, job,
+                parts, plan, media, index, slot, &placement, job,
             )?,
             CallKind::Media(MediaCall::VisionEncoding) => crate::runner::encoder::encode_vision(
-                parts, plan, batch, index, slot, &placement, job,
+                parts, plan, media, index, slot, &placement, job,
             )?,
             CallKind::Media(MediaCall::LatentEncoding) => {
                 crate::runner::encoder::encode_conditions(
-                    parts, plan, batch, index, slot, &placement, job,
+                    parts, plan, media, index, slot, &placement, job,
                 )?
             }
             CallKind::Media(MediaCall::LatentPreparation) => {
-                crate::runner::denoiser::prepare(parts, plan, batch, index, slot, job)?
+                crate::runner::denoiser::prepare(parts, plan, media, index, slot, job)?
             }
             CallKind::Media(MediaCall::Denoising) => {
-                crate::runner::denoiser::denoise(parts, plan, batch, index, slot, &placement, job)?
+                crate::runner::denoiser::denoise(parts, plan, media, index, slot, &placement, job)?
             }
             CallKind::Media(MediaCall::VideoDecoding) => crate::runner::decoder::decode_video(
-                parts, plan, batch, index, slot, &placement, job,
+                parts, plan, media, index, slot, &placement, job,
             )?,
             CallKind::Media(MediaCall::AudioDecoding) => crate::runner::decoder::decode_audio(
-                parts, plan, batch, index, slot, &placement, job,
+                parts, plan, media, index, slot, &placement, job,
             )?,
             kind => {
                 return Err(Error::Unsupported(format!(
                     "{} is not a video model's media call",
                     kind.as_str()
-                ))
-                .into());
+                )));
             }
         }
     }
-
-    let owners = parts.owners();
-    let trajectories = parts
-        .denoisers
-        .video
-        .as_ref()
-        .map(|denoiser| &denoiser.runner as &dyn Trajectories);
-    let commit = batch.issue_commit(
-        plan,
-        owners,
-        parts.requests,
-        trajectories,
-        job.on(stream.as_ref()),
-    )?;
-    batch.phase = Phase::Committing(commit);
     Ok(())
 }
 
-/// Apply the completion of the job [`forward`] prepared last. Returns
-/// whether the batch's forward is complete.
+/// The step of a batch that failed holding no reservation: `job`
+/// performs what it recorded before, if anything, and the batch's calls
+/// fail from its completion.
+fn ended(job: Job, failure: Failure) -> Step {
+    if job.is_empty() {
+        Step::Failed(failure)
+    } else {
+        Step::Job(job, Pending::Discarding(failure))
+    }
+}
+
+/// Retire what a failed batch reserved, recording in `job` the fences that
+/// end it.
+fn retire(storage: &RankStorage, mut media: MediaBatch, job: Job, failure: Failure) -> Step {
+    let failure = match media.discard(storage, &job) {
+        Ok(()) => failure,
+        // Storage the cleanup could not retire stays reserved; the rank
+        // cannot reuse it safely.
+        Err(cleanup) => Failure::fatal(PHASE)(cleanup),
+    };
+    ended(job, failure)
+}
+
+/// Apply the completion of the job [`forward`] prepared last.
 pub(crate) fn complete(
-    parts: &mut Parts<'_>,
-    state: &mut Option<MediaBatch>,
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
     completion: Completion,
-) -> std::result::Result<bool, WorkerError> {
-    let batch = state.as_mut().ok_or(Error::State(
-        "a media batch's job completed before it opened",
-    ))?;
-    match std::mem::replace(&mut batch.phase, Phase::Opened) {
-        // The job performed what a failed recording had recorded.
-        Phase::Failed(error) => {
-            batch.phase = Phase::Committed;
-            Err(error)
-        }
-        Phase::Predicates(predicated) => {
-            let mut completion = completion.check().map_err(|failure| failure.error)?;
-            let mut skipped = HashSet::new();
-            for index in predicated {
-                if !flag(&mut completion)? {
-                    skipped.insert(index);
+) -> std::result::Result<(), WorkerError> {
+    /// What the completion leaves to do on the worker batch.
+    enum Done {
+        Next(Pending),
+        Launched(Box<Launched>),
+        Failed(Failure),
+    }
+
+    let done = {
+        let mut parts = backend.media_parts()?;
+        let (plan, _, pending) = batch.media_parts();
+        let failed = Failure::new(PHASE);
+        match (pending.take(), completion.check()) {
+            // A predicate that could not be read, or a setup the library
+            // refused, fails the batch, which has reserved nothing yet.
+            (Some(Pending::Predicates(_) | Pending::Setup(..)), Err(failure)) => {
+                Done::Failed(failed(failure.error))
+            }
+            (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
+                match opening.predicates(&mut completion) {
+                    Ok(()) => Done::Next(Pending::Opened(opening)),
+                    Err(error) => Done::Failed(failed(error)),
                 }
             }
-            batch.skip(&skipped);
-            Ok(false)
+            (Some(Pending::Setup(opening, setup)), Ok(mut completion)) => {
+                match crate::runner::encoder::accept_conditions(&mut parts, setup, &mut completion)
+                {
+                    Ok(()) => Done::Next(Pending::Opened(opening)),
+                    Err(error) => Done::Failed(failed(error)),
+                }
+            }
+            // The job failed on its lane, which still made its event
+            // records: the batch retires what it reserved.
+            (Some(Pending::Committing(media)), Err(failure)) => {
+                Done::Next(Pending::Failing(media, failed(failure.error)))
+            }
+            (Some(Pending::Committing(mut media)), Ok(_)) => {
+                let trajectories = parts
+                    .denoisers
+                    .video
+                    .as_mut()
+                    .map(|denoiser| &mut denoiser.runner as &mut dyn Trajectories);
+                match media.apply_commit(plan, &parts.storage.tensors, parts.requests, trajectories)
+                {
+                    Ok(()) => Done::Launched(Box::new(media.launch())),
+                    Err(failure) if failure.committed => Done::Failed(failure),
+                    Err(failure) => Done::Next(Pending::Failing(media, failure)),
+                }
+            }
+            // The lane performed what the failed batch had recorded;
+            // whether that failed again changes nothing of what follows.
+            (Some(Pending::Failing(media, failure)), _) => {
+                Done::Next(Pending::Failing(media, failure))
+            }
+            (Some(Pending::Discarding(failure)), Ok(_)) => Done::Failed(failure),
+            // Fences the retirement recorded were not all made.
+            (Some(Pending::Discarding(_)), Err(cleanup)) => {
+                Done::Failed(Failure::fatal(PHASE)(cleanup.error))
+            }
+            (Some(Pending::Opened(_)) | None, _) => {
+                return Err(WorkerError::classify(
+                    Error::State("a media batch has no job on its lane"),
+                    Some(PHASE),
+                ));
+            }
         }
-        Phase::Setup(setup) => {
-            let mut completion = completion.check().map_err(|failure| failure.error)?;
-            crate::runner::encoder::accept_conditions(parts, setup, &mut completion)?;
-            Ok(false)
+    };
+    match done {
+        Done::Next(state) => {
+            *batch.media_parts().2 = Some(state);
+            Ok(())
         }
-        Phase::Committing(commit) => {
-            completion.check().map_err(|failure| failure.error)?;
-            let owners = parts.owners();
-            let trajectories = parts
-                .denoisers
-                .video
-                .as_mut()
-                .map(|denoiser| &mut denoiser.runner as &mut dyn Trajectories);
-            batch.apply_commit(commit, owners, parts.requests, trajectories)?;
-            batch.phase = Phase::Committed;
-            Ok(true)
+        Done::Launched(launched) => {
+            batch.launch(*launched);
+            batch.set_stage(Stage::Done);
+            Ok(())
         }
-        Phase::Opening | Phase::Opened | Phase::Committed => {
-            Err(Error::State("a media batch has no job on its lane").into())
-        }
+        Done::Failed(failure) => fail(backend, batch, failure),
     }
 }
 
@@ -1025,6 +970,7 @@ pub(crate) fn decode_range<'a>(
 /// The batch's stream.
 pub(crate) fn stream_of(batch: &MediaBatch) -> Result<Stream> {
     batch
+        .batch
         .stream
         .clone()
         .ok_or_else(|| Error::Invariant("a device media call has no stream".into()))
@@ -1050,11 +996,10 @@ pub(crate) fn row_width(output: &TensorRef) -> Result<u64> {
 }
 
 /// Bind a call's single output as rows of `shape` on every rank that
-/// computes it.
+/// computes it; the batch commits the write.
 pub(crate) fn bind_rows(
     parts: &Parts<'_>,
     batch: &mut MediaBatch,
-    index: usize,
     output: &TensorRef,
     shape: Vec<u64>,
     placement: &Placement<'_>,
@@ -1067,13 +1012,13 @@ pub(crate) fn bind_rows(
             shape,
             region: None,
         }],
-        batch.device,
+        batch.target(),
         placement,
     )?
     .into_iter()
     .next()
     .ok_or_else(|| Error::Invariant("an encoder product was not bound".into()))?;
-    batch.calls[index].writes.push(write.clone());
+    batch.batch.writes.push(write.clone());
     Ok(write)
 }
 
@@ -1090,7 +1035,9 @@ pub(crate) fn publish(
 ) -> Result<()> {
     let owners = parts.owners();
     owners.store.produced(write, shape, stream, None)?;
-    batch.calls[index].export(owners, call, &call.outputs[0], write, false, stream)
+    batch.batch.calls[index]
+        .forward
+        .export(owners, call, &call.outputs[0], write, false, stream)
 }
 
 /// Publish a call's first output, whose bound view the producer filled, and
@@ -1112,5 +1059,7 @@ pub(crate) fn publish_bound(
 ) -> Result<()> {
     let owners = parts.owners();
     owners.store.write(write, &write.view(), stream, None)?;
-    batch.calls[index].export(owners, call, &call.outputs[0], write, host, stream)
+    batch.batch.calls[index]
+        .forward
+        .export(owners, call, &call.outputs[0], write, host, stream)
 }

@@ -6,9 +6,10 @@
 //! by import path. Host calls run as tasks on the rank's host lane (see
 //! [`crate::host::task`]); execution reserves their outputs, configures and
 //! submits the tasks and commits the batch. Their outputs stay deferred
-//! until the tasks finish, when the batch publishes them (the decoded
-//! condition products, the encoded unit rows) or delivers the finished MP4
-//! before its result is sent.
+//! until the tasks finish, when the launched batch publishes them (the
+//! decoded condition products, the encoded unit rows) or delivers the
+//! finished MP4 before its result is sent
+//! ([`crate::executor::batch::HostStage`]).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -212,7 +213,7 @@ pub(crate) fn read_media(
             products,
         },
     )?;
-    let state = &mut batch.calls[index];
+    let state = &mut batch.batch.calls[index].forward;
     state.tasks.push(task);
     state.publication = Some(Publication::Products(written));
     Ok(())
@@ -294,15 +295,11 @@ pub(crate) fn encode_units(
         placement,
     )?;
     let rows = write.view();
-    let imported = if batch.inputs.borrowed(&call.inputs[0]) {
+    let imported = if batch.borrowed(&call.inputs[0]) {
         None
     } else {
         let store = parts.owners().store;
-        Some(
-            batch
-                .inputs
-                .read(store, &call.inputs[0], call.call_id, Device::Cpu, None)?,
-        )
+        Some(batch.read(store, &call.inputs[0], call.call_id, None)?)
     };
     let frame_rate = parts.video.model.facts.frame_rate;
     let function = parts
@@ -347,7 +344,7 @@ pub(crate) fn encode_units(
         }
         local.push(row_index as u64);
     }
-    let state = &mut batch.calls[index];
+    let state = &mut batch.batch.calls[index].forward;
     state.tasks = tasks;
     state.publication = Some(Publication::Encoded {
         product: call.outputs[0].clone(),
@@ -371,9 +368,7 @@ pub(crate) fn encode_audio(
         ));
     }
     let store = parts.owners().store;
-    let pcm = batch
-        .inputs
-        .read(store, &call.inputs[0], call.call_id, Device::Cpu, None)?;
+    let pcm = batch.read(store, &call.inputs[0], call.call_id, None)?;
     let session = parts
         .video
         .mux_session(slot, call.request_key, parts.media)?;
@@ -393,7 +388,7 @@ pub(crate) fn encode_audio(
             session,
         },
     )?;
-    batch.calls[index].tasks.push(task);
+    batch.batch.calls[index].forward.tasks.push(task);
     Ok(())
 }
 
@@ -489,7 +484,7 @@ pub(crate) fn mux(
         (MediaTask::Append { session, units }, None)
     };
     let task = submit(parts, action)?;
-    let state = &mut batch.calls[index];
+    let state = &mut batch.batch.calls[index].forward;
     state.tasks.push(task);
     state.publication = publication;
     Ok(())

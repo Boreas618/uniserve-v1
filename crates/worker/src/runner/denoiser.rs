@@ -1444,13 +1444,10 @@ pub(crate) fn prepare(
     let store = parts.owners().store;
     let stream = stream_of(batch)?;
     let issue = job.on(Some(&stream));
-    let device = batch.device;
-    let features = batch
-        .inputs
-        .read(store, &call.inputs[0], call.call_id, device, issue)?;
+    let features = batch.read(store, &call.inputs[0], call.call_id, issue)?;
     let conditions: Vec<Arc<crate::ProductRead>> = call.inputs[1..]
         .iter()
-        .map(|input| batch.inputs.read(store, input, call.call_id, device, issue))
+        .map(|input| batch.read(store, input, call.call_id, issue))
         .collect::<Result<_>>()?;
     let denoiser = parts
         .denoisers
@@ -1483,7 +1480,7 @@ pub(crate) fn prepare(
             .runner
             .encode_conditions(id, slot, &size, &latents, job)?;
     }
-    batch.calls[index].latent = Some(update);
+    batch.batch.calls[index].forward.latent = Some(update);
     Ok(())
 }
 
@@ -1613,7 +1610,7 @@ pub(crate) fn denoise(
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
     let (update, mode) = denoiser.runner.denoise(id, slot, call, params, job)?;
     batch.record(mode);
-    batch.calls[index].latent = Some(update);
+    batch.batch.calls[index].forward.latent = Some(update);
     if call.outputs.is_empty() {
         return Ok(());
     }
@@ -1648,17 +1645,19 @@ pub(crate) fn denoise(
                 shape,
                 region,
             }],
-            batch.device,
+            batch.target(),
             placement,
         )?;
         let write = bound
             .into_iter()
             .next()
             .ok_or_else(|| Error::Invariant("a latent product was not bound".into()))?;
-        batch.calls[index].writes.push(write.clone());
+        batch.batch.writes.push(write.clone());
         let issue = job.on(Some(&stream));
         owners.store.write(&write, sample, issue, None)?;
-        batch.calls[index].export(owners, call, output, &write, false, issue)?;
+        batch.batch.calls[index]
+            .forward
+            .export(owners, call, output, &write, false, issue)?;
     }
     Ok(())
 }
