@@ -1,53 +1,534 @@
-//! One batch in flight: the dispatch of its jobs to the capability that
-//! serves it, its launch and its materialization.
+//! One batch in flight: the skeleton every capability's batch is built on,
+//! and the dispatch of a batch's jobs to the capability that serves it.
 //!
-//! Every batch carries calls of one kind on one component, and its forward
-//! is a sequence of jobs of its lane: [`forward`] prepares the next job and
-//! [`complete`] applies its completion. The first job completes the
-//! batch's imported inputs ([`crate::executor::inputs`]); the others belong
-//! to what serves the kind: the causal LM runner, the diffusion LM runner,
-//! an image model's batches ([`crate::executor::image`]), a video model's
-//! media batches ([`crate::executor::video`]) and transfers
-//! ([`crate::executor::transfer`]). A kind no capability of the rank serves
-//! is reported unsupported, which fails the batch with `UnsupportedSetup`
-//! and leaves the rank serving. No forward issues its own stream work: the
-//! jobs of every batch are operations its owner recorded.
+//! A batch carries calls of one kind on one component. Its forward is a
+//! sequence of jobs of its lane: [`forward`] prepares the next one and
+//! [`complete`] applies its completion. The first job completes the batch's
+//! imported inputs ([`crate::executor::inputs`]); the others belong to what
+//! serves the kind: the causal LM and diffusion LM runners, an image model's
+//! batches ([`crate::executor::image`]), a video model's media batches
+//! ([`crate::executor::video`]) and transfers ([`crate::executor::transfer`]).
+//! No forward issues its own stream work: the jobs of every batch are
+//! operations its owner recorded.
 //!
-//! A capability reserves a batch's outputs, records its device work and the
-//! copies of its result words into an output lease, then hands the batch to
-//! materialization as a [`Launched`] value. Once the lease's device fences
-//! complete, [`materialize`] reads the words back, decodes every call's
-//! result and accepts its progress into the request pool. A capability whose
-//! results also need host work after the device finished (encoding decoded
-//! images) attaches it as a [`HostStage`].
+//! Every capability's batch goes through the same steps, which this module
+//! implements once:
+//!
+//! 1. **Open** ([`Opening::open`]). Bind every call's pending output to its
+//!    request and record in the opening job the read of every host-gated
+//!    predicate. The job's completion decides which calls are active
+//!    ([`Opening::predicates`]); a skipped call only publishes false flags.
+//! 2. **Lease** ([`Batch::lease`]). Lease the batch's output storage and
+//!    record the start of its device work.
+//! 3. **Flags** ([`Batch::bind_flags`]). Bind every call's completion flag;
+//!    a skipped call publishes false at once.
+//! 4. **Seal** ([`Batch::end_reads`], [`Batch::set_flags`],
+//!    [`Batch::validate`], [`Batch::seal`]). End the batch's read leases,
+//!    publish the executed calls' flags, validate every owner's update and
+//!    seal the lease, whose fences retire the batch's storage accesses.
+//! 5. **Commit** ([`Batch::commit`]). Once the job that carries the batch's
+//!    device work completed, its writes become visible and its calls
+//!    pending. A failure before this point retires everything the batch
+//!    reserved ([`Batch::discard`]); a failure at or past it is fatal.
+//! 6. **Launch and materialization** ([`Batch::launch`], [`materialize`]).
+//!    Once the lease's fences complete, every call's result is decoded and
+//!    its progress accepted.
+//!
+//! A failed batch reports its calls failed under the failure's code
+//! ([`fail`]); a fatal failure stops the rank. A kind no capability of the
+//! rank serves is reported unsupported ([`unsupported`]), which fails the
+//! batch with `UnsupportedSetup` and leaves the rank serving. A capability
+//! whose results need host work after the device finished (encoding
+//! decoded images) attaches it to its launch as a [`HostStage`].
 
-use super::backend::{WorkerBackend, WorkerBatch};
+use std::collections::HashMap;
+use std::sync::{Arc, MutexGuard, PoisonError};
+use std::time::Instant;
+
+use uniserve_core::CallId;
+use uniserve_cuda::Stream;
+use uniserve_ipc::{
+    Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardMode,
+    ForwardStats, MediaCall, RequestKey, TensorRef, WorkerInfo,
+};
+
 use crate::config::placement::Capability;
 use crate::error::WorkerError;
+use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::Device;
 use crate::lane::{Completion, Job, Recorder};
 use crate::request::RequestPool;
-use crate::storage::{OutputBuffer, OutputLease, TensorStore};
+use crate::storage::{
+    OutputBuffer, OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead, Scalar,
+    TensorStore,
+};
 use crate::stream::{EventPool, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
-use std::sync::{Arc, MutexGuard, PoisonError};
-use std::time::Instant;
-use uniserve_core::CallId;
-use uniserve_cuda::Stream;
-use uniserve_ipc::{
-    Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, ErrorCode, ForwardMode,
-    ForwardStats, MediaCall, TensorRef, WorkerInfo,
-};
 
-/// A forward batch launched on the device, awaiting its output fences.
+/// Where a batch's forward stands between its jobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Its imported inputs are not resident yet.
+    #[default]
+    Inputs,
+    /// Its capability's forward has jobs to run.
+    Forward,
+    /// Nothing is left for its lane.
+    Done,
+}
+
+/// A batch's failure, the step it happened in, and whether it happened at
+/// or past the commit point, after which the rank cannot roll back what
+/// became visible.
+pub(crate) struct Failure {
+    pub(crate) error: Error,
+    pub(crate) phase: &'static str,
+    pub(crate) committed: bool,
+}
+
+impl Failure {
+    /// A failure before the commit point, in `phase`.
+    pub(crate) fn new(phase: &'static str) -> impl Fn(Error) -> Self {
+        move |error| Self {
+            error,
+            phase,
+            committed: false,
+        }
+    }
+
+    /// A failure at or past the commit point, in `phase`.
+    pub(crate) fn fatal(phase: &'static str) -> impl Fn(Error) -> Self {
+        move |error| Self {
+            error,
+            phase,
+            committed: true,
+        }
+    }
+}
+
+/// One call's state through its batch: what every capability tracks, and
+/// `forward`, what the call contributes to its capability's forward.
+pub(crate) struct CallState<F = ()> {
+    pub(crate) output: PendingOutput,
+    /// The request slot of the call's request.
+    pub(crate) slot: usize,
+    /// False when the call's host-gated predicate skipped it.
+    pub(crate) active: bool,
+    pub(crate) completion_write: Option<ProductBuffer>,
+    pub(crate) forward: F,
+}
+
+/// A batch whose outputs are bound, before its output storage is leased:
+/// its host-gated predicates decide first which calls are active.
+pub(crate) struct Opening<F = ()> {
+    calls: Vec<CallState<F>>,
+    /// The calls whose predicate the opening job reads, in the order of its
+    /// reads.
+    predicated: Vec<usize>,
+    /// This rank reports the component's host results.
+    reports: bool,
+    started: Instant,
+}
+
+impl<F: Default> Opening<F> {
+    /// Bind the outputs of `plan`'s calls to their requests' live epochs and
+    /// slots, and record in `job` the read of every host-gated predicate of
+    /// a call `gated` selects. Each predicate is read after its producer's
+    /// fence; its read lease ends behind the read, and the job's completion
+    /// carries one byte per predicate.
+    #[expect(clippy::too_many_arguments, reason = "the owners a batch opens on")]
+    pub(crate) fn open(
+        requests: &mut RequestPool,
+        tensors: &TensorStore,
+        info: &WorkerInfo,
+        rank: usize,
+        plan: &BatchPlan,
+        device: Option<i32>,
+        job: Recorder<'_>,
+        gated: impl Fn(&Call) -> bool,
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let first = plan
+            .calls
+            .first()
+            .ok_or_else(|| Error::Invariant("a batch has calls".into()))?;
+        let reports = reports_output(info, rank, &first.component)?;
+
+        let rows = plan
+            .calls
+            .iter()
+            .map(|call| {
+                let request = requests.get(call.request_key.request_id.0)?;
+                Ok((call.request_key, call.call_id, request.slot()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bound = requests.bind_calls(&rows)?;
+        let mut calls = Vec::with_capacity(plan.calls.len());
+        for (index, (call, request)) in plan.calls.iter().zip(&bound).enumerate() {
+            calls.push(CallState {
+                output: PendingOutput::new(call, request.progress()?, index)?,
+                slot: request.slot(),
+                active: true,
+                completion_write: None,
+                forward: F::default(),
+            });
+        }
+
+        let mut predicated = Vec::new();
+        for (index, call) in plan.calls.iter().enumerate() {
+            let Some(predicate) = call
+                .predicate
+                .as_ref()
+                .filter(|predicate| predicate.dtype == DType::U8 && gated(call))
+            else {
+                continue;
+            };
+            request_flag(tensors, call, predicate, device, job)?;
+            predicated.push(index);
+        }
+        Ok(Self {
+            calls,
+            predicated,
+            reports,
+            started,
+        })
+    }
+}
+
+impl<F> Opening<F> {
+    /// The calls' states, for a capability that sets what they contribute
+    /// to its forward.
+    pub(crate) fn calls_mut(&mut self) -> &mut [CallState<F>] {
+        &mut self.calls
+    }
+
+    /// Whether the opening job reads predicates, so the batch continues
+    /// only once that job completed.
+    pub(crate) fn reads_predicates(&self) -> bool {
+        !self.predicated.is_empty()
+    }
+
+    /// Apply the opening job's completion: a call whose predicate read
+    /// false is skipped.
+    pub(crate) fn predicates(&mut self, completion: &mut Completion) -> Result<()> {
+        for index in std::mem::take(&mut self.predicated) {
+            if !flag(completion)? {
+                let state = &mut self.calls[index];
+                state.active = false;
+                state.output.output.status = CallStatus::Predicated;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A batch whose output storage is leased: its calls and what it
+/// reserved. It borrows nothing, so it waits between its jobs as it is.
+pub(crate) struct Batch<F = ()> {
+    pub(crate) calls: Vec<CallState<F>>,
+    /// The batch's output lease: its calls' completion words and payloads.
+    pub(crate) buffer: OutputLease,
+    /// The products the batch writes, visible once it commits.
+    pub(crate) writes: Vec<ProductBuffer>,
+    /// The products the batch reads, leased until its read fences.
+    pub(crate) reads: Vec<Arc<ProductRead>>,
+    /// Signals the physical end of the batch's storage accesses.
+    pub(crate) retirement: Arc<Retirement>,
+    /// The stream and device the batch's device work runs on.
+    pub(crate) stream: Option<Stream>,
+    pub(crate) device: Option<i32>,
+    /// This rank reports the component's host results.
+    pub(crate) reports: bool,
+    pub(crate) started: Instant,
+}
+
+impl<F> Batch<F> {
+    /// Lease the opened batch's output storage, `words` words for its calls'
+    /// completions and payloads, and record the start of its device work in
+    /// `job`.
+    pub(crate) fn lease(
+        opening: Opening<F>,
+        outputs: &mut OutputPool,
+        words: usize,
+        stream: Option<Stream>,
+        device: Option<i32>,
+        events: &EventPool,
+        job: &Job,
+    ) -> Result<Self> {
+        let Opening {
+            calls,
+            reports,
+            started,
+            ..
+        } = opening;
+        let devices: Vec<i32> = device.into_iter().collect();
+        let buffer = outputs.lease(calls.len(), words.max(1), &devices, false)?;
+        if let Some(stream) = &stream
+            && let Err(error) = lock(&buffer).begin_device(device, job.on(Some(stream)), events)
+        {
+            lock(&buffer).abandon();
+            return Err(error);
+        }
+        Ok(Self {
+            calls,
+            buffer,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            retirement: Arc::new(Retirement::default()),
+            stream,
+            device,
+            reports,
+            started,
+        })
+    }
+
+    /// Where the batch issues its stream work: `job`, on its stream.
+    pub(crate) fn issue<'j>(&'j self, job: &'j Job) -> Recorder<'j> {
+        job.on(self.stream.as_ref())
+    }
+
+    /// The device the batch's products live on.
+    pub(crate) fn target(&self) -> Device {
+        self.device.map_or(Device::Cpu, Device::Cuda)
+    }
+
+    /// Indices of the calls that execute.
+    pub(crate) fn active(&self) -> Vec<usize> {
+        (0..self.calls.len())
+            .filter(|&index| self.calls[index].active)
+            .collect()
+    }
+
+    /// The request slot of every call's request, for relayed products.
+    pub(crate) fn slots(&self, plan: &BatchPlan) -> HashMap<RequestKey, usize> {
+        plan.calls
+            .iter()
+            .zip(&self.calls)
+            .map(|(call, state)| (call.request_key, state.slot))
+            .collect()
+    }
+
+    /// Bind every call's completion flag; a skipped call publishes false
+    /// now.
+    pub(crate) fn bind_flags(
+        &mut self,
+        plan: &BatchPlan,
+        tensors: &TensorStore,
+        job: &Job,
+    ) -> Result<()> {
+        let target = self.target();
+        let flags: Vec<(TensorRef, Device)> = plan
+            .calls
+            .iter()
+            .filter_map(|call| call.completion_output.clone())
+            .map(|flag| (flag, target))
+            .collect();
+        if flags.is_empty() {
+            return Ok(());
+        }
+        let slots = self.slots(plan);
+        let bound = tensors.bind_outputs(
+            &flags,
+            OutputPlacement {
+                request_slots: Some(&slots),
+                ..OutputPlacement::default()
+            },
+        )?;
+        let owners: HashMap<_, usize> = plan
+            .calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, call)| Some((call.completion_output.as_ref()?.buffer_id(), index)))
+            .collect();
+        for write in bound {
+            self.writes.push(write.clone());
+            let index = *owners
+                .get(&write.id())
+                .ok_or_else(|| Error::Invariant("a completion flag names no call".into()))?;
+            let state = &mut self.calls[index];
+            if !state.active {
+                tensors.write_scalar(&write, Scalar::Int(0), job.on(self.stream.as_ref()))?;
+            }
+            state.completion_write = Some(write);
+        }
+        Ok(())
+    }
+
+    /// Record the end of the batch's read leases in `job`. A read ends at
+    /// the fence of `after`'s write it fed when every read has one,
+    /// otherwise at a reader fence.
+    pub(crate) fn end_reads(
+        &mut self,
+        tensors: &TensorStore,
+        job: &Job,
+        after: &[ProductBuffer],
+    ) -> Result<()> {
+        let reads = std::mem::take(&mut self.reads);
+        let after = if after.len() == reads.len() {
+            after
+        } else {
+            &[]
+        };
+        tensors.complete_reads(&reads, job.on(self.stream.as_ref()), after)
+    }
+
+    /// Record the completion flags of the executed calls: they become true.
+    pub(crate) fn set_flags(&self, tensors: &TensorStore, job: &Job) -> Result<()> {
+        for state in self.calls.iter().filter(|state| state.active) {
+            if let Some(write) = &state.completion_write {
+                tensors.write_scalar(write, Scalar::Int(1), job.on(self.stream.as_ref()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Check every call's captured output and the batch's writes before
+    /// the commit point.
+    pub(crate) fn validate(&self, plan: &BatchPlan, tensors: &TensorStore) -> Result<()> {
+        {
+            let output = lock(&self.buffer);
+            for (state, call) in self.calls.iter().zip(&plan.calls) {
+                state.output.validate_output(&output, call)?;
+            }
+        }
+        tensors.validate_writes(&self.writes)
+    }
+
+    /// Seal the lease in `job` and complete the batch's retirement (the
+    /// physical end of its storage accesses) once the lease's fences
+    /// complete. The executor learns of their completion from the job it
+    /// submits for them ([`crate::executor::Backend::await_outputs`]),
+    /// which also wakes the service.
+    pub(crate) fn seal(&self, events: &EventPool, job: &Job) -> Result<()> {
+        let stream = job.on(self.stream.as_ref());
+        // A lease of host storage is sealed on no stream.
+        let streams = if stream.stream().is_some() {
+            vec![stream]
+        } else {
+            Vec::new()
+        };
+        let fences = lock(&self.buffer)
+            .seal(&streams, events)?
+            .unwrap_or_default();
+        let lease = Arc::clone(&self.buffer);
+        let retirement = Arc::clone(&self.retirement);
+        stream.defer(
+            events,
+            fences,
+            Box::new(move || {
+                lock(&lease).copies_finished();
+                crate::transfer::notify(retirement.complete(Ok(()))?);
+                Ok(())
+            }),
+        )
+    }
+
+    /// The pending state of every call of `plan`: its request, its call
+    /// and whether it advances its request's state.
+    pub(crate) fn pending(plan: &BatchPlan) -> Vec<(RequestKey, CallId, bool)> {
+        plan.calls
+            .iter()
+            .map(|call| (call.request_key, call.call_id, call.advances_state()))
+            .collect()
+    }
+
+    /// Make the batch's writes visible and its calls pending, once the job
+    /// carrying its device work completed. Every failure here is past the
+    /// commit point.
+    pub(crate) fn commit(
+        &mut self,
+        plan: &BatchPlan,
+        tensors: &TensorStore,
+        requests: &mut RequestPool,
+    ) -> std::result::Result<(), Failure> {
+        let fatal = Failure::fatal("batch commit");
+        for state in &mut self.calls {
+            state.output.reports_output = self.reports;
+        }
+        let writes = std::mem::take(&mut self.writes);
+        tensors.commit_writes(&writes).map_err(&fatal)?;
+        requests.add_pending(&Self::pending(plan)).map_err(&fatal)
+    }
+
+    /// Retire every reservation after a failure before the commit point,
+    /// recording in `job` the fences that end them: storage returns once
+    /// those fences complete.
+    pub(crate) fn discard(
+        &mut self,
+        tensors: &TensorStore,
+        events: &EventPool,
+        job: &Job,
+    ) -> Result<()> {
+        let reads = std::mem::take(&mut self.reads);
+        let completed = tensors.complete_reads(&reads, job.on(self.stream.as_ref()), &[]);
+        let writes = std::mem::take(&mut self.writes);
+        let abandoned = tensors.abandon_writes(&writes);
+        let sealed = if lock(&self.buffer).sealed() {
+            Ok(())
+        } else {
+            self.seal(events, job)
+        };
+        lock(&self.buffer).abandon();
+        completed.and(abandoned).and(sealed)
+    }
+
+    /// Hand the committed batch to materialization: `stats` are its
+    /// forward's, `timer` names its materialization in the statistics and
+    /// `host` is host work its results need after the device finished.
+    pub(crate) fn launch(
+        self,
+        stats: ForwardStats,
+        timer: &'static str,
+        host: Option<Box<dyn HostStage>>,
+    ) -> Launched {
+        Launched {
+            outputs: self.calls.into_iter().map(|state| state.output).collect(),
+            buffer: self.buffer,
+            started: self.started,
+            stats,
+            timer,
+            host,
+        }
+    }
+}
+
+/// Record the read of a host-gated (U8) predicate after its producer's
+/// fence: the job's completion carries its byte, which [`flag`] decodes.
+pub(crate) fn request_flag(
+    tensors: &TensorStore,
+    call: &Call,
+    predicate: &TensorRef,
+    device: Option<i32>,
+    job: Recorder<'_>,
+) -> Result<()> {
+    let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), job)?;
+    // One byte of a committed product, which the read lease keeps until
+    // the reader's fence that ends it below.
+    job.read(read.value().address(), 1);
+    tensors.complete_reads(&[read], job, &[])
+}
+
+/// The predicate the next read of `completion` carries
+/// ([`request_flag`]).
+pub(crate) fn flag(completion: &mut Completion) -> Result<bool> {
+    match completion.read()?[..] {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(Error::Invalid(
+            "call predicate is not a canonical boolean".into(),
+        )),
+    }
+}
+
+/// A batch launched on the device, awaiting its output fences.
 pub(crate) struct Launched {
     pub(crate) outputs: Vec<PendingOutput>,
     pub(crate) buffer: OutputLease,
     pub(crate) started: Instant,
     pub(crate) stats: ForwardStats,
-    /// The runtime's component timer name for materialization.
+    /// The component timer name of the batch's materialization.
     pub(crate) timer: &'static str,
     /// Host work that completes the calls' results after the device.
     pub(crate) host: Option<Box<dyn HostStage>>,
@@ -61,7 +542,7 @@ pub(crate) trait HostStage {
     fn poll(&mut self) -> Result<bool>;
 
     /// Attach the finished host results to the calls' outputs (before they
-    /// resolve), returning nothing else.
+    /// resolve).
     fn finish(&mut self, outputs: &mut [PendingOutput]) -> Result<()>;
 
     /// Withdraw work of a batch that will not be materialized.
@@ -85,7 +566,7 @@ pub(crate) fn reports_output(info: &WorkerInfo, rank: usize, component: &str) ->
 }
 
 /// The wire code of a batch failure classified as `code`.
-pub(crate) fn error_code(code: crate::ErrorCode) -> ErrorCode {
+fn error_code(code: crate::ErrorCode) -> ErrorCode {
     match code {
         crate::ErrorCode::ResourceError => ErrorCode::ResourceExhausted,
         crate::ErrorCode::ComputeError => ErrorCode::ComputeError,
@@ -97,7 +578,7 @@ pub(crate) fn error_code(code: crate::ErrorCode) -> ErrorCode {
 }
 
 /// Every call of `plan` fails with `code`, reporting its accepted progress.
-pub(crate) fn failed_output(
+fn failed_output(
     requests: &RequestPool,
     plan: &BatchPlan,
     predecessors: &[Option<CallId>],
@@ -132,62 +613,55 @@ pub(crate) fn failed_output(
     })
 }
 
-/// Record the read of a host-gated (U8) predicate after its producer's
-/// fence: the job's completion carries its byte, which [`flag`] decodes.
-pub(crate) fn request_flag(
-    tensors: &TensorStore,
-    call: &Call,
-    predicate: &TensorRef,
-    device: Option<i32>,
-    job: Recorder<'_>,
-) -> Result<()> {
-    let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), job)?;
-    // One byte of a committed product, which the read lease keeps until
-    // the reader's fence that ends it below.
-    job.read(read.value().address(), 1);
-    tensors.complete_reads(&[read], job, &[])
-}
-
-/// The predicate the next read of `completion` carries
-/// ([`request_flag`]).
-pub(crate) fn flag(completion: &mut Completion) -> Result<bool> {
-    match completion.read()?[..] {
-        [0] => Ok(false),
-        [1] => Ok(true),
-        _ => Err(Error::Invalid(
-            "call predicate is not a canonical boolean".into(),
-        )),
+/// Report a failed batch: a fatal failure, or one at or past the commit
+/// point, stops the rank; any other completes the batch with its calls
+/// failed under the failure's code, and the rank keeps serving.
+pub(crate) fn fail(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    failure: Failure,
+) -> std::result::Result<(), WorkerError> {
+    let mut error = WorkerError::classify(failure.error, Some(failure.phase));
+    if failure.committed {
+        // Products and pending calls may already be visible; the rank cannot
+        // roll them back.
+        error.fatal = true;
     }
+    if error.fatal {
+        return Err(error);
+    }
+    let plan = Arc::clone(batch.shared_plan());
+    tracing::warn!(
+        target: "uniserve_worker.execution",
+        "batch {} failed: {error}{}",
+        plan.batch_id,
+        error
+            .traceback()
+            .map(|trace| format!("\n{trace}"))
+            .unwrap_or_default()
+    );
+    let output = failed_output(
+        backend.requests(),
+        &plan,
+        batch.predecessors(),
+        error_code(error.code),
+    )?;
+    batch.complete(BatchResult {
+        output,
+        media: Vec::new(),
+    });
+    batch.set_stage(Stage::Done);
+    Ok(())
 }
 
-/// Seal the lease on `stream` and complete `retirement` (the physical end
-/// of the batch's storage accesses) once its fences complete. The batch's
-/// executor learns of their completion from the job it submits for them
-/// ([`crate::executor::Backend::await_outputs`]), which also wakes the
-/// service.
-pub(crate) fn seal(
-    events: &EventPool,
-    buffer: &OutputLease,
-    stream: impl Issue,
-    retirement: &Arc<Retirement>,
-) -> Result<()> {
-    // A lease of host storage is sealed on no stream.
-    let streams = if stream.stream().is_some() {
-        vec![stream]
-    } else {
-        Vec::new()
-    };
-    let fences = lock(buffer).seal(&streams, events)?.unwrap_or_default();
-    let lease = Arc::clone(buffer);
-    let retirement = Arc::clone(retirement);
-    stream.defer(
-        events,
-        fences,
-        Box::new(move || {
-            lock(&lease).copies_finished();
-            crate::transfer::notify(retirement.complete(Ok(()))?);
-            Ok(())
-        }),
+/// The error of a call kind whose capability is not served on this rank.
+pub(crate) fn unsupported(kind: CallKind, capability: &str) -> WorkerError {
+    WorkerError::classify(
+        Error::Unsupported(format!(
+            "{} is served by the {capability} capability",
+            kind.as_str()
+        )),
+        None,
     )
 }
 
@@ -279,8 +753,9 @@ fn abandon_launched(requests: &mut RequestPool, mut launched: Launched) -> Resul
     Ok(())
 }
 
-/// Orders one runtime's per-slot state across the streams of its runners:
-/// each batch waits for the previous batch recorded on another stream.
+/// Orders one runner family's per-slot state across the streams of its
+/// runners: each batch waits for the previous batch recorded on another
+/// stream.
 #[derive(Default)]
 pub(crate) struct StreamOrder {
     last: Option<(usize, Arc<uniserve_cuda::Event>)>,
@@ -317,18 +792,6 @@ impl StreamOrder {
     }
 }
 
-/// Where a batch's forward stands between its jobs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum Stage {
-    /// Its imported inputs are not resident yet.
-    #[default]
-    Inputs,
-    /// Its capability's forward has jobs to run.
-    Forward,
-    /// Nothing is left for its lane.
-    Done,
-}
-
 /// Materialize launched work whose device results are ready.
 pub(crate) fn poll(
     backend: &mut WorkerBackend,
@@ -344,57 +807,6 @@ pub(crate) fn abandon(
     launched: Launched,
 ) -> std::result::Result<(), WorkerError> {
     Ok(abandon_launched(backend.requests_mut(), launched)?)
-}
-
-/// Fail every call of a batch whose execution failed before any runtime
-/// committed work: a fatal failure stops the rank, any other completes the
-/// batch with its calls failed under the failure's code.
-pub(crate) fn fail(
-    backend: &mut WorkerBackend,
-    batch: &mut WorkerBatch,
-    error: Error,
-    context: &str,
-) -> std::result::Result<(), WorkerError> {
-    let error = WorkerError::classify(error, Some(context));
-    if error.fatal {
-        return Err(error);
-    }
-    let plan = batch.shared_plan();
-    tracing::warn!(
-        target: "uniserve_worker.execution",
-        "batch {} failed: {error}",
-        plan.batch_id
-    );
-    let output = failed_output(
-        backend.requests(),
-        plan,
-        batch.predecessors(),
-        error_code(error.code),
-    )?;
-    batch.complete(BatchResult {
-        output,
-        media: Vec::new(),
-    });
-    Ok(())
-}
-
-/// The error of a call kind whose runtime is not available on this rank.
-pub(crate) fn unsupported(kind: CallKind, runtime: &str) -> WorkerError {
-    WorkerError::classify(
-        Error::Unsupported(format!(
-            "{} is served by the {runtime} runtime",
-            kind_name(kind)
-        )),
-        None,
-    )
-}
-
-fn kind_name(kind: CallKind) -> &'static str {
-    match kind {
-        CallKind::Forward(mode) => mode.as_str(),
-        CallKind::Media(call) => call.as_str(),
-        CallKind::Transfer(mode) => mode.as_str(),
-    }
 }
 
 /// The next job of a batch's forward at its stage: the completion of its
@@ -488,7 +900,7 @@ pub(crate) fn complete(
 }
 
 /// Whether the forwards of `kind` on this rank are recorded into jobs
-/// ([`batch::forward`]): a video model's media calls, on its devices and
+/// ([`crate::executor::video::forward`]): a video model's media calls, on its devices and
 /// on its host lane. The others issue their own stream work.
 fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
     use MediaCall::*;
@@ -521,8 +933,7 @@ fn imported(
     match completed {
         Ok(()) => batch.set_stage(Stage::Forward),
         Err(error) => {
-            batch.set_stage(Stage::Done);
-            fail(backend, batch, error, "input import")?;
+            fail(backend, batch, Failure::new("input import")(error))?;
         }
     }
     Ok(())
