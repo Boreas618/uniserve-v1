@@ -21,7 +21,7 @@
 //!    and pending calls together. A failure before the commit point retires
 //!    everything the batch reserved and reports every call as failed; a
 //!    failure after it is fatal.
-//! 4. **Materialization** ([`crate::executor::forward::launch::materialize`]):
+//! 4. **Materialization** ([`crate::executor::batch::materialize`]):
 //!    once the
 //!    lease's device fences complete, decode each call's result and accept
 //!    its progress.
@@ -44,8 +44,8 @@ use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
-use crate::executor::forward::Stage;
-use crate::executor::forward::launch::{Launched, StreamOrder, error_code, failed_output};
+use crate::executor::batch::Stage;
+use crate::executor::batch::{Launched, StreamOrder, error_code, failed_output};
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::lane::{Completion, ExpertStep, ExpertVariant, Job};
 use crate::parallel::{ExpertUnion, MicrobatchForward};
@@ -615,7 +615,7 @@ pub(crate) fn forward(
 
     let parts = backend.parts();
     let (Some(runtime), Some(storage)) = (parts.text, parts.storage) else {
-        return Err(crate::executor::forward::unsupported(kind, "text"));
+        return Err(crate::executor::batch::unsupported(kind, "text"));
     };
     let mut owners = Owners {
         runtime,

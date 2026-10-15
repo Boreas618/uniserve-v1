@@ -42,10 +42,10 @@ use uniserve_ipc::{
 use crate::config::placement::{Capability, Declarations};
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
-use crate::executor::forward::batch::{MediaBatch, Trajectories};
-use crate::executor::forward::batch::{Parts, latent_params, product_name, stream_of};
-use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::executor::forward::transfer::latents::Pool;
+use crate::executor::products::{OutputShape, Placement, bind_outputs};
+use crate::executor::transfer::latents::Pool;
+use crate::executor::video::{MediaBatch, Trajectories};
+use crate::executor::video::{Parts, latent_params, product_name, stream_of};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list, integers};
 use crate::lane::{Completion, Job};
 use crate::parallel::joins::GraphFunctions;

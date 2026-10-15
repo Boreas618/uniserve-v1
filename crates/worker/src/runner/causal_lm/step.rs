@@ -20,7 +20,7 @@ use super::calls::{self, Prepared};
 use super::context::{self, Sources};
 use super::runners::Step;
 use super::{CausalLMRunners, StepParts};
-use crate::executor::forward::batch::image::ImageParts;
+use crate::executor::image::ImageParts;
 use crate::lane::Job;
 use crate::runner::causal_lm::{
     Embeddings, FINISH_IDS, PromptChunks, SamplingColumns, StepRequest, TokenRow, logit_layout,

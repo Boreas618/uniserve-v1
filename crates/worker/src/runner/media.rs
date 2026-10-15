@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use uniserve_core::ComponentConfig;
 use uniserve_ipc::{Batch as BatchPlan, Call, DimBound, TensorRef, TransferTransport};
 
-use crate::executor::forward::batch::{MediaBatch, Parts, Publication, product_name};
-use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, supplied};
+use crate::executor::products::{OutputShape, Placement, bind_outputs, supplied};
+use crate::executor::video::{MediaBatch, Parts, Publication, product_name};
 use crate::ffi::{Device, Function, Handle, Interpreter};
 use crate::host::mux::{MuxFunctions, read_unit};
 use crate::host::reader::{ConditionProducts, ConditionReader, ReaderFunctions};
@@ -228,7 +228,7 @@ fn borrow_unit(
 ) -> Result<UnitFrames> {
     let export = supplied(plan, product)
         .ok_or_else(|| Error::Invalid("a borrowed media input has no export".into()))?;
-    let tensor = crate::executor::forward::placement::tensor(export)?;
+    let tensor = crate::executor::products::tensor(export)?;
     let transport = parts
         .storage
         .transports
@@ -403,7 +403,7 @@ fn read_rows(parts: &Parts<'_>, plan: &BatchPlan, product: &TensorRef) -> Result
     let export = supplied(plan, product).ok_or_else(|| {
         Error::Invalid("artifact assembly input has no transfer locations".into())
     })?;
-    let tensor = crate::executor::forward::placement::tensor(export)?;
+    let tensor = crate::executor::products::tensor(export)?;
     if tensor.shape.len() != 2
         || tensor
             .locations

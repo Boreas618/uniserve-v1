@@ -13,7 +13,7 @@ use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
-use crate::executor::forward::decodes_video;
+use crate::executor::batch::decodes_video;
 use crate::ffi::{Handle, Interpreter};
 use crate::host::HostLane;
 use crate::host::image::ImageTask;

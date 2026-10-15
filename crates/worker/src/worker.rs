@@ -48,7 +48,7 @@ use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::WorkerBackend;
-use crate::executor::forward::transfer::TransferRuntime;
+use crate::executor::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Interpreter};
 use crate::lane::BLOCK_ON_TIMEOUT;

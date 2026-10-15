@@ -22,7 +22,7 @@ use uniserve_ipc::{
 };
 
 use crate::executor::PendingOutput;
-use crate::executor::forward::products::Publications;
+use crate::executor::products::Publications;
 use crate::storage::memory::{dtype_name, parse_dtype};
 use crate::storage::{LatentExport, LatentImport, LatentPool, LatentStorage};
 use crate::stream::Issue;

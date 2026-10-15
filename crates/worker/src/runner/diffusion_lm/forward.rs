@@ -25,7 +25,7 @@
 //!    completed. A failure before that commit retires everything the batch
 //!    reserved and reports every call as failed; a failure of the commit
 //!    itself is fatal.
-//! 4. **Completion** ([`crate::executor::forward::launch::materialize`]).
+//! 4. **Completion** ([`crate::executor::batch::materialize`]).
 //!    Once the lease's device fences complete, decode each call's result
 //!    and accept its progress. These calls write no prefix cache: each
 //!    keeps its visible length.
@@ -45,8 +45,8 @@ use super::{DiffusionLMRunner, Executed, Expert, KIND, Recorded};
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
-use crate::executor::forward::Stage;
-use crate::executor::forward::launch::{
+use crate::executor::batch::Stage;
+use crate::executor::batch::{
     Launched, StreamOrder, error_code, failed_output, flag, lock, reports_output, request_flag,
     seal,
 };
@@ -936,7 +936,7 @@ fn context<'a>(
         ..
     }) = parts.storage
     else {
-        return Err(crate::executor::forward::unsupported(kind, "diffusion LM"));
+        return Err(crate::executor::batch::unsupported(kind, "diffusion LM"));
     };
     Ok(Context {
         info: parts.info,

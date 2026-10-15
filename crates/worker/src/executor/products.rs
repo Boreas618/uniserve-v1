@@ -1,18 +1,38 @@
-//! The products a video batch's calls read and publish.
+//! Publication of a batch's products to the ranks and workers that read
+//! them.
+//!
+//! A runtime exports a product once the producer has written it: the
+//! tensor store exports its value through every export mechanism that
+//! reaches the producing call's consumers, retains each location's
+//! retirement on the product's buffer, and the product's descriptor joins
+//! the call's completion (and so the batch result the engine routes to the
+//! consumers). The locations become the buffer's registered exports at the
+//! batch's commit point and are revoked when the buffer is released; a
+//! batch that fails before committing revokes them at once. The same rules
+//! hold for every runtime, so this module is the one place that applies
+//! them.
+//!
+//! The products a video batch's calls read and publish:
 //!
 //! A call reads products other calls published (`Call::inputs`, a
 //! predicate) and publishes its own (`Call::outputs`, a completion scalar).
 //! Products live in the rank's [`TensorStore`]: imports from other ranks
-//! reach it before the batch executes (`forward::inputs`), and every input
+//! reach it before the batch executes ([`crate::executor::inputs`]), and every input
 //! is then leased from it ([`Reads`]); host codecs read some inputs in place
 //! from their shared-memory exports instead. [`bind_outputs`] reserves a
 //! call's outputs at their scheduler placement and [`export`] publishes a
 //! written one.
 
+use crate::executor::PendingOutput;
+use crate::ffi::Device;
+use crate::storage::{OutputPlacement, ProductBuffer, ProductExport, TensorStore};
+use crate::stream::Issue;
+use crate::transfer::Transports;
+use crate::transfer::exports::{self, Location};
+use crate::{Error, EventPool, ProductRead, Result};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
-
 use uniserve_core::CallId;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
@@ -20,12 +40,104 @@ use uniserve_ipc::{
     TransferHandle,
 };
 
-use crate::ffi::Device;
-use crate::storage::OutputPlacement;
-use crate::stream::Issue;
-use crate::transfer::Transports;
-use crate::transfer::exports::Location;
-use crate::{Error, EventPool, ProductBuffer, ProductRead, Result, TensorStore};
+/// The product exports a batch accepted before its commit point.
+#[derive(Default)]
+pub(crate) struct Publications {
+    exports: Vec<(BufferId, Vec<Location>)>,
+}
+
+impl Publications {
+    /// Accept an export another owner made of `buffer` (a latent version,
+    /// say): its `locations` register with the batch's products and its
+    /// descriptor joins the call's completion products.
+    pub(crate) fn accept(
+        &mut self,
+        buffer: BufferId,
+        locations: Vec<Location>,
+        export: TensorExport,
+        output: &mut PendingOutput,
+    ) -> Result<()> {
+        // Record the locations before the descriptor is accepted, so a
+        // failure from here on revokes them with the batch.
+        self.exports.push((buffer, locations));
+        let mut products = output.products().to_vec();
+        products.push(export);
+        output.set_products(products)
+    }
+
+    /// Issue the export of an encoder feature to other ranks and workers to
+    /// `stream`, behind the work that produced it. Readers on this rank
+    /// lease it from the tensor store directly, so a feature is exported
+    /// only when the rank publishes over a mechanism other ranks read, and
+    /// only by the rank that reports its component's results: `None`
+    /// otherwise. [`Self::locate`] publishes the export once that work was
+    /// performed.
+    pub(crate) fn issue_feature(
+        tensors: &TensorStore,
+        transports: &Transports,
+        call: &Call,
+        write: &ProductBuffer,
+        reports: bool,
+        stream: impl Issue,
+    ) -> Result<Option<ProductExport>> {
+        if !reports || !transports.exports_remotely() {
+            return Ok(None);
+        }
+        let product = call
+            .encoder_output
+            .as_ref()
+            .filter(|product| product.buffer_id() == write.id())
+            .ok_or_else(|| {
+                Error::Invariant("an exported feature names no encoder output".into())
+            })?;
+        tensors
+            .export_buffer(call, product, write, transports, false, None, stream)
+            .map(Some)
+    }
+
+    /// Publish an issued `export` of `write` once its work was performed:
+    /// its locations register with the batch's products and its descriptor
+    /// joins the call's completion products.
+    pub(crate) fn locate(
+        &mut self,
+        tensors: &TensorStore,
+        write: &ProductBuffer,
+        export: ProductExport,
+        output: &mut PendingOutput,
+    ) -> Result<()> {
+        let (export, locations) = tensors.located(write, export)?;
+        self.accept(write.id(), locations, export, output)
+    }
+
+    /// Check, before the commit point, that no buffer already registers
+    /// different locations.
+    pub(crate) fn validate(&self, tensors: &TensorStore) -> Result<()> {
+        for (buffer, locations) in &self.exports {
+            tensors.validate_exports(*buffer, locations)?;
+        }
+        Ok(())
+    }
+
+    /// Register the locations with their buffers at the commit point; they
+    /// are revoked when the buffers are released.
+    pub(crate) fn register(&mut self, tensors: &TensorStore) -> Result<()> {
+        for (buffer, locations) in self.exports.drain(..) {
+            tensors.register_exports(buffer, locations)?;
+        }
+        Ok(())
+    }
+
+    /// Revoke every location of a batch that failed before its commit
+    /// point; physical accesses still retire through the transports.
+    pub(crate) fn revoke(&mut self) -> Result<()> {
+        let locations: Vec<Location> = self
+            .exports
+            .drain(..)
+            .flat_map(|(_, locations)| locations)
+            .collect();
+        exports::release(&locations)
+    }
+}
 
 /// The rank's product owners a batch uses.
 #[derive(Clone, Copy)]
@@ -38,7 +150,7 @@ pub(crate) struct ProductOwners<'a> {
 /// One batch's reads of products in the rank's tensor store.
 ///
 /// Products other ranks published were imported and published into the
-/// store before the batch executes (`forward::inputs`), so every input is
+/// store before the batch executes ([`crate::executor::inputs`]), so every input is
 /// leased like a product of this rank. Inputs a host codec reads in place
 /// from their shared-memory exports (*borrowed*) are not in the store.
 #[derive(Default)]

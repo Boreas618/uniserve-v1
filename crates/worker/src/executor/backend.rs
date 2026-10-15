@@ -19,8 +19,8 @@ use uniserve_ipc::{
     RequestKind, WorkerInfo, WorkerResponseError,
 };
 
-use super::forward::batch::image::ImageParts;
-use super::forward::{self, launch::Launched};
+use super::batch::{self, Launched};
+use super::image::ImageParts;
 use super::lifecycle::{LaneJobs, RequestStorage, Retirement};
 use super::{Backend, BatchResult, Submission};
 use crate::config::placement::Components;
@@ -77,7 +77,7 @@ pub struct WorkerBackend {
     weights: Option<crate::parallel::DwdpManager>,
     /// The transfer runtime: tensor transfers, cache exports and installs, and
     /// the streams batch imports run on.
-    transfer: Option<forward::transfer::TransferRuntime>,
+    transfer: Option<super::transfer::TransferRuntime>,
     /// The admitted video requests, on ranks of a video model.
     video: Option<VideoRequests>,
     /// The rank's encoder, denoiser and decoder runners.
@@ -117,7 +117,7 @@ pub(crate) struct Parts<'a> {
     pub image: Option<ImageParts<'a>>,
     pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
     pub experts: Option<&'a Arc<crate::parallel::ExpertUnion>>,
-    pub transfer: Option<&'a mut forward::transfer::TransferRuntime>,
+    pub transfer: Option<&'a mut super::transfer::TransferRuntime>,
 }
 
 /// Every request storage owner, in lifecycle order: rank storage, the text
@@ -135,7 +135,7 @@ fn owners<'a>(
     trajectories: &'a mut Trajectories,
     latents: &'a mut Option<ImageLatents>,
     diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
-    transfer: &'a mut Option<forward::transfer::TransferRuntime>,
+    transfer: &'a mut Option<super::transfer::TransferRuntime>,
     video: &'a mut Option<VideoRequests>,
     denoisers: &'a mut DenoiserRunners,
     media_outputs: &'a mut Option<OutputPool>,
@@ -186,7 +186,7 @@ pub struct WorkerBatch {
     predecessors: Vec<Option<CallId>>,
     retirement: Retirement,
     /// Where the batch's forward stands between its jobs.
-    stage: forward::Stage,
+    stage: batch::Stage,
     /// What a forward that issues itself kept for its submitter: how the
     /// completion of the imported inputs, or a forward inside a converted
     /// batch, ended.
@@ -196,7 +196,7 @@ pub struct WorkerBatch {
     /// A diffusion LM batch between its jobs.
     denoising: Option<crate::runner::diffusion_lm::Pending>,
     /// A transfer batch between its jobs.
-    transfer: Option<forward::transfer::Pending>,
+    transfer: Option<super::transfer::Pending>,
     /// The batch's profiler step is open: its forward began and has not
     /// ended.
     stepping: bool,
@@ -207,13 +207,13 @@ pub struct WorkerBatch {
     /// The host preparation of an image encoding batch's inline images.
     image_inputs: Option<Inputs>,
     /// An image batch between two of its jobs.
-    image: Option<forward::batch::image::Pending>,
+    image: Option<super::image::Pending>,
     /// The video requests the batch started, while the library sizes them.
     sizing: Option<crate::request::video::Sizing>,
     /// Products and cache transfers imported from other calls.
-    inputs: forward::inputs::Inputs,
+    inputs: super::inputs::Inputs,
     /// A media batch's calls and completion.
-    media: Option<forward::batch::MediaBatch>,
+    media: Option<super::video::MediaBatch>,
     output: Option<BatchResult>,
 }
 
@@ -224,7 +224,7 @@ impl WorkerBatch {
             plan,
             predecessors: Vec::new(),
             retirement,
-            stage: forward::Stage::default(),
+            stage: batch::Stage::default(),
             issued: None,
             tokens: None,
             denoising: None,
@@ -235,7 +235,7 @@ impl WorkerBatch {
             image_inputs: None,
             image: None,
             sizing: None,
-            inputs: forward::inputs::Inputs::default(),
+            inputs: super::inputs::Inputs::default(),
             media: None,
             output: None,
         }
@@ -270,11 +270,11 @@ impl WorkerBatch {
             .collect()
     }
 
-    pub(crate) fn stage(&self) -> forward::Stage {
+    pub(crate) fn stage(&self) -> batch::Stage {
         self.stage
     }
 
-    pub(crate) fn set_stage(&mut self, stage: forward::Stage) {
+    pub(crate) fn set_stage(&mut self, stage: batch::Stage) {
         self.stage = stage;
     }
 
@@ -307,8 +307,8 @@ impl WorkerBatch {
         &mut self,
     ) -> (
         &BatchPlan,
-        &forward::inputs::Inputs,
-        &mut Option<forward::transfer::Pending>,
+        &super::inputs::Inputs,
+        &mut Option<super::transfer::Pending>,
     ) {
         (&self.plan, &self.inputs, &mut self.transfer)
     }
@@ -338,7 +338,7 @@ impl WorkerBatch {
         &mut self,
     ) -> (
         &BatchPlan,
-        &mut Option<forward::batch::image::Pending>,
+        &mut Option<super::image::Pending>,
         &mut Option<Inputs>,
     ) {
         (&self.plan, &mut self.image, &mut self.image_inputs)
@@ -351,17 +351,17 @@ impl WorkerBatch {
     ) -> (
         &BatchPlan,
         HashSet<uniserve_ipc::BufferId>,
-        &mut Option<forward::batch::MediaBatch>,
+        &mut Option<super::video::MediaBatch>,
     ) {
         (&self.plan, self.inputs.borrowed(), &mut self.media)
     }
 
     /// The batch's imported inputs.
-    pub(crate) fn inputs(&self) -> &forward::inputs::Inputs {
+    pub(crate) fn inputs(&self) -> &super::inputs::Inputs {
         &self.inputs
     }
 
-    pub(crate) fn inputs_mut(&mut self) -> &mut forward::inputs::Inputs {
+    pub(crate) fn inputs_mut(&mut self) -> &mut super::inputs::Inputs {
         &mut self.inputs
     }
 }
@@ -689,7 +689,7 @@ impl WorkerBackend {
     }
 
     /// Install the transfer runtime.
-    pub(crate) fn set_transfer(&mut self, transfer: forward::transfer::TransferRuntime) {
+    pub(crate) fn set_transfer(&mut self, transfer: super::transfer::TransferRuntime) {
         self.transfer = Some(transfer);
     }
 
@@ -796,10 +796,10 @@ impl WorkerBackend {
     }
 
     /// The parts a video batch executes with.
-    pub(crate) fn media_parts(&mut self) -> Result<forward::batch::Parts<'_>> {
+    pub(crate) fn media_parts(&mut self) -> Result<super::video::Parts<'_>> {
         let unserved =
             || Error::Unsupported("video calls are served on a video model's rank".into());
-        Ok(forward::batch::Parts {
+        Ok(super::video::Parts {
             requests: &mut self.requests,
             storage: self
                 .rank_storage
@@ -1209,7 +1209,7 @@ impl Backend for WorkerBackend {
         // Products other calls published are imported for every runtime
         // alike. What the imports recorded for the lane is performed even
         // when an import failed after it: the fences are due either way.
-        let (job, admitted) = forward::inputs::admit(self, batch);
+        let (job, admitted) = super::inputs::admit(self, batch);
         let submitted = match batch.route() {
             Some(kind) if !job.is_empty() => {
                 Some(self.start(Some(kind), job, true).map_err(lane_lost)?)
@@ -1225,7 +1225,7 @@ impl Backend for WorkerBackend {
         completion: Completion,
     ) -> std::result::Result<(), WorkerError> {
         let Some(mut sizing) = batch.sizing.take() else {
-            return forward::inputs::admitted(self, batch, completion);
+            return super::inputs::admitted(self, batch, completion);
         };
 
         // The job asked the library to size the requests the batch started.
@@ -1259,7 +1259,7 @@ impl Backend for WorkerBackend {
         // The cache transfers other calls published are imported behind the
         // admitted products (`admit_inputs`), and the batch waits for both
         // (`await_inputs` subscribes to what blocks them).
-        if !forward::inputs::prepare(self, batch)? {
+        if !super::inputs::prepare(self, batch)? {
             return Ok(false);
         }
         // Inline images of an image encoding batch are decoded on the image
@@ -1277,7 +1277,7 @@ impl Backend for WorkerBackend {
         batch: &mut WorkerBatch,
         submission: &Arc<Submission>,
     ) -> std::result::Result<(), WorkerError> {
-        Ok(forward::inputs::subscribe(self, batch, submission)?)
+        Ok(super::inputs::subscribe(self, batch, submission)?)
     }
 
     fn lane(&self, batch: &WorkerBatch) -> Option<usize> {
@@ -1311,36 +1311,36 @@ impl Backend for WorkerBackend {
                 // Imported values become resident before the runtime
                 // consumes them like local ones; an import that failed
                 // fails the batch's calls.
-                forward::Stage::Inputs => {}
+                batch::Stage::Inputs => {}
                 // Each executed batch with calls is one profiler step.
-                forward::Stage::Forward if !batch.stepping => {
+                batch::Stage::Forward if !batch.stepping => {
                     batch.stepping = true;
                     if let Some(profiler) = &mut self.profiler {
                         profiler.begin();
                     }
                 }
-                forward::Stage::Forward => {}
-                forward::Stage::Done => self.end_forward(batch),
+                batch::Stage::Forward => {}
+                batch::Stage::Done => self.end_forward(batch),
             }
 
             // The profiler's window opens before the first job of its
             // first step's forward and closes behind the last job of its
             // last step's: each of its jobs is one the batch waits for.
-            if stage != forward::Stage::Inputs
+            if stage != batch::Stage::Inputs
                 && let Some(profiler) = &mut self.profiler
                 && let Some(job) = profiler.next(&lanes, kind)
             {
                 batch.profiling = Some(job);
                 return Ok(Some(job));
             }
-            if stage == forward::Stage::Done {
+            if stage == batch::Stage::Done {
                 self.release_predecessors(batch, true)?;
                 return Ok(None);
             }
 
             // A stage that needs nothing of the lane advances without a
             // job.
-            let submitted = match forward::forward(self, batch, kind) {
+            let submitted = match batch::forward(self, batch, kind) {
                 Ok(Some(job)) => {
                     // One forward is in flight at a time (the executor's
                     // ordering): lifecycle work without a stream follows
@@ -1380,7 +1380,7 @@ impl Backend for WorkerBackend {
             }
             return Ok(());
         }
-        let completed = forward::complete(self, batch, kind, completion);
+        let completed = batch::complete(self, batch, kind, completion);
         if completed.is_err() {
             self.end_forward(batch);
         }
@@ -1396,7 +1396,7 @@ impl Backend for WorkerBackend {
         };
         // The fences are named by the lease, which holds them whatever the
         // event pool has released since they were recorded.
-        let fences: Vec<_> = forward::launch::lock(&running.buffer)
+        let fences: Vec<_> = batch::lock(&running.buffer)
             .device_fences()
             .map(|(device, fence)| (device, Arc::clone(fence)))
             .collect();
@@ -1425,7 +1425,7 @@ impl Backend for WorkerBackend {
             .check()
             .map_err(|failure| lane_lost(failure.error))?;
         if let Some(running) = &batch.running {
-            forward::launch::lock(&running.buffer).fences_completed();
+            batch::lock(&running.buffer).fences_completed();
         }
         Ok(())
     }
@@ -1502,7 +1502,7 @@ impl Backend for WorkerBackend {
         let mut advanced = false;
         if batch.output.is_none()
             && let Some(running) = batch.running.as_mut()
-            && let Some(result) = forward::poll(self, &batch.plan, running)?
+            && let Some(result) = batch::poll(self, &batch.plan, running)?
         {
             batch.output = Some(result);
             batch.running = None;
@@ -1560,7 +1560,7 @@ impl Backend for WorkerBackend {
         let mut abandoned = batch
             .running
             .take()
-            .map_or(Ok(()), |running| forward::abandon(self, running));
+            .map_or(Ok(()), |running| batch::abandon(self, running));
         if let Some(media) = &mut batch.media {
             let closed = self.media_parts().and_then(|parts| {
                 let owners = parts.owners();
@@ -1570,7 +1570,7 @@ impl Backend for WorkerBackend {
         }
         // Imports the batch did not consume are abandoned; their storage
         // retires with their physical accesses.
-        let closed = forward::inputs::close(self, batch).map_err(WorkerError::from);
+        let closed = super::inputs::close(self, batch).map_err(WorkerError::from);
         abandoned.and(closed)
     }
 

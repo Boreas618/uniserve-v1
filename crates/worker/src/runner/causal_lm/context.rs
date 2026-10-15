@@ -22,7 +22,7 @@ use std::sync::Arc;
 use uniserve_ipc::{Call, ForwardBatch};
 
 use crate::executor::PendingOutput;
-use crate::executor::forward::batch::image::ImageParts;
+use crate::executor::image::ImageParts;
 use crate::ffi::Device;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};

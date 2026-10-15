@@ -73,14 +73,14 @@ use uniserve_ipc::{Batch as BatchPlan, CallKind, ForwardStats, MediaCall};
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
-use crate::executor::forward::batch::MediaBatch;
-use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::batch::image::{ImageBatch, Progress, Resume, allocations};
-use crate::executor::forward::batch::{
+use crate::executor::image::ImageParts;
+use crate::executor::image::{ImageBatch, Progress, Resume, allocations};
+use crate::executor::products::Publications;
+use crate::executor::products::{OutputShape, Placement, bind_outputs};
+use crate::executor::video::MediaBatch;
+use crate::executor::video::{
     Parts, bind_rows, decode_range, product_name, publish, publish_bound, row_width, stream_of,
 };
-use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::executor::forward::products::Publications;
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Completion, Job};
 use crate::parallel::joins::GraphFunctions;

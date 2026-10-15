@@ -6,7 +6,7 @@ use super::runners::EncoderRunners;
 use super::{EncoderConfig, EncoderRunner, TextSetup};
 use crate::Result;
 use crate::config::placement::Placed;
-use crate::executor::forward::batch::extent;
+use crate::executor::video::extent;
 use crate::runner::RunnerSetup;
 use crate::runner::component::{
     Component, TEXT_GRAPHS, VideoSetup, call_path, device_index, placed_device,

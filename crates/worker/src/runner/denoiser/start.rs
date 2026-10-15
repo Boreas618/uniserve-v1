@@ -6,7 +6,7 @@ use uniserve_ipc::MediaCall;
 use super::runners::DenoiserRunners;
 use super::{Conditioning, DenoiserRunner};
 use crate::config::placement::Placed;
-use crate::executor::forward::batch::extent;
+use crate::executor::video::extent;
 use crate::ffi::{DType, Device, Interpreter};
 use crate::runner::component::{Component, DENOISER_GRAPHS, VideoSetup, placed_device};
 use crate::{Error, Result};

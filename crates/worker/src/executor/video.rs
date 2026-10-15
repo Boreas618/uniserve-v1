@@ -16,8 +16,6 @@
 //! When recording fails part way, what was recorded before is still
 //! submitted and the batch fails from its completion.
 
-pub(crate) mod image;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError};
 
@@ -31,11 +29,11 @@ use uniserve_ipc::{
 use super::products::Publications;
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
-use crate::executor::forward::launch::{flag, request_flag};
-use crate::executor::forward::placement::{
+use crate::executor::batch::{flag, request_flag};
+use crate::executor::pending::{BatchResult, PendingOutput};
+use crate::executor::products::{
     OutputShape, Placement, ProductOwners, Reads, bind_completion, bind_outputs, export,
 };
-use crate::executor::pending::{BatchResult, PendingOutput};
 use crate::ffi::Device;
 use crate::host::HostTask;
 use crate::host::task::{MediaTask, TaskOutput};

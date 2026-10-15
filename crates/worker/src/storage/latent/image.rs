@@ -20,9 +20,9 @@ use uniserve_cuda::{CopyBatch, SourceOrder};
 
 use uniserve_ipc::{BufferId, LatentParams, RequestKey};
 
-use crate::executor::forward::launch::StreamOrder;
-use crate::executor::forward::transfer::latents::Pool;
+use crate::executor::batch::StreamOrder;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::transfer::latents::Pool;
 use crate::storage::LatentStorage;
 use crate::storage::memory::StorageView;
 use crate::stream::Issue;

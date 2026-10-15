@@ -22,7 +22,7 @@ use super::batch::{Batch, CallState};
 use super::calls;
 use super::step::{Invoked, Stepped};
 use crate::cuda_graph::{GraphMode, ShapeKey};
-use crate::executor::forward::launch::lock;
+use crate::executor::batch::lock;
 use crate::lane::Completion;
 use crate::runner::causal_lm::Executed;
 use crate::storage::{LogprobLayout, ProductBuffer, Scalar};
