@@ -86,7 +86,7 @@ pub use storage::{
 };
 pub use stream::{CUDAStream, Deferred, EventPool, Fill, Issue, RowFill, Submitter};
 pub use transfer::{
-    BufferRegistry, CacheImport, DescriptorGrants, ImportBackend, ImportCopy, KVImporter,
+    BufferRegistry, CacheImport, CacheImporter, DescriptorGrants, ImportBackend, ImportCopy,
     PeerStorage, Read, ReadBackend, ReadRegion, ReadReservation, RegisteredBuffer,
     SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead, Spans, TransferCapacity,
     TransferPool, TransferRead, TransferTicket, Transport, TransportKind, TransportOptions,
