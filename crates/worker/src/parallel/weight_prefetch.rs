@@ -15,7 +15,7 @@ use crate::config::{Device, WorkerLaunch};
 use crate::cuda_graph::GraphBreaks;
 use crate::ffi::{Function, Handle, Interpreter};
 use crate::lane::Lanes;
-use crate::model::LoadedModel;
+use crate::worker::LoadedModel;
 use crate::{Error, Result};
 
 #[derive(Default)]

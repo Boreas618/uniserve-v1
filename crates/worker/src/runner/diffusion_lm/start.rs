@@ -19,18 +19,18 @@ use super::buffers::{BankLayout, Banks, DenoiseLayout, DenoiseViews, Dimensions}
 use super::facts::Facts;
 use super::shapes::{SLOT_BUCKETS, Shapes, chunk_rows};
 use super::{CANDIDATES, DiffusionLMRunner, Functions, RUNNER};
+use crate::config::placement::Components;
+use crate::config::placement::RunnerKind;
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
 use crate::ffi::{Handle, Interpreter};
 use crate::lane::Lanes;
-use crate::model::LoadedModel;
-use crate::model::components::RunnerKind;
-use crate::model::registry::Components;
 use crate::parallel::{DwdpManager, ExpertUnion};
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::methods::{Argument, Methods};
 use crate::runner::scratch::Scratches;
 use crate::storage::{CachePlan, GroupShape, OutputPool, PrefixCache};
+use crate::worker::LoadedModel;
 use crate::{Error, Result};
 
 /// The call kind the runner serves.

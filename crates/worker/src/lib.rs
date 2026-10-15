@@ -20,7 +20,6 @@ mod host;
 pub mod lane;
 pub mod launch;
 mod logging;
-pub mod model;
 pub mod parallel;
 pub mod profiling;
 mod request;

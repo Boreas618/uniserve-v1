@@ -21,8 +21,10 @@
 //! in dependency order: execution, runners, streams, requests, the process
 //! world, then deferred device memory.
 
+mod loading;
 mod storage;
 
+pub(crate) use loading::LoadedModel;
 pub use storage::RankStorage;
 
 use std::collections::BTreeMap;
@@ -38,6 +40,8 @@ use crate::capacity::checks;
 use crate::capacity::device::{DeviceBudget, total_bytes};
 use crate::capacity::plan::{LatentPlan, Plan, Report, TokenFacts, TokenLayout, page_size};
 use crate::capacity::video::VideoCapacity;
+use crate::config::placement::Capability;
+use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
@@ -48,9 +52,6 @@ use crate::executor::forward::transfer::TransferRuntime;
 use crate::ffi::Device as StorageDevice;
 use crate::ffi::{DType, Handle, Interpreter};
 use crate::lane::{BLOCK_ON_TIMEOUT, Lanes};
-use crate::model::components::Capability;
-use crate::model::registry::Components;
-use crate::model::{ComponentMesh, Description, ExpertPartition, LoadedModel, sequence_kind};
 use crate::parallel::world::{World, startup_timeout};
 use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, PeerGroup};
 use crate::profiling::kernels::{KernelRecords, KernelWatch};
@@ -78,6 +79,7 @@ use crate::stream::{CUDAStream, EventPool};
 use crate::transfer::{Capacity, TransportKind, TransportOptions, Transports};
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
+use loading::{ComponentMesh, Description, ExpertPartition, sequence_kind};
 
 /// One caching-allocator segment: device, graph pool id and bytes.
 type Segment = (i32, (u64, u64), u64);
@@ -523,10 +525,6 @@ impl Worker {
 
     pub fn plan(&self) -> &Plan {
         &self.plan
-    }
-
-    pub fn model(&self) -> Option<&LoadedModel> {
-        self.model.as_ref()
     }
 
     pub fn world(&self) -> Option<&World> {
@@ -1350,7 +1348,7 @@ fn video_layout(
     report: Report,
     config: &mut WorkerConfig,
     launch: &WorkerLaunch,
-    declarations: &crate::model::components::Declarations,
+    declarations: &crate::config::placement::Declarations,
     components: &Components,
     video: &VideoModel,
     capacity: &VideoCapacity,

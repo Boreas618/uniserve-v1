@@ -5,8 +5,8 @@ use uniserve_ipc::MediaCall;
 use super::runners::EncoderRunners;
 use super::{EncoderConfig, EncoderRunner, TextSetup};
 use crate::Result;
+use crate::config::placement::Placed;
 use crate::executor::forward::batch::extent;
-use crate::model::registry::Placed;
 use crate::runner::RunnerSetup;
 use crate::runner::component::{
     Component, TEXT_GRAPHS, VideoSetup, call_path, device_index, placed_device,
@@ -33,7 +33,7 @@ impl EncoderRunners {
         let path = placed
             .calls
             .iter()
-            .find(|call| call.is(crate::model::components::Capability::TextEncoder))
+            .find(|call| call.is(crate::config::placement::Capability::TextEncoder))
             .map(|call| call.path.clone())
             .unwrap_or_default();
         let (stream, scratch) = setup.stream(MediaCall::TextEncoding, device)?;
@@ -59,7 +59,7 @@ impl EncoderRunners {
                     .collect(),
                 max_text_tokens: plan.max_text_tokens as usize,
             },
-            vision: placed.has(crate::model::components::Capability::PatchEncoder),
+            vision: placed.has(crate::config::placement::Capability::PatchEncoder),
         })?;
         self.text = Some(Component {
             name: placed.name.clone(),
@@ -92,8 +92,8 @@ impl EncoderRunners {
             })
         };
         let runner = EncoderRunner::conditions(
-            setup(crate::model::components::Capability::VideoEncoder)?,
-            setup(crate::model::components::Capability::AudioEncoder)?,
+            setup(crate::config::placement::Capability::VideoEncoder)?,
+            setup(crate::config::placement::Capability::AudioEncoder)?,
         )?;
         self.latent = Some(Component {
             name: placed.name.clone(),

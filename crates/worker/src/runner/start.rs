@@ -8,6 +8,8 @@ use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{CallKind, MediaCall};
 
 use crate::capacity::plan::LatentPlan;
+use crate::config::placement::Capability;
+use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
@@ -16,9 +18,6 @@ use crate::ffi::{Handle, Interpreter};
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::Lanes;
-use crate::model::LoadedModel;
-use crate::model::components::Capability;
-use crate::model::registry::Components;
 use crate::runner::ImageSetup;
 use crate::runner::causal_lm::model_dtype;
 use crate::runner::causal_lm::start::TextBounds;
@@ -33,6 +32,7 @@ use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::media::MediaRunner;
 use crate::runner::scratch::Scratches;
 use crate::storage::{ImageLatents, LatentPool, LatentStorage, OutputPool};
+use crate::worker::LoadedModel;
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
@@ -538,7 +538,7 @@ pub(crate) fn start_video(
     DecoderRunners,
     Option<MediaRunner>,
 )> {
-    use crate::model::components::Capability;
+    use crate::config::placement::Capability;
 
     let mut encoders = EncoderRunners::default();
     let mut denoisers = DenoiserRunners::default();

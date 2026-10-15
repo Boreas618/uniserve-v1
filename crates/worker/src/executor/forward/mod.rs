@@ -35,10 +35,10 @@ use uniserve_ipc::Batch as BatchPlan;
 
 use super::backend::{WorkerBackend, WorkerBatch};
 use crate::Error;
+use crate::config::placement::Capability;
 use crate::error::WorkerError;
 use crate::executor::BatchResult;
 use crate::lane::{Completion, Job};
-use crate::model::components::Capability;
 
 /// Where a batch's forward stands between its jobs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

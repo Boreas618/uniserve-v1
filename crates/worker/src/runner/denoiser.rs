@@ -39,6 +39,7 @@ use uniserve_ipc::{
     ShapeBound, VideoDenoiserInfo,
 };
 
+use crate::config::placement::{Capability, Declarations};
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::{MediaBatch, Trajectories};
@@ -47,7 +48,6 @@ use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::executor::forward::transfer::latents::Pool;
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list, integers};
 use crate::lane::{Completion, Job};
-use crate::model::components::{Capability, Declarations};
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};

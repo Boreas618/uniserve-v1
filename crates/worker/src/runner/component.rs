@@ -10,11 +10,11 @@ use uniserve_ipc::{CallKind, MediaCall, WorkerInfo};
 
 use crate::capacity::video::VideoCapacity;
 use crate::config::WorkerConfig;
+use crate::config::placement::Capability;
+use crate::config::placement::Placed;
 use crate::cuda_graph::{GraphPool, GraphStorage};
 use crate::ffi::{Device, Handle, Interpreter};
 use crate::lane::Lanes;
-use crate::model::components::Capability;
-use crate::model::registry::Placed;
 use crate::runner::denoiser::VideoModel;
 use crate::{Error, Result};
 

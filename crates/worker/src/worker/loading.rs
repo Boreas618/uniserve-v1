@@ -1,4 +1,4 @@
-//! Model description, loading and component bindings.
+//! The model-loading steps of [`Worker::start`](super::Worker::start).
 //!
 //! Loading runs in two phases around process-group creation:
 //!
@@ -14,39 +14,33 @@
 //! The rank reads what it needs of a loaded model from the owner of each
 //! fact: the loaded model's own (its attention backend and numerical
 //! formats) here, a capability's from that capability's runner.
-//!
-//! Component bindings ([`bind`]) and the registry of placed components by
-//! capability ([`registry`]) follow.
-
-pub mod components;
-pub mod registry;
 
 use tvm_ffi::Any;
 
-use crate::config::{Device, WorkerLaunch};
+use crate::config::WorkerLaunch;
 use crate::ffi::{Handle, Interpreter, integer_list, list, strings, texts};
 
 /// The library module that reads and loads a rank's model.
 const LOADING: &str = "uniserve.loading.rank";
+use crate::config::placement::Declarations;
 use crate::{Error, Result};
-use components::Declarations;
 
 /// The meta-device description of a model and its declarations.
-pub struct Description {
+pub(crate) struct Description {
     handle: Handle,
     /// `module.QualName` of the model class.
-    pub model_name: String,
-    pub declarations: Declarations,
+    pub(crate) model_name: String,
+    pub(crate) declarations: Declarations,
     /// Routed-expert module paths, when experts are disaggregated.
-    pub expert_paths: Vec<String>,
+    pub(crate) expert_paths: Vec<String>,
     /// The model decodes video, which bounds its request concurrency.
-    pub video_decoder: bool,
+    pub(crate) video_decoder: bool,
 }
 
 impl Description {
     /// Read the model's configuration and validate the placement against
     /// it (`read_config`).
-    pub fn describe(launch: &WorkerLaunch) -> Result<Self> {
+    pub(crate) fn describe(launch: &WorkerLaunch) -> Result<Self> {
         let execution = &launch.execution;
         let model = launch.model.as_ref();
         let components = serde_json::to_string(&launch.components).map_err(|error| {
@@ -100,32 +94,32 @@ impl Description {
 }
 
 /// One component's meshes, passed to loading.
-pub struct ComponentMesh {
-    pub component: String,
+pub(crate) struct ComponentMesh {
+    pub(crate) component: String,
     /// Outermost declared paths of the component.
-    pub paths: Vec<String>,
-    pub mesh: Handle,
-    pub units: Option<Handle>,
+    pub(crate) paths: Vec<String>,
+    pub(crate) mesh: Handle,
+    pub(crate) units: Option<Handle>,
     /// The sequence-parallel kind of the placement.
-    pub sequence: &'static str,
+    pub(crate) sequence: &'static str,
 }
 
 /// The expert-parallel union a model partitions its routed experts over.
-pub struct ExpertPartition {
+pub(crate) struct ExpertPartition {
     /// The torch world holding the union communicator.
-    pub world: Handle,
-    pub attention_ranks: usize,
-    pub dedicated: bool,
+    pub(crate) world: Handle,
+    pub(crate) attention_ranks: usize,
+    pub(crate) dedicated: bool,
 }
 
 /// A loaded model and its declarations.
-pub struct LoadedModel {
+pub(crate) struct LoadedModel {
     handle: Handle,
-    pub model_name: String,
-    pub declarations: Declarations,
-    pub video_decoder: bool,
+    pub(crate) model_name: String,
+    pub(crate) declarations: Declarations,
+    pub(crate) video_decoder: bool,
     /// The attention backend the model was loaded with.
-    pub attention_backend: String,
+    pub(crate) attention_backend: String,
 }
 
 impl LoadedModel {
@@ -133,7 +127,7 @@ impl LoadedModel {
     /// narrowed to the rank's resident modules: dedicated expert ranks hold
     /// only the routed experts, and attention ranks of a disaggregated
     /// union exclude them.
-    pub fn load(
+    pub(crate) fn load(
         description: Description,
         launch: &WorkerLaunch,
         meshes: Vec<ComponentMesh>,
@@ -225,18 +219,18 @@ impl LoadedModel {
         })
     }
 
-    pub fn handle(&self) -> &Handle {
+    pub(crate) fn handle(&self) -> &Handle {
         &self.handle
     }
 
     /// The storage formats of the loaded parameters (`weight_formats`).
-    pub fn weight_formats(&self) -> Result<Vec<String>> {
+    pub(crate) fn weight_formats(&self) -> Result<Vec<String>> {
         self.formats("weight_formats")
     }
 
     /// The input formats of the loaded linear layers
     /// (`activation_formats`).
-    pub fn activation_formats(&self) -> Result<Vec<String>> {
+    pub(crate) fn activation_formats(&self) -> Result<Vec<String>> {
         self.formats("activation_formats")
     }
 
@@ -248,24 +242,11 @@ impl LoadedModel {
 }
 
 /// The sequence-parallel kind name of a placement.
-pub fn sequence_kind(placement: &uniserve_core::ComponentConfig) -> &'static str {
+pub(crate) fn sequence_kind(placement: &uniserve_core::ComponentConfig) -> &'static str {
     match placement.parallel_config.sequence_parallel {
         uniserve_core::SequenceParallel::Local => "local",
         uniserve_core::SequenceParallel::Ulysses { .. } => "ulysses",
         uniserve_core::SequenceParallel::Allgather { .. } => "allgather",
         uniserve_core::SequenceParallel::Hybrid { .. } => "hybrid",
     }
-}
-
-/// The CUDA ordinal of a device name, or `-1` for the host.
-pub fn device_index(name: &str) -> i64 {
-    Device::parse(name, "device")
-        .ok()
-        .and_then(Device::cuda_index)
-        .map_or(-1, i64::from)
-}
-
-/// An integer list argument.
-pub fn shape_argument(values: &[usize]) -> tvm_ffi::Array<Any> {
-    integer_list(values.iter().map(|&value| value as i64))
 }

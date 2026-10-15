@@ -59,10 +59,10 @@ use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::ffi::{Backing, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Job, Lanes};
-use crate::model::LoadedModel;
 use crate::runner::scratch::Scratches;
 use crate::transfer::PeerStorage;
 use crate::warmup::WarmupHooks;
+use crate::worker::LoadedModel;
 use crate::{Error, Result};
 
 /// The library module of expert exchanges.
