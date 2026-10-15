@@ -31,10 +31,8 @@
 //! | `embedding_mask` | u8 | `[T]` | Rust: tokens whose embedding is replaced (multimodal) |
 
 use crate::ffi::DType;
+use crate::runner::attention::ROW_SECTIONS;
 use crate::runner::input_buffers::Columns;
-
-/// Host sections of the row gather's column array before the page counts.
-pub(crate) const ROW_SECTIONS: usize = 6;
 
 /// Finish tokens a decode row passes to the decode forward. A row with more
 /// is selected by the runner's `sample`.

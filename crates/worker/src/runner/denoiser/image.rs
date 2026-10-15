@@ -20,7 +20,7 @@
 //! (`step`).
 //!
 //! Input tensors of a forward: `positions [3, T]` int64, `timesteps [R, 1]`
-//! float32 and the packed row columns of [`AttentionColumns`], where `R`
+//! float32 and the packed row columns of [`AttentionMetadata`], where `R`
 //! rows of at most `T` tokens predict at most `P` latent rows; `noise`
 //! holds one image's drawn initial noise. Samples are the latent pool's
 //! step workspace, into which the caller gathers each trajectory's
@@ -57,7 +57,7 @@ use crate::profiling::kernels::KernelRecord;
 use crate::request::diffusion::{BranchSet, BranchSource, GuidancePlan, Prefix};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::ImageSetup;
-use crate::runner::attention::{AttentionCapacity, AttentionColumns, AttentionGeometry};
+use crate::runner::attention::{AttentionCapacity, AttentionMetadata};
 use crate::runner::causal_lm::{CausalLMRunners, Step};
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
@@ -206,7 +206,7 @@ pub struct ImageDiffusion {
     stream: Option<Stream>,
     methods: Methods,
     capacity: DiffusionCapacity,
-    attention: AttentionColumns,
+    attention: AttentionMetadata,
     positions: StorageView,
     timesteps: StorageView,
     /// One image's initial noise, `[P, width]` in the samples' dtype: the
@@ -279,7 +279,7 @@ impl ImageDiffusion {
             &[capacity.units as i64, width],
             stream.as_ref(),
         )?;
-        let attention = AttentionColumns::allocate(
+        let attention = AttentionMetadata::allocate(
             AttentionCapacity {
                 rows: capacity.rows,
                 tokens: capacity.tokens,
@@ -524,19 +524,21 @@ impl ImageDiffusion {
     }
 
     /// The arguments of the Python half's `denoise`, `plan_denoise` and
-    /// `encode_conditions` for staged rows and their attention geometry.
-    fn arguments(&self, rows: &[[i64; 7]], geometry: &AttentionGeometry) -> Result<Vec<Argument>> {
-        Ok(vec![
+    /// `encode_conditions` for staged rows and their staged attention
+    /// metadata.
+    fn arguments(&self, rows: &[[i64; 7]]) -> Vec<Argument> {
+        let attention = &self.attention;
+        vec![
             Argument::Handle(self.methods.runner.clone()),
-            Argument::Tensor(self.attention.column("row_columns")?.clone()),
+            Argument::Tensor(attention.row_columns().clone()),
             Argument::Tensor(self.positions.clone()),
             Argument::Tensor(self.timesteps.clone()),
             Argument::Integers(rows.iter().flatten().copied().collect()),
-            Argument::Integers(geometry.queries.clone()),
-            Argument::Integers(geometry.prefixes.clone()),
-            Argument::Integers(geometry.starts.clone()),
-            Argument::Integers(geometry.widths.clone()),
-        ])
+            Argument::Integers(attention.queries.clone()),
+            Argument::Integers(attention.prefixes.clone()),
+            Argument::Integers(attention.starts.clone()),
+            Argument::Integers(attention.widths.clone()),
+        ]
     }
 
     /// Evaluate the denoising rows of one step. Rows of one image share
@@ -579,10 +581,9 @@ impl ImageDiffusion {
         let widths = captured
             .as_ref()
             .map(|_| self.capacity.graph_widths.clone());
-        let geometry = self
-            .attention
+        self.attention
             .stage(&attention, tables, widths.as_deref(), check, issue)?;
-        let arguments = self.arguments(&described, &geometry)?;
+        let arguments = self.arguments(&described);
         let graph = match (&captured, &stream) {
             (Some(shape), Some(_)) => match self.graphs.lookup(shape, None)? {
                 Lookup::Replay(graph) => Some(graph),
@@ -648,10 +649,9 @@ impl ImageDiffusion {
                 write: true,
             })
             .collect();
-        let geometry = self
-            .attention
+        self.attention
             .stage(&attention, tables, None, check, issue)?;
-        let mut arguments = self.arguments(&described, &geometry)?;
+        let mut arguments = self.arguments(&described);
         // Each row's features follow the forward's tensors as a tensor of
         // their own.
         arguments.extend(
@@ -728,7 +728,7 @@ impl ImageDiffusion {
                 write: false,
             })
             .collect();
-        let geometry: AttentionGeometry = self.attention.stage(
+        self.attention.stage(
             &attention,
             tables,
             Some(&self.capacity.graph_widths),
@@ -736,7 +736,7 @@ impl ImageDiffusion {
             self.stream.as_ref(),
         )?;
         // The warmup evaluation, then the capture of the same forward.
-        let arguments = self.arguments(&described, &geometry)?;
+        let arguments = self.arguments(&described);
         MethodCall::new(&self.methods.denoise, arguments.clone()).invoke()?;
         let (Some(ordinal), Some(stream)) = (self.device.cuda_index(), &self.stream) else {
             return Err(Error::Invariant(

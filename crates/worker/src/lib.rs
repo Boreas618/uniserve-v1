@@ -55,9 +55,7 @@ pub use request::diffusion::{
 };
 pub use request::{Request, RequestPool, RequestProgress};
 pub use runner::ImageSetup;
-pub use runner::attention::{
-    AttentionCapacity, AttentionColumns, AttentionGeometry, ROW_SECTIONS, pack_rows,
-};
+pub use runner::attention::{AttentionCapacity, AttentionMetadata, ROW_SECTIONS, pack_rows};
 pub use runner::decoder::{DecodeImage, DecoderRunner};
 pub use runner::denoiser::image::{
     ConditionRow, DenoiseRow, DiffusionCapacity, DiffusionShape, DiffusionStorage, ImageDiffusion,

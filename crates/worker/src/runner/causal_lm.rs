@@ -73,6 +73,7 @@ use crate::cuda_graph::{ShapeKey, TextShapes};
 use crate::ffi::{DType, Handle};
 use crate::lane::{Capture, Completion, Job};
 use crate::request::decode_state::DecodeState;
+use crate::runner::attention::pack_rows;
 use crate::sampling::SamplingPath;
 use crate::sampling::plan::{SamplingGroup, padded};
 use crate::storage::memory::StorageView;
@@ -81,8 +82,6 @@ use crate::stream::{Fill, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
 use runners::{COMPLETION_FIELDS, StepParts};
-
-use input_buffers::ROW_SECTIONS;
 
 /// The commit mode of a row that only sets its slot's cache length
 /// (`uniserve.sampling.state.CACHE`).
@@ -872,37 +871,22 @@ impl CausalLMRunner {
         }
 
         // The row gather's host columns: per-row sections of stride R + 1,
-        // then each token's row.
+        // then each token's row ([`pack_rows`]).
         let mut row_columns = Vec::new();
         let mut token_ids = Vec::new();
         let mut positions = Vec::new();
         let mut relays = Vec::new();
         if !decode {
-            let stride = dimensions.rows + 1;
-            row_columns = vec![0_i64; (ROW_SECTIONS + pages.len()) * stride + padded_tokens];
-            let mut query_offset = 0;
-            let mut prefix_offset = 0;
-            for row in 0..padded_rows {
-                row_columns[row] = slots[row];
-                row_columns[stride + row] = prefixes[row];
-                row_columns[2 * stride + row] = queries[row];
-                // Live rows write the cache; padding rows do not.
-                row_columns[3 * stride + row] = i64::from(row < live);
-                row_columns[4 * stride + row] = query_offset;
-                row_columns[5 * stride + row] = prefix_offset;
-                for (table, selected) in pages.iter().enumerate() {
-                    row_columns[(ROW_SECTIONS + table) * stride + row] =
-                        selected.lengths.get(row).copied().unwrap_or(0) as i64;
-                }
-                let token_section = (ROW_SECTIONS + pages.len()) * stride;
-                for token in 0..queries[row] as usize {
-                    row_columns[token_section + query_offset as usize + token] = row as i64;
-                }
-                query_offset += queries[row];
-                prefix_offset += prefixes[row];
-            }
-            row_columns[4 * stride + padded_rows] = query_offset;
-            row_columns[5 * stride + padded_rows] = prefix_offset;
+            let padded: Vec<AttentionRow> = (0..padded_rows)
+                .map(|row| AttentionRow {
+                    slot: slots[row] as u32,
+                    prefix: prefixes[row] as u32,
+                    query: queries[row] as u32,
+                    // Live rows write the cache; padding rows do not.
+                    write: row < live,
+                })
+                .collect();
+            row_columns = pack_rows(&padded, &pages, dimensions.rows + 1, padded_tokens);
 
             token_ids = vec![0_i64; padded_tokens];
             // Axis-major: axis `a` of token `t` at `a * padded_tokens + t`.
