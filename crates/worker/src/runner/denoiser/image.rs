@@ -61,10 +61,11 @@ use crate::runner::attention::{AttentionCapacity, AttentionMetadata};
 use crate::runner::causal_lm::{CausalLMRunners, Step};
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
+use crate::storage::AttentionRow;
 use crate::storage::LatentUpdate;
+use crate::storage::PrefixCache;
 use crate::storage::Scratch;
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{AttentionRow, BlockTables, GroupTable};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -542,12 +543,11 @@ impl ImageDiffusion {
     }
 
     /// Evaluate the denoising rows of one step. Rows of one image share
-    /// samples; `check` validates attention reads against the cache.
+    /// samples; their attention reads `prefix_cache`'s pages.
     pub(crate) fn predict(
         &mut self,
         rows: &[DenoiseRow],
-        tables: &BlockTables,
-        check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
+        prefix_cache: &mut PrefixCache,
         job: &Job,
     ) -> Result<Predicted> {
         let stream = self.stream.clone();
@@ -582,7 +582,7 @@ impl ImageDiffusion {
             .as_ref()
             .map(|_| self.capacity.graph_widths.clone());
         self.attention
-            .stage(&attention, tables, widths.as_deref(), check, issue)?;
+            .stage(&attention, prefix_cache, widths.as_deref(), issue)?;
         let arguments = self.arguments(&described);
         let graph = match (&captured, &stream) {
             (Some(shape), Some(_)) => match self.graphs.lookup(shape, None)? {
@@ -608,12 +608,12 @@ impl ImageDiffusion {
         Ok(Predicted { mode, offsets })
     }
 
-    /// Write the K/V of latent images inserted as conditioning.
+    /// Write the K/V of latent images inserted as conditioning into
+    /// `prefix_cache`, every write checked against its live accesses.
     pub(crate) fn condition(
         &mut self,
         rows: &[ConditionRow],
-        tables: &BlockTables,
-        check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
+        prefix_cache: &mut PrefixCache,
         job: &Job,
     ) -> Result<()> {
         let stream = self.stream.clone();
@@ -650,7 +650,7 @@ impl ImageDiffusion {
             })
             .collect();
         self.attention
-            .stage(&attention, tables, None, check, issue)?;
+            .stage(&attention, prefix_cache, None, issue)?;
         let mut arguments = self.arguments(&described);
         // Each row's features follow the forward's tensors as a tensor of
         // their own.
@@ -698,7 +698,7 @@ impl ImageDiffusion {
     pub fn capture(
         &mut self,
         rows: &[DenoiseRow],
-        tables: &BlockTables,
+        prefix_cache: &mut PrefixCache,
         pools: &[Arc<GraphPool<Handle>>],
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
@@ -730,9 +730,8 @@ impl ImageDiffusion {
             .collect();
         self.attention.stage(
             &attention,
-            tables,
+            prefix_cache,
             Some(&self.capacity.graph_widths),
-            |_, _, _| Ok(()),
             self.stream.as_ref(),
         )?;
         // The warmup evaluation, then the capture of the same forward.
@@ -959,9 +958,8 @@ impl ImageBatch<'_> {
         let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
             Error::Unsupported("image trajectories require a prefix cache".into())
         })?;
-        let (tables, manager) = prefix_cache.split();
-        let coordinates = tables.coordinates(slot, visible)?;
-        manager.validate_conditioning(call.request_key, buffer, slot, visible, tables)?;
+        let coordinates = prefix_cache.tables().coordinates(slot, visible)?;
+        prefix_cache.validate_conditioning(call.request_key, buffer, slot, visible)?;
         Ok(coordinates.into())
     }
 
@@ -1281,14 +1279,14 @@ impl ImageBatch<'_> {
             let key = plan.calls[index].request_key;
             let slot = forward.request_pool_indices[row];
             let own = self.batch.calls[index].slot as u32;
-            let tables = prefix_cache.tables_mut();
             if slot != own {
-                if forward.seq_lens[row] - forward.query_lens[row] > tables.allocated_length(slot) {
+                let prefix = forward.seq_lens[row] - forward.query_lens[row];
+                if prefix > prefix_cache.tables().allocated_length(slot) {
                     return Err(Error::Invalid(
                         "forward row exceeds alternative-prefix capacity".into(),
                     ));
                 }
-                tables.retain_prefix(key, slot);
+                prefix_cache.retain_prefix(key, slot);
             }
             // Readers retain their prefix, writers also their query tokens.
             let length = u64::from(if forward.write_cache[row] {
@@ -1296,19 +1294,7 @@ impl ImageBatch<'_> {
             } else {
                 forward.seq_lens[row] - forward.query_lens[row]
             });
-            let mut spans = Vec::new();
-            for group in 0..tables.groups().len() as u32 {
-                let table = tables.table(slot, group)?;
-                let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
-                if length > start {
-                    spans.extend(table.spans(start, length - start)?);
-                }
-            }
-            prefix_cache.manager().retain_execution(
-                key,
-                &spans,
-                std::sync::Arc::clone(&self.batch.retirement),
-            );
+            prefix_cache.retain(key, slot, length, &self.batch.retirement)?;
         }
         Ok(descriptors)
     }
@@ -1648,7 +1634,6 @@ impl ImageBatch<'_> {
                 let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
                     Error::Unsupported("image trajectories require a prefix cache".into())
                 })?;
-                let (tables, manager) = prefix_cache.split();
                 let prefixes: Vec<(u32, &[u32])> = fills
                     .iter()
                     .map(|(_, slot, tokens)| (*slot, &tokens[..]))
@@ -1658,8 +1643,7 @@ impl ImageBatch<'_> {
                 // it reads; the job ends with it, because the evaluation
                 // is completed from the job that performed it, and the
                 // step follows in the next job.
-                let step =
-                    text.prefill_cache(experts, &component, &prefixes, tables, manager, job)?;
+                let step = text.prefill_cache(experts, &component, &prefixes, prefix_cache, job)?;
                 return Ok(Progress::Boundary(Resume::Denoise(Box::new(
                     DenoiseResume {
                         state: Denoising {
@@ -1772,14 +1756,13 @@ impl ImageBatch<'_> {
             }
         }
         for (_, rows, owners) in &groups {
-            let prefix_cache = self.storage.prefix_cache.as_ref().ok_or_else(|| {
+            let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a prefix cache".into())
             })?;
             let diffusion = self.parts.diffusion_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
             })?;
-            let predicted =
-                diffusion.predict(rows, prefix_cache.tables(), |_, _, _| Ok(()), job)?;
+            let predicted = diffusion.predict(rows, prefix_cache, job)?;
             let mode = predicted.mode.as_str();
             *stats.mode_counts.entry(mode.into()).or_default() += 1;
             if predicted.mode == GraphMode::Replay {

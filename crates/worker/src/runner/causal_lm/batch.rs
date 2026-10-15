@@ -335,26 +335,18 @@ impl<'a> TokenBatch<'a> {
             }
             for &row in call_rows {
                 // Readers retain their prefix, writers also their query
-                // tokens; a windowed group starts at its first resident page.
+                // tokens.
                 let length = u64::from(if forward.write_cache[row] {
                     forward.seq_lens[row]
                 } else {
                     forward.seq_lens[row] - forward.query_lens[row]
                 });
-                let mut spans = Vec::new();
-                let tables = prefix_cache.tables();
-                for group in 0..tables.groups().len() as u32 {
-                    let table = tables.table(state.slot as u32, group)?;
-                    let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
-                    if length > start {
-                        spans.extend(table.spans(start, length - start)?);
-                    }
-                }
-                prefix_cache.manager().retain_execution(
+                prefix_cache.retain(
                     call.request_key,
-                    &spans,
-                    Arc::clone(&self.batch.retirement),
-                );
+                    state.slot as u32,
+                    length,
+                    &self.batch.retirement,
+                )?;
             }
         }
 

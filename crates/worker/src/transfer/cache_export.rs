@@ -21,7 +21,7 @@ use super::exports::{self, Exports, Location};
 use super::{Spans, Transports, copy_planner};
 use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView, dtype_name};
-use crate::storage::{CachePlanes, GroupTable, PrefixCacheManager};
+use crate::storage::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
 use crate::stream::Issue;
 use crate::transfer::Retirement;
 use crate::{Error, Result};
@@ -93,10 +93,10 @@ impl CacheExport {
     /// from the job's completion on after a recorder. On failure every
     /// location is revoked and the reservation released. The returned
     /// transfer becomes resident only when the batch commits it
-    /// (`PrefixCacheManager::validate_exports` then `apply_exports`).
+    /// (`PrefixCache::validate_transfers` then `apply_transfers`).
     pub fn locate(
         self,
-        manager: &mut PrefixCacheManager<Arc<Retirement>>,
+        accesses: &mut UnitAccesses<Arc<Retirement>>,
     ) -> Result<(CacheTransfer, Vec<Location>)> {
         let Self {
             buffer,
@@ -118,7 +118,7 @@ impl CacheExport {
                     unlocated.push(export);
                     continue;
                 }
-                match export.locate(|retirement| manager.retain_export(buffer, retirement)) {
+                match export.locate(|retirement| accesses.retain_export(buffer, retirement)) {
                     Ok(located) => {
                         tensor
                             .locations
@@ -135,7 +135,7 @@ impl CacheExport {
             if let Err(cleanup) = exports::release(&locations) {
                 tracing::warn!(target: "uniserve_worker.transfer", "failed to revoke a failed KV export: {cleanup}");
             }
-            manager.release_exports(&[buffer]);
+            accesses.release_exports(&[buffer]);
             return Err(error);
         }
         Ok((transfer, locations))
@@ -144,13 +144,13 @@ impl CacheExport {
     /// Revoke an export that is not published and release its reservation.
     /// As for [`Self::locate`], only once the issuer performed its work:
     /// the copies into an export's storage ran before it is given back.
-    pub fn revoke(self, manager: &mut PrefixCacheManager<Arc<Retirement>>) {
+    pub fn revoke(self, accesses: &mut UnitAccesses<Arc<Retirement>>) {
         self.exports
             .into_iter()
             .flatten()
             .flatten()
             .for_each(Exports::revoke);
-        manager.release_exports(&[self.buffer]);
+        accesses.release_exports(&[self.buffer]);
     }
 }
 
@@ -164,7 +164,8 @@ impl CacheExport {
 /// issuer's work was performed.
 #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
 pub fn export(
-    manager: &mut PrefixCacheManager<Arc<Retirement>>,
+    accesses: &mut UnitAccesses<Arc<Retirement>>,
+    bases: &TransferBases,
     tables: &crate::storage::BlockTables,
     planes: &CachePlanes,
     slot: u32,
@@ -175,7 +176,7 @@ pub fn export(
     consumers: &[usize],
     stream: impl Issue,
 ) -> Result<CacheExport> {
-    let (base, base_extent) = manager
+    let (base, base_extent) = bases
         .destination_base(buffer.owner, destination)
         .map_or((None, 0), |(buffer, extent)| (Some(buffer), extent));
     if visible > tables.allocated_length(slot) {
@@ -208,7 +209,7 @@ pub fn export(
         selected.push(table);
     }
     if visible > base_extent {
-        manager.reserve_export(buffer, &spans)?;
+        accesses.reserve_export(buffer, &spans)?;
     }
 
     let mut transfer = CacheTransfer {
@@ -236,7 +237,7 @@ pub fn export(
             };
             exports.push(Vec::new());
             group.tensors = export_group(
-                manager,
+                accesses,
                 planes,
                 &export,
                 buffer,
@@ -254,7 +255,7 @@ pub fn export(
         exports,
     };
     if let Err(error) = result {
-        export.revoke(manager);
+        export.revoke(accesses);
         return Err(error);
     }
     Ok(export)
@@ -265,7 +266,7 @@ pub fn export(
     reason = "one group's complete export inputs"
 )]
 fn export_group(
-    manager: &mut PrefixCacheManager<Arc<Retirement>>,
+    accesses: &mut UnitAccesses<Arc<Retirement>>,
     planes: &CachePlanes,
     export: &GroupExport<'_>,
     buffer: BufferId,
@@ -287,7 +288,7 @@ fn export_group(
         u64::from(export.visible),
         u64::from(table.shape.page_tokens),
     );
-    let mut retain = |retirement| manager.retain_export(buffer, retirement);
+    let mut retain = |retirement| accesses.retain_export(buffer, retirement);
 
     let mut tensors = Vec::new();
     for field in 0..2 {

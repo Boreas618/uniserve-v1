@@ -19,10 +19,9 @@ pub use prefix_cache::block_tables::{
     AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
     TablePages, table_pages,
 };
-pub use prefix_cache::manager::PrefixCacheManager;
 pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, GroupAxis};
 pub use prefix_cache::planes::{CachePlanes, FIELDS, UnitColumn, UnitSnapshot};
-pub use prefix_cache::{PendingImport, PrefixCache, ScratchUnits};
+pub use prefix_cache::{PendingImport, PrefixCache, ScratchUnits, TransferBases, UnitAccesses};
 pub use products::{
     Metadata, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore, Scalar,
     ValueRange,
