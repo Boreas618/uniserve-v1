@@ -23,16 +23,13 @@ use uniserve_ipc::{
 
 use crate::executor::PendingOutput;
 use crate::executor::products::Publications;
+use crate::storage::latent::Pool;
 use crate::storage::memory::{dtype_name, parse_dtype};
-use crate::storage::{LatentExport, LatentImport, LatentPool, LatentStorage};
+use crate::storage::{LatentExport, LatentImport, LatentStorage};
 use crate::stream::Issue;
 use crate::transfer::exports;
 use crate::transfer::{Read, ReadRef, Retirement, Transports, fetch};
 use crate::{Error, Result};
-
-/// A latent pool whose imports retain their transport reads and whose
-/// exports retain their locations' retirements.
-pub(crate) type Pool = LatentPool<Arc<LatentImport<ReadRef>>, Arc<LatentExport<Arc<Retirement>>>>;
 
 /// The `u32` pages of a scheduler page table.
 fn pages(params: &LatentParams) -> Vec<u32> {
@@ -351,7 +348,7 @@ mod tests {
     /// A pool of two slots and three usable two-unit pages on host memory.
     fn pool() -> Result<(Pool, LatentStorage)> {
         Ok((
-            LatentPool::new(2, 4, 2)?,
+            crate::storage::LatentPool::new(2, 4, 2)?,
             LatentStorage::allocate(2, 4, 2, WIDTH, DType::F32, false, None, None)?,
         ))
     }

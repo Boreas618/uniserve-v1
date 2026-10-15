@@ -11,7 +11,7 @@ use crate::request::video::{MediaPlan, VideoSize};
 use crate::runner::component::Component;
 use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
-use crate::storage::ImageLatents;
+use crate::storage::LatentCache;
 use crate::{Error, Result};
 
 /// What the model answers about an admitted audio track decoded in some
@@ -62,7 +62,7 @@ impl DecoderRunners {
     /// latent rows are the head of the step workspace of `latents`.
     pub(crate) fn warm_image(
         &self,
-        latents: Option<&ImageLatents>,
+        latents: Option<&LatentCache>,
         layout: Option<ImageDenoiserLayout>,
         side: u32,
     ) -> Result<()> {
