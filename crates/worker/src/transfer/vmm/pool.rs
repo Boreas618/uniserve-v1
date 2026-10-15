@@ -1,5 +1,6 @@
 //! Bounded export ranges and asynchronous observation of remote readers.
 
+use crate::transfer::{ACK_SLOTS, CLAIMED};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -10,20 +11,17 @@ use uniserve_cuda::{
 use crate::stream::{Fill, Issue};
 use crate::{DescriptorGrants, Error, Result};
 
-pub const ACK_SLOTS: usize = 64;
-pub const HEADER_BYTES: usize = ACK_SLOTS * size_of::<u32>();
-pub const CHUNK_ALIGNMENT: usize = 512;
-const CLAIMED: u32 = 1;
+pub(crate) const HEADER_BYTES: usize = ACK_SLOTS * size_of::<u32>();
+pub(crate) const CHUNK_ALIGNMENT: usize = 512;
 
 /// An immutable byte range. The payload follows the remote-reader header.
-pub struct PoolChunk {
-    pub offset: usize,
-    pub nbytes: usize,
-    pub payload_bytes: usize,
+pub(crate) struct PoolChunk {
+    pub(crate) offset: usize,
+    pub(crate) nbytes: usize,
 }
 
 impl PoolChunk {
-    pub fn payload_offset(&self) -> usize {
+    pub(crate) fn payload_offset(&self) -> usize {
         self.offset + HEADER_BYTES
     }
 }
@@ -48,7 +46,7 @@ impl Drop for Allocation {
 /// `backing` retains the exportable allocation the pool places chunks in.
 /// Reader words are copied on a private stream. Polling observes a completed
 /// snapshot and never waits for device work on the host.
-pub struct VmmPool<B> {
+pub(crate) struct VmmPool<B> {
     backing: Option<B>,
     device: DeviceId,
     address: usize,
@@ -72,7 +70,12 @@ impl<B> VmmPool<B> {
     ///
     /// # Safety
     /// `address` must identify that mapping.
-    pub unsafe fn new(backing: B, device: i32, address: usize, capacity: usize) -> Result<Self> {
+    pub(crate) unsafe fn new(
+        backing: B,
+        device: i32,
+        address: usize,
+        capacity: usize,
+    ) -> Result<Self> {
         Ok(Self {
             backing: Some(backing),
             device: DeviceId(device),
@@ -90,21 +93,21 @@ impl<B> VmmPool<B> {
         })
     }
 
-    pub fn backing(&self) -> Result<&B> {
+    pub(crate) fn backing(&self) -> Result<&B> {
         self.backing
             .as_ref()
             .ok_or(Error::State("VMM pool is closed"))
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
     }
 
     /// Reserve a payload and clear its reader words in the order of the
     /// producer `issue`'s stream. None reports capacity exhaustion without
     /// reserving any bytes. The pool shares that stream until close, which
     /// drains the header initialization issued here.
-    pub fn reserve(&mut self, bytes: usize, issue: impl Issue) -> Result<Option<Arc<PoolChunk>>> {
+    pub(crate) fn reserve(
+        &mut self,
+        bytes: usize,
+        issue: impl Issue,
+    ) -> Result<Option<Arc<PoolChunk>>> {
         let stream = issue
             .stream()
             .ok_or_else(|| Error::Invalid("a VMM pool chunk is cleared on a stream".into()))?;
@@ -128,7 +131,6 @@ impl<B> VmmPool<B> {
         let chunk = Arc::new(PoolChunk {
             offset,
             nbytes: span,
-            payload_bytes: bytes,
         });
         self.allocations.insert(
             offset,
@@ -191,7 +193,7 @@ impl<B> VmmPool<B> {
 
     /// Return a range whose accesses the caller has already drained. Releasing
     /// a retired or replaced handle cannot release a different live export.
-    pub fn release(&mut self, chunk: &Arc<PoolChunk>) -> Result<()> {
+    pub(crate) fn release(&mut self, chunk: &Arc<PoolChunk>) -> Result<()> {
         let Some(allocation) = self.allocations.get(&chunk.offset) else {
             return Ok(());
         };
@@ -207,7 +209,7 @@ impl<B> VmmPool<B> {
 
     /// Revoke a chunk after its consuming calls have resolved. Existing remote
     /// readers may still access it; no new reader may claim it after this call.
-    pub fn retire(
+    pub(crate) fn retire(
         &mut self,
         chunk: &Arc<PoolChunk>,
         consumers: &[usize],
@@ -249,14 +251,14 @@ impl<B> VmmPool<B> {
         Ok(())
     }
 
-    pub fn awaiting_acknowledgment(&self) -> bool {
+    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
         self.allocations
             .values()
             .any(|allocation| allocation.readers.is_some())
     }
 
     /// Consume only completed readback, then submit the next bounded snapshot.
-    pub fn reap(&mut self) -> Result<()> {
+    pub(crate) fn reap(&mut self) -> Result<()> {
         self.backing()?;
         if self.failed {
             return Err(Error::Resource("VMM pool device completion is unknown"));
@@ -367,7 +369,7 @@ impl<B> VmmPool<B> {
 
     /// The caller ends all local and remote uses before closing the pool.
     /// Drain owned readback and return numerical backing outside owner locks.
-    pub fn close(&mut self) -> Result<Option<B>> {
+    pub(crate) fn close(&mut self) -> Result<Option<B>> {
         if self.backing.is_none() {
             return Ok(None);
         }

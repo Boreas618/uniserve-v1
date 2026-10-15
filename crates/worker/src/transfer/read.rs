@@ -10,34 +10,27 @@
 //! stream per thread and device: on an SM-partition stream the driver takes
 //! copies of mapped peer windows only one call each (`uniserve_cuda::copy`).
 
+use super::{ACKNOWLEDGED, CLAIMED};
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::ThreadId;
-use std::time::Duration;
 
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, SourceOrder, Stream, memset_d32};
-use uniserve_ipc::{Locator, TransferTransport};
+use uniserve_ipc::Locator;
 
-use super::endpoint::SourceGrant;
+use super::export_table::SourceGrant;
 use super::pool::{ReadBackend, TransferPool, TransferRead};
 use super::{
-    Capacity, Notify, Retirement, SHM_HEADER_BYTES, SharedRead, Spans, TransferTicket,
-    copy_on_host, copy_planner, notify, submit_copy,
+    Capacity, Notify, Retirement, Spans, TransferTicket, copy_on_host, copy_planner, notify,
+    submit_copy,
 };
 use crate::ffi::{Backing, DType, Device};
 use crate::host::HostTask;
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Outcome, Result};
-
-/// Reader acknowledgment states written into a VMM chunk header.
-pub(crate) const CLAIMED: u32 = 1;
-pub(crate) const ACKNOWLEDGED: u32 = 2;
-
-/// How long a shared-memory reader waits for its producer's readiness.
-const SHARED_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) type ReadPool = TransferPool<NativeRead>;
 pub(crate) type BorrowedReads = Mutex<Option<HashMap<usize, Weak<Read>>>>;
@@ -488,7 +481,7 @@ pub(crate) enum ReadCall {
         region: Option<Vec<Range<u64>>>,
     },
     /// Map a CUDA VMM export and copy it into the destination.
-    Cuda(super::cuda_vmm::CudaRead),
+    Cuda(super::vmm::CudaRead),
 }
 
 /// The native read backend of the transfer pool.
@@ -649,7 +642,7 @@ impl NativeRead {
 
     /// Stage host bytes for a device destination: host-copy `source` into
     /// this thread's page-locked staging, then copy staging to `destination`.
-    fn copy_from_host(
+    pub(super) fn copy_from_host(
         &self,
         source: &Spans,
         destination: &Spans,
@@ -687,92 +680,17 @@ impl NativeRead {
         }
         copied
     }
-
-    fn shared(
-        &self,
-        locator: &Arc<Locator>,
-        slot: usize,
-        destination: &Spans,
-        region: Option<&[Range<u64>]>,
-    ) -> Result<()> {
-        let TransferTransport::PosixShm { name, .. } = &locator.transport else {
-            return Err(Error::Invalid(
-                "shared read requires a shared storage locator".into(),
-            ));
-        };
-        let mut read = SharedRead::open(name, 0, locator.nbytes as usize, slot)?;
-        read.wait(SHARED_READY_TIMEOUT, || self.read.check_active())?;
-
-        let source = payload(
-            read.mapping()? as Arc<dyn Backing>,
-            SHM_HEADER_BYTES,
-            locator,
-        )?;
-        let source = match region {
-            Some(region) => source.region(region)?,
-            None => source,
-        };
-        self.copy_from_host(&source, destination, || read.release())
-    }
-
-    fn channel(
-        &self,
-        locator: &Arc<Locator>,
-        destination: &Spans,
-        region: Option<&[Range<u64>]>,
-    ) -> Result<()> {
-        let TransferTransport::Channel { payload: bytes, .. } = &locator.transport else {
-            return Err(Error::Invalid(
-                "channel read requires a channel locator".into(),
-            ));
-        };
-        if bytes.len() as u64 != locator.nbytes {
-            return Err(Error::Invalid(
-                "channel payload disagrees with its locator size".into(),
-            ));
-        }
-        let backing: Arc<dyn Backing> = Arc::new(ChannelPayload(Arc::clone(locator)));
-        let source = payload(backing, 0, locator)?;
-        let source = match region {
-            Some(region) => source.region(region)?,
-            None => source,
-        };
-        self.copy_from_host(&source, destination, || {})
-    }
 }
 
 /// A contiguous view of a locator's payload bytes at `offset` in `backing`.
-fn payload(backing: Arc<dyn Backing>, offset: usize, locator: &Locator) -> Result<Spans> {
+pub(super) fn payload(
+    backing: Arc<dyn Backing>,
+    offset: usize,
+    locator: &Locator,
+) -> Result<Spans> {
     let dtype: DType = parse_dtype(&locator.dtype)?;
     let shape: Vec<i64> = locator.shape.iter().map(|&extent| extent as i64).collect();
     Spans::single(StorageView::contiguous(backing, offset, dtype, &shape)?)
-}
-
-/// A rank-channel payload as host memory a copy can read in place. The
-/// locator is immutable and retained by the read for the copy's duration.
-struct ChannelPayload(Arc<Locator>);
-
-impl ChannelPayload {
-    fn bytes(&self) -> &[u8] {
-        match &self.0.transport {
-            TransferTransport::Channel { payload, .. } => payload,
-            _ => &[],
-        }
-    }
-}
-
-impl Backing for ChannelPayload {
-    fn device(&self) -> Device {
-        Device::Cpu
-    }
-
-    fn address(&self) -> u64 {
-        self.bytes().as_ptr() as u64
-    }
-
-    fn len(&self) -> usize {
-        self.bytes().len()
-    }
 }
 
 /// Reserve a read's credits and task and issue its destination handoff

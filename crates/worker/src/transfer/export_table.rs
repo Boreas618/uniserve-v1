@@ -1,7 +1,7 @@
 //! Registered transport exports of one endpoint and their reclamation.
 //!
 //! Every registering transport (local, shared memory, CUDA VMM) owns one
-//! [`Endpoint`]: a bounded [`BufferRegistry`] of its exports, keyed by the
+//! [`ExportTable`]: a bounded [`BufferRegistry`] of its exports, keyed by the
 //! locator's transport identity. Endpoints are also published in a
 //! process-wide map by name, so a reader in the same address space resolves
 //! a local or CUDA VMM locator to the producer's storage directly.
@@ -11,8 +11,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use uniserve_ipc::{Locator, TransferTransport, Wake};
 
+use super::backing::{SourceRetirement, TransportBuffer};
 use super::registry::{BufferRegistry, RegisteredBuffer};
-use super::source::{SourceRetirement, TransportBuffer};
 use super::{Retirement, notify};
 use crate::host::HostLane;
 use crate::{Error, EventPool, Result};
@@ -31,12 +31,13 @@ pub(crate) struct Source {
 
 type Table = BufferRegistry<SourceKey, Source, Arc<Retirement>>;
 
-static ENDPOINTS: LazyLock<Mutex<HashMap<String, Weak<Endpoint>>>> = LazyLock::new(Mutex::default);
+static ENDPOINTS: LazyLock<Mutex<HashMap<String, Weak<ExportTable>>>> =
+    LazyLock::new(Mutex::default);
 
 /// A process-local reader's admission to a registered export. Releasing it
 /// lets the producer reclaim the export once its other readers finished.
 pub(crate) struct SourceGrant {
-    owner: Arc<Endpoint>,
+    owner: Arc<ExportTable>,
     key: SourceKey,
 }
 
@@ -47,7 +48,7 @@ impl SourceGrant {
 }
 
 /// One transport's registered exports.
-pub(crate) struct Endpoint {
+pub(crate) struct ExportTable {
     name: String,
     events: Arc<EventPool>,
     state: Mutex<Table>,
@@ -57,7 +58,7 @@ pub(crate) struct Endpoint {
     wake: Mutex<Option<Wake>>,
 }
 
-impl Endpoint {
+impl ExportTable {
     pub(crate) fn new(name: String, capacity: usize, events: Arc<EventPool>) -> Result<Arc<Self>> {
         let endpoint = Arc::new(Self {
             name,
@@ -342,7 +343,7 @@ impl Endpoint {
     }
 }
 
-impl Drop for Endpoint {
+impl Drop for ExportTable {
     fn drop(&mut self) {
         self.unregister();
     }
