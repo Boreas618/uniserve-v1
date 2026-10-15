@@ -19,21 +19,29 @@
 //!
 //! | kind | module | methods |
 //! | --- | --- | --- |
-//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `prepare_resident`, `warm`; packed: `encode` over the slot tensors, `pack_images` |
-//! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident`, `warm` |
+//! | [`EncoderInfo::Vision`] | `PatchEncoder` | `encode`, `prepare_resident`, `warm`; packed: `encode` over the slot tensors |
+//! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident`, `draw_noise`, `warm` |
 //!
 //! Such a runner receives its device's product arena once; an unpacked
 //! `encode` writes its results into product [`Region`]s of it, in the
 //! product's dtype, and returns the results' shapes, which the caller
 //! publishes.
 //!
-//! **Images.** Inline request images are decoded and transformed on a host
-//! lane by `EncoderRunner.prepare_image` ([`prepare_input`]), which returns an
-//! opaque [`PreparedImage`] in page-locked memory; resident image products
-//! are transformed on the device by `prepare_resident`. Both reach `encode`
-//! as handles. Unpacked encoders encode images of one pixel shape per
-//! numerical call, in first-appearance order, so an image's features do not
-//! depend on the other images of its batch.
+//! **Images.** An image's facts (`EncoderRunner.image_facts`: its canvas,
+//! patch grid and prepared pixel shape) are known before its pixels. Inline
+//! request images are decoded and transformed on a host lane
+//! ([`ImagePreparation::prepare`]) into a block of the runner's
+//! [`PinnedPool`]; resident image products are transformed on the device by
+//! `prepare_resident`, into the packed slot they are encoded from or into
+//! the runner's resident pixels. Unpacked vision encoders encode
+//! host-prepared images of one pixel shape per numerical call, in
+//! first-appearance order, so an image's features do not depend on the
+//! other images of its batch, and each resident image alone.
+//!
+//! **Posterior noise.** A latent encoder that samples its posterior reads
+//! its noise: before each image's encode, `draw_noise` fills the runner's
+//! noise buffer from the image's request seed and the request's latent
+//! encodings before it.
 //!
 //! **Packed vision.** An encoder with `max_patches` encodes images packed in
 //! fixed slots of `max_patches` patch rows (`PatchEncoder.encode_packed`):
@@ -90,7 +98,7 @@ use crate::runner::methods::{
 };
 use crate::runner::{ImageSetup, RunnerSetup};
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{Metadata, OutputPlacement, ProductBuffer, ValueRange};
+use crate::storage::{Metadata, OutputPlacement, PinnedPool, ProductBuffer, ValueRange};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -119,12 +127,10 @@ impl Tower {
     }
 }
 
-/// One image prepared for an encoder: the opaque Python value and the facts
-/// planning needs.
-#[derive(Clone, Debug)]
-pub struct PreparedImage {
-    /// The prepared pixels (`uniserve.media.pixels.PreparedImage`).
-    pub value: Handle,
+/// What preparing an image produces besides its pixels, known before them
+/// (`EncoderRunner.image_facts`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageFacts {
     /// `[patches, row]` for a patch tower, `[channels, height, width]`
     /// otherwise.
     pub shape: Vec<i64>,
@@ -135,22 +141,14 @@ pub struct PreparedImage {
     pub width: u32,
 }
 
-impl PreparedImage {
-    /// The image `value` a preparation returned, with what `facts`
-    /// (`EncoderRunner.image_facts`) reports of it.
-    fn from_value(facts: &Function, value: Any) -> Result<Self> {
-        let image = Handle::new(value)?;
-        let values = crate::ffi::integers(facts.call_values(&[image.to_any()])?)
-            .map_err(|error| Error::numerical(facts.name(), &error))?;
-        Self::from_facts(facts, image, &values)
-    }
-
-    /// The prepared `image` with the `values` that `facts` reported of it.
-    fn from_facts(facts: &Function, image: Handle, values: &[i64]) -> Result<Self> {
+impl ImageFacts {
+    /// The facts `function` (`EncoderRunner.image_facts`) returned:
+    /// `[height, width, rows, columns, *shape]`.
+    fn parse(function: &Function, values: &[i64]) -> Result<Self> {
         let [height, width, rows, columns, ref shape @ ..] = values[..] else {
             return Err(Error::Interface(format!(
                 "{} reports a canvas, a grid and a pixel shape",
-                facts.name()
+                function.name()
             )));
         };
         let dimension = |extent: i64, name: &str| -> Result<u32> {
@@ -158,7 +156,7 @@ impl PreparedImage {
                 .ok()
                 .filter(|&extent| extent > 0)
                 .ok_or_else(|| {
-                    Error::Interface(format!("{} reports an invalid {name}", facts.name()))
+                    Error::Interface(format!("{} reports an invalid {name}", function.name()))
                 })
         };
         // A patch tower reports its grid; other towers report zeros.
@@ -168,12 +166,17 @@ impl PreparedImage {
             _ => {
                 return Err(Error::Interface(format!(
                     "{} reports a grid that is not two positive extents",
-                    facts.name()
+                    function.name()
                 )));
             }
         };
+        if shape.is_empty() || shape.iter().any(|&extent| extent < 1) {
+            return Err(Error::Interface(format!(
+                "{} reports an invalid pixel shape",
+                function.name()
+            )));
+        }
         Ok(Self {
-            value: image,
             shape: shape.to_vec(),
             grid,
             height: dimension(height, "height")?,
@@ -185,36 +188,136 @@ impl PreparedImage {
     pub fn patches(&self) -> Option<u32> {
         self.grid.map(|[rows, columns]| rows * columns)
     }
+
+    /// Values of the prepared pixels.
+    pub fn elements(&self) -> i64 {
+        self.shape.iter().product()
+    }
 }
 
-/// Decode and transform one inline request image on the calling (host)
-/// thread with the model's image policy.
-///
-/// `input_images` is the request's input image count, which a shared pixel
-/// budget divides; `pin` places the pixels in page-locked memory for an
-/// asynchronous copy to a CUDA device.
-pub fn prepare_input(
-    function: &Function,
-    facts: &Function,
-    loaded: &Handle,
-    tower: Tower,
-    payload: &str,
-    input_images: u32,
-    pin: bool,
-) -> Result<PreparedImage> {
-    if input_images == 0 {
-        return Err(Error::Invalid(
-            "request admission declares no input images".into(),
+/// Where an image's pixels are.
+#[derive(Clone, Debug)]
+pub enum ImagePixels {
+    /// Prepared on the host into a block of the encoder's pinned pool
+    /// ([`ImagePreparation::prepare`]).
+    Host(StorageView),
+    /// A resident image product, which the encode prepares on its device;
+    /// `signed_unit` declares values in `[-1, 1]` rather than `[0, 1]`.
+    Resident {
+        image: StorageView,
+        signed_unit: bool,
+    },
+}
+
+/// One image ready for an encoder: its facts and its pixels.
+#[derive(Clone, Debug)]
+pub struct PreparedImage {
+    pub facts: ImageFacts,
+    pub pixels: ImagePixels,
+}
+
+/// The image policy's preparation functions over a loaded model:
+/// `EncoderRunner.image_size`, `image_facts` and `prepare_image`.
+#[derive(Clone)]
+pub struct ImagePreparation {
+    loaded: Handle,
+    size: Function,
+    facts: Function,
+    prepare: Function,
+}
+
+impl ImagePreparation {
+    pub fn new(loaded: Handle) -> Result<Self> {
+        let function = |name: &str| Interpreter::import(&format!("{ENCODER}.{name}"));
+        Ok(Self {
+            loaded,
+            size: function("image_size")?,
+            facts: function("image_facts")?,
+            prepare: function("prepare_image")?,
+        })
+    }
+
+    pub fn loaded(&self) -> &Handle {
+        &self.loaded
+    }
+
+    /// Decode and transform one inline request image on the calling (host)
+    /// thread with the model's image policy, into a block of `pool` in the
+    /// policy's pixel `dtype`: read the image's size from its header, plan
+    /// its preparation, lease its pixels and write them.
+    ///
+    /// `input_images` is the request's input image count, which a shared
+    /// pixel budget divides.
+    pub fn prepare(
+        &self,
+        tower: Tower,
+        payload: &str,
+        input_images: u32,
+        pool: &Arc<PinnedPool>,
+        dtype: DType,
+    ) -> Result<PreparedImage> {
+        if input_images == 0 {
+            return Err(Error::Invalid(
+                "request admission declares no input images".into(),
+            ));
+        }
+        let payload = Any::from(tvm_ffi::String::from(payload));
+        let size = crate::ffi::integers(self.size.call_values(std::slice::from_ref(&payload))?)
+            .map_err(|error| Error::numerical(self.size.name(), &error))?;
+        let [height, width] = size[..] else {
+            return Err(Error::Interface(format!(
+                "{} reports a height and a width",
+                self.size.name()
+            )));
+        };
+        let tower = Any::from(tvm_ffi::String::from(tower.name()));
+        let input_images = Any::from(i64::from(input_images));
+        let values = crate::ffi::integers(self.facts.call_values(&[
+            self.loaded.to_any(),
+            tower.clone(),
+            Any::from(height),
+            Any::from(width),
+            input_images.clone(),
+        ])?)
+        .map_err(|error| Error::numerical(self.facts.name(), &error))?;
+        let facts = ImageFacts::parse(&self.facts, &values)?;
+
+        let bytes = facts.elements() as usize * dtype.bytes();
+        let pixels = StorageView::contiguous(pool.lease(bytes)?, 0, dtype, &facts.shape)?;
+        self.prepare.call_values(&[
+            self.loaded.to_any(),
+            tower,
+            payload,
+            input_images,
+            Any::from(pixels.to_tensor()?),
+        ])?;
+        Ok(PreparedImage {
+            facts,
+            pixels: ImagePixels::Host(pixels),
+        })
+    }
+
+    /// Record the facts call of a resident image of `height` x `width`
+    /// pixels for `tower` into `job`: a generated image, so with no input
+    /// images. The job's completion returns them
+    /// ([`Self::returned_facts`]).
+    pub(crate) fn record_facts(&self, tower: Tower, height: u32, width: u32, job: &Job) {
+        job.call_returning(MethodCall::new(
+            &self.facts,
+            vec![
+                Argument::Handle(self.loaded.clone()),
+                Argument::Text(tower.name().to_owned()),
+                Argument::Integer(i64::from(height)),
+                Argument::Integer(i64::from(width)),
+                Argument::Integer(0),
+            ],
         ));
     }
-    let value = function.call_values(&[
-        loaded.to_any(),
-        Any::from(tvm_ffi::String::from(tower.name())),
-        Any::from(tvm_ffi::String::from(payload)),
-        Any::from(i64::from(input_images)),
-        Any::from(pin),
-    ])?;
-    PreparedImage::from_value(facts, value)
+
+    /// The facts a recorded facts call returned.
+    pub(crate) fn returned_facts(&self, values: &[i64]) -> Result<ImageFacts> {
+        ImageFacts::parse(&self.facts, values)
+    }
 }
 
 /// The text workload an encoder's execution context is prepared for.
@@ -240,6 +343,8 @@ pub struct VisionEncoder {
     pub row_width: u32,
     /// The image policy's pixel dtype.
     pub pixel_dtype: DType,
+    /// Values of the largest image the `vit` transform prepares.
+    pub image_elements: u64,
 }
 
 impl VisionEncoder {
@@ -258,6 +363,13 @@ pub struct LatentEncoder {
     /// Values per latent patch row.
     pub width: u32,
     pub output_dtype: DType,
+    /// The image policy's pixel dtype.
+    pub pixel_dtype: DType,
+    /// Values of the largest image the `vae` transform prepares.
+    pub image_elements: u64,
+    /// Values of the largest posterior noise the encoder draws; zero when
+    /// it takes its posterior's mean.
+    pub noise_elements: u64,
 }
 
 /// A text encoder (`TextEncoder`).
@@ -306,6 +418,26 @@ impl EncoderInfo {
             let name = function.call_as(&[loaded.view(), (&path).into()])?;
             dtype_named(&function, name)
         };
+        let pixel_dtype = || -> Result<DType> {
+            let function = method("pixel_dtype")?;
+            let name = function.call_as(&[loaded.view()])?;
+            dtype_named(&function, name)
+        };
+        let count = |function: Function, arguments: &[Any]| -> Result<u64> {
+            let arguments: Vec<_> = arguments.iter().map(Into::into).collect();
+            let value: i64 = function.call_as(&arguments)?;
+            u64::try_from(value)
+                .map_err(|_| Error::Interface(format!("{} is out of range", function.name())))
+        };
+        let image_elements = |tower: Tower| -> Result<u64> {
+            count(
+                method("image_elements")?,
+                &[
+                    loaded.to_any(),
+                    Any::from(tvm_ffi::String::from(tower.name())),
+                ],
+            )
+        };
         let kind: tvm_ffi::String = method("kind")?.call_as(&[loaded.view(), (&path).into()])?;
         Ok(match kind.as_str() {
             "vision" => {
@@ -317,8 +449,6 @@ impl EncoderInfo {
                         "packed vision slots must hold whole output features".into(),
                     ));
                 }
-                let pixels = method("pixel_dtype")?;
-                let pixel_dtype = dtype_named(&pixels, pixels.call_as(&[loaded.view()])?)?;
                 Self::Vision(VisionEncoder {
                     patch_size,
                     downsample,
@@ -328,13 +458,17 @@ impl EncoderInfo {
                     image_patches: extent("image_patches")?,
                     // A patch row holds the RGB values of one patch.
                     row_width: 3 * patch_size * patch_size,
-                    pixel_dtype,
+                    pixel_dtype: pixel_dtype()?,
+                    image_elements: image_elements(Tower::Vit)?,
                 })
             }
             "latent" => Self::Latent(LatentEncoder {
                 downsample: extent("downsample")?,
                 width: extent("output_width")?,
                 output_dtype: output_dtype()?,
+                pixel_dtype: pixel_dtype()?,
+                image_elements: image_elements(Tower::Vae)?,
+                noise_elements: count(method("noise_elements")?, &[loaded.to_any(), path.clone()])?,
             }),
             "text" => Self::Text(TextEncoder {
                 hidden_size: extent("output_width")?,
@@ -446,8 +580,8 @@ fn unpacked_rows(vision: &VisionEncoder, config: &EncoderConfig) -> usize {
 
 /// Patch rows an image passes through a vision encoder: its packed rows,
 /// or its pixels' patches.
-fn image_rows(image: &PreparedImage, patch_size: u32) -> usize {
-    match image.shape[..] {
+fn image_rows(facts: &ImageFacts, patch_size: u32) -> usize {
+    match facts.shape[..] {
         [rows, _] => rows as usize,
         [_, height, width] => {
             (height as usize / patch_size as usize) * (width as usize / patch_size as usize)
@@ -600,9 +734,8 @@ struct EncoderMethods {
     encode: Function,
     position_ids: Function,
     prepare_resident: Function,
-    image_facts: Function,
+    draw_noise: Function,
     warm: Function,
-    pack_images: Function,
     /// Captures a forward between its begin and end.
     capture: GraphFunctions,
 }
@@ -615,9 +748,8 @@ impl EncoderMethods {
             encode: method("encode")?,
             position_ids: method("position_ids")?,
             prepare_resident: method("prepare_resident")?,
-            image_facts: method("image_facts")?,
+            draw_noise: method("draw_noise")?,
             warm: method("warm")?,
-            pack_images: method("pack_images")?,
             capture: GraphFunctions::import()?,
         })
     }
@@ -651,6 +783,16 @@ pub struct EncoderRunner {
     stream: Option<Stream>,
     methods: EncoderMethods,
     packed: Option<PackedVision>,
+    /// The host blocks inline images are prepared into, page-locked for
+    /// the runner's device.
+    pinned: Arc<PinnedPool>,
+    /// An unpacked image encoder's device storage of one resident image's
+    /// prepared pixels: the largest image its tower prepares, flat, in the
+    /// pixel dtype. A packed encoder prepares them in their slot.
+    resident: Option<StorageView>,
+    /// A sampling latent encoder's posterior noise: the largest draw, flat,
+    /// FP32.
+    noise: Option<StorageView>,
     text: Option<TextBuffers>,
     text_capacities: Vec<usize>,
     config: EncoderConfig,
@@ -694,9 +836,16 @@ impl EncoderRunner {
             ));
         }
 
-        let mut packed = None;
+        let (mut packed, mut resident, mut noise) = (None, None, None);
         match info {
             EncoderInfo::Vision(vision) => {
+                if vision.max_patches.is_none() {
+                    resident = Some(allocate(
+                        device,
+                        vision.pixel_dtype,
+                        &[vision.image_elements as i64],
+                    )?);
+                }
                 if let (Some(max_patches), Some(slot_tokens)) =
                     (vision.max_patches, vision.slot_tokens())
                 {
@@ -727,7 +876,20 @@ impl EncoderRunner {
                     });
                 }
             }
-            EncoderInfo::Latent(_) => {}
+            EncoderInfo::Latent(latent) => {
+                resident = Some(allocate(
+                    device,
+                    latent.pixel_dtype,
+                    &[latent.image_elements as i64],
+                )?);
+                if latent.noise_elements > 0 {
+                    noise = Some(allocate(
+                        device,
+                        DType::F32,
+                        &[latent.noise_elements as i64],
+                    )?);
+                }
+            }
             EncoderInfo::Text(_) | EncoderInfo::Condition => {
                 return Err(Error::Invariant(
                     "only an image model's vision or latent encoder is constructed here".into(),
@@ -762,6 +924,9 @@ impl EncoderRunner {
             stream,
             methods,
             packed,
+            pinned: PinnedPool::new(device.cuda_index()),
+            resident,
+            noise,
             text: None,
             text_capacities: Vec::new(),
             config: config.clone(),
@@ -840,6 +1005,9 @@ impl EncoderRunner {
             stream: Some(stream),
             methods,
             packed: None,
+            pinned: PinnedPool::new(device.cuda_index()),
+            resident: None,
+            noise: None,
             text,
             text_capacities,
             config: config.clone(),
@@ -851,6 +1019,21 @@ impl EncoderRunner {
 
     pub fn info(&self) -> EncoderInfo {
         self.info
+    }
+
+    /// The host blocks inline images for this runner are prepared into.
+    pub fn pinned(&self) -> &Arc<PinnedPool> {
+        &self.pinned
+    }
+
+    /// The dtype of the pixels an image encoder reads; `None` for a text
+    /// or condition encoder.
+    pub fn pixel_dtype(&self) -> Option<DType> {
+        match self.info {
+            EncoderInfo::Vision(vision) => Some(vision.pixel_dtype),
+            EncoderInfo::Latent(latent) => Some(latent.pixel_dtype),
+            EncoderInfo::Text(_) | EncoderInfo::Condition => None,
+        }
     }
 
     pub fn device(&self) -> Device {
@@ -878,7 +1061,7 @@ impl EncoderRunner {
     /// Encode one black `side` x `side` image through the model's input
     /// transform and discard it: the startup warmup of an unpacked image
     /// encoder (packed vision encoders warm by capturing). A latent encoder
-    /// sampling its posterior draws from the device's default generator.
+    /// that samples its posterior encodes with zero noise.
     pub fn warm(&self, side: u32) -> Result<()> {
         match (&self.info, &self.packed) {
             (EncoderInfo::Vision(_), None) | (EncoderInfo::Latent(_), _) => {
@@ -891,75 +1074,41 @@ impl EncoderRunner {
         }
     }
 
-    /// Record the preparation of a resident image product for this encoder
-    /// into `job`; `signed_unit` declares pixel values in `[-1, 1]` rather
-    /// than `[0, 1]`. The job's completion carries the prepared image
-    /// ([`Completion::handle`]), of which [`Self::image_facts`] records what
-    /// planning needs.
-    pub(crate) fn prepare_resident(
-        &self,
-        image: &StorageView,
-        tower: Tower,
-        signed_unit: bool,
-        job: &Job,
-    ) -> Result<()> {
-        if matches!(self.info, EncoderInfo::Text(_)) {
-            return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
-        }
-        job.call_handle(MethodCall::new(
-            &self.methods.prepare_resident,
-            vec![
-                Argument::Handle(self.methods.runner.clone()),
-                Argument::Tensor(image.clone()),
-                Argument::Text(tower.name().to_owned()),
-                Argument::Bool(signed_unit),
-            ],
-        ));
-        Ok(())
-    }
-
-    /// Record the call that reports the facts of a prepared `image` into
-    /// `job`; the job's completion carries them ([`Completion::returned`])
-    /// and [`Self::prepared`] reads them.
-    pub(crate) fn image_facts(&self, image: &Handle, job: &Job) {
-        job.call_returning(MethodCall::new(
-            &self.methods.image_facts,
-            vec![Argument::Handle(image.clone())],
-        ));
-    }
-
-    /// The prepared `image` with the `facts` its facts call returned.
-    pub(crate) fn prepared(&self, image: Handle, facts: &[i64]) -> Result<PreparedImage> {
-        PreparedImage::from_facts(&self.methods.image_facts, image, facts)
-    }
-
-    /// Encode images, writing image `i`'s result into `out[i]`.
+    /// Encode images, writing image `i`'s result into `out[i]`. A latent
+    /// encoder that samples its posterior draws image `i`'s noise at
+    /// `draws[i]`: its request's seed and the request's latent encodings
+    /// before it.
     ///
-    /// Unpacked encoders run one numerical call per pixel shape, in first
-    /// appearance order; packed vision runs chunks of the packed capacity.
-    /// Returns each image's result shape.
-    ///
-    /// FIXME: unpacked vision and latent encoding are eager Python calls
-    /// over Python-held pixels of request-chosen shapes, and a latent
-    /// encoder's posterior draws from the device's default generator
-    /// inside the call instead of reading noise the caller supplies.
-    pub fn encode(&mut self, images: &[&PreparedImage], out: &[StorageView]) -> Result<Encoded> {
+    /// An unpacked vision encoder runs one numerical call per group of
+    /// host-prepared images of one pixel shape, in first appearance order,
+    /// and one per resident image; a latent encoder one per image; packed
+    /// vision runs chunks of the packed capacity. Returns each image's
+    /// result shape. The caller keeps host-prepared pixels until the
+    /// encode's device work completed.
+    pub fn encode(
+        &mut self,
+        images: &[&PreparedImage],
+        draws: &[(u64, u64)],
+        out: &[StorageView],
+    ) -> Result<Encoded> {
         // At once: the recorded encode, performed here.
         let job = Job::new();
-        let recorded = self.record(images, out, &job)?;
+        let recorded = self.record(images, draws, out, &job)?;
         let mut completion = job.perform().check().map_err(|failure| failure.error)?;
         recorded.finish(&mut completion)
     }
 
     /// Record the encoding of `images` into `job`, image `i`'s result into
-    /// `out[i]`: a packed encoder's grid upload, packing call, graph launch
-    /// or eager call and feature copies per chunk; an unpacked encoder's
-    /// eager call per group of one pixel shape. The job's completion gives
-    /// the result ([`Recorded::finish`]): an unpacked call returns the
-    /// shapes it wrote.
+    /// `out[i]` and a sampling latent encoder's noise of image `i` at
+    /// `draws[i]`: a packed encoder's grid upload, pixel copies and resident
+    /// preparations, graph launch or eager call and feature copies per
+    /// chunk; an unpacked encoder's resident preparations, noise draws and
+    /// eager calls. The job's completion gives the result
+    /// ([`Recorded::finish`]): an unpacked call returns the shapes it wrote.
     pub(crate) fn record(
         &mut self,
         images: &[&PreparedImage],
+        draws: &[(u64, u64)],
         out: &[StorageView],
         job: &Job,
     ) -> Result<Recorded> {
@@ -979,39 +1128,44 @@ impl EncoderRunner {
         if images.is_empty() {
             return Ok(result);
         }
+        let runner = || Argument::Handle(self.methods.runner.clone());
         match (&self.info, &self.packed) {
             (EncoderInfo::Vision(_), Some(_)) => {
                 self.encode_packed(images, out, &mut result.encoded, job)?
             }
-            (EncoderInfo::Vision(_) | EncoderInfo::Latent(_), _) => {
-                let groups = match self.info {
-                    EncoderInfo::Vision(vision) => {
-                        // Each call stays within the rows its projections
-                        // were prepared for.
-                        let budget = unpacked_rows(&vision, &self.config);
-                        shape_groups(images)
-                            .into_iter()
-                            .flat_map(|group| {
-                                chunk_rows(group, budget, |index| {
-                                    image_rows(images[index], vision.patch_size)
-                                })
-                            })
-                            .collect()
-                    }
-                    _ => shape_groups(images),
-                };
+            (EncoderInfo::Vision(vision), None) => {
+                // Host-prepared images of one pixel shape share a call,
+                // within the rows its projections were prepared for; each
+                // resident image is prepared into the resident pixels and
+                // encoded alone.
+                let budget = unpacked_rows(vision, &self.config);
+                let host = images.iter().enumerate().filter_map(|(index, image)| {
+                    matches!(image.pixels, ImagePixels::Host(_))
+                        .then_some((index, image.facts.shape.as_slice()))
+                });
+                let resident = (0..images.len())
+                    .filter(|&index| matches!(images[index].pixels, ImagePixels::Resident { .. }))
+                    .map(|index| vec![index]);
+                let groups: Vec<Vec<usize>> = shape_groups(host)
+                    .into_iter()
+                    .flat_map(|group| {
+                        chunk_rows(group, budget, |index| {
+                            image_rows(&images[index].facts, vision.patch_size)
+                        })
+                    })
+                    .chain(resident)
+                    .collect();
                 for group in groups {
-                    // Each image's product follows the images as a tensor
-                    // of its own.
-                    let mut arguments = vec![
-                        Argument::Handle(self.methods.runner.clone()),
-                        Argument::Handles(
-                            group
-                                .iter()
-                                .map(|&index| images[index].value.clone())
-                                .collect(),
-                        ),
-                    ];
+                    let mut grids = Vec::new();
+                    let mut arguments = vec![runner(), Argument::None];
+                    for &index in &group {
+                        let image = images[index];
+                        if let Some([rows, columns]) = image.facts.grid {
+                            grids.extend([i64::from(rows), i64::from(columns)]);
+                        }
+                        arguments.push(Argument::Tensor(self.pixels(image, Tower::Vit, job)?));
+                    }
+                    arguments[1] = Argument::Integers(grids);
                     arguments.extend(
                         group
                             .iter()
@@ -1022,11 +1176,105 @@ impl EncoderRunner {
                     result.encoded.record(GraphMode::Eager);
                 }
             }
+            (EncoderInfo::Latent(_), _) => {
+                if draws.len() != images.len() {
+                    return Err(Error::Invariant(
+                        "latent images and their posterior draws must align".into(),
+                    ));
+                }
+                for (index, image) in images.iter().enumerate() {
+                    let pixels = self.pixels(image, Tower::Vae, job)?;
+                    let mut arguments = vec![
+                        runner(),
+                        Argument::Tensor(pixels),
+                        Argument::Tensor(out[index].clone()),
+                    ];
+                    if let Some(noise) = &self.noise {
+                        let [_, height, width] = image.facts.shape[..] else {
+                            return Err(Error::Invariant(
+                                "latent pixels are [channels, height, width]".into(),
+                            ));
+                        };
+                        let (seed, draw) = draws[index];
+                        job.call(MethodCall::new(
+                            &self.methods.draw_noise,
+                            vec![
+                                runner(),
+                                // The seed's bits; the Python half reads them
+                                // as unsigned.
+                                Argument::Integer(seed as i64),
+                                Argument::Integer(draw as i64),
+                                Argument::Integer(height),
+                                Argument::Integer(width),
+                                Argument::Tensor(noise.clone()),
+                            ],
+                        ));
+                        arguments.push(Argument::Tensor(noise.clone()));
+                    }
+                    job.call_returning(MethodCall::new(&self.methods.encode, arguments));
+                    result.returning.push(vec![index]);
+                    result.encoded.record(GraphMode::Eager);
+                }
+            }
             (EncoderInfo::Text(_) | EncoderInfo::Condition, _) => {
                 return Err(Error::Invalid(format!("{} encodes no images", self.owner)));
             }
         }
         Ok(result)
+    }
+
+    /// The pixels an unpacked call reads for `image`: its host-prepared
+    /// pixels, or the runner's resident pixels after recording the resident
+    /// image's preparation into them for `tower`. Calls run in the job's
+    /// order on one stream, so the next resident image is prepared after
+    /// the call that read the last one.
+    fn pixels(&self, image: &PreparedImage, tower: Tower, job: &Job) -> Result<StorageView> {
+        match &image.pixels {
+            ImagePixels::Host(pixels) => Ok(pixels.clone()),
+            ImagePixels::Resident {
+                image: value,
+                signed_unit,
+            } => {
+                let resident = self.resident.as_ref().ok_or_else(|| {
+                    Error::Invariant("an unpacked image encoder holds resident pixels".into())
+                })?;
+                let elements = image.facts.elements();
+                if elements > resident.numel() as i64 {
+                    return Err(Error::Invalid(format!(
+                        "a resident image of {elements} values exceeds {}'s {} resident values",
+                        self.owner,
+                        resident.numel()
+                    )));
+                }
+                let pixels = resident
+                    .prefix(elements)?
+                    .reshape(resident.dtype(), &image.facts.shape)?;
+                self.prepare_resident(value, tower, *signed_unit, &pixels, job);
+                Ok(pixels)
+            }
+        }
+    }
+
+    /// Record the preparation of a resident image product for `tower` into
+    /// `out` (`EncoderRunner.prepare_resident`).
+    fn prepare_resident(
+        &self,
+        image: &StorageView,
+        tower: Tower,
+        signed_unit: bool,
+        out: &StorageView,
+        job: &Job,
+    ) {
+        job.call(MethodCall::new(
+            &self.methods.prepare_resident,
+            vec![
+                Argument::Handle(self.methods.runner.clone()),
+                Argument::Tensor(image.clone()),
+                Argument::Text(tower.name().to_owned()),
+                Argument::Bool(signed_unit),
+                Argument::Tensor(out.clone()),
+            ],
+        ));
     }
 
     /// The arguments of the Python half's `encode` of `slots` packed slots.
@@ -1069,8 +1317,9 @@ impl EncoderRunner {
             .iter()
             .map(|image| {
                 image
+                    .facts
                     .grid
-                    .filter(|_| image.shape.len() == 2)
+                    .filter(|_| image.facts.shape.len() == 2)
                     .ok_or_else(|| {
                         Error::Invalid(
                             "packed vision images require patch rows covering their grids".into(),
@@ -1088,18 +1337,38 @@ impl EncoderRunner {
                 .prefix(2 * slots as i64)?
                 .upload(grid_bytes(&layout).as_slice(), issue)?;
 
-            // FIXME: prepared images are Python-held, so their patch rows
-            // reach the slots through one call on the Python thread.
-            let mut pack = vec![
-                Argument::Handle(self.methods.runner.clone()),
-                Argument::Tensor(pixels.clone()),
-            ];
-            pack.extend(
-                images[offset..offset + slots]
-                    .iter()
-                    .map(|image| Argument::Handle(image.value.clone())),
-            );
-            job.call(MethodCall::new(&self.methods.pack_images, pack));
+            // Each image's prepared patch rows go to the front of its slot:
+            // host-prepared rows are copied there, and a resident image is
+            // prepared there. Rows past an image keep earlier finite values,
+            // which only padding reads. A host job reads the copies'
+            // sources as it records them.
+            let order = if stream.is_some() {
+                SourceOrder::Stream
+            } else {
+                SourceOrder::DuringCall
+            };
+            let mut rows_in = CopyBatch::new(order);
+            for (slot, image) in images[offset..offset + slots].iter().enumerate() {
+                let target = pixels.narrow(
+                    0,
+                    slot as i64 * i64::from(max_patches),
+                    image.facts.shape[0],
+                )?;
+                match &image.pixels {
+                    ImagePixels::Host(source) => {
+                        rows_in.push(target.address(), source.address(), source.nbytes() as usize)
+                    }
+                    ImagePixels::Resident {
+                        image: value,
+                        signed_unit,
+                    } => self.prepare_resident(value, Tower::Vit, *signed_unit, &target, job),
+                }
+            }
+            // SAFETY: each source is host-prepared pixels of the slot's
+            // shape, which the caller keeps until the copies completed (a
+            // host job copies them now), and each target lies in the
+            // runner's packed pixels.
+            unsafe { issue.copy(&rows_in) }?;
 
             let arguments = self.packed_arguments(slots)?;
             let mode = match (self.graph(EncoderGraph::Packed { slots })?, &stream) {
@@ -1458,12 +1727,12 @@ fn chunk_rows(group: Vec<usize>, budget: usize, rows: impl Fn(usize) -> usize) -
 
 /// Image indices grouped by exact pixel shape, groups in first-appearance
 /// order.
-fn shape_groups(images: &[&PreparedImage]) -> Vec<Vec<usize>> {
-    let mut groups: Vec<(Vec<i64>, Vec<usize>)> = Vec::new();
-    for (index, image) in images.iter().enumerate() {
-        match groups.iter_mut().find(|(shape, _)| *shape == image.shape) {
+fn shape_groups<'a>(shapes: impl IntoIterator<Item = (usize, &'a [i64])>) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(&[i64], Vec<usize>)> = Vec::new();
+    for (index, shape) in shapes {
+        match groups.iter_mut().find(|(group, _)| *group == shape) {
             Some((_, members)) => members.push(index),
-            None => groups.push((image.shape.clone(), vec![index])),
+            None => groups.push((shape, vec![index])),
         }
     }
     groups.into_iter().map(|(_, members)| members).collect()
@@ -1835,6 +2104,9 @@ impl EncoderRunner {
             stream: Some(video.stream.clone()),
             methods: EncoderMethods::new(Handle::none())?,
             packed: None,
+            pinned: PinnedPool::new(Some(video.device)),
+            resident: None,
+            noise: None,
             text: None,
             text_capacities: Vec::new(),
             config: EncoderConfig::default(),
@@ -2329,21 +2601,14 @@ pub(crate) fn image_placement(
 
 /// An image encoding between two of its jobs.
 pub(crate) enum EncodeResume {
-    /// The job on the lane prepares the resident images: its completion
-    /// carries the prepared images.
-    Handles {
+    /// The job on the lane reads the resident images' facts.
+    Facts {
         call: MediaCall,
         /// Each active call's image; none yet for a resident one.
         images: Vec<Option<PreparedImage>>,
-        /// The positions of the resident images in `images`.
-        resident: Vec<usize>,
-    },
-    /// The job on the lane reads the prepared resident images' facts.
-    Facts {
-        call: MediaCall,
-        images: Vec<Option<PreparedImage>>,
-        resident: Vec<usize>,
-        handles: Vec<Handle>,
+        /// The resident images by position in `images`: the image product
+        /// and whether its values are in `[-1, 1]`.
+        resident: Vec<(usize, StorageView, bool)>,
     },
     /// The job on the lane holds an unpacked encoder's calls: its
     /// completion carries the shapes they wrote.
@@ -2359,10 +2624,10 @@ impl ImageBatch<'_> {
     /// product, up to its first job boundary. `prepared` holds the
     /// host-prepared inline images by call index.
     ///
-    /// The encoding's jobs: the preparation of the resident images and then
-    /// the read of their facts, when the batch has any; the encode calls;
-    /// and, after an unpacked encoder's calls returned the shapes they
-    /// wrote, the features' fences and exports.
+    /// The encoding's jobs: the read of the resident images' facts, when
+    /// the batch has any; the encode calls; and, after an unpacked
+    /// encoder's calls returned the shapes they wrote, the features' fences
+    /// and exports.
     pub(crate) fn encode(
         &mut self,
         call: MediaCall,
@@ -2396,39 +2661,17 @@ impl ImageBatch<'_> {
         completion: &mut Completion,
     ) -> Result<Progress> {
         match resume {
-            EncodeResume::Handles {
-                call,
-                images,
-                resident,
-            } => {
-                // The prepared images came back; their facts are calls of
-                // the next job.
-                let route = self.encoder_route(call)?;
-                let runner = &self.parts.encoders.image[route];
-                let handles = resident
-                    .iter()
-                    .map(|_| completion.handle())
-                    .collect::<Result<Vec<_>>>()?;
-                for handle in &handles {
-                    runner.image_facts(handle, job);
-                }
-                Ok(Progress::Boundary(Resume::Encode(EncodeResume::Facts {
-                    call,
-                    images,
-                    resident,
-                    handles,
-                })))
-            }
             EncodeResume::Facts {
                 call,
                 mut images,
                 resident,
-                handles,
             } => {
-                let route = self.encoder_route(call)?;
-                let runner = &self.parts.encoders.image[route];
-                for (&position, handle) in resident.iter().zip(handles) {
-                    images[position] = Some(runner.prepared(handle, &completion.returned()?)?);
+                let preparation = self.parts.policy.preparation();
+                for (position, image, signed_unit) in resident {
+                    images[position] = Some(PreparedImage {
+                        facts: preparation.returned_facts(&completion.returned()?)?,
+                        pixels: ImagePixels::Resident { image, signed_unit },
+                    });
                 }
                 self.encode_images(job, call, images)
             }
@@ -2456,8 +2699,8 @@ impl ImageBatch<'_> {
             .route(&self.plan.calls[first].component, CallKind::Media(call))
     }
 
-    /// Lease the resident images and record their preparation, then go on
-    /// to the encode when every image is prepared already.
+    /// Lease the resident images and record the reads of their facts, then
+    /// go on to the encode when every image is prepared on the host.
     fn prepare_images(
         &mut self,
         job: &Job,
@@ -2470,12 +2713,12 @@ impl ImageBatch<'_> {
         if active.is_empty() {
             return Ok(Progress::done(ForwardStats::default()));
         }
-        let route = self.encoder_route(call)?;
         let target = self.target();
         let stream = self.batch.stream.clone();
 
-        // Every image, inline or resident, prepared for the encoder. A
-        // resident image is prepared by a call of the job.
+        // Every image, inline or resident, ready for the encoder. A
+        // resident image's facts are a call of the job; the encode prepares
+        // its pixels.
         let mut images: Vec<Option<PreparedImage>> = Vec::with_capacity(active.len());
         let mut resident = Vec::new();
         for (position, &index) in active.iter().enumerate() {
@@ -2510,11 +2753,29 @@ impl ImageBatch<'_> {
                             ));
                         }
                     };
-                    let runner = &self.parts.encoders.image[route];
                     let value = read.value().clone();
                     self.batch.reads.push(read);
-                    runner.prepare_resident(&value, tower, range == ValueRange::SignedUnit, job)?;
-                    resident.push(position);
+                    // An image product is [3, height, width], or a batch of
+                    // one of them.
+                    let (height, width) = match value.shape() {
+                        [.., 3, height, width] => (*height, *width),
+                        _ => {
+                            return Err(Error::Invalid(
+                                "a resident image is [3, height, width]".into(),
+                            ));
+                        }
+                    };
+                    let extent = |side: i64| {
+                        u32::try_from(side)
+                            .map_err(|_| Error::Invalid("a resident image is too large".into()))
+                    };
+                    self.parts.policy.preparation().record_facts(
+                        tower,
+                        extent(height)?,
+                        extent(width)?,
+                        job,
+                    );
+                    resident.push((position, value, range == ValueRange::SignedUnit));
                     images.push(None);
                 }
                 _ => {
@@ -2528,8 +2789,8 @@ impl ImageBatch<'_> {
             return self.encode_images(job, call, images);
         }
 
-        // The prepared images come back with the job that prepared them.
-        Ok(Progress::Boundary(Resume::Encode(EncodeResume::Handles {
+        // The resident images' facts come back with the job that read them.
+        Ok(Progress::Boundary(Resume::Encode(EncodeResume::Facts {
             call,
             images,
             resident,
@@ -2567,10 +2828,32 @@ impl ImageBatch<'_> {
             OutputPlacement::default(),
         )?;
         self.batch.writes.extend(writes.iter().cloned());
+
+        // A latent image's posterior noise is drawn at its request's seed
+        // and the request's latent encodings before it.
+        let draws = match call {
+            MediaCall::LatentEncoding => active
+                .iter()
+                .map(|&index| {
+                    let request = self
+                        .requests
+                        .get(plan.calls[index].request_key.request_id.0)?;
+                    let seed = request
+                        .admission()
+                        .image
+                        .as_ref()
+                        .and_then(|image| image.seed)
+                        .unwrap_or(0);
+                    Ok((seed, request.posterior_draw()?))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => Vec::new(),
+        };
         let runner = &mut self.parts.encoders.image[route];
         let products: Vec<StorageView> = writes.iter().map(|write| write.view()).collect();
         let borrowed: Vec<&PreparedImage> = images.iter().collect();
-        let recorded = runner.record(&borrowed, &products, job)?;
+        let recorded = runner.record(&borrowed, &draws, &products, job)?;
+        self.retain_pixels(&images, job)?;
 
         // An unpacked encoder's calls return the shapes they wrote, which
         // the features are fenced and exported with: the next job's work.
@@ -2584,6 +2867,34 @@ impl ImageBatch<'_> {
         let encoded = recorded.finish(&mut Completion::default())?;
         self.publish_features(job, &images, &writes, &encoded)
             .map(Progress::done)
+    }
+
+    /// Keep the host-prepared pixels of `images` from their pool until the
+    /// stream passed the work recorded in `job` that reads them. A host job
+    /// reads them before it completes: its calls hold their arguments and
+    /// its copies take their sources as they are recorded.
+    fn retain_pixels(&self, images: &[PreparedImage], job: &Job) -> Result<()> {
+        let pixels: Vec<StorageView> = images
+            .iter()
+            .filter_map(|image| match &image.pixels {
+                ImagePixels::Host(pixels) => Some(pixels.clone()),
+                ImagePixels::Resident { .. } => None,
+            })
+            .collect();
+        let issue = job.on(self.batch.stream.as_ref());
+        if pixels.is_empty() || issue.stream().is_none() {
+            return Ok(());
+        }
+        let events = &self.storage.events;
+        let fence = events.fence(issue, false)?;
+        issue.defer(
+            events,
+            vec![fence],
+            Box::new(move || {
+                drop(pixels);
+                Ok(())
+            }),
+        )
     }
 
     /// Fence each feature at the shape its encode wrote and issue its
@@ -2608,8 +2919,8 @@ impl ImageBatch<'_> {
                 &shape,
                 issue,
                 Some(Metadata::Feature {
-                    height: image.height,
-                    width: image.width,
+                    height: image.facts.height,
+                    width: image.facts.width,
                 }),
             )?;
             // Other ranks and workers import the feature from its export,
@@ -2684,19 +2995,16 @@ mod tests {
 
     #[test]
     fn unpacked_images_group_by_pixel_shape_in_appearance_order() {
-        let image = |shape: &[i64]| PreparedImage {
-            value: Handle::none(),
-            shape: shape.to_vec(),
-            grid: None,
-            height: 1,
-            width: 1,
-        };
-        let (a, b, c) = (
-            image(&[3, 32, 32]),
-            image(&[3, 16, 32]),
-            image(&[3, 32, 32]),
+        let (a, b, c) = ([3, 32, 32], [3, 16, 32], [3, 32, 32]);
+        assert_eq!(
+            shape_groups([(0, &a[..]), (1, &b[..]), (2, &c[..])]),
+            vec![vec![0, 2], vec![1]]
         );
-        assert_eq!(shape_groups(&[&a, &b, &c]), vec![vec![0, 2], vec![1]]);
+        // Members keep their own indices.
+        assert_eq!(
+            shape_groups([(4, &b[..]), (7, &a[..])]),
+            vec![vec![4], vec![7]]
+        );
     }
 
     #[test]
@@ -2710,6 +3018,7 @@ mod tests {
             image_patches: 2520,
             row_width: 768,
             pixel_dtype: DType::F32,
+            image_elements: 3 * 2520 * 256,
         };
         assert_eq!(info.slot_tokens(), Some(280));
         // Two segments per slot.

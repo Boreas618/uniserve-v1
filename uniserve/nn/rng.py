@@ -102,6 +102,16 @@ def flow_noise_seed(request_seed: int, semantic_image_index: int) -> int:
     return _splitmix_coordinate(request_seed, semantic_image_index)
 
 
+def posterior_noise_seed(request_seed: int, encode_index: int) -> int:
+    """Return the seed of one latent encoding's posterior noise.
+
+    ``encode_index`` counts the request's latent encodings before this one.
+    A second mixing step keeps these seeds apart from the flow-noise seeds
+    of the same request and index.
+    """
+    return _splitmix_coordinate(flow_noise_seed(request_seed, encode_index), 0)
+
+
 def normal_noise(
     seeds: tuple[int, ...], outputs: tuple[torch.Tensor, ...]
 ) -> None:
@@ -152,6 +162,7 @@ __all__ = [
     "DRAW_LAYOUT_TARGET",
     "flow_noise_seed",
     "normal_noise",
+    "posterior_noise_seed",
     "philox4x32_10",
     "sampling_key",
     "sampling_uniform",
