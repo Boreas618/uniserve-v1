@@ -81,7 +81,7 @@ impl DenoiserRunners {
                 "the video denoiser computes on CUDA".into(),
             ));
         };
-        let runner = DenoiserRunner::new(crate::runner::denoiser::DenoiserSetup {
+        let runner = DenoiserRunner::video(crate::runner::denoiser::DenoiserSetup {
             loaded,
             component: &placed.name,
             stream,

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use uniserve_ipc::{BufferId, RequestKey};
 
-use super::image::{DenoiseRow, ImageDiffusion};
+use super::image::DenoiseRow;
 use super::{DenoiserRunner, Evicted, VideoModel};
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
@@ -40,7 +40,7 @@ pub(crate) struct DenoiserRunners {
     /// The layout each admitted slot holds on the video denoiser.
     layouts: HashMap<usize, usize>,
     /// An image model's denoiser, with its component.
-    pub(crate) image: Option<(String, ImageDiffusion)>,
+    pub(crate) image: Option<(String, DenoiserRunner)>,
     /// The denoising steps captured at startup, largest first, and their
     /// graph pools: one on the denoiser's device and one on each other
     /// device its modules run on (a generation tower). Empty when flow
@@ -55,7 +55,7 @@ impl DenoiserRunners {
     /// The denoiser of an image model with the steps startup captures,
     /// their graph pools and the unit reset column of its stream.
     pub(crate) fn image(
-        denoiser: Option<(String, ImageDiffusion)>,
+        denoiser: Option<(String, DenoiserRunner)>,
         flow: Vec<FlowShape>,
         flow_pools: Vec<Arc<GraphPool<Handle>>>,
         units: Option<UnitColumn>,
@@ -87,14 +87,14 @@ impl DenoiserRunners {
         for shape in &shapes {
             self.capture_step(shape, &pools, latents, prefix_cache)?;
         }
-        if let Some((_, diffusion)) = &self.image {
-            if let Some(stream) = diffusion.stream() {
+        if let Some((_, denoiser)) = &self.image {
+            if let Some(stream) = denoiser.stream() {
                 stream.synchronize()?;
             }
             tracing::info!(
                 target: "uniserve_worker.warmup",
                 "captured {} image denoising graphs",
-                diffusion.captured()
+                denoiser.captured()
             );
         }
         Ok(())
@@ -113,12 +113,12 @@ impl DenoiserRunners {
     ) -> Result<()> {
         let page_units = latents.pool.page_units() as u32;
         let workspace = latents.workspace()?.clone();
-        let Some((_, diffusion)) = &mut self.image else {
+        let Some((_, denoiser)) = &mut self.image else {
             return Ok(());
         };
-        let units = diffusion.layout().latent_rows(shape.height, shape.width)?;
+        let units = denoiser.layout()?.latent_rows(shape.height, shape.width)?;
         let padded = units.div_ceil(page_units) * page_units;
-        let stream = diffusion.stream().cloned();
+        let stream = denoiser.stream().cloned();
         // Captured samples start from zeros, as fresh scratch pages do.
         workspace
             .narrow(0, 0, i64::from(padded) * shape.images as i64)?
@@ -141,7 +141,7 @@ impl DenoiserRunners {
         }
         let lengths = vec![prefix; shape.images];
         with_scratch(prefix_cache, &lengths, stream.as_ref(), |prefix_cache| {
-            diffusion.capture(&rows, prefix_cache, pools, &mut || Ok(()))
+            denoiser.capture_step(&rows, prefix_cache, pools, &mut || Ok(()))
         })
     }
 
@@ -254,7 +254,9 @@ impl DenoiserRunners {
                 runner.capture(id)?;
             }
             runner.warm_conditioner(true)?;
-            runner.stream().synchronize()?;
+            if let Some(stream) = runner.stream() {
+                stream.synchronize()?;
+            }
             runner.seal();
         }
         Ok(())

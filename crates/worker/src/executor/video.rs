@@ -558,7 +558,7 @@ impl<'a> Parts<'a> {
                     .filter(|denoiser| denoiser.name == component);
                 let denoiser = denoiser
                     .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-                Ok((denoiser.device, Some(denoiser.runner.stream().clone())))
+                Ok((denoiser.device, denoiser.runner.stream().cloned()))
             }
             MediaCall::VideoDecoding => {
                 let decoder = self

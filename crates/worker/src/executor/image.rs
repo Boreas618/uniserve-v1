@@ -41,7 +41,7 @@ use crate::request::RequestPool;
 use crate::request::diffusion::{BranchSource, Prefix, Trajectories};
 use crate::runner::decoder::DecoderRunner;
 use crate::runner::decoder::runners::DecoderRunners;
-use crate::runner::denoiser::image::ImageDiffusion;
+use crate::runner::denoiser::DenoiserRunner;
 use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::inputs::Inputs;
@@ -491,11 +491,12 @@ impl ImageParts<'_> {
         self.policy
     }
 
-    pub(crate) fn diffusion(&self) -> Option<&ImageDiffusion> {
+    /// The image denoiser.
+    pub(crate) fn denoiser(&self) -> Option<&DenoiserRunner> {
         self.denoisers.image.as_ref().map(|(_, runner)| runner)
     }
 
-    pub(crate) fn diffusion_mut(&mut self) -> Option<&mut ImageDiffusion> {
+    pub(crate) fn denoiser_mut(&mut self) -> Option<&mut DenoiserRunner> {
         self.denoisers.image.as_mut().map(|(_, runner)| runner)
     }
 

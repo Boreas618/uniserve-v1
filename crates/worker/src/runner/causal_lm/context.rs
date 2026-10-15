@@ -415,10 +415,10 @@ pub(super) fn visual(
             ));
         }
         let image = image?;
-        let diffusion = image.diffusion().ok_or_else(|| {
+        let denoiser = image.denoiser().ok_or_else(|| {
             Error::Unsupported("latent state prefill requires an image denoiser".into())
         })?;
-        let layout = diffusion.layout();
+        let layout = denoiser.layout()?;
         let query = layout.sequence_length(feature.height, feature.width)?;
         if query > call.bounds.max_tokens {
             return Err(Error::Invalid(

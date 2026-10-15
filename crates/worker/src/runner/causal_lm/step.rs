@@ -605,16 +605,18 @@ pub(super) fn condition_latents(
     let image = image.as_mut().ok_or_else(|| {
         Error::Unsupported("latent conditioning requires the image runtime".into())
     })?;
-    let diffusion = image.diffusion_mut().ok_or_else(|| {
+    let denoiser = image.denoiser_mut().ok_or_else(|| {
         Error::Unsupported("latent conditioning requires an image denoiser".into())
     })?;
-    let denoiser = diffusion.stream().cloned();
+    let denoiser_stream = denoiser.stream().cloned();
     let prefix_cache = storage
         .prefix_cache
         .as_mut()
         .ok_or_else(|| Error::Unsupported("text calls require a prefix cache".into()))?;
-    runtime.order().wait(job.on(denoiser.as_ref()))?;
-    diffusion.condition(rows, prefix_cache, job)?;
-    runtime.order_mut().record(job.on(denoiser.as_ref()))?;
+    runtime.order().wait(job.on(denoiser_stream.as_ref()))?;
+    denoiser.condition_latents(rows, prefix_cache, job)?;
+    runtime
+        .order_mut()
+        .record(job.on(denoiser_stream.as_ref()))?;
     runtime.order().wait(job.on(stream))
 }
