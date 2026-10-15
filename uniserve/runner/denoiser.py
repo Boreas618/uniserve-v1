@@ -677,12 +677,6 @@ class DenoiserRunner:
         return int(_denoiser(loaded, component).legal_frame_count(int(frames)))
 
     @staticmethod
-    def condition_rows(loaded, component: str, size, conditions, spans) -> int:
-        """Condition rows of a request size."""
-        network = _denoiser(loaded, component)
-        return int(_size(network, size, conditions, spans).condition_rows)
-
-    @staticmethod
     def layout_size(loaded, component: str, size, conditions, spans):
         """The smallest layout holding a request size."""
         network = _denoiser(loaded, component)

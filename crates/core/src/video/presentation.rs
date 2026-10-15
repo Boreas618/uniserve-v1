@@ -17,12 +17,9 @@
 //! carries the text tag ([`TEXT_TAG`]).
 
 use std::borrow::Cow;
+use std::fmt;
 
-use thiserror_ext::AsReport as _;
-
-use super::plan::{Prepared, RequestPlan, Vision};
-use super::{RequestField, VideoInputError};
-use crate::profile::tokenizer::HuggingFaceTokenizer;
+use super::plan::{Prepared, RequestField, RequestPlan, VideoInputError, Vision};
 
 /// The AdaLN tag of a vision token.
 pub const VIDEO_TAG: u8 = 0;
@@ -109,6 +106,24 @@ pub fn segments<'a>(plan: &RequestPlan, prompt: &'a str) -> Vec<Segment<'a>> {
     segments
 }
 
+/// The tokenizer calls a presentation needs: the checkpoint's tokenizer with
+/// the special tokens its configuration declares, which a prompt may
+/// contain.
+pub trait Tokenizer {
+    /// Why encoding failed.
+    type Error: fmt::Display;
+
+    /// The token ids of `text`, without special tokens added.
+    ///
+    /// # Errors
+    ///
+    /// Returns the tokenizer's error.
+    fn encode(&self, text: &str) -> Result<Vec<u32>, Self::Error>;
+
+    /// The id of a named token, or `None` when the vocabulary lacks it.
+    fn token_id(&self, token: &str) -> Option<u32>;
+}
+
 /// The tokenized presentation and the AdaLN tag of every token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Presentation {
@@ -126,8 +141,8 @@ pub struct Presentation {
 /// or contains a vision placeholder or marker, which would misalign the
 /// conditioner's vision inputs, and [`VideoInputError::Internal`] when the
 /// tokenizer fails or lacks the vision tokens a vision block needs.
-pub fn present(
-    tokenizer: &HuggingFaceTokenizer,
+pub fn present<T: Tokenizer>(
+    tokenizer: &T,
     plan: &RequestPlan,
     prompt: &str,
 ) -> Result<Presentation, VideoInputError> {
@@ -139,7 +154,7 @@ pub fn present(
     }
     // A vision block needs the vision vocabulary; a prompt can only produce
     // the vision tokens the tokenizer has, which it must not contain.
-    let token = |name: &'static str| (name, tokenizer.token_to_id(name));
+    let token = |name: &'static str| (name, tokenizer.token_id(name));
     let required = |(name, id): (&str, Option<u32>)| {
         id.ok_or_else(|| VideoInputError::internal(format!("the tokenizer has no {name} token")))
     };
@@ -170,10 +185,9 @@ pub fn present(
                 tags.extend(std::iter::repeat_n(VIDEO_TAG, block));
             }
             Segment::Text(text) => {
-                let ids = tokenizer.encode(text, false).map_err(|error| {
+                let ids = tokenizer.encode(text).map_err(|error| {
                     VideoInputError::internal(format!(
-                        "tokenizing the presentation failed: {}",
-                        error.as_report()
+                        "tokenizing the presentation failed: {error}"
                     ))
                 })?;
                 if position == last && ids.iter().any(|id| placeholders.contains(id)) {
@@ -193,17 +207,104 @@ pub fn present(
 #[cfg(test)]
 pub(super) mod tests {
     use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::convert::Infallible;
 
     use serde_json::Value;
-    use tokenizers::models::bpe::{BPE, Vocab};
-    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-    use super::super::RequestField;
+    use super::super::plan::RequestField;
     use super::super::plan::tests::{Request, fixture, vision};
-    use super::{Segment, TEXT_TAG, VIDEO_TAG, VisionPad, present, segments};
-    use crate::profile::assets::PipelineCheckpoint;
-    use crate::profile::tokenizer::HuggingFaceTokenizer;
-    use crate::serving::model::pipeline_tokenizer;
+    use super::{Segment, TEXT_TAG, Tokenizer, VIDEO_TAG, VisionPad, present, segments};
+
+    /// The ids of the vision markers and placeholders in
+    /// [`CharacterTokenizer`]'s vocabulary.
+    const VISION_TOKENS: [(&str, u32); 4] = [
+        ("<|vision_start|>", 128),
+        ("<|vision_end|>", 129),
+        ("<|image_pad|>", 130),
+        ("<|video_pad|>", 131),
+    ];
+
+    /// A deterministic tokenizer: one token per character, its code point,
+    /// plus the vision markers and placeholders as special tokens.
+    pub(in crate::video) struct CharacterTokenizer;
+
+    impl Tokenizer for CharacterTokenizer {
+        type Error = Infallible;
+
+        fn encode(&self, text: &str) -> Result<Vec<u32>, Infallible> {
+            let mut ids = Vec::new();
+            let mut rest = text;
+            'text: while let Some(first) = rest.chars().next() {
+                for (token, id) in VISION_TOKENS {
+                    if let Some(after) = rest.strip_prefix(token) {
+                        ids.push(id);
+                        rest = after;
+                        continue 'text;
+                    }
+                }
+                ids.push(u32::from(first));
+                rest = &rest[first.len_utf8()..];
+            }
+            Ok(ids)
+        }
+
+        fn token_id(&self, token: &str) -> Option<u32> {
+            VISION_TOKENS
+                .iter()
+                .find(|(name, _)| *name == token)
+                .map(|&(_, id)| id)
+        }
+    }
+
+    /// The checkpoint tokenizer's recorded output on the texts of the
+    /// vectors' presentations, and its recorded vision token ids.
+    struct RecordedTokenizer {
+        tokens: HashMap<String, u32>,
+        texts: HashMap<String, Vec<u32>>,
+    }
+
+    impl RecordedTokenizer {
+        fn new(fixture: &Value) -> Self {
+            let tokens = fixture["tokens"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(name, id)| (name.clone(), id.as_u64().unwrap() as u32))
+                .collect();
+            let mut texts = HashMap::new();
+            for case in fixture["requests"].as_array().unwrap() {
+                let Some(expected) = case.get("expected") else {
+                    continue;
+                };
+                for segment in expected["segments"].as_array().unwrap() {
+                    if let Some(text) = segment.get("text") {
+                        let ids = segment["token_ids"].as_array().unwrap();
+                        texts.insert(
+                            text.as_str().unwrap().to_owned(),
+                            ids.iter().map(|id| id.as_u64().unwrap() as u32).collect(),
+                        );
+                    }
+                }
+            }
+            Self { tokens, texts }
+        }
+    }
+
+    impl Tokenizer for RecordedTokenizer {
+        type Error = String;
+
+        fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+            self.texts
+                .get(text)
+                .cloned()
+                .ok_or_else(|| format!("no recorded tokens for {text:?}"))
+        }
+
+        fn token_id(&self, token: &str) -> Option<u32> {
+            self.tokens.get(token).copied()
+        }
+    }
 
     fn expected_segments(case: &Value) -> Vec<Segment<'static>> {
         case["expected"]["segments"]
@@ -268,75 +369,26 @@ pub(super) mod tests {
         }
     }
 
-    /// A deterministic tokenizer: one token per character, plus the vision
-    /// markers and placeholders as special tokens.
-    pub(in crate::serving::video) fn character_tokenizer() -> HuggingFaceTokenizer {
-        let mut vocab: Vocab = (1_u32..=127)
-            .map(|id| (char::from_u32(id).unwrap().to_string(), id))
-            .collect();
-        vocab.insert("<unk>".to_owned(), 0);
-        let specials = [
-            ("<|vision_start|>", 128),
-            ("<|vision_end|>", 129),
-            ("<|image_pad|>", 130),
-            ("<|video_pad|>", 131),
-        ];
-        for (token, id) in specials {
-            vocab.insert(token.to_owned(), id);
-        }
-        let model = BPE::builder()
-            .vocab_and_merges(vocab, Vec::new())
-            .unk_token("<unk>".to_owned())
-            .build()
-            .unwrap();
-        let mut tokenizer = TokenizerBuilder::new(model);
-        tokenizer.add_special_tokens(
-            &specials
-                .iter()
-                .map(|(token, _)| AddedToken::from(*token, true))
-                .collect::<Vec<_>>(),
-        );
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("tokenizer.json");
-        tokenizer.save(&path, false).unwrap();
-        HuggingFaceTokenizer::new(&path).unwrap()
-    }
-
-    /// Vision blocks are tagged video, markers included; labels and the
-    /// prompt are tagged text and tokenized segment by segment.
+    /// With the checkpoint tokenizer's recorded output, the presentation's
+    /// token ids and tags equal the reference's: vision blocks are tagged
+    /// video, markers included, and labels and the prompt are tagged text and
+    /// tokenized segment by segment.
     #[test]
-    fn vision_blocks_carry_the_video_tag() {
+    fn presentations_match_the_reference() {
         let fixture = fixture();
         let vision = vision(&fixture);
-        let tokenizer = character_tokenizer();
-        let case = fixture["requests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|case| case["name"] == "ref2va_video_audio")
-            .unwrap();
-        let plan = Request::parse(case).plan(&vision).unwrap();
-        let presentation = present(&tokenizer, &plan, "go").unwrap();
-
-        let mut expected_ids = Vec::new();
-        let mut expected_tags = Vec::new();
-        for segment in segments(&plan, "go") {
-            match segment {
-                Segment::Text(text) => {
-                    expected_ids.extend(text.chars().map(u32::from));
-                    expected_tags.extend(std::iter::repeat_n(TEXT_TAG, text.chars().count()));
-                }
-                Segment::Vision { pad, tokens } => {
-                    let pad = if pad == VisionPad::Image { 130 } else { 131 };
-                    expected_ids.push(128);
-                    expected_ids.extend(std::iter::repeat_n(pad, tokens as usize));
-                    expected_ids.push(129);
-                    expected_tags.extend(std::iter::repeat_n(VIDEO_TAG, tokens as usize + 2));
-                }
+        let tokenizer = RecordedTokenizer::new(&fixture);
+        for case in fixture["requests"].as_array().unwrap() {
+            if case.get("expected").is_none() {
+                continue;
             }
+            let plan = Request::parse(case).plan(&vision).unwrap();
+            let presentation = present(&tokenizer, &plan, case["prompt"].as_str().unwrap())
+                .unwrap_or_else(|error| panic!("{}: {error}", case["name"]));
+            let (token_ids, tags) = expected_tokens(&fixture, case);
+            assert_eq!(presentation.token_ids, token_ids, "{}", case["name"]);
+            assert_eq!(presentation.tags, tags, "{}", case["name"]);
         }
-        assert_eq!(presentation.token_ids, expected_ids);
-        assert_eq!(presentation.tags, expected_tags);
     }
 
     /// A prompt that is empty or carries vision tokens is rejected.
@@ -344,42 +396,12 @@ pub(super) mod tests {
     fn prompts_must_be_plain_text() {
         let fixture = fixture();
         let vision = vision(&fixture);
-        let tokenizer = character_tokenizer();
         let plan = Request::parse(&fixture["requests"][0])
             .plan(&vision)
             .unwrap();
-        for prompt in ["", "a <|image_pad|> b", "<|vision_start|>"] {
-            let error = present(&tokenizer, &plan, prompt).unwrap_err();
+        for prompt in ["", " \n", "a <|image_pad|> b", "<|vision_start|>"] {
+            let error = present(&CharacterTokenizer, &plan, prompt).unwrap_err();
             assert_eq!(error.field(), Some(RequestField::Prompt), "{prompt:?}");
-        }
-    }
-
-    /// With the checkpoint's own tokenizer, loaded as the server loads it
-    /// (`UNISERVE_MINIMAX_H3_MODEL` names the checkpoint root), the token ids
-    /// equal the reference's.
-    #[tokio::test]
-    async fn checkpoint_tokenizer_matches_the_reference() {
-        let Ok(root) = std::env::var("UNISERVE_MINIMAX_H3_MODEL") else {
-            eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
-            return;
-        };
-        let pipeline = PipelineCheckpoint::resolve(&root, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let tokenizer = pipeline_tokenizer(&pipeline).await.unwrap();
-        let fixture = fixture();
-        let vision = vision(&fixture);
-        for case in fixture["requests"].as_array().unwrap() {
-            if case.get("expected").is_none() {
-                continue;
-            }
-            let plan = Request::parse(case).plan(&vision).unwrap();
-            let presentation =
-                present(&tokenizer, &plan, case["prompt"].as_str().unwrap()).unwrap();
-            let (token_ids, tags) = expected_tokens(&fixture, case);
-            assert_eq!(presentation.token_ids, token_ids, "{}", case["name"]);
-            assert_eq!(presentation.tags, tags, "{}", case["name"]);
         }
     }
 }

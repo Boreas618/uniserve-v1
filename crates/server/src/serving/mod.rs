@@ -69,9 +69,8 @@ pub use input::{
 pub use media::ImageInput;
 pub(crate) use model::LoadedModel;
 pub use model::{
-    InputProcessor, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ModelSupport, ServedEndpoint,
-    ServedFeature, ServedModality, ServedSamplingControl, VIDEO_FPS, WorkerCapabilities,
-    validate_video_capacity, video_frame_count,
+    InputProcessor, ModelSupport, ServedEndpoint, ServedFeature, ServedModality,
+    ServedSamplingControl, WorkerCapabilities, validate_video_capacity,
 };
 pub use preprocessing::chat_image_urls;
 

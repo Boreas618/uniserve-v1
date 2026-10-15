@@ -15,25 +15,24 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use uniserve_core::video::plan::{
+    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
+    MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
+    MAX_VIDEO_SECONDS, MIN_ASPECT_RATIO, MIN_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, PlanLimits,
+    RequestPlan, Target, VIDEO_FPS, VisionConfig, video_frame_count,
+};
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
 };
 use uniserve_engine::VideoDenoiserInfo;
 
-use super::plan::{
-    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
-    MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
-    MIN_ASPECT_RATIO, NAMED_ASPECT_RATIOS, PlanLimits, RequestPlan, Target, VisionConfig,
-};
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
 use super::{ConditionInput, VideoIngest, VideoRequestInput};
 use crate::config::VideoMediaSettings;
 use crate::openai::{ApiError, VideoCondition, VideoGenerationRequest};
 use crate::profile::tokenizer::DynTokenizer;
-use crate::serving::{
-    MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, ServeError, ServeRequestId, VIDEO_FPS, video_frame_count,
-};
+use crate::serving::{ServeError, ServeRequestId};
 
 /// The only numerical quality the video service runs.
 const LOSSLESS: &str = "lossless";
@@ -151,7 +150,7 @@ impl VideoService {
         // The named ratios served at any short edge, in their canonical
         // order, and each served pair's canvas; `auto` is 16:9 for t2va and
         // ref2va.
-        let served = plan::named_canvases(self.ingest.limits());
+        let served = plan::served_canvases(self.ingest.limits());
         let named: Vec<String> = NAMED_ASPECT_RATIOS
             .iter()
             .map(|(width, height)| format!("{width}:{height}"))
@@ -498,13 +497,17 @@ mod tests {
 
     use base64::Engine as _;
     use image::ImageEncoder as _;
-    use uniserve_core::{
-        Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoTask, VisionGrid,
+    use uniserve_core::video::plan::{
+        AudioFacts, ConditionSpec, ConditionType, FrameRate, ImageFacts, MediaFacts, PlanLimits,
+        RequestPlan, Role, Target, VideoFacts, plan_request,
     };
-    use uniserve_engine::{ConditionTiles, VideoDenoiserInfo};
+    use uniserve_core::{
+        Canvas, ConditionMedia, ConditionRole, ConditionTiles, ConditionVision, ImageFit,
+        VideoTask, VisionGrid,
+    };
+    use uniserve_engine::VideoDenoiserInfo;
 
-    use super::super::plan::tests::{Request, fixture, vision};
-    use super::super::presentation::tests::character_tokenizer;
+    use super::super::tests::{character_tokenizer, vision};
     use super::VideoService;
     use crate::config::VideoMediaSettings;
     use crate::openai::{ApiError, VideoGenerationRequest};
@@ -533,7 +536,7 @@ mod tests {
                 max_sequence_rows,
                 condition_tiles,
             },
-            vision(&fixture()),
+            vision(),
             15.0,
             max_condition_rows,
             &VideoMediaSettings::default(),
@@ -549,16 +552,92 @@ mod tests {
         video: [4, 4, 8],
     };
 
-    /// The plan of the vectors request named `name`.
-    fn planned(name: &str) -> super::RequestPlan {
-        let fixture = fixture();
-        let case = fixture["requests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|case| case["name"] == name)
-            .unwrap();
-        Request::parse(case).plan(&vision(&fixture)).unwrap()
+    /// The plan of a request with these conditions and probed media, for
+    /// every task the model serves.
+    fn planned(
+        task: VideoTask,
+        target: Target<'_>,
+        conditions: &[(ConditionSpec, MediaFacts)],
+    ) -> RequestPlan {
+        let (specs, media): (Vec<_>, Vec<_>) = conditions.iter().cloned().unzip();
+        let limits = PlanLimits {
+            tasks: VideoTask::ALL.to_vec(),
+            max_video_seconds: 15.0,
+            canvases: None,
+        };
+        plan_request(task, &target, &specs, &media, &vision(), &limits).unwrap()
+    }
+
+    /// A five-second 16:9 ref2va request on a 16:9 video started 1.5 seconds
+    /// in (300 frames at 30000/1001 fps, a ten-second 44.1 kHz soundtrack)
+    /// and a three-second 48 kHz audio reference.
+    fn video_and_audio() -> RequestPlan {
+        let reference = |condition_type| ConditionSpec {
+            condition_type,
+            role: Role::Reference,
+            frame_index: None,
+            start_seconds: None,
+        };
+        let video = VideoFacts {
+            display_width: 16,
+            display_height: 9,
+            frame_rate: FrameRate {
+                numerator: 30_000,
+                denominator: 1001,
+            },
+            frames: 300,
+            soundtrack: Some(AudioFacts {
+                sample_rate: 44_100,
+                samples: 441_000,
+            }),
+        };
+        let audio = AudioFacts {
+            sample_rate: 48_000,
+            samples: 144_000,
+        };
+        planned(
+            VideoTask::Ref2va,
+            Target {
+                short_edge: 768,
+                aspect_ratio: "auto",
+                duration_seconds: Some(5.0),
+            },
+            &[
+                (
+                    ConditionSpec {
+                        start_seconds: Some(1.5),
+                        ..reference(ConditionType::VideoAudio)
+                    },
+                    MediaFacts::Video(video),
+                ),
+                (reference(ConditionType::Audio), MediaFacts::Audio(audio)),
+            ],
+        )
+    }
+
+    /// An eight-second fl2va request whose first keyframe, 1000x600, sets
+    /// the canvas.
+    fn first_keyframe() -> RequestPlan {
+        planned(
+            VideoTask::Fl2va,
+            Target {
+                short_edge: 768,
+                aspect_ratio: "auto",
+                duration_seconds: Some(8.0),
+            },
+            &[(
+                ConditionSpec {
+                    condition_type: ConditionType::Image,
+                    role: Role::Keyframe,
+                    frame_index: Some(0),
+                    start_seconds: None,
+                },
+                MediaFacts::Image(ImageFacts {
+                    width: 1000,
+                    height: 600,
+                }),
+            )],
+        )
     }
 
     fn refusal(error: ApiError) -> String {
@@ -580,7 +659,7 @@ mod tests {
     /// one row below it, while a dense denoiser still counts 37,950.
     #[test]
     fn tile_packed_conditions_are_bounded_by_their_tiles() {
-        let plan = planned("ref2va_video_audio");
+        let plan = video_and_audio();
         let text_rows = 1024;
 
         assert_eq!(service(37_950, None).check_rows(&plan, text_rows), Ok(()));
@@ -608,7 +687,7 @@ mod tests {
     /// and is refused one row below that bound, naming both counts.
     #[test]
     fn the_sequence_bound_counts_tile_packed_rows() {
-        let plan = planned("ref2va_video_audio");
+        let plan = video_and_audio();
         let bounded = |bound| packed_service(1 << 17, Some(bound), Some(REGION_TILES));
         assert_eq!(bounded(85_582).check_rows(&plan, 1024), Ok(()));
         let message = refusal(bounded(85_581).check_rows(&plan, 1024).unwrap_err());
@@ -622,7 +701,7 @@ mod tests {
     /// denoiser refuses it while a dense one admits it.
     #[test]
     fn tile_packing_refuses_keyframes() {
-        let plan = planned("fl2va_first_auto");
+        let plan = first_keyframe();
         assert_eq!(service(1 << 17, None).check_rows(&plan, 1024), Ok(()));
         let message = refusal(
             packed_service(1 << 17, None, Some(REGION_TILES))

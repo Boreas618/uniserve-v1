@@ -25,12 +25,13 @@ pub mod codec;
 mod events;
 mod media;
 mod shared_memory;
-mod video;
+/// MiniMax-H3 video request rules and the conditions they describe.
+pub mod video;
 pub use media::{MediaSource, SharedMedia};
 pub use shared_memory::SharedMemory;
 pub use video::{
-    AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
-    VideoCondition, VisionGrid,
+    AudioClip, ConditionMedia, ConditionRole, ConditionTiles, ConditionVision, ImageFit,
+    MediaLocator, VideoClip, VideoCondition, VisionGrid,
 };
 /// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;

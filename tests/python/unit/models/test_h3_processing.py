@@ -1,10 +1,11 @@
-"""MiniMax-H3 request planning matches the diffusers reference vectors.
+"""The Python library plans MiniMax-H3 requests as the reference does.
 
-The vectors in ``minimax_h3_plan.json``, generated from the diffusers
-MiniMax-H3 pipeline and the checkpoint's Qwen3-VL processor, tokenizer and
-audio VAE, are shared with the Rust planner's tests
-(``crates/server/src/serving/video``), so both implementations are checked
-against the same reference values.
+``processing`` calls the request rules of ``uniserve-core`` through the rank
+runtime library. Planned requests and their presentations, through that
+call, match the vectors in ``minimax_h3_plan.json``, generated from the
+diffusers MiniMax-H3 pipeline and the checkpoint's Qwen3-VL processor,
+tokenizer and audio VAE; the rules' own tests
+(``crates/core/src/video``) check each step against the same vectors.
 """
 
 from __future__ import annotations
@@ -61,6 +62,48 @@ def _names(cases: list[dict[str, Any]]) -> list[str]:
     return [case["name"] for case in cases]
 
 
+def _processor(directory: Path, name: str, config: dict[str, Any]) -> None:
+    pixels = config.pop("pixels")
+    (directory / name).write_text(
+        json.dumps(
+            {
+                **config,
+                "size": dict(
+                    zip(("shortest_edge", "longest_edge"), pixels, strict=True)
+                ),
+            }
+        )
+    )
+
+
+def test_vision_config_reads_the_processor_configs(tmp_path):
+    vision = _FIXTURE["vision"]
+    geometry = {
+        name: vision[name]
+        for name in ("patch_size", "temporal_patch_size", "merge_size")
+    }
+    images = (vision["image_min_pixels"], vision["image_max_pixels"])
+    videos = (vision["video_min_pixels"], vision["video_max_pixels"])
+    _processor(
+        tmp_path, "preprocessor_config.json", {**geometry, "pixels": images}
+    )
+    _processor(
+        tmp_path,
+        "video_preprocessor_config.json",
+        {**geometry, "pixels": videos},
+    )
+    assert VisionConfig.from_processor(tmp_path) == _VISION
+
+    # The image and video processors must patch alike.
+    _processor(
+        tmp_path,
+        "video_preprocessor_config.json",
+        {**geometry, "merge_size": 1, "pixels": videos},
+    )
+    with pytest.raises(ValueError, match="patch geometry"):
+        VisionConfig.from_processor(tmp_path)
+
+
 @pytest.mark.parametrize("case", _FIXTURE["canvas_cases"])
 def test_canvas(case):
     if case.get("error"):
@@ -83,68 +126,6 @@ def test_duration(case):
     assert plan.num_frames == case["num_frames"]
     assert plan.latent_frames == case["latent_frames"]
     assert plan.audio_latents == case["audio_latents"]
-
-
-@pytest.mark.parametrize("case", _FIXTURE["reference_image_cases"])
-def test_reference_image(case):
-    if case.get("error"):
-        with pytest.raises(ValueError):
-            processing.reference_image_size(*case["size"])
-        return
-    size = processing.reference_image_size(*case["size"])
-    assert size == _size(case["resize"])
-    grid = _VISION.image_grid(size.height, size.width)
-    assert list(grid) == case["vision_grid"]
-    assert _VISION.block_tokens(grid) == case["vision_tokens"]
-    assert processing.rows_per_frame(size) == case["rows"]
-
-
-@pytest.mark.parametrize("case", _FIXTURE["keyframe_cases"])
-def test_keyframe_cover_crop(case):
-    crop = processing.cover_crop(*case["size"], _size(case["canvas"]))
-    assert {
-        "width": crop.width,
-        "height": crop.height,
-        "left": crop.left,
-        "top": crop.top,
-    } == case["cover_crop"]
-
-
-@pytest.mark.parametrize("case", _FIXTURE["video_reference_cases"])
-def test_video_reference(case):
-    media = VideoFacts(
-        display_width=case["display"][0],
-        display_height=case["display"][1],
-        frame_rate=Fraction(*case["frame_rate"]),
-        frames=case["frames"],
-    )
-    arguments = (media, case["start_seconds"], case["num_frames"], _VISION)
-    if case.get("error"):
-        with pytest.raises(ValueError):
-            processing.video_reference(*arguments)
-        return
-    clip, seen = processing.video_reference(*arguments)
-    assert clip.canvas == _size(case["canvas"])
-    assert clip.start_frame == case["start_frame"]
-    assert clip.frames == case["clip_frames"]
-    assert clip.vae_frames == case["vae_frames"]
-    assert clip.latent_frames == case["latent_frames"]
-    assert list(seen.frame_indices) == case["frame_indices"]
-    assert list(seen.block_timestamps) == case["block_timestamps"]
-    assert list(seen.grid) == case["vision_grid"]
-    assert seen.block_tokens == case["block_tokens"]
-    rows = clip.latent_frames * processing.rows_per_frame(clip.canvas)
-    assert rows == case["rows"]
-
-
-@pytest.mark.parametrize("case", _FIXTURE["audio_cases"])
-def test_audio_clip(case):
-    clip = processing.audio_clip(
-        _audio_facts(case),
-        case["start_seconds"],
-        case["num_frames"],
-    )
-    assert _audio(clip) == case["clip"]
 
 
 def _audio_facts(track: dict[str, Any]) -> AudioFacts:

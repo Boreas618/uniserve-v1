@@ -48,8 +48,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use thiserror_ext::AsReport as _;
 
-use super::VideoInputError;
-use super::plan::ConditionType;
+use uniserve_core::video::plan::{ConditionType, VideoInputError};
 
 const MIB: u64 = 1 << 20;
 /// Default cap of one image condition.
@@ -577,8 +576,8 @@ mod tests {
     use axum::routing::get;
     use base64::Engine as _;
 
-    use super::super::RequestField;
-    use super::super::plan::ConditionType;
+    use uniserve_core::video::plan::{ConditionType, RequestField};
+
     use super::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy, is_public};
 
     fn limits() -> MediaLimits {
