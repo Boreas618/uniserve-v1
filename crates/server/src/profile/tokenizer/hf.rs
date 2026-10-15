@@ -190,6 +190,21 @@ impl HuggingFaceTokenizer {
     }
 }
 
+/// The tokenizer of a MiniMax-H3 conditioner presentation: each text is
+/// encoded on its own without special tokens added, and the vision markers
+/// and placeholders resolve through the vocabulary.
+impl uniserve_core::video::presentation::Tokenizer for HuggingFaceTokenizer {
+    type Error = String;
+
+    fn encode(&self, text: &str) -> std::result::Result<Vec<u32>, String> {
+        Self::encode(self, text, false).map_err(|error| error.to_report_string())
+    }
+
+    fn token_id(&self, token: &str) -> Option<u32> {
+        self.token_to_id(token)
+    }
+}
+
 /// Reads one JSON tokenizer file.
 fn read_json(path: &Path) -> Result<Value> {
     let text = std::fs::read_to_string(path).map_err(|error| {

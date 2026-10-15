@@ -18,126 +18,35 @@
 //!    file's sample rate and decoded sample count, through `ffprobe`.
 //! 4. [`plan::plan_request`] resolves the canvas, the frame counts, how each
 //!    condition is prepared, the Qwen3-VL vision grids and the condition rows;
-//!    [`presentation::present`] tokenizes the conditioner's presentation and
-//!    tags every token for the denoiser's AdaLN modulation.
+//!    [`presentation::present`] tokenizes the conditioner's presentation with
+//!    the checkpoint's tokenizer and tags every token for the denoiser's AdaLN
+//!    modulation.
 //!
-//! The rules are those of `uniserve/models/minimax_h3/processing.py`; both
-//! implementations are tested against
-//! `tests/python/fixtures/minimax_h3_plan.json`, generated from the diffusers
-//! reference pipeline.
+//! The request rules are `uniserve-core`'s ([`plan`], [`presentation`]),
+//! which the Python library calls through the rank runtime library.
 //!
 //! Every rejection is a [`VideoInputError::Invalid`] naming the request field
 //! at fault, `conditions[i]` for a condition; it converts into an OpenAI
 //! `invalid_request_error`. Failures of the server's own resources (a missing
 //! `ffprobe`, scratch storage) are [`VideoInputError::Internal`].
 
-pub mod plan;
-pub mod presentation;
 pub mod probe;
 pub mod service;
 pub mod sources;
 
 pub use service::{PreparedVideo, VideoService};
 
-use std::fmt;
+use uniserve_core::VideoTask;
+use uniserve_core::video::plan::{
+    self, ConditionSpec, PlanLimits, RequestPlan, Target, VideoInputError, VisionConfig,
+};
+use uniserve_core::video::presentation::{self, Presentation};
 
 use crate::openai::ApiError;
 use crate::profile::tokenizer::DynTokenizer;
 
-use plan::{ConditionSpec, PlanLimits, RequestPlan, Target, VisionConfig};
-use presentation::Presentation;
 use probe::MediaProber;
 use sources::{FetchedMedia, MediaFetcher};
-use uniserve_core::VideoTask;
-
-/// The request field a rejection names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestField {
-    /// `task`.
-    Task,
-    /// `prompt`.
-    Prompt,
-    /// `target.short_edge`.
-    TargetShortEdge,
-    /// `target.aspect_ratio`.
-    TargetAspectRatio,
-    /// `target.duration_seconds`.
-    TargetDuration,
-    /// The condition list as a whole: counts and keyframe order.
-    Conditions,
-    /// One condition, by its position in the request.
-    Condition(usize),
-}
-
-impl RequestField {
-    /// The OpenAI error `param` of the field: the field path, with a
-    /// condition reported as `conditions` (the message names its index).
-    pub const fn param(self) -> &'static str {
-        match self {
-            Self::Task => "task",
-            Self::Prompt => "prompt",
-            Self::TargetShortEdge => "target.short_edge",
-            Self::TargetAspectRatio => "target.aspect_ratio",
-            Self::TargetDuration => "target.duration_seconds",
-            Self::Conditions | Self::Condition(_) => "conditions",
-        }
-    }
-}
-
-impl fmt::Display for RequestField {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Condition(index) => write!(formatter, "conditions[{index}]"),
-            field => formatter.write_str(field.param()),
-        }
-    }
-}
-
-/// A conditioned video request the server does not serve, or could not
-/// ingest.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum VideoInputError {
-    /// The request breaks a rule; the same request fails again on retry.
-    #[error("{field}: {message}")]
-    Invalid {
-        /// The field at fault.
-        field: RequestField,
-        /// What is wrong with it.
-        message: String,
-    },
-    /// The server failed while ingesting valid input, for example because
-    /// `ffprobe` could not run or scratch storage failed.
-    #[error("{0}")]
-    Internal(String),
-}
-
-impl VideoInputError {
-    /// Rejects `field` with `message`.
-    pub fn invalid(field: RequestField, message: impl Into<String>) -> Self {
-        Self::Invalid {
-            field,
-            message: message.into(),
-        }
-    }
-
-    /// Rejects `conditions[index]` with `message`.
-    pub fn condition(index: usize, message: impl Into<String>) -> Self {
-        Self::invalid(RequestField::Condition(index), message)
-    }
-
-    /// Reports a server-side ingestion failure.
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal(message.into())
-    }
-
-    /// The field a rejection names; `None` for a server failure.
-    pub const fn field(&self) -> Option<RequestField> {
-        match self {
-            Self::Invalid { field, .. } => Some(*field),
-            Self::Internal(_) => None,
-        }
-    }
-}
 
 impl From<VideoInputError> for ApiError {
     /// A rejection becomes a 400 `invalid_request_error` whose message starts
@@ -267,7 +176,7 @@ impl VideoIngest {
             &self.vision,
             &self.limits,
         )?;
-        let presentation = presentation::present(&self.tokenizer, &plan, request.prompt)?;
+        let presentation = presentation::present(&*self.tokenizer, &plan, request.prompt)?;
         Ok(PreparedVideoRequest {
             plan,
             presentation,
@@ -277,7 +186,7 @@ impl VideoIngest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -286,16 +195,79 @@ mod tests {
     use axum::routing::get;
     use base64::Engine as _;
     use image::ImageEncoder as _;
+    use serde_json::Value;
+    use tokenizers::models::bpe::{BPE, Vocab};
+    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
+    use uniserve_core::VideoTask;
+    use uniserve_core::video::plan::{
+        ConditionSpec, ConditionType, PlanLimits, Prepared, RequestField, Role, Target,
+        VideoInputError, VisionConfig,
+    };
+    use uniserve_core::video::presentation::{TEXT_TAG, VIDEO_TAG};
 
-    use super::plan::tests::{fixture, limits, vision};
-    use super::plan::{ConditionRole, ConditionSpec, ConditionType, Prepared, Target};
-    use super::presentation::tests::character_tokenizer;
-    use super::presentation::{TEXT_TAG, VIDEO_TAG};
     use super::probe::{MediaProber, ProbeConfig};
     use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
-    use super::{ConditionInput, RequestField, VideoIngest, VideoInputError, VideoRequestInput};
+    use super::{ConditionInput, VideoIngest, VideoRequestInput};
     use crate::openai::ApiError;
-    use uniserve_core::VideoTask;
+    use crate::profile::assets::PipelineCheckpoint;
+    use crate::profile::tokenizer::HuggingFaceTokenizer;
+    use crate::serving::model::pipeline_tokenizer;
+
+    /// The planning vectors the request rules are tested against.
+    fn fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../../../tests/python/fixtures/minimax_h3_plan.json"
+        ))
+        .unwrap()
+    }
+
+    /// The MiniMax-H3 checkpoint's vision processor geometry.
+    pub(in crate::serving::video) fn vision() -> VisionConfig {
+        serde_json::from_value(fixture()["vision"].clone()).unwrap()
+    }
+
+    /// Limits that serve every task, duration and canvas the model does.
+    fn limits() -> PlanLimits {
+        PlanLimits {
+            tasks: VideoTask::ALL.to_vec(),
+            max_video_seconds: 15.0,
+            canvases: None,
+        }
+    }
+
+    /// A deterministic tokenizer: one token per character, plus the vision
+    /// markers and placeholders as special tokens.
+    pub(in crate::serving::video) fn character_tokenizer() -> HuggingFaceTokenizer {
+        let mut vocab: Vocab = (1_u32..=127)
+            .map(|id| (char::from_u32(id).unwrap().to_string(), id))
+            .collect();
+        vocab.insert("<unk>".to_owned(), 0);
+        let specials = [
+            ("<|vision_start|>", 128),
+            ("<|vision_end|>", 129),
+            ("<|image_pad|>", 130),
+            ("<|video_pad|>", 131),
+        ];
+        for (token, id) in specials {
+            vocab.insert(token.to_owned(), id);
+        }
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .unk_token("<unk>".to_owned())
+            .build()
+            .unwrap();
+        let mut tokenizer = TokenizerBuilder::new(model);
+        tokenizer.add_special_tokens(
+            &specials
+                .iter()
+                .map(|(token, _)| AddedToken::from(*token, true))
+                .collect::<Vec<_>>(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tokenizer.json");
+        tokenizer.save(&path, false).unwrap();
+        HuggingFaceTokenizer::new(&path).unwrap()
+    }
 
     fn ingest(scratch: &std::path::Path) -> VideoIngest {
         let fetcher = MediaFetcher::new(MediaPolicy {
@@ -317,7 +289,7 @@ mod tests {
         VideoIngest::new(
             fetcher,
             prober,
-            vision(&fixture()),
+            vision(),
             limits(),
             Arc::new(character_tokenizer()),
         )
@@ -341,7 +313,7 @@ mod tests {
 
     const REFERENCE: ConditionSpec = ConditionSpec {
         condition_type: ConditionType::Image,
-        role: ConditionRole::Reference,
+        role: Role::Reference,
         frame_index: None,
         start_seconds: None,
     };
@@ -454,5 +426,51 @@ mod tests {
 
         let failed: ApiError = VideoInputError::internal("ffprobe did not start").into();
         assert_eq!(failed.code(), "server_error");
+    }
+
+    /// The checkpoint's own tokenizer, loaded as the server loads it
+    /// (`UNISERVE_MINIMAX_H3_MODEL` names the checkpoint root), encodes every
+    /// text the vectors present to the reference's token ids and resolves
+    /// the vision markers and placeholders to the reference's ids.
+    #[tokio::test]
+    async fn checkpoint_tokenizer_matches_the_reference() {
+        use uniserve_core::video::presentation::Tokenizer as _;
+
+        let Ok(root) = std::env::var("UNISERVE_MINIMAX_H3_MODEL") else {
+            eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
+            return;
+        };
+        let pipeline = PipelineCheckpoint::resolve(&root, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let tokenizer = pipeline_tokenizer(&pipeline).await.unwrap();
+        let fixture = fixture();
+        for (token, id) in fixture["tokens"].as_object().unwrap() {
+            assert_eq!(
+                tokenizer.token_id(token).map(u64::from),
+                id.as_u64(),
+                "{token}"
+            );
+        }
+        for case in fixture["requests"].as_array().unwrap() {
+            let Some(expected) = case.get("expected") else {
+                continue;
+            };
+            for segment in expected["segments"].as_array().unwrap() {
+                let Some(text) = segment.get("text") else {
+                    continue;
+                };
+                let ids: Vec<u64> = uniserve_core::video::presentation::Tokenizer::encode(
+                    &tokenizer,
+                    text.as_str().unwrap(),
+                )
+                .unwrap()
+                .into_iter()
+                .map(u64::from)
+                .collect();
+                assert_eq!(Value::from(ids), segment["token_ids"], "{}", case["name"]);
+            }
+        }
     }
 }

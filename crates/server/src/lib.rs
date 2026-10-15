@@ -145,7 +145,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_video_seconds: config.engine.max_video_seconds,
         max_condition_rows: config.engine.max_condition_rows,
         // Video workers provision only the frame counts the API admits.
-        min_video_seconds: Some(crate::serving::MIN_VIDEO_SECONDS),
+        min_video_seconds: Some(uniserve_core::video::plan::MIN_VIDEO_SECONDS),
         // Video workers prepare exactly the canvases of the configured
         // resolutions and aspect ratios, and report them back as the only
         // canvases requests may target.

@@ -54,14 +54,12 @@ from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 from .conditioning import Conditioner
 from .config import (
-    NAMED_ASPECT_RATIOS,
     DenoiserConfig,
     DenseAttention,
     DmdLadder,
     PddGrid,
     SparseAttention,
     UniformGrid,
-    canvas,
 )
 from .inputs import (
     AttentionInput,
@@ -90,6 +88,7 @@ from .packing import (
     tile_packing,
     video_latent_frames,
 )
+from .processing import NAMED_ASPECT_RATIOS, canvas
 from .transformer import Transformer, TransformerLayer
 
 # A visual condition is held at this clean time for every step whose

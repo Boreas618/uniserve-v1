@@ -32,7 +32,7 @@ from .checkpoint import (
     detect,
 )
 from .encoder import TextEncoderConfig
-from .packing import CANVAS_MULTIPLE
+from .processing import buckets
 
 # DMD rungs are unshifted noise levels on the 1000-step training clock.
 TRAINING_CLOCK = 1000.0
@@ -41,67 +41,10 @@ TRAINING_CLOCK = 1000.0
 # evaluations and the clean endpoint.
 UNIFORM_GRID_POINTS = 50
 
-# The released (adapt_shape_v1) canvas rule: a 768-pixel short edge, an area
-# cap of the 16:9 canvas, sides on the packing's 32-pixel grid, and aspect
-# ratios from 1:4 to 4:1. Request planning and the denoisers' canvases both
-# resolve through ``canvas``.
-CANVAS_SHORT_EDGE = 768
-CANVAS_MAX_PIXELS = 768 * 1344
-MIN_ASPECT_RATIO, MAX_ASPECT_RATIO = 1 / 4, 4
-
-# Width:height ratios a text- or reference-conditioned request may name.
-NAMED_ASPECT_RATIOS = ((21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16))
-
-
-def canvas(aspect_width: float, aspect_height: float) -> image.Config:
-    """Resolve a display aspect ratio into the released canvas.
-
-    The short edge starts at 768, the area is capped at ``768 * 1344`` and
-    both sides are then rounded to the nearest multiple of 32, so the final
-    area may slightly exceed the cap. Only the ratio of the arguments
-    matters: an aspect ratio or a keyframe's displayed dimensions.
-
-    Raises:
-        ValueError: The ratio lies outside 1:4 to 4:1.
-    """
-    if aspect_width <= 0 or aspect_height <= 0:
-        raise ValueError("an H3 aspect ratio must be positive")
-    ratio = aspect_width / aspect_height
-    if not MIN_ASPECT_RATIO <= ratio <= MAX_ASPECT_RATIO:
-        raise ValueError(
-            "H3 generates aspect ratios from 1:4 to 4:1, got "
-            f"{aspect_width}:{aspect_height}"
-        )
-    if ratio >= 1:
-        width, height = CANVAS_SHORT_EDGE * ratio, float(CANVAS_SHORT_EDGE)
-    else:
-        width, height = float(CANVAS_SHORT_EDGE), CANVAS_SHORT_EDGE / ratio
-    area = width * height
-    if area > CANVAS_MAX_PIXELS:
-        # ``** 0.5`` rather than ``math.sqrt`` reproduces the reference's
-        # arithmetic.
-        scale = (CANVAS_MAX_PIXELS / area) ** 0.5
-        width, height = width * scale, height * scale
-    return image.Config(
-        max(CANVAS_MULTIPLE, round(height / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
-        max(CANVAS_MULTIPLE, round(width / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
-    )
-
-
-# FastH3 DMD exports are trained on, and generate only, 12 buckets: the named
-# aspect ratios at the 768p and 480p resolutions. The 768p buckets are the
-# canvas rule's canvases; the 480p buckets, (height, width) below in the same
-# ratio order, are the training table's own rather than a rescaled rule (21:9
-# is 992x416, not 960x416). A deployment prepares a subset of them.
-DMD_CANVASES = (
-    *(canvas(*ratio) for ratio in NAMED_ASPECT_RATIOS),
-    image.Config(416, 992),
-    image.Config(480, 832),
-    image.Config(480, 640),
-    image.Config(480, 480),
-    image.Config(640, 480),
-    image.Config(832, 480),
-)
+# FastH3 DMD exports are trained on, and generate only, the 12 training
+# buckets of the request rules: the named aspect ratios at the 768p and 480p
+# resolutions. A deployment prepares a subset of them.
+DMD_CANVASES = buckets()
 
 # A FastVideo PDD student's packed sequence capacity in rows; the checkpoint
 # owns this bound and serving options may only tighten it.
