@@ -56,14 +56,11 @@ from uniserve.models import (
 )
 from uniserve.nn.attention import (
     AttentionBatch,
-    BlockTable,
-    PagedInput,
-    SequenceLengths,
 )
 from uniserve.nn.attention.gather import (
     gather_request_decode_inputs,
-    gather_request_rows,
 )
+from uniserve.runner.attention import AttentionMetadata
 from uniserve.runner.context import execution_context, kernel_records
 from uniserve.sampling.greedy import greedy
 from uniserve.sampling.logprobs import (
@@ -260,12 +257,6 @@ class CausalLMRunner:
         # The operators are prepared for the largest forward.
         context.prepare(TextSize(int(tokens), int(rows)))
         self.context = self._context = context
-        self._page_tokens = tuple(int(value) for value in page_tokens)
-        self._windowed = tuple(bool(value) for value in windowed)
-
-        self._unit_tables = unit_tables
-        self._slot_start_pages = start_pages
-        self._table_shapes = table_shapes
         self._verified_lengths = verified_lengths
         self._future_input_tokens = future_input_tokens
         self._logical_lengths = logical_lengths
@@ -286,23 +277,19 @@ class CausalLMRunner:
         self._last_stage = self._pipeline.rank == self._pipeline.size - 1
 
         # Attention metadata of one forward, written by the gathers and read
-        # by the attention operators. Captured graphs address these
-        # tensors, so they live as long as the runner. Rows no gather wrote
-        # are inert: they select no page and write no cache entry.
-        rows, tokens, tables = int(rows), int(tokens), len(self._page_tokens)
+        # by the attention operators.
+        rows, tokens = int(rows), int(tokens)
         with self._scope():
-
-            def zeros(*shape: int) -> torch.Tensor:
-                return torch.zeros(shape, dtype=torch.int32, device=placed)
-
-            self._block_tables = zeros(tables, rows, int(width))
-            self._start_pages = zeros(tables, rows)
-            self._cache_lengths = zeros(rows)
-            self._query_lengths = zeros(rows)
-            self._query_offsets = zeros(rows + 1)
-            self._prefix_offsets = zeros(rows + 1)
-            self._write_indices = torch.full(
-                (tables, tokens), -1, dtype=torch.int64, device=placed
+            self._attention_metadata = AttentionMetadata(
+                page_tokens,
+                windowed,
+                unit_tables,
+                start_pages,
+                table_shapes,
+                rows,
+                tokens,
+                int(width),
+                placed,
             )
 
             # The tokens and positions a decode gathers from the slot state.
@@ -362,68 +349,6 @@ class CausalLMRunner:
                 with torch.cuda.stream(self._stream):
                     yield
 
-    def _attention(
-        self,
-        rows: int,
-        tokens: int,
-        widths: Sequence[int],
-        queries: Sequence[int],
-        prefixes: Sequence[int],
-        starts: Sequence[int],
-        causal: Sequence[int],
-        causal_values: torch.Tensor | None,
-    ) -> AttentionBatch:
-        """The attention inputs of ``rows`` rows over the gathered metadata.
-
-        ``queries``, ``prefixes`` and ``starts`` (``[table][row]``, read for
-        windowed tables) are the host mirrors of the gathered lengths and
-        first selected pages. ``causal`` holds each row's causality; when
-        the rows differ, the caller staged them in ``causal_values`` for
-        operators that consume the device column (``None`` for a forward
-        whose rows are all causal).
-        """
-        query = SequenceLengths(
-            values=self._query_lengths[:rows],
-            offsets=self._query_offsets[: rows + 1],
-            host=tuple(int(value) for value in queries),
-        )
-        prefix = SequenceLengths(
-            values=self._cache_lengths[:rows],
-            offsets=self._prefix_offsets[: rows + 1],
-            host=tuple(int(value) for value in prefixes),
-        )
-        mode = tuple(bool(value) for value in causal)
-        flags = (
-            None
-            if causal_values is None or len(set(mode)) == 1
-            else causal_values[:rows]
-        )
-        entries = {}
-        for table, table_width in enumerate(widths):
-            first = None
-            host_first = None
-            if self._windowed[table]:
-                first = self._start_pages[table, :rows]
-                host_first = tuple(
-                    int(value)
-                    for value in starts[table * rows : (table + 1) * rows]
-                )
-            blocks = BlockTable(
-                self._block_tables[table, :rows, : int(table_width)],
-                self._page_tokens[table],
-                first,
-                host_first,
-            )
-            entries[table] = PagedInput(
-                query,
-                prefix,
-                blocks,
-                self._write_indices[table, :tokens],
-                mode,
-                flags,
-            )
-        return AttentionBatch(entries, query)
-
     def _decode_attention(
         self,
         rows: int,
@@ -435,24 +360,24 @@ class CausalLMRunner:
         """Gather ``rows`` decode rows from the slot state."""
         gather_request_decode_inputs(
             request_pool_indices=slots[:rows],
-            request_unit_tables=self._unit_tables,
-            request_start_pages=self._slot_start_pages,
-            table_shapes=self._table_shapes,
+            request_unit_tables=self._attention_metadata.unit_tables,
+            request_start_pages=self._attention_metadata.slot_start_pages,
+            table_shapes=self._attention_metadata.table_shapes,
             request_cache_lengths=self._verified_lengths,
             request_tokens=self._future_input_tokens[:, 0],
             request_positions=self._logical_lengths,
             input_ids=self._decode_ids[:rows],
             positions=self._decode_positions[:, :rows],
-            block_tables=self._block_tables[:, :rows],
-            start_pages=self._start_pages[:, :rows],
-            cache_lengths=self._cache_lengths[:rows],
-            query_lengths=self._query_lengths[:rows],
-            query_offsets=self._query_offsets[: rows + 1],
-            prefix_offsets=self._prefix_offsets[: rows + 1],
-            write_indices=self._write_indices[:, :rows],
+            block_tables=self._attention_metadata.block_tables[:, :rows],
+            start_pages=self._attention_metadata.start_pages[:, :rows],
+            cache_lengths=self._attention_metadata.cache_lengths[:rows],
+            query_lengths=self._attention_metadata.query_lengths[:rows],
+            query_offsets=self._attention_metadata.query_offsets[: rows + 1],
+            prefix_offsets=self._attention_metadata.prefix_offsets[: rows + 1],
+            write_indices=self._attention_metadata.write_indices[:, :rows],
             columns=int(max(widths)),
         )
-        return self._attention(
+        return self._attention_metadata.batch(
             rows, rows, widths, (1,) * rows, prefixes, starts, (1,) * rows, None
         )
 
@@ -571,7 +496,10 @@ class CausalLMRunner:
             with self._context.expert_step(int(expert_capacity)):
                 hidden = self._model(inputs)
                 indices = (
-                    self._query_offsets[1 : rows + 1].to(torch.int64) - 1
+                    self._attention_metadata.query_offsets[1 : rows + 1].to(
+                        torch.int64
+                    )
+                    - 1
                 ).clamp_min(0)
                 values = self._project(hidden, indices, rows, logits[:rows])
                 maxima, tokens = greedy(values, self._vocab)
@@ -609,23 +537,8 @@ class CausalLMRunner:
         causal_values: torch.Tensor,
     ) -> AttentionBatch:
         """Gather the attention metadata of ``rows`` rows of host tokens."""
-        gather_request_rows(
-            columns=row_columns,
-            rows=rows,
-            tokens=tokens,
-            width=int(max(widths)),
-            request_unit_tables=self._unit_tables,
-            request_start_pages=self._slot_start_pages,
-            table_shapes=self._table_shapes,
-            block_tables=self._block_tables,
-            start_pages=self._start_pages,
-            cache_lengths=self._cache_lengths,
-            query_lengths=self._query_lengths,
-            query_offsets=self._query_offsets,
-            prefix_offsets=self._prefix_offsets,
-            write_indices=self._write_indices,
-        )
-        return self._attention(
+        self._attention_metadata.gather(row_columns, rows, tokens, widths)
+        return self._attention_metadata.batch(
             rows,
             tokens,
             widths,
@@ -768,7 +681,10 @@ class CausalLMRunner:
                 states = hidden[:tokens].copy_(self._model(inputs))
                 # A row without tokens repeats the position before it.
                 indices = (
-                    self._query_offsets[1 : rows + 1].to(torch.int64) - 1
+                    self._attention_metadata.query_offsets[1 : rows + 1].to(
+                        torch.int64
+                    )
+                    - 1
                 ).clamp_min(0)
                 self._project(states, indices, rows, logits[:rows])
 

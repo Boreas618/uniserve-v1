@@ -1,10 +1,10 @@
-//! Paged attention columns of a binding that attends to the prefix cache.
+//! Attention metadata of a runner that attends to the prefix cache.
 //!
-//! A binding reading the prefix cache through block tables (a causal LM, an
-//! image denoiser) owns one set of fixed device columns sized for `R` rows
-//! and `T` tokens over `Tb` numerical tables of width `W`. Per invocation
-//! the runner selects each row's visible pages against the installed block
-//! tables and packs one host column array (`row_columns`):
+//! A runner reading the prefix cache through block tables (a causal LM, an
+//! image denoiser) gathers each forward's attention metadata on the device
+//! from one packed host column array (`row_columns`), sized for `R` rows and
+//! `T` tokens over `Tb` numerical tables. Per forward the runner selects
+//! each row's visible pages against the installed block tables and packs:
 //!
 //! | Section | Words |
 //! | --- | --- |
@@ -13,10 +13,10 @@
 //! | each table's selected page count | `R + 1` each |
 //! | each token's row | `T` |
 //!
-//! The binding's gather (`uniserve.nn.attention.gather`) derives the
-//! device block tables, lengths, offsets and write indices from it and the
-//! slots' installed tables in one launch
-//! (`uniserve.runner.attention`).
+//! The Python half's [`AttentionMetadata`](`uniserve.runner.attention`)
+//! derives the device block tables, lengths, offsets and write indices from
+//! it and the slots' installed tables in one launch
+//! (`uniserve.nn.attention.gather`), and owns those device tensors.
 
 use std::sync::Arc;
 
@@ -31,7 +31,8 @@ use crate::{Error, Result};
 /// Host sections of `row_columns` before the per-table page counts.
 pub const ROW_SECTIONS: usize = 6;
 
-/// The capacity of an attention column set.
+/// The capacity of a runner's attention metadata: rows, tokens, numerical
+/// tables and the widest page width a row selects from one table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttentionCapacity {
     pub rows: usize,
@@ -45,112 +46,72 @@ impl AttentionCapacity {
     pub fn row_words(&self) -> usize {
         (ROW_SECTIONS + self.tables) * (self.rows + 1) + self.tokens
     }
-
-    fn columns(&self) -> Vec<(&'static str, DType, Vec<i64>)> {
-        let (rows, tokens, tables) = (self.rows as i64, self.tokens as i64, self.tables as i64);
-        vec![
-            ("row_columns", DType::I64, vec![self.row_words() as i64]),
-            (
-                "block_tables",
-                DType::I32,
-                vec![tables, rows, self.width as i64],
-            ),
-            ("start_pages", DType::I32, vec![tables, rows]),
-            ("cache_lengths", DType::I32, vec![rows]),
-            ("query_lengths", DType::I32, vec![rows]),
-            ("causal_values", DType::I32, vec![rows]),
-            ("query_offsets", DType::I32, vec![rows + 1]),
-            ("prefix_offsets", DType::I32, vec![rows + 1]),
-            ("write_indices", DType::I64, vec![tables, tokens]),
-        ]
-    }
 }
 
-/// The host geometry of one invocation's attention rows, passed to the
-/// binding beside the packed columns.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AttentionGeometry {
+/// One runner's attention metadata on the host: the packed row column its
+/// Python half gathers from, and the host mirrors of the last staged
+/// forward's rows, which an eager forward and a capture read.
+pub struct AttentionMetadata {
+    pub capacity: AttentionCapacity,
+    /// `int64 [row_words]` on the runner's device.
+    row_columns: StorageView,
+    /// Rows and tokens of the last staged forward.
     pub rows: usize,
     pub tokens: usize,
+    /// Each row's query and prefix length.
     pub queries: Vec<i64>,
     pub prefixes: Vec<i64>,
-    /// Each windowed table's first pages, `rows` per table.
+    /// Each windowed table's first selected pages, `rows` per table.
     pub starts: Vec<i64>,
+    /// Each table's page width.
     pub widths: Vec<i64>,
 }
 
-impl AttentionGeometry {
-    /// `[rows, tokens, queries, prefixes, starts, widths]`.
-    pub fn to_any(&self) -> tvm_ffi::Any {
-        let list =
-            |values: &[i64]| tvm_ffi::Any::from(crate::ffi::integer_list(values.iter().copied()));
-        tvm_ffi::Any::from(crate::ffi::list([
-            tvm_ffi::Any::from(self.rows as i64),
-            tvm_ffi::Any::from(self.tokens as i64),
-            list(&self.queries),
-            list(&self.prefixes),
-            list(&self.starts),
-            list(&self.widths),
-        ]))
-    }
-}
-
-/// One binding's attention columns.
-pub struct AttentionColumns {
-    pub capacity: AttentionCapacity,
-    columns: Vec<(&'static str, StorageView)>,
-}
-
-impl AttentionColumns {
-    /// Allocate the columns on `device` (host memory when `None`), zeroed
-    /// and with every write index -1 (no cache write), on `stream`.
+impl AttentionMetadata {
+    /// Allocate the packed row column on `device` (host memory when
+    /// `None`), zeroed on `stream`.
     pub fn allocate(
         capacity: AttentionCapacity,
         device: Option<i32>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
-        let mut columns = Vec::new();
-        for (name, dtype, shape) in capacity.columns() {
-            let bytes = shape.iter().product::<i64>().max(1) as usize * dtype.bytes();
-            let memory: Arc<dyn Backing> = match device {
-                Some(device) => Memory::device(device, bytes)?,
-                None => Memory::host(bytes),
-            };
-            let view = StorageView::contiguous(memory, 0, dtype, &shape)?;
-            view.zero(stream)?;
-            columns.push((name, view));
-        }
-        let columns = Self { capacity, columns };
-        let writes = columns.column("write_indices")?;
-        let inert = vec![0xff_u8; writes.nbytes() as usize];
-        writes.upload(&inert, stream)?;
-        if let Some(stream) = stream {
-            stream.synchronize()?;
-        }
-        Ok(columns)
+        let words = capacity.row_words();
+        let bytes = words * DType::I64.bytes();
+        let memory: Arc<dyn Backing> = match device {
+            Some(device) => Memory::device(device, bytes)?,
+            None => Memory::host(bytes),
+        };
+        let row_columns = StorageView::contiguous(memory, 0, DType::I64, &[words as i64])?;
+        row_columns.zero(stream)?;
+        Ok(Self {
+            capacity,
+            row_columns,
+            rows: 0,
+            tokens: 0,
+            queries: Vec::new(),
+            prefixes: Vec::new(),
+            starts: Vec::new(),
+            widths: Vec::new(),
+        })
     }
 
-    pub fn column(&self, name: &str) -> Result<&StorageView> {
-        self.columns
-            .iter()
-            .find(|(column, _)| *column == name)
-            .map(|(_, view)| view)
-            .ok_or_else(|| Error::Invariant(format!("attention columns have no {name}")))
+    pub fn row_columns(&self) -> &StorageView {
+        &self.row_columns
     }
 
-    /// Select `rows`' pages, pack the host columns and copy them to the
-    /// device on `stream`. `widths` fixes each table's page width (a
-    /// captured graph's configured widths); `None` uses the rows' own.
-    /// `check` validates each table's writes against the cache's live
-    /// accesses.
+    /// Select `rows`' pages, pack the host column and copy it to the device
+    /// on `stream`, and keep the forward's host mirrors. `widths` fixes each
+    /// table's page width (a captured graph's configured widths); `None`
+    /// uses the rows' own. `check` validates each table's writes against
+    /// the cache's live accesses.
     pub fn stage(
-        &self,
+        &mut self,
         rows: &[AttentionRow],
         tables: &BlockTables,
         widths: Option<&[usize]>,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
         stream: impl Issue,
-    ) -> Result<AttentionGeometry> {
+    ) -> Result<()> {
         let capacity = self.capacity;
         let tokens: usize = rows.iter().map(|row| row.query as usize).sum();
         if rows.is_empty() || rows.len() > capacity.rows || tokens > capacity.tokens {
@@ -164,7 +125,7 @@ impl AttentionColumns {
         let pages = tables.prepare_attention(rows, check)?;
         if pages.len() != capacity.tables {
             return Err(Error::Invariant(
-                "attention pages disagree with the binding's tables".into(),
+                "attention pages disagree with the runner's tables".into(),
             ));
         }
         let widths = pages
@@ -186,7 +147,7 @@ impl AttentionColumns {
                 };
                 if width > capacity.width {
                     return Err(Error::Invalid(format!(
-                        "table {table} selects {width} pages; the binding holds {}",
+                        "table {table} selects {width} pages; the runner holds {}",
                         capacity.width
                     )));
                 }
@@ -195,7 +156,7 @@ impl AttentionColumns {
             .collect::<Result<Vec<_>>>()?;
         let words = pack_rows(rows, &pages, capacity.rows + 1, capacity.tokens);
         let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
-        self.column("row_columns")?.upload(&bytes, stream)?;
+        self.row_columns.upload(&bytes, stream)?;
 
         let mut starts = vec![0; pages.len() * rows.len()];
         for (table, selected) in pages.iter().enumerate() {
@@ -203,14 +164,13 @@ impl AttentionColumns {
                 starts[table * rows.len() + row] = i64::from(start);
             }
         }
-        Ok(AttentionGeometry {
-            rows: rows.len(),
-            tokens,
-            queries: rows.iter().map(|row| i64::from(row.query)).collect(),
-            prefixes: rows.iter().map(|row| i64::from(row.prefix)).collect(),
-            starts,
-            widths,
-        })
+        self.rows = rows.len();
+        self.tokens = tokens;
+        self.queries = rows.iter().map(|row| i64::from(row.query)).collect();
+        self.prefixes = rows.iter().map(|row| i64::from(row.prefix)).collect();
+        self.starts = starts;
+        self.widths = widths;
+        Ok(())
     }
 }
 
