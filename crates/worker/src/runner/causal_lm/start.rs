@@ -22,7 +22,6 @@ use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::forward::launch::StreamOrder;
 use crate::ffi::{DType, Handle, Interpreter};
-use crate::lane::Lanes;
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::{
     CausalLMRunner, Construction, Dimensions, RunnerParts, TableShape, methods, model_dtype,
@@ -34,6 +33,7 @@ use crate::worker::LoadedModel;
 use crate::{Error, Result};
 
 use crate::parallel::{DwdpManager, ExpertUnion, PeerGroup};
+use crate::stream::Streams;
 
 /// The text call kinds a runner may serve.
 pub(crate) const TEXT_KINDS: [CallKind; 3] = [
@@ -217,7 +217,7 @@ pub(crate) fn expert_tokens(config: &WorkerConfig) -> usize {
 /// The streams serving text calls on `device`, with the text kinds each
 /// serves: every configured lane with a text kind, or the device stream.
 fn streams(
-    lanes: &Lanes,
+    streams: &Streams,
     device: Device,
     kinds: &[CallKind],
 ) -> Result<Vec<(Option<Stream>, Vec<CallKind>)>> {
@@ -225,7 +225,7 @@ fn streams(
         return Ok(vec![(None, kinds.to_vec())]);
     };
     let mut result: Vec<(Option<Stream>, Vec<CallKind>)> = Vec::new();
-    for lane in lanes.lanes() {
+    for lane in streams.lanes() {
         let served: Vec<CallKind> = kinds
             .iter()
             .copied()
@@ -236,8 +236,8 @@ fn streams(
             result.push((Some(stream), served));
         }
     }
-    if lanes.lanes().is_empty() {
-        let stream = lanes
+    if streams.lanes().is_empty() {
+        let stream = streams
             .stream_for(kinds[0], DeviceId(index))
             .ok_or(Error::State("text calls have no execution stream"))?;
         let stream = stream.stream()?.clone();
@@ -268,7 +268,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) model: &'a LoadedModel,
     /// The model declares an image policy.
     pub(crate) image_processor: bool,
-    pub(crate) lanes: &'a Lanes,
+    pub(crate) streams: &'a Streams,
     pub(crate) prefix_cache: Option<&'a PrefixCache>,
     pub(crate) components: &'a Components,
     /// The shared scratch of each stream the runners' contexts borrow.
@@ -356,7 +356,7 @@ impl CausalLMRunners {
         let mut targets = Vec::new();
         let mut groups = Vec::new();
         for (component, path, device, kinds) in &texts {
-            for (stream, served) in streams(startup.lanes, *device, kinds)? {
+            for (stream, served) in streams(startup.streams, *device, kinds)? {
                 let mut peers = Vec::new();
                 let microbatches = experts.as_ref().map_or(1, |experts| experts.microbatches());
                 for microbatch in 0..microbatches {
@@ -391,7 +391,7 @@ impl CausalLMRunners {
         }
         if experts.is_some() && groups.len() != 1 {
             return Err(Error::Unsupported(format!(
-                "expert parallelism serves one text lane; {} lanes serve text",
+                "expert parallelism serves one text lane; {} streams serve text",
                 groups.len()
             )));
         }
@@ -430,7 +430,7 @@ impl CausalLMRunners {
                 Some(peers) => {
                     let owner = stream
                         .as_ref()
-                        .and_then(|stream| startup.lanes.owner(stream.raw()));
+                        .and_then(|stream| startup.streams.owner(stream.raw()));
                     peers.stream_collectives(&component, device, owner)?
                 }
                 None => None,

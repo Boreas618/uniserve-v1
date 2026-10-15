@@ -24,12 +24,12 @@ use crate::config::placement::RunnerKind;
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
 use crate::ffi::{Handle, Interpreter};
-use crate::lane::Lanes;
 use crate::parallel::{DwdpManager, ExpertUnion};
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::methods::{Argument, Methods};
 use crate::runner::scratch::Scratches;
 use crate::storage::{CachePlan, GroupShape, OutputPool, PrefixCache};
+use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::{Error, Result};
 
@@ -177,14 +177,14 @@ impl Bounds {
 
 /// The stream serving the runner's calls on `device`: the configured lane
 /// serving token denoising, or the device stream.
-fn stream(lanes: &Lanes, device: Device) -> Result<Option<Stream>> {
+fn stream(streams: &Streams, device: Device) -> Result<Option<Stream>> {
     let Some(index) = device.cuda_index() else {
         return Ok(None);
     };
-    let mut serving = lanes.lanes().iter().filter(|lane| lane.serves(KIND));
+    let mut serving = streams.lanes().iter().filter(|lane| lane.serves(KIND));
     let stream = match (serving.next(), serving.next()) {
         (Some(lane), None) => lane.stream.stream()?.clone(),
-        (None, _) if lanes.lanes().is_empty() => lanes
+        (None, _) if streams.lanes().is_empty() => streams
             .stream_for(KIND, DeviceId(index))
             .ok_or(Error::State("diffusion LM calls have no execution stream"))?
             .stream()?
@@ -210,7 +210,7 @@ pub(crate) struct Startup<'a> {
     /// Routed experts use an expert exchange, and the attention ranks of a
     /// disaggregated expert union (zero when every rank holds its experts).
     pub(crate) experts: (bool, usize),
-    pub(crate) lanes: &'a Lanes,
+    pub(crate) streams: &'a Streams,
     pub(crate) prefix_cache: Option<&'a PrefixCache>,
     pub(crate) components: &'a mut Components,
     /// The shared work areas of the rank's streams.
@@ -323,7 +323,7 @@ impl DiffusionLMRunner {
                 .as_ref()
                 .and_then(|sampling| bounds.banks(&facts, startup.request_slots, sampling));
 
-            let stream = stream(startup.lanes, device)?;
+            let stream = stream(startup.streams, device)?;
             if let Some(experts) = experts.as_ref()
                 && stream.as_ref().map(Stream::raw) != Some(experts.stream(0).raw())
             {
@@ -363,7 +363,7 @@ impl DiffusionLMRunner {
                 Some(peers) => {
                     let owner = stream
                         .as_ref()
-                        .and_then(|stream| startup.lanes.owner(stream.raw()));
+                        .and_then(|stream| startup.streams.owner(stream.raw()));
                     peers.stream_collectives(&component, device, owner)?
                 }
                 None => None,
