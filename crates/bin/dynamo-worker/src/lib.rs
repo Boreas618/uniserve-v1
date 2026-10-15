@@ -38,6 +38,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
+use uniserve_core::video::plan::{VIDEO_FPS, video_frame_count};
 use uniserve_core::{MediaKind, VideoTask};
 use uniserve_engine::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -48,10 +49,7 @@ use uniserve_server::{
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     profile::omni::resolution::ResolutionName,
     profile::video::{VideoRasters, VideoResolution},
-    serving::{
-        FinishStatus, RequestOutput, ServeRequestId, VIDEO_FPS, validate_video_capacity,
-        video_frame_count,
-    },
+    serving::{FinishStatus, RequestOutput, ServeRequestId, validate_video_capacity},
 };
 
 // The served canvases come from `--video-resolutions` and

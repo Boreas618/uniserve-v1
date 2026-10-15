@@ -24,8 +24,8 @@ use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
-use crate::serving::video::plan::VisionConfig;
 use crate::serving::{InputProcessor, ServedSamplingControl, ServingRuntime, WorkerCapabilities};
+use uniserve_core::video::plan::VisionConfig;
 
 /// Served model name the simulated state answers to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";

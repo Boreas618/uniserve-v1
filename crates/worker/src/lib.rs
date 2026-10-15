@@ -6,6 +6,9 @@
 //! owns request state, storage, streams, graphs policy, transfers and the
 //! IPC service; Python computes through the library functions Rust imports
 //! by path.
+//!
+//! The library also exports the video request rules of `uniserve-core` to
+//! the Python library, which plans MiniMax-H3 requests with them.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -23,6 +26,7 @@ mod logging;
 pub mod parallel;
 pub mod profiling;
 mod request;
+mod rules;
 mod runner;
 mod sampling;
 mod service;

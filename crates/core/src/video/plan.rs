@@ -1,4 +1,4 @@
-//! MiniMax-H3 request planning.
+//! MiniMax-H3 request rules.
 //!
 //! [`plan_request`] resolves everything a request implies before any pixel is
 //! decoded: the generated canvas and frame counts, how every condition is
@@ -8,13 +8,17 @@
 //! rows it adds. [`check_request`] applies the subset of rules that needs no
 //! media, so a malformed request is rejected before its media are fetched.
 //!
+//! These are the only implementation of the rules: the server plans every
+//! request with them, the worker counts condition rows with them, and the
+//! Python library (`uniserve.models.minimax_h3.processing`) calls them
+//! through the rank runtime library. They are tested against
+//! `tests/python/fixtures/minimax_h3_plan.json`, vectors generated from the
+//! reference pipeline.
+//!
 //! The arithmetic reproduces the diffusers MiniMax-H3 pipeline and the
 //! checkpoint's Qwen3-VL processor operation for operation, in `f64` where
 //! they compute in Python floats, so that every rounding lands on the same
-//! side. The same rules are implemented for library callers by
-//! `uniserve/models/minimax_h3/processing.py`; both are tested against
-//! `tests/python/fixtures/minimax_h3_plan.json`. Rules the reference leaves
-//! open are fixed identically in both:
+//! side. Rules the reference leaves open are fixed here:
 //!
 //! - `start_time_seconds` skips the first `floor(s * 24 + 0.5)` frames of a
 //!   reference video's 24 fps timeline and the first `floor(s * rate + 0.5)`
@@ -28,20 +32,14 @@
 //!   carry exactly one soundtrack lasts as long as that soundtrack after its
 //!   start offset.
 
+use std::fmt;
 use std::path::Path;
 
-use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use uniserve_core::{
-    Canvas, ConditionMedia, ConditionVision, ImageFit, MediaLocator, VideoCondition, VideoTask,
-};
 
-use uniserve_engine::ConditionTiles;
-
-use super::probe::{AudioFacts, ImageFacts, MediaFacts, VideoFacts};
-use super::{RequestField, VideoInputError};
-use crate::profile::video::{VideoRaster, VideoResolution};
-use crate::serving::{VIDEO_FPS, video_frame_count};
+use super::{ConditionMedia, ConditionTiles, ConditionVision, ImageFit, MediaLocator};
+use super::{VideoCondition, VisionGrid};
+use crate::{Canvas, VideoTask};
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
@@ -60,6 +58,38 @@ pub const NAMED_ASPECT_RATIOS: [(u32, u32); 6] =
 /// The ratio `auto` means for `t2va` and `ref2va`.
 const DEFAULT_ASPECT_RATIO: (u32, u32) = (16, 9);
 
+/// Short edges of the FastH3 training buckets, in pixels: the canvas rule's
+/// 768 and 480.
+pub const BUCKET_SHORT_EDGES: [u32; 2] = [768, 480];
+
+const fn bucket_canvas(width: u32, height: u32) -> Canvas {
+    Canvas { width, height }
+}
+
+/// The FastH3 training buckets: for each short edge of
+/// [`BUCKET_SHORT_EDGES`], the canvas of each ratio of
+/// [`NAMED_ASPECT_RATIOS`]. The 768-pixel buckets are the canvas rule's
+/// canvases; the 480-pixel ones are the training table's own rather than a
+/// rescaled rule (21:9 is 992x416, not 960x416).
+const BUCKETS: [[Canvas; 6]; 2] = [
+    [
+        bucket_canvas(1536, 672),
+        bucket_canvas(1344, 768),
+        bucket_canvas(1024, 768),
+        bucket_canvas(768, 768),
+        bucket_canvas(768, 1024),
+        bucket_canvas(768, 1344),
+    ],
+    [
+        bucket_canvas(992, 416),
+        bucket_canvas(832, 480),
+        bucket_canvas(640, 480),
+        bucket_canvas(480, 480),
+        bucket_canvas(480, 640),
+        bucket_canvas(480, 832),
+    ],
+];
+
 /// Short edge an image reference is encoded at, upscaling included.
 pub const REFERENCE_IMAGE_SHORT_EDGE: u32 = 2048;
 
@@ -68,6 +98,14 @@ const VAE_FRAMES_PER_CHUNK: u32 = 17;
 const VAE_LATENTS_PER_CHUNK: u32 = 5;
 /// Fewest 24 fps frames a reference video must keep: one VAE window.
 pub const MIN_REFERENCE_FRAMES: u32 = VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK;
+
+/// Frame rate, in frames per second, of every MiniMax-H3 video.
+pub const VIDEO_FPS: u32 = 24;
+/// Shortest explicit video duration, in seconds, the MiniMax-H3 API admits.
+pub const MIN_VIDEO_SECONDS: f64 = 4.0;
+/// Longest explicit video duration, in seconds, the MiniMax-H3 API admits. A
+/// deployment may serve a lower maximum, never a higher one.
+pub const MAX_VIDEO_SECONDS: f64 = 15.0;
 
 /// The audio VAE's sample rate and hop: 40 latents per second.
 pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
@@ -91,6 +129,96 @@ pub const MAX_AUDIO_REFERENCES: usize = 3;
 /// References of all types one request may carry; keyframes not counted.
 pub const MAX_REFERENCES: usize = 12;
 
+/// The request field a rejection names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestField {
+    /// `task`.
+    Task,
+    /// `prompt`.
+    Prompt,
+    /// `target.short_edge`.
+    TargetShortEdge,
+    /// `target.aspect_ratio`.
+    TargetAspectRatio,
+    /// `target.duration_seconds`.
+    TargetDuration,
+    /// The condition list as a whole: counts and keyframe order.
+    Conditions,
+    /// One condition, by its position in the request.
+    Condition(usize),
+}
+
+impl RequestField {
+    /// The OpenAI error `param` of the field: the field path, with a
+    /// condition reported as `conditions` (the message names its index).
+    pub const fn param(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Prompt => "prompt",
+            Self::TargetShortEdge => "target.short_edge",
+            Self::TargetAspectRatio => "target.aspect_ratio",
+            Self::TargetDuration => "target.duration_seconds",
+            Self::Conditions | Self::Condition(_) => "conditions",
+        }
+    }
+}
+
+impl fmt::Display for RequestField {
+    /// The field path; a condition is `conditions[i]`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Condition(index) => write!(formatter, "conditions[{index}]"),
+            field => formatter.write_str(field.param()),
+        }
+    }
+}
+
+/// A video request the rules reject, or a failure while preparing valid
+/// input.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VideoInputError {
+    /// The request breaks a rule; the same request fails again on retry.
+    #[error("{field}: {message}")]
+    Invalid {
+        /// The field at fault.
+        field: RequestField,
+        /// What is wrong with it.
+        message: String,
+    },
+    /// Preparing valid input failed: for example `ffprobe` could not run,
+    /// scratch storage failed or the tokenizer lacks a vision token.
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl VideoInputError {
+    /// Rejects `field` with `message`.
+    pub fn invalid(field: RequestField, message: impl Into<String>) -> Self {
+        Self::Invalid {
+            field,
+            message: message.into(),
+        }
+    }
+
+    /// Rejects `conditions[index]` with `message`.
+    pub fn condition(index: usize, message: impl Into<String>) -> Self {
+        Self::invalid(RequestField::Condition(index), message)
+    }
+
+    /// Reports a failure while preparing valid input.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+
+    /// The field a rejection names; `None` for a failure.
+    pub const fn field(&self) -> Option<RequestField> {
+        match self {
+            Self::Invalid { field, .. } => Some(*field),
+            Self::Internal(_) => None,
+        }
+    }
+}
+
 /// The media type of a condition, by its request name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,14 +233,52 @@ pub enum ConditionType {
     Audio,
 }
 
-/// Whether a condition anchors a generated frame or is a reference.
+impl ConditionType {
+    /// Every condition type.
+    pub const ALL: [Self; 4] = [Self::Image, Self::Video, Self::VideoAudio, Self::Audio];
+
+    /// The type's request name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::VideoAudio => "video_audio",
+            Self::Audio => "audio",
+        }
+    }
+
+    /// The type a request name denotes, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
+}
+
+/// Whether a condition anchors a generated frame or is a reference: a
+/// condition's `role` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ConditionRole {
+pub enum Role {
     /// Anchors the first or last generated frame.
     Keyframe,
     /// Conditions the generation as a whole.
     Reference,
+}
+
+impl Role {
+    /// The role's request name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Keyframe => "keyframe",
+            Self::Reference => "reference",
+        }
+    }
+
+    /// The role a request name denotes, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Keyframe, Self::Reference]
+            .into_iter()
+            .find(|role| role.as_str() == name)
+    }
 }
 
 /// The generated frame a keyframe anchors.
@@ -123,6 +289,60 @@ pub enum FramePosition {
     First,
     /// `frame_index` -1.
     Last,
+}
+
+/// The probed facts of one condition's media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaFacts {
+    /// An image.
+    Image(ImageFacts),
+    /// A video and its soundtrack.
+    Video(VideoFacts),
+    /// An audio file.
+    Audio(AudioFacts),
+}
+
+/// An image as displayed, after its EXIF orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageFacts {
+    /// Displayed width in pixels.
+    pub width: u32,
+    /// Displayed height in pixels.
+    pub height: u32,
+}
+
+/// A rational frame rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRate {
+    /// Frames per `denominator` seconds.
+    pub numerator: u32,
+    /// Seconds per `numerator` frames.
+    pub denominator: u32,
+}
+
+/// A video's display aspect, frame rate, frame count and soundtrack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoFacts {
+    /// Width of the display aspect, in lowest terms. Only the ratio to
+    /// `display_height` matters.
+    pub display_width: u64,
+    /// Height of the display aspect, in lowest terms.
+    pub display_height: u64,
+    /// The stream's average frame rate.
+    pub frame_rate: FrameRate,
+    /// Frames a decoder outputs for the whole stream.
+    pub frames: u64,
+    /// The first audio stream, when the video has one.
+    pub soundtrack: Option<AudioFacts>,
+}
+
+/// A soundtrack's native sample rate and decoded sample count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioFacts {
+    /// Samples per second.
+    pub sample_rate: u32,
+    /// Samples per channel a decoder outputs.
+    pub samples: u64,
 }
 
 /// Denoiser rows of one latent frame of `canvas`: one per 32x32 pixel block.
@@ -180,6 +400,60 @@ fn nearest_multiple(value: f64) -> u32 {
     ((value / multiple).round_ties_even() * multiple).max(multiple) as u32
 }
 
+/// The training bucket of a short edge and a named ratio; `None` when no
+/// bucket has them.
+pub fn bucket(short_edge: u32, ratio: (u32, u32)) -> Option<Canvas> {
+    let edge = BUCKET_SHORT_EDGES
+        .iter()
+        .position(|&edge| edge == short_edge)?;
+    let named = NAMED_ASPECT_RATIOS
+        .iter()
+        .position(|&named| named == ratio)?;
+    Some(BUCKETS[edge][named])
+}
+
+/// The short edge of the training bucket with exactly this canvas; `None`
+/// when no bucket has it.
+pub fn bucket_short_edge(canvas: Canvas) -> Option<u32> {
+    BUCKET_SHORT_EDGES
+        .into_iter()
+        .zip(BUCKETS)
+        .find(|(_, buckets)| buckets.contains(&canvas))
+        .map(|(edge, _)| edge)
+}
+
+/// Frames of `seconds` of video at `fps`: the product rounded half to even,
+/// as the reference implementations round with Python's `round`.
+pub fn requested_frames(seconds: f64, fps: u32) -> u32 {
+    // Callers pass validated durations, whose products stay far below 2^32.
+    (seconds * f64::from(fps)).round_ties_even() as u32
+}
+
+/// Converts an explicit duration into its output frame count.
+///
+/// The requested frame count is `seconds * 24` rounded half to even
+/// ([`requested_frames`]), and the output extends it upward to the next
+/// complete native temporal window, a count of the form `17n + 5`. The
+/// output may therefore last longer than requested: 4 seconds yields 107
+/// frames and 15 seconds 362.
+///
+/// # Errors
+///
+/// Returns a message when `seconds` is not finite or lies outside
+/// `[MIN_VIDEO_SECONDS, max_video_seconds]`.
+pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> Result<u32, String> {
+    if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
+        return Err(format!(
+            "video duration must be a finite number of seconds in [{MIN_VIDEO_SECONDS}, \
+             {max_video_seconds}]"
+        ));
+    }
+    let requested = requested_frames(seconds, VIDEO_FPS);
+    // The frames up to the next count congruent to 5 modulo 17.
+    let window = VAE_FRAMES_PER_CHUNK;
+    Ok(requested + (window + VAE_LATENTS_PER_CHUNK - requested % window) % window)
+}
+
 /// The requested output, as the request states it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target<'a> {
@@ -198,7 +472,7 @@ pub struct ConditionSpec {
     /// `conditions[i].type`.
     pub condition_type: ConditionType,
     /// `conditions[i].role`.
-    pub role: ConditionRole,
+    pub role: Role,
     /// `conditions[i].frame_index`: 0 or -1 for a keyframe.
     pub frame_index: Option<i64>,
     /// `conditions[i].start_time_seconds`, for video references.
@@ -219,7 +493,7 @@ pub struct PlanLimits {
 
 impl PlanLimits {
     /// The `target.short_edge` values the deployment serves, in the order of
-    /// its canvases: each served canvas's training-bucket class, or the
+    /// its canvases: each served canvas's training-bucket short edge, or the
     /// canvas rule's 768 for a canvas no bucket has and without restricted
     /// canvases.
     pub fn short_edges(&self) -> Vec<u32> {
@@ -227,9 +501,8 @@ impl PlanLimits {
             return vec![CANVAS_SHORT_EDGE];
         };
         let mut edges = Vec::new();
-        for canvas in canvases {
-            let edge = VideoRaster::find(canvas.width, canvas.height)
-                .map_or(CANVAS_SHORT_EDGE, |bucket| bucket.resolution.short_edge());
+        for &canvas in canvases {
+            let edge = bucket_short_edge(canvas).unwrap_or(CANVAS_SHORT_EDGE);
             if !edges.contains(&edge) {
                 edges.push(edge);
             }
@@ -238,22 +511,10 @@ impl PlanLimits {
     }
 }
 
-/// A Qwen3-VL `(t, h, w)` patch grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct VisionGrid {
-    /// Temporal blocks; 1 for an image.
-    pub t: u32,
-    /// Patch rows.
-    pub h: u32,
-    /// Patch columns.
-    pub w: u32,
-}
-
 /// The Qwen3-VL processor geometry: patching and pixel budgets.
 ///
 /// Read from the checkpoint's `processor/preprocessor_config.json` and
-/// `processor/video_preprocessor_config.json` with
-/// [`VisionConfig::read`].
+/// `processor/video_preprocessor_config.json` with [`VisionConfig::read`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisionConfig {
     /// Pixels per patch side.
@@ -293,28 +554,22 @@ impl VisionConfig {
     ///
     /// # Errors
     ///
-    /// Fails when a file cannot be read or parsed, or when the two configs
-    /// disagree on the patch geometry.
-    pub fn read(image: &Path, video: &Path) -> anyhow::Result<Self> {
-        let read = |path: &Path| -> anyhow::Result<ProcessorFile> {
+    /// Returns a message when a file cannot be read or parsed, or when the
+    /// two configs disagree on the patch geometry.
+    pub fn read(image: &Path, video: &Path) -> Result<Self, String> {
+        let read = |path: &Path| -> Result<ProcessorFile, String> {
             let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+                .map_err(|error| format!("reading {}: {error}", path.display()))?;
+            serde_json::from_str(&text)
+                .map_err(|error| format!("parsing {}: {error}", path.display()))
         };
         let image = read(image)?;
         let video = read(video)?;
-        anyhow::ensure!(
-            (
-                image.patch_size,
-                image.temporal_patch_size,
-                image.merge_size
-            ) == (
-                video.patch_size,
-                video.temporal_patch_size,
-                video.merge_size
-            ),
-            "the image and video processors disagree on the patch geometry"
-        );
+        let geometry =
+            |file: &ProcessorFile| (file.patch_size, file.temporal_patch_size, file.merge_size);
+        if geometry(&image) != geometry(&video) {
+            return Err("the image and video processors disagree on the patch geometry".to_owned());
+        }
         Ok(Self {
             patch_size: image.patch_size,
             temporal_patch_size: image.temporal_patch_size,
@@ -462,7 +717,8 @@ pub struct KeyframeFit {
     pub cover_crop: Option<CoverCrop>,
 }
 
-/// The samples of a soundtrack the request conditions on.
+/// The samples of a soundtrack the request conditions on: the media reader's
+/// [`super::AudioClip`] and the latents it encodes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AudioClip {
     /// The native sample rate.
@@ -483,9 +739,21 @@ impl AudioClip {
     pub const fn rows(&self) -> u32 {
         AUDIO_CHANNELS * self.latents
     }
+
+    /// What the media reader decodes.
+    const fn media(&self) -> super::AudioClip {
+        super::AudioClip {
+            sample_rate: self.sample_rate,
+            start_sample: self.start_sample,
+            source_samples: self.source_samples,
+            samples: self.samples,
+        }
+    }
 }
 
-/// The frames of a reference video the request conditions on.
+/// The frames of a reference video the request conditions on: the media
+/// reader's [`super::VideoClip`], the latent frames it encodes to and its
+/// soundtrack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct VideoClip {
     /// The canvas of the video's own display aspect the frames are put on.
@@ -567,29 +835,79 @@ pub struct ConditionPlan {
 }
 
 impl ConditionPlan {
+    /// The condition's described role and what the media reader decodes its
+    /// bytes into. `canvas` is the generated canvas, which a keyframe is
+    /// fitted to.
+    fn media(&self, canvas: Canvas) -> (super::ConditionRole, ConditionMedia) {
+        match &self.prepared {
+            Prepared::Keyframe(fit) => {
+                let role = match fit.position {
+                    FramePosition::First => super::ConditionRole::FirstFrame,
+                    FramePosition::Last => super::ConditionRole::LastFrame,
+                };
+                // A stretched keyframe is resized straight onto the canvas; a
+                // cover-cropped one past it, then centred.
+                let fit = match fit.cover_crop {
+                    None => ImageFit {
+                        resized: canvas,
+                        left: 0,
+                        top: 0,
+                        size: canvas,
+                    },
+                    Some(crop) => ImageFit {
+                        resized: Canvas {
+                            width: crop.width,
+                            height: crop.height,
+                        },
+                        left: crop.left,
+                        top: crop.top,
+                        size: canvas,
+                    },
+                };
+                (role, ConditionMedia::Image(fit))
+            }
+            Prepared::Image(size) => (
+                super::ConditionRole::Reference,
+                ConditionMedia::Image(ImageFit {
+                    resized: *size,
+                    left: 0,
+                    top: 0,
+                    size: *size,
+                }),
+            ),
+            Prepared::Video(clip) => (
+                super::ConditionRole::Reference,
+                ConditionMedia::Video {
+                    clip: super::VideoClip {
+                        canvas: clip.canvas,
+                        start_frame: clip.start_frame,
+                        frames: clip.frames,
+                        vae_frames: clip.vae_frames,
+                    },
+                    soundtrack: clip.soundtrack.as_ref().map(AudioClip::media),
+                },
+            ),
+            Prepared::Audio(clip) => (
+                super::ConditionRole::Reference,
+                ConditionMedia::Audio(clip.media()),
+            ),
+        }
+    }
+
     /// Denoiser rows the condition takes, packed as `tiles` prescribes: its
     /// video and audio rows without tiles, or the rows of the whole tiles
     /// they fill, a video's in tiles of its `(latent frames, height / 32,
     /// width / 32)` token grid. `None` for a keyframe under tiles, which a
-    /// region packing does not hold.
-    pub fn packed_rows(&self, tiles: Option<ConditionTiles>) -> Option<u64> {
-        let Some(tiles) = tiles else {
-            return Some(u64::from(self.video_rows) + u64::from(self.audio_rows));
-        };
-        match &self.prepared {
-            Prepared::Keyframe(_) => None,
-            Prepared::Image(_) => Some(tiles.rows(self.audio_rows, self.video_rows, None)),
-            Prepared::Video(clip) => Some(tiles.rows(
-                self.audio_rows,
-                0,
-                Some([
-                    clip.latent_frames,
-                    clip.canvas.height / CANVAS_MULTIPLE,
-                    clip.canvas.width / CANVAS_MULTIPLE,
-                ]),
-            )),
-            Prepared::Audio(_) => Some(tiles.rows(self.audio_rows, 0, None)),
-        }
+    /// region packing does not hold. `canvas` is the generated canvas.
+    pub fn packed_rows(&self, canvas: Canvas, tiles: Option<ConditionTiles>) -> Option<u64> {
+        let (role, media) = self.media(canvas);
+        super::packed_rows(
+            tiles,
+            role,
+            &media,
+            u64::from(self.video_rows),
+            self.audio_rows,
+        )
     }
 
     /// Denoiser video rows of each temporal unit the video encoder encodes,
@@ -621,74 +939,15 @@ impl ConditionPlan {
     /// what the conditioner reads of it, and the denoiser rows it encodes to.
     /// `canvas` is the generated canvas, which a keyframe is fitted to.
     pub fn describe(&self, canvas: Canvas, source: MediaLocator) -> VideoCondition {
-        let audio = |clip: &AudioClip| uniserve_core::AudioClip {
-            sample_rate: clip.sample_rate,
-            start_sample: clip.start_sample,
-            source_samples: clip.source_samples,
-            samples: clip.samples,
-        };
-        let (role, media) = match &self.prepared {
-            Prepared::Keyframe(fit) => {
-                let role = match fit.position {
-                    FramePosition::First => uniserve_core::ConditionRole::FirstFrame,
-                    FramePosition::Last => uniserve_core::ConditionRole::LastFrame,
-                };
-                let size = canvas;
-                // A stretched keyframe is resized straight onto the canvas; a
-                // cover-cropped one past it, then centred.
-                let fit = match fit.cover_crop {
-                    None => ImageFit {
-                        resized: size,
-                        left: 0,
-                        top: 0,
-                        size,
-                    },
-                    Some(crop) => ImageFit {
-                        resized: Canvas {
-                            width: crop.width,
-                            height: crop.height,
-                        },
-                        left: crop.left,
-                        top: crop.top,
-                        size,
-                    },
-                };
-                (role, ConditionMedia::Image(fit))
-            }
-            Prepared::Image(size) => (
-                uniserve_core::ConditionRole::Reference,
-                ConditionMedia::Image(ImageFit {
-                    resized: *size,
-                    left: 0,
-                    top: 0,
-                    size: *size,
-                }),
-            ),
-            Prepared::Video(clip) => (
-                uniserve_core::ConditionRole::Reference,
-                ConditionMedia::Video {
-                    clip: uniserve_core::VideoClip {
-                        canvas: clip.canvas,
-                        start_frame: clip.start_frame,
-                        frames: clip.frames,
-                        vae_frames: clip.vae_frames,
-                    },
-                    soundtrack: clip.soundtrack.as_ref().map(audio),
-                },
-            ),
-            Prepared::Audio(clip) => (
-                uniserve_core::ConditionRole::Reference,
-                ConditionMedia::Audio(audio(clip)),
-            ),
-        };
+        let (role, media) = self.media(canvas);
         let vision = self.vision.as_ref().map(|vision| match vision {
             Vision::Image(image) => ConditionVision {
-                grid: core_grid(image.grid),
+                grid: image.grid,
                 tokens: image.tokens,
                 frame_indices: Vec::new(),
             },
             Vision::Video(video) => ConditionVision {
-                grid: core_grid(video.grid),
+                grid: video.grid,
                 tokens: video.grid.t * video.block_tokens,
                 frame_indices: video.frame_indices.clone(),
             },
@@ -701,14 +960,6 @@ impl ConditionPlan {
             latent_units: self.latent_units(),
             audio_rows: self.audio_rows,
         }
-    }
-}
-
-const fn core_grid(grid: VisionGrid) -> uniserve_core::VisionGrid {
-    uniserve_core::VisionGrid {
-        t: grid.t,
-        h: grid.h,
-        w: grid.w,
     }
 }
 
@@ -758,13 +1009,14 @@ impl RequestPlan {
     pub fn condition_rows(&self, tiles: Option<ConditionTiles>) -> Option<u64> {
         self.conditions
             .iter()
-            .map(|plan| plan.packed_rows(tiles))
+            .map(|plan| plan.packed_rows(self.canvas, tiles))
             .sum()
     }
 }
 
-/// The video latent frames of a `17n + 5` frame count.
-const fn latent_frames(frames: u32) -> u32 {
+/// The video latent frames of a `17n + 5` frame count: five per complete
+/// 17-frame window and two for the trailing 5-frame overlap.
+pub const fn latent_frames(frames: u32) -> u32 {
     (frames - VAE_LATENTS_PER_CHUNK) / VAE_FRAMES_PER_CHUNK * VAE_LATENTS_PER_CHUNK + 2
 }
 
@@ -1029,13 +1281,21 @@ fn requested_ratio(
 }
 
 /// The canvas a target names without consulting media; `None` for `fl2va`
-/// with `auto`.
+/// with `auto`, whose canvas follows the first keyframe.
 ///
 /// At the canvas rule's 768-pixel short edge a ratio resolves through
 /// [`canvas`]. Another short edge names the FastH3 training bucket of that
-/// resolution class, whose sides the rule does not produce: 480p 21:9 is
-/// 992x416.
-fn named_canvas(task: VideoTask, target: &Target<'_>) -> Result<Option<Canvas>, VideoInputError> {
+/// short edge ([`bucket`]), whose sides the rule does not produce: 480p 21:9
+/// is 992x416.
+///
+/// # Errors
+///
+/// Returns [`VideoInputError::Invalid`] for `target.aspect_ratio` when the
+/// task does not accept the ratio or the short edge has no canvas for it.
+pub fn named_canvas(
+    task: VideoTask,
+    target: &Target<'_>,
+) -> Result<Option<Canvas>, VideoInputError> {
     let Some((width, height)) = requested_ratio(task, target.aspect_ratio)? else {
         return Ok(None);
     };
@@ -1044,14 +1304,8 @@ fn named_canvas(task: VideoTask, target: &Target<'_>) -> Result<Option<Canvas>, 
             .map(Some)
             .map_err(|error| VideoInputError::invalid(RequestField::TargetAspectRatio, error));
     }
-    VideoResolution::from_short_edge(target.short_edge)
-        .and_then(|resolution| VideoRaster::named(resolution, &format!("{width}:{height}")))
-        .map(|bucket| {
-            Some(Canvas {
-                width: bucket.width,
-                height: bucket.height,
-            })
-        })
+    bucket(target.short_edge, (width, height))
+        .map(Some)
         .ok_or_else(|| {
             VideoInputError::invalid(
                 RequestField::TargetAspectRatio,
@@ -1066,7 +1320,7 @@ fn named_canvas(task: VideoTask, target: &Target<'_>) -> Result<Option<Canvas>, 
 /// Every named aspect ratio the deployment serves at each of its short edges,
 /// with the canvas it resolves to, short edge by short edge in
 /// [`NAMED_ASPECT_RATIOS`] order.
-pub fn named_canvases(limits: &PlanLimits) -> Vec<(u32, String, Canvas)> {
+pub fn served_canvases(limits: &PlanLimits) -> Vec<(u32, String, Canvas)> {
     let mut served = Vec::new();
     for short_edge in limits.short_edges() {
         for (width, height) in NAMED_ASPECT_RATIOS {
@@ -1178,7 +1432,7 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
     for (index, condition) in conditions.iter().enumerate() {
         let reject = |message: String| Err(VideoInputError::condition(index, message));
         match condition.role {
-            ConditionRole::Keyframe => {
+            Role::Keyframe => {
                 if condition.condition_type != ConditionType::Image {
                     return reject("a keyframe must be an image".to_owned());
                 }
@@ -1190,7 +1444,7 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
                     }
                 }
             }
-            ConditionRole::Reference => {
+            Role::Reference => {
                 if task == VideoTask::Fl2va {
                     return reject("fl2va takes keyframes only".to_owned());
                 }
@@ -1204,7 +1458,7 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
                 condition.condition_type,
                 ConditionType::Video | ConditionType::VideoAudio
             );
-            if condition.role == ConditionRole::Keyframe || !video {
+            if condition.role == Role::Keyframe || !video {
                 return reject("start_time_seconds applies to video references only".to_owned());
             }
             if !start.is_finite() || start < 0.0 {
@@ -1215,7 +1469,7 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
 
     let signature: Vec<i64> = conditions
         .iter()
-        .filter(|condition| condition.role == ConditionRole::Keyframe)
+        .filter(|condition| condition.role == Role::Keyframe)
         .filter_map(|condition| condition.frame_index)
         .collect();
     let keyframes_valid = matches!(signature.as_slice(), [0] | [-1] | [0, -1]);
@@ -1230,7 +1484,7 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
         let references = || {
             conditions
                 .iter()
-                .filter(|condition| condition.role == ConditionRole::Reference)
+                .filter(|condition| condition.role == Role::Reference)
         };
         let count = |kind: fn(ConditionType) -> bool| {
             references()
@@ -1297,7 +1551,7 @@ fn check_media(
 
 /// The soundtrack a reference conditions on, if any.
 fn soundtrack<'a>(condition: &ConditionSpec, media: &'a MediaFacts) -> Option<&'a AudioFacts> {
-    if condition.role == ConditionRole::Keyframe {
+    if condition.role == Role::Keyframe {
         return None;
     }
     match media {
@@ -1515,19 +1769,17 @@ pub fn plan_request(
     let mut keyframes = 0;
     for (index, (condition, facts)) in conditions.iter().zip(media).enumerate() {
         let plan = match (condition.role, facts) {
-            (ConditionRole::Keyframe, MediaFacts::Image(image)) => {
+            (Role::Keyframe, MediaFacts::Image(image)) => {
                 keyframes += 1;
                 plan_keyframe(index, condition, image, size, keyframes - 1, task, vision)?
             }
-            (ConditionRole::Keyframe, _) => {
+            (Role::Keyframe, _) => {
                 return Err(VideoInputError::condition(
                     index,
                     "a keyframe must be an image",
                 ));
             }
-            (ConditionRole::Reference, _) => {
-                plan_reference(index, condition, facts, frames, vision)?
-            }
+            (Role::Reference, _) => plan_reference(index, condition, facts, frames, vision)?,
         };
         plans.push(plan);
     }
@@ -1547,30 +1799,33 @@ pub(super) mod tests {
     use serde::Deserialize;
     use serde_json::{Value, json};
 
-    use super::super::RequestField;
     use super::super::presentation::present;
-    use super::super::presentation::tests::character_tokenizer;
-    use super::super::probe::{AudioFacts, FrameRate, ImageFacts, MediaFacts, VideoFacts};
+    use super::super::presentation::tests::CharacterTokenizer;
     use super::{
-        AudioClip, Canvas, ConditionPlan, ConditionRole, ConditionSpec, ConditionType, PlanLimits,
-        Prepared, RequestPlan, Target, VideoTask, Vision, VisionConfig, audio_clip, canvas,
-        cover_crop, plan_request, reference_image_size, rows_per_frame, video_reference,
+        AudioClip, AudioFacts, BUCKET_SHORT_EDGES, Canvas, ConditionPlan, ConditionSpec,
+        ConditionType, FrameRate, ImageFacts, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits,
+        Prepared, RequestField, RequestPlan, Role, Target, VideoFacts, VideoInputError, VideoTask,
+        Vision, VisionConfig, audio_clip, bucket, bucket_short_edge, canvas, check_request,
+        cover_crop, plan_request, reference_image_size, requested_frames, rows_per_frame,
+        video_frame_count, video_reference,
     };
+    use crate::MediaLocator;
+    use crate::video::ConditionTiles;
 
-    /// The shared planning vectors, generated from the diffusers reference.
-    pub(in crate::serving::video) fn fixture() -> Value {
+    /// The planning vectors, generated from the diffusers reference.
+    pub(in crate::video) fn fixture() -> Value {
         serde_json::from_str(include_str!(
-            "../../../../../tests/python/fixtures/minimax_h3_plan.json"
+            "../../../../tests/python/fixtures/minimax_h3_plan.json"
         ))
         .unwrap()
     }
 
-    pub(in crate::serving::video) fn vision(fixture: &Value) -> VisionConfig {
+    pub(in crate::video) fn vision(fixture: &Value) -> VisionConfig {
         VisionConfig::deserialize(&fixture["vision"]).unwrap()
     }
 
     /// Limits that serve every task, duration and canvas the model does.
-    pub(in crate::serving::video) fn limits() -> PlanLimits {
+    pub(in crate::video) fn limits() -> PlanLimits {
         PlanLimits {
             tasks: vec![VideoTask::T2va, VideoTask::Fl2va, VideoTask::Ref2va],
             max_video_seconds: 15.0,
@@ -1628,16 +1883,16 @@ pub(super) mod tests {
     }
 
     /// The task, target, conditions and media of a vectors request.
-    pub(in crate::serving::video) struct Request {
-        pub(in crate::serving::video) task: VideoTask,
-        pub(in crate::serving::video) aspect_ratio: String,
-        pub(in crate::serving::video) target: (u32, Option<f64>),
-        pub(in crate::serving::video) conditions: Vec<ConditionSpec>,
-        pub(in crate::serving::video) media: Vec<MediaFacts>,
+    pub(in crate::video) struct Request {
+        task: VideoTask,
+        aspect_ratio: String,
+        target: (u32, Option<f64>),
+        conditions: Vec<ConditionSpec>,
+        media: Vec<MediaFacts>,
     }
 
     impl Request {
-        pub(in crate::serving::video) fn parse(case: &Value) -> Self {
+        pub(in crate::video) fn parse(case: &Value) -> Self {
             let target = &case["target"];
             let conditions = case["conditions"].as_array().unwrap();
             Self {
@@ -1651,7 +1906,7 @@ pub(super) mod tests {
                     .iter()
                     .map(|entry| ConditionSpec {
                         condition_type: ConditionType::deserialize(&entry["type"]).unwrap(),
-                        role: ConditionRole::deserialize(&entry["role"]).unwrap(),
+                        role: Role::deserialize(&entry["role"]).unwrap(),
                         frame_index: entry.get("frame_index").and_then(Value::as_i64),
                         start_seconds: entry.get("start_time_seconds").and_then(Value::as_f64),
                     })
@@ -1663,7 +1918,7 @@ pub(super) mod tests {
             }
         }
 
-        pub(in crate::serving::video) fn target(&self) -> Target<'_> {
+        fn target(&self) -> Target<'_> {
             Target {
                 short_edge: self.target.0,
                 aspect_ratio: &self.aspect_ratio,
@@ -1671,10 +1926,10 @@ pub(super) mod tests {
             }
         }
 
-        pub(in crate::serving::video) fn plan(
+        pub(in crate::video) fn plan(
             &self,
             vision: &VisionConfig,
-        ) -> Result<RequestPlan, super::super::VideoInputError> {
+        ) -> Result<RequestPlan, VideoInputError> {
             plan_request(
                 self.task,
                 &self.target(),
@@ -1760,6 +2015,53 @@ pub(super) mod tests {
         }
     }
 
+    /// The 768-pixel training buckets are the canvas rule's canvases of the
+    /// named ratios; the 480-pixel ones are the training table's own, and a
+    /// canvas names its bucket's short edge.
+    #[test]
+    fn buckets_name_the_training_canvases() {
+        for ratio in NAMED_ASPECT_RATIOS {
+            let rule = canvas(f64::from(ratio.0), f64::from(ratio.1)).unwrap();
+            assert_eq!(bucket(768, ratio), Some(rule), "{ratio:?}");
+            for short_edge in BUCKET_SHORT_EDGES {
+                let canvas = bucket(short_edge, ratio).unwrap();
+                assert_eq!((canvas.width % 32, canvas.height % 32), (0, 0));
+                assert_eq!(bucket_short_edge(canvas), Some(short_edge));
+                // A mirrored ratio has the transposed bucket.
+                let mirrored = bucket(short_edge, (ratio.1, ratio.0));
+                if let Some(mirrored) = mirrored {
+                    assert_eq!(
+                        (mirrored.width, mirrored.height),
+                        (canvas.height, canvas.width)
+                    );
+                }
+            }
+        }
+        let narrow = Canvas {
+            width: 992,
+            height: 416,
+        };
+        assert_eq!(bucket(480, (21, 9)), Some(narrow));
+        assert_eq!(
+            bucket_short_edge(Canvas {
+                width: 960,
+                height: 416
+            }),
+            None
+        );
+        assert_eq!(bucket(720, (16, 9)), None);
+        assert_eq!(bucket(768, (3, 2)), None);
+    }
+
+    /// A duration's frames round half to even, as Python's `round` does:
+    /// 1.5 frames are 2 and 4.5 frames are 4.
+    #[test]
+    fn requested_frames_round_half_to_even() {
+        assert_eq!(requested_frames(5.0, 24), 120);
+        assert_eq!(requested_frames(0.0625, 24), 2);
+        assert_eq!(requested_frames(0.1875, 24), 4);
+    }
+
     /// Durations align up to `17n + 5` frames within the served range, with
     /// the latent counts the reference derives from them.
     #[test]
@@ -1777,10 +2079,16 @@ pub(super) mod tests {
             if case.get("error").is_some() {
                 let field = plan.unwrap_err().field();
                 assert_eq!(field, Some(RequestField::TargetDuration), "{case}");
+                assert!(video_frame_count(seconds, 15.0).is_err(), "{case}");
                 continue;
             }
             let plan = plan.unwrap();
             assert_eq!(u64::from(plan.num_frames), case["num_frames"], "{case}");
+            assert_eq!(
+                u64::from(video_frame_count(seconds, 15.0).unwrap()),
+                case["num_frames"],
+                "{case}"
+            );
             assert_eq!(
                 u64::from(plan.latent_frames),
                 case["latent_frames"],
@@ -1872,6 +2180,51 @@ pub(super) mod tests {
             ..video
         };
         assert_eq!(image.latent_units(), [1008]);
+    }
+
+    /// The worker counts an admitted condition's rows from its description:
+    /// for every planned condition of the vectors, densely and in the region
+    /// tiles of both tile sizes, the described condition packs into exactly
+    /// the rows its plan does, and a keyframe under tiles into none.
+    #[test]
+    fn described_conditions_pack_like_their_plans() {
+        let fixture = fixture();
+        let vision = vision(&fixture);
+        let source = MediaLocator {
+            name: "uniserve-media-0".to_owned(),
+            bytes: 1,
+        };
+        let tilings = [
+            None,
+            Some(ConditionTiles {
+                rows: 64,
+                video: [4, 4, 4],
+            }),
+            Some(ConditionTiles {
+                rows: 128,
+                video: [4, 4, 8],
+            }),
+        ];
+        for case in fixture["requests"].as_array().unwrap() {
+            if case.get("expected").is_none() {
+                continue;
+            }
+            let plan = Request::parse(case).plan(&vision).unwrap();
+            for condition in &plan.conditions {
+                let described = condition.describe(plan.canvas, source.clone());
+                for tiles in tilings {
+                    let planned = condition.packed_rows(plan.canvas, tiles);
+                    assert_eq!(described.packed_rows(tiles), planned, "{}", case["name"]);
+                    let keyframe = matches!(condition.prepared, Prepared::Keyframe(_));
+                    assert_eq!(planned.is_none(), keyframe && tiles.is_some());
+                }
+                // Densely, the rows are the condition's own.
+                assert_eq!(
+                    described.packed_rows(None),
+                    Some(u64::from(condition.video_rows + condition.audio_rows))
+                );
+            }
+        }
     }
 
     /// Reference videos resample to 24 fps, honour the start offset, keep a
@@ -1983,13 +2336,12 @@ pub(super) mod tests {
     fn rejected_requests_name_the_field() {
         let fixture = fixture();
         let vision = vision(&fixture);
-        let tokenizer = character_tokenizer();
         for case in fixture["requests"].as_array().unwrap() {
             let Some(error) = case.get("error") else {
                 continue;
             };
             let rejection = match Request::parse(case).plan(&vision) {
-                Ok(plan) => present(&tokenizer, &plan, case["prompt"].as_str().unwrap())
+                Ok(plan) => present(&CharacterTokenizer, &plan, case["prompt"].as_str().unwrap())
                     .expect_err("the request was accepted"),
                 Err(rejection) => rejection,
             };
@@ -2029,7 +2381,7 @@ pub(super) mod tests {
             aspect_ratio: "9:16",
             ..FIVE_SECONDS
         };
-        let error = super::check_request(VideoTask::T2va, &portrait, &[], &limits).unwrap_err();
+        let error = check_request(VideoTask::T2va, &portrait, &[], &limits).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
     }
 
@@ -2071,7 +2423,7 @@ pub(super) mod tests {
                 aspect_ratio,
                 ..FIVE_SECONDS
             };
-            let error = super::check_request(VideoTask::T2va, &target, &[], &served).unwrap_err();
+            let error = check_request(VideoTask::T2va, &target, &[], &served).unwrap_err();
             assert_eq!(error.field(), Some(field), "{short_edge} {aspect_ratio}");
         }
 
@@ -2082,7 +2434,7 @@ pub(super) mod tests {
             aspect_ratio: "16:9",
             ..FIVE_SECONDS
         };
-        let error = super::check_request(VideoTask::T2va, &target, &[], &limits()).unwrap_err();
+        let error = check_request(VideoTask::T2va, &target, &[], &limits()).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetShortEdge));
     }
 
@@ -2097,7 +2449,7 @@ pub(super) mod tests {
             max_video_seconds: 8.0,
             ..limits()
         };
-        let error = super::check_request(VideoTask::T2va, &ten_seconds, &[], &limits).unwrap_err();
+        let error = check_request(VideoTask::T2va, &ten_seconds, &[], &limits).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetDuration));
     }
 
@@ -2108,7 +2460,7 @@ pub(super) mod tests {
             tasks: vec![VideoTask::Ref2va],
             ..limits()
         };
-        let error = super::check_request(VideoTask::T2va, &FIVE_SECONDS, &[], &limits).unwrap_err();
+        let error = check_request(VideoTask::T2va, &FIVE_SECONDS, &[], &limits).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::Task));
     }
 
@@ -2132,11 +2484,11 @@ pub(super) mod tests {
             };
             let keyframe = ConditionSpec {
                 condition_type: ConditionType::Image,
-                role: ConditionRole::Keyframe,
+                role: Role::Keyframe,
                 frame_index: Some(0),
                 start_seconds: None,
             };
-            let checked = super::check_request(VideoTask::Fl2va, &target, &[keyframe], &limits());
+            let checked = check_request(VideoTask::Fl2va, &target, &[keyframe], &limits());
             assert_eq!(checked.is_ok(), accepted, "{ratio:?}");
         }
     }

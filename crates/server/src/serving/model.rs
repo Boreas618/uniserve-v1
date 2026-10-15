@@ -25,6 +25,7 @@ use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
 use thiserror::Error;
+use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, VisionConfig};
 use uniserve_core::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
     ImageGenerationConfig, ImageParams, RequestId, SamplingParams,
@@ -39,7 +40,6 @@ use crate::serving::input::{
     TextPromptRequest,
 };
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
-use crate::serving::video::plan::VisionConfig;
 use crate::serving::video::{PreparedVideo, VideoService};
 use crate::serving::{
     CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key,
@@ -312,7 +312,7 @@ impl ModelConfig {
                     processor.push(pipeline.component_file("processor", name).await?);
                 }
                 let vision = VisionConfig::read(&processor[0], &processor[1])
-                    .map_err(|error| ModelResolutionError::MediaContract(format!("{error:#}")))?;
+                    .map_err(ModelResolutionError::MediaContract)?;
                 let model = Self::from_pipeline(
                     &served_name,
                     description,
@@ -1042,16 +1042,6 @@ impl InputProcessor {
     }
 }
 
-/// Shortest explicit video duration, in seconds, the MiniMax H3 API admits.
-pub const MIN_VIDEO_SECONDS: f64 = 4.0;
-
-/// Longest explicit video duration, in seconds, the MiniMax H3 API admits. A deployment may
-/// configure a lower `max_video_seconds` capacity, never a higher one.
-pub const MAX_VIDEO_SECONDS: f64 = 15.0;
-
-/// Frame rate, in frames per second, of every MiniMax H3 video.
-pub const VIDEO_FPS: u32 = 24;
-
 /// Checks a deployment's video duration capacity against the API range.
 ///
 /// # Errors
@@ -1070,29 +1060,6 @@ pub fn validate_video_capacity(max_video_seconds: f64) -> std::result::Result<()
              {max_video_seconds}"
         ))
     }
-}
-
-/// Converts an explicit MiniMax H3 duration into its output frame count.
-///
-/// The requested frame count is `seconds * 24` rounded half to even, as the reference
-/// implementations round with Python's `round`, and the output extends it upward to the next
-/// complete native temporal window, a count of the form `17n + 5`. The output may therefore
-/// last longer than requested: 4 seconds yields 107 frames and 15 seconds 362.
-///
-/// # Errors
-///
-/// Returns a message when `seconds` is not finite or lies outside
-/// `[MIN_VIDEO_SECONDS, max_video_seconds]`.
-pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> std::result::Result<u32, String> {
-    if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
-        return Err(format!(
-            "video duration must be a finite number of seconds in [{MIN_VIDEO_SECONDS}, \
-             {max_video_seconds}]"
-        ));
-    }
-    // The range bounds the product to [96, 360], so the conversion is exact.
-    let requested = (seconds * f64::from(VIDEO_FPS)).round_ties_even() as u32;
-    Ok(requested + (22 - requested % 17) % 17)
 }
 
 /// Returns the multimodal resources required by the active profile.

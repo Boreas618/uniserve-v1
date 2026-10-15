@@ -7,6 +7,10 @@ every function of the numerical library by its import path. Everything
 after that is the library's: descriptor parsing, registration, model
 loading, serving and shutdown. The process exits with the status it
 returns.
+
+The same library exports the video request rules of ``uniserve-core``,
+which the numerical library plans MiniMax-H3 requests with
+(:func:`library`).
 """
 
 from __future__ import annotations
@@ -63,6 +67,25 @@ def import_path(path: str) -> Callable[..., Any]:
     return translate(call)
 
 
+@functools.cache
+def library() -> tvm_ffi.Module:
+    """The rank runtime library ``uniserve._worker``, loaded once.
+
+    Besides the rank entry ``main`` it exports the video request rules
+    (``video_plan`` and the functions beside it), which any process may
+    call: loading the library starts nothing.
+
+    Raises:
+        ImportError: The library is not installed.
+    """
+    spec = importlib.util.find_spec("uniserve._worker")
+    if spec is None or spec.origin is None:
+        raise ImportError(
+            "the worker library uniserve._worker is not installed"
+        )
+    return tvm_ffi.load_module(spec.origin)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -78,16 +101,13 @@ def main() -> None:
     # would otherwise raise inside a library call on this thread.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    spec = importlib.util.find_spec("uniserve._worker")
-    if spec is None or spec.origin is None:
-        sys.stderr.write(
-            "uniserve-worker: error: the worker library "
-            "uniserve._worker is not installed\n"
-        )
+    try:
+        entry = library()["main"]
+    except ImportError as error:
+        sys.stderr.write(f"uniserve-worker: error: {error}\n")
         sys.stderr.flush()
         os._exit(1)
-    library = tvm_ffi.load_module(spec.origin)
-    code = int(library["main"](sys.argv[1:], import_path))
+    code = int(entry(sys.argv[1:], import_path))
     sys.stdout.flush()
     sys.stderr.flush()
     # Skip interpreter finalization: an aborted rank retains device

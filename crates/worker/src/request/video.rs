@@ -8,12 +8,18 @@
 //! the frame counts, canvases and prompt capacities a rank admits and the
 //! layouts it prepares; [`MediaPlan::admit`] resolves a request's exact size
 //! and the smallest prepared prompt capacity whose layout holds it.
+//!
+//! A request's condition rows are the request rules' count
+//! ([`VideoCondition::packed_rows`] under the denoiser's declared condition
+//! tiles), computed at admission without the Python thread; only the
+//! layout questions, which are the model's arithmetic, are asked.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tvm_ffi::Any;
-use uniserve_core::{Canvas, ConditionRole, VideoCondition};
+use uniserve_core::video::plan::requested_frames;
+use uniserve_core::{Canvas, ConditionRole, ConditionTiles, VideoCondition};
 use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
@@ -314,11 +320,6 @@ fn preparation_order(extents: &[CanvasExtent]) -> Vec<Canvas> {
         .collect()
 }
 
-/// The seconds-to-frames rule the HTTP planner shares: round half to even.
-fn frames_of(seconds: f64, rate: u32) -> u32 {
-    (seconds * f64::from(rate)).round_ties_even() as u32
-}
-
 impl MediaPlan {
     /// Plan a deployment's admitted sizes on the loaded denoiser.
     ///
@@ -338,10 +339,10 @@ impl MediaPlan {
         canvases: &[Canvas],
     ) -> Result<Self> {
         let facts = &model.facts;
-        let longest = model.legal_frame_count(frames_of(max_seconds, facts.frame_rate))?;
+        let longest = model.legal_frame_count(requested_frames(max_seconds, facts.frame_rate))?;
         let mut count = model.legal_frame_count(
             min_seconds
-                .map_or(1, |seconds| frames_of(seconds, facts.frame_rate))
+                .map_or(1, |seconds| requested_frames(seconds, facts.frame_rate))
                 .max(1),
         )?;
         let mut frame_counts = vec![count];
@@ -504,6 +505,25 @@ pub(crate) fn condition_shapes(conditions: &[VideoCondition]) -> Arc<[ConditionS
     conditions.iter().map(ConditionShape::of).collect()
 }
 
+/// The denoiser rows a request's conditions occupy, as the denoiser packs
+/// them (densely, or in its declared condition `tiles`).
+///
+/// Fails, as an invalid request, for a keyframe a tile-packing denoiser
+/// holds no rows for, or rows beyond a 32-bit count.
+fn condition_rows(conditions: &[VideoCondition], tiles: Option<ConditionTiles>) -> Result<u32> {
+    let rows = conditions
+        .iter()
+        .map(|condition| condition.packed_rows(tiles))
+        .sum::<Option<u64>>()
+        .ok_or_else(|| {
+            Error::Invalid(
+                "this denoiser packs conditions in region tiles and holds no keyframes".into(),
+            )
+        })?;
+    u32::try_from(rows)
+        .map_err(|_| Error::Invalid(format!("{rows} condition rows exceed any capacity")))
+}
+
 /// One admitted video request on this rank.
 pub(crate) struct VideoRequest {
     pub(crate) key: RequestKey,
@@ -539,6 +559,8 @@ struct Unsized {
     slot: usize,
     key: RequestKey,
     size: VideoSize,
+    /// The request's condition rows ([`condition_rows`]).
+    condition_rows: u32,
     /// The layout of each prompt capacity of the plan, in its order: a
     /// startup layout for a size without conditions, otherwise asked for.
     layouts: Vec<Option<VideoLayout>>,
@@ -551,7 +573,7 @@ struct Unsized {
 enum Asked {
     /// The layouts of sizes with conditions.
     Layouts,
-    /// Each request's condition rows and which of its layouts hold it.
+    /// Which of each request's layouts hold it.
     Holds,
     /// The preparation of these layouts, which displaced the held ones.
     Preparation(Vec<VideoLayout>, Vec<Evicted>),
@@ -560,14 +582,14 @@ enum Asked {
 /// The admission of the video requests a batch started, between the jobs
 /// that ask the library to size them.
 ///
-/// A request's condition rows, the layout of its size at each prompt
-/// capacity and whether a layout holds it are the model's arithmetic over
-/// the request's own size, so no table answers them: every request is asked
-/// for, in jobs of the Python thread. A request without conditions takes
-/// one job (its layouts are startup layouts); a conditioned one takes a job
-/// for its layouts first. A request whose layout the denoiser does not
-/// hold (one prepared at startup or for an earlier request) takes a
-/// further job, on the denoiser's lane, that prepares the layout.
+/// The layout of a request's size at each prompt capacity and whether a
+/// layout holds it are the model's arithmetic over the request's own size,
+/// so no table answers them: every request is asked for, in jobs of the
+/// Python thread. A request without conditions takes one job (its layouts
+/// are startup layouts); a conditioned one takes a job for its layouts
+/// first. A request whose layout the denoiser does not hold (one prepared at
+/// startup or for an earlier request) takes a further job, on the
+/// denoiser's lane, that prepares the layout.
 ///
 /// The requests a batch started are sized together: a size the model
 /// rejects fails the batch, and with it every request of the sizing that
@@ -687,6 +709,7 @@ impl VideoRequests {
         };
         if denoising {
             self.plan.check(&size)?;
+            let rows = condition_rows(&video.conditions, self.model.facts.condition_tiles)?;
             // A request restarted in the slot replaces the one waiting.
             self.waiting.retain(|waiting| waiting.slot != slot);
             self.waiting.push(Unsized {
@@ -704,6 +727,7 @@ impl VideoRequests {
                     })
                     .collect(),
                 size,
+                condition_rows: rows,
                 admitted: None,
             });
         }
@@ -722,10 +746,9 @@ impl VideoRequests {
     }
 
     /// Record into `job` the next step of `sizing`: the layouts not yet
-    /// known; once every layout is known, each request's condition rows and
-    /// whether each of its layouts holds it; and for requests whose
-    /// selected layout `denoisers` does not hold, that layout's
-    /// preparation. Returns whether the job belongs on the denoiser's lane
+    /// known; once every layout is known, whether each of a request's
+    /// layouts holds it; and for requests whose selected layout `denoisers`
+    /// does not hold, that layout's preparation. Returns whether the job belongs on the denoiser's lane
     /// (a preparation works on its stream) rather than on the Python thread
     /// alone.
     pub(crate) fn ask(
@@ -777,7 +800,6 @@ impl VideoRequests {
                 }
                 continue;
             }
-            self.model.ask_request_size(&request.size, job);
             for layout in request.layouts.iter().flatten() {
                 self.model.ask_holds(layout, &request.size, job);
             }
@@ -819,12 +841,6 @@ impl VideoRequests {
                     })
                 };
                 for waiting in &mut sizing.requests {
-                    let rows = integer(completion.returned()?)?;
-                    let condition_rows = u32::try_from(rows).map_err(|_| {
-                        Error::Interface(
-                            "the video model reports an invalid condition row count".into(),
-                        )
-                    })?;
                     let layouts: Vec<VideoLayout> =
                         waiting.layouts.iter().flatten().copied().collect();
                     let holds = layouts
@@ -833,7 +849,7 @@ impl VideoRequests {
                         .collect::<Result<Vec<bool>>>()?;
                     waiting.admitted = Some(self.plan.select(
                         waiting.size.clone(),
-                        condition_rows,
+                        waiting.condition_rows,
                         &layouts,
                         &holds,
                     )?);
@@ -1162,12 +1178,5 @@ mod tests {
             &[false, false]
         )));
         assert!(refused(plan.select(size, 513, &layouts, &[true, true])));
-    }
-
-    #[test]
-    fn seconds_round_half_to_even_frames() {
-        assert_eq!(frames_of(5.0, 24), 120);
-        assert_eq!(frames_of(0.0625, 24), 2);
-        assert_eq!(frames_of(0.020_833_333_333_333_33 * 2.5, 24), 1);
     }
 }

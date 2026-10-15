@@ -32,11 +32,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use tvm_ffi::Any;
-use uniserve_core::{Canvas, VideoCondition};
+use uniserve_core::{Canvas, ConditionTiles, VideoCondition};
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8, memset_d32};
 use uniserve_ipc::{
-    Batch as BatchPlan, Call, ConditionTiles, DimBound, LatentParams, OutputInfo, RasterAxes,
-    ShapeBound, VideoDenoiserInfo,
+    Batch as BatchPlan, Call, DimBound, LatentParams, OutputInfo, RasterAxes, ShapeBound,
+    VideoDenoiserInfo,
 };
 
 use crate::config::placement::{Capability, Declarations};
@@ -1771,7 +1771,6 @@ struct LayoutAnswers {
 /// The sizing methods, each called with the loaded model first.
 struct SizingMethods {
     legal_frame_count: Function,
-    condition_rows: Function,
     layout_size: Function,
     holds: Function,
     condition_layout: Function,
@@ -1875,7 +1874,6 @@ impl VideoModel {
         let of_decoder = |name: &str| Interpreter::import(&format!("{DECODER}.{name}"));
         let methods = SizingMethods {
             legal_frame_count: of_denoiser("legal_frame_count")?,
-            condition_rows: of_denoiser("condition_rows")?,
             layout_size: of_denoiser("layout_size")?,
             holds: of_denoiser("holds")?,
             condition_layout: of_denoiser("condition_layout")?,
@@ -2095,14 +2093,6 @@ impl VideoModel {
         MethodCall::new(method, all)
     }
 
-    /// Record the call asking a request's condition rows: the job's
-    /// completion carries the count. A size the model rejects fails the
-    /// job with the model's error ([`invalid_size`]).
-    pub(crate) fn ask_request_size(&self, size: &VideoSize, job: &Job) {
-        let arguments = size_values(size).into();
-        job.call_returning(self.asked(&self.methods.condition_rows, arguments));
-    }
-
     /// Record the call asking the smallest layout holding `size`
     /// ([`Self::layout_size`] as a call of `job`): its completion carries
     /// the layout's extents.
@@ -2112,7 +2102,9 @@ impl VideoModel {
     }
 
     /// Record the call asking whether `layout` holds `size`: the job's
-    /// completion carries one for a layout that does, zero otherwise.
+    /// completion carries one for a layout that does, zero otherwise. A size
+    /// the model rejects fails the job with the model's error
+    /// ([`invalid_size`]).
     pub(crate) fn ask_holds(&self, layout: &VideoLayout, size: &VideoSize, job: &Job) {
         let mut arguments = vec![Argument::Integers(layout.values().to_vec())];
         arguments.extend(size_values(size));

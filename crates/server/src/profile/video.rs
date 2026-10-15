@@ -2,14 +2,15 @@
 //!
 //! A deployment provisions the cartesian product of its configured
 //! resolutions and aspect ratios; the worker prepares every product raster at
-//! startup and a request selects one of them. Every bucket side is a multiple
-//! of 32 pixels, one latent token (VAE stride 16, patch 2).
+//! startup and a request selects one of them. The bucket table is the request
+//! rules' ([`uniserve_core::video::plan::bucket`]).
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::Canvas;
+use uniserve_core::video::plan::{NAMED_ASPECT_RATIOS, bucket};
 
 use crate::profile::omni::resolution::ResolutionName;
 
@@ -84,13 +85,6 @@ impl VideoResolution {
             Self::P480 => 480,
         }
     }
-
-    /// Returns the class a `target.short_edge` names.
-    pub fn from_short_edge(short_edge: u32) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|resolution| resolution.short_edge() == short_edge)
-    }
 }
 
 impl fmt::Display for VideoResolution {
@@ -110,7 +104,8 @@ impl FromStr for VideoResolution {
     }
 }
 
-/// Aspect ratios of the checkpoint's training buckets, landscape first.
+/// Aspect ratios of the checkpoint's training buckets, landscape first: the
+/// names of [`NAMED_ASPECT_RATIOS`], in its order.
 pub const VIDEO_ASPECT_RATIOS: [ResolutionName; 6] = [
     ResolutionName::Landscape21x9,
     ResolutionName::Landscape16x9,
@@ -136,49 +131,17 @@ pub struct VideoRaster {
 impl VideoRaster {
     /// Returns the training bucket for a resolution and aspect ratio, or
     /// `None` when the checkpoint has no such bucket.
-    pub const fn new(resolution: VideoResolution, aspect_ratio: ResolutionName) -> Option<Self> {
-        let (width, height) = match (resolution, aspect_ratio) {
-            (VideoResolution::P768, ResolutionName::Landscape21x9) => (1536, 672),
-            (VideoResolution::P768, ResolutionName::Landscape16x9) => (1344, 768),
-            (VideoResolution::P768, ResolutionName::Landscape4x3) => (1024, 768),
-            (VideoResolution::P768, ResolutionName::Square) => (768, 768),
-            (VideoResolution::P768, ResolutionName::Portrait3x4) => (768, 1024),
-            (VideoResolution::P768, ResolutionName::Portrait9x16) => (768, 1344),
-            (VideoResolution::P480, ResolutionName::Landscape21x9) => (992, 416),
-            (VideoResolution::P480, ResolutionName::Landscape16x9) => (832, 480),
-            (VideoResolution::P480, ResolutionName::Landscape4x3) => (640, 480),
-            (VideoResolution::P480, ResolutionName::Square) => (480, 480),
-            (VideoResolution::P480, ResolutionName::Portrait3x4) => (480, 640),
-            (VideoResolution::P480, ResolutionName::Portrait9x16) => (480, 832),
-            _ => return None,
-        };
+    pub fn new(resolution: VideoResolution, aspect_ratio: ResolutionName) -> Option<Self> {
+        let named = VIDEO_ASPECT_RATIOS
+            .iter()
+            .position(|&name| name == aspect_ratio)?;
+        let canvas = bucket(resolution.short_edge(), NAMED_ASPECT_RATIOS[named])?;
         Some(Self {
             resolution,
             aspect_ratio,
-            width,
-            height,
+            width: canvas.width,
+            height: canvas.height,
         })
-    }
-
-    /// Returns the training bucket of a resolution class and a `W:H` aspect
-    /// ratio, or `None` when the checkpoint has no such bucket.
-    pub fn named(resolution: VideoResolution, aspect_ratio: &str) -> Option<Self> {
-        VIDEO_ASPECT_RATIOS
-            .into_iter()
-            .find(|name| name.as_str() == aspect_ratio)
-            .and_then(|name| Self::new(resolution, name))
-    }
-
-    /// Returns the training bucket with exactly these pixel dimensions.
-    pub fn find(width: u32, height: u32) -> Option<Self> {
-        VideoResolution::ALL
-            .into_iter()
-            .flat_map(|resolution| {
-                VIDEO_ASPECT_RATIOS
-                    .into_iter()
-                    .filter_map(move |aspect_ratio| Self::new(resolution, aspect_ratio))
-            })
-            .find(|raster| raster.width == width && raster.height == height)
     }
 }
 
@@ -318,45 +281,28 @@ fn join<S: AsRef<str>>(values: impl Iterator<Item = S>) -> String {
 mod tests {
     use super::*;
 
+    /// Each trained aspect name denotes the named ratio at its position, so
+    /// a raster is the request rules' bucket of that ratio at its
+    /// resolution's short edge; an untrained name has none.
     #[test]
-    fn every_bucket_is_token_aligned_and_mirrored() {
-        for resolution in VideoResolution::ALL {
-            for aspect_ratio in VIDEO_ASPECT_RATIOS {
-                let raster = VideoRaster::new(resolution, aspect_ratio).unwrap();
-                assert_eq!(raster.width % 32, 0);
-                assert_eq!(raster.height % 32, 0);
-            }
-            for (landscape, portrait) in [
-                (ResolutionName::Landscape16x9, ResolutionName::Portrait9x16),
-                (ResolutionName::Landscape4x3, ResolutionName::Portrait3x4),
-            ] {
-                let landscape = VideoRaster::new(resolution, landscape).unwrap();
-                let portrait = VideoRaster::new(resolution, portrait).unwrap();
+    fn rasters_are_the_named_buckets() {
+        for (name, (width, height)) in VIDEO_ASPECT_RATIOS.into_iter().zip(NAMED_ASPECT_RATIOS) {
+            assert_eq!(name.as_str(), format!("{width}:{height}"));
+            for resolution in VideoResolution::ALL {
+                let raster = VideoRaster::new(resolution, name).unwrap();
+                let expected = bucket(resolution.short_edge(), (width, height)).unwrap();
                 assert_eq!(
-                    (landscape.width, landscape.height),
-                    (portrait.height, portrait.width)
+                    (raster.width, raster.height),
+                    (expected.width, expected.height)
                 );
             }
         }
-        assert!(VideoRaster::new(VideoResolution::P768, ResolutionName::Landscape3x2).is_none());
-    }
-
-    #[test]
-    fn short_edges_and_sizes_name_the_training_buckets() {
-        for resolution in VideoResolution::ALL {
-            assert_eq!(
-                VideoResolution::from_short_edge(resolution.short_edge()),
-                Some(resolution)
-            );
-        }
-        assert_eq!(VideoResolution::from_short_edge(720), None);
         // The 480p 21:9 bucket is the training table's, not a rescaled 768p
         // canvas.
-        let narrow = VideoRaster::named(VideoResolution::P480, "21:9").unwrap();
+        let narrow =
+            VideoRaster::new(VideoResolution::P480, ResolutionName::Landscape21x9).unwrap();
         assert_eq!((narrow.width, narrow.height), (992, 416));
-        assert_eq!(VideoRaster::find(992, 416), Some(narrow));
-        assert!(VideoRaster::find(960, 416).is_none());
-        assert!(VideoRaster::named(VideoResolution::P768, "3:2").is_none());
+        assert!(VideoRaster::new(VideoResolution::P768, ResolutionName::Landscape3x2).is_none());
     }
 
     #[test]

@@ -30,62 +30,9 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use super::VideoInputError;
-use super::plan::ConditionType;
-
-/// The probed facts of one condition's media.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MediaFacts {
-    /// An image.
-    Image(ImageFacts),
-    /// A video and its soundtrack.
-    Video(VideoFacts),
-    /// An audio file.
-    Audio(AudioFacts),
-}
-
-/// An image as displayed, after its EXIF orientation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImageFacts {
-    /// Displayed width in pixels.
-    pub width: u32,
-    /// Displayed height in pixels.
-    pub height: u32,
-}
-
-/// A rational frame rate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameRate {
-    /// Frames per `denominator` seconds.
-    pub numerator: u32,
-    /// Seconds per `numerator` frames.
-    pub denominator: u32,
-}
-
-/// A video's display aspect, frame rate, frame count and soundtrack.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VideoFacts {
-    /// Width of the display aspect, in lowest terms. Only the ratio to
-    /// `display_height` matters.
-    pub display_width: u64,
-    /// Height of the display aspect, in lowest terms.
-    pub display_height: u64,
-    /// The stream's average frame rate.
-    pub frame_rate: FrameRate,
-    /// Frames a decoder outputs for the whole stream.
-    pub frames: u64,
-    /// The first audio stream, when the video has one.
-    pub soundtrack: Option<AudioFacts>,
-}
-
-/// A soundtrack's native sample rate and decoded sample count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioFacts {
-    /// Samples per second.
-    pub sample_rate: u32,
-    /// Samples per channel a decoder outputs.
-    pub samples: u64,
-}
+use uniserve_core::video::plan::{
+    AudioFacts, ConditionType, FrameRate, ImageFacts, MediaFacts, VideoFacts, VideoInputError,
+};
 
 /// The largest image accepted, in pixels: Pillow, which decodes condition
 /// images for the conditioner and the VAE, refuses larger ones as
@@ -846,11 +793,12 @@ mod tests {
     use image::{ImageEncoder as _, RgbImage};
     use serde_json::json;
 
-    use super::super::plan::ConditionType;
+    use uniserve_core::video::plan::RequestField;
+
     use super::{
-        AudioFacts, FrameRate, ImageFacts, MediaFacts, MediaProber, ProbeConfig, ProbeOutput,
-        VideoFacts, audio_stream, count_decoded_packets, exif_orientation, probe_image,
-        sum_frame_samples, video_streams,
+        AudioFacts, ConditionType, FrameRate, ImageFacts, MediaFacts, MediaProber, ProbeConfig,
+        ProbeOutput, VideoFacts, audio_stream, count_decoded_packets, exif_orientation,
+        probe_image, sum_frame_samples, video_streams,
     };
 
     /// A TIFF-structured EXIF block holding one orientation entry of the
@@ -1378,18 +1326,12 @@ mod tests {
             .probe(3, ConditionType::Audio, &plain)
             .await
             .unwrap_err();
-        assert_eq!(
-            error.field(),
-            Some(super::super::RequestField::Condition(3))
-        );
+        assert_eq!(error.field(), Some(RequestField::Condition(3)));
         let error = prober
             .probe(4, ConditionType::Video, &mp3)
             .await
             .unwrap_err();
-        assert_eq!(
-            error.field(),
-            Some(super::super::RequestField::Condition(4))
-        );
+        assert_eq!(error.field(), Some(RequestField::Condition(4)));
     }
 
     /// A missing `ffprobe` is the server's failure, not the request's.

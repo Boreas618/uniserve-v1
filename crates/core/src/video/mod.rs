@@ -1,13 +1,21 @@
-//! The conditions of a video request, as the workers read and encode them.
+//! MiniMax-H3 video requests: their rules and their conditions.
 //!
-//! The server plans every condition before admission (`serving::video::plan`
-//! in `uniserve-server`): how its media is prepared, what the conditioner
-//! reads of it, and the denoiser rows it adds. A [`VideoCondition`] carries
-//! that plan to the engine and on to the workers: the shared-memory object
-//! holding the fetched bytes, the exact media the worker's media reader
-//! decodes them into, the conditioner's view, and the rows the latent
+//! [`plan`] holds the request rules: the canvas, the frame counts, how every
+//! condition is prepared, what the conditioner reads of it and the denoiser
+//! rows it adds. [`presentation`] lists and tokenizes what the conditioner
+//! reads. The rules exist once, here: the server plans requests with them
+//! before admission, the worker counts a request's condition rows with them,
+//! and the Python library calls them through the rank runtime library.
+//!
+//! The server plans every condition before admission. A [`VideoCondition`]
+//! carries that plan to the engine and on to the workers: the shared-memory
+//! object holding the fetched bytes, the exact media the worker's media
+//! reader decodes them into, the conditioner's view, and the rows the latent
 //! encoders produce. The engine sizes the products of the calls that read
 //! and encode conditions from these values alone; it never decodes media.
+
+pub mod plan;
+pub mod presentation;
 
 use serde::{Deserialize, Serialize};
 
@@ -184,10 +192,95 @@ pub struct VideoCondition {
     pub audio_rows: u32,
 }
 
+/// Whole-tile condition packing of a multi-region video denoiser.
+///
+/// Each condition occupies whole tiles of `rows` rows: its audio rows fill
+/// tiles of their own, then an image's rows fill tiles, while a video's
+/// `(latent frames, height, width)` token grid is cut into tiles of `video`
+/// tokens along those axes, each tile taking `rows` rows however few tokens
+/// it holds. A condition's packed rows are its tile count times `rows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionTiles {
+    /// Rows of one tile.
+    pub rows: u32,
+    /// Tokens of one video tile along latent frames, height and width; their
+    /// product is `rows`.
+    pub video: [u32; 3],
+}
+
+impl ConditionTiles {
+    /// Packed rows of a condition with `audio_rows` audio rows and either
+    /// `image_rows` image rows or a video token grid `(frames, height,
+    /// width)`.
+    pub fn rows(&self, audio_rows: u32, image_rows: u64, video_grid: Option<[u32; 3]>) -> u64 {
+        let tiles = |count: u64, size: u32| count.div_ceil(u64::from(size));
+        let visual = match video_grid {
+            Some(grid) => grid
+                .iter()
+                .zip(self.video)
+                .map(|(&extent, size)| tiles(u64::from(extent), size))
+                .product(),
+            None => tiles(image_rows, self.rows),
+        };
+        (tiles(u64::from(audio_rows), self.rows) + visual) * u64::from(self.rows)
+    }
+}
+
+/// Denoiser rows a condition packs into, as `tiles` prescribes: its video
+/// and audio rows without tiles, or the rows of the whole tiles they fill, a
+/// video's in tiles of its `(latent frames, height / 32, width / 32)` token
+/// grid. `None` for a keyframe under tiles, which a region packing does not
+/// hold.
+///
+/// This is the count a denoiser's `make_size` reaches for the same condition
+/// (its `condition_tiles` declare the packing), so admission in the server
+/// and in the worker bounds what the denoiser packs.
+fn packed_rows(
+    tiles: Option<ConditionTiles>,
+    role: ConditionRole,
+    media: &ConditionMedia,
+    video_rows: u64,
+    audio_rows: u32,
+) -> Option<u64> {
+    let Some(tiles) = tiles else {
+        return Some(video_rows + u64::from(audio_rows));
+    };
+    if role.is_keyframe() {
+        return None;
+    }
+    Some(match media {
+        ConditionMedia::Image(_) => tiles.rows(audio_rows, video_rows, None),
+        ConditionMedia::Video { clip, .. } => tiles.rows(
+            audio_rows,
+            0,
+            Some([
+                plan::latent_frames(clip.vae_frames),
+                clip.canvas.height / plan::CANVAS_MULTIPLE,
+                clip.canvas.width / plan::CANVAS_MULTIPLE,
+            ]),
+        ),
+        ConditionMedia::Audio(_) => tiles.rows(audio_rows, 0, None),
+    })
+}
+
 impl VideoCondition {
     /// Denoiser video rows of the condition.
     pub fn video_rows(&self) -> u64 {
         self.latent_units.iter().map(|rows| u64::from(*rows)).sum()
+    }
+
+    /// Denoiser rows the condition packs into, as `tiles` prescribes (see
+    /// [`plan::ConditionPlan::packed_rows`], which counts the same rows
+    /// before the condition is described); `None` for a keyframe under
+    /// tiles.
+    pub fn packed_rows(&self, tiles: Option<ConditionTiles>) -> Option<u64> {
+        packed_rows(
+            tiles,
+            self.role,
+            &self.media,
+            self.video_rows(),
+            self.audio_rows,
+        )
     }
 
     /// Bytes of the RGB24 pixels the video encoder encodes.

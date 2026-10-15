@@ -5,9 +5,9 @@ accept: a ``task``, its ``conditions`` and a ``target`` of short edge, aspect
 ratio and duration. A t2va row carries no conditions; an fl2va or ref2va row
 lists its condition media, which the body names by ``file://`` URI under the
 point's ``video.condition_root``. The canvas and frame count a target
-resolves to follow the model package's request rules
-(``uniserve.models.minimax_h3.processing``), which the server's planner
-shares; validation holds every MP4 to its own request's canvas and frames.
+resolves to follow the request rules the server plans with, which the model
+package calls (``uniserve.models.minimax_h3.processing``); validation holds
+every MP4 to its own request's canvas and frames.
 Media files are read when the request is built, before measurement, and
 inspection uses each request's shape and never runs inside a load slot.
 """
@@ -96,15 +96,17 @@ def target_canvas(
     # rules are imported on first use.
     from uniserve.models.minimax_h3 import processing
 
-    ratio = _named_ratio(task, aspect_ratio)
-    if ratio is None:
-        if task != processing.Task.FL2VA:
-            ratio = processing.DEFAULT_ASPECT_RATIO
-        elif keyframe is None:
+    _named_ratio(task, aspect_ratio)
+    size = processing.named_canvas(
+        processing.Task(task),
+        processing.Target(
+            aspect_ratio=aspect_ratio, short_edge=TARGET_SHORT_EDGE
+        ),
+    )
+    if size is None:
+        if keyframe is None:
             raise ValueError("an fl2va auto target follows its first keyframe")
-        else:
-            ratio = keyframe
-    size = processing.canvas(*ratio)
+        size = processing.canvas(*keyframe)
     return size.width, size.height
 
 

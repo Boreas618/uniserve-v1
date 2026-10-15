@@ -11,8 +11,7 @@ use validator::Validate;
 
 use super::common::Normalizable;
 use uniserve_core::VideoTask;
-
-use crate::serving::video::plan::{ConditionRole, ConditionType};
+use uniserve_core::video::plan::{ConditionType, Role};
 
 /// The seed a request without one uses, as the official reference does.
 pub const DEFAULT_VIDEO_SEED: u64 = 42;
@@ -31,7 +30,7 @@ pub struct VideoCondition {
     /// `data:`, `file://` or `http(s)://` location of the media.
     pub uri: String,
     /// `keyframe` (an image anchoring a generated frame) or `reference`.
-    pub role: ConditionRole,
+    pub role: Role,
     /// The generated frame a keyframe anchors: 0 or -1.
     #[serde(default)]
     pub frame_index: Option<i64>,

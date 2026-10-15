@@ -12,6 +12,7 @@ use base64::Engine as _;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
+use uniserve_core::video::plan::VisionConfig;
 use uniserve_core::{GenerationLimits, GenerationRequest, ImageIngestStep};
 use uniserve_engine::VideoDenoiserInfo;
 use uniserve_server::VideoMediaSettings;
@@ -24,7 +25,6 @@ use uniserve_server::serving::media::{
     ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
 };
 use uniserve_server::serving::video::VideoService;
-use uniserve_server::serving::video::plan::VisionConfig;
 use uniserve_server::serving::{
     InputProcessor, ResponseOptions, ServeRequestId, ServedFeature, chat_image_urls,
 };
