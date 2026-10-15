@@ -75,8 +75,8 @@ pub use storage::{
     AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, BufferBinding, BufferPool,
     CachePlan, CachePlanes, GroupShape, GroupTable, HostBuffers, LatentExport, LatentImport,
     LatentPool, LatentStorage, LatentUpdate, LogprobLayout, OutputBuffer, OutputPool,
-    OutputStorage, PrefixCache, PrefixCacheManager, ProductBuffer, ProductRead, RequestSlots,
-    TablePages, TensorStore, UnitColumn, table_pages,
+    OutputStorage, PrefixCache, PrefixCacheManager, ProductBuffer, ProductRead, ProductStore,
+    RequestSlots, TablePages, UnitColumn, table_pages,
 };
 pub use stream::{CUDAStream, Deferred, EventPool, Fill, Issue, RowFill, Submitter};
 pub use transfer::{

@@ -51,7 +51,7 @@ use crate::executor::Submission;
 use crate::ffi::Device;
 use crate::lane::{Completion, Job};
 use crate::storage::{
-    Metadata, OutputPlacement, PendingImport, PrefixCache, ProductRead, TensorStore, ValueRange,
+    Metadata, OutputPlacement, PendingImport, PrefixCache, ProductRead, ProductStore, ValueRange,
 };
 use crate::transfer::{Notify, Retirement, fetch};
 use crate::{Error, Outcome, Result};
@@ -1248,7 +1248,7 @@ fn consumer_kind(plan: &BatchPlan, product: &TensorRef) -> Result<CallKind> {
         .ok_or_else(|| Error::Invalid("a supplied input product has no consumer".into()))
 }
 
-fn tensors(backend: &WorkerBackend) -> Result<&TensorStore> {
+fn tensors(backend: &WorkerBackend) -> Result<&ProductStore> {
     backend
         .rank_storage()
         .map(|storage| &storage.tensors)

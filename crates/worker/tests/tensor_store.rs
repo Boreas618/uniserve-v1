@@ -13,7 +13,7 @@ use uniserve_worker::ffi::Device;
 use uniserve_worker::storage::memory::StorageView;
 use uniserve_worker::storage::{OutputPlacement, Scalar};
 use uniserve_worker::transfer::{Capacity, TransportKind, TransportOptions, Transports, notify};
-use uniserve_worker::{BufferPool, EventPool, ProductBuffer, Result, TensorStore};
+use uniserve_worker::{BufferPool, EventPool, ProductBuffer, ProductStore, Result};
 
 const CPU: Device = Device::Cpu;
 
@@ -50,8 +50,8 @@ fn store(
     compact: bool,
     request_capacity: usize,
     relay_depth: usize,
-) -> Result<TensorStore> {
-    TensorStore::new(
+) -> Result<ProductStore> {
+    ProductStore::new(
         4,
         1024,
         1024,
@@ -102,7 +102,7 @@ fn read(view: &StorageView) -> Vec<f32> {
 }
 
 fn persistent(
-    store: &TensorStore,
+    store: &ProductStore,
     product: &TensorRef,
     allocation: BufferAllocation,
     region: Option<Vec<Range<u64>>>,
@@ -125,7 +125,7 @@ fn persistent(
 
 /// Write `values` into a bound product and commit it.
 fn publish(
-    store: &TensorStore,
+    store: &ProductStore,
     buffer: &ProductBuffer,
     values: &[f32],
     shape: &[u64],
@@ -154,7 +154,7 @@ fn released_storage_returns_only_after_its_last_reader() -> Result<()> {
     // The released range stays occupied while the lease is open.
     let next = reference(4, 0, WireDType::F32, &[2, 3]);
     assert!(persistent(&store, &next, allocation(&next, 0, 24), None).is_err());
-    let ready = |store: &TensorStore| {
+    let ready = |store: &ProductStore| {
         store.retirement_ready(
             &HashSet::from([product.buffer_id()]),
             &HashSet::new(),
