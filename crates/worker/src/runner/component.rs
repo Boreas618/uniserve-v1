@@ -14,8 +14,8 @@ use crate::config::placement::Capability;
 use crate::config::placement::Placed;
 use crate::cuda_graph::{GraphPool, GraphStorage};
 use crate::ffi::{Device, Handle, Interpreter};
-use crate::lane::Lanes;
 use crate::runner::denoiser::VideoModel;
+use crate::stream::Streams;
 use crate::{Error, Result};
 
 /// A placed video component on this rank.
@@ -70,7 +70,7 @@ pub(crate) struct VideoSetup<'a> {
     pub(crate) capacity: &'a VideoCapacity,
     pub(crate) info: &'a WorkerInfo,
     pub(crate) config: &'a WorkerConfig,
-    pub(crate) lanes: &'a mut Lanes,
+    pub(crate) streams: &'a mut Streams,
     pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
     /// The attention backend the model loaded with.
     pub(crate) attention: String,
@@ -82,13 +82,13 @@ impl VideoSetup<'_> {
     /// which grows to the largest context prepared and keeps what captured
     /// graphs address.
     pub(crate) fn stream(&mut self, kind: MediaCall, device: Device) -> Result<(Stream, Handle)> {
-        let lanes = &mut *self.lanes;
+        let streams = &mut *self.streams;
         let Device::Cuda(index) = device else {
             return Err(Error::Unsupported(
                 "video components compute on CUDA devices".into(),
             ));
         };
-        let forked = lanes.fork_module(CallKind::Media(kind), uniserve_cuda::DeviceId(index))?;
+        let forked = streams.fork_module(CallKind::Media(kind), uniserve_cuda::DeviceId(index))?;
         let stream = forked.stream()?.clone();
         let scratch = Handle::new(
             Interpreter::import("uniserve.bindings.context.Scratch")?.call_values(&[])?,

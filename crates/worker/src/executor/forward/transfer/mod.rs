@@ -40,8 +40,9 @@ use super::inputs::{Inputs, component_device};
 use crate::error::WorkerError;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::Device;
-use crate::lane::{Completion, Job, Lanes};
+use crate::lane::{Completion, Job};
 use crate::storage::OutputPool;
+use crate::stream::Streams;
 use crate::{Error, Result};
 
 pub(crate) use batch::Pending;
@@ -60,22 +61,22 @@ impl TransferRuntime {
     /// of `lanes`, with `queue_depth` batches of at most `max_calls` calls
     /// in flight.
     pub(crate) fn start(
-        lanes: &Lanes,
+        streams: &Streams,
         devices: &[i32],
         kinds: &[CallKind],
         queue_depth: usize,
         max_calls: usize,
     ) -> Result<Self> {
-        let mut streams = HashMap::new();
+        let mut served = HashMap::new();
         for &device in devices {
             for &kind in kinds {
-                if let Some(stream) = lanes.stream_for(kind, DeviceId(device)) {
-                    streams.insert((kind, device), stream.stream()?.clone());
+                if let Some(stream) = streams.stream_for(kind, DeviceId(device)) {
+                    served.insert((kind, device), stream.stream()?.clone());
                 }
             }
         }
         Ok(Self {
-            streams,
+            streams: served,
             // One completion word per call; transfers read nothing back.
             outputs: OutputPool::new(
                 devices.first().copied(),

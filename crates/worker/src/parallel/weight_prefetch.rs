@@ -14,7 +14,7 @@ use super::world::World;
 use crate::config::{Device, WorkerLaunch};
 use crate::cuda_graph::GraphBreaks;
 use crate::ffi::{Function, Handle, Interpreter};
-use crate::lane::Lanes;
+use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::{Error, Result};
 
@@ -639,7 +639,7 @@ impl DwdpManager {
         launch: &WorkerLaunch,
         world: &World,
         model: &LoadedModel,
-        lanes: &Lanes,
+        streams: &Streams,
         node: &str,
     ) -> Result<Option<Self>> {
         let Some(union) = &launch.expert_parallel else {
@@ -651,8 +651,8 @@ impl DwdpManager {
         let Device::Cuda(device) = launch.device() else {
             return Err(Error::Unsupported("DWDP requires CUDA peer memory".into()));
         };
-        let stream = match lanes.lanes() {
-            [] => lanes.preparation(DeviceId(device)),
+        let stream = match streams.lanes() {
+            [] => streams.preparation(DeviceId(device)),
             [lane] => Some(&lane.stream),
             _ => {
                 return Err(Error::Unsupported(

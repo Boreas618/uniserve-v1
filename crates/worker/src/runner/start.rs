@@ -17,7 +17,6 @@ use crate::executor::forward::decodes_video;
 use crate::ffi::{Handle, Interpreter};
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
-use crate::lane::Lanes;
 use crate::runner::ImageSetup;
 use crate::runner::causal_lm::model_dtype;
 use crate::runner::causal_lm::start::TextBounds;
@@ -32,6 +31,7 @@ use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::media::MediaRunner;
 use crate::runner::scratch::Scratches;
 use crate::storage::{ImageLatents, LatentPool, LatentStorage, OutputPool};
+use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::worker::RankStorage;
 use crate::{Error, Result};
@@ -98,7 +98,7 @@ pub(crate) struct Startup<'a> {
     /// Host tasks the rank admits at once.
     pub(crate) host_capacity: usize,
     pub(crate) model: &'a LoadedModel,
-    pub(crate) lanes: &'a Lanes,
+    pub(crate) streams: &'a Streams,
     pub(crate) storage: &'a RankStorage,
     pub(crate) latent: Option<LatentPlan>,
     pub(crate) components: &'a Components,
@@ -119,11 +119,11 @@ struct Target {
 }
 
 /// The lane stream serving `kind` on `device`.
-fn stream(lanes: &Lanes, kind: CallKind, device: Device) -> Result<Option<Stream>> {
+fn stream(streams: &Streams, kind: CallKind, device: Device) -> Result<Option<Stream>> {
     let Some(index) = device.cuda_index() else {
         return Ok(None);
     };
-    let stream = lanes
+    let stream = streams
         .stream_for(kind, DeviceId(index))
         .ok_or(Error::State("image calls have no execution stream"))?;
     Ok(Some(stream.stream()?.clone()))
@@ -213,7 +213,7 @@ impl ImageOwners {
                             path: call.path.clone(),
                             kind,
                             device: placed.device,
-                            stream: stream(startup.lanes, kind, placed.device)?,
+                            stream: stream(startup.streams, kind, placed.device)?,
                         });
                     }
                 }

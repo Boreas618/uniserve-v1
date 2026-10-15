@@ -1,4 +1,5 @@
-//! Execution streams and the events that order work across them.
+//! Execution streams, the rank's set of them, and the events that order work
+//! across them.
 
 mod events;
 mod issue;
@@ -8,8 +9,12 @@ pub use events::{Deferred, EventPool, Submitter};
 pub(crate) use issue::HostFunction;
 pub use issue::{Fill, Issue, RowFill};
 
+use crossbeam_channel::{Receiver, Sender};
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
+use uniserve_ipc::CallKind;
 
+use crate::config::{Device, WorkerConfig};
+use crate::lane::{Completion, JobId, JobQueues, Lane};
 use crate::{Error, Result};
 
 /// The stream a numerical binding names by its integer handle.
@@ -160,5 +165,217 @@ impl Drop for CUDAStream {
         if self.close(false).is_err() {
             let _ = self.close(true);
         }
+    }
+}
+
+/// Every stream of a rank: its lanes', each device's preparation stream for
+/// startup work outside any lane, the full-device streams of its other
+/// devices, and the module and microbatch streams capability runtimes fork
+/// from a lane. They close in dependency order: preparation, modules,
+/// microbatches, lanes, devices, each newest first.
+pub struct Streams {
+    /// The configured lanes, or the one lane of a rank without them.
+    lanes: Vec<Lane>,
+    /// Where the lanes post their completions; the rank's job queues take
+    /// them from here, and give the posting end to the Python thread's
+    /// work.
+    posted: Sender<(JobId, Completion)>,
+    completions: Receiver<(JobId, Completion)>,
+    /// The full-device streams of the other CUDA devices of a rank without
+    /// configured lanes.
+    devices: Vec<CUDAStream>,
+    preparation: Vec<CUDAStream>,
+    modules: Vec<CUDAStream>,
+    microbatches: Vec<CUDAStream>,
+}
+
+impl Streams {
+    /// Create the streams of `devices`.
+    pub fn create(config: &WorkerConfig, devices: &[Device]) -> Result<Self> {
+        let cuda: Vec<DeviceId> = devices
+            .iter()
+            .filter_map(|device| device.cuda_index().map(DeviceId))
+            .collect();
+        let (posted, completions) = crossbeam_channel::unbounded();
+        let mut streams = Self {
+            lanes: Vec::new(),
+            posted: posted.clone(),
+            completions,
+            devices: Vec::new(),
+            preparation: Vec::new(),
+            modules: Vec::new(),
+            microbatches: Vec::new(),
+        };
+        if cuda.is_empty() {
+            return Ok(streams);
+        }
+        if !config.lanes.is_empty() {
+            let [device] = cuda[..] else {
+                return Err(Error::Unsupported(
+                    "execution lanes require one physical device".into(),
+                ));
+            };
+            if config.expert_microbatches > 1 && config.lanes.len() > 1 {
+                return Err(Error::Unsupported(
+                    "expert parallelism runs on exactly one execution lane".into(),
+                ));
+            }
+            let counts: Vec<u32> = config
+                .lanes
+                .iter()
+                .map(|lane| u32::try_from(lane.sm_budget).unwrap_or(u32::MAX))
+                .collect();
+            let partitions = CUDAStream::partition(device, &counts)?;
+            for (index, (config, stream)) in
+                config.lanes.iter().cloned().zip(partitions).enumerate()
+            {
+                streams
+                    .lanes
+                    .push(Lane::start(index, Some(config), stream, posted.clone())?);
+            }
+        } else {
+            // The primary device leads `devices`.
+            for (index, &device) in cuda.iter().enumerate() {
+                let stream = CUDAStream::create(device)?;
+                if index == 0 {
+                    streams
+                        .lanes
+                        .push(Lane::start(0, None, stream, posted.clone())?);
+                } else {
+                    streams.devices.push(stream);
+                }
+            }
+        }
+        for &device in &cuda {
+            streams.preparation.push(CUDAStream::create(device)?);
+        }
+        Ok(streams)
+    }
+
+    /// The configured lanes; empty for a rank without them.
+    pub fn lanes(&self) -> &[Lane] {
+        if self.configured() { &self.lanes } else { &[] }
+    }
+
+    /// Whether the lanes are configured SM partitions.
+    fn configured(&self) -> bool {
+        self.lanes.first().is_some_and(|lane| lane.config.is_some())
+    }
+
+    /// The job queue of every lane with the call kinds it serves, for the
+    /// executor, which submits each forward to its lane.
+    pub fn job_queues(&self) -> JobQueues {
+        JobQueues::of(&self.lanes, self.posted.clone(), self.completions.clone())
+    }
+
+    /// The stream of the lane serving `kind`, or `device`'s full-device
+    /// stream without configured lanes.
+    pub fn stream_for(&self, kind: CallKind, device: DeviceId) -> Option<&CUDAStream> {
+        if self.configured() {
+            return self
+                .lanes
+                .iter()
+                .find(|lane| lane.serves(kind))
+                .map(|lane| &lane.stream);
+        }
+        self.full_device_streams()
+            .find(|stream| stream.device() == device)
+    }
+
+    /// The full-device streams of a rank without configured lanes.
+    fn full_device_streams(&self) -> impl Iterator<Item = &CUDAStream> {
+        self.lanes
+            .iter()
+            .filter(|_| !self.configured())
+            .map(|lane| &lane.stream)
+            .chain(&self.devices)
+    }
+
+    /// The startup preparation stream of `device`.
+    pub fn preparation(&self, device: DeviceId) -> Option<&CUDAStream> {
+        self.preparation
+            .iter()
+            .find(|stream| stream.device() == device)
+    }
+
+    /// Fork the stream serving `kind` for a module that runs beside it.
+    /// With lanes, exactly one lane must serve the kind.
+    pub fn fork_module(&mut self, kind: CallKind, device: DeviceId) -> Result<&CUDAStream> {
+        let matching: Vec<&CUDAStream> = if self.configured() {
+            self.lanes
+                .iter()
+                .filter(|lane| lane.serves(kind))
+                .map(|lane| &lane.stream)
+                .collect()
+        } else {
+            self.full_device_streams()
+                .filter(|stream| stream.device() == device)
+                .collect()
+        };
+        let [origin] = matching[..] else {
+            return Err(Error::Invalid(format!(
+                "{} is served by {} execution lanes; a module stream needs exactly one",
+                kind.as_str(),
+                matching.len()
+            )));
+        };
+        let stream = origin.fork()?;
+        self.modules.push(stream);
+        self.modules
+            .last()
+            .ok_or(Error::State("module stream was not registered"))
+    }
+
+    /// Fork the first lane (or device stream) for one more microbatch.
+    pub fn fork_microbatch(&mut self) -> Result<&CUDAStream> {
+        let origin = self
+            .lanes
+            .first()
+            .map(|lane| &lane.stream)
+            .ok_or(Error::State("a microbatch stream requires a CUDA lane"))?;
+        let stream = origin.fork()?;
+        self.microbatches.push(stream);
+        self.microbatches
+            .last()
+            .ok_or(Error::State("microbatch stream was not registered"))
+    }
+
+    /// The owned stream whose handle is `handle`.
+    pub fn owner(&self, handle: usize) -> Option<&CUDAStream> {
+        self.iter()
+            .find(|stream| stream.handle().is_ok_and(|raw| raw == handle))
+    }
+
+    /// Every owned stream, for synchronization before teardown.
+    pub fn iter(&self) -> impl Iterator<Item = &CUDAStream> {
+        self.preparation
+            .iter()
+            .chain(&self.modules)
+            .chain(&self.microbatches)
+            .chain(self.lanes.iter().map(|lane| &lane.stream))
+            .chain(&self.devices)
+    }
+
+    /// Close the streams in dependency order: preparation, modules,
+    /// microbatches, then lanes, each newest first. Attempts every stream
+    /// before returning the first failure. No job is in flight unless the
+    /// close is aborted: the worker drained the lanes
+    /// ([`JobQueues::drain`]).
+    pub fn close(&mut self, aborted: bool) -> Result<()> {
+        let mut failure = None;
+        let mut close = |stream: &mut CUDAStream| {
+            if let Err(error) = stream.close(aborted) {
+                failure.get_or_insert(error);
+            }
+        };
+        self.preparation.iter_mut().rev().for_each(&mut close);
+        self.modules.iter_mut().rev().for_each(&mut close);
+        self.microbatches.iter_mut().rev().for_each(&mut close);
+        self.lanes
+            .iter_mut()
+            .rev()
+            .for_each(|lane| close(&mut lane.stream));
+        self.devices.iter_mut().rev().for_each(&mut close);
+        failure.map_or(Ok(()), Err)
     }
 }
