@@ -14,6 +14,7 @@
 //! "current" stream. All validation precedes the first device write, and
 //! failed or unknown device completions keep their storage retained.
 
+pub(super) mod block_tables;
 pub(super) mod manager;
 pub(super) mod plan;
 pub(super) mod planes;
@@ -25,10 +26,11 @@ use tvm_ffi::Any;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{BlockTable, BufferId, CacheTransfer, RequestKey, Wake};
 
+use self::block_tables::{BlockTableStorage, BlockTables, GroupTable};
 use self::plan::{CACHE, CachePlan};
 use self::planes::{CachePlanes, UnitColumn};
+use super::PrefixCacheManager;
 use super::memory::StorageView;
-use super::{BlockTableStorage, BlockTables, GroupTable, PrefixCacheManager};
 use crate::ffi::{Handle, Interpreter};
 use crate::host::HostLane;
 use crate::stream::Issue;
