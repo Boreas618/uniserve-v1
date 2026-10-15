@@ -16,7 +16,6 @@ mod cuda_graph;
 pub mod error;
 pub mod executor;
 pub mod ffi;
-mod handoff;
 mod host;
 pub mod lane;
 pub mod launch;
