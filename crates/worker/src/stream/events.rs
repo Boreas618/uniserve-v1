@@ -28,10 +28,12 @@ pub(crate) struct Deferral {
 }
 
 /// Starts the job that completes once the events it is given completed
-/// ([`crate::lane::JobQueues::after`]) and names it. The device is the one
-/// whose notification stream waits for the events. It is called with the
-/// pool locked, so it does not use the pool.
-pub type Submitter = Box<dyn Fn(DeviceId, Vec<Arc<Event>>) -> Result<JobId> + Send + Sync>;
+/// ([`crate::lane::JobQueues::after`]) and names it: on `lane` when the
+/// events' records are queued there, on any lane otherwise. The device is
+/// the one whose notification stream waits for the events. It is called
+/// with the pool locked, so it does not use the pool.
+pub type Submitter =
+    Box<dyn Fn(DeviceId, Option<usize>, Vec<Arc<Event>>) -> Result<JobId> + Send + Sync>;
 
 /// What starts the job of deferred work a submitted job carried.
 type Start<'a> = dyn Fn(DeviceId, Vec<Arc<Event>>) -> Result<JobId> + 'a;
@@ -49,6 +51,8 @@ struct ActiveEvent {
     references: usize,
     /// Whether the lease was recorded, at once or into a job.
     recorded: bool,
+    /// The lane and job whose queued record of the lease is not made yet.
+    queued: Option<(usize, JobId)>,
 }
 
 struct State {
@@ -56,6 +60,9 @@ struct State {
     active: HashMap<usize, ActiveEvent>,
     /// Deferred work by the job whose completion runs it.
     deferred: HashMap<JobId, Vec<Deferral>>,
+    /// The leases whose records each submitted job queued, until it
+    /// completed.
+    queued: HashMap<JobId, Vec<usize>>,
     /// Deferred work whose job is still to be started: it was deferred on
     /// another thread than the submitter's, or before a submitter was
     /// installed.
@@ -106,6 +113,7 @@ impl Default for EventPool {
                 available: HashMap::new(),
                 active: HashMap::new(),
                 deferred: HashMap::new(),
+                queued: HashMap::new(),
                 unsubmitted: Vec::new(),
                 status: Status::Open,
                 wake: None,
@@ -174,6 +182,7 @@ impl EventPool {
                 device,
                 references: 0,
                 recorded: false,
+                queued: None,
             },
         );
         Ok(event)
@@ -260,7 +269,7 @@ impl EventPool {
 
         let here = std::thread::current().id();
         if matches!(&state.submitter, Some((thread, _)) if *thread == here) {
-            return submit(&mut state, vec![deferral], None);
+            return submit_waiting(&mut state, deferral);
         }
         state.unsubmitted.push(deferral);
         let wake = state.wake.clone();
@@ -307,6 +316,35 @@ impl EventPool {
         }
         let deferrals = std::mem::take(&mut state.unsubmitted);
         submit(&mut state, deferrals, None)
+    }
+
+    /// Note that `job`, submitted to `lane`, queued the records of
+    /// `events`: deferred work waiting on them waits on that lane until the
+    /// job completed ([`Self::performed`]).
+    pub(crate) fn queued(&self, job: JobId, lane: usize, events: &[Arc<Event>]) {
+        let mut state = self.lock();
+        let mut keys = Vec::with_capacity(events.len());
+        for event in events {
+            if let Some(active) = state.active.get_mut(&key(event)) {
+                active.queued = Some((lane, job));
+                keys.push(key(event));
+            }
+        }
+        if !keys.is_empty() {
+            state.queued.insert(job, keys);
+        }
+    }
+
+    /// Note that `job` completed: the records it queued are made.
+    pub(crate) fn performed(&self, job: JobId) {
+        let mut state = self.lock();
+        for key in state.queued.remove(&job).unwrap_or_default() {
+            if let Some(active) = state.active.get_mut(&key)
+                && active.queued.is_some_and(|(_, queued)| queued == job)
+            {
+                active.queued = None;
+            }
+        }
     }
 
     /// Whether `job` is one that deferred work waits for.
@@ -472,27 +510,28 @@ impl Drop for EventPool {
     }
 }
 
-/// Start one job that waits for the events of all of `deferrals` and keep
-/// them under its name. `start` starts it behind the job that carried them;
-/// without one the installed submitter does. Work whose job could not be
+/// Start the jobs that wait for the events of `deferrals` and keep the work
+/// under their names. `start` starts one job behind the job that carried
+/// them, on its lane; without one the installed submitter starts one job
+/// per lane whose queued records the events wait for (one on any lane when
+/// every record is made), and a deferral whose events span several lanes
+/// runs once all of its jobs completed. Work whose job could not be
 /// started stays unsubmitted, so shutdown still runs it.
 fn submit(state: &mut State, deferrals: Vec<Deferral>, start: Option<&Start<'_>>) -> Result<()> {
+    let Some(start) = start else {
+        let mut result = Ok(());
+        for deferral in deferrals {
+            result = result.and(submit_waiting(state, deferral));
+        }
+        return result;
+    };
     let events: Vec<Arc<Event>> = deferrals
         .iter()
         .flat_map(|deferral| deferral.events.iter().cloned())
         .collect();
-    // The notification stream of the first event's device waits for all
-    // of them: a stream may wait for another device's event.
-    let device = events
-        .first()
-        .and_then(|event| state.active.get(&key(event)))
-        .map(|active| DeviceId(active.device));
-
-    let started = match (device, start, &state.submitter) {
-        (None, _, _) => Err(invariant("deferred work waits on no active device event")),
-        (Some(device), Some(start), _) => start(device, events),
-        (Some(device), None, Some((_, submitter))) => submitter(device, events),
-        (Some(_), None, None) => Err(invariant("deferred work has no submitter")),
+    let started = match device(state, &events) {
+        Some(device) => start(device, events),
+        None => Err(invariant("deferred work waits on no active device event")),
     };
     match started {
         Ok(job) => {
@@ -504,6 +543,94 @@ fn submit(state: &mut State, deferrals: Vec<Deferral>, start: Option<&Start<'_>>
             Err(error)
         }
     }
+}
+
+/// The device whose notification stream waits for `events`: the first
+/// event's (a stream may wait for another device's event).
+fn device(state: &State, events: &[Arc<Event>]) -> Option<DeviceId> {
+    events
+        .first()
+        .and_then(|event| state.active.get(&key(event)))
+        .map(|active| DeviceId(active.device))
+}
+
+/// Start, through the installed submitter, the jobs one deferral made
+/// outside a recording waits for: one per lane whose queued records its
+/// events wait for, each waiting for that lane's events. The deferral's
+/// work runs once every one of them completed.
+fn submit_waiting(state: &mut State, deferral: Deferral) -> Result<()> {
+    let mut lanes: Vec<(Option<usize>, Vec<Arc<Event>>)> = Vec::new();
+    for event in &deferral.events {
+        let lane = state
+            .active
+            .get(&key(event))
+            .and_then(|active| active.queued.map(|(lane, _)| lane));
+        match lanes.iter_mut().find(|(queued, _)| *queued == lane) {
+            Some((_, events)) => events.push(Arc::clone(event)),
+            None => lanes.push((lane, vec![Arc::clone(event)])),
+        }
+    }
+    // Events whose records are made join any lane's job.
+    if lanes.len() > 1
+        && let Some(position) = lanes.iter().position(|(lane, _)| lane.is_none())
+    {
+        let (_, made) = lanes.remove(position);
+        lanes[0].1.extend(made);
+    }
+    let Some((_, submitter)) = &state.submitter else {
+        state.unsubmitted.push(deferral);
+        return Err(invariant("deferred work has no submitter"));
+    };
+
+    let Deferral { events, owner } = deferral;
+    let mut started = Vec::with_capacity(lanes.len());
+    let mut failure = None;
+    for (lane, waited) in &lanes {
+        let job = match device(state, waited) {
+            Some(device) => submitter(device, *lane, waited.clone()),
+            None => Err(invariant("deferred work waits on no active device event")),
+        };
+        match job {
+            Ok(job) => started.push(job),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    if let Some(error) = failure {
+        // Jobs already started wait for nothing that runs; the work is kept
+        // whole for shutdown.
+        state.unsubmitted.push(Deferral { events, owner });
+        return Err(error);
+    }
+
+    // Each job releases its own events' references at its completion; the
+    // last to complete runs the work.
+    let owner = Arc::new(Mutex::new((started.len(), Some(owner))));
+    for ((_, waited), job) in lanes.into_iter().zip(started) {
+        let owner = Arc::clone(&owner);
+        let part: Deferred = Box::new(move || {
+            let mut joined = owner.lock().unwrap_or_else(PoisonError::into_inner);
+            joined.0 -= 1;
+            match (joined.0, joined.1.take()) {
+                (0, Some(owner)) => {
+                    drop(joined);
+                    owner()
+                }
+                (_, owner) => {
+                    joined.1 = owner;
+                    Ok(())
+                }
+            }
+        });
+        state.deferred.entry(job).or_default().push(Deferral {
+            events: waited,
+            owner: part,
+        });
+    }
+    let _ = events;
+    Ok(())
 }
 
 /// Run every owner and return the first failure.
@@ -608,7 +735,7 @@ mod tests {
         let events = EventPool::new();
         let jobs = JobQueues::default();
         let lane = jobs.clone();
-        events.set_submitter(Some(Box::new(move |device, events| {
+        events.set_submitter(Some(Box::new(move |device, _, events| {
             lane.after(DECODE, device, events)
         })));
         (events, jobs)
@@ -657,6 +784,70 @@ mod tests {
         assert!(!events.pending() && !events.owns(job));
         // The work's reference went with it: the lease is returned.
         assert!(events.device(&event).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_work_waits_on_the_lanes_that_queued_its_records() -> Result<()> {
+        let events = EventPool::new();
+        let jobs = JobQueues::default();
+        // The lane each waiting job was asked for, in order.
+        let lanes = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::clone(&lanes);
+        let queues = jobs.clone();
+        events.set_submitter(Some(Box::new(move |device, lane, events| {
+            asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(lane);
+            queues.after(DECODE, device, events)
+        })));
+        let asked = || std::mem::take(&mut *lanes.lock().unwrap_or_else(PoisonError::into_inner));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let first = fence(&events)?;
+        let second = fence(&events)?;
+        // Two submitted jobs that queued records; their own completions
+        // are not what the work waits for.
+        let recording = jobs.call(Job::new(), false);
+        let other = jobs.call(Job::new(), false);
+        while jobs.take().is_some() {}
+
+        // A record queued on lane 1: the work waits there.
+        events.queued(recording, 1, std::slice::from_ref(&first));
+        events.defer(vec![Arc::clone(&first)], counting(&runs))?;
+        assert_eq!(asked(), vec![Some(1)]);
+        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        events.complete(job, completion)?;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+        // Records queued on two lanes: one waiting job each, and the work
+        // runs once both completed.
+        let first = fence(&events)?;
+        events.queued(recording, 1, std::slice::from_ref(&first));
+        events.queued(other, 0, std::slice::from_ref(&second));
+        events.defer(
+            vec![Arc::clone(&first), Arc::clone(&second)],
+            counting(&runs),
+        )?;
+        let mut waited = asked();
+        waited.sort();
+        assert_eq!(waited, vec![Some(0), Some(1)]);
+        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        events.complete(job, completion)?;
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
+        events.complete(job, completion)?;
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+
+        // Once the recording jobs completed, their records are made: any
+        // lane waits.
+        events.performed(recording);
+        events.performed(other);
+        let third = fence(&events)?;
+        events.queued(recording, 1, std::slice::from_ref(&third));
+        events.performed(recording);
+        events.defer(vec![third], counting(&runs))?;
+        assert_eq!(asked(), vec![None]);
         Ok(())
     }
 
