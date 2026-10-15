@@ -1,4 +1,4 @@
-"""The stub model read and loaded on the host as a rank loads a model."""
+"""Read and load a model as a rank does; by default the stub on the host."""
 
 import json
 
@@ -21,7 +21,7 @@ LOCAL = {
 
 
 def read_config(**overrides):
-    """Read the stub model's configuration as a rank does."""
+    """Read a model's configuration as a rank does; the stub's by default."""
     arguments = {
         "stub": True,
         "path": None,
