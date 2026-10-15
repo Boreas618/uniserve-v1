@@ -14,38 +14,58 @@
 //! - **Cache install** (`TransferMode::CacheInstall`): each call adopts the cache
 //!   import its batch prepared into its slot's pages ([`prefix_cache`]).
 //!
-//! A batch is jobs of its lane ([`forward`], [`complete`], see [`batch`]):
-//! its calls bind their outputs, a first job reads the host predicates that
-//! skip calls, the last job carries the transfers, and every owner commits
-//! together at that job's completion. Cache transfers run on the stream of the
+//! A batch is at most two jobs of its lane ([`forward`], [`complete`]) on
+//! the shared batch skeleton ([`crate::executor::batch`]). The first exists
+//! when a call has a host-gated predicate: it reads them, and a false one
+//! skips its call, which only publishes a false completion flag. The last
+//! job carries everything the batch issues: the start of its output lease,
+//! the completion flags, the transfers with their exports, the readers'
+//! fences and the lease's seal.
+//!
+//! The completion of that job is the batch's commit point. Exports are
+//! located only there, so nothing of an export reaches another process
+//! before the device work it describes is complete. Every owner's update is
+//! then validated (products and their exports, cache exports and installs,
+//! pending calls) and they become visible together. A failure before that
+//! point retires everything the batch reserved, also from the job's
+//! completion on: the job still carries what the batch recorded before it
+//! failed (cache table installs and unit resets do their host bookkeeping
+//! when recorded, so their device work follows), and an export is revoked
+//! only after the copies into it ran. Of an export that failed itself the
+//! job keeps only the event operations ([`crate::stream::Issue::attempt`]).
+//! A failure after the commit point is fatal. Cache transfers run on the stream of the
 //! component's text prefill, ordered with the text batches that read and
 //! write the same pages; tensor transfers run on the stream serving them on
 //! the component's device.
 
-mod batch;
 pub(crate) mod latents;
 pub(crate) mod prefix_cache;
 mod tensor;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{Batch as BatchPlan, BufferId, CallKind, RequestKey, TransferMode};
+use uniserve_ipc::{
+    Batch as BatchPlan, BufferId, CallKind, ForwardStats, RequestKey, TransferMode,
+};
 
 use super::backend::{WorkerBackend, WorkerBatch};
-use super::batch::Stage;
+use super::batch::{Batch, Failure, Launched, Opening, Stage, fail, lock};
+use super::image::ImageParts;
 use super::inputs::{Inputs, component_device};
+use super::products::Publications;
 use crate::error::WorkerError;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::Device;
-use crate::lane::{Completion, Job};
-use crate::storage::OutputPool;
+use crate::lane::{Completion, Job, Recorder};
+use crate::request::RequestPool;
+use crate::storage::{OutputPool, ProductBuffer, ProductExport};
 use crate::stream::Streams;
+use crate::worker::RankStorage;
 use crate::{Error, Result};
-
-pub(crate) use batch::Pending;
-use batch::{Failure, Opening, TransferBatch, fatal};
+use latents::PendingExport;
+use prefix_cache::{Exporting, Installation, Published};
 
 /// The transfer runtime of a rank: the lane streams its transfers and
 /// imports run on, and its output storage.
@@ -152,6 +172,9 @@ impl RequestStorage for TransferRuntime {
     }
 }
 
+/// The step a transfer batch's failure is reported in.
+const PHASE: &str = "transfer batch";
+
 /// Whether `kind` transfers prefix cache, on the stream of the component's text
 /// prefill.
 fn transfers_cache(kind: CallKind) -> bool {
@@ -220,6 +243,7 @@ fn open(
         plan,
         device,
         job.on(stream),
+        |_| true,
     )
 }
 
@@ -242,20 +266,35 @@ fn record(
     let mut parts = backend.parts();
     let (Some(runtime), Some(storage)) = (parts.transfer, parts.storage) else {
         let error = Error::Unsupported("transfers require rank storage".into());
-        return Pending::Discarding(None, error.into());
+        return Pending::Discarding(None, Failure::new(PHASE)(error));
     };
-    let mut batch = match TransferBatch::begin(
+    // One completion word per call; transfers read nothing back.
+    let calls = plan.calls.len();
+    let leased = Batch::lease(
         opening,
         &mut runtime.outputs,
-        storage,
-        parts.requests,
-        plan,
+        calls,
+        stream.cloned(),
         device,
-        stream,
+        &storage.events,
         job,
-    ) {
-        Ok(batch) => batch,
-        Err(error) => return Pending::Discarding(None, error.into()),
+    );
+    let mut batch = match leased {
+        Ok(leased) => TransferBatch {
+            storage,
+            requests: parts.requests,
+            plan,
+            job,
+            stream,
+            recorded: Recorded {
+                batch: leased,
+                products: VecDeque::new(),
+                versions: VecDeque::new(),
+                exports: VecDeque::new(),
+                installations: Vec::new(),
+            },
+        },
+        Err(error) => return Pending::Discarding(None, Failure::new(PHASE)(error)),
     };
 
     let result = (|| -> Result<()> {
@@ -309,10 +348,10 @@ pub(crate) fn forward<'a>(
 
     let job = Job::new();
     let next = match placement(backend, plan, kind) {
-        Err(error) => Pending::Discarding(None, error.into()),
+        Err(error) => Pending::Discarding(None, Failure::new(PHASE)(error)),
         Ok((device, stream)) => match state {
             None => match open(backend, plan, kind, device, stream.as_ref(), &job) {
-                Ok(opening) if opening.predicated() => Pending::Predicates(opening),
+                Ok(opening) if opening.reads_predicates() => Pending::Predicates(opening),
                 Ok(opening) => record(
                     backend,
                     plan,
@@ -323,7 +362,7 @@ pub(crate) fn forward<'a>(
                     stream.as_ref(),
                     &job,
                 ),
-                Err(error) => Pending::Discarding(None, error.into()),
+                Err(error) => Pending::Discarding(None, Failure::new(PHASE)(error)),
             },
             Some(Pending::Opened(opening)) => record(
                 backend,
@@ -372,11 +411,11 @@ pub(crate) fn complete(
     let next = match (state, completed) {
         // A predicate that could not be read fails the batch, which has
         // reserved nothing yet.
-        (Some(Pending::Predicates(_)), Err(error)) => Pending::Failed(error.into()),
+        (Some(Pending::Predicates(_)), Err(error)) => Pending::Failed(Failure::new(PHASE)(error)),
         (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
             match opening.predicates(&mut completion) {
                 Ok(()) => Pending::Opened(opening),
-                Err(error) => Pending::Failed(error.into()),
+                Err(error) => Pending::Failed(Failure::new(PHASE)(error)),
             }
         }
         (Some(Pending::Committing(recorded)), completed) => {
@@ -415,7 +454,7 @@ pub(crate) fn complete(
             // and the rank cannot reuse it safely.
             Pending::Failed(match completed.map(drop).and(retired) {
                 Ok(()) => failure,
-                Err(cleanup) => fatal(cleanup),
+                Err(cleanup) => Failure::fatal(PHASE)(cleanup),
             })
         }
         (state, _) => {
@@ -430,20 +469,300 @@ pub(crate) fn complete(
     Ok(())
 }
 
-/// Report a failed batch: a failure past its commit point stops the rank,
-/// any other completes the batch with its calls failed.
-fn fail(
-    backend: &mut WorkerBackend,
-    batch: &mut WorkerBatch,
-    failure: Failure,
-) -> std::result::Result<(), WorkerError> {
-    batch.set_stage(Stage::Done);
-    if failure.committed {
-        // Products, cache directories and pending calls may already be
-        // visible; the rank cannot roll them back.
-        let mut error = WorkerError::classify(failure.error, Some("transfer batch"));
-        error.fatal = true;
-        return Err(error);
+/// A transfer batch between two of its jobs.
+pub(crate) enum Pending {
+    /// The job on the lane reads the batch's host-gated predicates.
+    Predicates(Opening),
+    /// The predicates are known: the batch reserves, transfers and seals
+    /// next.
+    Opened(Opening),
+    /// The job on the lane is the batch's last: its completion commits the
+    /// batch.
+    Committing(Box<Recorded>),
+    /// The job on the lane carries what the failed batch recorded: its
+    /// completion retires what the batch reserved, if anything.
+    Discarding(Option<Box<Recorded>>, Failure),
+    /// The batch failed and holds nothing: its calls are reported next.
+    Failed(Failure),
+}
+
+/// What a batch keeps from the recording of its last job to that job's
+/// completion: the batch, and the exports whose locations exist once the
+/// job was performed.
+pub(crate) struct Recorded {
+    pub(super) batch: Batch,
+    /// Product exports, each with its call and the write it publishes.
+    pub(super) products: VecDeque<(usize, ProductBuffer, ProductExport)>,
+    /// Trajectory versions exported from the latent pool, with their calls.
+    pub(super) versions: VecDeque<(usize, PendingExport)>,
+    /// Cache exports, and the installs resident once the batch commits.
+    pub(super) exports: VecDeque<Exporting>,
+    pub(super) installations: Vec<Installation>,
+}
+
+/// What a batch's exports became at its job's completion.
+#[derive(Default)]
+struct Located {
+    /// Product exports, registered once the batch commits.
+    publications: Publications,
+    /// Trajectory versions, released from the latent pool if the batch
+    /// fails before committing.
+    versions: Vec<BufferId>,
+    published: Vec<Published>,
+}
+
+/// A transfer batch recording its last job: its borrowed owners and what it
+/// reserved.
+pub(super) struct TransferBatch<'a> {
+    pub(super) storage: &'a mut RankStorage,
+    pub(super) requests: &'a mut RequestPool,
+    pub(super) plan: &'a BatchPlan,
+    /// The job everything the batch issues is recorded into, and the
+    /// stream it issues on.
+    job: &'a Job,
+    stream: Option<&'a Stream>,
+    pub(super) recorded: Recorded,
+}
+
+impl<'a> TransferBatch<'a> {
+    /// Where the batch issues its stream work: its job.
+    pub(super) fn issue(&self) -> Recorder<'a> {
+        self.job.on(self.stream)
     }
-    super::batch::fail(backend, batch, failure.error, "transfer batch")
+
+    /// The device the batch's products live on.
+    pub(super) fn target(&self) -> crate::ffi::Device {
+        self.recorded.batch.target()
+    }
+
+    /// Indices of the calls that execute.
+    pub(super) fn active(&self) -> Vec<usize> {
+        self.recorded.batch.active()
+    }
+
+    /// Request slots of the batch's calls, for relayed outputs.
+    pub(super) fn slots(&self) -> HashMap<RequestKey, usize> {
+        self.recorded.batch.slots(self.plan)
+    }
+
+    /// Bind every call's completion flag; skipped calls publish false.
+    fn bind_flags(&mut self) -> Result<()> {
+        self.recorded
+            .batch
+            .bind_flags(self.plan, &self.storage.tensors, self.job)
+    }
+
+    /// Record the end of the batch's device work: its readers' fences, the
+    /// completion flags of the executed calls and the seal of its lease.
+    /// The updates that depend on no export's locations are validated here;
+    /// the others at the job's completion ([`Recorded::commit`]).
+    fn seal(&mut self) -> Result<()> {
+        let batch = &mut self.recorded.batch;
+        // A copy's read ends at the fence of the write it fed.
+        let after: Vec<ProductBuffer> = batch
+            .writes
+            .iter()
+            .filter(|write| {
+                batch.calls.iter().all(|state| {
+                    state
+                        .completion_write
+                        .as_ref()
+                        .is_none_or(|flag| flag.id() != write.id())
+                })
+            })
+            .cloned()
+            .collect();
+        batch.end_reads(&self.storage.tensors, self.job, &after)?;
+        batch.set_flags(&self.storage.tensors, self.job)?;
+        self.storage.tensors.validate_writes(&batch.writes)?;
+        batch.seal(&self.storage.events, self.job)?;
+        self.requests
+            .validate_pending(&Batch::<()>::pending(self.plan))
+    }
+
+    /// End the recording after `result`. A failed batch still records what
+    /// ends its device work (the fences of its reads, the seal of its
+    /// lease), so the storage they guard returns once its job ran.
+    fn end(self, result: Result<()>) -> (Recorded, Option<Failure>) {
+        let Err(error) = result else {
+            return (self.recorded, None);
+        };
+        let mut recorded = self.recorded;
+        let batch = &mut recorded.batch;
+        let completed = batch.end_reads(&self.storage.tensors, self.job, &[]);
+        let sealed = if lock(&batch.buffer).sealed() {
+            Ok(())
+        } else {
+            batch.seal(&self.storage.events, self.job)
+        };
+        let failure = match completed.and(sealed) {
+            Ok(()) => Failure::new(PHASE)(error),
+            // Storage the cleanup could not fence stays reserved; the rank
+            // cannot reuse it safely.
+            Err(cleanup) => Failure::fatal(PHASE)(cleanup),
+        };
+        (recorded, Some(failure))
+    }
+}
+
+impl Recorded {
+    /// Apply the completion of the batch's last job: locate its exports,
+    /// validate every owner's update, then commit them together.
+    fn commit(
+        mut self,
+        storage: &mut RankStorage,
+        requests: &mut RequestPool,
+        mut image: Option<&mut ImageParts<'_>>,
+        plan: &BatchPlan,
+        completed: Result<()>,
+    ) -> std::result::Result<Launched, Failure> {
+        let mut located = Located::default();
+        let accepted = completed
+            .and_then(|()| self.locate(storage, image.as_deref_mut(), &mut located))
+            .and_then(|()| self.validate(storage, plan, &located));
+        if let Err(error) = accepted {
+            return Err(match self.retire(storage, image, located) {
+                Ok(()) => Failure::new(PHASE)(error),
+                // Storage the cleanup could not retire stays reserved; the
+                // rank cannot reuse it safely.
+                Err(cleanup) => Failure::fatal(PHASE)(cleanup),
+            });
+        }
+
+        // Every owner accepted its update. Any failure from here is fatal.
+        let fatal = Failure::fatal(PHASE);
+        let Located {
+            mut publications,
+            published,
+            ..
+        } = located;
+        self.batch.commit(plan, &storage.tensors, requests)?;
+        publications.register(&storage.tensors).map_err(&fatal)?;
+        prefix_cache::apply(storage, published, self.installations).map_err(&fatal)?;
+
+        let mut stats = ForwardStats::default();
+        stats.component_us.insert(
+            "transfer_execute".into(),
+            self.batch.started.elapsed().as_micros() as u64,
+        );
+        Ok(self.batch.launch(stats, "transfer_materialize", None))
+    }
+
+    /// Retire every reservation of a batch that failed while it recorded
+    /// its job, once that job completed.
+    fn discard(self, storage: &mut RankStorage, image: Option<&mut ImageParts<'_>>) -> Result<()> {
+        self.retire(storage, image, Located::default())
+    }
+
+    /// The locations of the batch's exports, now that their device work is
+    /// complete: each joins its call's completion.
+    fn locate(
+        &mut self,
+        storage: &mut RankStorage,
+        image: Option<&mut ImageParts<'_>>,
+        located: &mut Located,
+    ) -> Result<()> {
+        let calls = &mut self.batch.calls;
+        while let Some((index, write, export)) = self.products.pop_front() {
+            let (export, locations) = storage.tensors.located(&write, export)?;
+            located
+                .publications
+                .accept(write.id(), locations, export, &mut calls[index].output)?;
+        }
+
+        if !self.versions.is_empty() {
+            let (pool, _) = image
+                .ok_or_else(|| {
+                    Error::Invariant("exported trajectory versions lost their latent pool".into())
+                })?
+                .latent_pool()?;
+            while let Some((index, version)) = self.versions.pop_front() {
+                // The version stays the pool's until the batch commits.
+                located.versions.push(version.buffer());
+                latents::locate_export(
+                    pool,
+                    version,
+                    &mut located.publications,
+                    &mut calls[index].output,
+                )?;
+            }
+        }
+
+        while let Some(export) = self.exports.pop_front() {
+            let export = export.locate(storage)?;
+            calls[export.call].output.output.cache_output = Some(export.transfer.clone());
+            located.published.push(export);
+        }
+        Ok(())
+    }
+
+    /// Check, before the commit point, the updates that name the located
+    /// exports: the calls' outputs, the publications and the cache
+    /// transfers.
+    fn validate(
+        &self,
+        storage: &mut RankStorage,
+        plan: &BatchPlan,
+        located: &Located,
+    ) -> Result<()> {
+        {
+            let output = lock(&self.batch.buffer);
+            for (state, call) in self.batch.calls.iter().zip(&plan.calls) {
+                state.output.validate_output(&output, call)?;
+            }
+        }
+        located.publications.validate(&storage.tensors)?;
+        prefix_cache::validate(storage, &located.published, &self.installations)
+    }
+
+    /// Retire every reservation after a failure before the commit point:
+    /// the exports located so far and those that were not, the versions
+    /// exported from `image`'s latent pool, the batch's writes and its
+    /// lease. The batch's job completed, so its fences are recorded and
+    /// storage returns once they complete.
+    fn retire(
+        mut self,
+        storage: &mut RankStorage,
+        image: Option<&mut ImageParts<'_>>,
+        located: Located,
+    ) -> Result<()> {
+        let Located {
+            mut publications,
+            mut versions,
+            published,
+        } = located;
+        let revoked = publications.revoke();
+        for (_, _, export) in self.products.drain(..) {
+            export.revoke();
+        }
+
+        // A version's locations were revoked with the publications or are
+        // revoked here; the pool forgets the export either way.
+        for (_, version) in self.versions.drain(..) {
+            versions.push(version.buffer());
+            version.revoke();
+        }
+        let released = match (versions.is_empty(), image) {
+            (true, _) => Ok(()),
+            (false, Some(image)) => image
+                .latent_pool()
+                .map(|(pool, _)| pool.release_exports(&versions)),
+            (false, None) => Err(Error::Invariant(
+                "exported trajectory versions lost their latent pool".into(),
+            )),
+        };
+
+        for export in &published {
+            self.batch.calls[export.call].output.output.cache_output = None;
+        }
+        let mut unpublished = prefix_cache::revoke(storage, published);
+        for export in self.exports.drain(..) {
+            unpublished = unpublished.and(export.revoke(storage));
+        }
+
+        let writes = std::mem::take(&mut self.batch.writes);
+        let abandoned = storage.tensors.abandon_writes(&writes);
+        lock(&self.batch.buffer).abandon();
+        revoked.and(released).and(unpublished).and(abandoned)
+    }
 }

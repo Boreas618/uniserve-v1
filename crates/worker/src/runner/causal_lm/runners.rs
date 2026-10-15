@@ -42,10 +42,8 @@ use uniserve_ipc::{BufferId, CallKind, ForwardMode, ForwardStats, RequestKey, Wa
 
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
-use crate::executor::BatchResult;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
-use crate::executor::batch::Stage;
-use crate::executor::batch::{Launched, StreamOrder, error_code, failed_output};
+use crate::executor::batch::{Failure, Stage, StreamOrder, fail, unsupported};
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::lane::{Completion, ExpertStep, ExpertVariant, Job};
 use crate::parallel::{ExpertUnion, MicrobatchForward};
@@ -65,8 +63,8 @@ pub(crate) struct StepParts<'a> {
     pub(crate) cache: &'a mut PrefixCacheManager<Arc<Retirement>>,
 }
 
-use super::batch::{Batch, Opening, Owners, TokenBatch};
-use super::commit::{Commit, Committed, Failure};
+use super::batch::{Opening, Owners, Parked, TokenBatch};
+use super::commit::{Commit, Committed, PHASE};
 use super::step::condition_latents;
 
 /// One step's forwards as a job holds them, awaiting its completion.
@@ -86,10 +84,10 @@ pub(crate) enum Pending {
     /// The predicates are known: the batch reserves its storage next.
     Opened(Opening),
     /// The job on the lane is the batch's last.
-    Committing(Box<TokenBatch>, Commit),
+    Committing(Box<Parked>, Commit),
     /// A job of the batch failed before its commit point: the batch
     /// retires what it reserved next.
-    Failing(Box<TokenBatch>, Failure),
+    Failing(Box<Parked>, Failure),
     /// The job on the lane retires what the failed batch reserved.
     Discarding(Failure),
     /// The batch failed and holds nothing: its calls are reported next.
@@ -615,7 +613,7 @@ pub(crate) fn forward(
 
     let parts = backend.parts();
     let (Some(runtime), Some(storage)) = (parts.text, parts.storage) else {
-        return Err(crate::executor::batch::unsupported(kind, "text"));
+        return Err(unsupported(kind, "text"));
     };
     let mut owners = Owners {
         runtime,
@@ -631,12 +629,12 @@ pub(crate) fn forward(
             Ok(opening) if opening.reads_predicates() => (Some(job), Pending::Predicates(opening)),
             Ok(opening) => reserve(owners, opening, job),
             // The fences the opening recorded are still due.
-            Err(error) if job.is_empty() => (None, Pending::Failed(error.into())),
-            Err(error) => (Some(job), Pending::Discarding(error.into())),
+            Err(error) if job.is_empty() => (None, Pending::Failed(Failure::new(PHASE)(error))),
+            Err(error) => (Some(job), Pending::Discarding(Failure::new(PHASE)(error))),
         },
         Some(Pending::Opened(opening)) => reserve(owners, opening, job),
-        Some(Pending::Failing(batch, failure)) => {
-            let batch = Batch::resume(owners, *batch, job);
+        Some(Pending::Failing(parked, failure)) => {
+            let batch = TokenBatch::resume(owners, *parked, job);
             discard(batch, failure)
         }
         Some(
@@ -672,11 +670,13 @@ pub(crate) fn complete(
     let next = match (state, completion.check()) {
         // A predicate that could not be read fails the batch, which has
         // reserved nothing yet.
-        (Some(Pending::Predicates(_)), Err(failure)) => Pending::Failed(failure.error.into()),
+        (Some(Pending::Predicates(_)), Err(failure)) => {
+            Pending::Failed(Failure::new(PHASE)(failure.error))
+        }
         (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
             match opening.predicates(&mut completion) {
                 Ok(()) => Pending::Opened(opening),
-                Err(error) => Pending::Failed(error.into()),
+                Err(error) => Pending::Failed(Failure::new(PHASE)(error)),
             }
         }
         (Some(Pending::Committing(state, commit)), completed) => {
@@ -696,19 +696,19 @@ pub(crate) fn complete(
                 plan,
                 experts,
             };
-            let mut token_batch = Batch::resume(owners, *state, Job::new());
+            let mut token_batch = TokenBatch::resume(owners, *state, Job::new());
             let committed = match completed {
                 Ok(mut completion) => token_batch.complete(commit, &mut completion),
-                Err(failure) => Err(Failure {
-                    committed: Batch::committed(&commit, failure.operation),
-                    error: failure.error,
-                }),
+                Err(failure) if TokenBatch::committed(&commit, failure.operation) => {
+                    Err(Failure::fatal(PHASE)(failure.error))
+                }
+                Err(failure) => Err(Failure::new(PHASE)(failure.error)),
             };
             match committed {
                 Ok(committed) => {
                     let stats = statistics(&token_batch, committed.as_ref());
-                    let (_, state, _) = token_batch.park();
-                    let launched = state.launch(stats);
+                    let (_, parked, _) = token_batch.park();
+                    let launched = parked.launch(stats);
                     batch.launch(launched);
                     batch.set_stage(Stage::Done);
                     return Ok(());
@@ -724,10 +724,9 @@ pub(crate) fn complete(
         }
         // Storage the cleanup could not retire stays reserved; the rank
         // cannot reuse it safely.
-        (Some(Pending::Discarding(_)), Err(failure)) => Pending::Failed(Failure {
-            error: failure.error,
-            committed: true,
-        }),
+        (Some(Pending::Discarding(_)), Err(failure)) => {
+            Pending::Failed(Failure::fatal(PHASE)(failure.error))
+        }
         (Some(Pending::Discarding(failure)), Ok(_)) => Pending::Failed(failure),
         (state, _) => {
             *batch.token_parts().1 = state;
@@ -745,15 +744,16 @@ pub(crate) fn complete(
 /// and record the image denoiser's conditioning of its latent images, its
 /// step and its commit.
 fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, Pending) {
-    let mut batch = match Batch::lease(owners, opening, job) {
+    let failed = Failure::new(PHASE);
+    let mut batch = match TokenBatch::lease(owners, opening, job) {
         Ok(batch) => batch,
         // Nothing is reserved yet, and the job was dropped with only the
         // batch's order in it.
-        Err(error) => return (None, Pending::Failed(error.into())),
+        Err(error) => return (None, Pending::Failed(failed(error))),
     };
-    let rows = batch.reserve().map_err(Failure::from).and_then(|()| {
-        if batch.calls.iter().any(|state| state.active) {
-            batch.rows().map(Some).map_err(Failure::from)
+    let rows = batch.reserve().map_err(&failed).and_then(|()| {
+        if batch.batch.calls.iter().any(|state| state.active) {
+            batch.rows().map(Some).map_err(&failed)
         } else {
             Ok(None)
         }
@@ -771,13 +771,13 @@ fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, 
                     &mut batch.image,
                     batch.storage,
                     &conditions,
-                    batch.stream.as_ref(),
+                    batch.batch.stream.as_ref(),
                     &batch.job,
                 )
             };
             let committing = conditioned
-                .map_err(Failure::from)
-                .and_then(|()| batch.step(rows).map_err(Failure::from))
+                .map_err(&failed)
+                .and_then(|()| batch.step(rows).map_err(&failed))
                 .and_then(|stepped| batch.finish(Some(stepped)));
             commit(batch, committing)
         }
@@ -791,7 +791,7 @@ fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, 
 
 /// The batch's last job, or its retirement where recording the job failed.
 fn commit<'a>(
-    batch: Batch<'a>,
+    batch: TokenBatch<'a>,
     committing: std::result::Result<Commit, Failure>,
 ) -> (Option<Job>, Pending) {
     match committing {
@@ -805,20 +805,17 @@ fn commit<'a>(
 
 /// Retire what a failed batch reserved: the job that records its fences, or
 /// nothing where it holds no stream work.
-fn discard<'a>(mut batch: Batch<'a>, failure: Failure) -> (Option<Job>, Pending) {
+fn discard<'a>(mut batch: TokenBatch<'a>, failure: Failure) -> (Option<Job>, Pending) {
     if failure.committed {
         return (None, Pending::Failed(failure));
     }
-    if let Err(cleanup) = batch.discard() {
+    let discarded = batch
+        .batch
+        .discard(&batch.storage.tensors, &batch.storage.events, &batch.job);
+    if let Err(cleanup) = discarded {
         // Storage the cleanup could not retire stays reserved; the rank
         // cannot reuse it safely.
-        return (
-            None,
-            Pending::Failed(Failure {
-                error: cleanup,
-                committed: true,
-            }),
-        );
+        return (None, Pending::Failed(Failure::fatal(PHASE)(cleanup)));
     }
     let (job, _, _) = batch.park();
     if job.is_empty() {
@@ -828,63 +825,9 @@ fn discard<'a>(mut batch: Batch<'a>, failure: Failure) -> (Option<Job>, Pending)
     }
 }
 
-/// Report a failed batch: a failure past the commit point stops the rank,
-/// any other completes the batch with its calls failed.
-fn fail(
-    backend: &mut WorkerBackend,
-    batch: &mut WorkerBatch,
-    failure: Failure,
-) -> std::result::Result<(), WorkerError> {
-    let plan = Arc::clone(batch.shared_plan());
-    let mut error = WorkerError::classify(failure.error, Some("token batch"));
-    if failure.committed {
-        // Products and slot state may already be visible; the rank cannot
-        // roll them back.
-        error.fatal = true;
-    }
-    if error.fatal {
-        return Err(error);
-    }
-    tracing::warn!(
-        target: "uniserve_worker.execution",
-        "text batch {} failed: {error}{}",
-        plan.batch_id,
-        error
-            .traceback()
-            .map(|trace| format!("\n{trace}"))
-            .unwrap_or_default()
-    );
-    let output = failed_output(
-        backend.requests(),
-        &plan,
-        batch.predecessors(),
-        error_code(error.code),
-    )?;
-    batch.complete(BatchResult {
-        output,
-        media: Vec::new(),
-    });
-    batch.set_stage(Stage::Done);
-    Ok(())
-}
-
-impl TokenBatch {
-    /// The committed batch as launched work awaiting materialization.
-    fn launch(self, stats: ForwardStats) -> Launched {
-        Launched {
-            outputs: self.calls.into_iter().map(|state| state.output).collect(),
-            buffer: self.buffer,
-            started: self.started,
-            stats,
-            timer: "text_materialize",
-            host: None,
-        }
-    }
-}
-
-fn statistics(batch: &Batch<'_>, committed: Option<&Committed>) -> ForwardStats {
+fn statistics(batch: &TokenBatch<'_>, committed: Option<&Committed>) -> ForwardStats {
     let mut stats = ForwardStats::default();
-    let elapsed = batch.started.elapsed().as_micros() as u64;
+    let elapsed = batch.batch.started.elapsed().as_micros() as u64;
     stats.component_us.insert("text_execute".into(), elapsed);
     let Some(committed) = committed else {
         return stats;

@@ -46,8 +46,9 @@ use uniserve_ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 
 use crate::config::Device;
 use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
+use crate::executor::batch::lock;
 use crate::executor::image::ImageParts;
-use crate::executor::image::{Encoding, ImageBatch, allocations, lock};
+use crate::executor::image::{Encoding, ImageBatch, allocations};
 use crate::executor::products::{OutputShape, Placement, bind_outputs};
 use crate::executor::video::MediaBatch;
 use crate::executor::video::{Parts, decode_range, publish_bound, stream_of};
@@ -640,7 +641,7 @@ impl ImageBatch<'_> {
             return Ok(ForwardStats::default());
         }
         let target = self.target();
-        let stream = self.stream.clone();
+        let stream = self.batch.stream.clone();
         let issue = job.on(stream.as_ref());
         let decoder_range = self
             .parts
@@ -651,7 +652,7 @@ impl ImageBatch<'_> {
         // One encoding task per reporting call, reserved before any device
         // work so a full host lane fails the batch cleanly.
         let mut tasks: HashMap<usize, Arc<HostTask<ImageTask>>> = HashMap::new();
-        if self.reports {
+        if self.batch.reports {
             for &index in &active {
                 let task = self.parts.host.reserve()?;
                 self.encodings.push(Encoding {
@@ -689,7 +690,7 @@ impl ImageBatch<'_> {
                 },
             )?
         };
-        self.writes.extend(products.iter().cloned());
+        self.batch.writes.extend(products.iter().cloned());
         let product = |reference: &uniserve_ipc::TensorRef| {
             products
                 .iter()
@@ -733,14 +734,14 @@ impl ImageBatch<'_> {
                     },
                 ),
                 _ => {
-                    self.reads.push(read);
+                    self.batch.reads.push(read);
                     return Err(Error::Invalid(
                         "image encoding requires image product metadata".into(),
                     ));
                 }
             };
             let resident = read.value().clone();
-            self.reads.push(read);
+            self.batch.reads.push(read);
             sources.push(Some(Source::Resident(resident, range, height, width)));
         }
 
@@ -783,7 +784,7 @@ impl ImageBatch<'_> {
             let scratch = latents.place(&params)?;
             for ((index, params), scratch) in trajectories.iter().zip(&scratch) {
                 let call = &plan.calls[*index];
-                let slot = self.calls[*index].slot;
+                let slot = self.batch.calls[*index].slot;
                 let generation = call
                     .latent_input
                     .as_ref()
@@ -832,9 +833,9 @@ impl ImageBatch<'_> {
                         "image pixels exceed the call's completion byte bound".into(),
                     ));
                 }
-                let mut buffer = lock(&self.buffer);
+                let mut buffer = lock(&self.batch.buffer);
                 let host = buffer.capture_bytes(&pixels, issue, &self.storage.events)?;
-                if self.reports {
+                if self.batch.reports {
                     buffer.retain_reader()?;
                 }
                 staged.push((index, host, height, width));
@@ -899,7 +900,7 @@ impl ImageBatch<'_> {
             };
             task.configure(ImageTask::new(ImageWork::Encode {
                 pixels,
-                lease: Arc::clone(&self.buffer),
+                lease: Arc::clone(&self.batch.buffer),
                 height,
                 width,
                 maximum: usize::try_from(plan.calls[index].bounds.max_completion_bytes)

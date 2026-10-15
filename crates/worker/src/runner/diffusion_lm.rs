@@ -42,10 +42,10 @@
 //! capacity the agreement can choose. Graphs are captured and launched per
 //! capacity.
 
+mod batch;
 mod buffers;
 mod calls;
 mod facts;
-mod forward;
 mod shapes;
 mod start;
 
@@ -78,7 +78,7 @@ use calls::{DenoiseRow, ReadoutPass, Sequence};
 use facts::Facts;
 use shapes::{SLOT_BUCKETS, ShapeKey, Shapes};
 
-pub(crate) use forward::{Pending, complete, forward};
+pub(crate) use batch::{Pending, complete, forward};
 pub(crate) use start::{KIND, Startup, reserved_bytes};
 
 /// The expert steps of a runner's forwards.
@@ -954,7 +954,7 @@ impl DiffusionLMRunner {
         let step = |capacity: Option<usize>| {
             experts.map(|union| Expert {
                 union,
-                kind: forward::expert_kind(index),
+                kind: batch::expert_kind(index),
                 forced: capacity,
             })
         };

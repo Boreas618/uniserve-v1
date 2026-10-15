@@ -17,7 +17,7 @@
 //! The installed buffer becomes resident beside its source at the commit
 //! point, which also accepts the extent as the destination's base.
 
-use super::batch::TransferBatch;
+use super::TransferBatch;
 use crate::executor::inputs::Inputs;
 use crate::storage::{PendingImport, PrefixCache, PrefixCacheManager, UnitColumn};
 use crate::stream::Issue;
@@ -231,7 +231,7 @@ impl TransferBatch<'_> {
     pub(super) fn reserve_cache(&mut self, column: &UnitColumn, inputs: &Inputs) -> Result<()> {
         let plan = self.plan;
         let issue = self.issue();
-        let calls = &self.recorded.calls;
+        let calls = &self.recorded.batch.calls;
         let active: HashSet<u32> = self
             .active()
             .into_iter()
@@ -278,7 +278,7 @@ impl TransferBatch<'_> {
     pub(super) fn export_cache(&mut self) -> Result<()> {
         let plan = self.plan;
         for index in self.active() {
-            let state = &self.recorded.calls[index];
+            let state = &self.recorded.batch.calls[index];
             let (slot, visible) = (state.slot, state.output.progress.cache_visible_len);
             let export = export(
                 self.storage,
@@ -307,7 +307,9 @@ impl TransferBatch<'_> {
                 Error::Invalid("cache installation has no reserved physical input".into())
             })?;
             let (installation, extent) = install(self.storage, call, import, issue)?;
-            self.recorded.calls[index].output.set_cache_length(extent);
+            self.recorded.batch.calls[index]
+                .output
+                .set_cache_length(extent);
             self.recorded.installations.push(installation);
         }
         Ok(())
