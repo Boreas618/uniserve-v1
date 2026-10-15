@@ -57,7 +57,9 @@ row ``i`` reads ``timesteps[i]``. Rows cross flattened.
   inserted as conditioning.
 - :meth:`DenoiserRunner.step` combines each image's branch predictions
   with its trajectory's guidance and advances its samples by one solver
-  step.
+  step. A trajectory's schedules and guidance are made from the image's
+  parameters, which the caller keeps and passes to :meth:`~DenoiserRunner.plan`
+  and to every step.
 
 The static methods answer a deployment's sizing questions from the model's
 configuration alone, so a rank without the denoiser's weights asks them
@@ -153,12 +155,35 @@ class _Guided(Protocol):
     ) -> Guidance: ...
 
 
-@dataclass(frozen=True, slots=True)
-class _Trajectory:
-    """One image trajectory's host schedules and guidance."""
+def _trajectory(
+    network,
+    steps: int,
+    shift: float,
+    text_scale: float,
+    image_scale: float,
+    interval_low: float,
+    interval_high: float,
+    renorm: str,
+    renorm_min: float,
+) -> tuple[dict[str, Schedule], Guidance]:
+    """The schedules and guidance of one image trajectory.
 
-    schedules: dict[str, Schedule]
-    guidance: Guidance
+    A non-positive ``shift`` keeps the denoiser's default shift.
+    """
+    shift = float(shift)
+    schedules = dict(
+        network.make_schedules(
+            int(steps), shift=shift if shift > 0 else None, device="cpu"
+        )
+    )
+    guidance = cast(_Guided, network).make_guidance(
+        text_scale=float(text_scale),
+        image_scale=float(image_scale),
+        interval=(float(interval_low), float(interval_high)),
+        renorm=Renorm(str(renorm)),
+        renorm_min=float(renorm_min),
+    )
+    return schedules, guidance
 
 
 class _Buffered(Protocol):
@@ -1343,32 +1368,27 @@ class DenoiserRunner:
         renorm: str,
         renorm_min: float,
     ) -> list:
-        """The schedules and guidance of one image trajectory.
+        """What one image trajectory evaluates at each solver step.
 
-        A non-positive ``shift`` keeps the denoiser's default shift.
+        The trajectory's schedules and guidance are made from these
+        parameters; :meth:`step` takes them again. A non-positive ``shift``
+        keeps the denoiser's default shift.
 
         Returns:
-            ``[plan, timesteps, branches]``: an opaque plan the caller
-            passes back to :meth:`step`, each solver step's model timestep
-            and the mask of guidance branches it evaluates (bit 0
-            conditioned, 1 text-unconditional, 2 image-unconditional).
+            ``[timesteps, branches]``: each solver step's model timestep and
+            the mask of guidance branches it evaluates (bit 0 conditioned, 1
+            text-unconditional, 2 image-unconditional).
         """
-        # FIXME: a trajectory's schedule and guidance are host objects
-        # behind a handle; they become per-slot state rows once the solver
-        # update reads its endpoints and scales from tensors.
-        network = self._network
-        shift = float(shift)
-        schedules = dict(
-            network.make_schedules(
-                int(steps), shift=shift if shift > 0 else None, device="cpu"
-            )
-        )
-        guidance = cast(_Guided, network).make_guidance(
-            text_scale=float(text_scale),
-            image_scale=float(image_scale),
-            interval=(float(interval_low), float(interval_high)),
-            renorm=Renorm(str(renorm)),
-            renorm_min=float(renorm_min),
+        schedules, guidance = _trajectory(
+            self._network,
+            steps,
+            shift,
+            text_scale,
+            image_scale,
+            interval_low,
+            interval_high,
+            renorm,
+            renorm_min,
         )
         schedule = schedules["image"]
         masks = [
@@ -1376,7 +1396,7 @@ class DenoiserRunner:
             for index in range(schedule.num_steps)
         ]
         times = [float(value) for value in schedule.timesteps.tolist()]
-        return [_Trajectory(schedules, guidance), times, masks]
+        return [times, masks]
 
     def _image_draw_noise(
         self,
@@ -1597,29 +1617,60 @@ class DenoiserRunner:
             timesteps[: len(described)].zero_()
             self._evaluate(described, positions, timesteps, attention, features)
 
-    def step(self, rows: Sequence[int], *plans: _Trajectory) -> None:
+    def step(
+        self,
+        rows: Sequence[int],
+        parameters: Sequence[float],
+        renorms: Sequence[str],
+    ) -> None:
         """Advance each image's samples by one solver step.
 
         ``rows`` holds one ``[sample, units, slot, step, prediction,
         branches]`` row per image, flattened: the solver combines the
         image's branch predictions (consecutive from ``prediction``, in
-        evaluation order) with its plan's guidance and updates
+        evaluation order) with its trajectory's guidance and updates
         ``samples[sample:sample + units]`` in place toward the next
-        timestep. ``plans`` are the images' plans (:meth:`plan`).
+        timestep. ``parameters`` holds each image's ``[steps, shift,
+        text_scale, image_scale, interval_low, interval_high,
+        renorm_min]``, flattened, and ``renorms`` its renormalization: the
+        parameters :meth:`plan` was given, which make the trajectory's
+        schedules and guidance.
         """
         network = self._network
         described = [
             tuple(int(value) for value in rows[start : start + 6])
             for start in range(0, len(rows), 6)
         ]
-        if len(described) != len(plans):
-            raise ValueError("integration rows and plans must align")
+        settings = [
+            tuple(float(value) for value in parameters[start : start + 7])
+            for start in range(0, len(parameters), 7)
+        ]
+        if not len(described) == len(settings) == len(renorms):
+            raise ValueError(
+                "integration rows and trajectory parameters must align"
+            )
         with torch.inference_mode(), torch.cuda.stream(self._context.stream):
-            for (sample, units, slot, index, first, mask), trajectory in zip(
-                described, plans, strict=True
-            ):
-                schedule = trajectory.schedules["image"]
-                guidance = trajectory.guidance
+            for (sample, units, slot, index, first, mask), (
+                steps,
+                shift,
+                text_scale,
+                image_scale,
+                low,
+                high,
+                renorm_min,
+            ), renorm in zip(described, settings, renorms, strict=True):
+                schedules, guidance = _trajectory(
+                    network,
+                    int(steps),
+                    shift,
+                    text_scale,
+                    image_scale,
+                    low,
+                    high,
+                    str(renorm),
+                    renorm_min,
+                )
+                schedule = schedules["image"]
                 branches = guidance.branches(schedule, index)
                 if sum(_BITS[branch] for branch in branches) != mask:
                     raise ValueError(
@@ -1642,7 +1693,7 @@ class DenoiserRunner:
                         )
                     },
                     {"image": (guided,)},
-                    trajectory.schedules,
+                    schedules,
                     schedule.step(index),
                 )
 

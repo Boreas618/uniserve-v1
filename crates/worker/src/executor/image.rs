@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use uniserve_core::ImageParams;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, CallKind, CallStatus, ErrorCode, ForwardStats,
@@ -85,8 +86,8 @@ pub(crate) struct Planned {
     pub(crate) key: RequestKey,
     /// Image height and width in pixels.
     pub(crate) size: (u32, u32),
-    /// The solver steps the image was admitted with.
-    pub(crate) steps: usize,
+    /// The image parameters the trajectory was admitted with.
+    pub(crate) params: Arc<ImageParams>,
     /// The sources a guidance branch may condition on, each with its
     /// prefix where the request gives it (admitted negative tokens); the
     /// others were asked for, in this order.
