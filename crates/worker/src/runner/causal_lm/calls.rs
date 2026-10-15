@@ -12,7 +12,7 @@ use super::context::Media;
 use crate::executor::PendingOutput;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE as CACHE, FINISH_IDS, RowSource, TokenRow};
-use crate::sampling::SamplingMetadata;
+use crate::sampling::SamplingControls;
 use crate::storage::BlockTables;
 use crate::{Error, Result};
 
@@ -181,18 +181,18 @@ pub(super) fn sample_positions(
 }
 
 /// Sampling controls of a sampled call.
-pub(super) fn metadata(
+pub(super) fn controls(
     call: &Call,
     params: &SamplingParams,
     finish_tokens: &[u32],
     positions: &[u64],
     drafts: Vec<u32>,
     return_transition: bool,
-) -> Result<(SamplingMetadata, Option<Vec<f32>>)> {
-    let (mut metadata, draws) =
-        SamplingMetadata::for_call(call, params, finish_tokens, positions, drafts)?;
-    metadata.return_transition = return_transition;
-    Ok((metadata, draws))
+) -> Result<(SamplingControls, Option<Vec<f32>>)> {
+    let (mut controls, draws) =
+        SamplingControls::for_call(call, params, finish_tokens, positions, drafts)?;
+    controls.return_transition = return_transition;
+    Ok((controls, draws))
 }
 
 /// Check the cache extent a call writes and return it (prefix plus written
@@ -223,7 +223,7 @@ pub(super) fn finish(
     prepared: &Prepared,
     tables: &BlockTables,
     task: Option<usize>,
-    metadata: Option<&SamplingMetadata>,
+    controls: Option<&SamplingControls>,
     penalties: bool,
 ) -> Result<[i64; 8]> {
     let mode = kind(call)?;
@@ -276,13 +276,13 @@ pub(super) fn finish(
             Ok([slot, DECODE, task as i64, 0, 0, 0, 0, i64::from(penalties)])
         }
         (ForwardMode::Verify, Some(task)) => {
-            let metadata = metadata
+            let controls = controls
                 .ok_or_else(|| Error::Invariant("verification requires sampling inputs".into()))?;
             let visible = u64::from(row.prefix);
             let initialized = visible + u64::from(row.query);
             output.set_speculation(
-                metadata.draft_token_ids.clone(),
-                metadata.terminal_draft_prefix,
+                controls.draft_token_ids.clone(),
+                controls.terminal_draft_prefix,
                 visible,
                 initialized,
             );

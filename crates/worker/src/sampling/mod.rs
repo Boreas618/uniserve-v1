@@ -1,4 +1,6 @@
-//! Host controls for numerical token sampling and speculative verification.
+//! Token sampling: a sampled call's controls ([`SamplingControls`]) and a
+//! forward's sampling metadata ([`SamplingMetadata`]), which fills the
+//! sampler's parameter tensors.
 
 use std::collections::BTreeSet;
 
@@ -8,7 +10,11 @@ use uniserve_ipc::{Call, DrawLayout};
 
 use crate::{Error, Result};
 
-pub(crate) mod plan;
+mod metadata;
+
+pub(crate) use metadata::{
+    SampleTask, SamplingGroup, SamplingMetadata, logprob_request, logprob_words, padded,
+};
 
 /// Token relays carry continuation in bit 31 and the token in the low 31 bits.
 pub const TOKEN_CONTINUATION_BIT: u32 = 1 << 31;
@@ -25,23 +31,23 @@ pub enum SamplingPath {
 /// Per-call constraints aligned with candidate logit rows. Tensor values and
 /// penalties stay with the numerical backend; no device value is read here.
 #[derive(Clone, Debug, Default)]
-pub struct SamplingMetadata {
-    pub allowed: Vec<Option<Vec<u32>>>,
-    pub suppress: Vec<u32>,
-    pub finish_token_ids: Vec<u32>,
-    pub transition_token_ids: Vec<u32>,
-    pub force_finish: bool,
-    pub draft_token_ids: Vec<u32>,
+pub(crate) struct SamplingControls {
+    pub(crate) allowed: Vec<Option<Vec<u32>>>,
+    pub(crate) suppress: Vec<u32>,
+    pub(crate) finish_token_ids: Vec<u32>,
+    pub(crate) transition_token_ids: Vec<u32>,
+    pub(crate) force_finish: bool,
+    pub(crate) draft_token_ids: Vec<u32>,
     /// One-based prefix length ending at the first terminal draft token.
-    pub terminal_draft_prefix: Option<usize>,
-    pub return_transition: bool,
+    pub(crate) terminal_draft_prefix: Option<usize>,
+    pub(crate) return_transition: bool,
 }
 
-impl SamplingMetadata {
+impl SamplingControls {
     /// Resolve admitted and branch-local controls. Draw coordinates describe
     /// the candidate rows, independent of scheduling order or draft acceptance.
     /// The returned draws are absent only for the unshaped greedy path.
-    pub fn for_call(
+    pub(crate) fn for_call(
         call: &Call,
         parameters: &SamplingParams,
         finish_tokens: &[u32],
@@ -121,14 +127,19 @@ impl SamplingMetadata {
         Ok((result, draws))
     }
 
-    pub fn device_greedy(&self, parameters: &SamplingParams) -> bool {
+    pub(crate) fn device_greedy(&self, parameters: &SamplingParams) -> bool {
         self.draft_token_ids.is_empty()
             && parameters.device_greedy()
             && self.allowed.iter().all(Option::is_none)
     }
 
     /// Select a numerical implementation without inspecting logits on device.
-    pub fn path(&self, parameters: &SamplingParams, vocab: usize, cuda: bool) -> SamplingPath {
+    pub(crate) fn path(
+        &self,
+        parameters: &SamplingParams,
+        vocab: usize,
+        cuda: bool,
+    ) -> SamplingPath {
         if self.device_greedy(parameters) {
             return SamplingPath::Greedy {
                 suppressed: !self.suppress.is_empty(),
