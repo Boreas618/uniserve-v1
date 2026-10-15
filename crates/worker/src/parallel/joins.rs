@@ -16,27 +16,28 @@ use uniserve_cuda::Stream;
 use super::expert_union::ExpertUnion;
 use super::microbatches::{MicrobatchCall, turn};
 use crate::cuda_graph::CUDAGraph;
-use crate::ffi::{DeferredCall, Function, Handle};
+use crate::ffi::{DeferredCall, Function, Handle, Interpreter};
 use crate::profiling::range;
 use crate::{Error, Result};
 
-/// The shared graph interface (`uniserve.cuda_graph`).
+/// The library's graph capture functions (`uniserve.cuda_graph`).
 #[derive(Clone)]
 pub struct GraphFunctions {
-    /// `graphs.capture_begin(pool, stream, device) -> capture`.
+    /// `capture_begin(pool, stream, device) -> capture`.
     pub begin: Function,
-    /// `graphs.capture_end(capture) -> [graph, executables]`.
+    /// `capture_end(capture) -> [graph, executables]`.
     pub end: Function,
-    /// `graphs.release(graph)`.
+    /// `release(graph)`.
     pub release: Function,
 }
 
 impl GraphFunctions {
-    pub fn from_interface(interface: &crate::model::interface::Interface) -> Result<Self> {
+    /// The capture functions of the library's `uniserve.cuda_graph`.
+    pub fn import() -> Result<Self> {
         Ok(Self {
-            begin: interface.function("graphs.capture_begin")?,
-            end: interface.function("graphs.capture_end")?,
-            release: interface.function("graphs.release")?,
+            begin: Interpreter::import("uniserve.cuda_graph.capture_begin")?,
+            end: Interpreter::import("uniserve.cuda_graph.capture_end")?,
+            release: Interpreter::import("uniserve.cuda_graph.release")?,
         })
     }
 

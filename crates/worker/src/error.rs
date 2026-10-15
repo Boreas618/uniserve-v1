@@ -29,7 +29,7 @@ pub enum Error {
     #[error("{0}")]
     Invariant(String),
     /// A Python numerical function raised. `kind` is the translated error
-    /// kind (`uniserve.interface.errors`) and `traceback` the Python
+    /// kind (`uniserve.errors`) and `traceback` the Python
     /// traceback carried by TVM-FFI.
     #[error("{function}: {kind}: {message}")]
     Numerical {
@@ -38,7 +38,8 @@ pub enum Error {
         message: String,
         traceback: String,
     },
-    /// The interface table or a binding does not satisfy its contract.
+    /// A library function or a value it returned does not satisfy its
+    /// contract.
     #[error("{0}")]
     Interface(String),
     /// A failure every party of one operation observes: the result of a
@@ -46,7 +47,7 @@ pub enum Error {
     /// It reports and classifies as the failure it shares.
     #[error(transparent)]
     Shared(std::sync::Arc<Error>),
-    /// Python returned a tensor where the interface expects an opaque
+    /// Python returned a tensor where the worker expects an opaque
     /// object. Handles cross threads; a tensor handle must not.
     #[error("a tensor cannot be held as an opaque handle")]
     TensorHandle,
@@ -371,12 +372,12 @@ fn kind_code(error: &Error) -> ErrorCode {
     }
 }
 
-/// Map the kind of a failed interface call to a code.
+/// Map the kind of a failed library call to a code.
 ///
 /// The numerical library translates every exception its functions raise to
-/// one of its interface kinds (`uniserve.interface.errors`). The
+/// one of its error kinds (`uniserve.errors`). The
 /// remaining kinds are the ones TVM-FFI itself reports when a value that
-/// crossed the interface cannot be converted: a wrong type, a missing key,
+/// crossed into Rust cannot be converted: a wrong type, a missing key,
 /// an index out of range or a value out of range.
 pub fn numerical_code(kind: &str) -> ErrorCode {
     match kind {

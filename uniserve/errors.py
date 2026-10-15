@@ -1,10 +1,11 @@
 """Failure kinds reported to the Rust worker through TVM-FFI.
 
 The worker classifies a numerical failure by the TVM-FFI error kind, the
-name of the exception class that crossed the interface. Python's exception
+name of the exception class that crossed into it. Python's exception
 hierarchy is not visible from Rust, so :func:`translate` maps every
-exception an interface function raises onto a fixed vocabulary of kinds,
-keeping the original type name in the message and the original traceback.
+exception a library function the worker calls raises onto a fixed
+vocabulary of kinds, keeping the original type name in the message and the
+original traceback.
 """
 
 from __future__ import annotations

@@ -17,8 +17,7 @@ use tvm_ffi::Any;
 use uniserve_core::ComponentConfig;
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall, TransferMode};
 
-use crate::ffi::{Handle, integers, texts};
-use crate::model::interface::Interface;
+use crate::ffi::{Handle, Interpreter, integers, texts};
 use crate::parallel::topology::{HOST_COMPONENTS, is_host_component};
 use crate::{Error, Result};
 
@@ -268,7 +267,7 @@ pub struct Declarations {
 }
 
 /// The library class whose methods report a description's declarations.
-const DESCRIPTION: &str = "uniserve.interface.loading.Description";
+const DESCRIPTION: &str = "uniserve.loading.rank.Description";
 
 /// Split a concatenated column into consecutive runs of `lengths`.
 fn runs<T>(lengths: &[i64], values: Vec<T>) -> Vec<Vec<T>> {
@@ -286,15 +285,13 @@ impl Declarations {
     /// A call no runner can execute (other than a runner's helper methods)
     /// is refused. A model that reconstructs video also declares the host
     /// components that encode and assemble its units.
-    pub fn read(interface: &Interface, description: &Handle) -> Result<Self> {
+    pub fn read(description: &Handle) -> Result<Self> {
         let call = |method: &str, component: Option<&str>| -> Result<Any> {
             let mut arguments = vec![description.to_any()];
             if let Some(component) = component {
                 arguments.push(Any::from(tvm_ffi::String::from(component)));
             }
-            interface
-                .import(&format!("{DESCRIPTION}.{method}"))?
-                .call_values(&arguments)
+            Interpreter::import(&format!("{DESCRIPTION}.{method}"))?.call_values(&arguments)
         };
         let strings = |method: &str, component: Option<&str>| -> Result<Vec<String>> {
             texts(call(method, component)?).map_err(|error| Error::numerical(method, &error))

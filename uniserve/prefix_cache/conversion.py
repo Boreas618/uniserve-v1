@@ -11,7 +11,8 @@ The caller owns every scratch buffer and the stream the work runs on.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal, cast
+from math import prod
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 
@@ -19,7 +20,10 @@ from uniserve.quantization import Quantizer
 
 from . import mha
 from .state import decode_region
-from .units import UnitPool
+from .units import UnitPool, named_fields, stream_scope
+
+if TYPE_CHECKING:
+    from .plan import CachePlan
 
 __all__ = ["copy_converted"]
 
@@ -150,4 +154,112 @@ def copy_converted(
                 source_slice=(slice(0, count), *trailing_slice),
                 target_slice=(slice(offset, offset + count), *trailing_slice),
                 workspace={},
+            )
+
+
+class PageConversion:
+    """The dtype and FP8 conversion of imported pages, on one stream.
+
+    Args:
+        plan: The ``cache_plan`` result.
+        num_units: The units the fields hold, sentinel included.
+        scratch: uint8 ``[20 * elements + 8 * scales]``: raw keys at bytes
+            ``[0, 8E)``, raw values at ``[8E, 16E)``, the FP32 conversion
+            scratch at ``[16E, 20E)`` and FP32 source scales at ``[20E, 20E +
+            8S)``, where ``E`` is ``elements`` (the largest group page's
+            elements) and ``S`` is ``scales`` (its scale entries).
+        elements: ``E`` above.
+        scales: ``S`` above.
+        stream: The stream conversions are enqueued on.
+        names, fields: The pool's unit fields, as :class:`UnitResets` takes
+            them.
+
+    Raises:
+        ValueError: The scratch disagrees with its layout.
+    """
+
+    def __init__(
+        self,
+        plan: CachePlan,
+        num_units: int,
+        scratch: torch.Tensor,
+        elements: int,
+        scales: int,
+        stream: int,
+        names: Sequence[str],
+        *fields: torch.Tensor,
+    ) -> None:
+        elements, scales = int(elements), int(scales)
+        if scratch.dtype != torch.uint8 or scratch.numel() < (
+            20 * elements + 8 * scales
+        ):
+            raise ValueError("the conversion scratch disagrees with its layout")
+        self._pool = UnitPool(
+            plan.planes,
+            named_fields(names, fields),
+            plan.configs,
+            num_units=int(num_units),
+        )
+        self._raw = scratch[: 16 * elements].view(2, 8 * elements)
+        self._values = scratch[16 * elements : 20 * elements].view(
+            torch.float32
+        )
+        self._scales = scratch[20 * elements : 20 * elements + 8 * scales].view(
+            torch.float32
+        )
+        self._scope = stream_scope(int(stream), scratch.device)
+
+    def convert(
+        self,
+        group: int,
+        source_dtype: str,
+        compute_dtype: str,
+        count: int,
+        offset: int,
+        source_offset: int,
+        source_page_tokens: int,
+        scale_heads: int,
+        pages: int,
+        units: Sequence[int],
+    ) -> None:
+        """Write one imported span into the destination page's units.
+
+        Reads ``[count, layers, heads, dim]`` raw keys and values of
+        ``source_dtype`` from the scratch (with FP8, also ``[pages, 2,
+        layers, scale groups]`` scales) and writes the destination page's
+        ``units`` at token ``offset`` with ``copy_converted``.
+        """
+        pool, raw = self._pool, self._raw
+        cache_group = pool.groups[int(group)]
+        dtype = getattr(torch, source_dtype)
+        layers, heads = len(cache_group.layers), cache_group.num_kv_heads
+        shape = (int(count), layers, heads, cache_group.head_dim)
+        nbytes = prod(shape) * dtype.itemsize
+        source = (
+            raw[0, :nbytes].view(dtype).view(shape),
+            raw[1, :nbytes].view(dtype).view(shape),
+        )
+        source_scales = None
+        if int(scale_heads) > 0:
+            first = pool.head_offset(cache_group.layers[0])
+            groups = -(-(first + heads) // int(scale_heads)) - first // int(
+                scale_heads
+            )
+            source_scales = self._scales[
+                : int(pages) * 2 * layers * groups
+            ].view(int(pages), 2, layers, groups)
+        with self._scope():
+            copy_converted(
+                pool,
+                int(group),
+                source,
+                source_scales,
+                self._values,
+                (raw[0], raw[1]),
+                tuple(int(unit) for unit in units),
+                int(offset),
+                int(source_offset),
+                int(source_page_tokens),
+                int(scale_heads),
+                getattr(torch, compute_dtype),
             )

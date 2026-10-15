@@ -57,10 +57,9 @@ use super::{ExpertParallel, ExpertTransport, MicrobatchLanes, yield_microbatch};
 use crate::config::{Device, WorkerLaunch};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
-use crate::ffi::{Backing, Function, Handle, integer_list};
+use crate::ffi::{Backing, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Job, Lanes};
 use crate::model::LoadedModel;
-use crate::model::interface::Interface;
 use crate::runner::scratch::Scratches;
 use crate::transfer::PeerStorage;
 use crate::warmup::WarmupHooks;
@@ -89,8 +88,8 @@ pub(super) struct ExpertFunctions {
 }
 
 impl ExpertFunctions {
-    fn import(interface: &Interface) -> Result<Self> {
-        let function = |name: &str| interface.import(&format!("{MODULE}.{name}"));
+    fn import() -> Result<Self> {
+        let function = |name: &str| Interpreter::import(&format!("{MODULE}.{name}"));
         Ok(Self {
             layers: function("layers")?,
             symmetric_bytes: function("symmetric_bytes")?,
@@ -300,7 +299,6 @@ impl Drop for ExpertUnion {
 
 /// What constructing the member borrows from the rank.
 pub(crate) struct ExpertStart<'a> {
-    pub(crate) interface: &'a Interface,
     pub(crate) launch: &'a WorkerLaunch,
     pub(crate) world: &'a World,
     pub(crate) model: &'a LoadedModel,
@@ -351,7 +349,7 @@ impl ExpertUnion {
                 "expert parallelism requires a CUDA device".into(),
             ));
         };
-        let functions = ExpertFunctions::import(start.interface)?;
+        let functions = ExpertFunctions::import()?;
 
         // `num_experts, top_k, hidden_size` of each layer, back to back.
         let sizes = functions.layers.call_values(&[
@@ -427,10 +425,7 @@ impl ExpertUnion {
         });
         // The library's host collectives over the union, which every
         // microbatch's exchange bootstraps its communicators with.
-        let bootstrap = start
-            .interface
-            .import(HOST_BOOTSTRAP)?
-            .call_values(&host_bootstrap(&host))?;
+        let bootstrap = Interpreter::import(HOST_BOOTSTRAP)?.call_values(&host_bootstrap(&host))?;
 
         let mut runtime = Self {
             parallel,
@@ -438,7 +433,7 @@ impl ExpertUnion {
             graphs: if config.graph_policy == "off" {
                 None
             } else {
-                Some(GraphFunctions::from_interface(start.interface)?)
+                Some(GraphFunctions::import()?)
             },
             device,
             dedicated,
@@ -556,14 +551,13 @@ impl ExpertUnion {
     /// stream's scratch, prepared for the sources' token bound.
     pub(crate) fn bind_experts(
         &mut self,
-        interface: &Interface,
         model: &LoadedModel,
         scratches: &mut Scratches,
     ) -> Result<()> {
-        let construct = interface.import(&format!("{MODULE}.ExpertLayers"))?;
+        let construct = Interpreter::import(&format!("{MODULE}.ExpertLayers"))?;
         for peer in &self.microbatches {
             let stream = peer.stream.raw();
-            let scratch = scratches.get(interface, stream, Some(self.device))?;
+            let scratch = scratches.get(stream, Some(self.device))?;
             self.layers_owners.push(Handle::new(construct.call_values(&[
                 model.handle().to_any(),
                 Any::from(stream as i64),

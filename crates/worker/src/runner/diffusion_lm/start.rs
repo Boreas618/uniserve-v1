@@ -21,11 +21,10 @@ use super::shapes::{SLOT_BUCKETS, Shapes, chunk_rows};
 use super::{CANDIDATES, DiffusionLMRunner, Functions, RUNNER};
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
-use crate::ffi::Handle;
+use crate::ffi::{Handle, Interpreter};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::components::RunnerKind;
-use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::parallel::{DwdpManager, ExpertUnion};
 use crate::runner::input_buffers::InputBuffers;
@@ -202,7 +201,6 @@ fn stream(lanes: &Lanes, device: Device) -> Result<Option<Stream>> {
 
 /// What startup borrows from the rank.
 pub(crate) struct Startup<'a> {
-    pub(crate) interface: &'a Interface,
     pub(crate) config: &'a WorkerConfig,
     pub(crate) request_slots: usize,
     pub(crate) queue_depth: usize,
@@ -277,10 +275,9 @@ impl DiffusionLMRunner {
             .prefix_cache
             .ok_or_else(|| Error::Invalid("a diffusion LM reads a prefix cache".into()))?;
         let config = startup.config;
-        let interface = startup.interface;
 
         // The attention layers' view of the pool.
-        let cache = prefix_cache.pool(interface)?;
+        let cache = prefix_cache.pool()?;
 
         let mut experts = startup.expert_runtime;
         if let Some(experts) = experts.as_ref()
@@ -295,7 +292,6 @@ impl DiffusionLMRunner {
         for (component, path, device) in placed {
             let cuda = device.cuda_index();
             let facts = Facts::read(
-                interface,
                 startup.model.handle(),
                 &path,
                 startup.experts.0,
@@ -373,7 +369,7 @@ impl DiffusionLMRunner {
                 None => None,
             };
             let handle = stream.as_ref().map_or(0, Stream::raw);
-            let scratch = startup.scratches.get(interface, handle, cuda)?;
+            let scratch = startup.scratches.get(handle, cuda)?;
             let optional = |handle: Option<Handle>| handle.map_or(Argument::None, Argument::Handle);
 
             let dimensions = bounds.dimensions(&facts, banks);
@@ -394,9 +390,7 @@ impl DiffusionLMRunner {
                 // The functions of each communicator's collectives on the
                 // stream, by communicator name.
                 match &collectives {
-                    Some(collectives) => {
-                        Argument::Handle(Handle::new(collectives.natives(interface)?)?)
-                    }
+                    Some(collectives) => Argument::Handle(Handle::new(collectives.natives()?)?),
                     None => Argument::None,
                 },
                 bounds.tokens.into(),
@@ -418,8 +412,8 @@ impl DiffusionLMRunner {
                     arguments.push(view.into());
                 }
             }
-            let methods = Methods::construct(interface, RUNNER, arguments)?;
-            let functions = Functions::resolve(interface, &methods)?;
+            let methods = Methods::construct(RUNNER, arguments)?;
+            let functions = Functions::resolve(&methods)?;
             // Idle ranks join expert steps through the model's expert
             // layers; a text binding may already provide them.
             if let Some(experts) = experts.as_deref_mut()
@@ -434,7 +428,7 @@ impl DiffusionLMRunner {
                     let key = buffers.column("input_ids")?.address() as usize;
                     reserve_pools(
                         startup.graphs,
-                        &interface.function("graphs.pool")?,
+                        &Interpreter::import("uniserve.cuda_graph.pool")?,
                         key,
                         owner.clone(),
                         &[ordinal],
@@ -501,7 +495,6 @@ impl DiffusionLMRunner {
 /// generating rank's banks and the sampler workspace its Python half
 /// allocates. `experts` is as in [`Startup`].
 pub(crate) fn reserved_bytes(
-    interface: &Interface,
     model: &LoadedModel,
     components: &Components,
     experts: (bool, usize),
@@ -512,16 +505,14 @@ pub(crate) fn reserved_bytes(
     let cuda = config.device.cuda_index().is_some();
     let mut bytes = 0;
     for (_, path, _) in placed(components)? {
-        let facts = Facts::read(interface, model.handle(), &path, experts.0, experts.1)?;
+        let facts = Facts::read(model.handle(), &path, experts.0, experts.1)?;
         let bounds = Bounds::new(config, request_slots, cache, None, &facts, cuda)?;
         let banks = config
             .canvas_sampling
             .as_ref()
             .and_then(|sampling| bounds.banks(&facts, request_slots, sampling));
         let workspace = match (bounds.denoise, banks) {
-            (Some((_, chunk_rows)), Some(_)) => {
-                facts.workspace_bytes(interface, chunk_rows, cuda)?
-            }
+            (Some((_, chunk_rows)), Some(_)) => facts.workspace_bytes(chunk_rows, cuda)?,
             _ => 0,
         };
         let resident = banks.map(|banks| banks.bytes()).transpose()?.unwrap_or(0);

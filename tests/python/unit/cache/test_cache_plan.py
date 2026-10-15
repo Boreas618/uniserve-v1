@@ -1,4 +1,4 @@
-"""The worker's cache interface describes, resets and converts unit pools."""
+"""The library describes, resets and converts the worker's unit pools."""
 
 import subprocess
 import sys
@@ -7,9 +7,13 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve.interface import cache, errors, runtime
+from uniserve import errors
 from uniserve.models import CausalLM, TransformerDecoder
 from uniserve.nn.attention import Attention
+from uniserve.prefix_cache import plan as cache
+from uniserve.prefix_cache.conversion import PageConversion
+from uniserve.prefix_cache.units import UnitResets
+from uniserve.worker import import_path
 
 pytestmark = pytest.mark.unit
 
@@ -152,7 +156,7 @@ def test_unit_bindings_reset_the_units_rust_selects():
     for name, tensor in fields.items():
         tensor.fill_(1 if name.endswith("initialized") else 3)
     units = torch.tensor([2, 1, 0, 0], dtype=torch.int64)
-    resets = cache.UnitResets(units, 0, list(fields), *fields.values())
+    resets = UnitResets(units, 0, list(fields), *fields.values())
 
     resets.recycle(1)
     assert not torch.any(fields["key.initialized"][:, 2])
@@ -169,14 +173,14 @@ def test_unit_bindings_reset_the_units_rust_selects():
     assert torch.all(fields["value.initialized"][:, 0])
 
 
-def test_a_failed_unit_reset_crosses_the_interface_with_its_kind():
+def test_a_failed_unit_reset_reaches_the_worker_with_its_kind():
     plan = cache.cache_plan(_model(layers=6), 16, "float8_e4m3fn")
     fields = _fields(plan, 4)
     # Unit 9 lies outside the four-unit pool.
     units = torch.tensor([9, 0, 0, 0], dtype=torch.int64)
-    resets = cache.UnitResets(units, 0, list(fields), *fields.values())
+    resets = UnitResets(units, 0, list(fields), *fields.values())
     # The rank reaches the method by import path.
-    zero = runtime.import_path("uniserve.interface.cache.UnitResets.zero")
+    zero = import_path("uniserve.prefix_cache.units.UnitResets.zero")
 
     with pytest.raises(errors.InputError):
         zero(resets, 1)
@@ -194,7 +198,7 @@ def test_a_recycled_fp8_unit_encodes_like_a_fresh_unit(device):
     (name,) = plan.layers()
     state = pool.state(name)
     units = torch.tensor([1, 0, 0], dtype=torch.int64, device=device)
-    resets = cache.UnitResets(units, 0, list(fields), *fields.values())
+    resets = UnitResets(units, 0, list(fields), *fields.values())
 
     large = torch.full((4, 4, 4), 1792.0, device=device)
     state.write((1,), start=0, key=large, value=-large)
@@ -222,7 +226,7 @@ def test_conversion_binding_encodes_scratch_spans_like_writes():
     scales_count = 4 * layers * heads
     fields = _fields(plan, 3)
     scratch = torch.zeros(20 * elements + 8 * scales_count, dtype=torch.uint8)
-    conversion = cache.PageConversion(
+    conversion = PageConversion(
         plan,
         3,
         scratch,
@@ -280,10 +284,10 @@ def test_conversion_binding_encodes_scratch_spans_like_writes():
         )
 
 
-def test_interface_import_does_not_initialize_cuda():
+def test_importing_the_cache_modules_does_not_initialize_cuda():
     code = (
         "import torch\n"
-        "from uniserve.interface import cache\n"
+        "from uniserve.prefix_cache import conversion, plan, units\n"
         "assert not torch.cuda.is_initialized()\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)

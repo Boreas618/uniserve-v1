@@ -17,8 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tvm_ffi::{Any, AnyView};
 
-use crate::ffi::{Function, Handle};
-use crate::model::interface::Interface;
+use crate::ffi::{Function, Handle, Interpreter};
 use crate::{Error, Result};
 
 /// Bytes of an encoded unit's length prefix.
@@ -159,12 +158,12 @@ pub(crate) struct MuxFunctions {
 }
 
 impl MuxFunctions {
-    pub(crate) fn new(interface: &Interface) -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
-            open: interface.import(&format!("{CONTAINER}.open"))?,
-            append: interface.import(&format!("{CONTAINER}.append"))?,
-            finish: interface.import(&format!("{CONTAINER}.finish"))?,
-            close: interface.import(&format!("{CONTAINER}.close"))?,
+            open: Interpreter::import(&format!("{CONTAINER}.open"))?,
+            append: Interpreter::import(&format!("{CONTAINER}.append"))?,
+            finish: Interpreter::import(&format!("{CONTAINER}.finish"))?,
+            close: Interpreter::import(&format!("{CONTAINER}.close"))?,
         })
     }
 

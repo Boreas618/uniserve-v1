@@ -1,11 +1,12 @@
-"""Describing, loading and planning the stub model through the interface."""
+"""Describing, loading and planning the stub model as a rank does."""
 
 import pytest
 
 from tests.python.fixtures.stub import load_model, read_config
-from uniserve import interface
-from uniserve.interface import cache, loading
-from uniserve.interface.errors import UnsupportedSetup
+from uniserve.distributed import world
+from uniserve.errors import UnsupportedSetup
+from uniserve.loading import rank
+from uniserve.prefix_cache import plan as cache
 from uniserve.runner import causal_lm
 
 pytestmark = pytest.mark.unit
@@ -13,8 +14,7 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(scope="module")
 def loaded():
-    table = interface.table()
-    return table, load_model(read_config())
+    return load_model(read_config())
 
 
 def test_description_reports_calls_with_capability_tags():
@@ -54,17 +54,17 @@ def test_split_experts_require_routed_expert_layers():
 
 
 def test_a_loaded_model_reports_its_backend_sizes_and_formats(loaded):
-    _, model = loaded
-    assert loading.attention_backend(model) == "torch"
+    model = loaded
+    assert rank.attention_backend(model) == "torch"
     assert causal_lm.vocab_size(model) == 151671
     assert causal_lm.hidden_size(model) == 4
-    assert loading.weight_formats(model) == ["dense"]
+    assert rank.weight_formats(model) == ["dense"]
     # The stub has no quantizable linear layer.
-    assert loading.activation_formats(model) == []
+    assert rank.activation_formats(model) == []
 
 
 def test_cache_plan_describes_pages_of_the_requested_size(loaded):
-    _, model = loaded
+    model = loaded
     plan = cache.cache_plan(model, 32, "")
     assert cache.reads_pages(model, "torch", plan) is True
     assert plan.dtype() == "bfloat16"
@@ -78,14 +78,13 @@ def test_cache_plan_describes_pages_of_the_requested_size(loaded):
 
 
 def test_a_single_rank_world_binds_local_communicators():
-    table = interface.table()
     # One CPU rank outside a union: no backend choice, store or union.
-    world = table["distributed.initialize"](
+    process = world.initialize(
         0, 0, 1, "cpu", None, None, None, None, None, None
     )
-    assert table["distributed.create_groups"](world, [], [], [], []) == []
-    mesh = table["distributed.mesh"](
-        world,
+    assert world.create_groups(process, [], [], [], []) == []
+    mesh = world.mesh(
+        process,
         [0],
         [1, 1, 1, 1],
         ["pp", "cp", "tp", "ulysses"],
@@ -97,4 +96,4 @@ def test_a_single_rank_world_binds_local_communicators():
     )
     group = mesh.get_group("tp")
     assert (group.name, group.ranks, group.rank) == ("tp", (0,), 0)
-    table["distributed.destroy"](world)
+    world.destroy(process)

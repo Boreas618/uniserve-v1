@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from uniserve.interface import kernels
+from uniserve.profiling import kernel_table, layer_paths
 from uniserve.runner.context import kernel_records
 
 pytestmark = pytest.mark.unit
@@ -17,7 +17,7 @@ def _table(runners, stage="startup"):
         for label, (_, records) in runners.items()
     }
     return json.loads(
-        kernels.table(
+        kernel_table(
             stage,
             0,
             "cuda:0",
@@ -30,11 +30,11 @@ def _table(runners, stage="startup"):
 
 
 def test_numbered_layers_compress_into_ranges():
-    assert kernels.layer_paths(
+    assert layer_paths(
         ["layers.0.mlp", "layers.1.mlp", "layers.2.mlp", "layers.5.mlp", "head"]
     ) == ["layers.{0-2,5}.mlp", "head"]
     # Two varying positions cannot share one template.
-    assert kernels.layer_paths(["a.0.b.1", "a.1.b.0"]) == ["a.0.b.1", "a.1.b.0"]
+    assert layer_paths(["a.0.b.1", "a.1.b.0"]) == ["a.0.b.1", "a.1.b.0"]
 
 
 def test_equal_records_share_a_call_site_and_portable_sites_are_listed():

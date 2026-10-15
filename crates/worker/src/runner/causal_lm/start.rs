@@ -19,11 +19,10 @@ use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::forward::launch::StreamOrder;
-use crate::ffi::{DType, Handle};
+use crate::ffi::{DType, Handle, Interpreter};
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::components::RunnerKind;
-use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::{
@@ -262,7 +261,6 @@ struct Target {
 
 /// What text startup borrows from the rank.
 pub(crate) struct Startup<'a> {
-    pub(crate) interface: &'a Interface,
     pub(crate) config: &'a WorkerConfig,
     pub(crate) request_slots: usize,
     pub(crate) queue_depth: usize,
@@ -336,11 +334,11 @@ impl CausalLMRunners {
                 experts.parallel().max_tokens()
             )));
         }
-        let vocab = methods::vocab_size(startup.interface, startup.model.handle())?;
+        let vocab = methods::vocab_size(startup.model.handle())?;
         let dtype = model_dtype(&config.model_dtype)?;
 
         // The attention layers' view of the pool, bound once.
-        let pool = prefix_cache.pool(startup.interface)?;
+        let pool = prefix_cache.pool()?;
 
         let state = DecodeState::allocate(
             startup.request_slots,
@@ -408,7 +406,7 @@ impl CausalLMRunners {
             .iter()
             .map(|table| i64::from(table.windowed))
             .collect();
-        let create_pool = startup.interface.function("graphs.pool")?;
+        let create_pool = Interpreter::import("uniserve.cuda_graph.pool")?;
         let mut runners = Vec::new();
         let mut columns = Vec::new();
         let mut routes = HashMap::new();
@@ -445,46 +443,43 @@ impl CausalLMRunners {
                     .map(|(_, view)| view)
                     .ok_or_else(|| Error::Invariant(format!("block tables have no {name}")))
             };
-            let methods = methods::construct(
-                startup.interface,
-                &Construction {
-                    loaded: startup.model.handle(),
-                    path: &path,
-                    device: ordinal,
-                    stream: handle,
-                    scratch: startup.scratches.get(startup.interface, handle, ordinal)?,
-                    cache: &pool,
-                    experts: exchange,
-                    weights: startup.weights.map(|weights| weights.prefetch().clone()),
-                    collectives: bound
-                        .as_ref()
-                        .map(|bound| bound.natives(startup.interface).and_then(Handle::new))
-                        .transpose()?,
-                    rows: bounds.rows,
-                    tokens: bounds.tokens,
-                    width: bounds.width(),
-                    page_tokens: &table_layout,
-                    windowed: &windowed,
-                    state: [
-                        slot_table("unit_tables")?,
-                        slot_table("start_pages")?,
-                        slot_table("table_shapes")?,
-                        state.verified_lengths(),
-                        state.future_input_tokens(),
-                        state.logical_lengths(),
-                        state.predicates(),
-                        state.sampling_positions(),
-                        state.penalty_counts(),
-                        state.prompt_logits(),
-                    ],
-                },
-            )?;
+            let methods = methods::construct(&Construction {
+                loaded: startup.model.handle(),
+                path: &path,
+                device: ordinal,
+                stream: handle,
+                scratch: startup.scratches.get(handle, ordinal)?,
+                cache: &pool,
+                experts: exchange,
+                weights: startup.weights.map(|weights| weights.prefetch().clone()),
+                collectives: bound
+                    .as_ref()
+                    .map(|bound| bound.natives().and_then(Handle::new))
+                    .transpose()?,
+                rows: bounds.rows,
+                tokens: bounds.tokens,
+                width: bounds.width(),
+                page_tokens: &table_layout,
+                windowed: &windowed,
+                state: [
+                    slot_table("unit_tables")?,
+                    slot_table("start_pages")?,
+                    slot_table("table_shapes")?,
+                    state.verified_lengths(),
+                    state.future_input_tokens(),
+                    state.logical_lengths(),
+                    state.predicates(),
+                    state.sampling_positions(),
+                    state.penalty_counts(),
+                    state.prompt_logits(),
+                ],
+            })?;
 
             // The runner's vocabulary shard sizes its logits columns.
-            let functions = methods::Functions::resolve(startup.interface, &methods)?;
-            let shard = methods::vocab(startup.interface, &methods)?;
-            let hidden = methods::hidden_size(startup.interface, startup.model.handle())?;
-            let plans_attention = methods::plans_attention(startup.interface, &methods)?;
+            let functions = methods::Functions::resolve(&methods)?;
+            let shard = methods::vocab(&methods)?;
+            let hidden = methods::hidden_size(startup.model.handle())?;
+            let plans_attention = methods::plans_attention(&methods)?;
             if shard.size != vocab {
                 return Err(Error::Interface(format!(
                     "the text runner's vocabulary ({}) differs from the model's ({vocab})",
@@ -517,7 +512,7 @@ impl CausalLMRunners {
                 }
                 _ => None,
             };
-            columns.push(prefix_cache.bind_units(startup.interface, stream.as_ref())?);
+            columns.push(prefix_cache.bind_units(stream.as_ref())?);
             let group = groups
                 .iter()
                 .position(|peers| peers.contains(&runners.len()))
@@ -599,7 +594,6 @@ impl CausalLMRunners {
 
 /// Device bytes the causal LM runners allocate beside the cache pool.
 pub(crate) fn reserved_bytes(
-    interface: &Interface,
     model: &LoadedModel,
     config: &WorkerConfig,
     request_slots: usize,
@@ -608,11 +602,11 @@ pub(crate) fn reserved_bytes(
     streams: usize,
 ) -> Result<u64> {
     // A rank without a causal language model reports no vocabulary.
-    let vocab = methods::vocab_size(interface, model.handle())?;
+    let vocab = methods::vocab_size(model.handle())?;
     if vocab == 0 {
         return Ok(0);
     }
-    let hidden = methods::hidden_size(interface, model.handle())?;
+    let hidden = methods::hidden_size(model.handle())?;
     let cuda = config.device.is_cuda();
     let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
     let dtype = model_dtype(&config.model_dtype)?;

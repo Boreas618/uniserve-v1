@@ -2,8 +2,7 @@
 //! `uniserve.runner.causal_lm.CausalLMRunner`, its construction and
 //! the facts it reports.
 
-use crate::ffi::{Function, Handle};
-use crate::model::interface::Interface;
+use crate::ffi::{Function, Handle, Interpreter};
 use crate::runner::methods::{Argument, Methods};
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
@@ -29,8 +28,8 @@ pub(crate) struct Functions {
 
 impl Functions {
     /// Resolve the methods of `methods`' runner.
-    pub(crate) fn resolve(interface: &Interface, methods: &Methods) -> Result<Self> {
-        let method = |name: &str| methods.method(interface, name);
+    pub(crate) fn resolve(methods: &Methods) -> Result<Self> {
+        let method = |name: &str| methods.method(name);
         Ok(Self {
             decode: method("decode")?,
             plan_decode: method("plan_decode")?,
@@ -100,7 +99,7 @@ pub(crate) struct Construction<'a> {
 /// Construct the Python runner. Pipeline stages share the last stage's
 /// vocabulary in a collective, so every rank constructs its runners in
 /// the same order.
-pub(crate) fn construct(interface: &Interface, construction: &Construction<'_>) -> Result<Methods> {
+pub(crate) fn construct(construction: &Construction<'_>) -> Result<Methods> {
     let optional =
         |handle: &Option<Handle>| handle.clone().map_or(Argument::None, Argument::Handle);
     let mut arguments = vec![
@@ -120,42 +119,39 @@ pub(crate) fn construct(interface: &Interface, construction: &Construction<'_>) 
         construction.windowed.into(),
     ];
     arguments.extend(construction.state.iter().map(|&view| view.into()));
-    Methods::construct(interface, RUNNER, arguments)
+    Methods::construct(RUNNER, arguments)
 }
 
 /// A size of the loaded model's causal LM, read before a runner exists:
 /// the library function `name` over the loaded model.
-fn size(interface: &Interface, loaded: &Handle, name: &str) -> Result<usize> {
+fn size(loaded: &Handle, name: &str) -> Result<usize> {
     let function = format!("uniserve.runner.causal_lm.{name}");
-    let value = interface.import(&function)?.call(&[loaded.view()])?;
+    let value = Interpreter::import(&function)?.call(&[loaded.view()])?;
     let value = i64::try_from(value).map_err(|error| Error::numerical(&function, &error))?;
     Ok(value as usize)
 }
 
 /// Real vocabulary entries of the loaded model's causal LM; zero on a rank
 /// without one.
-pub(crate) fn vocab_size(interface: &Interface, loaded: &Handle) -> Result<usize> {
-    size(interface, loaded, "vocab_size")
+pub(crate) fn vocab_size(loaded: &Handle) -> Result<usize> {
+    size(loaded, "vocab_size")
 }
 
 /// The hidden width of the loaded model's causal LM; zero on a rank without
 /// one.
-pub(crate) fn hidden_size(interface: &Interface, loaded: &Handle) -> Result<usize> {
-    size(interface, loaded, "hidden_size")
+pub(crate) fn hidden_size(loaded: &Handle) -> Result<usize> {
+    size(loaded, "hidden_size")
 }
 
 /// A fact the runner reports once, by its method name.
-fn fact(interface: &Interface, methods: &Methods, name: &str) -> Result<tvm_ffi::Any> {
-    methods
-        .call(&methods.method(interface, name)?, Vec::new())
-        .invoke()
+fn fact(methods: &Methods, name: &str) -> Result<tvm_ffi::Any> {
+    methods.call(&methods.method(name)?, Vec::new()).invoke()
 }
 
 /// The vocabulary shard of this rank's logits.
-pub(crate) fn vocab(interface: &Interface, methods: &Methods) -> Result<Vocab> {
+pub(crate) fn vocab(methods: &Methods) -> Result<Vocab> {
     let malformed = || Error::Interface(format!("{RUNNER}.vocab returns four integers"));
-    let values =
-        crate::ffi::integers(fact(interface, methods, "vocab")?).map_err(|_| malformed())?;
+    let values = crate::ffi::integers(fact(methods, "vocab")?).map_err(|_| malformed())?;
     let [size, _padded, start, stop] = values[..] else {
         return Err(malformed());
     };
@@ -168,7 +164,7 @@ pub(crate) fn vocab(interface: &Interface, methods: &Methods) -> Result<Vocab> {
 
 /// Whether an attention operator plans each launch on the host, so a
 /// captured forward is launched after `plan_decode` or `plan_prefill`.
-pub(crate) fn plans_attention(interface: &Interface, methods: &Methods) -> Result<bool> {
-    bool::try_from(fact(interface, methods, "plans_attention")?)
+pub(crate) fn plans_attention(methods: &Methods) -> Result<bool> {
+    bool::try_from(fact(methods, "plans_attention")?)
         .map_err(|_| Error::Interface(format!("{RUNNER}.plans_attention returns a flag")))
 }

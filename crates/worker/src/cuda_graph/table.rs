@@ -165,7 +165,10 @@ mod tests {
             sink.lock().unwrap().push(value);
             Ok(Any::from(()))
         });
-        (Function::new("graphs.release", function), released)
+        (
+            Function::new("uniserve.cuda_graph.release", function),
+            released,
+        )
     }
 
     /// A one-segment capture result whose Python graph is `value`.

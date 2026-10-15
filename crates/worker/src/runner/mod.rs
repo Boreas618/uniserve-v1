@@ -23,7 +23,6 @@ use uniserve_cuda::Stream;
 use uniserve_ipc::{Call, CallKind};
 
 use crate::ffi::{Backing, DType, Handle};
-use crate::model::interface::Interface;
 use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
 
@@ -180,7 +179,6 @@ impl<R> ModelRunners<R> {
 
 /// What the Python runners of one module are constructed with.
 pub(crate) struct RunnerSetup<'a> {
-    pub(crate) interface: &'a Interface,
     pub(crate) loaded: &'a Handle,
     /// The module's path in the model.
     pub(crate) path: &'a str,
@@ -196,7 +194,6 @@ pub(crate) struct RunnerSetup<'a> {
 /// stream's shared work areas. The half constructs its own execution
 /// context and releases it when the runner closes.
 pub struct ImageSetup<'a> {
-    pub interface: &'a Interface,
     pub loaded: &'a Handle,
     /// The component the module belongs to.
     pub component: &'a str,

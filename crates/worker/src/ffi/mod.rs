@@ -1,10 +1,11 @@
 //! TVM-FFI values exchanged with the Python numerical library.
 //!
 //! The worker receives exactly one value from Python at startup: the
-//! interface table, a map from `<area>.<verb>` names to functions. Loading and
-//! binding functions return opaque handles and per-component maps of further
-//! functions. Everything Rust sends back is a TVM-FFI value: integers, floats,
-//! strings, shapes, arrays, maps, tensors and the handles it was given.
+//! function that resolves an import path to a library callable
+//! ([`Interpreter::import`]). Library functions return opaque handles and
+//! TVM-FFI values. Everything Rust sends back is a TVM-FFI value: integers,
+//! floats, strings, shapes, arrays, maps, tensors and the handles it was
+//! given.
 //!
 //! One thread of a rank executes Python: the [`Interpreter`]. A [`Function`]
 //! may be called from any thread; the call is handed to the interpreter and

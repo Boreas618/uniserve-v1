@@ -29,9 +29,8 @@ use self::plan::{CACHE, CachePlan};
 use self::planes::{CachePlanes, UnitColumn};
 use super::memory::StorageView;
 use super::{BlockTableStorage, BlockTables, GroupTable, PrefixCacheManager};
-use crate::ffi::Handle;
+use crate::ffi::{Handle, Interpreter};
 use crate::host::HostLane;
-use crate::model::interface::Interface;
 use crate::stream::Issue;
 use crate::transfer::cache_export::{self, CacheExport};
 use crate::transfer::{
@@ -168,10 +167,6 @@ impl PrefixCache {
     ///
     /// Every import workspace constructs the library's unit resets and
     /// page conversion on its own stream.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the pool's complete startup facts"
-    )]
     pub fn new(
         plan: Arc<CachePlan>,
         num_units: u32,
@@ -180,7 +175,6 @@ impl PrefixCache {
         import_capacity: usize,
         device: Option<i32>,
         stream: Option<&Stream>,
-        interface: &Interface,
     ) -> Result<Self> {
         let shapes = plan.group_shapes()?;
         let planes = Arc::new(CachePlanes::allocate(plan, device, num_units, stream)?);
@@ -190,7 +184,7 @@ impl PrefixCache {
 
         let workers = Self::import_workers(import_capacity);
         let workspaces = (0..workers)
-            .map(|_| ImportWorkspace::bind(&planes, interface).map(Arc::new))
+            .map(|_| ImportWorkspace::bind(&planes).map(Arc::new))
             .collect::<Result<Vec<_>>>()?;
         let importer = Arc::new(CacheImporter::new(workspaces));
         let lane = HostLane::new(import_capacity.max(1), workers, "worker-cache-import")?;
@@ -253,22 +247,18 @@ impl PrefixCache {
     /// The attention layers' view of the unit pool (the library's `pool`
     /// over the plan, the unit count and the unit fields by name), which
     /// execution contexts read prefixes through.
-    pub fn pool(&self, interface: &Interface) -> Result<Handle> {
+    pub fn pool(&self) -> Result<Handle> {
         let mut arguments = vec![
             self.plan().handle.to_any(),
             Any::from(i64::from(self.planes.num_units())),
         ];
         arguments.extend(self.planes.field_arguments()?);
-        Handle::new(
-            interface
-                .import(&format!("{CACHE}.pool"))?
-                .call_values(&arguments)?,
-        )
+        Handle::new(Interpreter::import(&format!("{CACHE}.pool"))?.call_values(&arguments)?)
     }
 
     /// Bind the unit resets to another stream (one per executing lane).
-    pub fn bind_units(&self, interface: &Interface, stream: Option<&Stream>) -> Result<UnitColumn> {
-        UnitColumn::bind(&self.planes, interface, stream)
+    pub fn bind_units(&self, stream: Option<&Stream>) -> Result<UnitColumn> {
+        UnitColumn::bind(&self.planes, stream)
     }
 
     /// Install scheduler page assignments: validate them all, write the

@@ -1,9 +1,15 @@
-"""The execution context a runner constructs for its module."""
+"""A runner's execution context and the helpers its forwards run in.
+
+:func:`execution_context` prepares a runner's module on its stream. A
+runner's forwards run on its stream with its prepared operators
+(:func:`scope`) and publish results into product tensors (:func:`write`).
+"""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -52,9 +58,9 @@ def execution_context(
     bound = None
     if collectives is not None:
         from uniserve.distributed import communicators
-        from uniserve.interface.distributed import stream_collectives
+        from uniserve.distributed.collectives import group_collectives
 
-        bound = stream_collectives(communicators(module), collectives)
+        bound = group_collectives(communicators(module), collectives)
     return ExecutionContext(
         module,
         device=None
@@ -98,3 +104,39 @@ def kernel_records(records: Iterable[Mapping[str, Any]]) -> list[str]:
     text of one JSON object.
     """
     return [json.dumps(record) for record in records]
+
+
+@contextmanager
+def scope(context) -> Iterator[None]:
+    """Run one forward on the runner's stream with its prepared operators."""
+    with torch.inference_mode(), context.activate():
+        yield
+
+
+def write(target: torch.Tensor, value: torch.Tensor) -> list[int]:
+    """Copy ``value`` into the leading elements of a product region.
+
+    Converts to the product's dtype on the current stream and returns the
+    value's shape, which the worker publishes as the product's shape.
+
+    Raises:
+        ValueError: The value exceeds the region.
+    """
+    shape = list(value.shape)
+    if value.numel() > target.numel():
+        raise ValueError("a result exceeds its product bound")
+    target.reshape(-1)[: value.numel()].view(value.shape).copy_(
+        local(value.detach(), target.device), non_blocking=True
+    )
+    return shape
+
+
+def local(value: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``value`` on ``device``, for a copy into worker storage there.
+
+    A value computed on another device (a generation tower) moves into
+    allocator storage of ``device`` first: the worker's storage is mapped
+    for its own device only, and a cross-device copy runs on the source
+    device.
+    """
+    return value.to(device, non_blocking=True)

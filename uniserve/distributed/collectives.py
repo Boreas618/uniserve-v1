@@ -11,7 +11,7 @@ traceable through captured graphs.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Protocol
@@ -382,3 +382,138 @@ def recv(payload: torch.Tensor, src: int, group) -> None:
         bound.recv(payload, src)
     else:
         dist.recv(payload, src=src, group=group)
+
+
+class _Transfer:
+    """A started native collective; its consumer joins it on its stream."""
+
+    def __init__(self, wait: Callable[..., Any], token: int) -> None:
+        self._wait = wait
+        # Cleared once the consumer has joined the collective.
+        self._token: int | None = token
+
+    def block_current_stream(self) -> None:
+        token, self._token = self._token, None
+        if token is not None:
+            self._wait(token, torch.cuda.current_stream().cuda_stream)
+
+
+class NativeCollectives:
+    """One group's collectives on the worker's NCCL communicator.
+
+    The worker binds one communicator per stream and group and constructs
+    this object over its functions; every call enqueues on that stream
+    (asynchronous ones on its transfer fork, joined by the consumer).
+    Members are ordered by ascending world rank, the backend order
+    ``Communicator`` assumes; roots and peers are world ranks.
+
+    Args:
+        name: The communicator's name: its mesh axes joined by ``.``.
+        all_reduce: ``(value, op)`` with ``op`` 0 for sum, 2 for max and 3
+            for min.
+        all_gather, reduce_scatter: ``(output, value)``.
+        start_all_gather, start_all_to_all: ``(output, value)``, returning
+            the token ``wait`` joins.
+        wait: ``(token, stream)`` joins a started collective on the CUDA
+            stream handle ``stream``.
+        all_to_all: ``(output, value, output_splits, input_splits)``.
+        gather: ``(outputs, value, root)``.
+        broadcast: ``(value, root)``.
+        send, recv: ``(value, peer)``.
+        send_recv: ``(output, value, destination, source)``.
+    """
+
+    _REDUCTIONS = {"sum": 0, "max": 2, "min": 3}
+
+    def __init__(
+        self,
+        name: str,
+        all_reduce: Callable[..., Any],
+        all_gather: Callable[..., Any],
+        start_all_gather: Callable[..., Any],
+        start_all_to_all: Callable[..., Any],
+        wait: Callable[..., Any],
+        all_to_all: Callable[..., Any],
+        gather: Callable[..., Any],
+        broadcast: Callable[..., Any],
+        reduce_scatter: Callable[..., Any],
+        send: Callable[..., Any],
+        recv: Callable[..., Any],
+        send_recv: Callable[..., Any],
+    ) -> None:
+        self.name = str(name)
+        self._all_reduce = all_reduce
+        self._all_gather = all_gather
+        self._start_all_gather = start_all_gather
+        self._start_all_to_all = start_all_to_all
+        self._wait = wait
+        self._all_to_all = all_to_all
+        self._gather = gather
+        self._broadcast = broadcast
+        self._reduce_scatter = reduce_scatter
+        self._send = send
+        self._recv = recv
+        self._send_recv = send_recv
+
+    def all_reduce(self, value: torch.Tensor, op: str = "sum") -> None:
+        self._all_reduce(value, self._REDUCTIONS[op])
+
+    def all_gather(self, output: torch.Tensor, value: torch.Tensor) -> None:
+        self._all_gather(output, value)
+
+    def start_all_gather(self, output, value) -> _Transfer:
+        return _Transfer(self._wait, self._start_all_gather(output, value))
+
+    def start_all_to_all(self, output, value) -> _Transfer:
+        return _Transfer(self._wait, self._start_all_to_all(output, value))
+
+    def all_to_all(self, output, value, output_splits, input_splits) -> None:
+        self._all_to_all(output, value, list(output_splits), list(input_splits))
+
+    def gather(self, outputs, value, root: int) -> None:
+        self._gather(list(outputs or ()), value, int(root))
+
+    def broadcast(self, value: torch.Tensor, root: int) -> None:
+        self._broadcast(value, int(root))
+
+    def reduce_scatter(self, output, value) -> None:
+        self._reduce_scatter(output, value)
+
+    def send(self, value: torch.Tensor, peer: int) -> None:
+        self._send(value, int(peer))
+
+    def recv(self, value: torch.Tensor, peer: int) -> None:
+        self._recv(value, int(peer))
+
+    def send_recv(self, output, value, dst: int, src: int) -> None:
+        self._send_recv(output, value, int(dst), int(src))
+
+    def close(self) -> None:
+        """The worker destroys the communicator."""
+
+
+def group_collectives(groups, collectives: Sequence[NativeCollectives]) -> dict:
+    """The stream collectives of ``groups`` by group name.
+
+    The result is what :func:`stream_collective_scope` takes for an
+    execution context.
+
+    ``collectives`` holds one stream's collectives of each communicator.
+    Every multi-member communicator of ``groups`` must have one: within an
+    activation, a collective never falls back to another stream.
+
+    Raises:
+        ValueError: A communicator has no stream collectives.
+    """
+    named = {native.name: native for native in collectives}
+    bound = {}
+    for group in groups:
+        if group.size == 1:
+            continue
+        native = named.get(group.name)
+        if native is None:
+            raise ValueError(
+                f"communicator {group.name!r} has no stream collectives"
+            )
+        bound[group._require().group_name] = native
+    return bound

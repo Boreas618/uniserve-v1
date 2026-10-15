@@ -26,19 +26,16 @@ pub use arguments::{Arguments, USAGE};
 pub use registration::{HeadWatch, register};
 pub use signals::Signals;
 
-use tvm_ffi::Map;
-
 use crate::config::{DescriptorError, resolve};
 use crate::error::WorkerError;
 use crate::ffi::Interpreter;
-use crate::model::interface::Interface;
 use crate::worker::Worker;
 
 /// Run the rank and return its exit status.
-pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> i64 {
+pub fn main(argv: &[String], import: tvm_ffi::Function) -> i64 {
     crate::logging::init();
-    // Installed first: Python's own SIGINT handler would raise inside an
-    // interface call.
+    // Installed first: Python's own SIGINT handler would raise inside a
+    // library call.
     let signals = match Signals::install() {
         Ok(signals) => signals,
         Err(error) => {
@@ -61,7 +58,7 @@ pub fn main(argv: &[String], table: Map<tvm_ffi::String, tvm_ffi::Function>) -> 
         );
         return 1;
     }
-    match run(&arguments, table, &signals) {
+    match run(&arguments, import, &signals) {
         Ok(()) => {
             tracing::info!(target: "uniserve_worker.launch", "worker shut down");
             0
@@ -97,10 +94,10 @@ impl<E: Into<WorkerError>> From<E> for Failure {
 /// Python calls.
 fn run(
     arguments: &Arguments,
-    table: Map<tvm_ffi::String, tvm_ffi::Function>,
+    import: tvm_ffi::Function,
     signals: &Signals,
 ) -> std::result::Result<(), Failure> {
-    let interface = Interface::from_table(table)?;
+    Interpreter::install_import(import);
     let interpreter = Interpreter::start()?;
     let (finished, outcome) = crossbeam_channel::bounded(1);
 
@@ -110,7 +107,7 @@ fn run(
             .spawn_scoped(scope, move || {
                 // The receiver outlives this thread: the interpreter holds
                 // it until this value arrives.
-                let _ = finished.send(serve(arguments, interface, signals));
+                let _ = finished.send(serve(arguments, signals));
             })
             .map_err(|error| crate::Error::Transport(format!("control thread: {error}")))?;
 
@@ -122,11 +119,7 @@ fn run(
 
 /// The rank's life on the control thread: register with the head, start,
 /// warm up, serve and close.
-fn serve(
-    arguments: &Arguments,
-    interface: Interface,
-    signals: &Signals,
-) -> std::result::Result<(), Failure> {
+fn serve(arguments: &Arguments, signals: &Signals) -> std::result::Result<(), Failure> {
     let (mut channel, descriptor) = register(arguments)?;
     let launch = resolve(descriptor).map_err(Failure::Descriptor)?;
     channel.set_bound(launch.ipc.max_payload_bytes);
@@ -138,7 +131,7 @@ fn serve(
         .map_err(|error| crate::Error::Transport(error.to_string()))?;
     let mut starting = Some(HeadWatch::start(hangup)?);
 
-    let mut worker = Worker::start(launch, interface)?;
+    let mut worker = Worker::start(launch)?;
     let served = worker.warmup().and_then(|()| {
         starting.take();
         signals.serving();

@@ -27,6 +27,10 @@
 //!   a time;
 //! - no interpreter was started: the library is used from Python (tests,
 //!   harnesses), where the caller's thread already is the Python thread.
+//!
+//! The library is reached by import path ([`Interpreter::import`]) through
+//! the one function the Python entry hands the rank,
+//! `uniserve.worker.import_path`. There is no table of entries.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -34,6 +38,7 @@ use std::sync::OnceLock;
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 use tvm_ffi::{Any, AnyView};
 
+use super::Function;
 use crate::handoff::{Handoff, hand};
 use crate::{Error, Result};
 
@@ -54,12 +59,44 @@ enum Request {
 /// the interpreter has stopped, sends fail and callers call directly.
 static REQUESTS: OnceLock<Sender<Request>> = OnceLock::new();
 
+/// The function that resolves an import path to a Python callable,
+/// installed once per process ([`Interpreter::install_import`]).
+static IMPORT: OnceLock<Function> = OnceLock::new();
+
 /// The thread that executes Python.
 pub struct Interpreter {
     requests: Receiver<Request>,
 }
 
 impl Interpreter {
+    /// Install the function through which every library function is
+    /// reached by its import path ([`Self::import`]): the rank's entry
+    /// installs the `import` argument of `main`, and a library loaded into
+    /// another Python process (a harness) installs the same function,
+    /// `uniserve.worker.import_path`. The first installation stays for the
+    /// process; every later one names the same function.
+    pub fn install_import(import: tvm_ffi::Function) {
+        let _ = IMPORT.set(Function::new("uniserve.worker.import_path", import));
+    }
+
+    /// The Python callable at a dotted import path, for example
+    /// `uniserve.runner.causal_lm.CausalLMRunner.decode`: a function, a
+    /// class (called to construct it) or a method (called with the object
+    /// first). Resolving imports the path's module on the Python thread.
+    ///
+    /// Fails when no import function was installed, when the path does not
+    /// resolve (the library's error, which names the path) or when it names
+    /// something that is not callable.
+    pub fn import(path: &str) -> Result<Function> {
+        let import = IMPORT
+            .get()
+            .ok_or(Error::State("no import function was installed"))?;
+        let imported = import.call(&[(&Any::from(tvm_ffi::String::from(path))).into()])?;
+        let function = tvm_ffi::Function::try_from(imported)
+            .map_err(|_| Error::Interface(format!("`{path}` is not callable")))?;
+        Ok(Function::new(path, function))
+    }
+
     /// Make the calling thread the process's Python thread. From now on a
     /// [`super::Function`] called on another thread runs here, inside
     /// [`Self::run`].

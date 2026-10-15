@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from uniserve.distributed import Communicator, DeviceMesh
+from uniserve.errors import SetupError
 from uniserve.models import (
     AudioDecoder,
     AudioEncoder,
@@ -43,8 +44,6 @@ from uniserve.nn.attention import (
     Ulysses,
 )
 from uniserve.nn.vae.patch import PatchAutoencoder
-
-from .errors import SetupError
 
 # Capability tags the worker understands, with the class each one names.
 CAPABILITIES: tuple[tuple[str, type], ...] = (

@@ -9,8 +9,7 @@
 
 use tvm_ffi::Any;
 
-use crate::ffi::{Function, Handle, Shape};
-use crate::model::interface::Interface;
+use crate::ffi::{Function, Handle, Interpreter, Shape};
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::StorageView;
@@ -124,20 +123,16 @@ impl Methods {
     /// Construct the Python runner `class(*arguments)`. A constructor may
     /// run collectives, so the ranks of a group construct their runners in
     /// the same order.
-    pub(crate) fn construct(
-        interface: &Interface,
-        class: &'static str,
-        arguments: Vec<Argument>,
-    ) -> Result<Self> {
+    pub(crate) fn construct(class: &'static str, arguments: Vec<Argument>) -> Result<Self> {
         let runner = MethodCall {
-            function: interface.import(class)?,
+            function: Interpreter::import(class)?,
             arguments,
         }
         .invoke()?;
         Ok(Self {
             class,
             runner: Handle::new(runner)?,
-            graphs: GraphFunctions::from_interface(interface)?,
+            graphs: GraphFunctions::import()?,
         })
     }
 
@@ -150,8 +145,8 @@ impl Methods {
     /// methods it calls once, when it is built, so a method the library
     /// does not have fails startup with its import path and a forward
     /// looks nothing up.
-    pub(crate) fn method(&self, interface: &Interface, name: &str) -> Result<Function> {
-        interface.import(&format!("{}.{name}", self.class))
+    pub(crate) fn method(&self, name: &str) -> Result<Function> {
+        Interpreter::import(&format!("{}.{name}", self.class))
     }
 
     /// A call of `method` on the runner with `arguments`.
@@ -184,18 +179,13 @@ pub(crate) struct RunnerClass {
 impl RunnerClass {
     /// The class at import path `class`, whose forward method is `forward`
     /// and whose constructor takes `fixed` before each runner's size.
-    pub(crate) fn new(
-        interface: &Interface,
-        class: &'static str,
-        forward: &str,
-        fixed: Vec<Argument>,
-    ) -> Result<Self> {
-        let method = |name: &str| interface.import(&format!("{class}.{name}"));
+    pub(crate) fn new(class: &'static str, forward: &str, fixed: Vec<Argument>) -> Result<Self> {
+        let method = |name: &str| Interpreter::import(&format!("{class}.{name}"));
         Ok(Self {
             class,
-            constructor: interface.import(class)?,
+            constructor: Interpreter::import(class)?,
             fixed,
-            graphs: GraphFunctions::from_interface(interface)?,
+            graphs: GraphFunctions::import()?,
             forward: method(forward)?,
             kernels: method("kernels")?,
             close: method("close")?,

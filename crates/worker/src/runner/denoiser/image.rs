@@ -49,7 +49,7 @@ use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::batch::image::{ImageBatch, Planned, Progress, Resume};
 use crate::executor::forward::transfer::latents;
-use crate::ffi::{DType, Function, Handle, integer_list};
+use crate::ffi::{DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Completion, Job, Value};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
@@ -248,7 +248,6 @@ impl ImageDiffusion {
         capacity: DiffusionCapacity,
         storage: DiffusionStorage,
     ) -> Result<Self> {
-        let interface = setup.interface;
         let owner = setup.owner();
         let (device, stream) = (setup.device, setup.stream.clone());
         if device.is_cuda() != stream.is_some() {
@@ -299,7 +298,7 @@ impl ImageDiffusion {
                 .ok_or_else(|| Error::Invariant(format!("the prefix cache has no {name}")))?;
             Ok(Any::from(view.to_tensor()?))
         };
-        let method = |name: &str| interface.import(&format!("{RUNNER}.{name}"));
+        let method = |name: &str| Interpreter::import(&format!("{RUNNER}.{name}"));
         let mut arguments = setup.arguments();
         arguments.extend([
             cache.to_any(),
@@ -317,7 +316,7 @@ impl ImageDiffusion {
         ]);
         let runner = Handle::new(method("image")?.call_values(&arguments)?)?;
         let plans_attention = method("plans_attention")?.call_as::<bool>(&[runner.view()])?;
-        let capture = GraphFunctions::from_interface(interface)?;
+        let capture = GraphFunctions::import()?;
         Ok(Self {
             graphs: GraphTable::new(owner.clone(), capture.release.clone()),
             methods: Methods {

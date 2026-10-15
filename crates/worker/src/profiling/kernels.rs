@@ -4,7 +4,7 @@
 //! Each runner reports one record per prepared operator as the text of a
 //! JSON object. The rank does not read the records: it keeps them by runner,
 //! notices when a runner's report changes, and hands them back to the
-//! library, which renders the kernel table (`interface.kernels.table`). The
+//! library, which renders the kernel table (`uniserve.profiling.kernel_table`). The
 //! table is logged as the line `uniserve-kernel-table {json}`.
 //!
 //! Startup lists and renders with calls it waits for. While serving, the
@@ -17,9 +17,8 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 use tvm_ffi::Any;
 
-use crate::ffi::Function;
+use crate::ffi::{Function, Interpreter};
 use crate::lane::{Completion, Job, JobId, JobQueues};
-use crate::model::interface::Interface;
 use crate::runner::methods::{Argument, MethodCall};
 use crate::{Error, Result};
 
@@ -29,7 +28,7 @@ const TAG: &str = "uniserve-kernel-table";
 pub const TARGET: &str = "uniserve_worker.execution.model_executor";
 
 /// The library function rendering the kernel table.
-const TABLE: &str = "uniserve.interface.kernels.table";
+const TABLE: &str = "uniserve.profiling.kernel_table";
 
 /// One operator's kernel record, as a runner's `kernels` method reports it:
 /// a JSON object text the rank passes on unread.
@@ -65,9 +64,9 @@ pub struct KernelRecords {
 
 impl KernelRecords {
     /// An empty report that renders through the library's table function.
-    pub fn new(interface: &Interface) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         Ok(Self {
-            table: interface.import(TABLE)?,
+            table: Interpreter::import(TABLE)?,
             runners: IndexMap::new(),
         })
     }

@@ -51,7 +51,7 @@ use crate::executor::forward::batch::image::ImageParts;
 use crate::executor::forward::batch::image::{Encoding, ImageBatch, allocations, lock};
 use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
 use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
-use crate::ffi::{DType, Function, Handle};
+use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
 use crate::lane::Job;
@@ -367,7 +367,6 @@ impl ImageDecoder {
         latents: StorageView,
         staging_bytes: usize,
     ) -> Result<Self> {
-        let interface = setup.interface;
         let owner = setup.owner();
         let (device, stream) = (setup.device, setup.stream.clone());
         if device.is_cuda() != stream.is_some() {
@@ -380,7 +379,7 @@ impl ImageDecoder {
             Device::Cpu => Memory::host(staging_bytes.max(1)),
         };
         let staging = StorageView::contiguous(memory, 0, DType::U8, &[staging_bytes as i64])?;
-        let method = |name: &str| interface.import(&format!("{DECODER}.{name}"));
+        let method = |name: &str| Interpreter::import(&format!("{DECODER}.{name}"));
         let mut arguments = setup.arguments();
         arguments.push(Any::from(latents.to_tensor()?));
         arguments.push(Any::from(staging.to_tensor()?));
@@ -1008,7 +1007,7 @@ impl VideoDecoder {
         )?;
         let [rows, width] = capacity.latent.map(|extent| extent as i64);
         let [frames, height, canvas_width] = capacity.frames.map(|extent| extent as i64);
-        let capture = GraphFunctions::from_interface(setup.interface)?;
+        let capture = GraphFunctions::import()?;
         Ok(Self {
             device: setup.device,
             runners: Vec::new(),
@@ -1022,12 +1021,12 @@ impl VideoDecoder {
                 &[frames * height * canvas_width * 3],
             )?,
             windows: HashMap::new(),
-            window_rows: setup.interface.import(&format!("{DECODER}.window_rows"))?,
+            window_rows: Interpreter::import(&format!("{DECODER}.window_rows"))?,
             graphs: GraphTable::new(format!("{}.decoder", setup.path), capture.release.clone()),
             capture,
             pool,
             loaded: setup.loaded.clone(),
-            class: RunnerClass::new(setup.interface, DECODER, "decode", setup.arguments())?,
+            class: RunnerClass::new(DECODER, "decode", setup.arguments())?,
             stream: setup.stream.clone(),
         })
     }
@@ -1317,7 +1316,7 @@ impl AudioDecoder {
         samples: u64,
         pool: Option<Arc<GraphPool<Handle>>>,
     ) -> Result<Self> {
-        let capture = GraphFunctions::from_interface(setup.interface)?;
+        let capture = GraphFunctions::import()?;
         Ok(Self {
             device: setup.device,
             runners: BTreeMap::new(),
@@ -1330,7 +1329,7 @@ impl AudioDecoder {
             graphs: GraphTable::new(format!("{}.decoder", setup.path), capture.release.clone()),
             capture,
             pool,
-            class: RunnerClass::new(setup.interface, DECODER, "decode", setup.arguments())?,
+            class: RunnerClass::new(DECODER, "decode", setup.arguments())?,
             stream: setup.stream.clone(),
         })
     }

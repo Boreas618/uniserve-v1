@@ -207,7 +207,7 @@ crates/engine/                Scheduler, KV allocation, executors, worker fleet 
 crates/server/                Model profiles, serving funnel, HTTP API, and engine clients
 crates/worker/                Rank runtime: the library a rank process loads through TVM-FFI
   launch/, config/            Launch descriptor, rank configuration and startup
-  model/                      Typed bindings over the numerical interface
+  model/                      Model description, loading and component placement
   executor/, runner/          Batch execution per computation and its CUDA graphs
   request/, sampling/         Request progress and sampling state
   storage/                    KV, latent, tensor, request-slot and output backing
@@ -218,8 +218,8 @@ crates/bin/uniserve/          `serve` and `engine` CLI entrypoints
 crates/bin/uniserve-host/     Per-host launcher for multi-host deployments
 crates/bin/dynamo-worker/     NVIDIA Dynamo worker backend
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
-  interface/                  Numerical interface table the rank runtime calls
-  worker.py                   Rank process entry: loads the rank runtime and hands it the interface
+  runner/                     The Python half of each runner, which the rank runtime calls
+  worker.py                   Rank process entry: loads the rank runtime and hands it the library's import function
 uniserve_kernels/             Native CUDA, Triton and CuTe kernels
 uniserve_eval/                Serving evaluator, profiles, and request workloads
 configs/minimax_h3/           H3 deployment files

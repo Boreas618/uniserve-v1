@@ -12,13 +12,12 @@ use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
 use crate::executor::forward::decodes_video;
-use crate::ffi::Handle;
+use crate::ffi::{Handle, Interpreter};
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::Lanes;
 use crate::model::LoadedModel;
 use crate::model::components::Capability;
-use crate::model::interface::Interface;
 use crate::model::registry::Components;
 use crate::runner::ImageSetup;
 use crate::runner::causal_lm::model_dtype;
@@ -93,7 +92,6 @@ const HOST_WORKERS: usize = 4;
 
 /// What image startup borrows from the rank.
 pub(crate) struct Startup<'a> {
-    pub(crate) interface: &'a Interface,
     pub(crate) config: &'a WorkerConfig,
     pub(crate) request_slots: usize,
     pub(crate) queue_depth: usize,
@@ -225,11 +223,10 @@ impl ImageOwners {
             return Ok(None);
         }
 
-        let interface = startup.interface;
         let config = startup.config;
         let loaded = startup.model.handle();
-        let facts = ImageModel::describe(interface, loaded)?;
-        let policy = ImagePolicy::new(interface, loaded.clone())?;
+        let facts = ImageModel::describe(loaded)?;
+        let policy = ImagePolicy::new(loaded.clone())?;
         let dtype = model_dtype(&config.model_dtype)?;
         let max_calls = config
             .max_batch_calls
@@ -269,7 +266,7 @@ impl ImageOwners {
                     width,
                     graph_widths: bounds.widths.iter().map(|&width| width as usize).collect(),
                 };
-                let pool = prefix_cache.pool(interface)?;
+                let pool = prefix_cache.pool()?;
                 (Some(bounds), Some(capacity), Some(pool))
             }
             (true, None, _) => {
@@ -332,12 +329,10 @@ impl ImageOwners {
         let mut order = Vec::new();
         for target in &targets {
             let scratch = startup.scratches.get(
-                interface,
                 target.stream.as_ref().map_or(0, Stream::raw),
                 target.device.cuda_index(),
             )?;
             let setup = ImageSetup {
-                interface,
                 loaded,
                 component: &target.component,
                 path: &target.path,
@@ -347,7 +342,7 @@ impl ImageOwners {
             };
             match target.kind {
                 CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-                    let info = EncoderInfo::describe(interface, loaded, &target.path, dtype)?;
+                    let info = EncoderInfo::describe(loaded, &target.path, dtype)?;
                     let runner = EncoderRunner::image(&setup, info, &encoder_config)?;
                     order.push((ImageRunner::Encoder(encoders.len()), setup.owner()));
                     encoder_routes.insert((target.component.clone(), target.kind), encoders.len());
@@ -405,7 +400,7 @@ impl ImageOwners {
                         },
                     )?;
                     order.push((ImageRunner::Denoiser, setup.owner()));
-                    units = Some(prefix_cache.bind_units(interface, target.stream.as_ref())?);
+                    units = Some(prefix_cache.bind_units(target.stream.as_ref())?);
                     diffusion = Some((target.component.clone(), runner));
                 }
                 CallKind::Media(MediaCall::ImageDecoding) => {
@@ -451,7 +446,7 @@ impl ImageOwners {
                 );
                 flow_pools = reserve_pools(
                     startup.graphs,
-                    &interface.function("graphs.pool")?,
+                    &Interpreter::import("uniserve.cuda_graph.pool")?,
                     runner.graph_key(),
                     "image:denoiser".to_owned(),
                     &devices,
@@ -463,7 +458,7 @@ impl ImageOwners {
         // Packed vision encoders capture their slot counts at warmup.
         let mut pools = HashMap::new();
         if config.graph_policy != "off" {
-            let create_pool = interface.function("graphs.pool")?;
+            let create_pool = Interpreter::import("uniserve.cuda_graph.pool")?;
             for (index, runner) in encoders.iter().enumerate() {
                 let (Some(key), Some(ordinal)) = (runner.graph_key(), runner.device().cuda_index())
                 else {
@@ -576,7 +571,6 @@ pub(crate) fn start_video(
         let info = setup.info;
         let capacity = (info.queue_depth as usize * info.max_batch_calls.max(1) as usize).max(1);
         Some(MediaRunner::new(
-            setup.interface,
             setup.loaded,
             host_components,
             setup.config.ffmpeg.clone(),

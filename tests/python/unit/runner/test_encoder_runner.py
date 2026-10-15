@@ -9,7 +9,6 @@ import torch
 from PIL import Image
 
 from tests.python.fixtures.stub import load_stub
-from uniserve import interface
 from uniserve.bindings.context import Scratch
 from uniserve.media.pixels import (
     prepare_host_image,
@@ -23,8 +22,7 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(scope="module")
 def loaded():
-    table = interface.table()
-    return table, load_stub()
+    return load_stub()
 
 
 def constructed(model, module):
@@ -48,7 +46,7 @@ def product(elements):
 
 
 def test_vision_features_fill_their_products(loaded):
-    table, model = loaded
+    model = loaded
     info, runner = constructed(model, "vision_encoder")
     assert EncoderRunner.kind(*info) == "vision"
     assert EncoderRunner.patch_size(*info) == 16
@@ -86,7 +84,7 @@ def test_vision_features_fill_their_products(loaded):
 
 
 def test_resident_images_encode_like_their_decoded_pixels(loaded):
-    table, model = loaded
+    model = loaded
     _, runner = constructed(model, "latent_encoder")
 
     # A generated [3, 32, 32] BF16 image product in [-1, 1].
@@ -112,7 +110,7 @@ def test_resident_images_encode_like_their_decoded_pixels(loaded):
 
 
 def test_encodings_larger_than_their_product_are_refused(loaded):
-    table, model = loaded
+    model = loaded
     _, runner = constructed(model, "vision_encoder")
     image = EncoderRunner.prepare_image(model, "vit", payload(32, 48), 1, 0)
     with pytest.raises(Exception, match="exceeds its product bound"):
@@ -120,7 +118,7 @@ def test_encodings_larger_than_their_product_are_refused(loaded):
 
 
 def test_inline_images_are_validated_on_the_host(loaded):
-    _, model = loaded
+    model = loaded
     with pytest.raises(Exception, match="not a valid encoded image"):
         EncoderRunner.prepare_image(model, "vit", "bm90IGFuIGltYWdl", 1, 0)
     with pytest.raises(Exception, match="no input images"):

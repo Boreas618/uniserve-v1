@@ -33,8 +33,8 @@ from tests.python.fixtures.checkpoints import (
 from uniserve import cuda_graph
 from uniserve.bindings.context import ExecutionContext, Scratch
 from uniserve.diffusion import canvas as sampler
-from uniserve.interface.loading import Loaded
 from uniserve.loading import weights
+from uniserve.loading.rank import Loaded
 from uniserve.models import DiffusionLMInput, TextInput, TextSize
 from uniserve.models import registry as models
 from uniserve.nn.attention import (

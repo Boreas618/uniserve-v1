@@ -62,7 +62,7 @@ pub struct ModelSource {
     pub path: String,
     pub base_model: Option<String>,
     /// Precision selectors as a JSON object text, interpreted by the
-    /// numerical library's loading interface.
+    /// numerical library's rank loading (`uniserve.loading.rank`).
     pub quantization: String,
 }
 

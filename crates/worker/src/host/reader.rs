@@ -29,8 +29,7 @@ use uniserve_core::{
     AudioClip, ConditionMedia, MediaLocator, SharedMemory, VideoClip, VideoCondition,
 };
 
-use crate::ffi::{Backing, DType, Function, Handle, integer_list};
-use crate::model::interface::Interface;
+use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
 use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
 
@@ -50,15 +49,14 @@ impl ReaderFunctions {
     /// Resolve the reader functions of the model `loaded` describes: the
     /// library's condition decoders, and the patch packing and audio rate
     /// the Python `EncoderRunner` answers from the model's description.
-    pub(crate) fn new(interface: &Interface, loaded: &Handle) -> Result<Self> {
+    pub(crate) fn new(loaded: &Handle) -> Result<Self> {
         const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
-        let sample_rate: i64 = interface
-            .import(&format!("{ENCODER}.sample_rate"))?
-            .call_as(&[loaded.view()])?;
+        let sample_rate: i64 =
+            Interpreter::import(&format!("{ENCODER}.sample_rate"))?.call_as(&[loaded.view()])?;
         Ok(Self {
-            read_image: interface.import("uniserve.media.reader.read_image")?,
-            read_audio: interface.import("uniserve.media.reader.read_audio")?,
-            pack_vision: interface.import(&format!("{ENCODER}.pack_pixels"))?,
+            read_image: Interpreter::import("uniserve.media.reader.read_image")?,
+            read_audio: Interpreter::import("uniserve.media.reader.read_audio")?,
+            pack_vision: Interpreter::import(&format!("{ENCODER}.pack_pixels"))?,
             loaded: loaded.clone(),
             sample_rate: u32::try_from(sample_rate)
                 .map_err(|_| Error::Interface("the audio encoder's rate is invalid".into()))?,
