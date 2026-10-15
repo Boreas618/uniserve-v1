@@ -4,7 +4,12 @@ Also shared computation capabilities.
 """
 
 from .causal_lm import CausalLM
-from .decoder import ImageDecoder
+from .decoder import (
+    AudioDecoder,
+    ImageDecoder,
+    VideoDecoder,
+    VideoPostprocessor,
+)
 from .denoiser import (
     Condition,
     ConditionRole,
@@ -20,7 +25,14 @@ from .diffusion_lm import (
     DiffusionLMInput,
     SelfConditioning,
 )
-from .encoder import Encoder, PatchEncoder, TextConditioner, TextEncoder
+from .encoder import (
+    AudioEncoder,
+    Encoder,
+    PatchEncoder,
+    TextConditioner,
+    TextEncoder,
+    VideoEncoder,
+)
 from .inputs import (
     DEFAULT_COMPONENT,
     ComponentEntry,
@@ -34,13 +46,6 @@ from .inputs import (
 )
 from .logits import Logits, VocabShard
 from .transformer import PhasedLayer, TransformerDecoder, TransformerEncoder
-from .video import (
-    AudioDecoder,
-    AudioEncoder,
-    VideoDecoder,
-    VideoEncoder,
-    VideoPostprocessor,
-)
 
 __all__ = [
     "DenoiserInput",
