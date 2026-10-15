@@ -15,8 +15,7 @@ from dataclasses import dataclass
 import torch
 
 from uniserve.bindings.context import ExecutionContext, TensorBuffers
-from uniserve.diffusion import normal_noise
-from uniserve.execution import DenoisingRunner
+from uniserve.diffusion import DenoisingStep, normal_noise
 from uniserve.media import image, video
 from uniserve.models import LatentInput, TextSize
 
@@ -152,20 +151,24 @@ def generate(
         TensorBuffers.allocate(requirements, device="cpu") as host,
         TensorBuffers.allocate(requirements, device=device) as backing,
     ):
-        runner = DenoisingRunner(denoiser, context=context)
-        runner.warmup(layout)
+        # The context holds the layout's operators and workspace; the
+        # request's own size is evaluated in that layout.
+        context.prepare(layout)
         request = backing.view(requirements)
         host_views = host.view(requirements)
 
-        runner.prepare_latents(
-            (layout,),
-            noise=noise,
-            state={
-                name: host_views[name].unsqueeze(0)
-                for name in denoiser.modalities
-            },
-        )
-        runner.prepare_state(
+        with context.activate():
+            denoiser.prepare_latents(
+                (layout,),
+                noise=noise,
+                state={
+                    name: host_views[name].unsqueeze(0)
+                    for name in denoiser.modalities
+                },
+                constants=context.constants,
+                workspace=context.workspace_views,
+            )
+        denoiser.prepare_state(
             (size,),
             layouts=(layout,),
             out={
@@ -191,7 +194,15 @@ def generate(
                 schedules["video"].step(step),
                 (conditioning,),
             )
-            runner.step(inputs, schedules, state=request)
+            with context.activate():
+                DenoisingStep(
+                    denoiser,
+                    inputs,
+                    schedules,
+                    request,
+                    context.constants,
+                    context.workspace_views,
+                )()
         group = denoiser.sequence_group()
         latents = {
             name: _gather(
