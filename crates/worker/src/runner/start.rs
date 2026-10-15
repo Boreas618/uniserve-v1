@@ -23,7 +23,8 @@ use crate::runner::causal_lm::start::TextBounds;
 use crate::runner::component::VideoSetup;
 use crate::runner::decoder::DecoderRunner;
 use crate::runner::decoder::runners::DecoderRunners;
-use crate::runner::denoiser::image::{DiffusionCapacity, DiffusionStorage, ImageDiffusion};
+use crate::runner::denoiser::DenoiserRunner;
+use crate::runner::denoiser::image::{DiffusionCapacity, DiffusionStorage};
 use crate::runner::denoiser::image_model::{ImageDenoiserLayout, ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::{DenoiserRunners, FlowShape};
 use crate::runner::encoder::runners::EncoderRunners;
@@ -386,7 +387,7 @@ impl ImageOwners {
                         .iter()
                         .map(|table| i64::from(table.windowed))
                         .collect();
-                    let runner = ImageDiffusion::new(
+                    let runner = DenoiserRunner::image(
                         &setup,
                         pool,
                         layout,
@@ -431,9 +432,9 @@ impl ImageOwners {
         {
             flow = flow_shapes(
                 config,
-                runner.layout(),
+                runner.layout()?,
                 max_calls,
-                runner.capacity().tokens,
+                runner.capacity()?.tokens,
                 latents.pool.capacity_units(),
             );
             if !flow.is_empty() {
@@ -447,7 +448,7 @@ impl ImageOwners {
                 flow_pools = reserve_pools(
                     startup.graphs,
                     &Interpreter::import("uniserve.cuda_graph.pool")?,
-                    runner.graph_key(),
+                    runner.graph_key()?,
                     "image:denoiser".to_owned(),
                     &devices,
                     None,
