@@ -22,9 +22,10 @@ use std::sync::Arc;
 
 use uniserve_cuda::Stream;
 
-use crate::ffi::{Backing, DType, Fields};
+use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{AttentionRow, BlockTables, GroupTable, TablePages};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// Host sections of `row_columns` before the per-table page counts.
@@ -137,15 +138,6 @@ impl AttentionColumns {
             .ok_or_else(|| Error::Invariant(format!("attention columns have no {name}")))
     }
 
-    /// The columns keyed as a binding receives them.
-    pub fn tensors(&self, fields: Fields) -> Result<Fields> {
-        let mut fields = fields;
-        for (name, view) in &self.columns {
-            fields = fields.with(name, view.to_tensor()?);
-        }
-        Ok(fields)
-    }
-
     /// Select `rows`' pages, pack the host columns and copy them to the
     /// device on `stream`. `widths` fixes each table's page width (a
     /// captured graph's configured widths); `None` uses the rows' own.
@@ -157,7 +149,7 @@ impl AttentionColumns {
         tables: &BlockTables,
         widths: Option<&[usize]>,
         check: impl FnMut(&GroupTable, u32, u32) -> Result<()>,
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<AttentionGeometry> {
         let capacity = self.capacity;
         let tokens: usize = rows.iter().map(|row| row.query as usize).sum();

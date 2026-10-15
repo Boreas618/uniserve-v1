@@ -1,5 +1,6 @@
 //! CUDA events: completion fences, timing and interprocess handles.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::driver::{CUDA_ERROR_NOT_READY, Handle, RawIpcEventHandle, driver, in_context};
@@ -70,9 +71,15 @@ impl Drop for EventHandle {
 /// outlive the stream that recorded it.
 ///
 /// Queries, waits and drop do not change the calling thread's context.
+///
+/// A thread that hands a record to another thread announces it first
+/// ([`Event::queue_record`]): the work the record will capture is not issued
+/// yet, so the event is not complete until that record is made.
 pub struct Event {
     flags: EventFlags,
     current: Mutex<Option<Arc<EventHandle>>>,
+    /// Records announced and not yet made.
+    queued: AtomicUsize,
 }
 
 impl Event {
@@ -80,7 +87,15 @@ impl Event {
         Self {
             flags,
             current: Mutex::new(None),
+            queued: AtomicUsize::new(0),
         }
+    }
+
+    /// Announce one record of this event that another thread will make.
+    /// Until [`Self::record`] makes it, [`Self::query`] reports the event
+    /// incomplete, whatever its earlier records captured.
+    pub fn queue_record(&self) {
+        self.queued.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn flags(&self) -> EventFlags {
@@ -105,8 +120,16 @@ impl Event {
         flags
     }
 
-    /// Captures the work queued on `stream` so far.
+    /// Captures the work queued on `stream` so far. This is the oldest
+    /// announced record, if one is.
     pub fn record(&self, stream: &Stream) -> Result<()> {
+        // An unannounced record leaves the count at zero.
+        let _ = self
+            .queued
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued.checked_sub(1)
+            });
+
         let driver = driver()?;
         let record_flags = if self.flags.external && stream.capture_status()? != CaptureStatus::None
         {
@@ -144,8 +167,12 @@ impl Event {
     }
 
     /// Whether all work captured by the most recent record has completed.
-    /// An event that was never recorded is complete. Device faults are errors.
+    /// An event that was never recorded is complete, and an event with an
+    /// announced record still to make is not. Device faults are errors.
     pub fn query(&self) -> Result<bool> {
+        if self.queued.load(Ordering::Acquire) > 0 {
+            return Ok(false);
+        }
         let Some(handle) = self.current() else {
             return Ok(true);
         };
@@ -231,6 +258,24 @@ impl Event {
                 context: context.raw(),
                 _retention: Retention::Primary { _context: context },
             }))),
+            queued: AtomicUsize::new(0),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_event_with_an_announced_record_is_not_complete() -> Result<()> {
+        let event = Event::new(EventFlags::default());
+        // Never recorded: nothing to wait for.
+        assert!(event.query()?);
+
+        // A record handed to another thread captures work not issued yet.
+        event.queue_record();
+        assert!(!event.query()?);
+        Ok(())
     }
 }

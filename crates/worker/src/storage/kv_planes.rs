@@ -22,12 +22,14 @@
 
 use std::sync::Arc;
 
-use tvm_ffi::AnyView;
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_2d_d8, memset_2d_d32};
+use tvm_ffi::Any;
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
 use super::kv_plan::KVPlan;
 use super::memory::{Memory, StorageView};
-use crate::ffi::{Backing, DType, Device, Function, Functions, Tensor};
+use crate::ffi::{Backing, DType, DeferredCall, Device, Function, Handle, strings};
+use crate::model::interface::Interface;
+use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
 
 /// The two K/V fields, in storage order.
@@ -63,66 +65,6 @@ fn allocate_values(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
         Some(device) => Memory::exportable(device, bytes, &Memory::peers(device)?),
         None => Ok(Memory::host(bytes)),
     }
-}
-
-/// Fill `height` rows of `width` bytes, `pitch` bytes apart, with `value`.
-///
-/// # Safety
-/// Every row lies in the memory of `stream`'s device (or host memory when
-/// `stream` is `None`) and stays valid until the fill completes.
-unsafe fn fill_d8(
-    address: u64,
-    pitch: usize,
-    value: u8,
-    width: usize,
-    height: usize,
-    stream: Option<&Stream>,
-) -> Result<()> {
-    match stream {
-        // SAFETY: forwarded from the caller.
-        Some(stream) => unsafe { memset_2d_d8(address, pitch, value, width, height, stream) }?,
-        None => {
-            for row in 0..height {
-                // SAFETY: forwarded from the caller.
-                unsafe {
-                    std::ptr::write_bytes(
-                        (address + (row * pitch) as u64) as *mut u8,
-                        value,
-                        width,
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Fill `height` rows of `width` 32-bit words, `pitch` bytes apart.
-///
-/// # Safety
-/// As for [`fill_d8`], with 4-byte aligned rows.
-unsafe fn fill_d32(
-    address: u64,
-    pitch: usize,
-    value: u32,
-    width: usize,
-    height: usize,
-    stream: Option<&Stream>,
-) -> Result<()> {
-    match stream {
-        // SAFETY: forwarded from the caller.
-        Some(stream) => unsafe { memset_2d_d32(address, pitch, value, width, height, stream) }?,
-        None => {
-            for row in 0..height {
-                let start = (address + (row * pitch) as u64) as *mut u32;
-                for word in 0..width {
-                    // SAFETY: forwarded from the caller.
-                    unsafe { start.add(word).write(value) };
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 impl KVPlanes {
@@ -171,35 +113,23 @@ impl KVPlanes {
             initialized,
         };
 
+        // One row spanning each allocation.
+        let whole = |address: u64, value: u32, width: usize, count: usize| RowFill {
+            address,
+            pitch: count * width,
+            value,
+            width,
+            count,
+            height: 1,
+        };
         for field in 0..2 {
             // SAFETY: each allocation spans exactly the filled bytes and is
             // owned by `planes`; the stream is drained below.
             unsafe {
-                fill_d8(
-                    planes.values[field].address(),
-                    plane_bytes,
-                    0,
-                    plane_bytes,
-                    1,
-                    stream,
-                )?;
-                fill_d8(
-                    planes.initialized[field].address(),
-                    cells,
-                    0,
-                    cells,
-                    1,
-                    stream,
-                )?;
+                stream.memset_2d(whole(planes.values[field].address(), 0, 1, plane_bytes))?;
+                stream.memset_2d(whole(planes.initialized[field].address(), 0, 1, cells))?;
                 if let Some(scales) = &planes.scales {
-                    fill_d32(
-                        scales[field].address(),
-                        cells * 4,
-                        UNIT_SCALE,
-                        cells,
-                        1,
-                        stream,
-                    )?;
+                    stream.memset_2d(whole(scales[field].address(), UNIT_SCALE, 4, cells))?;
                 }
             }
         }
@@ -233,6 +163,17 @@ impl KVPlanes {
             )));
         }
         Ok(())
+    }
+
+    /// The pool's unit fields as the library's cache classes take them: the
+    /// list of their names, then one tensor per field.
+    pub fn field_arguments(&self) -> Result<Vec<Any>> {
+        let fields = self.views()?;
+        let mut arguments = vec![Any::from(strings(fields.iter().map(|(name, _)| name)))];
+        for (_, view) in &fields {
+            arguments.push(Any::from(view.to_tensor()?));
+        }
+        Ok(arguments)
     }
 
     /// The bound field tensors' views, keyed as the numerical library reads
@@ -369,8 +310,8 @@ impl KVPlanes {
     }
 
     /// Reset units `1..=count` (contiguous startup scratch) with native
-    /// fills: values and flags zero, scales one.
-    pub fn zero_leading(&self, count: u32, stream: Option<&Stream>) -> Result<()> {
+    /// fills issued to `stream`: values and flags zero, scales one.
+    pub fn zero_leading(&self, count: u32, stream: impl Issue) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
@@ -378,35 +319,25 @@ impl KVPlanes {
         let units = self.num_units as usize;
         let columns = self.plan.columns as usize;
         let plane = self.plan.plane_bytes as usize;
+        let count = count as usize;
+        // Units `[1, count]` of every column: one row per column, a
+        // column's units apart.
+        let leading = |address: u64, value: u32, width: usize, cell: usize| RowFill {
+            address: address + (cell * width) as u64,
+            pitch: units * cell * width,
+            value,
+            width,
+            count: count * cell,
+            height: columns,
+        };
         for field in 0..2 {
             // SAFETY: rows `[1, count]` of each column lie inside the field
             // allocations owned by this pool; the caller orders the fills.
             unsafe {
-                fill_d8(
-                    self.values[field].address() + plane as u64,
-                    units * plane,
-                    0,
-                    count as usize * plane,
-                    columns,
-                    stream,
-                )?;
-                fill_d8(
-                    self.initialized[field].address() + 1,
-                    units,
-                    0,
-                    count as usize,
-                    columns,
-                    stream,
-                )?;
+                stream.memset_2d(leading(self.values[field].address(), 0, 1, plane))?;
+                stream.memset_2d(leading(self.initialized[field].address(), 0, 1, 1))?;
                 if let Some(scales) = &self.scales {
-                    fill_d32(
-                        scales[field].address() + 4,
-                        units * 4,
-                        UNIT_SCALE,
-                        count as usize,
-                        columns,
-                        stream,
-                    )?;
+                    stream.memset_2d(leading(scales[field].address(), UNIT_SCALE, 4, 1))?;
                 }
             }
         }
@@ -492,42 +423,44 @@ impl UnitSnapshot {
 pub struct UnitColumn {
     units: StorageView,
     stream: Option<usize>,
+    /// The library's `UnitResets` over the column and the pool's fields.
+    resets: Handle,
     zero: Function,
     recycle: Function,
     mark_initialized: Function,
 }
 
+/// The library class of the scattered unit resets.
+const UNIT_RESETS: &str = "uniserve_models.interface.cache.UnitResets";
+
 impl UnitColumn {
-    /// Allocate a column for `planes` and bind `cache.bind_units` to it on
-    /// `stream` (`None` for a CPU pool).
-    pub fn bind(planes: &KVPlanes, bind_units: &Function, stream: Option<&Stream>) -> Result<Self> {
+    /// Allocate a column for `planes` and construct the library's
+    /// `UnitResets` over it on `stream` (`None` for a CPU pool).
+    pub fn bind(planes: &KVPlanes, interface: &Interface, stream: Option<&Stream>) -> Result<Self> {
         let count = i64::from(planes.num_units);
         let memory = allocate(planes.device, planes.num_units as usize * 8)?;
         let units = StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[count])?;
 
-        let cache = tensor_map(&planes.views()?)?;
-        let tensor = units.to_tensor()?;
-        let handle = stream.map_or(0, |stream| stream.raw() as i64);
-        let functions = Functions::new(
-            bind_units.name(),
-            bind_units.call(&[
-                AnyView::from(&cache),
-                AnyView::from(&tensor),
-                AnyView::from(&handle),
-            ])?,
-        )?;
+        let mut arguments = vec![
+            Any::from(units.to_tensor()?),
+            Any::from(stream.map_or(0, |stream| stream.raw() as i64)),
+        ];
+        arguments.extend(planes.field_arguments()?);
+        let resets = Handle::new(interface.import(UNIT_RESETS)?.call_values(&arguments)?)?;
+        let method = |name: &str| interface.import(&format!("{UNIT_RESETS}.{name}"));
         Ok(Self {
             units,
             stream: stream.map(Stream::raw),
-            zero: functions.get("zero")?,
-            recycle: functions.get("recycle")?,
-            mark_initialized: functions.get("mark_initialized")?,
+            resets,
+            zero: method("zero")?,
+            recycle: method("recycle")?,
+            mark_initialized: method("mark_initialized")?,
         })
     }
 
     /// Write `units` into the column prefix in `stream` order.
-    fn upload(&self, planes: &KVPlanes, units: &[u32], stream: Option<&Stream>) -> Result<i64> {
-        if stream.map(Stream::raw) != self.stream {
+    fn upload(&self, planes: &KVPlanes, units: &[u32], stream: impl Issue) -> Result<i64> {
+        if stream.stream().map(Stream::raw) != self.stream {
             return Err(Error::Invariant(
                 "a unit column is used on the stream it was bound to".into(),
             ));
@@ -540,46 +473,41 @@ impl UnitColumn {
             .map(|&unit| planes.require_unit(unit).map(|()| i64::from(unit)))
             .collect::<Result<Vec<_>>>()?;
         let bytes = ids.len() * size_of::<i64>();
-        match (self.units.device(), stream) {
-            (Device::Cuda(_), Some(stream)) => {
-                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                batch.push(self.units.address(), ids.as_ptr() as u64, bytes);
-                // SAFETY: the driver reads the pageable ids during the call;
-                // the column write is ordered on the stream after the
-                // previous operation that read it.
-                unsafe { batch.submit(stream) }?;
-            }
-            _ => {
-                // SAFETY: a host column is written only by its owning thread,
-                // after the previous synchronous operation returned.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        ids.as_ptr(),
-                        self.units.address() as *mut i64,
-                        ids.len(),
-                    );
-                }
-            }
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        batch.push(self.units.address(), ids.as_ptr() as u64, bytes);
+        match self.units.device() {
+            // SAFETY: the ids are read during the call; the column write is
+            // ordered on the stream after the previous operation that read
+            // it.
+            Device::Cuda(_) if stream.stream().is_some() => unsafe { stream.copy(&batch) }?,
+            // SAFETY: a host column is written in its issuer's order, after
+            // the previous operation that read it.
+            _ => unsafe { stream.host().copy(&batch) }?,
         }
         Ok(ids.len() as i64)
     }
 
+    /// Upload `units` and run `function` over the column's prefix, in
+    /// `stream` order.
     fn apply(
         &self,
         function: &Function,
         planes: &KVPlanes,
         units: &[u32],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         if units.is_empty() {
             return Ok(());
         }
         let count = self.upload(planes, units, stream)?;
-        function.invoke(&[AnyView::from(&count)])
+        stream.call(DeferredCall::new(
+            function.clone(),
+            vec![self.resets.to_any(), Any::from(count)],
+        ))
     }
 
     /// Reset `units` completely: values zero, flags clear, scales one.
-    pub fn zero(&self, planes: &KVPlanes, units: &[u32], stream: Option<&Stream>) -> Result<()> {
+    pub fn zero(&self, planes: &KVPlanes, units: &[u32], stream: impl Issue) -> Result<()> {
         self.apply(&self.zero, planes, units, stream)
     }
 
@@ -588,7 +516,7 @@ impl UnitColumn {
     /// single-dtype unquantized pool needs no device work, a quantized one
     /// resets flags and scales, and a mixed-dtype pool is zeroed because
     /// stale bytes of one type need not decode as finite values of another.
-    pub fn recycle(&self, planes: &KVPlanes, units: &[u32], stream: Option<&Stream>) -> Result<()> {
+    pub fn recycle(&self, planes: &KVPlanes, units: &[u32], stream: impl Issue) -> Result<()> {
         if planes.plan.mixed_types() {
             self.zero(planes, units, stream)
         } else if planes.plan.quantized {
@@ -604,19 +532,8 @@ impl UnitColumn {
         &self,
         planes: &KVPlanes,
         units: &[u32],
-        stream: Option<&Stream>,
+        stream: impl Issue,
     ) -> Result<()> {
         self.apply(&self.mark_initialized, planes, units, stream)
     }
-}
-
-/// Convert named views into the `Map<String, Tensor>` bindings receive.
-/// Tensors are created on the calling thread, which owns them.
-pub fn tensor_map(
-    views: &[(String, StorageView)],
-) -> Result<tvm_ffi::Map<tvm_ffi::String, Tensor>> {
-    views
-        .iter()
-        .map(|(name, view)| Ok((tvm_ffi::String::from(name.as_str()), view.to_tensor()?)))
-        .collect()
 }

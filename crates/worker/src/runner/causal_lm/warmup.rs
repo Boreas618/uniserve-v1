@@ -10,6 +10,13 @@
 //! capture runs its step eagerly first, which also compiles the step's
 //! kernels.
 //!
+//! Each step and each commit is one job of the runner's lane: the eager
+//! call, then the capture, whose graph the job's completion carries. The
+//! runner stores it before the next step is prepared, so later steps launch
+//! the graphs of earlier ones. A bucket's scratch tables are two more jobs
+//! of the lane: one installs them before the bucket's steps, one clears
+//! them and resets the scratch units after.
+//!
 //! The scenario then admits one request, prefills one token with a token
 //! relay output, decodes from that relay and finishes, through the serving
 //! executor.
@@ -21,14 +28,18 @@ use uniserve_ipc::{
     ShapeBound, TensorRef,
 };
 
+use std::sync::Arc;
+
 use super::{CausalLMRunners, StepParts};
 use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
-use crate::executor::forward::experts::ExpertRuntime;
+use crate::lane::{BLOCK_ON_TIMEOUT, Job, JobQueues};
+use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
-use crate::runner::causal_lm::{COMMIT_CACHE, RowSource, StepRequest, TokenRow};
-use crate::storage::KVCache;
+use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
+use crate::storage::{KVCache, ScratchUnits};
+use crate::stream::Issue;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
 
@@ -40,6 +51,7 @@ pub(crate) struct CausalLMWarmup {
 
 impl WarmupHooks for CausalLMWarmup {
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
+        let lanes = backend.job_queues().clone();
         let parts = backend.parts();
         let (Some(runtime), Some(storage)) = (parts.text, parts.storage) else {
             return Ok(());
@@ -48,9 +60,11 @@ impl WarmupHooks for CausalLMWarmup {
             .kv
             .as_mut()
             .ok_or(Error::State("text warmup requires a KV cache"))?;
-        capture(runtime, kv, self.row_tokens, parts.experts).map_err(|error| {
-            WorkerError::classify(error, Some("text graph capture")).with_phase("warmup")
-        })
+        runtime
+            .warmup(kv, self.row_tokens, parts.experts, &lanes)
+            .map_err(|error| {
+                WorkerError::classify(error, Some("text graph capture")).with_phase("warmup")
+            })
     }
 
     fn scenarios(&mut self, scenarios: &mut Scenarios<'_>) -> std::result::Result<(), WorkerError> {
@@ -61,14 +75,13 @@ impl WarmupHooks for CausalLMWarmup {
     }
 }
 
-/// Install scratch tables of `lengths` tokens for slots `1..`, run
-/// `operation`, then clear the tables and reset the scratch units.
-pub(crate) fn with_scratch<T>(
+/// Lend scratch units to slots `1..` as block tables of `lengths` tokens,
+/// issued to `stream`: the units are reset, then the tables installed.
+pub(crate) fn install_scratch(
     kv: &mut KVCache,
     lengths: &[usize],
-    stream: Option<&uniserve_cuda::Stream>,
-    operation: impl FnOnce(&mut KVCache) -> Result<T>,
-) -> Result<T> {
+    stream: impl Issue,
+) -> Result<ScratchUnits> {
     let shapes = kv.plan().group_shapes()?;
     let count: usize = lengths
         .iter()
@@ -100,13 +113,38 @@ pub(crate) fn with_scratch<T>(
         }
     }
     kv.install(&tables, stream)?;
-    let result = operation(kv);
-    let slots: Vec<u32> = (1..=lengths.len() as u32).collect();
+    Ok(scratch)
+}
+
+/// Clear the scratch tables of slots `1..=rows` and return their units,
+/// issued to `stream`: the stream waits for what wrote the units, resets
+/// them and waits for the resets.
+pub(crate) fn release_scratch(
+    kv: &mut KVCache,
+    scratch: ScratchUnits,
+    rows: usize,
+    stream: impl Issue,
+) -> Result<()> {
+    let slots: Vec<u32> = (1..=rows as u32).collect();
     let cleared = kv.release_slots(&slots, stream);
     let finished = scratch.finish(kv, stream);
+    cleared.and(finished)
+}
+
+/// Install scratch tables of `lengths` tokens for slots `1..`, run
+/// `operation`, then clear the tables and reset the scratch units, issuing
+/// on `stream` at once: for a capture that issues its own stream work.
+pub(crate) fn with_scratch<T>(
+    kv: &mut KVCache,
+    lengths: &[usize],
+    stream: Option<&uniserve_cuda::Stream>,
+    operation: impl FnOnce(&mut KVCache) -> Result<T>,
+) -> Result<T> {
+    let scratch = install_scratch(kv, lengths, stream)?;
+    let result = operation(kv);
+    let released = release_scratch(kv, scratch, lengths.len(), stream);
     let value = result?;
-    cleared?;
-    finished?;
+    released?;
     Ok(value)
 }
 
@@ -136,179 +174,253 @@ fn rows(
         .collect()
 }
 
-/// Capture every runner's graphs.
-///
-/// With experts, each microbatch runner captures every bucket at every step
-/// capacity that holds it, largest first: each capture's eager warmup is a
-/// collective expert step at that capacity (announced to dedicated expert
-/// ranks), in which the other microbatches join.
-fn capture(
-    runtime: &mut CausalLMRunners,
-    kv: &mut KVCache,
-    row_tokens: usize,
-    experts: Option<&ExpertRuntime>,
-) -> Result<()> {
-    let shapes = kv.plan().group_shapes()?;
-    let pages: Vec<(usize, usize)> = shapes
-        .iter()
-        .map(|shape| (shape.page_tokens as usize, shape.units_per_page as usize))
-        .collect();
-    let units = kv.planes().num_units() as usize - 1;
-    // Step capacities a graph of `tokens` tokens is captured at.
-    let variants = |tokens: usize| -> Vec<Option<usize>> {
-        match experts {
-            None => vec![None],
-            Some(experts) => {
-                let mut capacities: Vec<Option<usize>> = experts
-                    .parallel()
-                    .capacities()
-                    .iter()
-                    .copied()
-                    .filter(|&capacity| capacity >= tokens)
-                    .map(Some)
-                    .collect();
-                capacities.reverse();
-                capacities
-            }
-        }
-    };
-    for index in 0..runtime.runners.len() {
-        let (group, peer) = runtime.locate(index)?;
-        let prefill = capture_order(
-            runtime.runners[index].shapes().prefill().to_vec(),
-            |shape| (shape.token_bucket * shape.row_bucket, shape.token_bucket),
-        );
-        let decode = capture_order(runtime.runners[index].shapes().decode().to_vec(), |&rows| {
-            (rows, rows)
-        });
-        let prime = runtime.runners[index]
-            .shapes()
-            .prefill()
+impl CausalLMRunners {
+    /// Capture every runner's graphs, each step a job of its lane.
+    ///
+    /// With experts, each microbatch runner captures every bucket at every
+    /// step capacity that holds it, largest first: each capture's eager
+    /// warmup is a collective expert step at that capacity (announced to
+    /// dedicated expert ranks), in which the other microbatches join.
+    fn warmup(
+        &mut self,
+        kv: &mut KVCache,
+        row_tokens: usize,
+        experts: Option<&Arc<ExpertUnion>>,
+        lanes: &JobQueues,
+    ) -> Result<()> {
+        let shapes = kv.plan().group_shapes()?;
+        let pages: Vec<(usize, usize)> = shapes
             .iter()
-            .map(|shape| shape.row_bucket - 1)
-            .max()
-            .unwrap_or(usize::MAX)
-            .max(1);
-        let stream = runtime.runners[index].stream().cloned();
-        let stream = stream.as_ref();
-        let run = |runtime: &mut CausalLMRunners,
-                   kv: &mut KVCache,
-                   rows: &[TokenRow],
-                   decode: bool,
-                   capacity: Option<usize>| {
-            step(runtime, experts, (group, peer), kv, rows, decode, capacity)
+            .map(|shape| (shape.page_tokens as usize, shape.units_per_page as usize))
+            .collect();
+        let units = kv.planes().num_units() as usize - 1;
+        // Step capacities a graph of `tokens` tokens is captured at.
+        let variants = |tokens: usize| -> Vec<Option<usize>> {
+            match experts {
+                None => vec![None],
+                Some(experts) => {
+                    let mut capacities: Vec<Option<usize>> = experts
+                        .parallel()
+                        .capacities()
+                        .iter()
+                        .copied()
+                        .filter(|&capacity| capacity >= tokens)
+                        .map(Some)
+                        .collect();
+                    capacities.reverse();
+                    capacities
+                }
+            }
         };
-        for shape in prefill {
-            let lengths = shape.scratch_lengths(row_tokens, &pages, units);
-            let selection = if shape.outputs {
-                TokenSelection::LastLogits
-            } else {
-                TokenSelection::Cache
+        for index in 0..self.runners.len() {
+            let (group, peer) = self.locate(index)?;
+            let prefill = capture_order(self.runners[index].shapes().prefill().to_vec(), |shape| {
+                (shape.token_bucket * shape.row_bucket, shape.token_bucket)
+            });
+            let decode = capture_order(self.runners[index].shapes().decode().to_vec(), |&rows| {
+                (rows, rows)
+            });
+            let prime = self.runners[index]
+                .shapes()
+                .prefill()
+                .iter()
+                .map(|shape| shape.row_bucket - 1)
+                .max()
+                .unwrap_or(usize::MAX)
+                .max(1);
+            let stream = self.runners[index].stream().cloned();
+            let stream = stream.as_ref();
+            let kind = self.kind(group)?;
+            let run = |runtime: &mut CausalLMRunners,
+                       kv: &mut KVCache,
+                       rows: &[TokenRow],
+                       decode: bool,
+                       capacity: Option<usize>,
+                       job: Job| {
+                runtime.warmup_step(
+                    experts,
+                    lanes,
+                    (group, peer),
+                    kv,
+                    rows,
+                    decode,
+                    capacity,
+                    job,
+                )
             };
-            for capacity in variants(shape.token_bucket) {
-                with_scratch(kv, &lengths, stream, |kv| {
-                    run(
-                        runtime,
-                        kv,
-                        &rows(1, &lengths, 0, selection),
-                        false,
-                        capacity,
-                    )
+            for shape in prefill {
+                let lengths = shape.scratch_lengths(row_tokens, &pages, units);
+                let selection = if shape.outputs {
+                    TokenSelection::LastLogits
+                } else {
+                    TokenSelection::Cache
+                };
+                for capacity in variants(shape.token_bucket) {
+                    let rows = rows(1, &lengths, 0, selection);
+                    self.warmup_bucket(lanes, kind, kv, &lengths, stream, |runtime, kv, _| {
+                        run(runtime, kv, &rows, false, capacity, Job::new())
+                    })?;
+                }
+            }
+            for size in decode {
+                let lengths = vec![1; size];
+                let tables = vec![2; size];
+                self.warmup_bucket(lanes, kind, kv, &tables, stream, |runtime, kv, after| {
+                    // One real token per row, prefilled in batches no larger than
+                    // the scheduler admits (the largest prefill bucket's live
+                    // rows) and committed as each slot's cache; then the decode
+                    // the graph captures with every row's continuation flag set.
+                    for first in (0..size).step_by(prime) {
+                        let count = prime.min(size - first);
+                        run(
+                            runtime,
+                            kv,
+                            &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
+                            false,
+                            None,
+                            Job::new(),
+                        )?;
+                    }
+                    let slots: Vec<usize> = (1..=size).collect();
+                    let prefilled: Vec<[i64; 8]> = slots
+                        .iter()
+                        .map(|&slot| [slot as i64, COMMIT_CACHE, -1, 1, 0, 0, 0, 0])
+                        .collect();
+                    runtime.warmup_commit(lanes, index, group, &prefilled)?;
+
+                    // The flags are set by the job of the first decode step
+                    // and cleared by the job that clears the tables.
+                    let mut job = Job::new();
+                    runtime.state.set_predicates(&slots, true, job.on(stream))?;
+                    runtime
+                        .state
+                        .set_predicates(&slots, false, after.on(stream))?;
+                    for capacity in variants(size) {
+                        run(
+                            runtime,
+                            kv,
+                            &rows(1, &lengths, 1, TokenSelection::LastLogits),
+                            true,
+                            capacity,
+                            std::mem::take(&mut job),
+                        )?;
+                    }
+                    Ok(())
                 })?;
             }
+            let runner = &self.runners[index];
+            tracing::info!(
+                target: "uniserve_worker.warmup",
+                "captured {} text graphs: {} decode and {} prefill buckets",
+                runner.captured(),
+                runner.shapes().decode().len(),
+                runner.shapes().prefill().len(),
+            );
         }
-        for size in decode {
-            let lengths = vec![1; size];
-            with_scratch(kv, &vec![2; size], stream, |kv| {
-                // One real token per row, prefilled in batches no larger than
-                // the scheduler admits (the largest prefill bucket's live
-                // rows) and committed as each slot's cache; then the decode
-                // the graph captures with every row's continuation flag set.
-                for first in (0..size).step_by(prime) {
-                    let count = prime.min(size - first);
-                    run(
-                        runtime,
-                        kv,
-                        &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
-                        false,
-                        None,
-                    )?;
-                }
-                let slots: Vec<usize> = (1..=size).collect();
-                let prefilled: Vec<[i64; 8]> = slots
-                    .iter()
-                    .map(|&slot| [slot as i64, COMMIT_CACHE, -1, 1, 0, 0, 0, 0])
-                    .collect();
-                runtime.runners[index].commit(&prefilled)?;
-                runtime.state.set_predicates(&slots, true, stream)?;
-                let mut captured = Ok(());
-                for capacity in variants(size) {
-                    captured = run(
-                        runtime,
-                        kv,
-                        &rows(1, &lengths, 1, TokenSelection::LastLogits),
-                        true,
-                        capacity,
-                    );
-                    if captured.is_err() {
-                        break;
-                    }
-                }
-                runtime.state.set_predicates(&slots, false, stream)?;
-                captured
-            })?;
-        }
-        if let Some(stream) = stream {
-            stream.synchronize()?;
-        }
-        let runner = &runtime.runners[index];
-        tracing::info!(
-            target: "uniserve_worker.warmup",
-            "captured {} text graphs: {} decode and {} prefill buckets",
-            runner.captured(),
-            runner.shapes().decode().len(),
-            runner.shapes().prefill().len(),
-        );
+        Ok(())
     }
-    Ok(())
-}
 
-/// One warmup step of `rows` on microbatch `peer` of `group`; the group's
-/// other microbatches join. `capacity` forces the expert step capacity.
-fn step(
-    runtime: &mut CausalLMRunners,
-    experts: Option<&ExpertRuntime>,
-    (group, peer): (usize, usize),
-    kv: &mut KVCache,
-    rows: &[TokenRow],
-    decode: bool,
-    capacity: Option<usize>,
-) -> Result<()> {
-    let (tables, cache) = kv.split();
-    let request = StepRequest {
-        mode: if decode {
-            ForwardMode::Decode
-        } else {
-            ForwardMode::Prefill
-        },
-        rows,
-        finish_ids: &[],
-        sampling: None,
-        prompt: &[],
-        embeddings: &[],
-    };
-    let mut requests: Vec<Option<StepRequest<'_>>> =
-        (0..runtime.groups[group].len()).map(|_| None).collect();
-    requests[peer] = Some(request);
-    runtime
-        .invoke(
+    /// Run a capture bucket's `steps` over scratch tables of `lengths`
+    /// tokens for slots `1..`. One job of `kind`'s lane installs the tables
+    /// before the steps; one clears them and resets the scratch units after
+    /// the steps, whether or not they succeeded. `steps` records into that
+    /// second job what the device undoes before the tables are cleared.
+    fn warmup_bucket(
+        &mut self,
+        lanes: &JobQueues,
+        kind: CallKind,
+        kv: &mut KVCache,
+        lengths: &[usize],
+        stream: Option<&uniserve_cuda::Stream>,
+        steps: impl FnOnce(&mut Self, &mut KVCache, &Job) -> Result<()>,
+    ) -> Result<()> {
+        let perform = |job: Job| -> Result<()> {
+            let completion = lanes.block_on(kind, job, BLOCK_ON_TIMEOUT)?;
+            completion
+                .check()
+                .map(drop)
+                .map_err(|failure| failure.error)
+        };
+
+        let before = Job::new();
+        let scratch = install_scratch(kv, lengths, before.on(stream))?;
+        perform(before)?;
+
+        let after = Job::new();
+        let stepped = steps(self, kv, &after);
+        let released = release_scratch(kv, scratch, lengths.len(), after.on(stream));
+        let performed = perform(after);
+        stepped.and(released).and(performed)
+    }
+
+    /// One warmup step of `rows` on microbatch `peer` of `group`, as a job
+    /// of the group's lane; the group's other microbatches join. `capacity`
+    /// forces the expert step capacity. The step continues `job`, which
+    /// holds what the device does before it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one warmup step's shape and owners"
+    )]
+    fn warmup_step(
+        &mut self,
+        experts: Option<&Arc<ExpertUnion>>,
+        lanes: &JobQueues,
+        (group, peer): (usize, usize),
+        kv: &mut KVCache,
+        rows: &[TokenRow],
+        decode: bool,
+        capacity: Option<usize>,
+        job: Job,
+    ) -> Result<()> {
+        let (tables, cache) = kv.split();
+        let prompt = PromptChunks::default();
+        let request = StepRequest {
+            mode: if decode {
+                ForwardMode::Decode
+            } else {
+                ForwardMode::Prefill
+            },
+            rows,
+            finish_ids: &[],
+            sampling: None,
+            prompt: &prompt,
+            embeddings: &[],
+        };
+        let mut requests: Vec<Option<StepRequest<'_>>> =
+            (0..self.groups[group].len()).map(|_| None).collect();
+        requests[peer] = Some(request);
+
+        let step = self.forward(
             experts,
             group,
             &requests,
             &mut StepParts { tables, cache },
             capacity,
-        )
-        .map(drop)
+            &job,
+        )?;
+        let completion = lanes.block_on(self.kind(group)?, job, BLOCK_ON_TIMEOUT)?;
+        let mut completion = completion.check().map_err(|failure| failure.error)?;
+        self.complete(step, &mut completion).map(drop)
+    }
+
+    /// Commit `rows` on runner `index` of `group` as a job of its lane,
+    /// storing the commit graph a bucket's first commit captures.
+    fn warmup_commit(
+        &mut self,
+        lanes: &JobQueues,
+        index: usize,
+        group: usize,
+        rows: &[[i64; 8]],
+    ) -> Result<()> {
+        let job = Job::new();
+        let captured = self.runners[index].commit(rows, &job)?;
+        let completion = lanes.block_on(self.kind(group)?, job, BLOCK_ON_TIMEOUT)?;
+        let mut completion = completion.check().map_err(|failure| failure.error)?;
+        match captured {
+            Some(key) => self.runners[index].complete_commit(key, &mut completion),
+            None => Ok(()),
+        }
+    }
 }
 
 /// One prefill and one relayed decode of a fresh request.

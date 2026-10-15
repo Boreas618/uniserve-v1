@@ -185,7 +185,7 @@ pub struct Report {
     pub activation_formats: Vec<String>,
 }
 
-/// Media-timeline facts of a video model, from the video runtime.
+/// Media-timeline facts of a video model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaFacts {
     pub num_steps: u32,
@@ -196,10 +196,21 @@ pub struct MediaFacts {
     pub local_product_bytes: u64,
     /// Product bytes of every component per request (the logical pool).
     pub product_bytes: u64,
-    /// Latent pool of sampled trajectories, when this rank holds samples.
+    /// Latent pool of sampled trajectories, when the worker holds the
+    /// denoiser. Every rank of the worker reports its pages, because the head
+    /// schedules a request's pages by the worker's report.
     pub latent: Option<LatentPlan>,
+    /// Whether this rank stores the latent pool: it holds the denoiser.
+    pub stores_latent: bool,
     /// Artifact regions imported from other codec ranks.
     pub artifact_import_regions: usize,
+}
+
+impl MediaFacts {
+    /// The latent pool this rank stores.
+    fn stored_latent(&self) -> Option<LatentPlan> {
+        self.latent.filter(|_| self.stores_latent)
+    }
 }
 
 /// Inputs of the token layout taken from the loaded model.
@@ -212,8 +223,6 @@ pub struct TokenFacts {
     pub latent_feature_bytes: u64,
     /// The latent pool of an image flow.
     pub latent: Option<LatentPlan>,
-    /// Aligned product bytes per request over every component.
-    pub product_bytes: u64,
 }
 
 /// The resolved capacity of a rank.
@@ -330,8 +339,7 @@ impl TokenLayout {
         } else {
             feature_bytes
         };
-        info.buffer_pool_bytes = (u64::from(info.encoder_cache_entries) + 1) * feature_bytes
-            + u64::from(info.request_slots) * facts.product_bytes;
+        info.buffer_pool_bytes = (u64::from(info.encoder_cache_entries) + 1) * feature_bytes;
         info.max_unresolved_calls = narrow(
             call_window(queue_depth, config.max_batch_calls)?,
             "unresolved calls",
@@ -482,7 +490,7 @@ pub fn request_layout(
         info.latent_pages = narrow(plan.num_pages, "latent pages")?;
     }
     let latent_bytes = media
-        .latent
+        .stored_latent()
         .map(|plan| plan.bytes())
         .transpose()?
         .unwrap_or(0);
@@ -506,7 +514,7 @@ pub fn request_layout(
         arena,
         fixed_device_bytes: BTreeMap::new(),
         physical_buffer_pool_bytes: slots as u64 * media.local_product_bytes,
-        latent: media.latent,
+        latent: media.stored_latent(),
         cache: None,
     };
     plan.clamp_lanes(config);
@@ -535,7 +543,7 @@ pub fn slot_requirements(
             0,
             0,
         )?;
-        let latent_bytes = match &media.latent {
+        let latent_bytes = match media.stored_latent() {
             Some(plan) => {
                 let pages = if plan.with_workspace {
                     plan.num_pages
@@ -566,8 +574,6 @@ pub fn slot_requirements(
 mod tests {
     use uniserve_ipc::{DimBound, ShapeBound};
 
-    use crate::ffi::Fields;
-
     use super::*;
 
     fn group() -> HostGroup {
@@ -596,34 +602,35 @@ mod tests {
         }
     }
 
-    /// A two-layer, one-column bfloat16 pool with 64-token pages, as
-    /// `model.cache_plan` describes it.
+    /// A two-layer, one-column bfloat16 pool with 64-token pages.
     fn cache() -> KVPlan {
-        let ints = |values: &[i64]| crate::ffi::integer_list(values.iter().copied());
-        let group = Fields::new()
-            .with("window", -1i64)
-            .with("page_tokens", 64i64)
-            .with("units_per_page", 2i64)
-            .with("layers", crate::ffi::strings(["layers.0", "layers.1"]))
-            .with("layer_ids", ints(&[0, 1]))
-            .with("axis_layers", ints(&[0, 1]))
-            .with("num_kv_heads", 4i64)
-            .with("total_kv_heads", 8i64)
-            .with("kv_head_offset", 4i64)
-            .with("head_dim", 128i64)
-            .text("dtype", "bfloat16")
-            .text("compute_dtype", "bfloat16")
-            .into_any();
         let plane_bytes = 64 * 4 * 128 * 2;
-        let plan = Fields::new()
-            .with("columns", 1i64)
-            .with("plane_bytes", plane_bytes)
-            .with("quantized", false)
-            .with("unit_bytes", 2 * (plane_bytes + 1))
-            .text("dtype", "bfloat16")
-            .with("groups", crate::ffi::list([group]))
-            .into_any();
-        KVPlan::decode(plan).unwrap()
+        KVPlan {
+            columns: 1,
+            plane_bytes,
+            quantized: false,
+            // Key and value planes, each with one initialization flag.
+            unit_bytes: 2 * (plane_bytes + 1),
+            dtype: uniserve_core::KvCacheDtype::BFloat16,
+            groups: vec![crate::storage::KVGroupPlan {
+                window: None,
+                page_tokens: 64,
+                units_per_page: 2,
+                layers: vec!["layers.0".into(), "layers.1".into()],
+                layer_ids: vec![0, 1],
+                axis: crate::storage::GroupAxis {
+                    offset: 0,
+                    total: 2,
+                },
+                num_kv_heads: 4,
+                total_kv_heads: 8,
+                kv_head_offset: 4,
+                head_dim: 128,
+                dtype: crate::ffi::DType::BF16,
+                compute_dtype: crate::ffi::DType::BF16,
+            }],
+            handle: crate::ffi::Handle::none(),
+        }
     }
 
     #[test]
@@ -682,7 +689,6 @@ mod tests {
             vision_feature_bytes: 0,
             latent_feature_bytes: 0,
             latent: None,
-            product_bytes: 0,
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
         let fixed_before = layout.fixed[&Device::Cuda(0)];
@@ -729,7 +735,6 @@ mod tests {
             vision_feature_bytes: 1024,
             latent_feature_bytes: 512,
             latent: Some(LatentPlan::image(8, 1000, None, 64, 12, 2)),
-            product_bytes: 256,
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
         let capacity = layout.fit_cache(&cache(), 0, &config, 0, &group()).unwrap();
@@ -737,7 +742,8 @@ mod tests {
         let plan = layout.finish(&config, Some(Arc::new(cache())));
         assert_eq!(plan.info.max_batch_calls, 4);
         assert_eq!(plan.info.encoder_entry_bytes, 1024);
-        assert_eq!(plan.info.buffer_pool_bytes, 257 * 1024 + 8 * 256);
+        // One feature per encoder cache entry and one in flight.
+        assert_eq!(plan.info.buffer_pool_bytes, 257 * 1024);
         // 1000 tokens in 64-unit pages, plus the sentinel page.
         assert_eq!(plan.info.latent_pages, 17);
         assert_eq!(plan.info.latent_page_units, 64);
@@ -756,6 +762,7 @@ mod tests {
             local_product_bytes: 4096,
             product_bytes: 8192,
             latent: None,
+            stores_latent: false,
             artifact_import_regions: 0,
         };
         let requirements = slot_requirements(&config, 12, &media, 2, 4).unwrap();
@@ -777,5 +784,49 @@ mod tests {
         assert_eq!(plan.info.buffer_pool_bytes, 3 * 8192);
         assert_eq!(plan.physical_buffer_pool_bytes, 3 * 4096);
         assert_eq!(plan.info.num_inference_steps, 8);
+    }
+
+    #[test]
+    fn every_rank_of_a_sampling_worker_reports_the_latent_pool() {
+        let config = WorkerConfig {
+            max_batch_calls: 2,
+            max_request_pool_size: 2,
+            ..WorkerConfig::default()
+        };
+        // Two slots of eight pages each, and the sentinel page.
+        let pool = LatentPlan {
+            request_pool_size: 2,
+            num_pages: 17,
+            page_units: 1024,
+            latent_width: 1,
+            element_bytes: 4,
+            with_workspace: false,
+        };
+        let facts = |stores_latent| MediaFacts {
+            num_steps: 8,
+            video_denoiser: None,
+            state_bytes: 1000,
+            local_product_bytes: 4096,
+            product_bytes: 8192,
+            latent: Some(pool),
+            stores_latent,
+            artifact_import_regions: 0,
+        };
+        let layout =
+            |stores_latent| request_layout(report(), &config, 12, &facts(stores_latent), false);
+        let denoising = layout(true).unwrap();
+        let other = layout(false).unwrap();
+
+        // The head compares the ranks' reports and schedules pages by them.
+        assert_eq!(other.info, denoising.info);
+        assert_eq!(denoising.info.latent_pages, 17);
+        assert_eq!(denoising.info.latent_page_units, 1024);
+
+        // Only the denoising rank stores the pool.
+        assert_eq!(denoising.latent, Some(pool));
+        assert_eq!(other.latent, None);
+        let requirement =
+            |stores_latent| slot_requirements(&config, 12, &facts(stores_latent), 2, 2).unwrap()[0];
+        assert!(requirement(false) < requirement(true));
     }
 }

@@ -19,7 +19,6 @@ use serde::Serialize;
 use tvm_ffi::{Any, AnyView};
 
 use super::host::HostGroup;
-use crate::ffi::{Fields, Record};
 use crate::profiling::range;
 use crate::{Error, Result};
 
@@ -261,22 +260,12 @@ pub struct Agreement {
     pub released: bool,
 }
 
-/// One expert layer as `experts.layers` describes it.
+/// The sizes of one expert layer, as the library's `layers` lists them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExpertLayer {
     pub num_experts: usize,
     pub top_k: usize,
     pub hidden_size: usize,
-}
-
-impl ExpertLayer {
-    pub fn from_record(record: &Record) -> Result<Self> {
-        Ok(Self {
-            num_experts: record.count("num_experts")?,
-            top_k: record.count("top_k")?,
-            hidden_size: record.count("hidden_size")?,
-        })
-    }
 }
 
 /// What every rank of a union must agree on before warmup enters
@@ -409,6 +398,16 @@ impl ExpertParallel {
         self.control().exchange.capacity_for(tokens)
     }
 
+    /// The step capacities a forward that sends `tokens` tokens can run at:
+    /// every capacity holding them. Fixed at startup, so the thread that
+    /// prepares a step reads them without the agreement's lock.
+    pub fn capacities_for(&self, tokens: usize) -> impl Iterator<Item = usize> + '_ {
+        self.capacities
+            .iter()
+            .copied()
+            .filter(move |&capacity| capacity >= tokens.max(1))
+    }
+
     /// The union's host group, shared with the transports' bootstrap.
     pub fn host(&self) -> &Arc<Mutex<HostGroup>> {
         &self.host
@@ -532,16 +531,18 @@ fn lock(host: &Mutex<HostGroup>) -> MutexGuard<'_, HostGroup> {
     host.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Host collectives over `host` as TVM-FFI functions, for numerical
-/// transports that bootstrap their own device communicators (FlashInfer's
-/// communication backend, DeepEP and NVSHMEM unique ids, barriers).
+/// Host collectives over `host`, for numerical transports that bootstrap
+/// their own device communicators (FlashInfer's communication backend,
+/// DeepEP and NVSHMEM unique ids, barriers): the arguments of the library's
+/// `HostBootstrap`, in its order.
 ///
-/// The map holds `rank` and `size` and the functions `all_gather(bytes) ->
-/// [bytes]`, `broadcast(bytes or None, root) -> bytes`, `barrier()` and
-/// `split(color, key) -> map`. Callers run them in the same order on every
-/// member and never concurrently with the expert step agreement, which
-/// shares the connections. TVM-FFI releases the GIL while they block.
-pub fn host_functions(host: &Arc<Mutex<HostGroup>>) -> Any {
+/// They are the member's `rank`, the group's `size` and the functions
+/// `all_gather(bytes) -> [bytes]`, `broadcast(bytes or None, root) ->
+/// bytes`, `barrier()` and `split(color, key)`, which returns these
+/// arguments for the subgroup. Callers run the functions in the same order
+/// on every member and never concurrently with the expert step agreement,
+/// which shares the connections. TVM-FFI releases the GIL while they block.
+pub fn host_bootstrap(host: &Arc<Mutex<HostGroup>>) -> Vec<Any> {
     let (rank, size) = {
         let group = lock(host);
         (group.rank(), group.size())
@@ -597,16 +598,18 @@ pub fn host_functions(host: &Arc<Mutex<HostGroup>>) -> Any {
             i64::try_from(*value).map_err(|error| Error::numerical("host.split", &error))
         };
         let subgroup = group.split(integer(color)?, integer(key)?)?;
-        Ok(host_functions(&Arc::new(Mutex::new(subgroup))))
+        Ok(Any::from(crate::ffi::list(host_bootstrap(&Arc::new(
+            Mutex::new(subgroup),
+        )))))
     }));
-    Fields::new()
-        .with("rank", rank as i64)
-        .with("size", size as i64)
-        .with("all_gather", all_gather)
-        .with("broadcast", broadcast)
-        .with("barrier", barrier)
-        .with("split", split)
-        .into_any()
+    vec![
+        Any::from(rank as i64),
+        Any::from(size as i64),
+        Any::from(all_gather),
+        Any::from(broadcast),
+        Any::from(barrier),
+        Any::from(split),
+    ]
 }
 
 /// A worker error raised back into the calling numerical code.

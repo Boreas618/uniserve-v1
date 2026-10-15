@@ -8,10 +8,11 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8, memset_d32};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8};
 
 use super::memory::{Memory, StorageView};
 use crate::ffi::{Backing, DType, Device};
+use crate::stream::{Fill, Issue};
 use crate::transfer::Spans;
 use crate::{Error, Result};
 
@@ -275,9 +276,10 @@ impl LatentStorage {
         step.narrow(0, i64::from(offset) * units, i64::from(count) * units)
     }
 
-    /// Write `pages` into the page table at `offset` in `stream` order. The
-    /// ids are read during the call, so the host never waits on the device.
-    pub fn upload_pages(&self, offset: u32, pages: &[u32], stream: Option<&Stream>) -> Result<()> {
+    /// Write `pages` into the page table at `offset`, in the order of what
+    /// `issue` issues. The ids are read during the call, so the host never
+    /// waits on the device.
+    pub fn upload_pages(&self, offset: u32, pages: &[u32], issue: impl Issue) -> Result<()> {
         if u64::from(offset) + pages.len() as u64 > u64::from(self.num_pages - 1)
             || pages
                 .iter()
@@ -289,55 +291,48 @@ impl LatentStorage {
         }
         let ids: Vec<i64> = pages.iter().map(|&page| i64::from(page)).collect();
         let destination = self.page_table.address() + u64::from(offset) * 8;
-        match (self.page_table.device(), stream) {
-            (Device::Cuda(_), Some(stream)) => {
-                let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-                batch.push(destination, ids.as_ptr() as u64, ids.len() * 8);
-                // SAFETY: the destination lies in the page table; the
-                // pageable source is consumed during the call.
-                unsafe { batch.submit(stream) }.map_err(Error::from)
-            }
-            (Device::Cpu, None) => {
-                // SAFETY: host table owned by this value; the caller orders
-                // its readers.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(ids.as_ptr(), destination as *mut i64, ids.len());
-                }
-                Ok(())
-            }
-            _ => Err(Error::Invalid(
-                "latent writes use a stream exactly for device storage".into(),
-            )),
-        }
+        require_issuer(self.page_table.device(), issue)?;
+
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        batch.push(destination, ids.as_ptr() as u64, ids.len() * 8);
+        // SAFETY: the destination lies in the page table, which this value
+        // owns and whose readers the caller orders; the pageable source is
+        // consumed during the call.
+        unsafe { issue.copy(&batch) }
     }
 
-    /// Set slot `slot`'s timestep to `value` on `stream`.
-    pub fn fill_timestep(
-        &self,
-        slot: u32,
-        value: f32,
-        stream: Option<&Stream>,
-    ) -> Result<StorageView> {
+    /// Set slot `slot`'s timestep to `value`, in the order of what `issue`
+    /// issues.
+    pub fn fill_timestep(&self, slot: u32, value: f32, issue: impl Issue) -> Result<StorageView> {
         if slot == 0 || slot > self.request_pool_size {
             return Err(Error::Invalid("latent slot is outside the pool".into()));
         }
         let row = self.timesteps.select(0, i64::from(slot))?;
-        match (row.device(), stream) {
-            // SAFETY: one aligned word of the timestep column.
-            (Device::Cuda(_), Some(stream)) => {
-                unsafe { memset_d32(row.address(), value.to_bits(), 1, stream) }?
-            }
-            (Device::Cpu, None) => {
-                // SAFETY: host column owned by this value.
-                unsafe { (row.address() as *mut f32).write(value) };
-            }
-            _ => {
-                return Err(Error::Invalid(
-                    "latent writes use a stream exactly for device storage".into(),
-                ));
-            }
-        }
+        require_issuer(row.device(), issue)?;
+
+        // SAFETY: one aligned word of the timestep column, which this value
+        // owns.
+        unsafe {
+            issue.fill(Fill {
+                address: row.address(),
+                value: value.to_bits(),
+                width: 4,
+                count: 1,
+            })
+        }?;
         Ok(row)
+    }
+}
+
+/// Latent storage on a device is written on a stream of that device, host
+/// storage without one.
+fn require_issuer(device: Device, issue: impl Issue) -> Result<()> {
+    if matches!(device, Device::Cuda(_)) == issue.stream().is_some() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(
+            "latent writes use a stream exactly for device storage".into(),
+        ))
     }
 }
 

@@ -1,5 +1,5 @@
-//! The Python thread of a rank: where calls and releases made on other
-//! threads run. A process has one interpreter, so this file holds one test
+//! The Python thread of a rank: where calls, releases and submitted work of
+//! other threads run. A process has one interpreter, so this file holds one test
 //! and runs in a process of its own.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -53,21 +53,48 @@ fn calls_and_releases_from_other_threads_run_on_the_interpreter_thread() {
     assert_eq!(value.unwrap(), 42);
     assert_eq!(*seen.lock().unwrap(), Some(here));
 
-    // A handle dropped here is released by the interpreter before the drop
-    // returns.
+    // A handle dropped here is released by the interpreter thread, in the
+    // order of its queue, without the dropping thread waiting: while the
+    // interpreter is held inside submitted work the drop returns and the
+    // object lives; once the queue was waited for it is released.
+    let limit = std::time::Duration::from_secs(30);
     let released = Arc::new(Mutex::new(None));
     let witness = DropWitness(Arc::clone(&released));
     let holder = tvm_ffi::Function::from_packed(move |_: &[AnyView]| {
         let _ = &witness;
         Ok(Any::from(()))
     });
-    drop(Handle::new(Any::from(holder)).unwrap());
+    let handle = Handle::new(Any::from(holder)).unwrap();
+    let (open, gate) = crossbeam_channel::bounded::<()>(1);
+    Interpreter::submit(move || {
+        let _ = gate.recv_timeout(limit);
+    });
+    drop(handle);
+    assert_eq!(*released.lock().unwrap(), None);
+    open.send(()).unwrap();
+    Interpreter::synchronize();
     assert_eq!(*released.lock().unwrap(), Some(python));
+
+    // Submitted work runs on the interpreter thread while its submitter
+    // goes on: here the submitter reaches the gate only after `submit`
+    // returned, and the work cannot end before the gate opens.
+    let (open, gate) = crossbeam_channel::bounded::<()>(1);
+    let (ran, result) = crossbeam_channel::bounded(1);
+    Interpreter::submit(move || {
+        gate.recv_timeout(limit).unwrap();
+        ran.send(std::thread::current().id()).unwrap();
+    });
+    open.send(()).unwrap();
+    assert_eq!(result.recv_timeout(limit).unwrap(), python);
 
     finished.send(()).unwrap();
     assert_eq!(interpreter.join().unwrap(), Some(()));
 
-    // With the interpreter stopped, a call runs on its caller's thread.
+    // With the interpreter stopped, a call and submitted work run on their
+    // caller's thread.
     assert_eq!(function.call_as::<i64>(&[(&argument).into()]).unwrap(), 42);
     assert_eq!(*seen.lock().unwrap(), Some(here));
+    let (ran, result) = crossbeam_channel::bounded(1);
+    Interpreter::submit(move || ran.send(std::thread::current().id()).unwrap());
+    assert_eq!(result.try_recv().unwrap(), here);
 }

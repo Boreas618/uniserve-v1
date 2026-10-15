@@ -12,6 +12,28 @@ use uniserve_worker::transfer::{
 };
 use uniserve_worker::{EventPool, Result};
 
+/// Export on `stream` and take the locations, complete at once.
+fn located(
+    transports: &Transports,
+    source: &Spans,
+    offset: Option<&[u64]>,
+    consumers: &[usize],
+    host: bool,
+    stream: Option<&uniserve_cuda::Stream>,
+    mut retain: impl FnMut(Arc<uniserve_worker::transfer::Retirement>) -> Result<()>,
+) -> Result<Vec<uniserve_worker::transfer::exports::Location>> {
+    exports::export(
+        transports,
+        source,
+        offset,
+        consumers,
+        host,
+        stream,
+        &mut retain,
+    )?
+    .locate(&mut retain)
+}
+
 fn endpoint() -> WorkerEndpoint {
     WorkerEndpoint {
         worker_id: "worker".into(),
@@ -85,7 +107,7 @@ fn local_reads_copy_or_borrow_and_retire_after_release() -> Result<()> {
     let (transports, capacity) = transports(&[TransportKind::Local], 1 << 12)?;
     let source = counting(&[4, 3])?;
     let mut retirements = Vec::new();
-    let locations = exports::export(&transports, &source, None, &[], false, None, |retirement| {
+    let locations = located(&transports, &source, None, &[], false, None, |retirement| {
         retirements.push(retirement);
         Ok(())
     })?;
@@ -132,7 +154,7 @@ fn shared_memory_and_channel_reads_stage_whole_payloads() -> Result<()> {
     let (transports, capacity) =
         transports(&[TransportKind::Shm, TransportKind::Channel], 1 << 12)?;
     let source = counting(&[3, 2])?;
-    let locations = exports::export(
+    let locations = located(
         &transports,
         &source,
         Some(&[2, 0]),
@@ -162,7 +184,7 @@ fn shared_memory_and_channel_reads_stage_whole_payloads() -> Result<()> {
 
     // Slot 1 is on another host: only the rank channel reaches it, and its
     // bytes travel inside the locator.
-    let remote = exports::export(&transports, &source, None, &[1], false, None, |_| Ok(()))?;
+    let remote = located(&transports, &source, None, &[1], false, None, |_| Ok(()))?;
     let (channel, exported) = &remote[0];
     assert_eq!(TransportKind::of(exported), TransportKind::Channel);
     let destination = zeros(&[2, 2])?;
@@ -191,11 +213,10 @@ fn fetches_cover_regions_from_shards_and_reject_missing_coverage() -> Result<()>
     // Two shards of a [4, 2] tensor: rows 0..2 and rows 2..4.
     let first = counting(&[2, 2])?;
     let second = counting(&[2, 2])?;
-    let mut locations =
-        exports::export(&transports, &first, Some(&[0, 0]), &[], false, None, |_| {
-            Ok(())
-        })?;
-    let shard = exports::export(
+    let mut locations = located(&transports, &first, Some(&[0, 0]), &[], false, None, |_| {
+        Ok(())
+    })?;
+    let shard = located(
         &transports,
         &second,
         Some(&[2, 0]),
@@ -215,9 +236,10 @@ fn fetches_cover_regions_from_shards_and_reject_missing_coverage() -> Result<()>
         &destination,
         &transports,
         &[1..3, 0..2],
-        None,
+        None::<&uniserve_cuda::Stream>,
         |_| Ok(()),
     )?;
+    fetch::start(&reads)?;
     assert_eq!(reads.len(), 2);
     for read in &reads {
         read.wait_ready();
@@ -258,7 +280,7 @@ fn a_failed_export_revokes_every_accepted_location() -> Result<()> {
     let (transports, capacity) = transports(&[TransportKind::Local, TransportKind::Shm], 24)?;
     let source = counting(&[2, 3])?;
     let accepted = AtomicUsize::new(0);
-    let result = exports::export(&transports, &source, None, &[0], false, None, |_| {
+    let result = located(&transports, &source, None, &[0], false, None, |_| {
         accepted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     });
@@ -275,7 +297,7 @@ fn a_failed_export_revokes_every_accepted_location() -> Result<()> {
 fn observers_of_one_read_run_once_each() -> Result<()> {
     let (transports, _) = transports(&[TransportKind::Local], 1 << 12)?;
     let source = counting(&[2])?;
-    let locations = exports::export(&transports, &source, None, &[], false, None, |_| Ok(()))?;
+    let locations = located(&transports, &source, None, &[], false, None, |_| Ok(()))?;
     let (transport, locator) = &locations[0];
     let destination = zeros(&[2])?;
     let read = transport.fetch(locator, Device::Cpu, Some(&destination), None, None, None)?;

@@ -1,12 +1,16 @@
 //! A token batch's reservation and retirement.
 //!
-//! [`Batch::open`] binds every call's pending output, resolves
-//! host-gated predicates and leases the batch's output storage.
-//! [`Batch::reserve`] installs the active calls' block tables, resets
-//! newly assigned units, retains the KV extents the batch reads and writes
-//! until its device work retires, binds its scalar products and leases its
-//! relayed predicates. [`Batch::discard`] retires all of it after a
-//! failure before the commit point.
+//! [`Opening::open`] binds every call's pending output and records the
+//! reads of the batch's host-gated predicates. [`Batch::lease`] leases the
+//! batch's output storage. [`Batch::reserve`] installs the active calls'
+//! block tables, resets newly assigned units, retains the KV extents the
+//! batch reads and writes until its device work retires, binds its scalar
+//! products and leases its relayed predicates. [`Batch::discard`] retires
+//! all of it after a failure before the commit point.
+//!
+//! None of this issues on the batch's stream: every stream operation is
+//! recorded in the batch's job. A batch is a sequence of jobs, and between
+//! two of them it is a [`TokenBatch`], which borrows nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -18,9 +22,11 @@ use uniserve_ipc::{Batch as BatchPlan, CallStatus, DType, ForwardMode, RequestKe
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, CausalLMRunners};
 use crate::executor::PendingOutput;
-use crate::executor::forward::image::ImageRuntime;
-use crate::executor::forward::launch::{lock, read_flag, reports_output, seal};
+use crate::executor::forward::batch::image::ImageParts;
+use crate::executor::forward::launch::{lock, reports_output, seal};
 use crate::ffi::Device;
+use crate::lane::{Completion, Job};
+use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
 use crate::sampling::SamplingMetadata;
 use crate::storage::{OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar};
@@ -47,23 +53,66 @@ pub(super) struct CallState {
     pub(super) prompt: Vec<super::step::PromptScore>,
 }
 
-/// A token batch's borrowed owners and the resources it reserved.
-pub(super) struct Batch<'a> {
+/// The owners a token batch borrows while one of its jobs is prepared or
+/// its completion applied.
+pub(super) struct Owners<'a> {
     pub(super) runtime: &'a mut CausalLMRunners,
     /// The image runtime, for prompts placing image features.
-    pub(super) image: Option<&'a mut ImageRuntime>,
+    pub(super) image: Option<ImageParts<'a>>,
     pub(super) storage: &'a mut RankStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
+    /// The rank's expert union, when its forwards are expert steps.
+    pub(super) experts: Option<Arc<ExpertUnion>>,
+}
+
+/// A token batch whose outputs are bound, before its output storage is
+/// leased: its host-gated predicates decide first which calls are active.
+pub(crate) struct Opening {
     /// The runner group serving the batch.
-    pub(super) group: usize,
-    /// The rank's expert runtime, when its forwards are expert steps.
-    pub(super) experts: Option<&'a crate::executor::forward::experts::ExpertRuntime>,
+    group: usize,
     /// The group's lane stream.
+    stream: Option<Stream>,
+    device: Option<i32>,
+    mode: ForwardMode,
+    /// This rank reports the component's host results.
+    reports: bool,
+    calls: Vec<CallState>,
+    /// The calls whose host-gated predicate the opening job reads, in the
+    /// order of its reads.
+    predicated: Vec<usize>,
+    started: Instant,
+}
+
+/// A token batch between two of its jobs: what it reserved and each call's
+/// state.
+pub(crate) struct TokenBatch {
+    pub(super) group: usize,
     pub(super) stream: Option<Stream>,
     pub(super) device: Option<i32>,
     pub(super) mode: ForwardMode,
-    /// This rank reports the component's host results.
+    pub(super) reports: bool,
+    pub(super) calls: Vec<CallState>,
+    pub(super) buffer: OutputLease,
+    pub(super) writes: Vec<ProductBuffer>,
+    pub(super) reads: Vec<Arc<ProductRead>>,
+    pub(super) retirement: Arc<Retirement>,
+    pub(super) started: Instant,
+}
+
+/// A token batch's borrowed owners, the resources it reserved and the job
+/// that records its stream work.
+pub(super) struct Batch<'a> {
+    pub(super) runtime: &'a mut CausalLMRunners,
+    pub(super) image: Option<ImageParts<'a>>,
+    pub(super) storage: &'a mut RankStorage,
+    pub(super) requests: &'a mut RequestPool,
+    pub(super) plan: &'a BatchPlan,
+    pub(super) experts: Option<Arc<ExpertUnion>>,
+    pub(super) group: usize,
+    pub(super) stream: Option<Stream>,
+    pub(super) device: Option<i32>,
+    pub(super) mode: ForwardMode,
     pub(super) reports: bool,
     pub(super) calls: Vec<CallState>,
     pub(super) buffer: OutputLease,
@@ -72,22 +121,23 @@ pub(super) struct Batch<'a> {
     /// Signals the physical end of the batch's KV accesses.
     pub(super) retirement: Arc<Retirement>,
     pub(super) started: Instant,
+    /// The batch's next job on its lane.
+    pub(super) job: Job,
 }
 
-impl<'a> Batch<'a> {
-    /// Bind the batch's outputs and lease its output storage.
-    #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
+impl Opening {
+    /// Bind the batch's outputs to their requests, then record in `job`
+    /// the batch's order after the previous one and the read of every
+    /// host-gated predicate: the job's completion carries one byte each.
     pub(super) fn open(
-        runtime: &'a mut CausalLMRunners,
-        image: Option<&'a mut ImageRuntime>,
-        storage: &'a mut RankStorage,
-        requests: &'a mut RequestPool,
-        experts: Option<&'a crate::executor::forward::experts::ExpertRuntime>,
+        owners: &mut Owners<'_>,
         info: &uniserve_ipc::WorkerInfo,
         rank: usize,
-        plan: &'a BatchPlan,
-        started: Instant,
+        job: &Job,
     ) -> Result<Self> {
+        let started = Instant::now();
+        let plan = owners.plan;
+        let runtime = &mut *owners.runtime;
         let first = plan
             .calls
             .first()
@@ -117,11 +167,11 @@ impl<'a> Batch<'a> {
             .calls
             .iter()
             .map(|call| {
-                let request = requests.get(call.request_key.request_id.0)?;
+                let request = owners.requests.get(call.request_key.request_id.0)?;
                 Ok((call.request_key, call.call_id, request.slot()))
             })
             .collect::<Result<Vec<_>>>()?;
-        let bound = requests.bind_calls(&rows)?;
+        let bound = owners.requests.bind_calls(&rows)?;
         let mut calls = Vec::with_capacity(plan.calls.len());
         for (index, (call, request)) in plan.calls.iter().zip(&bound).enumerate() {
             calls.push(CallState {
@@ -140,17 +190,80 @@ impl<'a> Batch<'a> {
         }
 
         // Host-gated predicates resolve before any storage is reserved; a
-        // false one skips its call.
-        runtime.order.wait(stream.as_ref())?;
-        for (call, state) in plan.calls.iter().zip(&mut calls) {
-            if let Some(predicate) = &call.predicate
-                && predicate.dtype == DType::U8
-                && !read_flag(&storage.tensors, call, predicate, device, stream.as_ref())?
-            {
+        // false one skips its call. Each is read after its producer's
+        // fence, and its lease ends behind the read.
+        let issue = job.on(stream.as_ref());
+        runtime.order.wait(issue)?;
+        let tensors = &owners.storage.tensors;
+        let mut predicated = Vec::new();
+        for (index, call) in plan.calls.iter().enumerate() {
+            let Some(predicate) = call
+                .predicate
+                .as_ref()
+                .filter(|value| value.dtype == DType::U8)
+            else {
+                continue;
+            };
+            let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), issue)?;
+            issue.read(read.value().address(), 1);
+            tensors.complete_reads(&[read], issue, &[])?;
+            predicated.push(index);
+        }
+        Ok(Self {
+            group,
+            stream,
+            device,
+            mode,
+            reports,
+            calls,
+            predicated,
+            started,
+        })
+    }
+
+    /// Whether the opening job reads predicates, so the batch continues
+    /// only once it completed.
+    pub(super) fn reads_predicates(&self) -> bool {
+        !self.predicated.is_empty()
+    }
+
+    /// Apply the opening job's completion: a call whose predicate read
+    /// false is skipped.
+    pub(super) fn predicates(&mut self, completion: &mut Completion) -> Result<()> {
+        for index in std::mem::take(&mut self.predicated) {
+            let active = match completion.read()?[..] {
+                [0] => false,
+                [1] => true,
+                _ => {
+                    return Err(Error::Invalid(
+                        "call predicate is not a canonical boolean".into(),
+                    ));
+                }
+            };
+            if !active {
+                let state = &mut self.calls[index];
                 state.active = false;
                 state.output.output.status = CallStatus::Predicated;
             }
         }
+        Ok(())
+    }
+}
+
+impl<'a> Batch<'a> {
+    /// Lease the opened batch's output storage and begin its job.
+    pub(super) fn lease(owners: Owners<'a>, opening: Opening, job: Job) -> Result<Self> {
+        let Opening {
+            group,
+            stream,
+            device,
+            mode,
+            reports,
+            calls,
+            started,
+            ..
+        } = opening;
+        let plan = owners.plan;
 
         // The output lease: completion fields per call plus payload words.
         let words = plan
@@ -163,37 +276,91 @@ impl<'a> Batch<'a> {
                 )
             });
         let devices: Vec<i32> = device.into_iter().collect();
-        let buffer = runtime
-            .outputs
-            .lease(plan.calls.len(), words.max(1), &devices, false)?;
+        let buffer =
+            owners
+                .runtime
+                .outputs
+                .lease(plan.calls.len(), words.max(1), &devices, false)?;
         if let Some(stream) = &stream {
-            lock(&buffer).begin_device(device, stream, &storage.events)?;
+            lock(&buffer).begin_device(device, job.on(Some(stream)), &owners.storage.events)?;
         }
-        Ok(Self {
-            runtime,
-            image,
-            storage,
-            requests,
-            plan,
-            group,
-            experts,
-            stream,
-            device,
-            mode,
-            reports,
-            calls,
-            buffer,
-            writes: Vec::new(),
-            reads: Vec::new(),
-            retirement: Arc::new(Retirement::default()),
-            started,
-        })
+        Ok(Self::resume(
+            owners,
+            TokenBatch {
+                group,
+                stream,
+                device,
+                mode,
+                reports,
+                calls,
+                buffer,
+                writes: Vec::new(),
+                reads: Vec::new(),
+                retirement: Arc::new(Retirement::default()),
+                started,
+            },
+            job,
+        ))
+    }
+
+    /// Continue a batch with its owners borrowed again, recording into
+    /// `job`.
+    pub(super) fn resume(owners: Owners<'a>, batch: TokenBatch, job: Job) -> Self {
+        Self {
+            runtime: owners.runtime,
+            image: owners.image,
+            storage: owners.storage,
+            requests: owners.requests,
+            plan: owners.plan,
+            experts: owners.experts,
+            group: batch.group,
+            stream: batch.stream,
+            device: batch.device,
+            mode: batch.mode,
+            reports: batch.reports,
+            calls: batch.calls,
+            buffer: batch.buffer,
+            writes: batch.writes,
+            reads: batch.reads,
+            retirement: batch.retirement,
+            started: batch.started,
+            job,
+        }
+    }
+
+    /// Give the owners back: the job to submit, the batch as it waits for
+    /// the job's completion, and the owners.
+    pub(super) fn park(self) -> (Job, TokenBatch, Owners<'a>) {
+        (
+            self.job,
+            TokenBatch {
+                group: self.group,
+                stream: self.stream,
+                device: self.device,
+                mode: self.mode,
+                reports: self.reports,
+                calls: self.calls,
+                buffer: self.buffer,
+                writes: self.writes,
+                reads: self.reads,
+                retirement: self.retirement,
+                started: self.started,
+            },
+            Owners {
+                runtime: self.runtime,
+                image: self.image,
+                storage: self.storage,
+                requests: self.requests,
+                plan: self.plan,
+                experts: self.experts,
+            },
+        )
     }
 
     /// Install tables, reset units, retain KV extents, bind products and
     /// lease relayed predicates of the active calls.
     pub(super) fn reserve(&mut self) -> Result<()> {
-        let stream = self.stream.as_ref();
+        let stream = self.job.on(self.stream.as_ref());
         let plan = self.plan;
         let kv = self
             .storage
@@ -367,6 +534,7 @@ impl<'a> Batch<'a> {
                 state.completion_write = Some(write);
             }
         }
+        let stream = self.job.on(self.stream.as_ref());
         for state in self.calls.iter().filter(|state| !state.active) {
             for write in [&state.completion_write, &state.transition_write]
                 .into_iter()
@@ -374,7 +542,7 @@ impl<'a> Batch<'a> {
             {
                 self.storage
                     .tensors
-                    .write_scalar(write, Scalar::Int(0), self.stream.as_ref())?;
+                    .write_scalar(write, Scalar::Int(0), stream)?;
             }
         }
         Ok(())
@@ -401,19 +569,19 @@ impl<'a> Batch<'a> {
             self.reads = self.storage.tensors.consume_batch(
                 &requests,
                 Some(target),
-                self.stream.as_ref(),
+                self.job.on(self.stream.as_ref()),
             )?;
         }
         Ok(())
     }
 
     /// Seal the lease on the batch's stream and retire its KV accesses and
-    /// output storage once the fences complete; wake the service then.
+    /// output storage once the fences complete.
     pub(super) fn seal(&self) -> Result<()> {
         seal(
             &self.storage.events,
             &self.buffer,
-            self.stream.as_ref(),
+            self.job.on(self.stream.as_ref()),
             &self.retirement,
         )
     }
@@ -421,7 +589,7 @@ impl<'a> Batch<'a> {
     /// Retire every reservation after a failure before the commit point;
     /// storage returns once the fences recorded here complete.
     pub(super) fn discard(&mut self) -> Result<()> {
-        let stream = self.stream.as_ref();
+        let stream = self.job.on(self.stream.as_ref());
         let reads = std::mem::take(&mut self.reads);
         let completed = self.storage.tensors.complete_reads(&reads, stream, &[]);
         let writes = std::mem::take(&mut self.writes);

@@ -21,30 +21,41 @@
 //! prepares a transient layout, evaluated eagerly, which the least recently
 //! used transient layout makes room for once no request uses it.
 
+pub(crate) mod image;
+pub(crate) mod image_model;
+pub(crate) mod runners;
+mod start;
+pub(crate) mod warmup;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, VideoCondition};
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memcpy_async, memset_d8, memset_d32};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8, memset_d32};
 use uniserve_ipc::{
-    Batch as BatchPlan, Call, ConditionTiles, LatentParams, OutputInfo, VideoDenoiserInfo,
+    Batch as BatchPlan, Call, ConditionTiles, DimBound, LatentParams, OutputInfo, RasterAxes,
+    ShapeBound, VideoDenoiserInfo,
 };
 
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::forward::batch::{MediaBatch, Trajectories};
-use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs, export};
+use crate::executor::forward::batch::{Parts, latent_params, product_name, stream_of};
+use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
 use crate::executor::forward::transfer::latents::Pool;
-use crate::executor::forward::video::{Parts, latent_params, stream_of};
-use crate::ffi::{Backing, DType, Function, Handle, Record, integer_list, integers};
+use crate::ffi::{Backing, DType, Function, Handle, integer_list, integers};
+use crate::lane::{Completion, Job};
 use crate::model::components::{Capability, Declarations};
 use crate::model::interface::Interface;
 use crate::parallel::joins::GraphFunctions;
+use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};
+use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::storage::{RequestSlots, SlotField};
+use crate::stream::{Fill, Issue};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
 
 /// A request's samples occupy at most this many pages, which bounds the
@@ -289,15 +300,15 @@ struct Conditioner {
 
 impl Conditioner {
     /// The arguments of `EncoderRunner.encode` at `capacity`.
-    fn arguments(&self, capacity: u32) -> Result<Vec<Any>> {
+    fn arguments(&self, capacity: u32) -> Result<Vec<Argument>> {
         let runner = self.runners.get(&capacity).ok_or_else(|| {
             Error::Invariant(format!("no text conditioner serves capacity {capacity}"))
         })?;
         Ok(vec![
-            runner.to_any(),
-            Any::from(self.input.prefix(i64::from(capacity))?.to_tensor()?),
-            Any::from(self.lengths.to_tensor()?),
-            Any::from(self.output.prefix(i64::from(capacity))?.to_tensor()?),
+            Argument::Handle(runner.clone()),
+            Argument::Tensor(self.input.prefix(i64::from(capacity))?),
+            Argument::Tensor(self.lengths.clone()),
+            Argument::Tensor(self.output.prefix(i64::from(capacity))?),
         ])
     }
 }
@@ -340,6 +351,11 @@ struct Layout {
     /// Live requests evaluating in the layout.
     references: usize,
 }
+
+/// The transient layouts a new one displaced ([`DenoiserRunner::ask_layout`]):
+/// their constants are released when this is dropped, behind the job that
+/// drained the stream.
+pub(crate) struct Evicted(#[expect(dead_code, reason = "held until it is dropped")] Vec<Layout>);
 
 /// One rank's video denoiser: its bound steps, buffers, latent pool and
 /// layouts.
@@ -401,8 +417,8 @@ pub(crate) struct DenoiserSetup<'a> {
     pub(crate) conditioning: Option<Conditioning>,
     pub(crate) conditioning_width: u64,
     pub(crate) attention: String,
-    /// The worker's workspace allocation callback.
-    pub(crate) allocate: tvm_ffi::Function,
+    /// The stream's shared work areas, a Python `Scratch`.
+    pub(crate) scratch: Handle,
     pub(crate) graph_pool: Option<Arc<GraphPool<Handle>>>,
     pub(crate) transient_layouts: usize,
 }
@@ -465,7 +481,7 @@ impl DenoiserRunner {
             text(setup.component),
             stream.clone(),
             text(&setup.attention),
-            Any::from(setup.allocate.clone()),
+            setup.scratch.to_any(),
             setup.maximum.descriptor(),
         ])?;
         let methods = Methods {
@@ -482,7 +498,6 @@ impl DenoiserRunner {
 
         let conditioner = match setup.conditioning {
             Some(conditioning) => {
-                const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
                 let Conditioning {
                     path,
                     mut capacities,
@@ -501,7 +516,7 @@ impl DenoiserRunner {
                         text(&path),
                         stream.clone(),
                         text(&setup.attention),
-                        Any::from(setup.allocate.clone()),
+                        setup.scratch.to_any(),
                         Any::from(integer_list([i64::from(capacity), width as i64])),
                     ])?;
                     runners.insert(capacity, Handle::new(runner)?);
@@ -569,9 +584,27 @@ impl DenoiserRunner {
         &self.stream
     }
 
-    /// Prepare `key` under a new id. Startup layouts are never released.
-    fn prepare(&mut self, model: &VideoModel, key: VideoLayout, startup: bool) -> Result<usize> {
+    /// Prepare startup layout `key` under a new id: read its fields and
+    /// prepare its constants, on the calling thread. Startup layouts are
+    /// never released.
+    fn prepare(&mut self, model: &VideoModel, key: VideoLayout) -> Result<usize> {
         let fields = model.layout_fields(&key)?;
+        let handle = Handle::new(
+            self.methods
+                .prepare_layout
+                .call_values(&[self.methods.runner.to_any(), key.descriptor()])?,
+        )?;
+        self.install(key, fields, handle, true)
+    }
+
+    /// Keep layout `key`, whose constants `handle` holds, under a new id.
+    fn install(
+        &mut self,
+        key: VideoLayout,
+        fields: LayoutFields,
+        handle: Handle,
+        startup: bool,
+    ) -> Result<usize> {
         let samples = SampleLayout::new(&fields, self.pages.page_units)?;
         if samples.pages > self.pages.pages {
             return Err(Error::Invalid(
@@ -632,11 +665,6 @@ impl DenoiserRunner {
                 tensors.push(self.state[index].clone());
             }
         }
-        let handle = Handle::new(
-            self.methods
-                .prepare_layout
-                .call_values(&[self.methods.runner.to_any(), key.descriptor()])?,
-        )?;
         self.layouts[id] = Some(Layout {
             key,
             handle,
@@ -661,41 +689,88 @@ impl DenoiserRunner {
     ) -> Result<usize> {
         match self.ids.get(&key) {
             Some(&id) => Ok(id),
-            None => self.prepare(model, key, true),
+            None => self.prepare(model, key),
         }
     }
 
-    /// The id of the layout a request evaluates in, preparing a transient
-    /// layout (and releasing an unused one) when it was not prepared.
-    pub(crate) fn acquire(&mut self, model: &VideoModel, key: VideoLayout) -> Result<usize> {
-        let id = match self.ids.get(&key) {
-            Some(&id) => {
-                if let Some(position) = self.transient.iter().position(|&entry| entry == id) {
-                    self.transient.remove(position);
-                    self.transient.push_back(id);
-                }
-                id
-            }
-            None => {
-                while self.transient.len() >= self.transient_capacity {
-                    let Some(position) = self.transient.iter().position(|&entry| {
-                        self.layout(entry)
-                            .is_ok_and(|layout| layout.references == 0)
-                    }) else {
-                        break;
-                    };
-                    let Some(evicted) = self.transient.remove(position) else {
-                        break;
-                    };
-                    self.release_layout(evicted)?;
-                }
-                let id = self.prepare(model, key, false)?;
-                self.transient.push_back(id);
-                id
-            }
+    /// Whether layout `key` is prepared.
+    pub(crate) fn prepared(&self, key: &VideoLayout) -> bool {
+        self.ids.contains_key(key)
+    }
+
+    /// Hold prepared layout `key` for one more request and return its id;
+    /// `None` when the layout is not prepared ([`Self::ask_layout`]).
+    pub(crate) fn acquire(&mut self, key: VideoLayout) -> Result<Option<usize>> {
+        let Some(&id) = self.ids.get(&key) else {
+            return Ok(None);
         };
+        if let Some(position) = self.transient.iter().position(|&entry| entry == id) {
+            self.transient.remove(position);
+            self.transient.push_back(id);
+        }
         self.layout_mut(id)?.references += 1;
-        Ok(id)
+        Ok(Some(id))
+    }
+
+    /// Record into `job`, a job of the runner's lane, the preparation of
+    /// transient layout `key`: the model's fields of the layout and the
+    /// constants the library prepares for it on the lane's stream.
+    /// [`Self::accept_layout`] keeps the layout from the job's completion.
+    ///
+    /// Unused transient layouts beyond the runner's capacity give way.
+    /// Their constants must outlive their last step, so the job drains
+    /// the stream first; the returned layouts are dropped once it
+    /// completed.
+    pub(crate) fn ask_layout(
+        &mut self,
+        model: &VideoModel,
+        key: VideoLayout,
+        job: &Job,
+    ) -> Result<Evicted> {
+        let mut evicted = Vec::new();
+        while self.transient.len() >= self.transient_capacity {
+            let Some(position) = self.transient.iter().position(|&entry| {
+                self.layout(entry)
+                    .is_ok_and(|layout| layout.references == 0)
+            }) else {
+                break;
+            };
+            let Some(id) = self.transient.remove(position) else {
+                break;
+            };
+            if let Some(layout) = self.layouts.get_mut(id).and_then(Option::take) {
+                self.ids.remove(&layout.key);
+                evicted.push(layout);
+            }
+        }
+        if !evicted.is_empty() {
+            job.on(Some(&self.stream)).synchronize()?;
+        }
+
+        model.ask_layout_fields(&key, job);
+        job.call_handle(MethodCall::new(
+            &self.methods.prepare_layout,
+            vec![
+                Argument::Handle(self.methods.runner.clone()),
+                Argument::Integers(key.values().to_vec()),
+            ],
+        ));
+        Ok(Evicted(evicted))
+    }
+
+    /// Keep transient layout `key` as the job of [`Self::ask_layout`]
+    /// prepared it.
+    pub(crate) fn accept_layout(
+        &mut self,
+        model: &VideoModel,
+        key: VideoLayout,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        let fields = model.read_layout_fields(completion)?;
+        let handle = completion.handle()?;
+        let id = self.install(key, fields, handle, false)?;
+        self.transient.push_back(id);
+        Ok(())
     }
 
     /// End a request's use of its layout.
@@ -705,18 +780,6 @@ impl DenoiserRunner {
             .references
             .checked_sub(1)
             .ok_or_else(|| Error::Invariant("video layout reference underflow".into()))?;
-        Ok(())
-    }
-
-    fn release_layout(&mut self, id: usize) -> Result<()> {
-        let Some(layout) = self.layouts.get_mut(id).and_then(Option::take) else {
-            return Ok(());
-        };
-        // The layout's constants must outlive its last step. Evicting a
-        // transient layout is rare, so the stream drains here; dropping the
-        // layout then releases its handle.
-        self.stream.synchronize()?;
-        self.ids.remove(&layout.key);
         Ok(())
     }
 
@@ -742,17 +805,19 @@ impl DenoiserRunner {
     /// Draw a request's noise from `seed` and fill its slot's host sources
     /// for its layout: the library's draw fills the slot's pinned noise
     /// rows, and `DenoiserRunner.prepare_latents` turns them into the
-    /// request's initial samples and state tables. Host work only.
+    /// request's initial samples and state tables. Host work only, recorded
+    /// into `job` so that it precedes the copies of the slot's sources.
     pub(crate) fn prepare_latents(
         &self,
         id: usize,
         slot: usize,
         size: &VideoSize,
         seed: u64,
+        job: &Job,
     ) -> Result<()> {
         let layout = self.layout(id)?;
-        let host = |name: String| -> Result<Any> {
-            Ok(Any::from(self.host.slot(&name, slot as u32)?.to_tensor()?))
+        let host = |name: String| -> Result<Argument> {
+            Ok(Argument::Tensor(self.host.slot(&name, slot as u32)?))
         };
         let noise = layout
             .fields
@@ -762,23 +827,24 @@ impl DenoiserRunner {
             .collect::<Result<Vec<_>>>()?;
 
         // The seed's bits; the Python half reads them as unsigned.
+        let runner = Argument::Handle(self.methods.runner.clone());
         let mut draw = vec![
-            self.methods.runner.to_any(),
-            Any::from(seed as i64),
-            layout.handle.to_any(),
+            runner.clone(),
+            Argument::Integer(seed as i64),
+            Argument::Handle(layout.handle.clone()),
         ];
-        draw.extend(size_arguments(size));
+        draw.extend(size_values(size));
         draw.push(host("condition_noise".into())?);
         draw.extend(noise.iter().cloned());
-        self.methods.draw_noise.call_values(&draw)?;
+        job.call(MethodCall::new(&self.methods.draw_noise, draw));
 
-        let mut prepare = vec![self.methods.runner.to_any(), layout.handle.to_any()];
-        prepare.extend(size_arguments(size));
+        let mut prepare = vec![runner, Argument::Handle(layout.handle.clone())];
+        prepare.extend(size_values(size));
         prepare.extend(noise);
         for field in &layout.fields.state {
             prepare.push(host(format!("{}_source", field.name))?);
         }
-        self.methods.prepare_latents.call_values(&prepare)?;
+        job.call(MethodCall::new(&self.methods.prepare_latents, prepare));
         Ok(())
     }
 
@@ -820,6 +886,7 @@ impl DenoiserRunner {
         slot: usize,
         call: &Call,
         params: &LatentParams,
+        job: &Job,
     ) -> Result<LatentUpdate> {
         let pages = self.slot_pages(slot, params)?;
         self.pool.require_initial(slot, &pages)?;
@@ -845,7 +912,7 @@ impl DenoiserRunner {
         // SAFETY: every destination lies in this slot's pages or rows, which
         // no other request owns; the pinned sources stay allocated for the
         // runner's lifetime and are rewritten only by the slot's next request.
-        unsafe { copies.submit(&self.stream) }?;
+        unsafe { job.on(Some(&self.stream)).copy(&copies) }?;
         LatentUpdate::for_call(slot, call, params)
     }
 
@@ -858,6 +925,7 @@ impl DenoiserRunner {
         slot: usize,
         features: &StorageView,
         count: u64,
+        job: &Job,
     ) -> Result<GraphMode> {
         let layout = self.layout(id)?;
         let (rows, width) = layout.fields.text_condition;
@@ -892,44 +960,49 @@ impl DenoiserRunner {
             buffers.lengths.address(),
             buffers.output.address(),
         );
+        let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
+        let mut prompt = CopyBatch::new(SourceOrder::Stream);
+        prompt.push(input, features.address(), (count * row_bytes) as usize);
         // SAFETY: the conditioner buffers and the slot's rows are owned by
-        // this runner; every range lies inside them and the stream orders
-        // the copies before and after the conditioner.
+        // this runner and the features are leased until the batch commits;
+        // every range lies inside them and the stream orders the copies
+        // before and after the conditioner.
         unsafe {
-            memcpy_async(
-                input,
-                features.address(),
-                (count * row_bytes) as usize,
-                &self.stream,
-            )?;
-            memset_d8(
-                input + count * row_bytes,
-                0,
-                ((u64::from(capacity) - count) * row_bytes) as usize,
-                &self.stream,
-            )?;
-            memset_d32(lengths, count as u32, 1, &self.stream)?;
+            issue.copy(&prompt)?;
+            issue.fill(Fill {
+                address: input + count * row_bytes,
+                value: 0,
+                width: 1,
+                count: ((u64::from(capacity) - count) * row_bytes) as usize,
+            })?;
+            issue.fill(Fill {
+                address: lengths,
+                value: count as u32,
+                width: 4,
+                count: 1,
+            })?;
         }
-        let mode = self.run_conditioner(capacity)?;
+        let mode = self.run_conditioner(capacity, job)?;
+
+        let mut refined = CopyBatch::new(SourceOrder::Stream);
+        refined.push(target.address(), output, (count * output_row) as usize);
         // SAFETY: as above.
         unsafe {
-            memcpy_async(
-                target.address(),
-                output,
-                (count * output_row) as usize,
-                &self.stream,
-            )?;
-            memset_d8(
-                target.address() + count * output_row,
-                0,
-                ((rows - count) * output_row) as usize,
-                &self.stream,
-            )?;
+            issue.copy(&refined)?;
+            issue.fill(Fill {
+                address: target.address() + count * output_row,
+                value: 0,
+                width: 1,
+                count: ((rows - count) * output_row) as usize,
+            })?;
         }
         Ok(mode)
     }
 
-    fn run_conditioner(&mut self, capacity: u32) -> Result<GraphMode> {
+    /// Record the conditioner's forward at `capacity`: the launch of its
+    /// graph or the eager call.
+    fn run_conditioner(&mut self, capacity: u32, job: &Job) -> Result<GraphMode> {
         let capturing = self.pool_handle.is_some();
         let conditioner = self
             .conditioner
@@ -943,13 +1016,14 @@ impl DenoiserRunner {
         };
         let mode = match lookup {
             Lookup::Replay(graph) => {
-                graph.launch(&self.stream)?;
+                job.on(Some(&self.stream)).launch(graph)?;
                 GraphMode::Replay
             }
             Lookup::Capture => {
-                conditioner
-                    .encode
-                    .call_values(&conditioner.arguments(capacity)?)?;
+                job.call(MethodCall::new(
+                    &conditioner.encode,
+                    conditioner.arguments(capacity)?,
+                ));
                 GraphMode::Eager
             }
         };
@@ -967,30 +1041,28 @@ impl DenoiserRunner {
         slot: usize,
         size: &VideoSize,
         latents: &[Vec<StorageView>],
+        job: &Job,
     ) -> Result<()> {
         let layout = self.layout(id)?;
-        let mut arguments = vec![self.methods.runner.to_any(), layout.handle.to_any()];
-        arguments.extend(size_arguments(size));
-        arguments.push(Any::from(
-            self.host
-                .slot("condition_noise", slot as u32)?
-                .to_tensor()?,
+        let mut arguments = vec![
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Handle(layout.handle.clone()),
+        ];
+        arguments.extend(size_values(size));
+        arguments.push(Argument::Tensor(
+            self.host.slot("condition_noise", slot as u32)?,
         ));
-        arguments.push(Any::from(
-            self.banks
-                .slot("text_condition", slot as u32)?
-                .to_tensor()?,
+        arguments.push(Argument::Tensor(
+            self.banks.slot("text_condition", slot as u32)?,
         ));
-        arguments.push(Any::from(integer_list(
-            latents.iter().map(|parts| parts.len() as i64),
-        )));
+        arguments.push(Argument::Integers(
+            latents.iter().map(|parts| parts.len() as i64).collect(),
+        ));
         for part in latents.iter().flatten() {
-            arguments.push(Any::from(part.to_tensor()?));
+            arguments.push(Argument::Tensor(part.clone()));
         }
-        self.methods
-            .encode_conditions
-            .call_values(&arguments)
-            .map(drop)
+        job.call(MethodCall::new(&self.methods.encode_conditions, arguments));
+        Ok(())
     }
 
     /// Advance a request's trajectory by one solver step and return its
@@ -1002,6 +1074,7 @@ impl DenoiserRunner {
         slot: usize,
         call: &Call,
         params: &LatentParams,
+        job: &Job,
     ) -> Result<(LatentUpdate, GraphMode)> {
         if params.step_count != 1 {
             return Err(Error::Invalid(
@@ -1042,30 +1115,41 @@ impl DenoiserRunner {
                 bytes as usize,
             );
         }
+        let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
         // SAFETY: the scratch, state buffers, slot rows and pages are owned by
         // this runner; steps of the runner are ordered on its stream.
         unsafe {
-            gather.submit(&self.stream)?;
-            memset_d32(self.step.address(), params.start_step, 1, &self.stream)?;
-            memset_d32(self.step.address() + 4, 0, 1, &self.stream)?;
+            issue.copy(&gather)?;
+            issue.fill(Fill {
+                address: self.step.address(),
+                value: params.start_step,
+                width: 4,
+                count: 1,
+            })?;
+            issue.fill(Fill {
+                address: self.step.address() + 4,
+                value: 0,
+                width: 4,
+                count: 1,
+            })?;
         }
 
-        let mode = self.run_step(id)?;
+        let mode = self.run_step(id, job)?;
 
+        let mut scatter = CopyBatch::new(SourceOrder::Stream);
+        scatter.push(
+            self.bank_address(write, first)?,
+            self.samples.address(),
+            (layout_pages * page_bytes) as usize,
+        );
         // SAFETY: as above; the scatter follows the step on the stream.
-        unsafe {
-            memcpy_async(
-                self.bank_address(write, first)?,
-                self.samples.address(),
-                (layout_pages * page_bytes) as usize,
-                &self.stream,
-            )?;
-        }
+        unsafe { issue.copy(&scatter) }?;
         Ok((LatentUpdate::for_call(slot, call, params)?, mode))
     }
 
     /// The arguments of `DenoiserRunner.denoise` for a layout.
-    fn step_arguments(&self, id: usize) -> Result<Vec<Any>> {
+    fn step_arguments(&self, id: usize) -> Result<Vec<Argument>> {
         let layout = self.layout(id)?;
         let text = self
             .envelope
@@ -1074,28 +1158,29 @@ impl DenoiserRunner {
             .position(|field| field.name == "text_condition")
             .ok_or_else(|| Error::Invariant("the envelope lacks text conditioning".into()))?;
         let mut arguments = vec![
-            self.methods.runner.to_any(),
-            layout.handle.to_any(),
-            Any::from(self.step.to_tensor()?),
-            Any::from(self.state[text].to_tensor()?),
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Handle(layout.handle.clone()),
+            Argument::Tensor(self.step.clone()),
+            Argument::Tensor(self.state[text].clone()),
         ];
-        for tensor in &layout.tensors {
-            arguments.push(Any::from(tensor.to_tensor()?));
-        }
+        arguments.extend(layout.tensors.iter().cloned().map(Argument::Tensor));
         Ok(arguments)
     }
 
-    fn run_step(&mut self, id: usize) -> Result<GraphMode> {
+    /// Record a solver step of layout `id`: the launch of its graph or the
+    /// eager call.
+    fn run_step(&mut self, id: usize, job: &Job) -> Result<GraphMode> {
         let mode = match self.graphs.lookup(&id, None) {
             Ok(Lookup::Replay(graph)) => {
-                graph.launch(&self.stream)?;
+                job.on(Some(&self.stream)).launch(graph)?;
                 GraphMode::Replay
             }
             // Transient layouts and uncaptured startup layouts run eagerly.
             _ => {
-                self.methods
-                    .denoise
-                    .call_values(&self.step_arguments(id)?)?;
+                job.call(MethodCall::new(
+                    &self.methods.denoise,
+                    self.step_arguments(id)?,
+                ));
                 GraphMode::Eager
             }
         };
@@ -1162,6 +1247,10 @@ impl DenoiserRunner {
     /// Run one placeholder step of a startup layout on slot `slot`, whose
     /// host sources a preparation filled, to prepare its kernels and plans
     /// before any capture. The scratch's values are discarded.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub(crate) fn warm(&mut self, id: usize, slot: usize) -> Result<()> {
         let layout = self.layout(id)?;
         let mut copies = CopyBatch::new(SourceOrder::Stream);
@@ -1208,9 +1297,7 @@ impl DenoiserRunner {
             )?;
             memset_d32(self.step.address(), 0, 2, &self.stream)?;
         }
-        self.methods
-            .denoise
-            .call_values(&self.step_arguments(id)?)?;
+        MethodCall::new(&self.methods.denoise, self.step_arguments(id)?).invoke()?;
         self.layout_mut(id)?.phase = Phase::Warmed;
         self.stream.synchronize()?;
         Ok(())
@@ -1230,11 +1317,11 @@ impl DenoiserRunner {
         if self.graphs.contains(&id, None) {
             return Ok(false);
         }
-        let arguments = self.step_arguments(id)?;
+        let step = MethodCall::new(&self.methods.denoise, self.step_arguments(id)?);
         let graph = self
             .capture
             .capture(&pool.value, self.stream.raw(), self.device, || {
-                self.methods.denoise.call_values(&arguments).map(drop)
+                step.invoke().map(drop)
             })?;
         self.graphs.insert(id, None, graph)?;
         self.graphs.record(GraphMode::Capture);
@@ -1243,6 +1330,10 @@ impl DenoiserRunner {
 
     /// Warm the conditioner at every capacity (largest first) on zero
     /// features, then capture each.
+    ///
+    /// FIXME: startup issues this on the runner's stream at once and drains
+    /// it, from the thread that starts the rank; as a job of the lane it
+    /// would be recorded like the serving forward.
     pub(crate) fn warm_conditioner(&mut self, capture: bool) -> Result<()> {
         let Some(conditioner) = &mut self.conditioner else {
             return Ok(());
@@ -1261,20 +1352,18 @@ impl DenoiserRunner {
         for &capacity in &capacities {
             // SAFETY: as above.
             unsafe { memset_d32(conditioner.lengths.address(), capacity, 1, &self.stream)? };
-            conditioner
-                .encode
-                .call_values(&conditioner.arguments(capacity)?)?;
+            MethodCall::new(&conditioner.encode, conditioner.arguments(capacity)?).invoke()?;
         }
         self.stream.synchronize()?;
         let (true, Some(pool)) = (capture, &self.pool_handle) else {
             return Ok(());
         };
         for capacity in capacities {
-            let arguments = conditioner.arguments(capacity)?;
+            let encode = MethodCall::new(&conditioner.encode, conditioner.arguments(capacity)?);
             let graph =
                 self.capture
                     .capture(&pool.value, self.stream.raw(), self.device, || {
-                        conditioner.encode.call_values(&arguments).map(drop)
+                        encode.invoke().map(drop)
                     })?;
             conditioner.graphs.insert(capacity, None, graph)?;
         }
@@ -1290,24 +1379,14 @@ impl DenoiserRunner {
     }
 
     /// The kernels the denoiser's and the conditioner's operators selected.
-    pub(crate) fn kernels(&self, label: &str) -> Result<Vec<Record>> {
-        let mut values: Vec<Any> = Vec::new();
-        let mut collect = |function: &Function, runner: &Handle| -> Result<()> {
-            let records: tvm_ffi::Array<Any> = function.call_as(&[runner.view()])?;
-            values.extend(records.iter());
-            Ok(())
-        };
-        collect(&self.methods.kernels, &self.methods.runner)?;
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
+        let mut calls = vec![kernels_call(&self.methods.kernels, &self.methods.runner)];
         if let Some(conditioner) = &self.conditioner {
             for runner in conditioner.runners.values() {
-                collect(&conditioner.kernels, runner)?;
+                calls.push(kernels_call(&conditioner.kernels, runner));
             }
         }
-        values
-            .into_iter()
-            .enumerate()
-            .map(|(index, record)| Record::new(format!("{label}.kernels[{index}]"), record))
-            .collect()
+        list_kernels(calls)
     }
 
     /// Release graphs and the Python half. An aborted close keeps
@@ -1344,6 +1423,7 @@ pub(crate) fn prepare(
     batch: &mut MediaBatch,
     index: usize,
     slot: usize,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let params = latent_params(plan, call)?;
@@ -1366,27 +1446,25 @@ pub(crate) fn prepare(
     }
     let store = parts.owners().store;
     let stream = stream_of(batch)?;
+    let issue = job.on(Some(&stream));
     let device = batch.device;
-    let features =
-        batch
-            .inputs
-            .read(store, &call.inputs[0], call.call_id, device, Some(&stream))?;
+    let features = batch
+        .inputs
+        .read(store, &call.inputs[0], call.call_id, device, issue)?;
     let conditions: Vec<Arc<crate::ProductRead>> = call.inputs[1..]
         .iter()
-        .map(|input| {
-            batch
-                .inputs
-                .read(store, input, call.call_id, device, Some(&stream))
-        })
+        .map(|input| batch.inputs.read(store, input, call.call_id, device, issue))
         .collect::<Result<_>>()?;
     let denoiser = parts
+        .denoisers
         .video
-        .denoiser
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
     // The request's noise and the host sources its slot is initialized from.
-    denoiser.runner.prepare_latents(id, slot, &size, seed)?;
-    let update = denoiser.runner.initialize(id, slot, call, params)?;
+    denoiser
+        .runner
+        .prepare_latents(id, slot, &size, seed, job)?;
+    let update = denoiser.runner.initialize(id, slot, call, params, job)?;
     let value = features.value();
     let count = u64::from(size.tokens);
     if value.shape().first().copied() != Some(count as i64) {
@@ -1394,18 +1472,19 @@ pub(crate) fn prepare(
             "prompt features disagree with the request's prompt".into(),
         ));
     }
-    denoiser.runner.condition(id, slot, value, count)?;
+    let mode = denoiser.runner.condition(id, slot, value, count, job)?;
+    batch.record(mode);
     if conditioned {
         let request = parts.video.request(slot, call.request_key)?;
         let latents = condition_latents(&request.conditions, &conditions)?;
         let denoiser = parts
+            .denoisers
             .video
-            .denoiser
             .as_ref()
             .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
         denoiser
             .runner
-            .encode_conditions(id, slot, &size, &latents)?;
+            .encode_conditions(id, slot, &size, &latents, job)?;
     }
     batch.calls[index].latent = Some(update);
     Ok(())
@@ -1515,6 +1594,7 @@ pub(crate) fn denoise(
     index: usize,
     slot: usize,
     placement: &Placement<'_>,
+    job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
     let params = latent_params(plan, call)?;
@@ -1527,14 +1607,15 @@ pub(crate) fn denoise(
     let names: Vec<String> = call
         .outputs
         .iter()
-        .map(|output| parts.video.product_name(call, output).map(str::to_owned))
+        .map(|output| product_name(parts.info, call, output).map(str::to_owned))
         .collect::<Result<_>>()?;
     let denoiser = parts
+        .denoisers
         .video
-        .denoiser
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-    let (update, _) = denoiser.runner.denoise(id, slot, call, params)?;
+    let (update, mode) = denoiser.runner.denoise(id, slot, call, params, job)?;
+    batch.record(mode);
     batch.calls[index].latent = Some(update);
     if call.outputs.is_empty() {
         return Ok(());
@@ -1578,10 +1659,9 @@ pub(crate) fn denoise(
             .next()
             .ok_or_else(|| Error::Invariant("a latent product was not bound".into()))?;
         batch.calls[index].writes.push(write.clone());
-        owners.store.write(&write, sample, Some(&stream), None)?;
-        let (exported, locations) =
-            export(owners, call, output, &write, false, None, Some(&stream))?;
-        batch.calls[index].publish(write.id(), locations, exported)?;
+        let issue = job.on(Some(&stream));
+        owners.store.write(&write, sample, issue, None)?;
+        batch.calls[index].export(owners, call, output, &write, false, issue)?;
     }
     Ok(())
 }
@@ -1598,6 +1678,8 @@ impl Trajectories for DenoiserRunner {
 
 const DENOISER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
 const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
+const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
+const OUTPUTS: &str = "uniserve_models.runner.denoiser.Outputs";
 
 /// What the model reports about its video timeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -1673,6 +1755,22 @@ impl LayoutFields {
     }
 }
 
+/// What the model's layout functions answer about one layout, as
+/// [`VideoModel::fields`] reads them.
+struct LayoutAnswers {
+    /// The state fields, in state order, and each one's dtype and elements.
+    names: Vec<String>,
+    dtypes: Vec<String>,
+    elements: Vec<i64>,
+    /// Each modality's `[rows, width, start, stop]` sample rows.
+    rows: Vec<i64>,
+    /// Elements of each modality's native draw.
+    draws: Vec<i64>,
+    condition_noise: i64,
+    text_rows: i64,
+    workspace: i64,
+}
+
 /// The sizing methods, each called with the loaded model first.
 struct SizingMethods {
     legal_frame_count: Function,
@@ -1691,6 +1789,9 @@ struct SizingMethods {
     workspace_elements: Function,
     products: Function,
     reader_products: Function,
+    /// The column methods of the `Outputs` the two product methods return:
+    /// owners, names, dtypes, ranks, extents, variable and raster axes.
+    output_columns: [Function; 7],
     unit_frames: Function,
     segment: Function,
     window_rows: Function,
@@ -1702,6 +1803,10 @@ struct SizingMethods {
 }
 
 /// A video model's facts and sizing rules.
+///
+/// FIXME: admission and planning size a request before any runner of its
+/// layout exists, so the facts record and the sizing functions are held
+/// here apart from `DenoiserRunner`; they go with the fact records.
 pub(crate) struct VideoModel {
     /// The component of the deployment's video denoiser.
     pub(crate) denoiser: String,
@@ -1788,6 +1893,20 @@ impl VideoModel {
             workspace_elements: of_denoiser("workspace_elements")?,
             products: of_denoiser("products")?,
             reader_products: of_denoiser("reader_products")?,
+            output_columns: [
+                "owners",
+                "names",
+                "dtypes",
+                "ranks",
+                "extents",
+                "variable_axes",
+                "raster_axes",
+            ]
+            .map(|column| interface.import(&format!("{OUTPUTS}.{column}")))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| Error::Invariant("the outputs have seven columns".into()))?,
             unit_frames: of_decoder("unit_frames")?,
             segment: of_decoder("segment")?,
             window_rows: of_decoder("window_rows")?,
@@ -1960,16 +2079,6 @@ impl VideoModel {
         narrow(self.integer(method, value)?, "frame count")
     }
 
-    /// A request's condition rows; a size the model rejects is an invalid
-    /// descriptor.
-    pub(crate) fn request_size(&self, size: &VideoSize) -> Result<u32> {
-        let method = &self.methods.condition_rows;
-        let value = self
-            .denoiser(method, size_arguments(size))
-            .map_err(invalid_size)?;
-        narrow(self.integer(method, value)?, "condition row count")
-    }
-
     /// The smallest layout holding `size`.
     pub(crate) fn layout_size(&self, size: &VideoSize) -> Result<VideoLayout> {
         let value = self
@@ -1978,13 +2087,39 @@ impl VideoModel {
         layout_of(value)
     }
 
-    pub(crate) fn holds(&self, layout: &VideoLayout, size: &VideoSize) -> Result<bool> {
-        let mut arguments = vec![layout_arguments(layout)];
-        arguments.extend(size_arguments(size));
-        let value = self
-            .denoiser(&self.methods.holds, arguments)
-            .map_err(invalid_size)?;
-        bool::try_from(value).map_err(|error| Error::numerical(self.methods.holds.name(), &error))
+    /// A sizing method of the denoiser component as a call for a job to
+    /// make.
+    fn asked(&self, method: &Function, arguments: Vec<Argument>) -> MethodCall {
+        let mut all = vec![
+            Argument::Handle(self.loaded.clone()),
+            Argument::Text(self.denoiser.clone()),
+        ];
+        all.extend(arguments);
+        MethodCall::new(method, all)
+    }
+
+    /// Record the call asking a request's condition rows: the job's
+    /// completion carries the count. A size the model rejects fails the
+    /// job with the model's error ([`invalid_size`]).
+    pub(crate) fn ask_request_size(&self, size: &VideoSize, job: &Job) {
+        let arguments = size_values(size).into();
+        job.call_returning(self.asked(&self.methods.condition_rows, arguments));
+    }
+
+    /// Record the call asking the smallest layout holding `size`
+    /// ([`Self::layout_size`] as a call of `job`): its completion carries
+    /// the layout's extents.
+    pub(crate) fn ask_layout_size(&self, size: &VideoSize, job: &Job) {
+        let arguments = size_values(size).into();
+        job.call_returning(self.asked(&self.methods.layout_size, arguments));
+    }
+
+    /// Record the call asking whether `layout` holds `size`: the job's
+    /// completion carries one for a layout that does, zero otherwise.
+    pub(crate) fn ask_holds(&self, layout: &VideoLayout, size: &VideoSize, job: &Job) {
+        let mut arguments = vec![Argument::Integers(layout.values().to_vec())];
+        arguments.extend(size_values(size));
+        job.call_returning(self.asked(&self.methods.holds, arguments));
     }
 
     /// `layout` widened so its condition region holds `rows`.
@@ -2011,24 +2146,82 @@ impl VideoModel {
         Ok(self.latent_shape(modality, layout)?.iter().product())
     }
 
-    /// The request state of `layout` on this rank.
+    /// The request state of `layout` on this rank, asked on the calling
+    /// thread (startup).
     pub(crate) fn layout_fields(&self, layout: &VideoLayout) -> Result<LayoutFields> {
         let methods = &self.methods;
         let of_layout = |method: &Function| self.denoiser(method, vec![layout_arguments(layout)]);
-        let counts = |method: &Function| -> Result<Vec<u64>> {
-            Ok(self
-                .integers(method, of_layout(method)?)?
-                .into_iter()
-                .map(|value| value.max(0) as u64)
-                .collect())
-        };
-        let count = |method: &Function| -> Result<u64> {
-            Ok(self.integer(method, of_layout(method)?)?.max(0) as u64)
-        };
+        let counts =
+            |method: &Function| -> Result<Vec<i64>> { self.integers(method, of_layout(method)?) };
+        let count = |method: &Function| -> Result<i64> { self.integer(method, of_layout(method)?) };
 
-        let names = strings(&methods.state_names, of_layout(&methods.state_names)?)?;
-        let dtypes = strings(&methods.state_dtypes, of_layout(&methods.state_dtypes)?)?;
-        let elements = counts(&methods.state_elements)?;
+        self.fields(LayoutAnswers {
+            names: strings(&methods.state_names, of_layout(&methods.state_names)?)?,
+            dtypes: strings(&methods.state_dtypes, of_layout(&methods.state_dtypes)?)?,
+            elements: counts(&methods.state_elements)?,
+            rows: counts(&methods.sample_rows)?,
+            draws: counts(&methods.noise_elements)?,
+            condition_noise: count(&methods.condition_noise_elements)?,
+            text_rows: count(&methods.text_condition_rows)?,
+            workspace: count(&methods.workspace_elements)?,
+        })
+    }
+
+    /// Record into `job` the calls that ask the request state of `layout`
+    /// on this rank; [`Self::read_layout_fields`] reads the job's
+    /// completion.
+    pub(crate) fn ask_layout_fields(&self, layout: &VideoLayout, job: &Job) {
+        let methods = &self.methods;
+        let of_layout = |method: &Function| {
+            self.asked(method, vec![Argument::Integers(layout.values().to_vec())])
+        };
+        job.call_texts(of_layout(&methods.state_names));
+        job.call_texts(of_layout(&methods.state_dtypes));
+        for method in [
+            &methods.state_elements,
+            &methods.sample_rows,
+            &methods.noise_elements,
+            &methods.condition_noise_elements,
+            &methods.text_condition_rows,
+            &methods.workspace_elements,
+        ] {
+            job.call_returning(of_layout(method));
+        }
+    }
+
+    /// The request state of a layout from the completion of the job that
+    /// asked it ([`Self::ask_layout_fields`]).
+    pub(crate) fn read_layout_fields(&self, completion: &mut Completion) -> Result<LayoutFields> {
+        let count = |values: Vec<i64>| {
+            values.first().copied().ok_or_else(|| {
+                Error::Interface("a layout sizing function returned no value".into())
+            })
+        };
+        self.fields(LayoutAnswers {
+            names: completion.texts()?,
+            dtypes: completion.texts()?,
+            elements: completion.returned()?,
+            rows: completion.returned()?,
+            draws: completion.returned()?,
+            condition_noise: count(completion.returned()?)?,
+            text_rows: count(completion.returned()?)?,
+            workspace: count(completion.returned()?)?,
+        })
+    }
+
+    /// A layout's request state from the model's answers.
+    fn fields(&self, answers: LayoutAnswers) -> Result<LayoutFields> {
+        let extent = |value: i64| value.max(0) as u64;
+        let LayoutAnswers {
+            names,
+            dtypes,
+            elements,
+            rows,
+            draws,
+            condition_noise,
+            text_rows,
+            workspace,
+        } = answers;
         let state = names
             .into_iter()
             .zip(dtypes)
@@ -2038,13 +2231,12 @@ impl VideoModel {
                     sample: self.facts.modalities.contains(&name),
                     name,
                     dtype: parse_dtype(&dtype)?,
-                    elements,
+                    elements: extent(elements),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let rows = counts(&methods.sample_rows)?;
-        let draws = counts(&methods.noise_elements)?;
+        let rows: Vec<u64> = rows.into_iter().map(extent).collect();
         let samples = self
             .facts
             .modalities
@@ -2061,17 +2253,23 @@ impl VideoModel {
                 )
             })
             .collect();
-        let noise = self.facts.modalities.iter().cloned().zip(draws).collect();
+        let noise = self
+            .facts
+            .modalities
+            .iter()
+            .cloned()
+            .zip(draws.into_iter().map(extent))
+            .collect();
         Ok(LayoutFields {
             state,
             samples,
             noise,
-            condition_noise: count(&methods.condition_noise_elements)?,
+            condition_noise: extent(condition_noise),
             text_condition: (
-                count(&methods.text_condition_rows)?,
+                extent(text_rows),
                 u64::from(self.facts.text_condition_width),
             ),
-            workspace: count(&methods.workspace_elements)?,
+            workspace: extent(workspace),
         })
     }
 
@@ -2186,29 +2384,21 @@ impl VideoModel {
         canvases: &[Canvas],
     ) -> Result<BTreeMap<String, Vec<OutputInfo>>> {
         let method = &self.methods.products;
-        let record = Record::new(
-            method.name(),
-            self.denoiser(
-                method,
-                vec![
-                    Any::from(i64::from(frames)),
-                    Any::from(i64::from(tokens)),
-                    Any::from(i64::from(rows)),
-                    text(dtype),
-                    Any::from(integer_list(canvases.iter().flat_map(|canvas| {
-                        [i64::from(canvas.width), i64::from(canvas.height)]
-                    }))),
-                ],
-            )?,
+        let outputs = self.denoiser(
+            method,
+            vec![
+                Any::from(i64::from(frames)),
+                Any::from(i64::from(tokens)),
+                Any::from(i64::from(rows)),
+                text(dtype),
+                Any::from(integer_list(canvases.iter().flat_map(|canvas| {
+                    [i64::from(canvas.width), i64::from(canvas.height)]
+                }))),
+            ],
         )?;
-        let mut result = BTreeMap::new();
-        for component in record.keys() {
-            let outputs = record
-                .records(&component)?
-                .iter()
-                .map(|output| crate::model::output_info(&component, output))
-                .collect::<Result<Vec<_>>>()?;
-            result.insert(component, outputs);
+        let mut result: BTreeMap<String, Vec<OutputInfo>> = BTreeMap::new();
+        for (component, output) in self.output_infos(outputs)? {
+            result.entry(component).or_default().push(output);
         }
         Ok(result)
     }
@@ -2229,15 +2419,86 @@ impl VideoModel {
                 Any::from(i64::from(rows)),
             ],
         )?;
-        let records: tvm_ffi::Array<Any> = value
-            .try_into()
-            .map_err(|error| Error::numerical(method.name(), &error))?;
-        records
-            .iter()
-            .map(|record| {
-                crate::model::output_info("media_reader", &Record::new(method.name(), record)?)
-            })
-            .collect()
+        Ok(self
+            .output_infos(value)?
+            .into_iter()
+            .map(|(_, output)| output)
+            .collect())
+    }
+
+    /// Read the outputs a product method returned (`Outputs`), column by
+    /// column, as each output's component and bound.
+    fn output_infos(&self, outputs: Any) -> Result<Vec<(String, OutputInfo)>> {
+        let [owners, names, dtypes, ranks, extents, variable, raster] =
+            &self.methods.output_columns;
+        let strings = |column: &Function| -> Result<Vec<String>> {
+            let values: tvm_ffi::Array<tvm_ffi::String> = column.call_as(&[(&outputs).into()])?;
+            Ok(values
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect())
+        };
+        let numbers = |column: &Function| -> Result<Vec<i64>> {
+            self.integers(column, column.call_values(std::slice::from_ref(&outputs))?)
+        };
+        let (owners, names, dtypes) = (strings(owners)?, strings(names)?, strings(dtypes)?);
+        let (ranks, extents) = (numbers(ranks)?, numbers(extents)?);
+        let (variable, raster) = (numbers(variable)?, numbers(raster)?);
+        let mut extents = extents.into_iter();
+        let mut result = Vec::with_capacity(names.len());
+        for (index, name) in names.into_iter().enumerate() {
+            let component = &owners[index];
+            let extent = |value: i64| {
+                u32::try_from(value).map_err(|_| {
+                    Error::Unsupported(format!("result {component}.{name} has an invalid extent"))
+                })
+            };
+            let dtype = [
+                uniserve_ipc::DType::U8,
+                uniserve_ipc::DType::I16,
+                uniserve_ipc::DType::I32,
+                uniserve_ipc::DType::I64,
+                uniserve_ipc::DType::F16,
+                uniserve_ipc::DType::BF16,
+                uniserve_ipc::DType::F32,
+            ]
+            .into_iter()
+            .find(|dtype| dtype.storage_name() == dtypes[index])
+            .ok_or_else(|| {
+                Error::Unsupported(format!("result {component}.{name} has no protocol dtype"))
+            })?;
+            let dims = extents
+                .by_ref()
+                .take(ranks[index] as usize)
+                .enumerate()
+                .map(|(axis, size)| {
+                    Ok(if variable[index] == axis as i64 {
+                        DimBound::Device { max: extent(size)? }
+                    } else {
+                        DimBound::Static(extent(size)?)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // A negative axis stands for an output that is not laid out at
+            // the canvas.
+            let raster_axes = match (raster[2 * index], raster[2 * index + 1]) {
+                (height, width) if height >= 0 && width >= 0 => Some(RasterAxes {
+                    height: extent(height)?,
+                    width: extent(width)?,
+                }),
+                _ => None,
+            };
+            result.push((
+                component.clone(),
+                OutputInfo {
+                    name,
+                    dtype,
+                    shape_bound: ShapeBound { dims },
+                    raster_axes,
+                },
+            ));
+        }
+        Ok(result)
     }
 }
 
@@ -2249,13 +2510,23 @@ pub(crate) fn size_arguments(size: &VideoSize) -> Vec<Any> {
     ]
 }
 
+/// A size as the arguments of a recorded call: what [`size_arguments`]
+/// passes, each list as its integers.
+fn size_values(size: &VideoSize) -> [Argument; 3] {
+    [
+        Argument::Integers(size.values()),
+        Argument::Integers(size.condition_values()),
+        Argument::Integers(size.span_values()),
+    ]
+}
+
 fn layout_of(value: Any) -> Result<VideoLayout> {
     let values = integers(value).map_err(|error| Error::numerical(DENOISER, &error))?;
     VideoLayout::from_values(&values)
 }
 
 /// A size the model rejects is the request's error, not the worker's.
-fn invalid_size(error: Error) -> Error {
+pub(crate) fn invalid_size(error: Error) -> Error {
     match error {
         Error::Numerical { kind, message, .. } if kind == "InputError" || kind == "ValueError" => {
             Error::Invalid(message)

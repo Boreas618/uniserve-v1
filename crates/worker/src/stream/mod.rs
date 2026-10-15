@@ -1,8 +1,12 @@
 //! Execution streams and the events that order work across them.
 
 mod events;
+mod issue;
 
-pub use events::{Deferred, EventPool};
+pub(crate) use events::Deferral;
+pub use events::{Deferred, EventPool, Submitter};
+pub(crate) use issue::HostFunction;
+pub use issue::{Fill, Issue, RowFill};
 
 use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
 
