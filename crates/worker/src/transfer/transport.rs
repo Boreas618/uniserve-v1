@@ -349,11 +349,9 @@ impl Transport {
             Backend::Cuda(cuda) => {
                 cuda.check()?;
                 CudaExports::validate(source)?;
-                self.events.reap()?;
             }
-            Backend::Local { .. } => self.events.reap()?,
             Backend::Shared { endpoint, .. } => endpoint.reap()?,
-            Backend::Channel { .. } => {}
+            Backend::Local { .. } | Backend::Channel { .. } => {}
         }
         self.capacity.acquire(view.nbytes)?;
 
