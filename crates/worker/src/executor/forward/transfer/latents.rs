@@ -533,13 +533,15 @@ mod tests {
             (0..9).map(|value| value as f32).collect::<Vec<_>>()
         );
 
-        // Revoked and released, the version retires and frees its bank.
+        // Revoked and released, the version retires and frees its bank: as
+        // soon as its readers completed, before the pool reaps it.
         for read in input.reads() {
             read.close()?;
         }
         publications.revoke()?;
         source.release_exports(&[latent(2).buffer_id()]);
         transports.reap()?;
+        source.require_writable(bank, &[2, 3])?;
         source.reap();
         source.require_writable(bank, &[2, 3])?;
         transports.close()
