@@ -17,8 +17,10 @@ use std::sync::Arc;
 use tvm_ffi::Any;
 
 use crate::ffi::{DType, Function, Handle, integers};
+use crate::lane::Job;
 use crate::model::interface::Interface;
 use crate::request::diffusion::{BranchSource, Prefix};
+use crate::runner::methods::{Argument, MethodCall};
 use crate::runner::vision::{FeatureInjection, FeatureLayout, PositionLayout};
 use crate::{Error, Result};
 
@@ -342,30 +344,29 @@ impl ImagePolicy {
         }
     }
 
-    /// The prefix a guidance branch of `source` conditions on. Admitted
-    /// negative tokens take precedence over the negative prompt.
-    pub(crate) fn guidance_prefix(
+    /// Record the call asking the prefix a guidance branch of `source`
+    /// conditions on: the job's completion carries `[reuses, *tokens]`,
+    /// which [`Self::prefix`] reads.
+    pub(crate) fn ask_prefix(
         &self,
         source: BranchSource,
         image_prompt: &str,
         negative_prompt: &str,
-        negative_tokens: &[u32],
-    ) -> Result<Prefix> {
-        if source == BranchSource::NegativeOrStart && !negative_tokens.is_empty() {
-            return Ok(Prefix {
-                tokens: Arc::from(negative_tokens),
-                reuses_conditioning: false,
-            });
-        }
-        // `[reuses, *tokens]`.
-        let value = self.guidance_prefix.call_values(&[
-            self.loaded.to_any(),
-            Any::from(tvm_ffi::String::from(source.name())),
-            Any::from(tvm_ffi::String::from(image_prompt)),
-            Any::from(tvm_ffi::String::from(negative_prompt)),
-        ])?;
-        let values = integers(value)
-            .map_err(|error| Error::numerical(self.guidance_prefix.name(), &error))?;
+        job: &Job,
+    ) {
+        job.call_returning(MethodCall::new(
+            &self.guidance_prefix,
+            vec![
+                Argument::Handle(self.loaded.clone()),
+                Argument::Text(source.name().to_owned()),
+                Argument::Text(image_prompt.to_owned()),
+                Argument::Text(negative_prompt.to_owned()),
+            ],
+        ));
+    }
+
+    /// The prefix a prefix call returned as `[reuses, *tokens]`.
+    pub(crate) fn prefix(&self, values: &[i64]) -> Result<Prefix> {
         let (reuses, tokens) = values.split_first().ok_or_else(|| {
             Error::Interface(format!(
                 "{} returns [reuses, *tokens]",

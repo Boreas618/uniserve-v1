@@ -208,6 +208,8 @@ pub struct WorkerBatch {
     image_inputs: Option<Inputs>,
     /// An image batch between two of its jobs.
     image: Option<forward::batch::image::Pending>,
+    /// The video requests the batch started, while the library sizes them.
+    sizing: Option<crate::request::video::Sizing>,
     /// Products and KV transfers imported from other calls.
     inputs: forward::inputs::Inputs,
     /// A media batch's calls and completion.
@@ -232,6 +234,7 @@ impl WorkerBatch {
             running: None,
             image_inputs: None,
             image: None,
+            sizing: None,
             inputs: forward::inputs::Inputs::default(),
             media: None,
             output: None,
@@ -797,7 +800,7 @@ impl WorkerBackend {
         started?;
         if let Some(video) = &mut self.video {
             for request in installed {
-                video.admit(request, &mut self.denoisers)?;
+                video.admit(request, self.denoisers.video.is_some())?;
             }
         }
 
@@ -1117,6 +1120,39 @@ impl Backend for WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
+        // A video request this batch started evaluates in a layout the
+        // library selects for its size. Asking is a job of the Python
+        // thread (it issues nothing on a stream); the batch goes on from
+        // its completion, and so do the request's later calls, which start
+        // behind this batch.
+        if let Some(video) = &mut self.video {
+            if batch.sizing.is_none() {
+                batch.sizing = video.begin_sizing();
+            }
+            if let Some(sizing) = &mut batch.sizing {
+                let job = Job::new();
+                let on_lane = match video.ask(sizing, &mut self.denoisers, &job) {
+                    Ok(on_lane) => on_lane,
+                    Err(error) => {
+                        if let Some(sizing) = batch.sizing.take() {
+                            video.abandon(sizing);
+                        }
+                        return Err(error.into());
+                    }
+                };
+                // A layout's preparation works on the denoiser's stream,
+                // so it is a job of that lane; the model's arithmetic is a
+                // job of the Python thread alone.
+                let submitted = if on_lane {
+                    let kind = CallKind::Media(uniserve_ipc::MediaCall::LatentPreparation);
+                    self.jobs.start(kind, job, true).map_err(lane_lost)?
+                } else {
+                    self.jobs.call(job, true)
+                };
+                return Ok(Some(submitted));
+            }
+        }
+
         // Products other calls published are imported for every runtime
         // alike. What the imports recorded for the lane is performed even
         // when an import failed after it: the fences are due either way.
@@ -1135,7 +1171,31 @@ impl Backend for WorkerBackend {
         batch: &mut WorkerBatch,
         completion: Completion,
     ) -> std::result::Result<(), WorkerError> {
-        forward::inputs::admitted(self, batch, completion)
+        let Some(mut sizing) = batch.sizing.take() else {
+            return forward::inputs::admitted(self, batch, completion);
+        };
+
+        // The job asked the library to size the requests the batch started.
+        let Some(video) = &mut self.video else {
+            return Err(Error::State("a batch sized requests on a rank without video").into());
+        };
+        let answered = completion
+            .check()
+            .map_err(|failure| crate::runner::denoiser::invalid_size(failure.error))
+            .and_then(|mut completion| {
+                video.answer(&mut sizing, &mut completion, &mut self.denoisers)
+            });
+        match answered {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                batch.sizing = Some(sizing);
+                Ok(())
+            }
+            Err(error) => {
+                video.abandon(sizing);
+                Err(error.into())
+            }
+        }
     }
 
     fn prepare_inputs(
