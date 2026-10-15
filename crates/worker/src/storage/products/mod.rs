@@ -588,6 +588,12 @@ impl ProductStore {
         Ok(())
     }
 
+    /// The metadata of the committed product `reference` names.
+    pub fn metadata(&self, reference: &TensorRef) -> Result<Option<Metadata>> {
+        let state = lock(&self.state);
+        Ok(Self::require_reference(&state, reference)?.metadata())
+    }
+
     fn require_reference(state: &State, reference: &TensorRef) -> Result<ProductBuffer> {
         let buffer = state.require_reference(reference.buffer_id())?.clone();
         if buffer.views().reference != *reference {
