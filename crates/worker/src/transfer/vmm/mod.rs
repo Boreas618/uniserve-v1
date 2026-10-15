@@ -1,4 +1,5 @@
-//! CUDA VMM exports (in place or pooled) and mapped-allocation reads.
+//! The CUDA VMM mechanism: exports in place or pooled, and mapped-allocation
+//! reads.
 //!
 //! A device product is exported where it lies when its storage is an
 //! exportable allocation, and otherwise copied into a chunk of the device's
@@ -7,27 +8,36 @@
 //! or a descriptor fetched from the producer's grant socket), map it on a
 //! device that can read it, and copy the exported spans.
 
+mod grants;
+mod handle;
+mod peer;
+pub(crate) mod pool;
+
+pub use grants::{DescriptorGrants, fetch_descriptor};
+pub use peer::{PeerExchange, PeerStorage};
+
 use std::collections::HashMap;
 use std::ops::Range;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use uniserve_cuda::{
     DeviceGuard, DeviceId, Event, IpcEventHandle, PeerMapping, ShareableHandle, SourceOrder,
     Stream, memset_d32,
 };
-use uniserve_ipc::{Locator, TransferTransport};
+use uniserve_ipc::{Locator, TransferTransport, WorkerEndpoint};
 
-use super::endpoint::Endpoint;
-use super::read::{ACKNOWLEDGED, CLAIMED, NativeRead};
-use super::source::{CudaSource, SharedPool, TransportBuffer};
-use super::transport::Staged;
-use super::vmm_pool::{ACK_SLOTS, VmmPool};
-use super::{Capacity, DescriptorGrants, Spans, copy_planner, fetch_descriptor};
+use super::backing::{CudaSource, SharedPool, TransportBuffer};
+use super::export_table::ExportTable;
+use super::read::{NativeRead, ReadCall};
+use super::transport::{Staged, read_destination};
+use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Notify, Spans, copy_planner};
 use crate::ffi::{Backing, Device};
 use crate::storage::memory::{Memory, StorageView, parse_dtype};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result};
+use handle::AllocationHandle;
+use pool::VmmPool;
 
 /// Bytes of one reader acknowledgment word in a pooled chunk's header.
 const ACK_WORD_BYTES: u64 = 4;
@@ -35,7 +45,7 @@ const ACK_WORD_BYTES: u64 = 4;
 /// A device's export pool and the shareable handle readers import.
 struct DevicePool {
     pool: SharedPool,
-    handle: Vec<u8>,
+    handle: AllocationHandle,
     /// The pool allocation's process descriptor, open for the pool's
     /// lifetime; grants duplicate it per export.
     _descriptor: Option<OwnedFd>,
@@ -60,7 +70,7 @@ pub(crate) enum Exported {
 }
 
 pub(crate) struct CudaExports {
-    pub(crate) endpoint: Arc<Endpoint>,
+    pub(crate) endpoint: Arc<ExportTable>,
     pub(crate) slot: usize,
     cross_host: bool,
     pool_bytes: usize,
@@ -75,7 +85,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl CudaExports {
     pub(crate) fn new(
-        endpoint: Arc<Endpoint>,
+        endpoint: Arc<ExportTable>,
         slot: usize,
         cross_host: bool,
         pool_bytes: u64,
@@ -123,7 +133,7 @@ impl CudaExports {
         source: &Spans,
         issue: impl Issue,
         consumers: &[usize],
-        capacity: &Arc<Capacity>,
+        bytes: ByteReservation<Notify>,
         events: &EventPool,
         locate: impl FnOnce(TransferTransport) -> Result<Locator>,
     ) -> Result<Exported> {
@@ -139,7 +149,10 @@ impl CudaExports {
         };
         let nbytes = source.nbytes();
         let export_id = uuid::Uuid::new_v4().simple().to_string();
-        let mut state = ExportState::default();
+        let mut state = ExportState {
+            bytes: Some(bytes),
+            ..ExportState::default()
+        };
 
         let result = (|| -> Result<Option<Staged>> {
             let first = source.first().address();
@@ -148,19 +161,13 @@ impl CudaExports {
                     let allocation = memory.allocation().ok_or_else(|| {
                         Error::Invariant("an exportable allocation is device memory".into())
                     })?;
-                    let handle = match allocation.export()? {
-                        Some(ShareableHandle::Fabric(bytes)) => bytes.to_vec(),
-                        Some(ShareableHandle::Descriptor(fd)) => {
-                            let bytes = fd.as_raw_fd().to_ne_bytes().to_vec();
-                            state.descriptor = Some(fd);
-                            bytes
-                        }
-                        None => {
-                            return Err(Error::Invariant(
-                                "a registered exportable allocation has no handle".into(),
-                            ));
-                        }
-                    };
+                    let shareable = allocation.export()?.ok_or_else(|| {
+                        Error::Invariant("a registered exportable allocation has a handle".into())
+                    })?;
+                    let handle = AllocationHandle::of(&shareable);
+                    if let ShareableHandle::Descriptor(fd) = shareable {
+                        state.descriptor = Some(fd);
+                    }
                     (source.clone(), handle, memory.len() as u64, offset)
                 }
                 None => {
@@ -193,7 +200,7 @@ impl CudaExports {
                     state.copied = Some(source.clone());
                     (
                         payload,
-                        pool.handle.clone(),
+                        pool.handle,
                         storage_bytes,
                         chunk.payload_offset() as u64,
                     )
@@ -208,10 +215,10 @@ impl CudaExports {
             }
             let ready = events.fence(issue, !self.cross_host)?;
             state.event = Some(Arc::clone(&ready));
-            if let Ok(bytes) = <[u8; 4]>::try_from(handle.as_slice()) {
+            if let AllocationHandle::Descriptor(fd) = handle {
                 let grants = self.grants()?;
                 grants
-                    .register(&export_id, i32::from_ne_bytes(bytes))
+                    .register(&export_id, fd)
                     .map_err(|error| Error::Transport(error.to_string()))?;
                 state.grants = Some(grants);
             }
@@ -229,7 +236,7 @@ impl CudaExports {
                 span_counts: layout.counts,
                 tensor_stride: spans.first().strides().to_vec(),
                 ready_event_handle: Vec::new(),
-                allocation_handle: handle,
+                allocation_handle: handle.encode(),
                 acknowledgment_offset: state
                     .allocation
                     .as_ref()
@@ -252,8 +259,9 @@ impl CudaExports {
                     export: export_id.clone(),
                     descriptor: state.descriptor.take(),
                 },
-                nbytes,
-                Arc::clone(capacity),
+                state.bytes.take().ok_or_else(|| {
+                    Error::Invariant("an export's bytes are held until its backing".into())
+                })?,
             ));
             Ok(Some(Staged::Fenced {
                 locator,
@@ -268,7 +276,7 @@ impl CudaExports {
             Ok(Some(staged)) => Ok(Exported::Staged(Box::new(staged))),
             Ok(None) => Ok(Exported::PoolExhausted),
             Err(error) => {
-                self.abandon(state, issue, events, &export_id, capacity, nbytes)?;
+                self.abandon(state, issue, events, &export_id)?;
                 Err(error)
             }
         }
@@ -285,8 +293,6 @@ impl CudaExports {
         issue: impl Issue,
         events: &EventPool,
         export_id: &str,
-        capacity: &Capacity,
-        nbytes: u64,
     ) -> Result<()> {
         let cleanup = (|| -> Result<()> {
             // A stream issued the failed attempt's copies at once and
@@ -322,7 +328,7 @@ impl CudaExports {
         if let Some((pool, chunk)) = &state.allocation {
             lock(pool).release(chunk)?;
         }
-        capacity.release(nbytes)
+        state.bytes.take().map_or(Ok(()), ByteReservation::release)
     }
 
     fn pool(&self, device: i32) -> Result<Arc<DevicePool>> {
@@ -334,16 +340,13 @@ impl CudaExports {
         let allocation = memory
             .allocation()
             .ok_or_else(|| Error::Invariant("an export pool is device memory".into()))?;
-        let (handle, descriptor) = match allocation.export()? {
-            Some(ShareableHandle::Fabric(bytes)) => (bytes.to_vec(), None),
-            Some(ShareableHandle::Descriptor(fd)) => {
-                (fd.as_raw_fd().to_ne_bytes().to_vec(), Some(fd))
-            }
-            None => {
-                return Err(Error::Invariant(
-                    "an export pool allocation has no shareable handle".into(),
-                ));
-            }
+        let shareable = allocation.export()?.ok_or_else(|| {
+            Error::Invariant("an export pool allocation has a shareable handle".into())
+        })?;
+        let handle = AllocationHandle::of(&shareable);
+        let descriptor = match shareable {
+            ShareableHandle::Descriptor(fd) => Some(fd),
+            ShareableHandle::Fabric(_) => None,
         };
         let address = memory.address() as usize;
         let capacity = memory.len();
@@ -412,6 +415,79 @@ impl CudaExports {
     }
 }
 
+impl CudaExports {
+    /// Complete a fenced export: its location with the interprocess handle
+    /// of its readiness event, once that event was recorded, registered in
+    /// the export table. A failure retires the export's backing.
+    pub(crate) fn locate(
+        &self,
+        events: &Arc<EventPool>,
+        mut locator: Locator,
+        ready: Option<Arc<Event>>,
+        buffer: Arc<TransportBuffer>,
+    ) -> Result<Locator> {
+        let registered = (|| -> Result<()> {
+            if let Some(ready) = &ready {
+                match &mut locator.transport {
+                    TransferTransport::CudaVmm {
+                        ready_event_handle, ..
+                    } => *ready_event_handle = ready.ipc_handle()?.0.to_vec(),
+                    _ => {
+                        return Err(Error::Invariant(
+                            "a fenced export has a CUDA VMM location".into(),
+                        ));
+                    }
+                }
+            }
+            self.endpoint.register(locator.clone(), Arc::clone(&buffer))
+        })();
+        if let Err(error) = registered {
+            TransportBuffer::reclaim(buffer, events, None)?;
+            return Err(error);
+        }
+        Ok(locator)
+    }
+
+    /// The read of a CUDA VMM export into `destination` on `device`, for
+    /// the transport of `source` (see [`Transport::issue_fetch`]).
+    pub(crate) fn read(
+        &self,
+        source: &WorkerEndpoint,
+        locator: &Locator,
+        device: Device,
+        destination: Option<&Spans>,
+        region: Option<&[Range<u64>]>,
+    ) -> Result<ReadCall> {
+        let TransferTransport::CudaVmm {
+            allocation_handle, ..
+        } = &locator.transport
+        else {
+            return Err(Error::Invalid(
+                "CUDA VMM read requires a CUDA VMM locator".into(),
+            ));
+        };
+        let same_node = locator.source.node == source.node;
+        if !same_node && !AllocationHandle::decode(allocation_handle)?.crosses_hosts() {
+            return Err(Error::Invalid(
+                "a device product crosses hosts only as a fabric handle".into(),
+            ));
+        }
+        if !matches!(device, Device::Cuda(_)) {
+            return Err(Error::Invalid(
+                "CUDA VMM destination must be a CUDA device".into(),
+            ));
+        }
+        Ok(ReadCall::Cuda(CudaRead {
+            locator: Arc::new(locator.clone()),
+            destination: read_destination(locator, device, destination, region)?,
+            region: region.map(<[_]>::to_vec),
+            slot: self.slot,
+            local: locator.source.address_space == source.address_space,
+            same_node,
+        }))
+    }
+}
+
 impl Drop for CudaExports {
     #[expect(
         clippy::mem_forget,
@@ -432,9 +508,11 @@ impl Drop for CudaExports {
 /// Resources one export attempt acquired, for failure cleanup.
 #[derive(Default)]
 struct ExportState {
+    /// The export's bytes, which its backing takes once constructed.
+    bytes: Option<ByteReservation<Notify>>,
     event: Option<Arc<Event>>,
     copied: Option<Spans>,
-    allocation: Option<(SharedPool, Arc<super::vmm_pool::PoolChunk>)>,
+    allocation: Option<(SharedPool, Arc<super::vmm::pool::PoolChunk>)>,
     descriptor: Option<OwnedFd>,
     grants: Option<Arc<DescriptorGrants>>,
     submitted: bool,
@@ -521,7 +599,7 @@ impl CudaRead {
         let _guard = DeviceGuard::new(DeviceId(device))?;
 
         let (mut mapped, mut event, acknowledgment, import_device) = if self.local {
-            let (buffer, grant) = Endpoint::acquire_read(&self.locator)?;
+            let (buffer, grant) = ExportTable::acquire_read(&self.locator)?;
             read.read.bind_source(grant)?;
             let spans = buffer.spans()?;
             // The export's spans live on the producer's device; its ready
@@ -598,17 +676,7 @@ impl CudaRead {
             import_device = source;
         }
 
-        let handle = match <[u8; 4]>::try_from(allocation_handle.as_slice()) {
-            Ok(_) => ShareableHandle::Descriptor(
-                fetch_descriptor(endpoint, export_id)
-                    .map_err(|error| Error::Transport(error.to_string()))?,
-            ),
-            Err(_) => ShareableHandle::Fabric(
-                <[u8; 64]>::try_from(allocation_handle.as_slice()).map_err(|_| {
-                    Error::Invalid("a CUDA VMM handle is a descriptor or a fabric handle".into())
-                })?,
-            ),
-        };
+        let handle = AllocationHandle::decode(allocation_handle)?.import(endpoint, export_id)?;
         let mapping = Memory::mapped(PeerMapping::import(
             DeviceId(import_device),
             &handle,

@@ -1,13 +1,14 @@
-//! Backing storage and retirement of registered transport exports.
+//! ExportBacking storage and retirement of registered transport exports.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use uniserve_cuda::Event;
 
-use super::vmm_pool::{PoolChunk, VmmPool};
+use super::vmm::pool::{PoolChunk, VmmPool};
 use super::{
-    Capacity, DRAIN_LIMIT, DescriptorGrants, Retirement, SharedBuffer, Spans, drain_event, notify,
+    ByteReservation, DRAIN_LIMIT, DescriptorGrants, Notify, Retirement, SharedBuffer, Spans,
+    drain_event, notify,
 };
 use crate::host::{HostAction, HostTask};
 use crate::storage::memory::Memory;
@@ -34,7 +35,7 @@ pub(crate) struct CudaSource {
     pub(crate) descriptor: Option<OwnedFd>,
 }
 
-enum Backing {
+enum ExportBacking {
     /// Spans read in place by readers in this process, fenced by the
     /// producer's event when they are device memory.
     Local {
@@ -49,51 +50,46 @@ enum Backing {
 /// belongs to its registry; the backing returns its bytes to the transfer
 /// capacity only after physical retirement.
 pub(crate) struct TransportBuffer {
-    capacity: Arc<Capacity>,
-    nbytes: u64,
-    backing: Mutex<Backing>,
+    /// Taken and returned by [`TransportBuffer::finish`], once the backing
+    /// was released.
+    bytes: Mutex<Option<ByteReservation<Notify>>>,
+    backing: Mutex<ExportBacking>,
 }
 
 impl TransportBuffer {
     pub(crate) fn local(
         source: Spans,
         event: Option<Arc<Event>>,
-        nbytes: u64,
-        capacity: Arc<Capacity>,
+        bytes: ByteReservation<Notify>,
     ) -> Self {
+        Self::new(ExportBacking::Local { source, event }, bytes)
+    }
+
+    pub(crate) fn shared(storage: SharedBuffer, bytes: ByteReservation<Notify>) -> Self {
+        Self::new(ExportBacking::Shared(storage), bytes)
+    }
+
+    pub(crate) fn cuda(source: CudaSource, bytes: ByteReservation<Notify>) -> Self {
+        Self::new(ExportBacking::Cuda(source), bytes)
+    }
+
+    fn new(backing: ExportBacking, bytes: ByteReservation<Notify>) -> Self {
         Self {
-            capacity,
-            nbytes,
-            backing: Mutex::new(Backing::Local { source, event }),
+            bytes: Mutex::new(Some(bytes)),
+            backing: Mutex::new(backing),
         }
     }
 
-    pub(crate) fn shared(storage: SharedBuffer, capacity: Arc<Capacity>) -> Self {
-        Self {
-            capacity,
-            nbytes: storage.nbytes() as u64,
-            backing: Mutex::new(Backing::Shared(storage)),
-        }
-    }
-
-    pub(crate) fn cuda(source: CudaSource, nbytes: u64, capacity: Arc<Capacity>) -> Self {
-        Self {
-            capacity,
-            nbytes,
-            backing: Mutex::new(Backing::Cuda(source)),
-        }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, Backing> {
+    fn lock(&self) -> MutexGuard<'_, ExportBacking> {
         self.backing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The exported spans a process-local reader borrows.
     pub(crate) fn spans(&self) -> Result<Spans> {
         match &*self.lock() {
-            Backing::Local { source, .. } => Ok(source.clone()),
-            Backing::Cuda(source) => Ok(source.source.clone()),
-            Backing::Shared(_) => Err(Error::Invariant(
+            ExportBacking::Local { source, .. } => Ok(source.clone()),
+            ExportBacking::Cuda(source) => Ok(source.source.clone()),
+            ExportBacking::Shared(_) => Err(Error::Invariant(
                 "shared buffers expose their mapping through a shared read".into(),
             )),
         }
@@ -102,9 +98,9 @@ impl TransportBuffer {
     /// The producer fence a reader waits on before reading the spans.
     pub(crate) fn event(&self) -> Option<Arc<Event>> {
         match &*self.lock() {
-            Backing::Local { event, .. } => event.clone(),
-            Backing::Cuda(source) => Some(Arc::clone(&source.event)),
-            Backing::Shared(_) => None,
+            ExportBacking::Local { event, .. } => event.clone(),
+            ExportBacking::Cuda(source) => Some(Arc::clone(&source.event)),
+            ExportBacking::Shared(_) => None,
         }
     }
 
@@ -112,7 +108,7 @@ impl TransportBuffer {
     /// VMM reader words are observed by the event pool and the VMM pool.
     pub(crate) fn settled(&self) -> bool {
         match &*self.lock() {
-            Backing::Shared(storage) => storage.settled(),
+            ExportBacking::Shared(storage) => storage.settled(),
             _ => true,
         }
     }
@@ -120,7 +116,7 @@ impl TransportBuffer {
     /// Shared buffers of CUDA producers unregister their mapping, which may
     /// wait for the device; they retire on a host lane.
     pub(crate) fn asynchronous(&self) -> bool {
-        matches!(&*self.lock(), Backing::Shared(storage) if storage.is_cuda())
+        matches!(&*self.lock(), ExportBacking::Shared(storage) if storage.is_cuda())
     }
 
     /// Wait on the host for the producer's last write, at most
@@ -129,7 +125,7 @@ impl TransportBuffer {
     pub(crate) fn drain(&self) -> Result<()> {
         if let Some(event) = self.event() {
             drain_event(&event, Instant::now() + DRAIN_LIMIT)?;
-        } else if let Backing::Shared(storage) = &*self.lock() {
+        } else if let ExportBacking::Shared(storage) = &*self.lock() {
             storage.synchronize()?;
         }
         Ok(())
@@ -145,7 +141,7 @@ impl TransportBuffer {
     ) -> Result<()> {
         {
             let backing = buffer.lock();
-            if let Backing::Cuda(source) = &*backing
+            if let ExportBacking::Cuda(source) = &*backing
                 && let Some((pool, chunk)) = &source.pool
             {
                 let grant = source
@@ -178,12 +174,12 @@ impl TransportBuffer {
         let copied = {
             let mut backing = self.lock();
             match &mut *backing {
-                Backing::Local { .. } => None,
-                Backing::Shared(storage) => {
+                ExportBacking::Local { .. } => None,
+                ExportBacking::Shared(storage) => {
                     storage.close()?;
                     None
                 }
-                Backing::Cuda(source) => {
+                ExportBacking::Cuda(source) => {
                     if source.pool.is_none() {
                         if let Some(grants) = &source.grants {
                             grants.release(&source.export);
@@ -195,7 +191,12 @@ impl TransportBuffer {
             }
         };
         drop(copied);
-        self.capacity.release(self.nbytes)
+        let bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        bytes.map_or(Ok(()), ByteReservation::release)
     }
 }
 

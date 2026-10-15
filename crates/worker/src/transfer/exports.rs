@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use uniserve_ipc::Locator;
 
-use super::cuda_vmm::Exported;
 use super::transport::{Staged, Transport, TransportKind, Transports};
+use super::vmm::Exported;
 use super::{Retirement, Spans};
 use crate::ffi::Device;
 use crate::stream::Issue;

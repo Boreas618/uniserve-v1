@@ -153,6 +153,41 @@ impl<C> TransferCapacity<C> {
     }
 }
 
+/// Bytes of a rank's transfer budget held by one export. The bytes return
+/// when the reservation is released or dropped: an attempt that fails on any
+/// path gives them back, and an export's backing keeps them until it retires.
+pub(crate) struct ByteReservation<C> {
+    capacity: Arc<TransferCapacity<C>>,
+    bytes: u64,
+}
+
+impl<C> ByteReservation<C> {
+    pub(crate) fn new(capacity: &Arc<TransferCapacity<C>>, bytes: u64) -> Result<Self> {
+        capacity.acquire(bytes)?;
+        Ok(Self {
+            capacity: Arc::clone(capacity),
+            bytes,
+        })
+    }
+
+    /// Return the bytes, reporting an accounting failure to the caller.
+    pub(crate) fn release(mut self) -> Result<()> {
+        let bytes = std::mem::take(&mut self.bytes);
+        self.capacity.release(bytes)
+    }
+}
+
+impl<C> Drop for ByteReservation<C> {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        if let Err(error) = self.capacity.release(self.bytes) {
+            tracing::warn!(target: "uniserve_worker.transfer", "failed to return transfer bytes: {error}");
+        }
+    }
+}
+
 /// A fetch's reserved read credits. Each submission takes one credit; close
 /// and destruction return only those which have not been handed to a read.
 pub struct ReadReservation<C> {

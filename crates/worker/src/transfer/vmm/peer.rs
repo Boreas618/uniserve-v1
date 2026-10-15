@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use uniserve_cuda::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
 
-use super::{DescriptorGrants, fetch_descriptor};
+use super::grants::DescriptorGrants;
+use super::handle::AllocationHandle;
 use crate::storage::memory::Memory;
 use crate::{Error, Result};
 
@@ -27,51 +28,35 @@ pub trait PeerExchange {
     fn barrier(&self) -> Result<()>;
 }
 
-/// A member's published handle: `[kind][bytes]` where kind 0 is a 64-byte
-/// fabric handle and kind 1 a grant endpoint name on `node`.
+/// A member's published handle: `node \0 endpoint \0 handle`, the
+/// member's host, the grant socket serving its descriptor, and its
+/// [`AllocationHandle`] (last, since a fabric handle may contain zeros).
 fn encode(node: &str, handle: &ShareableHandle, endpoint: &str) -> Vec<u8> {
     let mut payload = Vec::new();
-    match handle {
-        ShareableHandle::Fabric(bytes) => {
-            payload.push(0);
-            payload.extend_from_slice(bytes);
-        }
-        ShareableHandle::Descriptor(_) => {
-            payload.push(1);
-            payload.extend_from_slice(node.as_bytes());
-            payload.push(0);
-            payload.extend_from_slice(endpoint.as_bytes());
-        }
-    }
+    payload.extend_from_slice(node.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(endpoint.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&AllocationHandle::of(handle).encode());
     payload
 }
 
+/// Import a member's published handle on host `node`.
 fn decode(node: &str, payload: &[u8]) -> Result<ShareableHandle> {
-    match payload.split_first() {
-        Some((0, bytes)) => Ok(ShareableHandle::Fabric(
-            <[u8; 64]>::try_from(bytes)
-                .map_err(|_| Error::Invalid("a peer fabric handle has 64 bytes".into()))?,
-        )),
-        Some((1, rest)) => {
-            let separator = rest
-                .iter()
-                .position(|&byte| byte == 0)
-                .ok_or_else(|| Error::Invalid("a peer descriptor names its host".into()))?;
-            let (host, endpoint) = (&rest[..separator], &rest[separator + 1..]);
-            if host != node.as_bytes() {
-                return Err(Error::Unsupported(
-                    "peer storage across hosts requires fabric handles".into(),
-                ));
-            }
-            let endpoint = std::str::from_utf8(endpoint)
-                .map_err(|_| Error::Invalid("a peer grant endpoint is UTF-8".into()))?;
-            Ok(ShareableHandle::Descriptor(
-                fetch_descriptor(endpoint, PEER_EXPORT)
-                    .map_err(|error| Error::Transport(error.to_string()))?,
-            ))
-        }
-        _ => Err(Error::Invalid("a peer handle payload is malformed".into())),
+    let mut fields = payload.splitn(3, |&byte| byte == 0);
+    let (Some(host), Some(endpoint), Some(handle)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return Err(Error::Invalid("a peer handle payload is malformed".into()));
+    };
+    let handle = AllocationHandle::decode(handle)?;
+    if host != node.as_bytes() && !handle.crosses_hosts() {
+        return Err(Error::Unsupported(
+            "peer storage across hosts requires fabric handles".into(),
+        ));
     }
+    let endpoint = std::str::from_utf8(endpoint)
+        .map_err(|_| Error::Invalid("a peer grant endpoint is UTF-8".into()))?;
+    handle.import(endpoint, PEER_EXPORT)
 }
 
 /// This rank's exportable allocation and the mapping of every member's.
@@ -171,19 +156,26 @@ mod tests {
 
     #[test]
     fn fabric_payloads_round_trip_and_descriptors_stay_on_their_host() -> Result<()> {
-        let fabric = ShareableHandle::Fabric([7; 64]);
-        let payload = encode("node-a", &fabric, "unused");
+        // A fabric handle containing zeros imports on any host.
+        let mut bytes = [7; 64];
+        bytes[3] = 0;
+        let fabric = ShareableHandle::Fabric(bytes);
+        let payload = encode("node-a", &fabric, "uniserve-peer-x");
         assert!(
-            matches!(decode("node-b", &payload)?, ShareableHandle::Fabric(bytes) if bytes == [7; 64])
+            matches!(decode("node-b", &payload)?, ShareableHandle::Fabric(imported) if imported == bytes)
         );
 
-        let mut descriptor = vec![1];
-        descriptor.extend_from_slice(b"node-a\0uniserve-peer-x");
+        let file = std::fs::File::open("/dev/null")
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        let descriptor = ShareableHandle::Descriptor(file.into());
+        let payload = encode("node-a", &descriptor, "uniserve-peer-x");
         assert!(matches!(
-            decode("node-b", &descriptor),
+            decode("node-b", &payload),
             Err(Error::Unsupported(_))
         ));
-        assert!(decode("node-a", &[2]).is_err());
+
+        assert!(decode("node-a", b"node-a\0uniserve-peer-x").is_err());
+        assert!(decode("node-a", b"node-a\0uniserve-peer-x\0abc").is_err());
         Ok(())
     }
 }

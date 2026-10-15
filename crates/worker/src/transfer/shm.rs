@@ -1,27 +1,39 @@
-//! Shared host tensor storage and stream-ordered readiness.
+//! The shared-memory mechanism: a POSIX segment of this host holding a copy
+//! of the export behind a readiness word and one acknowledgment word per
+//! consumer slot ([`SharedBuffer`]), its export, its reads and in-place
+//! borrows ([`SharedRead`]).
 
 use std::io;
+use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use uniserve_core::SharedMemory;
-use uniserve_cuda::{DeviceGuard, Event, EventFlags, HostRegistration, Stream};
+use uniserve_cuda::{DeviceGuard, Event, EventFlags, HostRegistration, SourceOrder, Stream};
+use uniserve_ipc::{Locator, TransferTransport};
 
-use super::{DRAIN_LIMIT, drain_event};
+use super::backing::TransportBuffer;
+use super::export_table::ExportTable;
+use super::read::{NativeRead, ReadCall, payload};
+use super::transport::{Backend, ExportView, Transport, producer, read_destination, row_span};
+use super::{
+    ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, DRAIN_LIMIT, Notify, Spans, copy_planner,
+    drain_event,
+};
 use crate::ffi::{Backing, Device};
+use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
 
 pub const SHM_HEADER_BYTES: usize = 512;
+/// How long a reader waits for its producer's readiness.
+const SHARED_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const ACK_OFFSET: usize = 64;
-const ACK_SLOTS: usize = 64;
 const PENDING: u32 = 0;
 const READY: u32 = 1;
 const FAILED: u32 = 2;
-const CLAIMED: u32 = 1;
-const ACKNOWLEDGED: u32 = 2;
 
 /// A mapping can outlive its producer while a borrowed tensor view or a CUDA
 /// host function still uses it. It owns no CUDA resources: its final release
@@ -404,5 +416,157 @@ impl SharedRead {
 impl Drop for SharedRead {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+impl Transport {
+    /// The read of a shared-memory export of this host into `destination`
+    /// (see [`Transport::issue_fetch`]).
+    pub(super) fn shared_read(
+        &self,
+        slot: usize,
+        locator: &Locator,
+        device: Device,
+        destination: Option<&Spans>,
+        region: Option<&[Range<u64>]>,
+    ) -> Result<ReadCall> {
+        if locator.source.node != self.source.node {
+            return Err(Error::Invalid(
+                "shared storage transport requires the source node".into(),
+            ));
+        }
+        Ok(ReadCall::Shared {
+            locator: Arc::new(locator.clone()),
+            slot,
+            destination: read_destination(locator, device, destination, region)?,
+            region: region.map(<[_]>::to_vec),
+        })
+    }
+
+    pub(super) fn export_shared(
+        &self,
+        view: &ExportView<'_>,
+        endpoint: &Arc<ExportTable>,
+        consumers: &[usize],
+        bytes: ByteReservation<Notify>,
+        stream: impl Issue,
+    ) -> Result<Locator> {
+        let producer = producer(view.spans, stream.stream())?;
+        // The buffer keeps the producer's stream for its own lifetime: it
+        // drains the stream before it unregisters or releases its bytes.
+        let shared = producer.as_ref().map(|(_, stream)| (*stream).clone());
+        let mut storage = SharedBuffer::new(view.nbytes as usize, consumers.to_vec(), shared)?;
+
+        let written = (|| -> Result<Locator> {
+            let locator = view.locator(
+                &self.source,
+                TransferTransport::PosixShm {
+                    endpoint: endpoint.name().to_owned(),
+                    name: storage.name()?.to_owned(),
+                },
+            );
+            let mapping = storage.mapping()? as Arc<dyn Backing>;
+            let shape: Vec<i64> = view.shape.iter().map(|&extent| extent as i64).collect();
+            let payload = Spans::single(StorageView::contiguous(
+                mapping,
+                SHM_HEADER_BYTES,
+                view.spans.dtype(),
+                &shape,
+            )?)?;
+            match &producer {
+                Some((device, _)) => {
+                    // Mark in-flight storage before the first copy: a failed
+                    // copy must drain before unregistration or byte reuse.
+                    storage.begin_copy();
+                    let mut plan = copy_planner(Some(*device), SourceOrder::Stream)?;
+                    payload.plan_copy(view.spans, &mut plan)?;
+                    // SAFETY: the registered mapping stays mapped until the
+                    // buffer closes, which drains this stream first.
+                    unsafe { stream.copy_strided(&plan) }?;
+                }
+                None => {
+                    let mut plan = copy_planner(None, SourceOrder::Stream)?;
+                    payload.plan_copy(view.spans, &mut plan)?;
+                    // SAFETY: host operands, written in the producer's
+                    // order; no reader maps the segment yet.
+                    unsafe { stream.host().copy_strided(&plan) }?;
+                }
+            }
+            storage.mark_ready(stream)?;
+            Ok(locator)
+        })();
+        let locator = match written {
+            Ok(locator) => locator,
+            Err(error) => {
+                // The attempt failed: a stream issued its copies at once
+                // and drains them here; a job gives up the copies and this
+                // wait with the rest of the failed attempt. Either way no
+                // DMA into the mapping is outstanding when it is released.
+                stream.synchronize()?;
+                storage.release()?;
+                return Err(error);
+            }
+        };
+
+        let buffer = Arc::new(TransportBuffer::shared(storage, bytes));
+        if let Err(error) = endpoint.register(locator.clone(), Arc::clone(&buffer)) {
+            TransportBuffer::reclaim(buffer, &self.events, None)?;
+            return Err(error);
+        }
+        Ok(locator)
+    }
+
+    /// Borrow whole leading rows of a shared-memory export of this host in
+    /// place. `region` is in logical coordinates; releasing the returned
+    /// read ends the claim.
+    pub fn borrow(&self, locator: &Locator, region: Option<&[Range<u64>]>) -> Result<SharedRead> {
+        let Backend::Shared { slot, .. } = &self.backend else {
+            return Err(Error::Invalid(
+                "only shared storage supports host borrowing".into(),
+            ));
+        };
+        if locator.source.node != self.source.node {
+            return Err(Error::Invalid(
+                "shared storage transport requires the source node".into(),
+            ));
+        }
+        let TransferTransport::PosixShm { name, .. } = &locator.transport else {
+            return Err(Error::Invalid(
+                "shared storage borrow requires a shared storage locator".into(),
+            ));
+        };
+        let (offset, bytes) = row_span(locator, region)?;
+        let read = SharedRead::open(name, offset, bytes, *slot)?;
+        read.wait(SHARED_READY_TIMEOUT, || Ok(()))?;
+        Ok(read)
+    }
+}
+
+impl NativeRead {
+    pub(super) fn shared(
+        &self,
+        locator: &Arc<Locator>,
+        slot: usize,
+        destination: &Spans,
+        region: Option<&[Range<u64>]>,
+    ) -> Result<()> {
+        let TransferTransport::PosixShm { name, .. } = &locator.transport else {
+            return Err(Error::Invalid(
+                "shared read requires a shared storage locator".into(),
+            ));
+        };
+        let mut read = SharedRead::open(name, 0, locator.nbytes as usize, slot)?;
+        read.wait(SHARED_READY_TIMEOUT, || self.read.check_active())?;
+
+        let source = payload(
+            read.mapping()? as Arc<dyn Backing>,
+            SHM_HEADER_BYTES,
+            locator,
+        )?;
+        let source = match region {
+            Some(region) => source.region(region)?,
+            None => source,
+        };
+        self.copy_from_host(&source, destination, || read.release())
     }
 }

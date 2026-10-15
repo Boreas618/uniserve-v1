@@ -14,37 +14,36 @@ use uniserve_cuda::Event;
 
 use crate::{Completion, Error, Result};
 
+mod backing;
 pub mod cache_export;
 mod cache_import;
 mod capacity;
-mod cuda_vmm;
-mod descriptor_grants;
-mod endpoint;
+mod channel;
+mod export_table;
 pub mod exports;
 pub mod fetch;
-mod peer;
+mod local;
 mod pool;
 mod read;
 mod registry;
-mod shared_buffer;
-mod source;
+mod shm;
 mod spans;
 mod ticket;
 mod transport;
-pub mod vmm_pool;
+pub mod vmm;
 
 pub use cache_import::{
     CacheImport, CacheImporter, ImportBackend, ImportCopy, ImportEntry, ImportWorkspace,
 };
 pub(crate) use cache_import::{CacheImportBackend, ImportTask, Retired};
-pub use descriptor_grants::{DescriptorGrants, fetch_descriptor};
-pub use peer::{PeerExchange, PeerStorage};
 pub use read::{Read, ReadRef};
 pub use registry::{BufferRegistry, RegisteredBuffer};
-pub use shared_buffer::{SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead};
+pub use shm::{SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead};
 pub use spans::{Spans, copy_on_host, copy_planner, submit_copy};
 pub use transport::{Transport, TransportKind, TransportOptions, Transports};
+pub use vmm::{DescriptorGrants, PeerExchange, PeerStorage, fetch_descriptor};
 
+pub(crate) use capacity::ByteReservation;
 pub use capacity::{ReadReservation, TransferCapacity};
 pub use pool::{ReadBackend, TransferPool, TransferRead};
 pub use ticket::TransferTicket;
@@ -59,6 +58,14 @@ pub type Retirement = Completion<Error, Notify>;
 
 /// A rank's shared transfer byte budget and read credits.
 pub type Capacity = TransferCapacity<Notify>;
+
+/// Reader acknowledgment words in the header of a shared-memory segment or
+/// a pooled VMM chunk: one per consumer slot, which a reader sets to
+/// [`CLAIMED`] before it copies and to [`ACKNOWLEDGED`] after; the producer
+/// reuses the storage only once every claimed word is acknowledged.
+pub(crate) const ACK_SLOTS: usize = 64;
+pub(crate) const CLAIMED: u32 = 1;
+pub(crate) const ACKNOWLEDGED: u32 = 2;
 
 /// Run observers returned by a completion, after its owner unlocked.
 /// How long a host wait for device work may last where storage is given
