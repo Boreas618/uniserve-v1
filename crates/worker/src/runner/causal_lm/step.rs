@@ -15,11 +15,11 @@
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
+use super::CausalLMRunners;
 use super::batch::TokenBatch;
 use super::calls::{self, Prepared};
 use super::context::{self, Sources};
 use super::runners::Step;
-use super::{CausalLMRunners, StepParts};
 use crate::executor::image::ImageParts;
 use crate::lane::Job;
 use crate::runner::causal_lm::{
@@ -328,12 +328,11 @@ impl TokenBatch<'_> {
                 self.storage.prefix_cache.as_mut().ok_or_else(|| {
                     Error::Unsupported("text calls require a prefix cache".into())
                 })?;
-            let (tables, cache) = prefix_cache.split();
             Some(self.runtime.forward(
                 self.experts.as_ref(),
                 self.group,
                 &requests,
-                &mut StepParts { tables, cache },
+                prefix_cache,
                 None,
                 &self.job,
             )?)
@@ -614,16 +613,8 @@ pub(super) fn condition_latents(
         .prefix_cache
         .as_mut()
         .ok_or_else(|| Error::Unsupported("text calls require a prefix cache".into()))?;
-    let (tables, cache) = prefix_cache.split();
     runtime.order().wait(job.on(denoiser.as_ref()))?;
-    diffusion.condition(
-        rows,
-        tables,
-        |table, prefix, query| {
-            cache.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
-        },
-        job,
-    )?;
+    diffusion.condition(rows, prefix_cache, job)?;
     runtime.order_mut().record(job.on(denoiser.as_ref()))?;
     runtime.order().wait(job.on(stream))
 }

@@ -53,15 +53,8 @@ use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{
     CausalLMRunner, Executed, PromptChunks, RowSource, Staged, StepContext, StepRequest, TokenRow,
 };
-use crate::storage::{BlockTables, OutputPool, PrefixCacheManager, UnitColumn};
-use crate::transfer::Retirement;
+use crate::storage::{OutputPool, PrefixCache, UnitColumn};
 use crate::{Error, Result};
-
-/// The cache storage a text step borrows.
-pub(crate) struct StepParts<'a> {
-    pub(crate) tables: &'a BlockTables,
-    pub(crate) cache: &'a mut PrefixCacheManager<Arc<Retirement>>,
-}
 
 use super::batch::{Opening, Owners, Parked, TokenBatch};
 use super::commit::{Commit, Committed, PHASE};
@@ -200,7 +193,7 @@ impl CausalLMRunners {
         experts: Option<&Arc<ExpertUnion>>,
         group: usize,
         requests: &[Option<StepRequest<'_>>],
-        context: &mut StepParts<'_>,
+        prefix_cache: &mut PrefixCache,
         forced: Option<usize>,
         job: &Job,
     ) -> Result<Step> {
@@ -215,8 +208,7 @@ impl CausalLMRunners {
             runner.stage(
                 request,
                 &mut StepContext {
-                    tables: context.tables,
-                    cache: context.cache,
+                    prefix_cache: &mut *prefix_cache,
                     state,
                 },
                 job,
@@ -442,8 +434,7 @@ impl CausalLMRunners {
         experts: Option<&Arc<ExpertUnion>>,
         component: &str,
         prefixes: &[(u32, &[u32])],
-        tables: &BlockTables,
-        cache: &mut PrefixCacheManager<Arc<Retirement>>,
+        prefix_cache: &mut PrefixCache,
         job: &Job,
     ) -> Result<Step> {
         let (lane, group) = self.prefill_lane(component)?;
@@ -480,14 +471,7 @@ impl CausalLMRunners {
             embeddings: &[],
         })];
         requests.resize_with(self.groups[group].len(), || None);
-        let step = self.forward(
-            experts,
-            group,
-            &requests,
-            &mut StepParts { tables, cache },
-            None,
-            job,
-        )?;
+        let step = self.forward(experts, group, &requests, prefix_cache, None, job)?;
         self.order.record(job.on(stream.as_ref()))?;
         Ok(step)
     }

@@ -19,15 +19,13 @@
 
 use super::TransferBatch;
 use crate::executor::inputs::Inputs;
-use crate::storage::{PendingImport, PrefixCache, PrefixCacheManager, UnitColumn};
+use crate::storage::{PendingImport, PrefixCache, UnitColumn};
 use crate::stream::Issue;
-use crate::transfer::Retirement;
 use crate::transfer::cache_export::CacheExport;
 use crate::transfer::exports::{self, Location};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 use std::collections::HashSet;
-use std::sync::Arc;
 use uniserve_ipc::{BufferId, CacheTransfer, Call};
 
 /// The cache transfer destination of image generation conditioning.
@@ -47,7 +45,7 @@ impl Exporting {
     /// was performed: at once after a stream, from the job's completion on
     /// after a recorder.
     pub(crate) fn locate(self, storage: &mut RankStorage) -> Result<Published> {
-        let (transfer, locations) = self.export.locate(manager(storage)?)?;
+        let (transfer, locations) = cache(storage)?.locate_export(self.export)?;
         Ok(Published {
             call: self.call,
             buffer: self.buffer,
@@ -59,17 +57,16 @@ impl Exporting {
     /// Revoke an export that is not published, under the same condition as
     /// [`Self::locate`].
     pub(crate) fn revoke(self, storage: &mut RankStorage) -> Result<()> {
-        self.export.revoke(manager(storage)?);
+        cache(storage)?.revoke_export(self.export);
         Ok(())
     }
 }
 
-/// The cache manager of a rank that transfers prefix cache.
-fn manager(storage: &mut RankStorage) -> Result<&mut PrefixCacheManager<Arc<Retirement>>> {
+/// The prefix cache of a rank that transfers prefix cache.
+fn cache(storage: &mut RankStorage) -> Result<&mut PrefixCache> {
     storage
         .prefix_cache
         .as_mut()
-        .map(PrefixCache::manager)
         .ok_or_else(|| Error::Unsupported("cache transfers require a prefix cache".into()))
 }
 
@@ -174,12 +171,7 @@ pub(crate) fn validate(
         .iter()
         .map(|export| (export.buffer, export.transfer.clone()))
         .collect();
-    storage
-        .prefix_cache
-        .as_mut()
-        .ok_or_else(|| Error::Unsupported("cache transfers require a prefix cache".into()))?
-        .manager()
-        .validate_exports(&exported, installations)
+    cache(storage)?.validate_transfers(&exported, installations)
 }
 
 /// Make the exports and installs resident at the commit point and register
@@ -196,12 +188,7 @@ pub(crate) fn apply(
         .iter()
         .map(|export| (export.buffer, export.transfer.clone()))
         .collect();
-    storage
-        .prefix_cache
-        .as_mut()
-        .ok_or_else(|| Error::Unsupported("cache transfers require a prefix cache".into()))?
-        .manager()
-        .apply_exports(exported, installations);
+    cache(storage)?.apply_transfers(exported, installations);
     for export in published {
         storage
             .tensors
@@ -219,7 +206,7 @@ pub(crate) fn revoke(storage: &mut RankStorage, published: Vec<Published>) -> Re
     }
     if let Some(prefix_cache) = storage.prefix_cache.as_mut() {
         let buffers: Vec<BufferId> = published.iter().map(|export| export.buffer).collect();
-        prefix_cache.manager().release_exports(&buffers);
+        prefix_cache.release_exports(&buffers);
     }
     result
 }

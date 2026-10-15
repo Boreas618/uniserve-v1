@@ -1,16 +1,20 @@
-//! Resident cache transfers, incremental transfer bases, and physical accesses.
+//! Physical accesses to the prefix cache's units: executions that read or
+//! write them, exports other ranks read and imports that write them.
+//!
+//! A model stream orders its own accesses. Independent imports and
+//! immutable exports prevent overlapping writes; recycling a unit also waits
+//! for model accesses. Completion handles retain backend resources without
+//! inspecting them. Only successful physical completion removes an access;
+//! failed or unknown completions keep their storage retained.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, Range};
-use std::sync::Arc;
 
-use uniserve_core::CallId;
-use uniserve_ipc::{BufferId, CacheTransfer, RequestKey};
+use uniserve_ipc::{BufferId, RequestKey};
 
-use crate::{BlockTables, Completion, Error, Result};
+use crate::{Completion, Error, Result};
 
 type Ranges = HashMap<u32, Range<u64>>;
-type Destinations = HashMap<(RequestKey, String), (BufferId, u32)>;
 
 struct Execution<C> {
     completion: C,
@@ -29,224 +33,27 @@ struct Import<C> {
     retirement: C,
 }
 
-/// Own resident cache transfers and physical use of scheduler-assigned units.
-///
-/// A model stream orders its own accesses. Independent imports and immutable
-/// exports prevent overlapping writes; recycling a unit also waits for model
-/// accesses. Completion handles retain backend resources without inspecting
-/// them. Only successful physical completion removes an access.
-/// Handles must keep their completion at a stable address, as `Arc` does.
-pub struct PrefixCacheManager<C> {
+/// The physical accesses to the prefix cache's units. Handles must keep
+/// their completion at a stable address, as `Arc` does.
+pub struct UnitAccesses<C> {
     executions: HashMap<usize, Execution<C>>,
     units: HashMap<u32, HashSet<usize>>,
     exports: HashMap<BufferId, Export<C>>,
     imports: HashMap<BufferId, Import<C>>,
-    resident: HashMap<BufferId, Arc<CacheTransfer>>,
-    destination_bases: Destinations,
-    installed_bases: Destinations,
 }
 
-impl<C> Default for PrefixCacheManager<C> {
+impl<C> Default for UnitAccesses<C> {
     fn default() -> Self {
         Self {
             executions: HashMap::new(),
             units: HashMap::new(),
             exports: HashMap::new(),
             imports: HashMap::new(),
-            resident: HashMap::new(),
-            destination_bases: HashMap::new(),
-            installed_bases: HashMap::new(),
         }
     }
 }
 
-impl<C> PrefixCacheManager<C> {
-    pub fn resident(&self, buffer: BufferId) -> Option<&Arc<CacheTransfer>> {
-        self.resident.get(&buffer)
-    }
-
-    /// Borrow a conditioning export covered by the request's installed keys and values.
-    pub fn validate_conditioning(
-        &self,
-        request: RequestKey,
-        buffer: BufferId,
-        slot: u32,
-        visible: u64,
-        tables: &BlockTables,
-    ) -> Result<&Arc<CacheTransfer>> {
-        let export = self
-            .resident(buffer)
-            .ok_or_else(|| Error::Invalid("cache export buffer is not resident".into()))?;
-        if buffer.owner != request {
-            return Err(Error::Invalid(
-                "cache conditioning buffer belongs to another request".into(),
-            ));
-        }
-        if visible < u64::from(export.exported_extent)
-            || tables.allocated_length(slot) < export.exported_extent
-        {
-            return Err(Error::Invalid(
-                "cache conditioning allocation disagrees with its export".into(),
-            ));
-        }
-        for group in 0..tables.groups().len() as u32 {
-            tables.table(slot, group)?;
-        }
-        Ok(export)
-    }
-
-    /// The latest extent sent to this destination, retained even after its
-    /// descriptor is released. The receiver already owns that prefix.
-    pub fn destination_base(
-        &self,
-        request: RequestKey,
-        destination: &str,
-    ) -> Option<(BufferId, u32)> {
-        self.destination_bases
-            .get(&(request, destination.to_owned()))
-            .copied()
-    }
-
-    /// Check the destination's accepted prefix before copying an incremental
-    /// transfer into its assigned physical pages.
-    pub fn validate_install(&self, transfer: &CacheTransfer) -> Result<()> {
-        let installed = self
-            .installed_bases
-            .get(&(transfer.source.owner, transfer.destination.clone()))
-            .copied();
-        validate_base(transfer, installed)
-    }
-
-    /// Check all touched versions before any resource owner commits. Updates
-    /// to one destination must form a chain in batch order; rejection leaves
-    /// both resident descriptors and accepted bases unchanged.
-    pub fn validate_exports(
-        &self,
-        exports: &[(BufferId, CacheTransfer)],
-        installations: &[(BufferId, BufferId, CacheTransfer)],
-    ) -> Result<()> {
-        let mut resident = HashMap::new();
-        let mut destination_bases = Destinations::new();
-        let mut installed_bases = Destinations::new();
-
-        for (buffer, transfer) in exports {
-            if *buffer != transfer.source {
-                return Err(Error::Invalid(
-                    "cache export buffer differs from its source".into(),
-                ));
-            }
-            let existing = resident
-                .get(buffer)
-                .copied()
-                .or_else(|| self.resident(*buffer).map(AsRef::as_ref));
-            if existing.is_some_and(|existing| existing != transfer) {
-                return Err(Error::Invalid(
-                    "cache export conflicts with its resident buffer".into(),
-                ));
-            }
-
-            validate_next_base(transfer, &self.destination_bases, &mut destination_bases)?;
-            resident.insert(*buffer, transfer);
-        }
-
-        for (source, installed, transfer) in installations {
-            if *source != transfer.source || installed.owner != source.owner {
-                return Err(Error::Invalid(
-                    "installed cache buffer does not belong to its source".into(),
-                ));
-            }
-
-            validate_next_base(transfer, &self.installed_bases, &mut installed_bases)?;
-        }
-        Ok(())
-    }
-
-    /// Commit an already checked batch. The executor must leave this
-    /// directory unchanged between validation and the shared resource commit.
-    pub fn apply_exports(
-        &mut self,
-        exports: Vec<(BufferId, CacheTransfer)>,
-        installations: Vec<(BufferId, BufferId, CacheTransfer)>,
-    ) {
-        for (buffer, transfer) in exports {
-            self.destination_bases.insert(
-                (buffer.owner, transfer.destination.clone()),
-                (transfer.source, transfer.exported_extent),
-            );
-            self.resident.insert(buffer, Arc::new(transfer));
-        }
-
-        for (source, installed, transfer) in installations {
-            self.installed_bases.insert(
-                (installed.owner, transfer.destination.clone()),
-                (transfer.source, transfer.exported_extent),
-            );
-            let transfer = Arc::new(transfer);
-            self.resident.insert(source, Arc::clone(&transfer));
-            self.resident.insert(installed, transfer);
-        }
-    }
-
-    /// Remove consumed descriptors and return their buffers for revocation.
-    /// Physical exports and transfer bases have independent lifetimes.
-    pub fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Vec<BufferId> {
-        let calls: HashSet<_> = calls.iter().copied().collect();
-        let mut released = Vec::new();
-        self.resident.retain(|buffer, _| {
-            if calls.contains(&(buffer.owner, buffer.producer_call_id)) {
-                released.push(*buffer);
-                false
-            } else {
-                true
-            }
-        });
-        released
-    }
-
-    /// Forget a retired request epoch after its physical accesses have
-    /// drained; other epochs of its request id keep their entries.
-    pub fn drop_request(&mut self, request: RequestKey) {
-        self.resident.retain(|buffer, _| buffer.owner != request);
-        self.destination_bases
-            .retain(|(owner, _), _| *owner != request);
-        self.installed_bases
-            .retain(|(owner, _), _| *owner != request);
-    }
-
-    /// Forget transfer descriptions and bases when the cache owner closes.
-    /// Physical access retirement is independent and must already be drained.
-    pub fn clear_resident(&mut self) {
-        self.resident.clear();
-        self.destination_bases.clear();
-        self.installed_bases.clear();
-    }
-}
-
-fn validate_base(transfer: &CacheTransfer, current: Option<(BufferId, u32)>) -> Result<()> {
-    let current = current.map_or((None, 0), |(buffer, extent)| (Some(buffer), extent));
-    if current != (transfer.base, transfer.base_extent) {
-        return Err(Error::Invalid(
-            "cache transfer base does not match destination".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_next_base(
-    transfer: &CacheTransfer,
-    resident: &Destinations,
-    pending: &mut Destinations,
-) -> Result<()> {
-    let key = (transfer.source.owner, transfer.destination.clone());
-    validate_base(
-        transfer,
-        pending.get(&key).or_else(|| resident.get(&key)).copied(),
-    )?;
-    pending.insert(key, (transfer.source, transfer.exported_extent));
-    Ok(())
-}
-
-impl<E, N, C: Deref<Target = Completion<E, N>>> PrefixCacheManager<C> {
+impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
     pub fn has_pending_accesses(&mut self) -> bool {
         self.reap();
         !self.executions.is_empty() || self.has_transfers()
@@ -570,131 +377,9 @@ mod tests {
         }
     }
 
-    fn empty_transfer(source: BufferId, base: Option<BufferId>) -> CacheTransfer {
-        CacheTransfer {
-            groups: Vec::new(),
-            source,
-            destination: "decoder".into(),
-            base,
-            base_extent: 0,
-            exported_extent: 0,
-            compute_dtype: "bfloat16".into(),
-        }
-    }
-
-    #[test]
-    fn rejected_transfer_chains_leave_the_accepted_base_and_resident_values_unchanged() -> Result<()>
-    {
-        let mut cache = PrefixCacheManager::<()>::default();
-        let first = empty_transfer(buffer(1), None);
-        let second = empty_transfer(
-            BufferId {
-                producer_call_id: CallId::new(2, 0),
-                ..first.source
-            },
-            Some(first.source),
-        );
-        let mut third = empty_transfer(
-            BufferId {
-                producer_call_id: CallId::new(3, 0),
-                ..first.source
-            },
-            Some(first.source),
-        );
-        cache.validate_exports(&[(first.source, first.clone())], &[])?;
-        cache.apply_exports(vec![(first.source, first.clone())], vec![]);
-
-        // Even an empty suffix advances the accepted transfer base. The
-        // third update cannot skip the second update in the same batch.
-        assert!(
-            cache
-                .validate_exports(
-                    &[
-                        (second.source, second.clone()),
-                        (third.source, third.clone())
-                    ],
-                    &[],
-                )
-                .is_err()
-        );
-        assert_eq!(
-            cache.destination_base(first.source.owner, "decoder"),
-            Some((first.source, 0))
-        );
-        assert_eq!(
-            cache.resident(first.source).map(AsRef::as_ref),
-            Some(&first)
-        );
-        assert_eq!(cache.resident(second.source), None);
-
-        third.base = Some(second.source);
-        let batch = vec![
-            (second.source, second.clone()),
-            (third.source, third.clone()),
-        ];
-        cache.validate_exports(&batch, &[])?;
-        cache.apply_exports(batch, vec![]);
-        cache.release_calls(&[
-            (first.source.owner, first.source.producer_call_id),
-            (second.source.owner, second.source.producer_call_id),
-        ]);
-        assert_eq!(cache.resident(first.source), None);
-        assert_eq!(cache.resident(second.source), None);
-        assert_eq!(
-            cache.resident(third.source).map(AsRef::as_ref),
-            Some(&third)
-        );
-        assert_eq!(
-            cache.destination_base(first.source.owner, "decoder"),
-            Some((third.source, 0))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn installed_aliases_and_transfer_bases_retire_with_their_request() -> Result<()> {
-        let mut cache = PrefixCacheManager::<()>::default();
-        let first = empty_transfer(buffer(1), None);
-        let local = BufferId {
-            producer_call_id: CallId::new(5, 0),
-            ..first.source
-        };
-        let other = empty_transfer(buffer(2), None);
-        let installs = vec![
-            (first.source, local, first.clone()),
-            (other.source, other.source, other.clone()),
-        ];
-        cache.validate_install(&first)?;
-        cache.validate_exports(&[], &installs)?;
-        cache.apply_exports(vec![], installs);
-        cache.release_calls(&[(first.source.owner, first.source.producer_call_id)]);
-        assert_eq!(cache.resident(first.source), None);
-        assert_eq!(cache.resident(local).map(AsRef::as_ref), Some(&first));
-
-        let next = empty_transfer(
-            BufferId {
-                producer_call_id: CallId::new(2, 0),
-                ..first.source
-            },
-            Some(first.source),
-        );
-        cache.validate_install(&next)?;
-        assert!(cache.validate_install(&first).is_err());
-        cache.drop_request(first.source.owner);
-        cache.validate_install(&first)?;
-        assert!(cache.validate_install(&next).is_err());
-        assert_eq!(cache.resident(local), None);
-        assert_eq!(
-            cache.resident(other.source).map(AsRef::as_ref),
-            Some(&other)
-        );
-        assert!(cache.validate_install(&other).is_err());
-        Ok(())
-    }
-
     #[test]
     fn model_accesses_share_a_batch_fence_without_blocking_independent_intervals() -> Result<()> {
-        let mut cache = PrefixCacheManager::default();
+        let mut cache = UnitAccesses::default();
         let fence = Fence::default();
         let first = buffer(1);
         let second = buffer(2);
@@ -719,7 +404,7 @@ mod tests {
 
     #[test]
     fn exported_prefixes_wait_for_all_readers_and_preserve_owner_scoped_failures() -> Result<()> {
-        let mut cache = PrefixCacheManager::default();
+        let mut cache = UnitAccesses::default();
         let first = buffer(1);
         let left = Fence::default();
         let right = Fence::default();
@@ -754,7 +439,7 @@ mod tests {
 
     #[test]
     fn import_reservations_survive_rejection_and_end_only_at_physical_retirement() -> Result<()> {
-        let mut cache = PrefixCacheManager::default();
+        let mut cache = UnitAccesses::default();
         let first = buffer(1);
         let fence = Fence::default();
         cache.reserve_import(first, &[(2, 1, 2), (2, 3, 2)], Arc::clone(&fence))?;

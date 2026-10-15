@@ -363,29 +363,20 @@ impl Owners<'_> {
             .map_err(&reserve)?;
 
         // Every active call retains the prefix it reads until the batch's
-        // device work retires. A windowed group starts at its first
-        // resident page.
+        // device work retires.
         for (call, state) in calls.iter().zip(&batch.calls) {
             if !state.active {
                 continue;
             }
             let slot = state.slot as u32;
             let visible = state.output.progress.cache_visible_len;
-            let tables = self.prefix_cache.tables();
-            tables.coordinates(slot, visible).map_err(&reserve)?;
-            let mut spans = Vec::new();
-            for group in 0..tables.groups().len() as u32 {
-                let table = tables.table(slot, group).map_err(&reserve)?;
-                let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
-                if visible > start {
-                    spans.extend(table.spans(start, visible - start).map_err(&reserve)?);
-                }
-            }
-            self.prefix_cache.manager().retain_execution(
-                call.request_key,
-                &spans,
-                Arc::clone(&batch.retirement),
-            );
+            self.prefix_cache
+                .tables()
+                .coordinates(slot, visible)
+                .map_err(&reserve)?;
+            self.prefix_cache
+                .retain(call.request_key, slot, visible, &batch.retirement)
+                .map_err(&reserve)?;
         }
 
         // Completion flags of denoising steps; these calls publish nothing
@@ -471,8 +462,7 @@ impl Owners<'_> {
         }
         let pages = self
             .prefix_cache
-            .tables()
-            .prepare_attention(&readouts.attention, |_, _, _| Ok(()))
+            .prepare_attention(&readouts.attention)
             .map_err(&execute)?;
         let pass = ReadoutPass {
             rows: std::mem::take(&mut readouts.rows),
@@ -579,8 +569,7 @@ impl Owners<'_> {
         }
         let pages = self
             .prefix_cache
-            .tables()
-            .prepare_attention(&attention, |_, _, _| Ok(()))
+            .prepare_attention(&attention)
             .map_err(&execute)?;
         let issue = self.job.on(self.stream);
         let expert = self.expert();
