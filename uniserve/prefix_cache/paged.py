@@ -66,7 +66,7 @@ def paged_kv_write(
         return
 
     if not bool(((slots >= -1) & (slots < blocks * block_size)).all()):
-        raise ValueError("paged KV write index out of bounds")
+        raise ValueError("paged cache write index out of bounds")
     selected = torch.nonzero(slots >= 0, as_tuple=False).reshape(-1)
     if int(selected.numel()) == 0:
         return

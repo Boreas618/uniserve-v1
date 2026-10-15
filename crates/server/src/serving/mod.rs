@@ -1312,7 +1312,8 @@ pub struct CacheAccounting {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Prefix cache, latent, and encoder-cache requirements computed for one request during preprocessing.
+/// Prefix cache, latent, and encoder-cache requirements computed for one request during
+/// preprocessing.
 /// Media requests report `ResourceAccounting::default()`.
 pub struct ResourceAccounting {
     /// Cache-token capacity required for the request.

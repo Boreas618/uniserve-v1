@@ -3015,7 +3015,7 @@ fn device_products_cross_workers_over_cuda_vmm() -> anyhow::Result<()> {
 /// converted into the target's representation by the cache's conversion.
 #[test]
 #[ignore = "requires a CUDA device"]
-fn a_converting_cache_installs_cache_another_worker_exported() -> anyhow::Result<()> {
+fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Result<()> {
     use uniserve_engine::{WorkerExecutor, WorkerId};
 
     let edges = "source->target=cuda_vmm";

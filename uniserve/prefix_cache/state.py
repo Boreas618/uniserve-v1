@@ -331,7 +331,7 @@ def block_spans(blocks, start: int, length: int, block_size: int):
         or length < 0
         or start + length > len(blocks) * block_size
     ):
-        raise ValueError("KV token interval exceeds its block table")
+        raise ValueError("cache token interval exceeds its block table")
     spans = []
     while length:
         logical, offset = divmod(start, block_size)

@@ -702,7 +702,8 @@ impl GenerationRequest {
     }
 
     /// Checks reachable encoder work, image geometry, and guidance against loaded capacity.
-    /// Admission separately acquires prefix cache, cache entries, and latent storage from their pools.
+    /// Admission separately acquires prefix cache, cache entries, and latent storage from
+    /// their pools.
     ///
     /// # Errors
     ///
