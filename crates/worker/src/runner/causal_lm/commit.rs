@@ -1,6 +1,6 @@
 //! A token batch's output captures, relays and commit.
 //!
-//! Behind the step in the batch's last job ([`Batch::finish`]), each call
+//! Behind the step in the batch's last job ([`TokenBatch::finish`]), each call
 //! advances its progress and contributes one slot-state commit row. The job
 //! then copies the batch's completion section, its logprob words and its
 //! prompt scores into the output lease, relays sampled tokens and
@@ -8,32 +8,28 @@
 //! validates its proposed update first, and the operations past the commit
 //! point advance the slot state on the device.
 //!
-//! Once that job completed ([`Batch::complete`]), the host follows: products
+//! Once that job completed ([`TokenBatch::complete`]), the host follows: products
 //! become visible, captured graphs are stored and the calls become pending.
 //! A job that failed before its commit point retires what the batch
 //! reserved and reports every call as failed; a failure at or past it is
-//! fatal, because slot state on the device may have advanced.
+//! fatal, because slot state on the device may have advanced
+//! ([`crate::executor::batch::Failure`]).
 
-use uniserve_core::CallId;
 use uniserve_cuda::{CopyBatch, SourceOrder};
-use uniserve_ipc::RequestKey;
 
-use super::batch::{Batch, CallState};
+use super::batch::{TokenBatch, TokenCall};
 use super::calls;
 use super::step::{Invoked, Stepped};
 use crate::cuda_graph::{GraphMode, ShapeKey};
-use crate::executor::batch::lock;
+use crate::executor::batch::{Batch, CallState, Failure, lock};
 use crate::lane::Completion;
 use crate::runner::causal_lm::Executed;
-use crate::storage::{LogprobLayout, ProductBuffer, Scalar};
+use crate::storage::{LogprobLayout, ProductBuffer};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
-/// A failure, and whether it happened past the commit point.
-pub(crate) struct Failure {
-    pub(super) error: Error,
-    pub(super) committed: bool,
-}
+/// The step a token batch's failure is reported in.
+pub(super) const PHASE: &str = "token batch";
 
 /// What a batch's last job leaves for its completion.
 pub(crate) struct Commit {
@@ -45,8 +41,6 @@ pub(crate) struct Commit {
     point: usize,
     /// The commit graphs the job captures: each runner's bucket.
     captures: Vec<(usize, ShapeKey)>,
-    /// The calls that become pending.
-    pending: Vec<(RequestKey, CallId, bool)>,
 }
 
 /// How a committed batch's step ran, for its statistics.
@@ -58,23 +52,7 @@ pub(super) struct Committed {
     pub(super) drafts: u64,
 }
 
-impl From<Error> for Failure {
-    fn from(error: Error) -> Self {
-        Self {
-            error,
-            committed: false,
-        }
-    }
-}
-
-fn fatal(error: Error) -> Failure {
-    Failure {
-        error,
-        committed: true,
-    }
-}
-
-impl Batch<'_> {
+impl TokenBatch<'_> {
     /// Advance progress, then record the capture of outputs, the relay of
     /// products and the commit behind `stepped` in the batch's job. A batch
     /// whose calls were all skipped has no step: only their false flags
@@ -85,9 +63,10 @@ impl Batch<'_> {
     ) -> std::result::Result<Commit, Failure> {
         let skipped = Stepped::skipped();
         let invoked = stepped.as_ref().unwrap_or(&skipped);
-        let commits = self.advance(invoked)?;
-        self.capture(invoked)?;
-        self.relay(invoked)?;
+        let failed = Failure::new(PHASE);
+        let commits = self.advance(invoked).map_err(&failed)?;
+        self.capture(invoked).map_err(&failed)?;
+        self.relay(invoked).map_err(&failed)?;
         let mut commit = self.commit(&commits)?;
         commit.step = stepped.map(|stepped| (stepped.step, stepped.rows, stepped.drafts));
         Ok(commit)
@@ -109,7 +88,10 @@ impl Batch<'_> {
                     padded_tokens: 0,
                 };
                 let executed = match step {
-                    Some(step) => self.runtime.complete(step, completion).map_err(fatal)?,
+                    Some(step) => self
+                        .runtime
+                        .complete(step, completion)
+                        .map_err(Failure::fatal(PHASE))?,
                     // Only latent conditionings, which the image denoiser
                     // wrote.
                     None => Vec::new(),
@@ -134,12 +116,11 @@ impl Batch<'_> {
         for (runner, key) in commit.captures {
             self.runtime.runners[runner]
                 .complete_commit(key, completion)
-                .map_err(fatal)?;
+                .map_err(Failure::fatal(PHASE))?;
         }
 
-        let writes = std::mem::take(&mut self.writes);
-        self.storage.tensors.commit_writes(&writes).map_err(fatal)?;
-        self.requests.add_pending(&commit.pending).map_err(fatal)?;
+        self.batch
+            .commit(self.plan, &self.storage.tensors, self.requests)?;
         Ok(committed)
     }
 
@@ -163,11 +144,12 @@ impl Batch<'_> {
             .iter()
             .map(|&runner| (runner, Vec::new()))
             .collect();
-        for (call, state) in plan.calls.iter().zip(&mut self.calls) {
+        for (call, state) in plan.calls.iter().zip(&mut self.batch.calls) {
             if !state.active {
                 continue;
             }
             let prepared = state
+                .forward
                 .prepared
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("active call has no row".into()))?;
@@ -178,13 +160,13 @@ impl Batch<'_> {
                 .ar
                 .as_ref()
                 .is_some_and(|ar| ar.sampling.uses_penalties());
-            let position = match state.task {
-                Some(task) => Some(stepped.invocation(state.microbatch)?.position(task)),
+            let position = match state.forward.task {
+                Some(task) => Some(stepped.invocation(state.forward.microbatch)?.position(task)),
                 None => None,
             };
             let rows = commits
                 .iter_mut()
-                .find(|(runner, _)| *runner == state.microbatch)
+                .find(|(runner, _)| *runner == state.forward.microbatch)
                 .ok_or_else(|| {
                     Error::Invariant("a call's microbatch is outside its group".into())
                 })?;
@@ -194,10 +176,10 @@ impl Batch<'_> {
                 prepared,
                 tables,
                 position,
-                state.controls.as_ref(),
+                state.forward.controls.as_ref(),
                 penalties,
             )?);
-            if !state.prompt.is_empty() {
+            if !state.forward.prompt.is_empty() {
                 state.output.progress.prompt_logits_ready = true;
             }
         }
@@ -216,11 +198,11 @@ impl Batch<'_> {
     /// Capture one microbatch invocation's outputs from its runner's
     /// columns. The lane stream already waits on the microbatch's stream.
     fn capture_invocation(&mut self, invoked: &Invoked) -> Result<()> {
-        let stream = self.job.on(self.stream.as_ref());
+        let stream = self.job.on(self.batch.stream.as_ref());
         let runner = &self.runtime.runners[invoked.runner];
         let events = &self.storage.events;
-        let mut output = lock(&self.buffer);
-        let mine = |state: &CallState| state.microbatch == invoked.runner;
+        let mut output = lock(&self.batch.buffer);
+        let mine = |state: &CallState<TokenCall>| state.forward.microbatch == invoked.runner;
         if invoked.tasks > 0 {
             // Fields of the sampled tasks: `[valid | active | token |
             // accepted]`, one section per field.
@@ -228,8 +210,8 @@ impl Batch<'_> {
                 .column("completion")?
                 .narrow(1, 0, invoked.tasks as i64)?;
             let (offset, extent) = output.capture(&completion, stream, events)?;
-            for state in self.calls.iter_mut().filter(|state| mine(state)) {
-                if let Some(task) = state.task {
+            for state in self.batch.calls.iter_mut().filter(|state| mine(state)) {
+                if let Some(task) = state.forward.task {
                     state.output.sampling_range = Some((offset, extent, invoked.position(task)));
                 }
             }
@@ -253,8 +235,8 @@ impl Batch<'_> {
                         max_requested: group.layout.max_requested,
                     },
                 )?;
-                for state in self.calls.iter_mut().filter(|state| mine(state)) {
-                    if let Some(task) = state.task
+                for state in self.batch.calls.iter_mut().filter(|state| mine(state)) {
+                    if let Some(task) = state.forward.task
                         && let Some((first, _, row)) = sampling.logprob_span(task)
                         && first == group.offset
                     {
@@ -263,10 +245,10 @@ impl Batch<'_> {
                 }
             }
         }
-        for state in self.calls.iter_mut().filter(|state| mine(state)) {
+        for state in self.batch.calls.iter_mut().filter(|state| mine(state)) {
             // Chunks of one prompt report their scores in prompt order.
             let mut ranges = Vec::new();
-            for prompt in &mut state.prompt {
+            for prompt in &mut state.forward.prompt {
                 let Some(layout) = prompt.layout.take() else {
                     continue;
                 };
@@ -280,7 +262,7 @@ impl Batch<'_> {
                 output.register_logprobs(offset, count, layout)?;
                 ranges.extend((0..scored).map(|row| (offset, count, row)));
             }
-            if !state.prompt.is_empty() {
+            if !state.forward.prompt.is_empty() {
                 state.output.prompt_logprob_ranges = ranges;
             }
         }
@@ -301,16 +283,17 @@ impl Batch<'_> {
         let runner = &self.runtime.runners[invoked.runner];
         for (column, transition) in [("tagged", false), ("transition", true)] {
             let mut writes: Vec<(usize, ProductBuffer)> = self
+                .batch
                 .calls
                 .iter()
-                .filter(|state| state.microbatch == invoked.runner)
+                .filter(|state| state.forward.microbatch == invoked.runner)
                 .filter_map(|state| {
                     let write = if transition {
-                        &state.transition_write
+                        &state.forward.transition_write
                     } else {
-                        &state.token_write
+                        &state.forward.token_write
                     };
-                    Some((invoked.position(state.task?), write.clone()?))
+                    Some((invoked.position(state.forward.task?), write.clone()?))
                 })
                 .collect();
             writes.sort_by_key(|(position, _)| *position);
@@ -332,7 +315,7 @@ impl Batch<'_> {
                 self.storage.tensors.write_scalars(
                     &run,
                     &values,
-                    self.job.on(self.stream.as_ref()),
+                    self.job.on(self.batch.stream.as_ref()),
                 )?;
                 start = end;
             }
@@ -346,51 +329,30 @@ impl Batch<'_> {
         &mut self,
         commits: &[(usize, Vec<[i64; 8]>)],
     ) -> std::result::Result<Commit, Failure> {
-        let stream = self.job.on(self.stream.as_ref());
+        let failed = Failure::new(PHASE);
         let plan = self.plan;
+        let tensors = &self.storage.tensors;
 
-        // Readers end on the consuming stream, after this batch's writes when
-        // every read has a corresponding relay write.
+        // Readers end on the consuming stream, after this batch's relay
+        // writes when every read has one; completion flags no numerical
+        // step wrote become true.
         let after: Vec<ProductBuffer> = self
+            .batch
             .calls
             .iter()
-            .filter_map(|state| state.token_write.clone())
+            .filter_map(|state| state.forward.token_write.clone())
             .collect();
-        let reads = std::mem::take(&mut self.reads);
-        let after = if after.len() == reads.len() {
-            after
-        } else {
-            Vec::new()
-        };
-        self.storage
-            .tensors
-            .complete_reads(&reads, stream, &after)?;
-
-        // Completion flags no numerical step wrote become true.
-        for state in self.calls.iter().filter(|state| state.active) {
-            if let Some(write) = &state.completion_write {
-                self.storage
-                    .tensors
-                    .write_scalar(write, Scalar::Int(1), stream)?;
-            }
-        }
-        {
-            let output = lock(&self.buffer);
-            for (state, call) in self.calls.iter().zip(&plan.calls) {
-                state.output.validate_output(&output, call)?;
-            }
-        }
-        self.storage.tensors.validate_writes(&self.writes)?;
-        self.seal()?;
-        for state in &mut self.calls {
-            state.output.reports_output = self.reports;
-        }
-        let pending: Vec<_> = plan
-            .calls
-            .iter()
-            .map(|call| (call.request_key, call.call_id, call.advances_state()))
-            .collect();
-        self.requests.validate_pending(&pending)?;
+        self.batch
+            .end_reads(tensors, &self.job, &after)
+            .map_err(&failed)?;
+        self.batch.set_flags(tensors, &self.job).map_err(&failed)?;
+        self.batch.validate(plan, tensors).map_err(&failed)?;
+        self.batch
+            .seal(&self.storage.events, &self.job)
+            .map_err(&failed)?;
+        self.requests
+            .validate_pending(&Batch::<TokenCall>::pending(plan))
+            .map_err(&failed)?;
 
         // Every owner accepted its update. The job's operations from here
         // on change slot state, and any failure from here is fatal.
@@ -401,19 +363,23 @@ impl Batch<'_> {
         for (runner, rows) in commits {
             let captured = self.runtime.runners[*runner]
                 .commit(rows, &self.job)
-                .map_err(fatal)?;
+                .map_err(Failure::fatal(PHASE))?;
             captures.extend(captured.map(|key| (*runner, key)));
         }
-        self.install_prompt_tails().map_err(fatal)?;
-        if let (Some(experts), Some(lane)) = (&self.experts, &self.stream) {
-            experts.join_streams(&self.job, lane).map_err(fatal)?;
+        self.install_prompt_tails().map_err(Failure::fatal(PHASE))?;
+        if let (Some(experts), Some(lane)) = (&self.experts, &self.batch.stream) {
+            experts
+                .join_streams(&self.job, lane)
+                .map_err(Failure::fatal(PHASE))?;
         }
-        self.runtime.order.record(stream).map_err(fatal)?;
+        self.runtime
+            .order
+            .record(self.job.on(self.batch.stream.as_ref()))
+            .map_err(Failure::fatal(PHASE))?;
         Ok(Commit {
             step: None,
             point,
             captures,
-            pending,
         })
     }
 
@@ -421,9 +387,16 @@ impl Batch<'_> {
     /// slots' retained prompt logits.
     fn install_prompt_tails(&self) -> Result<()> {
         let tails: Vec<(usize, usize, usize)> = self
+            .batch
             .calls
             .iter()
-            .filter_map(|state| Some((state.microbatch, state.prompt.last()?.tail, state.slot)))
+            .filter_map(|state| {
+                Some((
+                    state.forward.microbatch,
+                    state.forward.prompt.last()?.tail,
+                    state.slot,
+                ))
+            })
             .collect();
         if tails.is_empty() {
             return Ok(());
@@ -440,6 +413,6 @@ impl Batch<'_> {
         }
         // SAFETY: rows of the binding's tail column, written by this
         // batch's step, into distinct slots' retained logits.
-        unsafe { self.job.on(self.stream.as_ref()).copy(&copies) }
+        unsafe { self.job.on(self.batch.stream.as_ref()).copy(&copies) }
     }
 }

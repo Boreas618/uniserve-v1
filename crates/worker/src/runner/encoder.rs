@@ -2472,7 +2472,7 @@ impl ImageBatch<'_> {
         }
         let route = self.encoder_route(call)?;
         let target = self.target();
-        let stream = self.stream.clone();
+        let stream = self.batch.stream.clone();
 
         // Every image, inline or resident, prepared for the encoder. A
         // resident image is prepared by a call of the job.
@@ -2504,7 +2504,7 @@ impl ImageBatch<'_> {
                             ..
                         }) => range,
                         _ => {
-                            self.reads.push(read);
+                            self.batch.reads.push(read);
                             return Err(Error::Invalid(
                                 "resident image encoding requires an image value range".into(),
                             ));
@@ -2512,7 +2512,7 @@ impl ImageBatch<'_> {
                     };
                     let runner = &self.parts.encoders.image[route];
                     let value = read.value().clone();
-                    self.reads.push(read);
+                    self.batch.reads.push(read);
                     runner.prepare_resident(&value, tower, range == ValueRange::SignedUnit, job)?;
                     resident.push(position);
                     images.push(None);
@@ -2566,7 +2566,7 @@ impl ImageBatch<'_> {
             &allocations,
             OutputPlacement::default(),
         )?;
-        self.writes.extend(writes.iter().cloned());
+        self.batch.writes.extend(writes.iter().cloned());
         let runner = &mut self.parts.encoders.image[route];
         let products: Vec<StorageView> = writes.iter().map(|write| write.view()).collect();
         let borrowed: Vec<&PreparedImage> = images.iter().collect();
@@ -2597,7 +2597,7 @@ impl ImageBatch<'_> {
     ) -> Result<ForwardStats> {
         let plan = self.plan;
         let active = self.active();
-        let stream = self.stream.clone();
+        let stream = self.batch.stream.clone();
         let issue = job.on(stream.as_ref());
         for (((write, image), shape), &index) in
             writes.iter().zip(images).zip(&encoded.shapes).zip(&active)
@@ -2619,7 +2619,7 @@ impl ImageBatch<'_> {
                 &self.storage.transports,
                 &plan.calls[index],
                 write,
-                self.reports,
+                self.batch.reports,
                 issue,
             )?;
             if let Some(export) = export {

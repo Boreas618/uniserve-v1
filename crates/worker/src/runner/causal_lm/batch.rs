@@ -1,49 +1,45 @@
-//! A token batch's reservation and retirement.
+//! A token batch's reservation, on the shared batch skeleton
+//! ([`crate::executor::batch`]).
 //!
-//! [`Opening::open`] binds every call's pending output and records the
-//! reads of the batch's host-gated predicates. [`Batch::lease`] leases the
-//! batch's output storage. [`Batch::reserve`] installs the active calls'
-//! block tables, resets newly assigned units, retains the cache extents the
-//! batch reads and writes until its device work retires, binds its scalar
-//! products and leases its relayed predicates. [`Batch::discard`] retires
-//! all of it after a failure before the commit point.
+//! [`Opening::open`] orders the batch after the previous one, binds every
+//! call's pending output and records the reads of the batch's host-gated
+//! predicates. [`TokenBatch::lease`] leases the batch's output storage.
+//! [`TokenBatch::reserve`] installs the active calls' block tables, resets
+//! newly assigned units, retains the cache extents the batch reads and
+//! writes until its device work retires, binds its scalar products and
+//! leases its relayed predicates. A failure before the commit point retires
+//! all of it ([`Batch::discard`]).
 //!
 //! None of this issues on the batch's stream: every stream operation is
 //! recorded in the batch's job. A batch is a sequence of jobs, and between
-//! two of them it is a [`TokenBatch`], which borrows nothing.
+//! two of them it is [`Parked`], which borrows nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 use uniserve_cuda::Stream;
-use uniserve_ipc::{Batch as BatchPlan, CallStatus, DType, ForwardMode, RequestKey, TensorRef};
+use uniserve_ipc::{Batch as BatchPlan, DType, ForwardMode, RequestKey, TensorRef};
 
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, CausalLMRunners};
-use crate::executor::PendingOutput;
-use crate::executor::batch::{lock, reports_output, seal};
+use crate::executor::batch::{Batch, Launched};
 use crate::executor::image::ImageParts;
 use crate::ffi::Device;
 use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
 use crate::sampling::SamplingControls;
-use crate::storage::{OutputLease, OutputPlacement, ProductBuffer, ProductRead, Scalar};
-use crate::transfer::Retirement;
+use crate::storage::{OutputPlacement, ProductBuffer, Scalar};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
-/// One call's state through its batch.
-pub(super) struct CallState {
-    pub(super) output: PendingOutput,
-    pub(super) slot: usize,
-    /// False when the call's host predicate skipped it.
-    pub(super) active: bool,
+/// What a call contributes to its token batch's forward, beside the state
+/// every batch keeps of it ([`crate::executor::batch::CallState`]).
+#[derive(Default)]
+pub(crate) struct TokenCall {
     pub(super) prepared: Option<Prepared>,
     pub(super) token_write: Option<ProductBuffer>,
     pub(super) transition_write: Option<ProductBuffer>,
-    pub(super) completion_write: Option<ProductBuffer>,
     /// The runner of the microbatch the call's row runs in.
     pub(super) microbatch: usize,
     /// The call's input index among its invocation's sampled tasks.
@@ -75,52 +71,37 @@ pub(crate) struct Opening {
     stream: Option<Stream>,
     device: Option<i32>,
     mode: ForwardMode,
-    /// This rank reports the component's host results.
-    reports: bool,
-    calls: Vec<CallState>,
-    /// The calls whose host-gated predicate the opening job reads, in the
-    /// order of its reads.
-    predicated: Vec<usize>,
-    started: Instant,
+    calls: crate::executor::batch::Opening<TokenCall>,
 }
 
-/// A token batch between two of its jobs: what it reserved and each call's
-/// state.
-pub(crate) struct TokenBatch {
-    pub(super) group: usize,
-    pub(super) stream: Option<Stream>,
-    pub(super) device: Option<i32>,
-    pub(super) mode: ForwardMode,
-    pub(super) reports: bool,
-    pub(super) calls: Vec<CallState>,
-    pub(super) buffer: OutputLease,
-    pub(super) writes: Vec<ProductBuffer>,
-    pub(super) reads: Vec<Arc<ProductRead>>,
-    pub(super) retirement: Arc<Retirement>,
-    pub(super) started: Instant,
+/// A token batch between two of its jobs: the batch and the runner group
+/// serving it.
+pub(crate) struct Parked {
+    group: usize,
+    mode: ForwardMode,
+    batch: Batch<TokenCall>,
 }
 
-/// A token batch's borrowed owners, the resources it reserved and the job
-/// that records its stream work.
-pub(super) struct Batch<'a> {
+impl Parked {
+    /// The committed batch as launched work awaiting materialization.
+    pub(super) fn launch(self, stats: uniserve_ipc::ForwardStats) -> Launched {
+        self.batch.launch(stats, "text_materialize", None)
+    }
+}
+
+/// A token batch's borrowed owners, the batch and the job that records its
+/// stream work.
+pub(super) struct TokenBatch<'a> {
     pub(super) runtime: &'a mut CausalLMRunners,
     pub(super) image: Option<ImageParts<'a>>,
     pub(super) storage: &'a mut RankStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
     pub(super) experts: Option<Arc<ExpertUnion>>,
+    /// The runner group serving the batch.
     pub(super) group: usize,
-    pub(super) stream: Option<Stream>,
-    pub(super) device: Option<i32>,
     pub(super) mode: ForwardMode,
-    pub(super) reports: bool,
-    pub(super) calls: Vec<CallState>,
-    pub(super) buffer: OutputLease,
-    pub(super) writes: Vec<ProductBuffer>,
-    pub(super) reads: Vec<Arc<ProductRead>>,
-    /// Signals the physical end of the batch's cache accesses.
-    pub(super) retirement: Arc<Retirement>,
-    pub(super) started: Instant,
+    pub(super) batch: Batch<TokenCall>,
     /// The batch's next job on its lane.
     pub(super) job: Job,
 }
@@ -135,7 +116,6 @@ impl Opening {
         rank: usize,
         job: &Job,
     ) -> Result<Self> {
-        let started = Instant::now();
         let plan = owners.plan;
         let runtime = &mut *owners.runtime;
         let first = plan
@@ -160,97 +140,47 @@ impl Opening {
         let lane = runtime.groups[group][0];
         let device = runtime.runners[lane].device();
         let stream = runtime.runners[lane].stream().cloned();
-        let reports = reports_output(info, rank, &first.component)?;
-
-        // Output rows, bound to their requests' live epochs and slots.
-        let rows = plan
-            .calls
-            .iter()
-            .map(|call| {
-                let request = owners.requests.get(call.request_key.request_id.0)?;
-                Ok((call.request_key, call.call_id, request.slot()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let bound = owners.requests.bind_calls(&rows)?;
-        let mut calls = Vec::with_capacity(plan.calls.len());
-        for (index, (call, request)) in plan.calls.iter().zip(&bound).enumerate() {
-            calls.push(CallState {
-                output: PendingOutput::new(call, request.progress()?, index)?,
-                slot: request.slot(),
-                active: true,
-                prepared: None,
-                token_write: None,
-                transition_write: None,
-                completion_write: None,
-                microbatch: lane,
-                task: None,
-                controls: None,
-                prompt: Vec::new(),
-            });
-        }
 
         // Host-gated predicates resolve before any storage is reserved; a
-        // false one skips its call. Each is read after its producer's
-        // fence, and its lease ends behind the read.
+        // false one skips its call.
         let issue = job.on(stream.as_ref());
         runtime.order.wait(issue)?;
-        let tensors = &owners.storage.tensors;
-        let mut predicated = Vec::new();
-        for (index, call) in plan.calls.iter().enumerate() {
-            let Some(predicate) = call
-                .predicate
-                .as_ref()
-                .filter(|value| value.dtype == DType::U8)
-            else {
-                continue;
-            };
-            let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), issue)?;
-            issue.read(read.value().address(), 1);
-            tensors.complete_reads(&[read], issue, &[])?;
-            predicated.push(index);
+        let mut calls = crate::executor::batch::Opening::<TokenCall>::open(
+            owners.requests,
+            &owners.storage.tensors,
+            info,
+            rank,
+            plan,
+            device,
+            issue,
+            |_| true,
+        )?;
+        for state in calls.calls_mut() {
+            state.forward.microbatch = lane;
         }
         Ok(Self {
             group,
             stream,
             device,
             mode,
-            reports,
             calls,
-            predicated,
-            started,
         })
     }
 
     /// Whether the opening job reads predicates, so the batch continues
     /// only once it completed.
     pub(super) fn reads_predicates(&self) -> bool {
-        !self.predicated.is_empty()
+        self.calls.reads_predicates()
     }
 
     /// Apply the opening job's completion: a call whose predicate read
     /// false is skipped.
     pub(super) fn predicates(&mut self, completion: &mut Completion) -> Result<()> {
-        for index in std::mem::take(&mut self.predicated) {
-            let active = match completion.read()?[..] {
-                [0] => false,
-                [1] => true,
-                _ => {
-                    return Err(Error::Invalid(
-                        "call predicate is not a canonical boolean".into(),
-                    ));
-                }
-            };
-            if !active {
-                let state = &mut self.calls[index];
-                state.active = false;
-                state.output.output.status = CallStatus::Predicated;
-            }
-        }
-        Ok(())
+        self.calls.predicates(completion)
     }
 }
 
-impl<'a> Batch<'a> {
+impl<'a> TokenBatch<'a> {
     /// Lease the opened batch's output storage and begin its job.
     pub(super) fn lease(owners: Owners<'a>, opening: Opening, job: Job) -> Result<Self> {
         let Opening {
@@ -258,10 +188,7 @@ impl<'a> Batch<'a> {
             stream,
             device,
             mode,
-            reports,
             calls,
-            started,
-            ..
         } = opening;
         let plan = owners.plan;
 
@@ -275,37 +202,21 @@ impl<'a> Batch<'a> {
                         .unwrap_or(usize::MAX),
                 )
             });
-        let devices: Vec<i32> = device.into_iter().collect();
-        let buffer =
-            owners
-                .runtime
-                .outputs
-                .lease(plan.calls.len(), words.max(1), &devices, false)?;
-        if let Some(stream) = &stream {
-            lock(&buffer).begin_device(device, job.on(Some(stream)), &owners.storage.events)?;
-        }
-        Ok(Self::resume(
-            owners,
-            TokenBatch {
-                group,
-                stream,
-                device,
-                mode,
-                reports,
-                calls,
-                buffer,
-                writes: Vec::new(),
-                reads: Vec::new(),
-                retirement: Arc::new(Retirement::default()),
-                started,
-            },
-            job,
-        ))
+        let batch = Batch::lease(
+            calls,
+            &mut owners.runtime.outputs,
+            words,
+            stream,
+            device,
+            &owners.storage.events,
+            &job,
+        )?;
+        Ok(Self::resume(owners, Parked { group, mode, batch }, job))
     }
 
     /// Continue a batch with its owners borrowed again, recording into
     /// `job`.
-    pub(super) fn resume(owners: Owners<'a>, batch: TokenBatch, job: Job) -> Self {
+    pub(super) fn resume(owners: Owners<'a>, parked: Parked, job: Job) -> Self {
         Self {
             runtime: owners.runtime,
             image: owners.image,
@@ -313,38 +224,22 @@ impl<'a> Batch<'a> {
             requests: owners.requests,
             plan: owners.plan,
             experts: owners.experts,
-            group: batch.group,
-            stream: batch.stream,
-            device: batch.device,
-            mode: batch.mode,
-            reports: batch.reports,
-            calls: batch.calls,
-            buffer: batch.buffer,
-            writes: batch.writes,
-            reads: batch.reads,
-            retirement: batch.retirement,
-            started: batch.started,
+            group: parked.group,
+            mode: parked.mode,
+            batch: parked.batch,
             job,
         }
     }
 
     /// Give the owners back: the job to submit, the batch as it waits for
     /// the job's completion, and the owners.
-    pub(super) fn park(self) -> (Job, TokenBatch, Owners<'a>) {
+    pub(super) fn park(self) -> (Job, Parked, Owners<'a>) {
         (
             self.job,
-            TokenBatch {
+            Parked {
                 group: self.group,
-                stream: self.stream,
-                device: self.device,
                 mode: self.mode,
-                reports: self.reports,
-                calls: self.calls,
-                buffer: self.buffer,
-                writes: self.writes,
-                reads: self.reads,
-                retirement: self.retirement,
-                started: self.started,
+                batch: self.batch,
             },
             Owners {
                 runtime: self.runtime,
@@ -360,7 +255,7 @@ impl<'a> Batch<'a> {
     /// Install tables, reset units, retain cache extents, bind products and
     /// lease relayed predicates of the active calls.
     pub(super) fn reserve(&mut self) -> Result<()> {
-        let stream = self.job.on(self.stream.as_ref());
+        let stream = self.job.on(self.batch.stream.as_ref());
         let plan = self.plan;
         let prefix_cache = self
             .storage
@@ -370,6 +265,7 @@ impl<'a> Batch<'a> {
 
         // Tables and new units precede any of the batch's writes.
         let active: HashSet<u32> = self
+            .batch
             .calls
             .iter()
             .filter(|state| state.active)
@@ -405,7 +301,7 @@ impl<'a> Batch<'a> {
                 .ok_or_else(|| Error::Invalid("forward row names no call".into()))?
                 .push(row);
         }
-        for ((call, state), call_rows) in plan.calls.iter().zip(&self.calls).zip(&rows) {
+        for ((call, state), call_rows) in plan.calls.iter().zip(&self.batch.calls).zip(&rows) {
             if !state.active {
                 continue;
             }
@@ -457,7 +353,7 @@ impl<'a> Batch<'a> {
                 prefix_cache.manager().retain_execution(
                     call.request_key,
                     &spans,
-                    Arc::clone(&self.retirement),
+                    Arc::clone(&self.batch.retirement),
                 );
             }
         }
@@ -470,16 +366,16 @@ impl<'a> Batch<'a> {
     /// of every call; skipped calls publish false flags now.
     fn bind_products(&mut self) -> Result<()> {
         let plan = self.plan;
-        let target = self.device.map_or(Device::Cpu, Device::Cuda);
+        let target = self.batch.target();
         let slots: HashMap<RequestKey, usize> = plan
             .calls
             .iter()
-            .zip(&self.calls)
+            .zip(&self.batch.calls)
             .map(|(call, state)| (call.request_key, state.slot))
             .collect();
         let mut groups: indexmap::IndexMap<(DType, String), Vec<(TensorRef, Device)>> =
             indexmap::IndexMap::new();
-        for (call, state) in plan.calls.iter().zip(&self.calls) {
+        for (call, state) in plan.calls.iter().zip(&self.batch.calls) {
             if !call.outputs.is_empty()
                 || call.image_output.is_some()
                 || call.encoder_output.is_some()
@@ -519,24 +415,24 @@ impl<'a> Batch<'a> {
             .collect();
         for write in bound.into_iter().flatten() {
             let id = write.id();
-            self.writes.push(write.clone());
+            self.batch.writes.push(write.clone());
             let index = owners[&id.owner];
             let call = &plan.calls[index];
-            let state = &mut self.calls[index];
+            let state = &mut self.batch.calls[index];
             let names = |value: &Option<TensorRef>| {
                 value.as_ref().is_some_and(|value| value.buffer_id() == id)
             };
             if names(&call.token_output) {
-                state.token_write = Some(write);
+                state.forward.token_write = Some(write);
             } else if names(&call.transition_output) {
-                state.transition_write = Some(write);
+                state.forward.transition_write = Some(write);
             } else if names(&call.completion_output) {
                 state.completion_write = Some(write);
             }
         }
-        let stream = self.job.on(self.stream.as_ref());
-        for state in self.calls.iter().filter(|state| !state.active) {
-            for write in [&state.completion_write, &state.transition_write]
+        let stream = self.job.on(self.batch.stream.as_ref());
+        for state in self.batch.calls.iter().filter(|state| !state.active) {
+            for write in [&state.completion_write, &state.forward.transition_write]
                 .into_iter()
                 .flatten()
             {
@@ -551,12 +447,12 @@ impl<'a> Batch<'a> {
     /// Lease every active call's relayed predicate on the consuming stream,
     /// which waits on each producer fence.
     fn lease_predicates(&mut self) -> Result<()> {
-        let target = self.device.map_or(Device::Cpu, Device::Cuda);
+        let target = self.batch.target();
         let requests: Vec<_> = self
             .plan
             .calls
             .iter()
-            .zip(&self.calls)
+            .zip(&self.batch.calls)
             .filter(|(_, state)| state.active)
             .filter_map(|(call, _)| {
                 call.predicate
@@ -566,40 +462,12 @@ impl<'a> Batch<'a> {
             })
             .collect();
         if !requests.is_empty() {
-            self.reads = self.storage.tensors.consume_batch(
+            self.batch.reads = self.storage.tensors.consume_batch(
                 &requests,
                 Some(target),
-                self.job.on(self.stream.as_ref()),
+                self.job.on(self.batch.stream.as_ref()),
             )?;
         }
         Ok(())
-    }
-
-    /// Seal the lease on the batch's stream and retire its cache accesses and
-    /// output storage once the fences complete.
-    pub(super) fn seal(&self) -> Result<()> {
-        seal(
-            &self.storage.events,
-            &self.buffer,
-            self.job.on(self.stream.as_ref()),
-            &self.retirement,
-        )
-    }
-
-    /// Retire every reservation after a failure before the commit point;
-    /// storage returns once the fences recorded here complete.
-    pub(super) fn discard(&mut self) -> Result<()> {
-        let stream = self.job.on(self.stream.as_ref());
-        let reads = std::mem::take(&mut self.reads);
-        let completed = self.storage.tensors.complete_reads(&reads, stream, &[]);
-        let writes = std::mem::take(&mut self.writes);
-        let abandoned = self.storage.tensors.abandon_writes(&writes);
-        let sealed = if lock(&self.buffer).sealed() {
-            Ok(())
-        } else {
-            self.seal()
-        };
-        lock(&self.buffer).abandon();
-        completed.and(abandoned).and(sealed)
     }
 }

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 use uniserve_ipc::{BufferAllocation, BufferId, DType as ProductDType, TensorRef};
 
-use super::batch::TransferBatch;
+use super::TransferBatch;
 use super::latents;
 use crate::executor::image::ImageParts;
 use crate::ffi::Device;
@@ -96,7 +96,7 @@ impl TransferBatch<'_> {
                 .storage
                 .tensors
                 .consume(input, call.call_id, Some(target), issue)?;
-            self.reads.push(std::sync::Arc::clone(&read));
+            self.recorded.batch.reads.push(std::sync::Arc::clone(&read));
             if read.value().dtype() != product_dtype(output.dtype)? {
                 return Err(Error::Invalid(
                     "product transfer changes its declared representation".into(),
@@ -146,7 +146,7 @@ impl TransferBatch<'_> {
                     .ok_or_else(|| {
                         Error::Invalid("latent transfer has no bound parameters".into())
                     })?;
-                let slot = self.recorded.calls[index].slot;
+                let slot = self.recorded.batch.calls[index].slot;
                 let (pool, storage) = image.latent_pool()?;
                 let pages: Vec<usize> = params
                     .page_table
@@ -200,7 +200,7 @@ impl TransferBatch<'_> {
             allocations,
             OutputPlacement::default(),
         )?;
-        self.recorded.writes.extend(bound.iter().cloned());
+        self.recorded.batch.writes.extend(bound.iter().cloned());
 
         let mut groups: IndexMap<(Placement, ProductDType, String), Vec<(TensorRef, Device)>> =
             IndexMap::new();
@@ -235,7 +235,7 @@ impl TransferBatch<'_> {
             },
         )?;
         for write in others.into_iter().flatten() {
-            self.recorded.writes.push(write.clone());
+            self.recorded.batch.writes.push(write.clone());
             bound.push(write);
         }
 

@@ -939,7 +939,7 @@ impl ImageBatch<'_> {
         Ok((
             Trajectory {
                 index,
-                slot: self.calls[index].slot,
+                slot: self.batch.calls[index].slot,
                 params,
                 steps: u32::from(image.steps),
             },
@@ -954,8 +954,8 @@ impl ImageBatch<'_> {
         let buffer = call.cache_input.ok_or_else(|| {
             Error::Invalid("image trajectory requires its conditioning prefix cache".into())
         })?;
-        let slot = self.calls[index].slot as u32;
-        let visible = self.calls[index].output.progress.cache_visible_len;
+        let slot = self.batch.calls[index].slot as u32;
+        let visible = self.batch.calls[index].output.progress.cache_visible_len;
         let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
             Error::Unsupported("image trajectories require a prefix cache".into())
         })?;
@@ -981,7 +981,7 @@ impl ImageBatch<'_> {
         let Some(product) = &call.latent_output else {
             return Ok(());
         };
-        if !self.reports || !self.storage.transports.exports_remotely() {
+        if !self.batch.reports || !self.storage.transports.exports_remotely() {
             return Ok(());
         }
         let (pool, storage) = self.parts.latent_pool()?;
@@ -991,7 +991,7 @@ impl ImageBatch<'_> {
             &self.storage.transports,
             call,
             product,
-            self.calls[index].slot,
+            self.batch.calls[index].slot,
             params,
             bank,
             step,
@@ -1116,7 +1116,7 @@ impl ImageBatch<'_> {
     }
 
     fn record_latents(&mut self, job: &Job) -> Result<ForwardStats> {
-        let stream = self.stream.clone();
+        let stream = self.batch.stream.clone();
         let issue = job.on(stream.as_ref());
         let mut trajectories = Vec::new();
         for index in self.active() {
@@ -1127,7 +1127,7 @@ impl ImageBatch<'_> {
                     "latent preparation assigns no denoising steps".into(),
                 ));
             }
-            if self.calls[index].output.progress.flow_step != 0 {
+            if self.batch.calls[index].output.progress.flow_step != 0 {
                 return Err(Error::Invalid(
                     "latent preparation requires a fresh trajectory".into(),
                 ));
@@ -1243,7 +1243,11 @@ impl ImageBatch<'_> {
             .values()
             .flatten()
             .map(|row| row.slot)
-            .chain(active.iter().map(|&index| self.calls[index].slot as u32))
+            .chain(
+                active
+                    .iter()
+                    .map(|&index| self.batch.calls[index].slot as u32),
+            )
             .collect();
         let units = self.parts.denoisers.units.as_ref();
         let prefix_cache = self.storage.prefix_cache.as_mut().ok_or_else(|| {
@@ -1276,7 +1280,7 @@ impl ImageBatch<'_> {
             }
             let key = plan.calls[index].request_key;
             let slot = forward.request_pool_indices[row];
-            let own = self.calls[index].slot as u32;
+            let own = self.batch.calls[index].slot as u32;
             let tables = prefix_cache.tables_mut();
             if slot != own {
                 if forward.seq_lens[row] - forward.query_lens[row] > tables.allocated_length(slot) {
@@ -1303,7 +1307,7 @@ impl ImageBatch<'_> {
             prefix_cache.manager().retain_execution(
                 key,
                 &spans,
-                std::sync::Arc::clone(&self.retirement),
+                std::sync::Arc::clone(&self.batch.retirement),
             );
         }
         Ok(descriptors)
@@ -1395,7 +1399,7 @@ impl ImageBatch<'_> {
         if active.is_empty() {
             return Ok(Progress::done(ForwardStats::default()));
         }
-        let stream = self.stream.clone();
+        let stream = self.batch.stream.clone();
         if let Some(text) = text.as_deref() {
             // Conditioning K/V and earlier prefixes were written by text
             // batches, possibly on another stream.
@@ -1470,7 +1474,7 @@ impl ImageBatch<'_> {
         experts: Option<&Arc<ExpertUnion>>,
     ) -> Result<Progress> {
         let plan = self.plan;
-        let stream = self.stream.clone();
+        let stream = self.batch.stream.clone();
         let trajectories: Vec<(Trajectory, ImageParams)> = trajectories
             .into_iter()
             .map(|(trajectory, image, conditioning)| {
@@ -1562,7 +1566,7 @@ impl ImageBatch<'_> {
         experts: Option<&Arc<ExpertUnion>>,
     ) -> Result<Progress> {
         let plan = self.plan;
-        let stream = self.stream.clone();
+        let stream = self.batch.stream.clone();
         let Denoising {
             trajectories,
             scratch,
@@ -1725,14 +1729,14 @@ impl ImageBatch<'_> {
         offset: u32,
     ) -> Result<()> {
         let plan = self.plan;
-        let stream = self.stream.clone();
+        let stream = self.batch.stream.clone();
         // One denoising row per branch of every stepping image; images
         // of one size share a numerical call.
         let mut groups: Vec<SizeGroup> = Vec::new();
         for &(position, _, set, time) in stepping {
             let (trajectory, _) = &trajectories[position];
             let key = plan.calls[trajectory.index].request_key;
-            let logical = self.calls[trajectory.index]
+            let logical = self.batch.calls[trajectory.index]
                 .output
                 .progress
                 .logical_position;

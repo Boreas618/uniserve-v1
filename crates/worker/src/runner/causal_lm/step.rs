@@ -1,10 +1,10 @@
 //! A token batch's invocation: input rows, sampling tasks and prompt scoring.
 //!
-//! Every active call contributes its input rows ([`Batch::rows`]): one row,
+//! Every active call contributes its input rows ([`TokenBatch::rows`]): one row,
 //! or for a prefill placing image features one row per prompt run and
 //! vision block. The calls split into one invocation per expert microbatch
 //! of the batch's runner group (one invocation without microbatches), and
-//! [`Batch::step`] records their forwards in the batch's job. Sampled calls become
+//! [`TokenBatch::step`] records their forwards in the batch's job. Sampled calls become
 //! tasks: prefill and decode sample their last projected row, a
 //! verification every candidate row. A prefill chunk that scores its prompt
 //! projects all of its rows; they score its tokens, its last row also
@@ -15,7 +15,7 @@
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
-use super::batch::Batch;
+use super::batch::TokenBatch;
 use super::calls::{self, Prepared};
 use super::context::{self, Sources};
 use super::runners::Step;
@@ -174,7 +174,7 @@ impl PromptScore {
     }
 }
 
-impl Batch<'_> {
+impl TokenBatch<'_> {
     /// Build the active calls' input rows. A latent conditioning has no
     /// text row: the image denoiser writes its K/V before the invocations
     /// run.
@@ -188,7 +188,7 @@ impl Batch<'_> {
         let tables = prefix_cache.tables();
 
         let active: Vec<usize> = (0..plan.calls.len())
-            .filter(|&index| self.calls[index].active)
+            .filter(|&index| self.batch.calls[index].active)
             .collect();
         let mut forward_rows: Vec<Vec<usize>> = vec![Vec::new(); plan.calls.len()];
         for (row, &call) in plan.forward.call_indices.iter().enumerate() {
@@ -211,7 +211,7 @@ impl Batch<'_> {
                 .as_ref()
                 .map(|ar| ar.finish_token_ids.clone())
                 .unwrap_or_default();
-            let state = &mut self.calls[index];
+            let state = &mut self.batch.calls[index];
             let prepared = if call.writes_context() || call.writes_visual_state() {
                 // A context prefill scores its prompt text; a visual-state
                 // row has no prompt tokens.
@@ -220,8 +220,8 @@ impl Batch<'_> {
                     tensors: &self.storage.tensors,
                     image: self.image.as_ref(),
                     tables,
-                    device: self.device,
-                    stream: self.job.on(self.stream.as_ref()),
+                    device: self.batch.device,
+                    stream: self.job.on(self.batch.stream.as_ref()),
                     input_images,
                 };
                 let slot = state.slot as u32;
@@ -276,10 +276,10 @@ impl Batch<'_> {
                     embeddings: Vec::new(),
                 }),
             }
-            state.prepared = Some(prepared);
+            state.forward.prepared = Some(prepared);
             params[index] = Some((admitted, finish));
         }
-        self.reads.extend(reads);
+        self.batch.reads.extend(reads);
         Ok(Rows {
             inputs,
             params,
@@ -339,7 +339,7 @@ impl Batch<'_> {
             )?)
         };
         for (index, controls) in metadata {
-            self.calls[index].controls = Some(controls);
+            self.batch.calls[index].forward.controls = Some(controls);
         }
 
         let invocations = planned
@@ -402,12 +402,13 @@ impl Batch<'_> {
         for (input, &(first_row, row_count)) in inputs.iter().zip(&spans) {
             let index = input.call;
             let call = &plan.calls[index];
-            let state = &mut self.calls[index];
-            state.microbatch = runner;
+            let state = &mut self.batch.calls[index];
+            state.forward.microbatch = runner;
             let (admitted, finish) = params[index]
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("active call lost its parameters".into()))?;
             let prepared = state
+                .forward
                 .prepared
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("active call has no row".into()))?;
@@ -422,15 +423,15 @@ impl Batch<'_> {
                 finish,
                 &positions,
                 prepared.drafts.clone(),
-                state.transition_write.is_some(),
+                state.forward.transition_write.is_some(),
             )?;
             greedy &= calls::greedy_eligible(
                 call,
                 admitted,
                 prepared,
                 &controls.finish_token_ids,
-                state.token_write.is_some(),
-                state.transition_write.is_some(),
+                state.forward.token_write.is_some(),
+                state.forward.transition_write.is_some(),
             );
             // The call samples from its last row.
             let position = first_row + row_count - 1;
@@ -461,7 +462,7 @@ impl Batch<'_> {
                 let token = rows[..position].iter().map(|row| row.query as usize).sum();
                 prompts.push((index, (first, count), token, i64::from(continued)));
             }
-            state.task = Some(sampled.len());
+            state.forward.task = Some(sampled.len());
             sampled.push((index, controls, draws, row, prepared.tagged));
         }
         // An image prompt scores each prompt run; a run after a vision block
@@ -469,8 +470,8 @@ impl Batch<'_> {
         // block retains its logits for the next chunk.
         for (input, &(first_row, row_count)) in inputs.iter().zip(&spans) {
             let index = input.call;
-            let state = &self.calls[index];
-            let Some(prepared) = &state.prepared else {
+            let state = &self.batch.calls[index];
+            let Some(prepared) = &state.forward.prepared else {
                 continue;
             };
             if !prepared.scores || prepared.media.is_none() {
@@ -504,7 +505,7 @@ impl Batch<'_> {
                         .0,
                     controls: controls.clone(),
                     draws: draws.clone(),
-                    slot: self.calls[*index].slot as u32,
+                    slot: self.batch.calls[*index].slot as u32,
                     row: *row,
                     gated: *gated,
                 })
@@ -522,7 +523,7 @@ impl Batch<'_> {
             Some(SamplingMetadata::build(
                 &tasks,
                 vocab,
-                self.device.is_some(),
+                self.batch.device.is_some(),
                 0,
                 dimensions.logprob_words(),
             )?)
@@ -551,7 +552,7 @@ impl Batch<'_> {
                 span,
                 token,
                 continued,
-                slot: self.calls[index].slot,
+                slot: self.batch.calls[index].slot,
                 tail,
                 words: cursor,
                 size: logprob_words(scored, top, ids.len()),
@@ -565,7 +566,7 @@ impl Batch<'_> {
             };
             score.record(&mut prompt_chunks, top, &ids);
             cursor += score.size;
-            self.calls[index].prompt.push(score);
+            self.batch.calls[index].forward.prompt.push(score);
         }
         if cursor > dimensions.logprob_words() {
             return Err(Error::Resource(
