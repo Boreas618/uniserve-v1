@@ -3,9 +3,10 @@
 //!
 //! An image request denoises one trajectory per generated image. When its
 //! latent is prepared, its batch opens an [`ImageTrajectory`]: the
-//! guidance plan the model's schedules and guidance select per step (built
-//! by Python once per trajectory and kept as an opaque handle the solver
-//! update receives back), and the request's guidance prefixes.
+//! guidance plan the model's schedules and guidance select per step (asked
+//! of the library once per trajectory; the solver update rebuilds the
+//! schedules and guidance from the image's parameters, which the plan
+//! keeps), and the request's guidance prefixes.
 //!
 //! Each guidance branch attends to a cache prefix: the conditioned branch to
 //! the request's own context; the unconditional branches to prefixes the
@@ -22,7 +23,8 @@ use std::sync::Arc;
 
 use uniserve_ipc::RequestKey;
 
-use crate::ffi::Handle;
+use uniserve_core::ImageParams;
+
 use crate::{Error, Result};
 
 /// A classifier-free guidance branch (`uniserve.diffusion.Branch`).
@@ -178,12 +180,12 @@ pub struct PrefixFill {
 }
 
 /// The guidance plan of one trajectory: per-step evaluation branches and
-/// timesteps, with the Python schedules and guidance the solver update
-/// combines predictions with.
+/// timesteps, with the image parameters its schedules and guidance are made
+/// from, which the solver update combines predictions with.
 #[derive(Clone, Debug)]
 pub struct GuidancePlan {
-    /// Opaque schedules and guidance (`DenoiserRunner.plan`).
-    pub handle: Handle,
+    /// The image parameters (`DenoiserRunner.plan`).
+    pub params: Arc<ImageParams>,
     /// The model timestep of each solver step.
     pub timesteps: Vec<f32>,
     /// The branches each step evaluates.
@@ -448,7 +450,7 @@ mod tests {
 
     fn plan(masks: &[u8]) -> GuidancePlan {
         GuidancePlan {
-            handle: Handle::none(),
+            params: Arc::new(ImageParams::default()),
             timesteps: (0..masks.len()).map(|step| step as f32).collect(),
             branches: masks
                 .iter()
