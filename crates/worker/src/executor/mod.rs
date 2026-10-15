@@ -34,10 +34,14 @@
 //! waits for completed.
 
 pub mod backend;
-pub(crate) mod forward;
-mod inputs;
+pub(crate) mod batch;
+pub(crate) mod image;
+pub(crate) mod inputs;
 pub mod lifecycle;
 mod pending;
+pub(crate) mod products;
+pub(crate) mod transfer;
+pub(crate) mod video;
 
 pub use inputs::{BatchInputs, InputReady, InputWait};
 pub use pending::{BatchResult, PendingOutput, request_output};

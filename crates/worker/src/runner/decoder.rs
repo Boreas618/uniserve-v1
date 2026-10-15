@@ -46,11 +46,11 @@ use uniserve_ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 
 use crate::config::Device;
 use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
-use crate::executor::forward::batch::MediaBatch;
-use crate::executor::forward::batch::image::ImageParts;
-use crate::executor::forward::batch::image::{Encoding, ImageBatch, allocations, lock};
-use crate::executor::forward::batch::{Parts, decode_range, publish_bound, stream_of};
-use crate::executor::forward::placement::{OutputShape, Placement, bind_outputs};
+use crate::executor::image::ImageParts;
+use crate::executor::image::{Encoding, ImageBatch, allocations, lock};
+use crate::executor::products::{OutputShape, Placement, bind_outputs};
+use crate::executor::video::MediaBatch;
+use crate::executor::video::{Parts, decode_range, publish_bound, stream_of};
 use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};

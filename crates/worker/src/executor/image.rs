@@ -25,13 +25,13 @@ use uniserve_ipc::{
 
 use crate::error::WorkerError;
 use crate::executor::backend::{Parts, WorkerBackend, WorkerBatch};
-use crate::executor::forward::launch::{
+use crate::executor::batch::{
     HostStage, Launched, error_code, failed_output, flag, reports_output, request_flag,
     seal as seal_lease,
 };
-use crate::executor::forward::products::Publications;
-use crate::executor::forward::transfer::latents::{self, PendingExport, Pool};
-use crate::executor::forward::{Stage, unsupported};
+use crate::executor::batch::{Stage, unsupported};
+use crate::executor::products::Publications;
+use crate::executor::transfer::latents::{self, PendingExport, Pool};
 use crate::executor::{BatchResult, PendingOutput};
 use crate::ffi::Device;
 use crate::host::image::ImageResult;
@@ -94,7 +94,7 @@ pub(crate) fn fatal(error: Error) -> Failure {
     }
 }
 
-pub(crate) use super::super::launch::lock;
+pub(crate) use super::batch::lock;
 
 /// A batch's persistent buffer allocations by buffer.
 pub(crate) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocation> {

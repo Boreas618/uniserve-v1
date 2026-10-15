@@ -1,32 +1,45 @@
-//! Launched forward batches and their materialization.
+//! One batch in flight: the dispatch of its jobs to the capability that
+//! serves it, its launch and its materialization.
 //!
-//! A capability runtime reserves a batch's outputs, launches its device
-//! work and copies its result words into an output lease, then hands the
-//! batch to materialization as a [`Launched`] value. Once the lease's device
-//! fences complete, [`materialize`] reads the words back, decodes every
-//! call's result and accepts its progress into the request pool. These
-//! steps are the same for every runtime that executes forward calls. A
-//! runtime whose results also need host work after the device finished
-//! (encoding decoded images) attaches it as a [`HostStage`].
+//! Every batch carries calls of one kind on one component, and its forward
+//! is a sequence of jobs of its lane: [`forward`] prepares the next job and
+//! [`complete`] applies its completion. The first job completes the
+//! batch's imported inputs ([`crate::executor::inputs`]); the others belong
+//! to what serves the kind: the causal LM runner, the diffusion LM runner,
+//! an image model's batches ([`crate::executor::image`]), a video model's
+//! media batches ([`crate::executor::video`]) and transfers
+//! ([`crate::executor::transfer`]). A kind no capability of the rank serves
+//! is reported unsupported, which fails the batch with `UnsupportedSetup`
+//! and leaves the rank serving. No forward issues its own stream work: the
+//! jobs of every batch are operations its owner recorded.
+//!
+//! A capability reserves a batch's outputs, records its device work and the
+//! copies of its result words into an output lease, then hands the batch to
+//! materialization as a [`Launched`] value. Once the lease's device fences
+//! complete, [`materialize`] reads the words back, decodes every call's
+//! result and accepts its progress into the request pool. A capability whose
+//! results also need host work after the device finished (encoding decoded
+//! images) attaches it as a [`HostStage`].
 
-use std::sync::{Arc, MutexGuard, PoisonError};
-use std::time::Instant;
-
-use uniserve_core::CallId;
-use uniserve_cuda::Stream;
-use uniserve_ipc::{
-    Batch as BatchPlan, BatchOutput, Call, CallStatus, ErrorCode, ForwardStats, TensorRef,
-    WorkerInfo,
-};
-
+use super::backend::{WorkerBackend, WorkerBatch};
+use crate::config::placement::Capability;
+use crate::error::WorkerError;
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::Device;
-use crate::lane::{Completion, Recorder};
+use crate::lane::{Completion, Job, Recorder};
 use crate::request::RequestPool;
 use crate::storage::{OutputBuffer, OutputLease, TensorStore};
 use crate::stream::{EventPool, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
+use std::sync::{Arc, MutexGuard, PoisonError};
+use std::time::Instant;
+use uniserve_core::CallId;
+use uniserve_cuda::Stream;
+use uniserve_ipc::{
+    Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, ErrorCode, ForwardMode,
+    ForwardStats, MediaCall, TensorRef, WorkerInfo,
+};
 
 /// A forward batch launched on the device, awaiting its output fences.
 pub(crate) struct Launched {
@@ -255,7 +268,7 @@ pub(crate) fn materialize(
 
 /// Cancel a launched batch's unresolved calls; its storage retires through
 /// the fences it recorded.
-pub(crate) fn abandon(requests: &mut RequestPool, mut launched: Launched) -> Result<()> {
+fn abandon_launched(requests: &mut RequestPool, mut launched: Launched) -> Result<()> {
     if let Some(host) = &mut launched.host {
         host.cancel();
     }
@@ -302,4 +315,225 @@ impl StreamOrder {
         self.last = Some((raw, event));
         Ok(())
     }
+}
+
+/// Where a batch's forward stands between its jobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Its imported inputs are not resident yet.
+    #[default]
+    Inputs,
+    /// Its capability's forward has jobs to run.
+    Forward,
+    /// Nothing is left for its lane.
+    Done,
+}
+
+/// Materialize launched work whose device results are ready.
+pub(crate) fn poll(
+    backend: &mut WorkerBackend,
+    plan: &BatchPlan,
+    launched: &mut Launched,
+) -> std::result::Result<Option<BatchResult>, WorkerError> {
+    Ok(materialize(backend.requests_mut(), plan, launched)?)
+}
+
+/// Cancel launched work that will not be materialized.
+pub(crate) fn abandon(
+    backend: &mut WorkerBackend,
+    launched: Launched,
+) -> std::result::Result<(), WorkerError> {
+    Ok(abandon_launched(backend.requests_mut(), launched)?)
+}
+
+/// Fail every call of a batch whose execution failed before any runtime
+/// committed work: a fatal failure stops the rank, any other completes the
+/// batch with its calls failed under the failure's code.
+pub(crate) fn fail(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    error: Error,
+    context: &str,
+) -> std::result::Result<(), WorkerError> {
+    let error = WorkerError::classify(error, Some(context));
+    if error.fatal {
+        return Err(error);
+    }
+    let plan = batch.shared_plan();
+    tracing::warn!(
+        target: "uniserve_worker.execution",
+        "batch {} failed: {error}",
+        plan.batch_id
+    );
+    let output = failed_output(
+        backend.requests(),
+        plan,
+        batch.predecessors(),
+        error_code(error.code),
+    )?;
+    batch.complete(BatchResult {
+        output,
+        media: Vec::new(),
+    });
+    Ok(())
+}
+
+/// The error of a call kind whose runtime is not available on this rank.
+pub(crate) fn unsupported(kind: CallKind, runtime: &str) -> WorkerError {
+    WorkerError::classify(
+        Error::Unsupported(format!(
+            "{} is served by the {runtime} runtime",
+            kind_name(kind)
+        )),
+        None,
+    )
+}
+
+fn kind_name(kind: CallKind) -> &'static str {
+    match kind {
+        CallKind::Forward(mode) => mode.as_str(),
+        CallKind::Media(call) => call.as_str(),
+        CallKind::Transfer(mode) => mode.as_str(),
+    }
+}
+
+/// The next job of a batch's forward at its stage: the completion of its
+/// imported inputs, then the jobs of the runtime serving `kind`. `None`
+/// when the stage advanced without needing the lane.
+pub(crate) fn forward(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    kind: CallKind,
+) -> std::result::Result<Option<Job>, WorkerError> {
+    use CallKind::Forward;
+
+    match batch.stage() {
+        Stage::Inputs => match crate::executor::inputs::forward(backend, batch) {
+            Ok(Some(job)) => Ok(Some(job)),
+            // Nothing is left to issue for the imports.
+            Ok(None) => imported(backend, batch, Ok(())).map(|()| None),
+            Err(error) => imported(backend, batch, Err(error)).map(|()| None),
+        },
+        Stage::Forward => match kind {
+            Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
+                crate::runner::causal_lm::forward(backend, batch, kind)
+            }
+            Forward(ForwardMode::TokenDenoising) => {
+                crate::runner::diffusion_lm::forward(backend, batch, kind)
+            }
+            CallKind::Transfer(_) => crate::executor::transfer::forward(backend, batch, kind),
+            _ if records(backend, kind) => {
+                let (plan, borrowed, state) = batch.media_parts();
+                let mut parts = backend.media_parts()?;
+                Ok(Some(crate::executor::video::forward(
+                    &mut parts, plan, borrowed, state,
+                )?))
+            }
+            // A video model's rank records its media calls ([`records`]);
+            // no other rank serves these kinds.
+            CallKind::Media(
+                MediaCall::MediaReading
+                | MediaCall::VideoEncoding
+                | MediaCall::AudioEncoding
+                | MediaCall::Muxing
+                | MediaCall::VideoDecoding
+                | MediaCall::AudioDecoding,
+            ) => Err(unsupported(kind, "video")),
+            // The remaining kinds are an image model's: its encoders, its
+            // denoiser and its decoder.
+            _ => crate::executor::image::forward(backend, batch, kind),
+        },
+        Stage::Done => Ok(None),
+    }
+}
+
+/// Apply the completion of the job [`forward`] prepared last.
+pub(crate) fn complete(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    kind: CallKind,
+    completion: Completion,
+) -> std::result::Result<(), WorkerError> {
+    use CallKind::Forward;
+
+    if batch.stage() == Stage::Inputs {
+        return match crate::executor::inputs::complete(batch, completion) {
+            // The imports' second job follows.
+            Ok(false) => Ok(()),
+            Ok(true) => imported(backend, batch, Ok(())),
+            Err(error) => imported(backend, batch, Err(error)),
+        };
+    }
+    match kind {
+        Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
+            crate::runner::causal_lm::complete(backend, batch, completion)
+        }
+        Forward(ForwardMode::TokenDenoising) => {
+            crate::runner::diffusion_lm::complete(backend, batch, completion)
+        }
+        CallKind::Transfer(_) => crate::executor::transfer::complete(backend, batch, completion),
+        _ if records(backend, kind) => {
+            let done = {
+                let (_, _, state) = batch.media_parts();
+                let mut parts = backend.media_parts()?;
+                crate::executor::video::complete(&mut parts, state, completion)?
+            };
+            if done {
+                batch.set_stage(Stage::Done);
+            }
+            Ok(())
+        }
+        _ => crate::executor::image::complete(backend, batch, kind, completion),
+    }
+}
+
+/// Whether the forwards of `kind` on this rank are recorded into jobs
+/// ([`batch::forward`]): a video model's media calls, on its devices and
+/// on its host lane. The others issue their own stream work.
+fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
+    use MediaCall::*;
+
+    matches!(
+        kind,
+        CallKind::Media(
+            MediaReading
+                | TextEncoding
+                | VisionEncoding
+                | LatentEncoding
+                | LatentPreparation
+                | Denoising
+                | VideoDecoding
+                | AudioDecoding
+                | VideoEncoding
+                | AudioEncoding
+                | Muxing
+        )
+    ) && backend.serves_video()
+}
+
+/// Continue with the forward once the imported inputs are resident; an
+/// import that failed fails the batch's calls.
+fn imported(
+    backend: &mut WorkerBackend,
+    batch: &mut WorkerBatch,
+    completed: crate::Result<()>,
+) -> std::result::Result<(), WorkerError> {
+    match completed {
+        Ok(()) => batch.set_stage(Stage::Forward),
+        Err(error) => {
+            batch.set_stage(Stage::Done);
+            fail(backend, batch, error, "input import")?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a component's model decodes video.
+pub(crate) fn decodes_video(capabilities: impl IntoIterator<Item = Capability>) -> bool {
+    capabilities.into_iter().any(|capability| {
+        matches!(
+            capability,
+            Capability::VideoDenoiser | Capability::VideoPostprocessor
+        )
+    })
 }

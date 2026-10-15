@@ -23,7 +23,6 @@
 //! the component's device.
 
 mod batch;
-mod cache;
 pub(crate) mod latents;
 pub(crate) mod prefix_cache;
 mod tensor;
@@ -34,8 +33,8 @@ use std::sync::Arc;
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{Batch as BatchPlan, BufferId, CallKind, RequestKey, TransferMode};
 
-use super::super::backend::{WorkerBackend, WorkerBatch};
-use super::Stage;
+use super::backend::{WorkerBackend, WorkerBatch};
+use super::batch::Stage;
 use super::inputs::{Inputs, component_device};
 use crate::error::WorkerError;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
@@ -446,5 +445,5 @@ fn fail(
         error.fatal = true;
         return Err(error);
     }
-    super::fail(backend, batch, failure.error, "transfer batch")
+    super::batch::fail(backend, batch, failure.error, "transfer batch")
 }
