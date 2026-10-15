@@ -11,7 +11,7 @@ use crate::{Completion, Error, Result};
 mod backend;
 mod copy;
 
-pub(crate) use backend::{CacheImportBackend, CacheImporter, ImportTask, Retired};
+pub(crate) use backend::{CacheImportBackend, ImportTask, Retired};
 pub use backend::{ImportEntry, ImportWorkspace};
 pub use copy::{ImportBackend, ImportCopy};
 
@@ -108,12 +108,12 @@ struct PoolState<I, W> {
 
 /// Share a bounded set of import workspaces among host tasks.
 /// I retains an import owner and dereferences its stable state.
-pub struct KVImporter<I, W> {
+pub struct CacheImporter<I, W> {
     state: Mutex<PoolState<I, W>>,
     available: Condvar,
 }
 
-impl<I, W> KVImporter<I, W> {
+impl<I, W> CacheImporter<I, W> {
     pub fn new(workspaces: Vec<Arc<W>>) -> Self {
         Self {
             state: Mutex::new(PoolState {
@@ -137,7 +137,7 @@ impl<I, W> KVImporter<I, W> {
     }
 }
 
-impl<T, I, W> KVImporter<I, W>
+impl<T, I, W> CacheImporter<I, W>
 where
     I: Deref<Target = CacheImport<T, W>>,
 {

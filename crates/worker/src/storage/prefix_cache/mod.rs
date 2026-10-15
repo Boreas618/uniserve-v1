@@ -112,7 +112,7 @@ impl PendingImport {
 
 /// Import workspaces, their copy lane and the retirement observers.
 struct Imports {
-    importer: Arc<CacheImporter>,
+    importer: Arc<CacheImporter<ImportEntry, ImportWorkspace>>,
     lane: HostLane<ImportTask>,
     retired: Arc<Retired>,
 }

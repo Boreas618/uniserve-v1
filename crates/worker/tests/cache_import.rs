@@ -5,7 +5,7 @@ use std::sync::Arc;
 use uniserve_core::{CallId, RequestId};
 use uniserve_ipc::{BufferId, RequestKey};
 use uniserve_worker::{
-    CacheImport, Completion, Error, HostLane, ImportBackend, ImportCopy, KVImporter, Outcome,
+    CacheImport, CacheImporter, Completion, Error, HostLane, ImportBackend, ImportCopy, Outcome,
 };
 
 type Read = Arc<Completion<String, ()>>;
@@ -56,7 +56,7 @@ impl ImportBackend for FailedCopy {
 fn unknown_completion_keeps_backing_after_importer_and_task_drop()
 -> Result<(), Box<dyn std::error::Error>> {
     let lane = HostLane::new(1, 1, "cache-copy-failure")?;
-    let importer = Arc::new(KVImporter::new(vec![Arc::new(())]));
+    let importer = Arc::new(CacheImporter::new(vec![Arc::new(())]));
     let write = Arc::new(Import::new(
         BufferId {
             owner: RequestKey::new(1, RequestId(1), 1),

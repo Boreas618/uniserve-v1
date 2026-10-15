@@ -22,7 +22,7 @@ use uniserve_cuda::Stream;
 use uniserve_ipc::{CacheTransfer, Locator, Wake};
 
 use super::copy::{ImportBackend, ImportCopy};
-use super::{CacheImport, KVImporter};
+use super::{CacheImport, CacheImporter};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
 use crate::storage::memory::{Memory, StorageView, dtype_name, parse_dtype};
 use crate::storage::{CachePlanes, GroupTable, UnitColumn};
@@ -141,11 +141,9 @@ impl Deref for ImportEntry {
     }
 }
 
-pub(crate) type CacheImporter = KVImporter<ImportEntry, ImportWorkspace>;
-
 /// Notifies retired imports' observers and the service wake.
 pub(crate) struct Retired {
-    pub(crate) importer: Weak<CacheImporter>,
+    pub(crate) importer: Weak<CacheImporter<ImportEntry, ImportWorkspace>>,
     pub(crate) wake: Mutex<Option<Wake>>,
 }
 
@@ -185,7 +183,7 @@ pub(crate) struct CacheImportBackend {
     pub(crate) initialized: Vec<u32>,
     pub(crate) planes: Arc<CachePlanes>,
     pub(crate) transports: Arc<Transports>,
-    pub(crate) importer: Arc<CacheImporter>,
+    pub(crate) importer: Arc<CacheImporter<ImportEntry, ImportWorkspace>>,
     pub(crate) retired: Arc<Retired>,
 }
 

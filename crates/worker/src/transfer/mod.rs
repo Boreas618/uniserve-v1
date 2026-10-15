@@ -1,7 +1,7 @@
 //! Transfer admission, transports, readable results, and physical retirement.
 //!
 //! The generic cores ([`TransferCapacity`], [`TransferTicket`],
-//! [`TransferPool`], [`BufferRegistry`], [`KVImporter`]) own admission,
+//! [`TransferPool`], [`BufferRegistry`], [`CacheImporter`]) own admission,
 //! cancellation and retirement rules; the native layer instantiates them with
 //! Rust-owned storage ([`Spans`] of [`crate::storage::memory::StorageView`]s),
 //! driver copies and the shared [`EventPool`].
@@ -34,9 +34,9 @@ mod transport;
 pub mod vmm_pool;
 
 pub use cache_import::{
-    CacheImport, ImportBackend, ImportCopy, ImportEntry, ImportWorkspace, KVImporter,
+    CacheImport, CacheImporter, ImportBackend, ImportCopy, ImportEntry, ImportWorkspace,
 };
-pub(crate) use cache_import::{CacheImportBackend, CacheImporter, ImportTask, Retired};
+pub(crate) use cache_import::{CacheImportBackend, ImportTask, Retired};
 pub use descriptor_grants::{DescriptorGrants, fetch_descriptor};
 pub use peer::{PeerExchange, PeerStorage};
 pub use read::{Read, ReadRef};

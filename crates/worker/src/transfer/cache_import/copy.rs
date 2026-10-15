@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::{Completion, Error, HostAction, HostTask, Outcome};
 
-use super::{CacheImport, KVImporter};
+use super::{CacheImport, CacheImporter};
 
 /// The copy work of one import. Workspace admission, cancellation and
 /// physical retirement belong to the importer.
@@ -35,14 +35,14 @@ pub trait ImportBackend: Send + Sync + 'static {
 /// One cache import's copy task. The importer retains its workspace and reads
 /// independently of the task result until their physical accesses end.
 pub struct ImportCopy<B: ImportBackend> {
-    importer: Arc<KVImporter<B::Import, B::Workspace>>,
+    importer: Arc<CacheImporter<B::Import, B::Workspace>>,
     write: Arc<CacheImport<B::Read, B::Workspace>>,
     backend: B,
 }
 
 impl<B: ImportBackend> ImportCopy<B> {
     pub fn new(
-        importer: Arc<KVImporter<B::Import, B::Workspace>>,
+        importer: Arc<CacheImporter<B::Import, B::Workspace>>,
         write: Arc<CacheImport<B::Read, B::Workspace>>,
         backend: B,
     ) -> Self {
