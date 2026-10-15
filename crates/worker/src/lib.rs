@@ -83,7 +83,7 @@ pub use storage::{
     OutputStorage, ProductBuffer, ProductRead, RequestSlots, TablePages, TensorStore, UnitColumn,
     table_pages,
 };
-pub use stream::{CUDAStream, Deferred, EventPool, Fill, Issue, RowFill};
+pub use stream::{CUDAStream, Deferred, EventPool, Fill, Issue, RowFill, Submitter};
 pub use transfer::{
     BufferRegistry, DescriptorGrants, ImportBackend, ImportCopy, KVImport, KVImporter, PeerStorage,
     Read, ReadBackend, ReadRegion, ReadReservation, RegisteredBuffer, SHM_HEADER_BYTES,

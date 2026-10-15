@@ -563,22 +563,25 @@ impl TensorStore {
         Ok(())
     }
 
-    /// Wake the service when a released buffer's fences complete. `stream`
-    /// is what records the fences that are not recorded yet.
-    fn wake_retirement(&self, buffer: &ProductBuffer, stream: impl Issue) -> Result<()> {
+    /// Have the service pass again once the fences of a released buffer
+    /// completed: the buffer's storage returns on that pass
+    /// ([`Self::reclaim`]). The deferred work is nothing itself; the
+    /// completion it waits for is the wake. `stream` is what records the
+    /// fences that are not recorded yet.
+    fn follow_fences(&self, buffer: &ProductBuffer, stream: impl Issue) -> Result<()> {
         let events: Vec<_> = lock(buffer).events().cloned().collect();
-        for event in events {
-            if !event.query()? {
-                stream.wake(&self.events, &event)?;
-            }
+        for event in &events {
+            // The deferral's own reference; the buffer keeps its own
+            // until it is reclaimed.
+            self.events.retain(event, self.events.device(event)?, 1)?;
         }
-        Ok(())
+        stream.defer(&self.events, events, Box::new(|| Ok(())))
     }
 
-    /// Wake on retirement, through `stream`, and cancel the imports of a
-    /// never-produced buffer.
+    /// Follow the fences of a released buffer, through `stream`, and
+    /// cancel the imports of a never-produced buffer.
     fn retire_buffer(&self, buffer: &ProductBuffer, stream: impl Issue) -> Result<()> {
-        self.wake_retirement(buffer, stream)?;
+        self.follow_fences(buffer, stream)?;
         let transfers: Vec<_> = {
             let value = lock(buffer);
             if value.state.produced() {
@@ -972,7 +975,6 @@ impl TensorStore {
         stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
-        self.events.reap()?;
         let state = lock(&self.state);
         state.require_buffer(buffer)?;
         let view = buffer.view();
@@ -993,7 +995,6 @@ impl TensorStore {
         stream: impl Issue,
         metadata: Option<Metadata>,
     ) -> Result<StorageView> {
-        self.events.reap()?;
         let state = lock(&self.state);
         state.require_buffer(buffer)?;
         self.write_value(buffer, value, stream, metadata)
@@ -1114,7 +1115,6 @@ impl TensorStore {
         values: &StorageView,
         stream: impl Issue,
     ) -> Result<Vec<StorageView>> {
-        self.events.reap()?;
         let state = lock(&self.state);
         let mut targets = Vec::with_capacity(writes.len());
         let mut seen = HashSet::new();
@@ -1186,7 +1186,6 @@ impl TensorStore {
         value: Scalar,
         stream: impl Issue,
     ) -> Result<StorageView> {
-        self.events.reap()?;
         let state = lock(&self.state);
         state.require_buffer(buffer)?;
         if lock(buffer).state.produced() {
@@ -1319,7 +1318,6 @@ impl TensorStore {
         stream: impl Issue,
         after_writes: &[ProductBuffer],
     ) -> Result<()> {
-        self.events.reap()?;
         let mut state = lock(&self.state);
         let mut seen = HashSet::new();
         let pending: Vec<_> = reads
@@ -1422,7 +1420,7 @@ impl TensorStore {
             read.close()?;
         }
         for buffer in released {
-            self.wake_retirement(&buffer, stream)?;
+            self.follow_fences(&buffer, stream)?;
         }
         let mut state = lock(&self.state);
         self.reclaim(&mut state)
@@ -1660,7 +1658,6 @@ impl TensorStore {
     /// produced and committed; a widened shard gets one fence over the
     /// union of its regions and becomes the whole logical tensor.
     pub fn complete_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
-        self.events.reap()?;
         let mut state = lock(&self.state);
         Self::wait_imported(&state, read, stream)?;
         let imported = Self::imported(read)?;
@@ -1685,7 +1682,8 @@ impl TensorStore {
                 .map(|fence| Arc::clone(&fence.event));
             if let Some(previous) = previous {
                 let owner = buffer.clone();
-                self.events.defer(
+                stream.defer(
+                    &self.events,
                     vec![previous],
                     Box::new(move || {
                         drop(owner);
@@ -1716,8 +1714,9 @@ impl TensorStore {
         lock(&self.state).release_calls(calls.iter().copied());
     }
 
-    /// Revoke the exports of released buffers and release the buffers. The
-    /// wake behind a buffer's outstanding fences is issued to `stream`.
+    /// Revoke the exports of released buffers and release the buffers.
+    /// What follows a buffer's outstanding fences is deferred through
+    /// `stream`.
     pub fn release_buffers(&self, buffers: &HashSet<BufferId>, stream: impl Issue) -> Result<()> {
         let revoked: Vec<_> = {
             let mut exports = lock(&self.exports);
@@ -1744,8 +1743,8 @@ impl TensorStore {
 
     /// Release retired requests' products, except retained persistent ones,
     /// and revoke every export location registered for their buffers
-    /// (products and published KV extents). The wake behind a product's
-    /// outstanding fences is issued to `stream`.
+    /// (products and published KV extents). What follows a product's
+    /// outstanding fences is deferred through `stream`.
     pub fn release_requests(
         &self,
         requests: &HashSet<RequestKey>,

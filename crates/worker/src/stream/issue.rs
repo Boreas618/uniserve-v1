@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use uniserve_cuda::{CopyBatch, Event, Stream, StridedCopy};
 
-use super::EventPool;
+use super::{Deferred, EventPool};
 use crate::ffi::DeferredCall;
 use crate::transfer::copy_on_host;
 use crate::{Error, Result};
@@ -98,10 +98,14 @@ pub trait Issue: Copy {
     /// Order the work issued after this behind `event`'s latest record.
     fn wait(&self, event: &Arc<Event>) -> Result<()>;
 
-    /// Fire the completion wake of `events` once `event` completes.
-    /// `event` is recorded by this issuer or was recorded before, so the
-    /// wake is ordered behind that record wherever it is made.
-    fn wake(&self, events: &EventPool, event: &Arc<Event>) -> Result<()>;
+    /// Run `owner` once every one of `fences` completed: the release of
+    /// storage that the work they fence addressed ([`EventPool::defer`]).
+    /// Each fence is recorded by this issuer or was recorded before, and
+    /// one retained reference of each goes with the deferral. A stream,
+    /// which made its records already, hands the deferral to `events` at
+    /// once; a job keeps it until the job is submitted, so the pool never
+    /// follows an event whose record is still to be made.
+    fn defer(&self, events: &EventPool, fences: Vec<Arc<Event>>, owner: Deferred) -> Result<()>;
 
     /// A Python call whose device work belongs to the stream, in order.
     fn call(&self, call: DeferredCall) -> Result<()>;
@@ -308,15 +312,8 @@ impl Issue for Option<&Stream> {
         Ok(stream.wait_event(event)?)
     }
 
-    fn wake(&self, events: &EventPool, event: &Arc<Event>) -> Result<()> {
-        let Some((notification, wake)) = events.notification(event)? else {
-            return Ok(());
-        };
-        notification.wait_event(event)?;
-        // The host function only signals the service's wake: it never calls
-        // CUDA or blocks, as host functions must not.
-        notification.launch_host_fn(move || wake.wake())?;
-        Ok(())
+    fn defer(&self, events: &EventPool, fences: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {
+        events.defer(fences, owner)
     }
 
     fn call(&self, call: DeferredCall) -> Result<()> {
@@ -383,8 +380,8 @@ impl<'a> Issue for &'a Stream {
         Some(*self).wait(event)
     }
 
-    fn wake(&self, events: &EventPool, event: &Arc<Event>) -> Result<()> {
-        Some(*self).wake(events, event)
+    fn defer(&self, events: &EventPool, fences: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {
+        Some(*self).defer(events, fences, owner)
     }
 
     fn call(&self, call: DeferredCall) -> Result<()> {

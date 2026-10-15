@@ -3,7 +3,8 @@
 mod events;
 mod issue;
 
-pub use events::{Deferred, EventPool};
+pub(crate) use events::Deferral;
+pub use events::{Deferred, EventPool, Submitter};
 pub(crate) use issue::HostFunction;
 pub use issue::{Fill, Issue, RowFill};
 
