@@ -105,18 +105,13 @@ from uniserve.models import (
 )
 from uniserve.nn.attention import (
     AttentionBatch,
-    AttentionInput,
-    BlockTable,
-    PagedInput,
-    SegmentedInput,
-    SequenceLengths,
 )
-from uniserve.nn.attention.gather import gather_request_rows
 from uniserve.nn.rng import flow_noise_seed
 from uniserve.processing import (
     load_tokenizer,
     resolve_prefix,
 )
+from uniserve.runner.attention import AttentionMetadata
 from uniserve.runner.context import (
     execution_context,
     held_module,
@@ -449,23 +444,12 @@ class DenoiserRunner:
 
     # An image denoiser's resident tensors and the tensors only its
     # forwards read and write (see :meth:`bound`).
-    _page_tokens: tuple[int, ...]
-    _windowed: tuple[bool, ...]
     _pipeline: Any
     _samples: torch.Tensor
     _slot_timesteps: torch.Tensor
-    _unit_tables: torch.Tensor
-    _slot_start_pages: torch.Tensor
-    _table_shapes: torch.Tensor
     _predictions: torch.Tensor
     _step: torch.Tensor
-    _block_tables: torch.Tensor
-    _start_pages: torch.Tensor
-    _cache_lengths: torch.Tensor
-    _query_lengths: torch.Tensor
-    _query_offsets: torch.Tensor
-    _prefix_offsets: torch.Tensor
-    _write_indices: torch.Tensor
+    _attention_metadata: AttentionMetadata
 
     def __init__(
         self,
@@ -569,13 +553,8 @@ class DenoiserRunner:
         runner._network = network
         runner._context = context
         runner._device = samples.device
-        runner._page_tokens = tuple(int(value) for value in page_tokens)
-        runner._windowed = tuple(bool(value) for value in windowed)
         runner._samples = samples
         runner._slot_timesteps = slot_timesteps
-        runner._unit_tables = unit_tables
-        runner._slot_start_pages = start_pages
-        runner._table_shapes = table_shapes
         runner._pipeline = network.mesh.get_group(
             "pp" if "pp" in network.mesh.axes else ()
         )
@@ -585,28 +564,26 @@ class DenoiserRunner:
         # network's input carries, and the attention metadata the gather
         # derives from the slot tables. Captured graphs address them, so
         # they live as long as the runner.
-        rows, tokens, tables = int(rows), int(tokens), len(runner._page_tokens)
+        rows, tokens = int(rows), int(tokens)
         target = runner._device
         latent_width = network.patch_size**2 * network.latent_channels
         with torch.inference_mode(), torch.cuda.stream(context.stream):
-
-            def zeros(*shape: int) -> torch.Tensor:
-                return torch.zeros(shape, dtype=torch.int32, device=target)
-
             runner._predictions = torch.zeros(
                 (int(units), latent_width),
                 dtype=network.prediction_dtype,
                 device=target,
             )
             runner._step = torch.zeros(1, dtype=torch.int64, device=target)
-            runner._block_tables = zeros(tables, rows, int(width))
-            runner._start_pages = zeros(tables, rows)
-            runner._cache_lengths = zeros(rows)
-            runner._query_lengths = zeros(rows)
-            runner._query_offsets = zeros(rows + 1)
-            runner._prefix_offsets = zeros(rows + 1)
-            runner._write_indices = torch.full(
-                (tables, tokens), -1, dtype=torch.int64, device=target
+            runner._attention_metadata = AttentionMetadata(
+                page_tokens,
+                windowed,
+                unit_tables,
+                start_pages,
+                table_shapes,
+                rows,
+                tokens,
+                int(width),
+                target,
             )
         runner._draw_noise = runner._image_draw_noise
         runner._prepare_latents = runner._image_prepare_latents
@@ -1469,67 +1446,18 @@ class DenoiserRunner:
         read-only rows read their segments without writing. No row is
         causal.
         """
-        gather_request_rows(
-            columns=row_columns,
-            rows=count,
-            tokens=tokens,
-            width=int(max(widths)),
-            request_unit_tables=self._unit_tables,
-            request_start_pages=self._slot_start_pages,
-            table_shapes=self._table_shapes,
-            block_tables=self._block_tables,
-            start_pages=self._start_pages,
-            cache_lengths=self._cache_lengths,
-            query_lengths=self._query_lengths,
-            query_offsets=self._query_offsets,
-            prefix_offsets=self._prefix_offsets,
-            write_indices=self._write_indices,
+        metadata = self._attention_metadata
+        metadata.gather(row_columns, count, tokens, widths)
+        return metadata.batch(
+            count,
+            tokens,
+            widths,
+            queries,
+            prefixes,
+            starts,
+            (False,) * count,
+            writes=writes,
         )
-        query = SequenceLengths(
-            values=self._query_lengths[:count],
-            offsets=self._query_offsets[: count + 1],
-            host=tuple(int(value) for value in queries),
-        )
-        prefix = SequenceLengths(
-            values=self._cache_lengths[:count],
-            offsets=self._prefix_offsets[: count + 1],
-            host=tuple(int(value) for value in prefixes),
-        )
-        entries: dict[int, AttentionInput] = {}
-        for table, width in enumerate(widths):
-            first = None
-            host_first = None
-            if self._windowed[table]:
-                first = self._start_pages[table, :count]
-                host_first = tuple(
-                    int(value)
-                    for value in starts[table * count : (table + 1) * count]
-                )
-            blocks = BlockTable(
-                self._block_tables[table, :count, : int(width)],
-                self._page_tokens[table],
-                first,
-                host_first,
-            )
-            if writes:
-                entries[table] = PagedInput(
-                    query,
-                    prefix,
-                    blocks,
-                    self._write_indices[table, :tokens],
-                    (False,) * count,
-                    None,
-                )
-            else:
-                entries[table] = SegmentedInput(
-                    query,
-                    prefix,
-                    blocks,
-                    None,
-                    query.values[:, None].expand(-1, max(query.host or (1,))),
-                    True,
-                )
-        return AttentionBatch(entries, query)
 
     def _evaluate(
         self,
