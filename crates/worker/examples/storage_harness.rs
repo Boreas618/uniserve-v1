@@ -175,7 +175,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     let events = EventPool::new();
     let jobs = JobQueues::single_lane()?;
     let lane = jobs.clone();
-    events.set_submitter(Some(Box::new(move |device, events| {
+    events.set_submitter(Some(Box::new(move |device, _, events| {
         lane.after(CallKind::Forward(ForwardMode::Decode), device, events)
     })));
 

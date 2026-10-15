@@ -227,6 +227,28 @@ impl JobQueues {
         self.start(kind, job, true)
     }
 
+    /// Queue on lane `lane` a job that completes once `events` completed,
+    /// as [`Self::after`] does on the lane serving a kind.
+    pub(crate) fn after_on(
+        &self,
+        lane: usize,
+        device: DeviceId,
+        events: Vec<Arc<Event>>,
+    ) -> Result<JobId> {
+        let job = Job::new();
+        job.after(device, events);
+        let id = self.name();
+        self.shared
+            .queues
+            .get(lane)
+            .ok_or(Error::Invariant(
+                "deferred work waits on an unknown lane".into(),
+            ))?
+            .1
+            .start(id, job, true)?;
+        Ok(id)
+    }
+
     /// Start `job` on the lane serving `kind` and wait on the calling
     /// thread for its completion, at most `timeout`.
     ///

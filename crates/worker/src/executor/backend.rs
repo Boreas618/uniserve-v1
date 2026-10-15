@@ -427,10 +427,18 @@ impl WorkerBackend {
     /// that job would reach the lane before the records and pass at once.
     fn start(&self, kind: Option<CallKind>, job: Job, wake: bool) -> Result<JobId> {
         let deferrals = job.deferrals();
+        let records = job.records();
+        let lane = kind.and_then(|kind| self.jobs.lane(kind));
         let submitted = match kind {
             Some(kind) => self.jobs.start(kind, job, wake)?,
             None => self.jobs.call(job, wake),
         };
+        // Work deferred later behind these records waits on their lane.
+        if let (Some(lane), Some(storage)) = (lane, &self.rank_storage)
+            && !records.is_empty()
+        {
+            storage.events.queued(submitted, lane, &records);
+        }
         if !deferrals.is_empty() {
             let storage = self.rank_storage.as_ref().ok_or(Error::State(
                 "a job defers work on a rank without an event pool",
@@ -452,21 +460,17 @@ impl WorkerBackend {
             return;
         };
         let jobs = self.jobs.clone();
-        // Any lane's notification stream waits for an event: work deferred
-        // outside a recording takes the first kind a lane serves.
-        //
-        // FIXME: with several lanes, an event recorded by a job that is
-        // still queued on another lane than this one has no record when
-        // this lane orders the wait, which then passes at once. Work
-        // deferred outside a recording has to go to the lane whose job
-        // records its event; the pool does not know that lane.
+        // Work deferred outside a recording waits on the lane whose job
+        // queued its events' records; once they are made, any lane's
+        // notification stream waits for them: the first kind a lane serves.
         let mut kinds = self.info.supported_calls.clone();
         kinds.sort_by_key(|&kind| jobs.lane(kind).is_none());
         let kind = kinds.first().copied();
         storage
             .events
-            .set_submitter(Some(Box::new(move |device, events| {
-                after(&jobs, kind, device, events)
+            .set_submitter(Some(Box::new(move |device, lane, events| match lane {
+                Some(lane) => jobs.after_on(lane, device, events),
+                None => after(&jobs, kind, device, events),
             })));
     }
 
@@ -1432,6 +1436,9 @@ impl Backend for WorkerBackend {
 
     fn completed(&mut self) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
         while let Some((job, completion)) = self.jobs.take() {
+            if let Some(storage) = &self.rank_storage {
+                storage.events.performed(job);
+            }
             // What belongs to no batch is applied here: the event pool's
             // deferred work, a lifecycle command's device work, the expert
             // union's step this rank joined, the kernel watch's calls.

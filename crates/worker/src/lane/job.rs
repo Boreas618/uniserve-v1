@@ -350,6 +350,18 @@ impl Job {
         std::mem::take(&mut self.deferrals.borrow_mut())
     }
 
+    /// The events whose records the job's operations queue.
+    pub(crate) fn records(&self) -> Vec<Arc<Event>> {
+        self.operations
+            .borrow()
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Record { event, .. } => Some(Arc::clone(event)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn push(&self, operation: Operation) {
         self.operations.borrow_mut().push(operation);
     }
