@@ -167,7 +167,8 @@ pub(crate) fn seal(
     let fences = lock(buffer).seal(&streams, events)?.unwrap_or_default();
     let lease = Arc::clone(buffer);
     let retirement = Arc::clone(retirement);
-    events.defer(
+    stream.defer(
+        events,
         fences,
         Box::new(move || {
             lock(&lease).copies_finished();
@@ -185,7 +186,7 @@ pub(crate) fn materialize(
     plan: &BatchPlan,
     launched: &mut Launched,
 ) -> Result<Option<BatchResult>> {
-    if lock(&launched.buffer).ready_at()?.is_none() {
+    if lock(&launched.buffer).ready_at().is_none() {
         return Ok(None);
     }
     if let Some(host) = &mut launched.host {

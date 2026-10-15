@@ -36,7 +36,7 @@ use crate::ffi::{DeferredCall, Handle};
 use crate::parallel::joins::GraphFunctions;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::runner::methods::MethodCall;
-use crate::stream::{EventPool, Fill, HostFunction, Issue, RowFill};
+use crate::stream::{Deferral, Deferred, EventPool, Fill, HostFunction, Issue, RowFill};
 use crate::{Error, Result};
 
 /// One item of work submitted to a lane. Every operation owns its data, so
@@ -46,6 +46,10 @@ pub(crate) struct Job {
     /// The events a lane lets complete before it posts the job's
     /// completion, and the device whose streams recorded them.
     after: RefCell<Option<After>>,
+    /// The deferred work whose events the operations record, or whose
+    /// events were recorded before: whoever submits the job hands it on
+    /// ([`Job::deferrals`]).
+    deferrals: RefCell<Vec<Deferral>>,
 }
 
 /// The events a completion waits for and the device of their streams.
@@ -81,14 +85,6 @@ enum Operation {
     Wait {
         stream: Stream,
         event: Arc<Event>,
-    },
-    /// Fire `wake` once `event`, recorded on a stream of `device`,
-    /// completes: from the notification stream the performing lane keeps
-    /// for the device.
-    Wake {
-        device: DeviceId,
-        event: Arc<Event>,
-        wake: Wake,
     },
     /// Every segment of a captured forward, and the breaks between them.
     Launch {
@@ -327,6 +323,7 @@ impl Default for Job {
         Self {
             operations: RefCell::new(Vec::new()),
             after: RefCell::new(None),
+            deferrals: RefCell::new(Vec::new()),
         }
     }
 }
@@ -341,8 +338,16 @@ impl Job {
         self.operations.borrow().len()
     }
 
+    /// Whether the job holds nothing for its submitter: no operation and
+    /// no deferred work.
     pub(crate) fn is_empty(&self) -> bool {
-        self.operations.borrow().is_empty()
+        self.operations.borrow().is_empty() && self.deferrals.borrow().is_empty()
+    }
+
+    /// Take the deferred work recorded so far. The job's submitter hands
+    /// it to the event pool where it submits the job.
+    pub(crate) fn deferrals(&self) -> Vec<Deferral> {
+        std::mem::take(&mut self.deferrals.borrow_mut())
     }
 
     fn push(&self, operation: Operation) {
@@ -350,9 +355,9 @@ impl Job {
     }
 
     /// Keep of the operations recorded from `start` on only the event
-    /// operations, in order: a failed attempt's events are still recorded,
-    /// waited on and woken for, so the storage they fence is returned, and
-    /// none of the work recorded between them is performed.
+    /// operations, in order: a failed attempt's events are still recorded
+    /// and waited on, so the storage they fence is returned, and none of
+    /// the work recorded between them is performed.
     fn keep_orders(&self, start: usize) {
         let mut operations = self.operations.borrow_mut();
         let attempted = operations.split_off(start);
@@ -430,34 +435,31 @@ impl Job {
         *self.after.borrow_mut() = Some((device, events));
     }
 
-    /// Continue this job with the operations of `other`.
+    /// Continue this job with the operations and the deferred work of
+    /// `other`.
     pub(crate) fn append(&self, other: Job) {
         self.operations
             .borrow_mut()
             .append(&mut other.operations.into_inner());
+        self.deferrals
+            .borrow_mut()
+            .append(&mut other.deferrals.into_inner());
     }
 
     /// Perform every operation in order on the calling thread, outside a
     /// lane: a microbatch thread in its turn of an expert step, or the
-    /// submitter itself on a rank without a lane. Such a job orders no wake
-    /// behind an event: only a lane has a notification stream to order it
-    /// on.
+    /// submitter itself on a rank without a lane.
     pub(crate) fn perform(self) -> Completion {
-        self.perform_operations(None).0
+        self.perform_operations().0
     }
 
-    /// Perform the operations, with the notification streams of the lane
-    /// whose execution thread this is; also return what the completion
-    /// waits for.
-    fn perform_operations(
-        self,
-        mut notifications: Option<&mut Notifications>,
-    ) -> (Completion, Option<After>) {
+    /// Perform the operations; also return what the completion waits for.
+    fn perform_operations(self) -> (Completion, Option<After>) {
         let after = self.after.into_inner();
         let mut completion = Completion::default();
         let mut operations = self.operations.into_inner().into_iter().enumerate();
         for (index, operation) in operations.by_ref() {
-            if let Err(error) = operation.perform(&mut completion, notifications.as_deref_mut()) {
+            if let Err(error) = operation.perform(&mut completion) {
                 completion.failure = Some(Failure {
                     operation: index,
                     error,
@@ -471,7 +473,7 @@ impl Job {
         // documentation). The first failure is the job's.
         for (_, operation) in operations {
             if operation.orders() {
-                let _ = operation.perform(&mut completion, notifications.as_deref_mut());
+                let _ = operation.perform(&mut completion);
             }
         }
         (completion, after)
@@ -479,20 +481,12 @@ impl Job {
 }
 
 impl Operation {
-    /// Whether the operation only orders work: an event record, wait or
-    /// wake.
+    /// Whether the operation only orders work: an event record or wait.
     fn orders(&self) -> bool {
-        matches!(
-            self,
-            Self::Record { .. } | Self::Wait { .. } | Self::Wake { .. }
-        )
+        matches!(self, Self::Record { .. } | Self::Wait { .. })
     }
 
-    fn perform(
-        self,
-        completion: &mut Completion,
-        notifications: Option<&mut Notifications>,
-    ) -> Result<()> {
+    fn perform(self, completion: &mut Completion) -> Result<()> {
         match self {
             Self::Copy { stream, copies, .. } => {
                 let stream = stream.as_ref();
@@ -511,22 +505,6 @@ impl Operation {
             Self::RowFill { stream, fill } => unsafe { stream.as_ref().memset_2d(fill) },
             Self::Record { stream, event } => (&stream).record(&event),
             Self::Wait { stream, event } => (&stream).wait(&event),
-            Self::Wake {
-                device,
-                event,
-                wake,
-            } => {
-                let notification = notifications
-                    .ok_or(Error::State(
-                        "a wake behind an event is ordered by a lane's execution thread",
-                    ))?
-                    .stream(device)?;
-                notification.wait_event(&event)?;
-                // The host function only signals the service's wake: it
-                // never calls CUDA or blocks, as host functions must not.
-                notification.launch_host_fn(move || wake.wake())?;
-                Ok(())
-            }
             Self::Launch { stream, graph } => graph.launch(&stream),
             Self::Call(call) => call.perform(completion),
             Self::Read {
@@ -564,7 +542,7 @@ impl Operation {
             }
             Self::HostFunction { stream, function } => stream.as_ref().launch_host_fn(function),
             Self::Synchronize { stream } => Issue::synchronize(&stream.as_ref()),
-            Self::ExpertStep(step) => step.perform(completion, notifications),
+            Self::ExpertStep(step) => step.perform(completion),
             Self::ExpertJoin { union, leaving } => {
                 completion.joins.push_back(union.idle(leaving)?);
                 Ok(())
@@ -657,11 +635,7 @@ impl ExpertStep {
     /// Agree on the step's capacity over the union's host group, run the
     /// step's forwards and joins at it, then what follows it on the lane's
     /// execution thread.
-    fn perform(
-        self,
-        completion: &mut Completion,
-        notifications: Option<&mut Notifications>,
-    ) -> Result<()> {
+    fn perform(self, completion: &mut Completion) -> Result<()> {
         let capacity = self.union.capacity(self.tokens, self.kind, self.forced)?;
         let variant = self
             .variants
@@ -683,7 +657,7 @@ impl ExpertStep {
         }
         completion.capacities.push_back(capacity);
 
-        let (then, _) = variant.then.perform_operations(notifications);
+        let (then, _) = variant.then.perform_operations();
         completion.captured.extend(then.captured);
         completion.reads.extend(then.reads);
         then.failure.map_or(Ok(()), |failure| Err(failure.error))
@@ -834,14 +808,15 @@ impl Issue for Recorder<'_> {
         Ok(())
     }
 
-    fn wake(&self, events: &EventPool, event: &Arc<Event>) -> Result<()> {
-        if let Some(wake) = events.wake() {
-            self.job.push(Operation::Wake {
-                device: DeviceId(events.device(event)?),
-                event: Arc::clone(event),
-                wake,
-            });
+    fn defer(&self, _events: &EventPool, fences: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {
+        // Nothing to wait for: the work runs now, as the pool runs it.
+        if fences.is_empty() {
+            return owner();
         }
+        self.job.deferrals.borrow_mut().push(Deferral {
+            events: fences,
+            owner,
+        });
         Ok(())
     }
 
@@ -978,7 +953,7 @@ impl Jobs {
             };
             // The job and everything it holds is gone before its submitter
             // learns that it completed.
-            let (completion, after) = job.perform_operations(Some(&mut notifications));
+            let (completion, after) = job.perform_operations();
             performing.job = None;
 
             let post = Post {

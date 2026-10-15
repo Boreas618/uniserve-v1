@@ -284,7 +284,7 @@ impl OutputBuffer {
         if self.readback.is_some() {
             return Ok(());
         }
-        if self.ready_at()?.is_none() {
+        if self.ready_at().is_none() {
             return Err(Error::Invariant(
                 "completion storage was observed before its copy event was ready".into(),
             ));
@@ -470,6 +470,10 @@ impl OutputBuffer {
 
         self.sealed = true;
         self.sealed_at = Some(Instant::now());
+        // Without a fence no device work writes the words: they are ready.
+        if self.fences().next().is_none() {
+            self.ready_at = self.sealed_at;
+        }
         Ok(Some(self.events()))
     }
 
@@ -492,23 +496,12 @@ impl OutputBuffer {
             .filter_map(|events| Some((events.device, events.end.as_ref()?)))
     }
 
-    /// First observed completion time, or None while device writes are pending.
-    pub fn ready_at(&mut self) -> Result<Option<Instant>> {
-        if !self.sealed {
-            return Ok(None);
-        }
-        if self.ready_at.is_some() {
-            return Ok(self.ready_at);
-        }
-
-        for event in self.fences() {
-            if !event.query()? {
-                return Ok(None);
-            }
-        }
-
-        self.ready_at = Some(Instant::now());
-        Ok(self.ready_at)
+    /// When the lease learned that every copy into it completed, or `None`
+    /// while it has not: a lease without fences knows when it is sealed,
+    /// one with fences when it is told ([`Self::fences_completed`],
+    /// [`Self::copies_finished`]). The lease does not ask the driver.
+    pub fn ready_at(&self) -> Option<Instant> {
+        self.ready_at.filter(|_| self.sealed)
     }
 
     /// The device finished every copy the fences cover: the words can be
@@ -528,9 +521,9 @@ impl OutputBuffer {
                 "completion row is outside its output buffer".into(),
             ));
         }
-        let Some(ready_at) = self.ready_at()? else {
+        let Some(ready_at) = self.ready_at() else {
             return Err(Error::Invariant(
-                "completion row was observed before query-ready".into(),
+                "completion row was observed before its copies completed".into(),
             ));
         };
         let timing = match self.timing {

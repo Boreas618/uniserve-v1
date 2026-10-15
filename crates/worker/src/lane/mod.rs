@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use uniserve_cuda::DeviceId;
+use uniserve_cuda::{DeviceId, Event};
 use uniserve_ipc::{CallKind, LaneConfig, Wake};
 
 use crate::config::{Device, WorkerConfig};
@@ -146,6 +146,20 @@ impl JobQueues {
         }
     }
 
+    /// The queues of one lane of their own that serves every call kind:
+    /// for a caller that issues on streams of its own, outside a rank, and
+    /// needs a lane to wait for device events ([`Self::after`]). The lane's
+    /// thread ends with the last clone of the queues.
+    pub fn single_lane() -> Result<Self> {
+        let (posted, completions) = crossbeam_channel::unbounded();
+        let (queue, jobs) = JobQueue::new(posted.clone());
+        std::thread::Builder::new()
+            .name("lane-0".into())
+            .spawn(move || jobs.run())
+            .map_err(|error| Error::Transport(format!("execution thread: {error}")))?;
+        Ok(Self::new(vec![(None, queue)], posted, completions))
+    }
+
     fn arrived(&self) -> std::sync::MutexGuard<'_, VecDeque<(JobId, Completion)>> {
         self.shared
             .arrived
@@ -178,6 +192,23 @@ impl JobQueues {
             }
             None => Ok(self.call(job, wake)),
         }
+    }
+
+    /// Queue, on the lane serving `kind`, a job that holds no operation
+    /// and completes once `events` completed ([`Job::after`]): the lane
+    /// orders the completion behind them on its notification stream of
+    /// `device` and goes on. The control thread's wake is fired behind it.
+    /// The events' records are made, or queued in jobs submitted to the
+    /// same lane before: a wait on an event without a record passes.
+    pub fn after(
+        &self,
+        kind: CallKind,
+        device: DeviceId,
+        events: Vec<Arc<Event>>,
+    ) -> Result<JobId> {
+        let job = Job::new();
+        job.after(device, events);
+        self.start(kind, job, true)
     }
 
     /// Start `job` on the lane serving `kind` and wait on the calling
@@ -268,7 +299,7 @@ impl JobQueues {
 
     /// The next completion that arrived, without waiting: one kept while
     /// another job was waited for, or one posted since.
-    pub(crate) fn take(&self) -> Option<(JobId, Completion)> {
+    pub fn take(&self) -> Option<(JobId, Completion)> {
         let kept = self.arrived().pop_front();
         kept.or_else(|| self.shared.completions.try_recv().ok())
     }

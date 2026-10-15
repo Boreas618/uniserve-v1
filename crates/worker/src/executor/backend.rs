@@ -410,25 +410,77 @@ impl WorkerBackend {
     /// stops the rank there.
     fn perform_lifecycle(&mut self) -> Result<()> {
         for (kind, job) in self.lifecycle.take() {
-            let submitted = match kind {
-                Some(kind) => self.jobs.start(kind, job, false)?,
-                // A rank that serves no call kind has no lane.
-                None => self.jobs.call(job, false),
-            };
+            let submitted = self.start(kind, job, false)?;
             self.lifecycle_jobs.insert(submitted);
         }
         Ok(())
     }
 
+    /// Submit `job` to the lane serving `kind` (the Python thread for a
+    /// rank that serves no call kind and so has no lane). `wake` is as for
+    /// [`JobQueues::start`].
+    ///
+    /// The deferred work the job carries waits for events the job records.
+    /// The job whose completion says they completed is started right
+    /// behind it, on the same lane, and the event pool runs the work when
+    /// that completion arrives ([`Backend::completed`]). Started earlier,
+    /// that job would reach the lane before the records and pass at once.
+    fn start(&self, kind: Option<CallKind>, job: Job, wake: bool) -> Result<JobId> {
+        let deferrals = job.deferrals();
+        let submitted = match kind {
+            Some(kind) => self.jobs.start(kind, job, wake)?,
+            None => self.jobs.call(job, wake),
+        };
+        if !deferrals.is_empty() {
+            let storage = self.rank_storage.as_ref().ok_or(Error::State(
+                "a job defers work on a rank without an event pool",
+            ))?;
+            let jobs = &self.jobs;
+            storage
+                .events
+                .defer_submitted(deferrals, |device, events| {
+                    after(jobs, kind, device, events)
+                })?;
+        }
+        Ok(submitted)
+    }
+
+    /// Have the rank's event pool start the jobs its deferred work waits
+    /// for on the rank's lanes, from this thread, the control thread.
+    fn serve_events(&self) {
+        let Some(storage) = &self.rank_storage else {
+            return;
+        };
+        let jobs = self.jobs.clone();
+        // Any lane's notification stream waits for an event: work deferred
+        // outside a recording takes the first kind a lane serves.
+        //
+        // FIXME: with several lanes, an event recorded by a job that is
+        // still queued on another lane than this one has no record when
+        // this lane orders the wait, which then passes at once. Work
+        // deferred outside a recording has to go to the lane whose job
+        // records its event; the pool does not know that lane.
+        let mut kinds = self.info.supported_calls.clone();
+        kinds.sort_by_key(|&kind| jobs.lane(kind).is_none());
+        let kind = kinds.first().copied();
+        storage
+            .events
+            .set_submitter(Some(Box::new(move |device, events| {
+                after(&jobs, kind, device, events)
+            })));
+    }
+
     /// Use the job queues of the rank's lanes for forward submission.
     pub fn set_job_queues(&mut self, jobs: JobQueues) {
-        // Lifecycle work that belongs to no lane's stream (a wake behind an
-        // event) is recorded for the first kind: one a lane serves, where
-        // the rank has lanes, since only a lane orders such a wake.
+        // Lifecycle work that belongs to no lane's stream (deferred work
+        // behind an event) is recorded for the first kind: one a lane
+        // serves, where the rank has lanes, since only a lane waits for an
+        // event.
         let mut kinds = self.info.supported_calls.clone();
         kinds.sort_by_key(|&kind| jobs.lane(kind).is_none());
         self.lifecycle = LaneJobs::new(&kinds);
         self.jobs = jobs;
+        self.serve_events();
     }
 
     /// End a batch's forward: close its profiler step and ask for the
@@ -468,6 +520,7 @@ impl WorkerBackend {
     /// Install the rank's storage owners.
     pub fn set_rank_storage(&mut self, storage: RankStorage) {
         self.rank_storage = Some(storage);
+        self.serve_events();
     }
 
     pub fn rank_storage(&self) -> Option<&RankStorage> {
@@ -1159,7 +1212,7 @@ impl Backend for WorkerBackend {
         let (job, admitted) = forward::inputs::admit(self, batch);
         let submitted = match batch.route() {
             Some(kind) if !job.is_empty() => {
-                Some(self.jobs.start(kind, job, true).map_err(lane_lost)?)
+                Some(self.start(Some(kind), job, true).map_err(lane_lost)?)
             }
             _ => None,
         };
@@ -1295,7 +1348,7 @@ impl Backend for WorkerBackend {
                     if lanes.lane(kind).is_some() {
                         self.lifecycle.follow(kind);
                     }
-                    Some(lanes.start(kind, job, true).map_err(lane_lost))
+                    Some(self.start(Some(kind), job, true).map_err(lane_lost))
                 }
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
@@ -1342,7 +1395,7 @@ impl Backend for WorkerBackend {
             return Ok(None);
         };
         // The fences are named by the lease, which holds them whatever the
-        // event pool has reaped since they were recorded.
+        // event pool has released since they were recorded.
         let fences: Vec<_> = forward::launch::lock(&running.buffer)
             .device_fences()
             .map(|(device, fence)| (device, Arc::clone(fence)))
@@ -1379,10 +1432,16 @@ impl Backend for WorkerBackend {
 
     fn completed(&mut self) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
         while let Some((job, completion)) = self.jobs.take() {
-            // What belongs to no batch is applied here: a lifecycle
-            // command's device work, the expert union's step this rank
-            // joined, the kernel watch's calls.
-            if self.lifecycle_jobs.remove(&job) {
+            // What belongs to no batch is applied here: the event pool's
+            // deferred work, a lifecycle command's device work, the expert
+            // union's step this rank joined, the kernel watch's calls.
+            let events = self.rank_storage.as_ref().map(|storage| &storage.events);
+            if let Some(events) = events.filter(|events| events.owns(job)) {
+                // The device finished what the job's events fence: the
+                // storage deferred behind them is released before the
+                // executor routes the completions that follow.
+                events.complete(job, completion)?;
+            } else if self.lifecycle_jobs.remove(&job) {
                 // The work a command recorded did not reach its storage:
                 // what that storage holds now is unknown.
                 completion.check().map_err(|failure| {
@@ -1626,6 +1685,25 @@ impl ServiceBackend for WorkerBackend {
             .map_err(lane_lost)?;
         self.joining = Some(submitted);
         Ok(None)
+    }
+}
+
+/// Start the job that completes once `events` completed where `kind` is
+/// served (the Python thread for a rank without a lane, which has no device
+/// event to wait for), with the control thread's wake behind it.
+fn after(
+    jobs: &JobQueues,
+    kind: Option<CallKind>,
+    device: uniserve_cuda::DeviceId,
+    events: Vec<Arc<uniserve_cuda::Event>>,
+) -> Result<JobId> {
+    match kind {
+        Some(kind) => jobs.after(kind, device, events),
+        None => {
+            let job = Job::new();
+            job.after(device, events);
+            Ok(jobs.call(job, true))
+        }
     }
 }
 
