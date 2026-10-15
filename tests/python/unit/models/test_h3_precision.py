@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from tests.python.fixtures.h3 import base_config, fasth3_config
-from uniserve_models.minimax_h3 import weight_config as _weight_config
+from uniserve.models.minimax_h3 import weight_config as _weight_config
 
 pytestmark = pytest.mark.unit
 

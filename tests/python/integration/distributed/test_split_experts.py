@@ -14,16 +14,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from uniserve_models.backends.experts import TorchBootstrap
-from uniserve_models.backends.experts import create as create_transport
-from uniserve_models.backends.experts.split import symmetric_bytes
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.distributed import Communicator, partition_experts
-from uniserve_models.distributed.symmetric import allocate_symmetric_storage
-from uniserve_models.interface import graphs
-from uniserve_models.model import TextSize
-from uniserve_models.nn.moe import FusedMoE
-from uniserve_models.quantization import Quantizer
+from uniserve import cuda_graph
+from uniserve.backends.experts import TorchBootstrap
+from uniserve.backends.experts import create as create_transport
+from uniserve.backends.experts.split import symmetric_bytes
+from uniserve.bindings.context import ExecutionContext
+from uniserve.distributed import Communicator, partition_experts
+from uniserve.distributed.symmetric import allocate_symmetric_storage
+from uniserve.models import TextSize
+from uniserve.nn.moe import FusedMoE
+from uniserve.quantization import Quantizer
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -203,7 +203,7 @@ def _exercise(
 
                 compare(call())
                 torch.cuda.synchronize(device)
-                graph = graphs.capture(call, stream=stream)
+                graph = cuda_graph.capture(call, stream=stream)
                 for _ in range(4):
                     with torch.cuda.stream(stream):
                         output = graph.replay()

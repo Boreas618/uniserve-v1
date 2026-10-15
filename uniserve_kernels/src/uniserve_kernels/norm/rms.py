@@ -1,6 +1,6 @@
 """Row-wise RMS normalization and residual-add RMS normalization.
 
-These Triton kernels back ``uniserve_models.nn.functional.rms_norm`` and
+These Triton kernels back ``uniserve.nn.functional.rms_norm`` and
 ``add_rms_norm``, which check the weight, residual and outputs against ``x``,
 allocate outputs the caller does not supply, and raise on CUDA whenever
 :func:`unsupported` or :func:`unsupported_add` reports a reason. One program

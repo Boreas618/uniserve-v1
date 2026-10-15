@@ -5,14 +5,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_models.diffusion import (
+from uniserve.diffusion import (
     AdditiveGuidance,
     Branch,
     Renorm,
     make_schedule,
 )
-from uniserve_models.nn import functional
-from uniserve_models.nn.norm import RMSNorm
+from uniserve.nn import functional
+from uniserve.nn.norm import RMSNorm
 
 pytestmark = pytest.mark.unit
 

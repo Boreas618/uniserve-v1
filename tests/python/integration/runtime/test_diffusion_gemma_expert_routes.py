@@ -21,12 +21,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve_models import catalog as models
-from uniserve_models.backends import moe as backends
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.interface import graphs
-from uniserve_models.model import TextSize
-from uniserve_models.nn.functional import sandwich_rms_norm
+from uniserve import cuda_graph
+from uniserve.backends import moe as backends
+from uniserve.bindings.context import ExecutionContext
+from uniserve.models import TextSize
+from uniserve.models import registry as models
+from uniserve.nn.functional import sandwich_rms_norm
 
 pytestmark = [
     pytest.mark.integration,
@@ -117,7 +117,7 @@ def _check_provider(block, provider):
             expected = feed_forward(experts(hidden, ids, weights))
             routes = experts(hidden, ids, weights, combine=False)
             assert torch.equal(feed_forward(routes), expected), provider
-        graph = graphs.capture(
+        graph = cuda_graph.capture(
             lambda: feed_forward(experts(hidden, ids, weights, combine=False)),
             stream=cuda_stream,
         )

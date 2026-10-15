@@ -13,7 +13,7 @@ import torch
 
 from tests.python.fixtures.audio_decoding import CONFIG
 from tests.python.fixtures.audio_decoding import decoder as _decoder
-from uniserve_models.minimax_h3.decoding import AudioDecoder
+from uniserve.models.minimax_h3.decoding import AudioDecoder
 
 pytestmark = pytest.mark.unit
 

@@ -3,7 +3,7 @@
 //! Input images feed both the VAE and the ViT encoder, in that order;
 //! generated images feed back through the VAE only. The resize policies here
 //! fix the values the worker's Bagel `image_processor`
-//! (`uniserve_models/bagel/processing.py`) uses with the default vision
+//! (`uniserve/models/bagel/processing.py`) uses with the default vision
 //! `image_size` of 980 and `patch_size` of 14.
 
 use serde::{Deserialize, Serialize};
@@ -40,9 +40,9 @@ pub struct BagelProfile {
     pub resolution_policy: ResolutionPolicy,
     /// Filters applied to decoded assistant output.
     pub output_filter: OutputFilterPolicy,
-    /// Ordered encoders and their loaded KV requirements for input images.
+    /// Ordered encoders and their loaded cache requirements for input images.
     pub image_encoders: Vec<ImageEncoderInput>,
-    /// Logical positions contributed by one input image, independently of KV tokens.
+    /// Logical positions contributed by one input image, independently of cache tokens.
     pub image_num_positions: u32,
     /// Image trigger and feedback encoder requirements.
     pub image_generation: ImageGenerationConfig,
@@ -56,7 +56,7 @@ impl BagelProfile {
     /// Maximum reusable encoder products tracked by the profile.
     pub const ENCODER_CACHE_ENTRIES: usize = 256;
     /// Primary checkpoint files in the order the worker's loader tries them
-    /// (`uniserve_models/bagel/weights.py`); the first present one holds the
+    /// (`uniserve/models/bagel/weights.py`); the first present one holds the
     /// latent position table.
     pub const PRIMARY_CHECKPOINT: [&'static str; 2] = ["ema.safetensors", "model.safetensors"];
     /// Learned latent position table, `[side * side, hidden]` for a square
@@ -146,13 +146,13 @@ impl BagelProfile {
         let image_encoders = vec![
             ImageEncoderInput {
                 encoder: ImageIngestStep::VaeEncode,
-                num_kv_tokens: None,
-                max_kv_tokens: None,
+                num_cache_tokens: None,
+                max_cache_tokens: None,
             },
             ImageEncoderInput {
                 encoder: ImageIngestStep::VitEncode,
-                num_kv_tokens: None,
-                max_kv_tokens: None,
+                num_cache_tokens: None,
+                max_cache_tokens: None,
             },
         ];
         let image_num_positions = 1;
@@ -168,8 +168,8 @@ impl BagelProfile {
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
                 encoder: ImageIngestStep::VaeEncode,
-                num_kv_tokens: None,
-                max_kv_tokens: None,
+                num_cache_tokens: None,
+                max_cache_tokens: None,
             }],
             sample_feedback_continuation: false,
         };
@@ -313,18 +313,18 @@ impl BagelProfile {
         Ok(vec![
             ImageEncoderInput {
                 encoder: ImageIngestStep::VaeEncode,
-                num_kv_tokens: Some(vae_tokens),
-                max_kv_tokens: None,
+                num_cache_tokens: Some(vae_tokens),
+                max_cache_tokens: None,
             },
             ImageEncoderInput {
                 encoder: ImageIngestStep::VitEncode,
-                num_kv_tokens: Some(vit_tokens),
-                max_kv_tokens: None,
+                num_cache_tokens: Some(vit_tokens),
+                max_cache_tokens: None,
             },
         ])
     }
 
-    /// Resolves the generated-image feedback KV contribution for the requested canvas.
+    /// Resolves the generated-image feedback cache contribution for the requested canvas.
     ///
     /// Fails when the canvas cannot be resized under the VAE policy, or when
     /// the profile's feedback configuration has no feedback source or is not a
@@ -344,8 +344,8 @@ impl BagelProfile {
                 "image feedback encoders do not match the model processor",
             ));
         }
-        policy.feedback_encoders[0].num_kv_tokens = Some(tokens);
-        policy.feedback_encoders[0].max_kv_tokens = None;
+        policy.feedback_encoders[0].num_cache_tokens = Some(tokens);
+        policy.feedback_encoders[0].max_cache_tokens = None;
         Ok(policy)
     }
 }

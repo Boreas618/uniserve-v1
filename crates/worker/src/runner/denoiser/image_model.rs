@@ -24,9 +24,9 @@ use crate::runner::methods::{Argument, MethodCall};
 use crate::runner::vision::{FeatureInjection, FeatureLayout, PositionLayout};
 use crate::{Error, Result};
 
-const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
-const DENOISER: &str = "uniserve_models.runner.denoiser.DenoiserRunner";
-const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
+const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
+const DENOISER: &str = "uniserve.runner.denoiser.DenoiserRunner";
+const DECODER: &str = "uniserve.runner.decoder.DecoderRunner";
 
 /// Language positions a generated image spans in its conversation: its
 /// closing framing token sits this far past the opening one, and the

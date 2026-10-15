@@ -101,8 +101,8 @@ fn observers_keep_the_retired_epoch_after_slot_reuse() -> uniserve_worker::Resul
         Some(RequestProgress {
             logical_position: 9,
             rng_counter: 4,
-            kv_computed_len: 9,
-            kv_visible_len: 9,
+            cache_computed_len: 9,
+            cache_visible_len: 9,
             prompt_logits_ready: true,
             ..RequestProgress::default()
         }),

@@ -29,7 +29,7 @@ const TAG: &str = "uniserve-kernel-table";
 pub const TARGET: &str = "uniserve_worker.execution.model_executor";
 
 /// The library function rendering the kernel table.
-const TABLE: &str = "uniserve_models.interface.kernels.table";
+const TABLE: &str = "uniserve.interface.kernels.table";
 
 /// One operator's kernel record, as a runner's `kernels` method reports it:
 /// a JSON object text the rank passes on unread.

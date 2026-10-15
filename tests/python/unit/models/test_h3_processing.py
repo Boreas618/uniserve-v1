@@ -17,9 +17,9 @@ from typing import Any
 
 import pytest
 
-from uniserve_models.media import image
-from uniserve_models.minimax_h3 import processing
-from uniserve_models.minimax_h3.processing import (
+from uniserve.media import image
+from uniserve.models.minimax_h3 import processing
+from uniserve.models.minimax_h3.processing import (
     AudioClip,
     AudioFacts,
     Condition,

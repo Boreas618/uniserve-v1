@@ -179,12 +179,12 @@ impl Batch<'_> {
     /// run.
     pub(super) fn rows(&mut self) -> Result<Rows> {
         let plan = self.plan;
-        let kv = self
+        let prefix_cache = self
             .storage
-            .kv
+            .prefix_cache
             .as_ref()
-            .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
-        let tables = kv.tables();
+            .ok_or_else(|| Error::Unsupported("text calls require a prefix cache".into()))?;
+        let tables = prefix_cache.tables();
 
         let active: Vec<usize> = (0..plan.calls.len())
             .filter(|&index| self.calls[index].active)
@@ -323,12 +323,11 @@ impl Batch<'_> {
                 .iter()
                 .map(|planned| planned.as_ref().map(|planned| planned.request(self.mode)))
                 .collect();
-            let kv = self
-                .storage
-                .kv
-                .as_mut()
-                .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
-            let (tables, cache) = kv.split();
+            let prefix_cache =
+                self.storage.prefix_cache.as_mut().ok_or_else(|| {
+                    Error::Unsupported("text calls require a prefix cache".into())
+                })?;
+            let (tables, cache) = prefix_cache.split();
             Some(self.runtime.forward(
                 self.experts.as_ref(),
                 self.group,
@@ -609,11 +608,11 @@ pub(super) fn condition_latents(
         Error::Unsupported("latent conditioning requires an image denoiser".into())
     })?;
     let denoiser = diffusion.stream().cloned();
-    let kv = storage
-        .kv
+    let prefix_cache = storage
+        .prefix_cache
         .as_mut()
-        .ok_or_else(|| Error::Unsupported("text calls require a KV cache".into()))?;
-    let (tables, cache) = kv.split();
+        .ok_or_else(|| Error::Unsupported("text calls require a prefix cache".into()))?;
+    let (tables, cache) = prefix_cache.split();
     runtime.order().wait(job.on(denoiser.as_ref()))?;
     diffusion.condition(
         rows,

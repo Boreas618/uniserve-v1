@@ -9,7 +9,7 @@
 //!
 //! 1. **Reservation** ([`super::batch`]): bind every call's pending output and the
 //!    batch's output lease; install its block tables, reset newly assigned
-//!    units and retain the KV extents it reads and writes until its device
+//!    units and retain the cache extents it reads and writes until its device
 //!    work retires; bind its scalar products (token relays, transition and
 //!    completion flags); lease its predicates. A call whose host predicate
 //!    is false is skipped (`Predicated`) and only publishes false flags.
@@ -55,14 +55,14 @@ use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{
     CausalLMRunner, Executed, PromptChunks, RowSource, Staged, StepContext, StepRequest, TokenRow,
 };
-use crate::storage::{BlockTables, KVCacheManager, OutputPool, UnitColumn};
+use crate::storage::{BlockTables, OutputPool, PrefixCacheManager, UnitColumn};
 use crate::transfer::Retirement;
 use crate::{Error, Result};
 
-/// The KV storage a text step borrows.
+/// The cache storage a text step borrows.
 pub(crate) struct StepParts<'a> {
     pub(crate) tables: &'a BlockTables,
-    pub(crate) cache: &'a mut KVCacheManager<Arc<Retirement>>,
+    pub(crate) cache: &'a mut PrefixCacheManager<Arc<Retirement>>,
 }
 
 use super::batch::{Batch, Opening, Owners, TokenBatch};
@@ -139,7 +139,7 @@ impl CausalLMRunners {
     }
 
     /// The order of these runners' batches across streams; other runtimes
-    /// reading what text batches write (their KV) wait on it.
+    /// reading what text batches write (their prefix cache) wait on it.
     pub(crate) fn order(&self) -> &StreamOrder {
         &self.order
     }
@@ -445,7 +445,7 @@ impl CausalLMRunners {
         component: &str,
         prefixes: &[(u32, &[u32])],
         tables: &BlockTables,
-        cache: &mut KVCacheManager<Arc<Retirement>>,
+        cache: &mut PrefixCacheManager<Arc<Retirement>>,
         job: &Job,
     ) -> Result<Step> {
         let (lane, group) = self.prefill_lane(component)?;

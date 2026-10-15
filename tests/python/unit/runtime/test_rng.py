@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_models.nn.rng import (
+from uniserve.nn.rng import (
     DRAW_LAYOUT_PROPOSAL,
     DRAW_LAYOUT_TARGET,
     normal_noise,

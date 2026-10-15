@@ -18,9 +18,9 @@ use uniserve_ipc::MediaCall;
 /// Algorithm inputs retained until their computation completes.
 pub(super) enum InflightInput {
     Generation {
-        /// Physical KV start and exact token contribution, when known, from the
+        /// Physical cache start and exact token contribution, when known, from the
         /// submitted image-extension input. The call carries its capacity.
-        image_kv: Option<(u32, Option<u32>)>,
+        image_cache: Option<(u32, Option<u32>)>,
         /// The submitted latent interval; cancellation can stop accepted
         /// progress while later submitted intervals still need validation.
         latent: Option<LatentParams>,

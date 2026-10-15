@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_models.nn.functional import topk_softmax
+from uniserve.nn.functional import topk_softmax
 
 pytestmark = pytest.mark.unit
 

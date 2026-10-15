@@ -18,10 +18,10 @@
 //! - `SimEngine::set_queue_depth` bounds the batches the scheduler may keep
 //!   unresolved. Depth 1 is the serial oracle that the depth-invariance tests
 //!   compare depth 2 against.
-//! - The KV page size is 64 tokens, one unit per page (`WorkerInfo::default`),
+//! - The cache page size is 64 tokens, one unit per page (`WorkerInfo::default`),
 //!   unless a test calls `SimEngine::set_page_tokens` or `set_groups`, and
 //!   generated images default to 512x512 (`ImageParams::default`).
-//! - The `general` request gauges and the `kv_cache` and `encoder` counters in
+//! - The `general` request gauges and the `prefix_cache` and `encoder` counters in
 //!   `SchedulerStats` are snapshots that `Scheduler::publish_cache_stats`
 //!   refreshes as the loop runs, not when an event is sent, so they can trail
 //!   the event stream. The `prefix` counters are recorded at admission.
@@ -145,7 +145,7 @@ fn text_input(token_ids: Vec<u32>) -> (Vec<u32>, MultimodalInputs) {
 ///
 /// The image sits at prompt-token position `before.len()`, the boundary
 /// between `before` and `after`, occupies `logical_positions` positions, and
-/// contributes `physical_tokens` KV tokens through a single ViT encode. `hash` is the image identity from which encoder-cache keys are
+/// contributes `physical_tokens` cache tokens through a single ViT encode. `hash` is the image identity from which encoder-cache keys are
 /// derived; the payload is a placeholder.
 fn image_input(
     mut before: Vec<u32>,
@@ -166,8 +166,8 @@ fn image_input(
                 num_positions: logical_positions,
                 encoders: vec![ImageEncoderInput {
                     encoder: ImageIngestStep::VitEncode,
-                    num_kv_tokens: Some(physical_tokens),
-                    max_kv_tokens: None,
+                    num_cache_tokens: Some(physical_tokens),
+                    max_cache_tokens: None,
                 }],
             }],
         },
@@ -203,8 +203,8 @@ fn generation_request(
         num_feedback_positions: 2,
         feedback_encoders: vec![ImageEncoderInput {
             encoder: ImageIngestStep::VitEncode,
-            num_kv_tokens: None,
-            max_kv_tokens: None,
+            num_cache_tokens: None,
+            max_cache_tokens: None,
         }],
         sample_feedback_continuation: true,
     };
@@ -1160,20 +1160,20 @@ fn stop_string_cutoff_is_request_local() {
 #[test]
 fn hybrid_groups_share_one_unit_pool() {
     use std::sync::atomic::Ordering;
-    use uniserve_core::{KvCacheGroup, KvGroupKind};
+    use uniserve_core::{CacheGroup, CacheGroupKind};
 
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
     sim.set_text_len(4);
     sim.set_num_units(64);
-    let base = sim.mut_info_for_test().kv_cache.clone().unwrap().groups[0].clone();
+    let base = sim.mut_info_for_test().prefix_cache.clone().unwrap().groups[0].clone();
     sim.set_groups(vec![
-        KvCacheGroup {
+        CacheGroup {
             layer_ids: (0..4).collect(),
             ..base.clone()
         },
-        KvCacheGroup {
-            kind: KvGroupKind::SlidingWindow {
+        CacheGroup {
+            kind: CacheGroupKind::SlidingWindow {
                 window: 96,
                 sink: 0,
             },
@@ -1235,12 +1235,12 @@ fn hybrid_groups_share_one_unit_pool() {
     // A finished request's units retire until its workers acknowledge the
     // queued finish, so the pool drains while the engine keeps running, not
     // at the moment `Finished` is observed; shutdown would abort that ack.
-    let num_units = stats.kv_cache.num_units.load(Ordering::Relaxed);
+    let num_units = stats.prefix_cache.num_units.load(Ordering::Relaxed);
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut free_units = stats.kv_cache.free_units.load(Ordering::Relaxed);
+    let mut free_units = stats.prefix_cache.free_units.load(Ordering::Relaxed);
     while free_units != num_units && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1));
-        free_units = stats.kv_cache.free_units.load(Ordering::Relaxed);
+        free_units = stats.prefix_cache.free_units.load(Ordering::Relaxed);
     }
     assert_eq!(free_units, num_units, "units did not return to the pool");
 
@@ -1282,7 +1282,7 @@ fn hybrid_groups_share_one_unit_pool() {
 
 /// Deployment policy controls prefix reuse without changing generated tokens.
 /// Both requests ask to read and write prefixes; the disabled deployment must
-/// override that permission while preserving each request's active KV state.
+/// override that permission while preserving each request's active cache state.
 #[test]
 fn prefix_cache_configuration_controls_reuse() {
     use uniserve_engine::{EngineConfig, EngineCore};
@@ -1293,7 +1293,7 @@ fn prefix_cache_configuration_controls_reuse() {
         let mut sim = SimEngine::new();
         sim.set_text_len(4);
         let config = EngineConfig {
-            prefix_cache: enabled,
+            prefix_reuse: enabled,
             ..EngineConfig::sim("sim-model")
         };
         let engine = EngineCore::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
@@ -1331,11 +1331,17 @@ fn prefix_cache_configuration_controls_reuse() {
 
         let hits = stats.prefix.hit_tokens.load(Ordering::Relaxed);
         if enabled {
-            assert!(hits >= 512, "the shared prompt did not reuse cached KV");
+            assert!(
+                hits >= 512,
+                "the shared prompt did not reuse cached keys and values"
+            );
         } else {
-            assert_eq!(hits, 0, "disabled prefix caching still reused KV");
             assert_eq!(
-                stats.kv_cache.pages_stored.load(Ordering::Relaxed),
+                hits, 0,
+                "disabled prefix caching still reused keys and values"
+            );
+            assert_eq!(
+                stats.prefix_cache.pages_stored.load(Ordering::Relaxed),
                 0,
                 "disabled prefix caching retained reusable pages"
             );
@@ -1855,13 +1861,13 @@ fn a_latent_image_block_is_written_by_its_own_call() {
     request.multimodal_inputs.images[0].encoders = vec![
         ImageEncoderInput {
             encoder: ImageIngestStep::VaeEncode,
-            num_kv_tokens: Some(6),
-            max_kv_tokens: None,
+            num_cache_tokens: Some(6),
+            max_cache_tokens: None,
         },
         ImageEncoderInput {
             encoder: ImageIngestStep::VitEncode,
-            num_kv_tokens: Some(5),
-            max_kv_tokens: None,
+            num_cache_tokens: Some(5),
+            max_cache_tokens: None,
         },
     ];
     let mut events = handle.submit(request).expect("submit request");
@@ -1937,7 +1943,7 @@ fn a_vision_block_beyond_the_step_budget_is_refused() {
     let jh = thread::spawn(move || sched.run(rx));
 
     // The first terminal event of a request whose image has one vision
-    // block of `block_tokens` KV tokens.
+    // block of `block_tokens` cache tokens.
     let terminal = |request_id: u64, block_tokens: u32| {
         let request = generation_request(
             RequestId(request_id),
@@ -2234,8 +2240,8 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     request.image_generation.num_feedback_positions = 1;
     request.image_generation.feedback_encoders = vec![ImageEncoderInput {
         encoder: ImageIngestStep::VitEncode,
-        num_kv_tokens: Some(1),
-        max_kv_tokens: None,
+        num_cache_tokens: Some(1),
+        max_cache_tokens: None,
     }];
     request.image_generation.sample_feedback_continuation = false;
 
@@ -2498,7 +2504,7 @@ fn gen_branch_model_image_starts_spend_budget() {
     );
 }
 
-/// Image-generating requests reserve their worst-case KV at admission. The
+/// Image-generating requests reserve their worst-case prefix cache at admission. The
 /// prompt plus the 32,768-token text budget alone exceeds this pool of 128
 /// usable units of one 256-token page each, so the scheduler rejects the
 /// request (a `Rejected` event and no `Finished`) instead of admitting it.
@@ -2951,11 +2957,11 @@ fn image_budget_suppresses_biased_image_start() {
     );
 }
 
-/// Every logical KV reservation returns to the block pool after completion,
+/// Every logical cache reservation returns to the block pool after completion,
 /// across text, image-only, and mixed requests, and no request remains running
 /// or in flight.
 #[test]
-fn kv_resources_return_after_completion() {
+fn cache_resources_return_after_completion() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = uniserve_engine::EngineHandle::new(command_tx);
 
@@ -2999,8 +3005,8 @@ fn kv_resources_return_after_completion() {
     assert_eq!(sched.stats.general.running.load(Ordering::Relaxed), 0);
     assert_eq!(sched.stats.general.in_flight.load(Ordering::Relaxed), 0);
     assert_eq!(
-        sched.stats.kv_cache.free_units.load(Ordering::Relaxed),
-        sched.stats.kv_cache.num_units.load(Ordering::Relaxed)
+        sched.stats.prefix_cache.free_units.load(Ordering::Relaxed),
+        sched.stats.prefix_cache.num_units.load(Ordering::Relaxed)
     );
 }
 

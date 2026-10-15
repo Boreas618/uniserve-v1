@@ -6,7 +6,7 @@
 //! A snapshot mixes two kinds of fields: interval deltas (admissions, queue
 //! wait totals, prefix-cache queries and hits, batch timing, domain call and
 //! time counters, worker forward counters) and point-in-time or lifetime
-//! values (running and waiting requests, the step counter, KV usage, maximum
+//! values (running and waiting requests, the step counter, cache usage, maximum
 //! queue wait, active and peak domain credits).
 
 use std::collections::BTreeMap;
@@ -60,9 +60,9 @@ impl SchedulerStatsReporter {
     /// exactly one snapshot. The first snapshot reports everything counted
     /// since the scheduler started.
     pub fn snapshot(&mut self, stats: &SchedulerStats) -> stats::SchedulerStats {
-        let num_units = stats.kv_cache.num_units.load(Ordering::Relaxed);
-        let free_units = stats.kv_cache.free_units.load(Ordering::Relaxed);
-        let kv_cache_usage = if num_units > 0 {
+        let num_units = stats.prefix_cache.num_units.load(Ordering::Relaxed);
+        let free_units = stats.prefix_cache.free_units.load(Ordering::Relaxed);
+        let prefix_cache_usage = if num_units > 0 {
             1.0 - (free_units as f64 / num_units as f64)
         } else {
             0.0
@@ -109,7 +109,7 @@ impl SchedulerStatsReporter {
             num_waiting_reqs: stats.general.pending.load(Ordering::Relaxed) as u64,
             step_counter: stats.general.steps.load(Ordering::Relaxed),
             current_wave: 0,
-            kv_cache_usage,
+            prefix_cache_usage,
             num_admitted_reqs: delta_queue_wait_count,
             avg_queue_wait_us,
             queue_wait_us_total: delta_queue_wait_us_total,
@@ -448,14 +448,14 @@ mod tests {
     use super::*;
 
     /// The first snapshot reports every counter as a delta from zero and
-    /// derives KV usage and average queue wait. A second snapshot over
+    /// derives cache usage and average queue wait. A second snapshot over
     /// unchanged counters reports zero deltas and no worker stats, while the
     /// lifetime maximum queue wait persists.
     #[test]
     fn snapshot_reports_deltas_and_usage() {
         let stats = SchedulerStats::default();
-        stats.kv_cache.num_units.store(100, Ordering::Relaxed);
-        stats.kv_cache.free_units.store(75, Ordering::Relaxed);
+        stats.prefix_cache.num_units.store(100, Ordering::Relaxed);
+        stats.prefix_cache.free_units.store(75, Ordering::Relaxed);
         stats.general.running.store(3, Ordering::Relaxed);
         stats.general.pending.store(2, Ordering::Relaxed);
         stats.prefix.query_tokens.store(2_560, Ordering::Relaxed);
@@ -500,7 +500,7 @@ mod tests {
 
         assert_eq!(snapshot.num_running_reqs, 3);
         assert_eq!(snapshot.num_waiting_reqs, 2);
-        assert!((snapshot.kv_cache_usage - 0.25).abs() < 1e-9);
+        assert!((snapshot.prefix_cache_usage - 0.25).abs() < 1e-9);
         assert_eq!(snapshot.num_admitted_reqs, 3);
         assert_eq!(snapshot.avg_queue_wait_us, 5_001);
         assert_eq!(snapshot.queue_wait_us_total, 15_003);

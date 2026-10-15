@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve_models.env import flag_from_value
+from uniserve.env import flag_from_value
 
 pytestmark = pytest.mark.unit
 

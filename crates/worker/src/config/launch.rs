@@ -143,8 +143,11 @@ const CAPABILITY_GROUPS: &[(&str, &[CallKind])] = {
         ("encoder_latent", &[Media(MediaCall::LatentEncoding)]),
         ("encoder_text", &[Media(MediaCall::TextEncoding)]),
         ("transfer_product", &[Transfer(TransferMode::Tensor)]),
-        ("transfer_kv_export", &[Transfer(TransferMode::KvExport)]),
-        ("transfer_kv_install", &[Transfer(TransferMode::KvInstall)]),
+        ("transfer_kv_export", &[Transfer(TransferMode::CacheExport)]),
+        (
+            "transfer_kv_install",
+            &[Transfer(TransferMode::CacheInstall)],
+        ),
         ("diffusion_prepare", &[Media(MediaCall::LatentPreparation)]),
         ("diffusion_step", &[Media(MediaCall::Denoising)]),
         (
@@ -213,15 +216,15 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
             ));
         }
     };
-    // A KV dtype in the precision selectors overrides `--kv-cache-dtype`, so
+    // A cache dtype in the precision selectors overrides `--kv-cache-dtype`, so
     // capacity planning and loading see one resolved value.
-    let kv_override = match quantization.get("kv_cache_dtype") {
+    let prefix_cache_dtype_override = match quantization.get("kv_cache_dtype") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(dtype)) => Some(dtype.clone()),
         Some(_) => return Err(DescriptorError::new("worker KV dtype is unsupported")),
     };
     if device.is_cuda() || generation.is_some_and(Device::is_cuda) {
-        cuda_representation(&descriptor, kv_override.as_deref())?;
+        cuda_representation(&descriptor, prefix_cache_dtype_override.as_deref())?;
     }
 
     if descriptor.queue_depth == 0 {
@@ -248,8 +251,8 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
     let attention = attention_options(&descriptor)?;
     let components = components(&descriptor, &role)?;
     let mut execution = execution(&descriptor, device, generation, &role, experts.as_ref())?;
-    if kv_override.is_some() {
-        execution.kv_cache_dtype = kv_override;
+    if prefix_cache_dtype_override.is_some() {
+        execution.prefix_cache_dtype = prefix_cache_dtype_override;
         execution.validate().map_err(DescriptorError::from)?;
     }
 
@@ -348,16 +351,16 @@ fn transfer_backends(value: &str) -> Result<Vec<String>, DescriptorError> {
 /// Refuse precisions no native CUDA attention kernel computes.
 fn cuda_representation(
     descriptor: &LaunchDescriptor,
-    kv_override: Option<&str>,
+    prefix_cache_dtype_override: Option<&str>,
 ) -> Result<(), DescriptorError> {
     if descriptor.model_dtype == "float32" {
         return Err(DescriptorError::new(
             "--dtype float32 has no native CUDA attention kernel: CUDA attention computes in bfloat16 or float16",
         ));
     }
-    let dtype = kv_override.or(descriptor.kv_cache_dtype.as_deref());
+    let dtype = prefix_cache_dtype_override.or(descriptor.prefix_cache_dtype.as_deref());
     if dtype == Some("float8_e4m3fn") {
-        let option = if kv_override.is_some() {
+        let option = if prefix_cache_dtype_override.is_some() {
             "--quantization-config kv_cache_dtype"
         } else {
             "--kv-cache-dtype"
@@ -598,8 +601,8 @@ fn execution(
             value => Ok(value.map(|value| value as usize)),
         }
     };
-    let kv_cache_dtype = descriptor
-        .kv_cache_dtype
+    let prefix_cache_dtype = descriptor
+        .prefix_cache_dtype
         .as_deref()
         .map(|dtype| {
             let dtype = dtype.trim();
@@ -635,15 +638,15 @@ fn execution(
         video_canvases: descriptor.video_canvases.clone(),
         deployment_components: descriptor.deployment_components.clone(),
         model_dtype: descriptor.model_dtype.clone(),
-        kv_storage_fraction: descriptor.kv_memory_fraction,
+        cache_storage_fraction: descriptor.cache_memory_fraction,
         prefill_cuda_graph: descriptor.prefill_cuda_graph,
         prefill_outputs: descriptor.prefill_outputs,
         flow_cuda_graph: descriptor.flow_cuda_graph,
         graph_policy: descriptor.graph_policy.clone(),
         attention_backend: Some(descriptor.attention_backend.clone()),
         block_size: positive(descriptor.block_size.map(u64::from))?,
-        kv_token_capacity: positive(descriptor.kv_token_capacity)?,
-        kv_cache_dtype,
+        cache_token_capacity: positive(descriptor.cache_token_capacity)?,
+        prefix_cache_dtype,
         lanes: descriptor.lane.clone(),
         ..WorkerConfig::default()
     };
@@ -658,7 +661,7 @@ fn execution(
         if config.expert_exchange == "alltoall" {
             // Each local graph also captures larger transfer capacities.
             // Geometric small buckets bound that product; the largest gap
-            // remains within the ordinary default KV padding reservation.
+            // remains within the ordinary default cache padding reservation.
             config.prefill_graph_token_sizes = [4, 8, 16, 32, 64, 128, 256, 512]
                 .into_iter()
                 .chain((1024..=16384).step_by(512))

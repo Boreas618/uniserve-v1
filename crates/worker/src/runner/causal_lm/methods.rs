@@ -1,5 +1,5 @@
 //! The Python half of [`super::CausalLMRunner`]:
-//! `uniserve_models.runner.causal_lm.CausalLMRunner`, its construction and
+//! `uniserve.runner.causal_lm.CausalLMRunner`, its construction and
 //! the facts it reports.
 
 use crate::ffi::{Function, Handle};
@@ -8,7 +8,7 @@ use crate::runner::methods::{Argument, Methods};
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
 
-const RUNNER: &str = "uniserve_models.runner.causal_lm.CausalLMRunner";
+const RUNNER: &str = "uniserve.runner.causal_lm.CausalLMRunner";
 
 /// The methods of the Python runner a forward calls, and the two its owner
 /// calls: `kernels` for the kernel table and `close` at retirement.
@@ -126,7 +126,7 @@ pub(crate) fn construct(interface: &Interface, construction: &Construction<'_>) 
 /// A size of the loaded model's causal LM, read before a runner exists:
 /// the library function `name` over the loaded model.
 fn size(interface: &Interface, loaded: &Handle, name: &str) -> Result<usize> {
-    let function = format!("uniserve_models.runner.causal_lm.{name}");
+    let function = format!("uniserve.runner.causal_lm.{name}");
     let value = interface.import(&function)?.call(&[loaded.view()])?;
     let value = i64::try_from(value).map_err(|error| Error::numerical(&function, &error))?;
     Ok(value as usize)

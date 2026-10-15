@@ -160,12 +160,12 @@ impl ExecutorInfo {
     /// reported as a physical worker.
     ///
     /// A single pool's record is returned unchanged. With several pools, the
-    /// record is cloned from the first pool that serves a KV forward call (or
+    /// record is cloned from the first pool that serves a cache forward call (or
     /// the first pool when none does), so fields the merge does not set, such
     /// as the model identity and endpoint, come from that pool. Call support and
     /// media routing are unions, queue depth is a sum, and most batch, slot,
     /// and storage limits take the smallest nonzero value any pool reports.
-    /// The exceptions are the KV cache, whose layout the KV pools must share
+    /// The exceptions are the prefix cache, whose layout the cache pools must share
     /// and whose block count is their smallest and per-token footprint their
     /// largest; request slots of a deployment that muxes video,
     /// the narrowest per-component sum of replica slots; and the diffusion
@@ -177,7 +177,7 @@ impl ExecutorInfo {
     /// Fails when there are no pools. With several pools, it also fails when
     /// media routing conflicts or is incomplete, when a deployment that muxes
     /// video reports no diffusion step count, when denoising pools disagree on the
-    /// step count, when KV pools disagree on cache layout or a routed KV pool
+    /// step count, when cache pools disagree on cache layout or a routed cache pool
     /// has no cache, when summed capacities overflow `u32`, or when the merged
     /// record fails `WorkerInfo::validate`.
     pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
@@ -193,7 +193,7 @@ impl ExecutorInfo {
 
         // Route-specific capacities contribute only when a pool implements the
         // corresponding call family. `routed` picks the first such pool, and
-        // `kv_indices` holds the index of the first pool serving each KV
+        // `cache_indices` holds the index of the first pool serving each cache
         // forward mode (prefill, decode, verify), deduplicated and in pool
         // order.
         let routed = |variant: CallKind| {
@@ -202,7 +202,7 @@ impl ExecutorInfo {
                 .find(|(_, info)| info.supported_calls.contains(&variant))
                 .map(|(_, info)| info)
         };
-        let mut kv_indices = [
+        let mut cache_indices = [
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Forward(ForwardMode::Decode),
             CallKind::Forward(ForwardMode::Verify),
@@ -214,11 +214,11 @@ impl ExecutorInfo {
                 .position(|(_, info)| info.supported_calls.contains(&variant))
         })
         .collect::<Vec<_>>();
-        kv_indices.sort_unstable();
-        kv_indices.dedup();
+        cache_indices.sort_unstable();
+        cache_indices.dedup();
 
         // Fields not merged below keep the seed pool's values.
-        let seed_index = kv_indices.first().copied().unwrap_or(0);
+        let seed_index = cache_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
         merged.media_components = self.media_routing()?;
         let denoising = routed(CallKind::Media(MediaCall::Denoising));
@@ -249,30 +249,30 @@ impl ExecutorInfo {
                     || info.video_denoiser == merged.video_denoiser),
             "workers disagree on the deployment's video denoiser"
         );
-        // Every KV stage must agree on its groups' retention policies and page
+        // Every cache stage must agree on its groups' retention policies and page
         // shapes. Capacity is the narrowest pool because a request may
-        // traverse all routed KV stages with one set of unit ids, and the
+        // traverse all routed cache stages with one set of unit ids, and the
         // per-unit footprint is the largest any of them reports
-        // (`KvCacheInfo::merge`).
-        if let Some(first_index) = kv_indices.first().copied() {
-            let mut kv_cache = self.workers[first_index]
+        // (`PrefixCacheInfo::merge`).
+        if let Some(first_index) = cache_indices.first().copied() {
+            let mut prefix_cache = self.workers[first_index]
                 .1
-                .kv_cache
+                .prefix_cache
                 .clone()
-                .context("executor routes KV work to a pool without a KV cache")?;
-            for index in kv_indices.iter().copied().skip(1) {
+                .context("executor routes cache work to a pool without a prefix cache")?;
+            for index in cache_indices.iter().copied().skip(1) {
                 let other = self.workers[index]
                     .1
-                    .kv_cache
+                    .prefix_cache
                     .as_ref()
-                    .context("executor routes KV work to a pool without a KV cache")?;
-                kv_cache = kv_cache
+                    .context("executor routes cache work to a pool without a prefix cache")?;
+                prefix_cache = prefix_cache
                     .merge(other)
-                    .context("executor KV pools expose incompatible cache layouts")?;
+                    .context("executor cache pools expose incompatible cache layouts")?;
             }
-            merged.kv_cache = Some(kv_cache);
+            merged.prefix_cache = Some(prefix_cache);
         } else {
-            merged.kv_cache = None;
+            merged.prefix_cache = None;
         }
 
         // A call is supported when any pool serves it. Each pool contributes
@@ -1016,7 +1016,7 @@ impl TransferConfig {
     pub(crate) fn bind_inputs(
         &self,
         products: &mut [uniserve_ipc::TensorExport],
-        kv_inputs: &mut [uniserve_ipc::KvTransfer],
+        cache_inputs: &mut [uniserve_ipc::CacheTransfer],
         destination: &uniserve_ipc::WorkerEndpoint,
     ) -> Result<(), UnroutableInputs> {
         let mut unroutable = Vec::new();
@@ -1030,7 +1030,7 @@ impl TransferConfig {
                 unroutable.push(buffer);
             }
         }
-        for export in kv_inputs.iter_mut() {
+        for export in cache_inputs.iter_mut() {
             let mut bound = true;
             for tensor in export.tensors_mut() {
                 bound &= self.bind_locations(tensor, destination);

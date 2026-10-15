@@ -5,10 +5,10 @@ import math
 import pytest
 import torch
 
-from uniserve_models.cache import Config, mha
-from uniserve_models.cache.conversion import copy_converted
-from uniserve_models.cache.units import UnitPool
-from uniserve_models.quantization import QuantizedTensor, Quantizer
+from uniserve.prefix_cache import Config, mha
+from uniserve.prefix_cache.conversion import copy_converted
+from uniserve.prefix_cache.units import UnitPool
+from uniserve.quantization import QuantizedTensor, Quantizer
 
 pytestmark = pytest.mark.unit
 

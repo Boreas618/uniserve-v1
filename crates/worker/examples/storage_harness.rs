@@ -1,10 +1,10 @@
-//! A TVM-FFI test harness that drives the native KV owners with the real
+//! A TVM-FFI test harness that drives the native cache owners with the real
 //! numerical interface: Python loads this library with
 //! `tvm_ffi.load_module`, passes the interface table and its cache plans
 //! and inspects the Rust-owned storage through the returned DLPack tensors
 //! (`tests/python/integration/storage`).
 //!
-//! `kv_transfer` builds a producer and a consumer cache, lets Python write
+//! `cache_transfer` builds a producer and a consumer cache, lets Python write
 //! the producer's pages, exports the producer's slot through one transport,
 //! imports it into the consumer (converting when the layouts differ) and
 //! adopts it, then retires every access and returns both caches' tensors.
@@ -23,7 +23,7 @@ use uniserve_worker::ffi::{Function, Handle, Record};
 use uniserve_worker::lane::JobQueues;
 use uniserve_worker::model::interface::Interface;
 use uniserve_worker::storage::memory::StorageView;
-use uniserve_worker::storage::{KVCache, KVPlan};
+use uniserve_worker::storage::{CachePlan, PrefixCache};
 use uniserve_worker::transfer::{Capacity, TransportKind, TransportOptions, Transports, notify};
 use uniserve_worker::{EventPool, Result};
 
@@ -58,7 +58,7 @@ fn units(value: Any) -> Result<Vec<Vec<UnitId>>> {
         .collect()
 }
 
-fn tables(slot: u32, groups: &[Vec<UnitId>], tokens: u32, plan: &KVPlan) -> Vec<BlockTable> {
+fn tables(slot: u32, groups: &[Vec<UnitId>], tokens: u32, plan: &CachePlan) -> Vec<BlockTable> {
     groups
         .iter()
         .enumerate()
@@ -107,17 +107,17 @@ fn wait(mut done: impl FnMut() -> Result<bool>, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn kv_transfer(
+fn cache_transfer(
     config: Map<FfiString, Any>,
 ) -> std::result::Result<Map<FfiString, Any>, tvm_ffi::Error> {
     run(Any::from(config)).map_err(failure)
 }
 
 fn run(config: Any) -> Result<Map<FfiString, Any>> {
-    let config = Record::new("kv_transfer", config)?;
+    let config = Record::new("cache_transfer", config)?;
     let interface = Interface::from_table(config.get("interface")?)?;
-    let plan = |key: &str| -> Result<Arc<KVPlan>> {
-        KVPlan::read(&interface, Handle::new(config.value(key)?)?).map(Arc::new)
+    let plan = |key: &str| -> Result<Arc<CachePlan>> {
+        CachePlan::read(&interface, Handle::new(config.value(key)?)?).map(Arc::new)
     };
     let source_plan = plan("source_plan")?;
     let destination_plan = plan("destination_plan")?;
@@ -137,7 +137,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         Stream::new(DeviceId(devices[1]))?,
     ];
     let width = 64;
-    let mut source = KVCache::new(
+    let mut source = PrefixCache::new(
         Arc::clone(&source_plan),
         num_units,
         2,
@@ -147,7 +147,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         Some(&streams[0]),
         &interface,
     )?;
-    let mut destination = KVCache::new(
+    let mut destination = PrefixCache::new(
         Arc::clone(&destination_plan),
         num_units,
         2,
@@ -278,4 +278,4 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     Ok(result)
 }
 
-tvm_ffi::tvm_ffi_dll_export_typed_func!(kv_transfer, kv_transfer);
+tvm_ffi::tvm_ffi_dll_export_typed_func!(cache_transfer, cache_transfer);

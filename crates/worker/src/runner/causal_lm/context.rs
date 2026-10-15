@@ -2,7 +2,7 @@
 //!
 //! A *context* prefill (`Call::writes_context`) holds a prompt with vision
 //! blocks: its rows alternate runs of prompt text (causal) and one block
-//! per `VisionInput` (non-causal), at increasing KV and position
+//! per `VisionInput` (non-causal), at increasing prefix cache and position
 //! coordinates; a block may advance the rotary position by less than its
 //! token count. A *visual-state* prefill (`Call::writes_visual_state`)
 //! places exactly one feature after a generated or ingested image: a vision
@@ -190,7 +190,7 @@ fn vision_row(
         })?;
     if prefix > u64::from(sources.tables.allocated_length(slot)) {
         return Err(Error::Invalid(
-            "vision row prefix lies outside the request's KV extent".into(),
+            "vision row prefix lies outside the request's cache extent".into(),
         ));
     }
     if !close_image && sources.input_images == 0 {
@@ -267,7 +267,7 @@ pub(super) fn context(
     let mut position = output.progress.logical_position;
     let (_, mut visible, _) = sources
         .tables
-        .coordinates(slot, output.progress.kv_visible_len)?;
+        .coordinates(slot, output.progress.cache_visible_len)?;
     let mut rows = Vec::new();
     let mut embeddings = Vec::new();
     let mut reads = Vec::new();
@@ -377,7 +377,7 @@ pub(super) fn visual(
     let start = output.progress.logical_position;
     let (_, visible, _) = sources
         .tables
-        .coordinates(slot, output.progress.kv_visible_len)?;
+        .coordinates(slot, output.progress.cache_visible_len)?;
     let feature = consume(sources, call, 0, latent)?;
     let read = Arc::clone(&feature.read);
     let image = sources

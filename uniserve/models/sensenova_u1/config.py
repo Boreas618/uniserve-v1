@@ -1,0 +1,402 @@
+"""Immutable SenseNova U1 architecture and checkpoint metadata normalization.
+
+``read_config`` resolves a checkpoint's ``llm_config``, ``vision_config`` and
+root fields, including keys that checkpoints duplicate across those maps,
+into one frozen ``Config`` tree of ``TransformerConfig``, ``vision.Config``
+and ``flow.Config``. Each dataclass validates its own fields on construction;
+typed rotary scaling recipes replace the checkpoint's rotary dictionaries.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from uniserve import loading
+from uniserve.diffusion import NoiseScale
+from uniserve.loading import checkpoint
+from uniserve.nn.rope import RoPEScaling
+
+from ...rotary import alias, read_rotary
+from . import flow, vision
+
+
+def _positive(value: object, name: str, *, integer: bool = False) -> None:
+    """Require a finite positive number, optionally a strict integer."""
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or (integer and not isinstance(value, int))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(
+            f"SenseNova {name} must be a positive "
+            f"{'integer' if integer else 'finite number'}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TransformerConfig:
+    """Text/flow decoder dimensions, normalization, and multi-axis rotary math.
+
+    One backbone serves both the text and flow routes, so these fields
+    describe both. ``transformer.TransformerLayer`` splits each head into a
+    temporal rotary half and height and width quarters: the temporal axis
+    uses ``rope_theta`` and ``max_position_embeddings``, the spatial axes
+    ``rope_theta_hw`` and ``max_position_embeddings_hw``, and all three share
+    ``rope_scaling`` and ``partial_rotary_factor``. ``layer_types`` and
+    ``sliding_window`` record the checkpoint's attention kinds, but
+    ``__post_init__`` rejects any ``sliding_attention`` layer.
+
+    Raises:
+        ValueError: From ``__post_init__`` when a field has the wrong type or
+            an invalid value.
+    """  # noqa: E501
+
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    layer_types: tuple[str, ...]
+    hidden_act: str = "silu"
+    rms_norm_eps: float = 1e-6
+    attention_bias: bool = False
+    max_position_embeddings: int = 32768
+    max_position_embeddings_hw: int = 10000
+    rope_theta: float = 10000.0
+    rope_theta_hw: float = 10000.0
+    rope_scaling: RoPEScaling | None = None
+    partial_rotary_factor: float = 1.0
+    sliding_window: int | None = None
+    pad_token_id: int | None = None
+    tie_word_embeddings: bool = False
+
+    def __post_init__(self) -> None:
+        for name in (
+            "vocab_size",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "max_position_embeddings",
+            "max_position_embeddings_hw",
+        ):
+            _positive(getattr(self, name), name, integer=True)
+        for name in (
+            "rms_norm_eps",
+            "rope_theta",
+            "rope_theta_hw",
+            "partial_rotary_factor",
+        ):
+            _positive(getattr(self, name), name)
+
+        if self.head_dim % 4:
+            raise ValueError(
+                "SenseNova head_dim must divide into "
+                "temporal/height/width partitions"
+            )
+        if self.num_attention_heads % self.num_key_value_heads:
+            raise ValueError(
+                "SenseNova attention heads must be divisible by KV heads"
+            )
+        if self.partial_rotary_factor > 1:
+            raise ValueError(
+                "SenseNova partial_rotary_factor must not exceed one"
+            )
+
+        if (
+            not isinstance(self.layer_types, tuple)
+            or len(self.layer_types) != self.num_hidden_layers
+        ):
+            raise ValueError(
+                "SenseNova layer_types must describe every decoder layer"
+            )
+        if any(
+            not isinstance(value, str)
+            or value not in {"full_attention", "sliding_attention"}
+            for value in self.layer_types
+        ):
+            raise ValueError(
+                "SenseNova layer_types contains an unsupported attention type"
+            )
+        if self.sliding_window is not None:
+            _positive(self.sliding_window, "sliding_window", integer=True)
+        if "sliding_attention" in self.layer_types:
+            if self.sliding_window is None:
+                raise ValueError(
+                    "SenseNova sliding_attention requires sliding_window"
+                )
+            # The multimodal mask implements full attention within image
+            # blocks and causal text visibility, without a local-window cutoff.
+            raise ValueError(
+                "SenseNova layer_types: sliding_attention is not "
+                "supported by the MoT decoder"
+            )
+
+        for name in ("attention_bias", "tie_word_embeddings"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"SenseNova {name} must be boolean")
+        if self.pad_token_id is not None and (
+            not isinstance(self.pad_token_id, int)
+            or isinstance(self.pad_token_id, bool)
+            or not 0 <= self.pad_token_id < self.vocab_size
+        ):
+            raise ValueError(
+                "SenseNova pad_token_id must be inside the vocabulary"
+            )
+        if not isinstance(self.hidden_act, str) or self.hidden_act not in {
+            "silu",
+            "swish",
+            "silu_and_mul",
+            "swiglu",
+            "gelu",
+            "gelu_and_mul",
+            "geglu",
+            "gelu_pytorch_tanh",
+            "gelu_tanh",
+        }:
+            raise ValueError(
+                f"unsupported SenseNova hidden_act {self.hidden_act!r}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class Config:
+    """Compose the language, patch embedding, and image prediction networks.
+
+    ``max_image_seq_len`` is the longest image token sequence the denoiser
+    accepts, which ``Denoiser.max_sequence_tokens`` reports. ``__post_init__``
+    requires RGB vision input whose output width equals the text hidden size.
+    """
+
+    text: TransformerConfig
+    vision: vision.Config
+    flow: flow.Config
+    max_image_seq_len: int = 4096
+
+    def __post_init__(self) -> None:
+        _positive(self.max_image_seq_len, "max_image_seq_len", integer=True)
+        if self.vision.output_size != self.text.hidden_size:
+            raise ValueError(
+                "SenseNova vision output must match text hidden_size"
+            )
+        if self.vision.num_channels != 3:
+            raise ValueError(
+                "SenseNova image prediction requires RGB vision inputs"
+            )
+
+
+def _stage_scalar(value: Any, name: str) -> Any:
+    """Collapse a per-stage list to its first entry; scalars pass through."""
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError(
+                f"SenseNova vision_config.{name} must not be empty"
+            )
+        return value[0]
+    return value
+
+
+def _required(config: Mapping[str, Any], name: str, label: str) -> Any:
+    """Return a required field of the ``label`` map for later validation."""
+    if name not in config:
+        raise ValueError(f"SenseNova {label} requires {name!r}")
+    return config[name]
+
+
+def _normalize(raw: Mapping[str, Any]) -> Config:
+    """Resolve checkpoint aliases once, without allocating numerical resources.
+
+    Raises:
+        RuntimeError: When the checkpoint requires a newer version of this
+            model implementation.
+        ValueError: For malformed metadata, including a missing
+            ``llm_config``, ``vision_config`` or text dimension without a
+            default, conflicting aliases, an unsupported rotary recipe or
+            sparse MoE text model, and fields that a rotary recipe or config
+            dataclass rejects.
+    """  # noqa: E501
+    from packaging.version import Version
+
+    # A checkpoint may name the minimum version of this model code it needs.
+    required = raw.get("uniserve_sensenova_min_version")
+    if required and Version("0.1.0") < Version(str(required)):
+        raise RuntimeError(
+            f"checkpoint requires UniServe model code >= {required}"
+        )
+
+    text, image = raw.get("llm_config"), raw.get("vision_config")
+    if not isinstance(text, Mapping) or not isinstance(image, Mapping):
+        raise ValueError(
+            "SenseNova llm_config and vision_config must be objects"
+        )
+    if text.get("num_experts", 0) != 0:
+        raise ValueError(
+            "SenseNova llm_config.num_experts: sparse MoE is not "
+            "supported by the dual-route MoT decoder"
+        )
+
+    # Checkpoints may carry rotary metadata under rope_scaling,
+    # rope_parameters, or both; read_rotary resolves their aliases.
+    rotary = read_rotary(
+        text,
+        owner="SenseNova",
+        default_theta=10000.0,
+        default_original=text.get("max_position_embeddings", 32768),
+    )
+
+    layers = _required(text, "num_hidden_layers", "llm_config")
+    heads = _required(text, "num_attention_heads", "llm_config")
+    _positive(layers, "llm_config.num_hidden_layers", integer=True)
+    _positive(heads, "llm_config.num_attention_heads", integer=True)
+    hidden = _required(text, "hidden_size", "llm_config")
+    _positive(hidden, "llm_config.hidden_size", integer=True)
+    if "head_dim" not in text and hidden % heads:
+        raise ValueError(
+            "SenseNova requires explicit head_dim for this hidden width"
+        )
+
+    use_window = text.get("use_sliding_window", False)
+    if not isinstance(use_window, bool):
+        raise ValueError("SenseNova use_sliding_window must be boolean")
+    window = text.get("sliding_window")
+    boundary = text.get("max_window_layers", 0)
+    if (
+        not isinstance(boundary, int)
+        or isinstance(boundary, bool)
+        or boundary < 0
+    ):
+        raise ValueError(
+            "SenseNova llm_config.max_window_layers must be a "
+            "non-negative integer"
+        )
+    layer_types = text.get("layer_types")
+    if layer_types is None:
+        # Without layer_types, the window fields define the per-layer
+        # attention kinds: with use_sliding_window and a sliding_window set,
+        # layers from max_window_layers onward use sliding attention.
+        layer_types = tuple(
+            "sliding_attention"
+            if use_window and window is not None and index >= boundary
+            else "full_attention"
+            for index in range(layers)
+        )
+    if not isinstance(layer_types, (list, tuple)):
+        raise ValueError("SenseNova layer_types must be a sequence")
+
+    vision_ratio = _stage_scalar(
+        image.get("downsample_ratio", 0.5), "downsample_ratio"
+    )
+    if raw.get("downsample_ratio", vision_ratio) != vision_ratio:
+        raise ValueError(
+            "SenseNova root and vision downsample_ratio must agree"
+        )
+    # A head deeper than two layers is the deep adaptive head sized by
+    # fm_head_dim and fm_head_mlp_ratio. The shallow two-layer MLP has a
+    # fixed hidden width of 4096, and the checkpoint's head fields do not
+    # apply to it.
+    head_layers = raw.get("fm_head_layers", 2)
+    _positive(head_layers, "fm_head_layers", integer=True)
+
+    return Config(
+        text=TransformerConfig(
+            vocab_size=_required(text, "vocab_size", "llm_config"),
+            hidden_size=hidden,
+            intermediate_size=_required(
+                text, "intermediate_size", "llm_config"
+            ),
+            num_hidden_layers=layers,
+            num_attention_heads=heads,
+            num_key_value_heads=_required(
+                text, "num_key_value_heads", "llm_config"
+            ),
+            head_dim=text.get("head_dim", hidden // heads),
+            layer_types=tuple(layer_types),
+            hidden_act=text.get("hidden_act", "silu"),
+            rms_norm_eps=text.get("rms_norm_eps", 1e-6),
+            attention_bias=text.get("attention_bias", False),
+            max_position_embeddings=text.get("max_position_embeddings", 32768),
+            max_position_embeddings_hw=text.get(
+                "max_position_embeddings_hw", 10000
+            ),
+            rope_theta=rotary.theta,
+            rope_theta_hw=text.get("rope_theta_hw", 10000.0),
+            rope_scaling=rotary.scaling,
+            partial_rotary_factor=rotary.partial_rotary_factor,
+            sliding_window=window,
+            # The text map's pad_token_id takes precedence over the root's.
+            pad_token_id=text.get("pad_token_id")
+            if text.get("pad_token_id") is not None
+            else raw.get("pad_token_id"),
+            tie_word_embeddings=alias(
+                text, "tie_word_embeddings", (raw,), False, owner="SenseNova"
+            ),
+        ),
+        vision=vision.Config(
+            hidden_size=image.get("hidden_size", 1024),
+            output_size=_stage_scalar(
+                image.get("llm_hidden_size", 2048), "llm_hidden_size"
+            ),
+            downsample_ratio=vision_ratio,
+            patch_size=image.get("patch_size", 16),
+            num_channels=image.get("num_channels", 3),
+            rope_theta=image.get("rope_theta_vision", 10000.0),
+        ),
+        flow=flow.Config(
+            head=flow.HeadConfig(
+                hidden_size=_required(raw, "fm_head_dim", "config")
+                if head_layers > 2
+                else 4096,
+                num_layers=head_layers,
+                mlp_ratio=_required(raw, "fm_head_mlp_ratio", "config")
+                if head_layers > 2
+                else 1.0,
+            ),
+            use_pixel_head=raw.get("use_pixel_head", False),
+            add_noise_scale_embedding=raw.get(
+                "add_noise_scale_embedding", False
+            ),
+            # The checkpoint's "dynamic" noise mode maps to NoiseScale's
+            # "resolution" mode; other mode names pass through unchanged.
+            noise=NoiseScale(
+                raw.get("noise_scale", 1.0),
+                "resolution"
+                if raw.get("noise_scale_mode") == "dynamic"
+                else raw.get("noise_scale_mode", "constant"),
+                raw.get("noise_scale_base_image_seq_len", 1.0),
+                raw.get("noise_scale_max_value", 1.0),
+            ),
+        ),
+        max_image_seq_len=raw.get("max_image_seq_len", 4096),
+    )
+
+
+def read_config(
+    root: Path,
+    io: loading.Config,
+    *,
+    sources: Mapping[str, checkpoint.Source],
+) -> Config:
+    """Normalize checkpoint aliases and typed rotary recipes before construction.
+
+    ``io`` and ``sources`` belong to the package ``read_config`` contract;
+    SenseNova reads only the local ``config.json`` and declares no
+    ``config_sources``. Metadata errors are those of ``_normalize``.
+    """  # noqa: E501
+    return _normalize(json.loads((root / "config.json").read_text()))
+
+
+# Checkpoint sources whose tensor headers read_config needs before module
+# selection. SenseNova derives every dimension from config.json, so it has
+# none.
+config_sources = ()

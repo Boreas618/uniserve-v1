@@ -14,23 +14,22 @@ from torch.nn import functional as F
 
 from tests.python.fixtures.h3 import dmd_denoiser
 from tests.python.fixtures.vsa import reference_attention
-from uniserve_models import loading
-from uniserve_models.bindings.context import ExecutionContext, TensorBuffers
-from uniserve_models.distributed import DeviceMesh
-from uniserve_models.interface import graphs
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.minimax_h3 import (
+from uniserve import cuda_graph, loading
+from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.distributed import DeviceMesh
+from uniserve.loading import checkpoint, weights
+from uniserve.models.minimax_h3 import (
     AttentionInput,
     Transformer,
     TransformerConfig,
 )
-from uniserve_models.minimax_h3.config import TRANSFORMER_FIELDS
-from uniserve_models.minimax_h3.denoiser import (
+from uniserve.models.minimax_h3.config import TRANSFORMER_FIELDS
+from uniserve.models.minimax_h3.denoiser import (
     modulation_timesteps,
     schedules,
 )
-from uniserve_models.minimax_h3.weights import transformer_component
-from uniserve_models.nn.attention import vsa
+from uniserve.models.minimax_h3.weights import transformer_component
+from uniserve.nn.attention import vsa
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -305,7 +304,7 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
                         result, reference, rtol=2e-2, atol=2e-2
                     )
             step.fill_(3)
-            graph = graphs.capture(
+            graph = cuda_graph.capture(
                 lambda: model(
                     hidden,
                     inputs,

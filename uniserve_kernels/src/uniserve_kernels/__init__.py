@@ -6,9 +6,9 @@ and host_memory; ``jit`` builds the CUDA C++ extensions.
 Launchers consume device tensors. Many write caller-supplied outputs and pair
 with a separate eligibility check such as ``activation.unsupported``, which
 returns the first unmet condition as a reason. Callers such as the numerical
-entry points in ``uniserve_models.nn.functional`` run that check, raise with its
+entry points in ``uniserve.nn.functional`` run that check, raise with its
 reason on CUDA, launch the kernel and define the portable formula for other
-devices, while provider adapters in ``uniserve_models.backends.attention``
+devices, while provider adapters in ``uniserve.backends.attention``
 bind the attention kernels. Kernels know nothing about workers, requests,
 lanes, models or runtime owners.
 """

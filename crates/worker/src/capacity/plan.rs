@@ -1,16 +1,16 @@
-//! Startup capacity planning: page size, request slots, KV units, latent
+//! Startup capacity planning: page size, request slots, cache units, latent
 //! pages and the [`WorkerInfo`] the rank reports.
 //!
 //! Planning runs after the model is loaded, so measured device storage
 //! includes the weights. Every quantity the engine schedules against must be
 //! identical on the ranks of a group, so the page size, the request-slot fit
-//! and the KV unit count are agreed over the group's [`HostGroup`] with a
+//! and the cache unit count are agreed over the group's [`HostGroup`] with a
 //! minimum reduction.
 //!
-//! Token workers (text, diffusion LM, image) place a KV pool beside fixed storage:
+//! Token workers (text, diffusion LM, image) place a cache pool beside fixed storage:
 //! the buffer pool, the tensor store's products, the latent pool and the
 //! storage each capability runtime reserves (input buffers, block tables,
-//! decode state, importer scratch). Automatic KV sizing gives the pool the
+//! decode state, importer scratch). Automatic cache sizing gives the pool the
 //! grant left after those and a graph-capture reservation. Media workers
 //! (video) size request slots instead, because every resident request keeps
 //! its whole media state.
@@ -25,13 +25,13 @@ use uniserve_ipc::{
 };
 
 use super::{
-    ArenaCapacity, DEFAULT_NUM_UNITS, KVCapacity, call_window, latent_pool_bytes,
+    ArenaCapacity, CacheCapacity, DEFAULT_NUM_UNITS, call_window, latent_pool_bytes,
     request_tensor_window,
 };
 use crate::config::{Device, WorkerConfig, graph_padding_block_count};
 use crate::cuda_graph::graph_storage_budget_bytes;
 use crate::parallel::host::HostGroup;
-use crate::storage::KVPlan;
+use crate::storage::CachePlan;
 use crate::{Error, Result};
 
 /// Product scalar banks keep one value of every protocol dtype per slot.
@@ -138,7 +138,7 @@ impl LatentPlan {
     pub fn image(
         slots: usize,
         max_tokens: usize,
-        kv_token_capacity: Option<usize>,
+        cache_token_capacity: Option<usize>,
         block_size: usize,
         width: usize,
         element_bytes: usize,
@@ -146,7 +146,7 @@ impl LatentPlan {
         let units = if max_tokens == 0 {
             0
         } else {
-            max_tokens.max(kv_token_capacity.unwrap_or(max_tokens))
+            max_tokens.max(cache_token_capacity.unwrap_or(max_tokens))
         };
         Self {
             request_pool_size: slots,
@@ -229,13 +229,13 @@ pub struct TokenFacts {
 pub struct Plan {
     pub info: WorkerInfo,
     pub arena: ArenaCapacity,
-    /// Fixed bytes by device, beside the KV pool.
+    /// Fixed bytes by device, beside the cache pool.
     pub fixed_device_bytes: BTreeMap<Device, u64>,
     /// Bytes of this rank's physical buffer pool.
     pub physical_buffer_pool_bytes: u64,
     pub latent: Option<LatentPlan>,
-    /// The KV layout, with the agreed unit count in `info.kv_cache`.
-    pub cache: Option<Arc<KVPlan>>,
+    /// The cache layout, with the agreed unit count in `info.prefix_cache`.
+    pub cache: Option<Arc<CachePlan>>,
 }
 
 impl Plan {
@@ -294,7 +294,7 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
         max_prefill_calls: 0,
         max_decode_calls: 0,
         request_slots: narrow(config.max_request_pool_size, "request slots")?,
-        kv_cache: None,
+        prefix_cache: None,
         latent_page_units: 0,
         latent_pages: 0,
         buffer_pool_bytes: 0,
@@ -305,7 +305,7 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
     })
 }
 
-/// A token worker's layout before the KV pool is fitted.
+/// A token worker's layout before the cache pool is fitted.
 pub struct TokenLayout {
     info: WorkerInfo,
     arena: ArenaCapacity,
@@ -384,7 +384,7 @@ impl TokenLayout {
         *self.fixed.entry(device).or_default() += bytes;
     }
 
-    /// Fit the KV pool beside the fixed storage and agree its unit count.
+    /// Fit the cache pool beside the fixed storage and agree its unit count.
     ///
     /// The pool takes the grant left after a graph-capture reservation (10%
     /// of the device), the widest default graph padding of every group, and
@@ -394,12 +394,12 @@ impl TokenLayout {
     /// index columns), charged with each unit.
     pub fn fit_cache(
         &mut self,
-        cache: &KVPlan,
+        cache: &CachePlan,
         unit_overhead: u64,
         config: &WorkerConfig,
         total_bytes: u64,
         group: &HostGroup,
-    ) -> Result<KVCapacity> {
+    ) -> Result<CacheCapacity> {
         let unit_bytes = cache.unit_bytes + unit_overhead;
         let pages: Vec<(u32, u32)> = cache
             .groups
@@ -419,14 +419,14 @@ impl TokenLayout {
             .div_ceil(unit_bytes);
 
         let cuda = config.device.is_cuda();
-        let tokens = config.kv_token_capacity.map(|tokens| tokens as u64);
+        let tokens = config.cache_token_capacity.map(|tokens| tokens as u64);
         let available = config.pool_storage_bytes.map(|bytes| bytes as u64);
         if cuda && tokens.is_none() && available.is_none() {
             return Err(Error::Invalid(
                 "automatic CUDA KV sizing requires a host storage grant".into(),
             ));
         }
-        let mut capacity = KVCapacity::derive(
+        let mut capacity = CacheCapacity::derive(
             &pages,
             tokens,
             unit_bytes,
@@ -441,8 +441,8 @@ impl TokenLayout {
         capacity.num_units = group.all_reduce_min(&[capacity.num_units as i64])?[0] as u64;
         let num_units = u32::try_from(capacity.num_units)
             .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
-        self.info.kv_cache = Some(cache.info(num_units));
-        // The arena's slot counts are independent of KV capacity; only its
+        self.info.prefix_cache = Some(cache.info(num_units));
+        // The arena's slot counts are independent of cache capacity; only its
         // transfer byte reservation follows the fitted pool.
         self.arena.transfer_bytes = (capacity.num_units * cache.unit_bytes)
             .max(self.feature_bytes)
@@ -451,7 +451,7 @@ impl TokenLayout {
         Ok(capacity)
     }
 
-    pub fn finish(self, config: &WorkerConfig, cache: Option<Arc<KVPlan>>) -> Plan {
+    pub fn finish(self, config: &WorkerConfig, cache: Option<Arc<CachePlan>>) -> Plan {
         let physical_buffer_pool_bytes = self.info.buffer_pool_bytes;
         let mut plan = Plan {
             info: self.info,
@@ -603,16 +603,16 @@ mod tests {
     }
 
     /// A two-layer, one-column bfloat16 pool with 64-token pages.
-    fn cache() -> KVPlan {
+    fn cache() -> CachePlan {
         let plane_bytes = 64 * 4 * 128 * 2;
-        KVPlan {
+        CachePlan {
             columns: 1,
             plane_bytes,
             quantized: false,
             // Key and value planes, each with one initialization flag.
             unit_bytes: 2 * (plane_bytes + 1),
-            dtype: uniserve_core::KvCacheDtype::BFloat16,
-            groups: vec![crate::storage::KVGroupPlan {
+            dtype: uniserve_core::PrefixCacheDtype::BFloat16,
+            groups: vec![crate::storage::CacheGroupPlan {
                 window: None,
                 page_tokens: 64,
                 units_per_page: 2,
@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn the_kv_pool_takes_the_grant_left_after_reservations() {
+    fn the_cache_pool_takes_the_grant_left_after_reservations() {
         let gib = 1u64 << 30;
         let config = WorkerConfig {
             device: Device::Cuda(0),
@@ -704,7 +704,7 @@ mod tests {
             + (fixed_before + gib).div_ceil(unit);
         assert_eq!(capacity.num_units, 20 * gib / unit - reserved);
         let plan = layout.finish(&config, Some(Arc::new(cache)));
-        let info = plan.info.kv_cache.as_ref().unwrap();
+        let info = plan.info.prefix_cache.as_ref().unwrap();
         assert_eq!(u64::from(info.num_units), capacity.num_units);
         assert_eq!(info.groups[0].kv_head_offset, 4);
         assert_eq!(

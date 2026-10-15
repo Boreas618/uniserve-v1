@@ -12,7 +12,7 @@
 //! | `penalty_counts` | `i32` | `[S, V]` | committed generated-token counts |
 //! | `prompt_logits` | model dtype | `[S, V]` | last logits of a scored prompt chunk |
 //!
-//! The slot's verified KV length is the block tables' `verified_lengths`,
+//! The slot's verified cache length is the block tables' `verified_lengths`,
 //! shared with attention gathers. `S` is the request slot count plus one:
 //! slot 0 is padding. Rust allocates, resets and copies; the runner's
 //! `commit` installs selections.

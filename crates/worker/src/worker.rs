@@ -10,7 +10,7 @@
 //! 3. The process world: host groups, the torch world, component groups
 //!    and meshes.
 //! 4. Loading, model facts, execution streams.
-//! 5. Capacity: page size, request slots, KV units and latent pages, all
+//! 5. Capacity: page size, request slots, cache units and latent pages, all
 //!    agreed over the group; the auxiliary-device check.
 //! 6. Request storage and the runners, created by the storage and
 //!    capability runtimes on the plan and handed to the backend.
@@ -74,7 +74,7 @@ use crate::runner::start::{
     ImageOwners, Startup as ImageStartup, reserved_bytes as image_reserved_bytes, start_video,
 };
 use crate::service::Service;
-use crate::storage::{BufferPool, GroupShape, KVCache, KVPlan, TensorStore};
+use crate::storage::{BufferPool, CachePlan, GroupShape, PrefixCache, TensorStore};
 use crate::stream::{CUDAStream, EventPool};
 use crate::transfer::{Capacity, TransportKind, TransportOptions, Transports};
 use crate::warmup::{Scenarios, WarmupHooks};
@@ -324,7 +324,7 @@ impl Worker {
             model: &model,
             image_processor: image.processing.is_some(),
             lanes: &lanes,
-            kv: storage.kv.as_ref(),
+            prefix_cache: storage.prefix_cache.as_ref(),
             components: &components,
             scratches: &mut scratches,
             graphs: &mut graphs,
@@ -364,7 +364,7 @@ impl Worker {
             model: &model,
             experts: expert_exchange(&launch),
             lanes: &lanes,
-            kv: storage.kv.as_ref(),
+            prefix_cache: storage.prefix_cache.as_ref(),
             components: &mut components,
             scratches: &mut scratches,
             graphs: &mut graphs,
@@ -759,7 +759,7 @@ impl Worker {
             } else {
                 0
             };
-            let measured = budget.budget(index, self.config.kv_storage_fraction)?;
+            let measured = budget.budget(index, self.config.cache_storage_fraction)?;
             let segments = self.segments(index)?;
             let pooled = self
                 .graphs
@@ -776,7 +776,7 @@ impl Worker {
 
     /// Bytes the caching allocator holds in each of its pools on `device`.
     fn segments(&self, device: i32) -> Result<Vec<Segment>> {
-        let function = "uniserve_models.interface.graphs.pool_bytes";
+        let function = "uniserve.cuda_graph.pool_bytes";
         let pools = self
             .interface
             .import(function)?
@@ -793,7 +793,7 @@ impl Worker {
 
     fn require_codecs(&self) -> std::result::Result<(), WorkerError> {
         self.interface
-            .import("uniserve_models.media.codec.require_codecs")
+            .import("uniserve.media.codec.require_codecs")
             .and_then(|function| function.invoke(&[]))
             .map_err(phase("warmup"))
     }
@@ -906,7 +906,7 @@ impl Drop for Worker {
 }
 
 /// Allocate the storage owners on the plan: device events, the product
-/// transports and the KV cache of a text model, whose planes are reset on
+/// transports and the prefix cache of a text model, whose planes are reset on
 /// the device's preparation stream.
 fn allocate_storage(
     launch: &WorkerLaunch,
@@ -972,8 +972,8 @@ fn allocate_storage(
 
     let device = config.device.cuda_index();
     let preparation = device.and_then(|index| lanes.preparation(DeviceId(index)));
-    let kv = match (&plan.cache, &plan.info.kv_cache) {
-        (Some(cache), Some(info)) => Some(KVCache::new(
+    let prefix_cache = match (&plan.cache, &plan.info.prefix_cache) {
+        (Some(cache), Some(info)) => Some(PrefixCache::new(
             Arc::clone(cache),
             info.num_units,
             plan.info.request_slots,
@@ -1000,7 +1000,7 @@ fn allocate_storage(
         events,
         tensors,
         transports,
-        kv,
+        prefix_cache,
         release_stream,
     ))
 }
@@ -1020,11 +1020,11 @@ fn cache_width(shapes: &[GroupShape], max_sequence_tokens: usize) -> u32 {
 /// Report the planned capacity once, for operators.
 fn log_capacity(config: &WorkerConfig, plan: &Plan) {
     let info = &plan.info;
-    let kv = info.kv_cache.as_ref().map_or_else(
-        || "no KV pool".to_owned(),
+    let prefix_cache = info.prefix_cache.as_ref().map_or_else(
+        || "no cache pool".to_owned(),
         |cache| {
             format!(
-                "{} KV units of {} bytes in {} groups",
+                "{} cache units of {} bytes in {} groups",
                 cache.num_units,
                 cache.unit_bytes,
                 cache.groups.len()
@@ -1033,7 +1033,7 @@ fn log_capacity(config: &WorkerConfig, plan: &Plan) {
     );
     tracing::info!(
         target: "uniserve_worker.launch",
-        "planned capacity: {kv}, KV page size {} tokens, {} request slots, {} calls and {} tokens per batch, {} latent pages, {} buffer pool bytes",
+        "planned capacity: {prefix_cache}, KV page size {} tokens, {} request slots, {} calls and {} tokens per batch, {} latent pages, {} buffer pool bytes",
         config.block_size.unwrap_or(0),
         info.request_slots,
         info.max_batch_calls,
@@ -1145,23 +1145,26 @@ fn plan(
 ) -> Result<(Plan, Option<VideoCapacity>)> {
     let device = config.device;
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
-        config.pool_storage_bytes =
-            Some(budget.budget(index, config.kv_storage_fraction)?.available as usize);
+        config.pool_storage_bytes = Some(
+            budget
+                .budget(index, config.cache_storage_fraction)?
+                .available as usize,
+        );
     }
 
     let declarations = &model.declarations;
     let text = declarations.has(Capability::CausalLm);
-    let kv_dtype = config.kv_cache_dtype.clone();
+    let prefix_cache_dtype = config.prefix_cache_dtype.clone();
     let block_size = page_size(
         config.block_size,
         |size| {
             if text {
-                KVPlan::reads_pages(
+                CachePlan::reads_pages(
                     interface,
                     model.handle(),
                     &model.attention_backend,
                     size,
-                    kv_dtype.as_deref(),
+                    prefix_cache_dtype.as_deref(),
                 )
             } else {
                 Ok(true)
@@ -1270,7 +1273,7 @@ fn plan(
         LatentPlan::image(
             config.max_request_pool_size,
             image_tokens,
-            config.kv_token_capacity,
+            config.cache_token_capacity,
             block_size,
             layout.width() as usize,
             element_bytes,
@@ -1286,7 +1289,7 @@ fn plan(
     };
     let mut layout = TokenLayout::new(report, config, launch.ipc.queue_depth, &token_facts)?;
     // Every rank of a worker holding a causal LM component keeps the same
-    // KV pool, including ranks that hold only its other components: the
+    // cache pool, including ranks that hold only its other components: the
     // worker advertises token work for all of its ranks, and they agree on
     // one pool capacity.
     let holds_text = held.iter().any(|name| {
@@ -1296,7 +1299,12 @@ fn plan(
             .any(|call| call.is(Capability::CausalLm))
     });
     let cache = if text && !dedicated && holds_text {
-        let cache = KVPlan::plan(interface, model.handle(), block_size, kv_dtype.as_deref())?;
+        let cache = CachePlan::plan(
+            interface,
+            model.handle(),
+            block_size,
+            prefix_cache_dtype.as_deref(),
+        )?;
         let total = match device {
             Device::Cuda(index) => total_bytes(index)?,
             Device::Cpu => 0,
@@ -1306,7 +1314,7 @@ fn plan(
         let shapes = cache.group_shapes()?;
         let width = cache_width(&shapes, config.max_sequence_tokens);
         let import_capacity = layout.info().max_unresolved_calls as usize;
-        let fixed = KVCache::fixed_bytes(
+        let fixed = PrefixCache::fixed_bytes(
             &cache,
             0,
             layout.info().request_slots,
@@ -1352,14 +1360,14 @@ fn plan(
                 &cache,
             )?,
         );
-        let columns = KVCache::import_workers(import_capacity) + unit_columns;
+        let columns = PrefixCache::import_workers(import_capacity) + unit_columns;
         layout.fit_cache(&cache, 8 * columns as u64, config, total, &world.host)?;
         Some(Arc::new(cache))
     } else {
         None
     };
     let mut plan = layout.finish(config, cache);
-    if let (Some(cache), Some(info)) = (&plan.cache, &plan.info.kv_cache) {
+    if let (Some(cache), Some(info)) = (&plan.cache, &plan.info.prefix_cache) {
         // Batches never exceed the largest captured graph bucket.
         let bounds = TextBounds::new(
             config,
@@ -1410,7 +1418,9 @@ fn video_layout(
         .get("video_codec")
         .map(|component| component.ranks.len());
     if let (Device::Cuda(index), Some(budget)) = (config.device, budget) {
-        let available = budget.budget(index, config.kv_storage_fraction)?.available;
+        let available = budget
+            .budget(index, config.cache_storage_fraction)?
+            .available;
         let maximum = config.max_request_pool_size;
         let minimum = config.min_request_pool_size.min(maximum).max(1);
         let facts = capacity.facts(video, maximum, local, codec_ranks)?;

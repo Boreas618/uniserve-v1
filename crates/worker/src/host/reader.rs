@@ -51,13 +51,13 @@ impl ReaderFunctions {
     /// library's condition decoders, and the patch packing and audio rate
     /// the Python `EncoderRunner` answers from the model's description.
     pub(crate) fn new(interface: &Interface, loaded: &Handle) -> Result<Self> {
-        const ENCODER: &str = "uniserve_models.runner.encoder.EncoderRunner";
+        const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
         let sample_rate: i64 = interface
             .import(&format!("{ENCODER}.sample_rate"))?
             .call_as(&[loaded.view()])?;
         Ok(Self {
-            read_image: interface.import("uniserve_models.media.reader.read_image")?,
-            read_audio: interface.import("uniserve_models.media.reader.read_audio")?,
+            read_image: interface.import("uniserve.media.reader.read_image")?,
+            read_audio: interface.import("uniserve.media.reader.read_audio")?,
             pack_vision: interface.import(&format!("{ENCODER}.pack_pixels"))?,
             loaded: loaded.clone(),
             sample_rate: u32::try_from(sample_rate)

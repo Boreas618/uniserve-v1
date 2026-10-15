@@ -11,8 +11,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_models.nn.functional import softcap
-from uniserve_models.nn.linear import VocabParallelHead
+from uniserve.nn.functional import softcap
+from uniserve.nn.linear import VocabParallelHead
 
 pytestmark = pytest.mark.unit
 

@@ -2,7 +2,7 @@
 
 UniServe serves FastH3 8-Step text-to-video-with-audio generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
-UniServe is a Rust serving system with a Python numerical library. Rust owns HTTP admission, scheduling, worker processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. `uniserve_models` supplies the numerical layers, loading, resource binding and the models; each worker rank runs the Rust rank runtime and calls those same numerical implementations through TVM-FFI.
+UniServe is a Rust serving system with a Python numerical library. Rust owns HTTP admission, scheduling, worker processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. `uniserve` supplies the numerical layers, loading, resource binding and the models; each worker rank runs the Rust rank runtime and calls those same numerical implementations through TVM-FFI.
 
 The configured model descriptions are `qwen3`, `sensenova`, `bagel`, `minimax-h3`, and `diffusion-gemma`. A server process loads exactly one description and exposes one served-model identity.
 
@@ -217,7 +217,7 @@ crates/worker/                Rank runtime: the library a rank process loads thr
 crates/bin/uniserve/          `serve` and `engine` CLI entrypoints
 crates/bin/uniserve-host/     Per-host launcher for multi-host deployments
 crates/bin/dynamo-worker/     NVIDIA Dynamo worker backend
-uniserve_models/              Numerical layers, loading, resource binding, concrete models and checkpoint catalog
+uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
   interface/                  Numerical interface table the rank runtime calls
   worker.py                   Rank process entry: loads the rank runtime and hands it the interface
 uniserve_kernels/             Native CUDA, Triton and CuTe kernels

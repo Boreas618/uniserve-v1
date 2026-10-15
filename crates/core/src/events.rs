@@ -241,7 +241,7 @@ pub enum RuntimeFamily {
     /// Unified multimodal understanding and generation runtime.
     Umm,
     /// Block-diffusion token runtime: prompt prefill and denoising passes
-    /// over token canvases that read the prompt's KV cache.
+    /// over token canvases that read the prompt's prefix cache.
     BlockDiffusion,
 }
 

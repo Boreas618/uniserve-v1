@@ -1,7 +1,7 @@
 //! Decoders: completed latents to delivered pixels and samples.
 //!
 //! A [`DecoderRunner`] is the Rust half of the Python
-//! `uniserve_models.runner.decoder.DecoderRunner` for one decoder of a
+//! `uniserve.runner.decoder.DecoderRunner` for one decoder of a
 //! model: an image, a video or an audio decoder. The three capabilities
 //! share the type and differ in the tensors and graphs of their forwards.
 //!
@@ -68,7 +68,7 @@ use crate::storage::{
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
-const DECODER: &str = "uniserve_models.runner.decoder.DecoderRunner";
+const DECODER: &str = "uniserve.runner.decoder.DecoderRunner";
 
 /// One image to decode.
 #[derive(Clone, Debug)]

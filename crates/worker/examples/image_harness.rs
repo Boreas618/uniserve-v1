@@ -36,7 +36,7 @@ fn failure(error: impl std::fmt::Display) -> tvm_ffi::Error {
 fn scratch(interface: &Interface) -> Result<Handle> {
     Handle::new(
         interface
-            .import("uniserve_models.bindings.context.Scratch")?
+            .import("uniserve.bindings.context.Scratch")?
             .call_values(&[])?,
     )
 }
@@ -147,9 +147,8 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         } else {
             Tower::Vae
         };
-        let function =
-            interface.import("uniserve_models.runner.encoder.EncoderRunner.prepare_image")?;
-        let facts = interface.import("uniserve_models.runner.encoder.EncoderRunner.image_facts")?;
+        let function = interface.import("uniserve.runner.encoder.EncoderRunner.prepare_image")?;
+        let facts = interface.import("uniserve.runner.encoder.EncoderRunner.image_facts")?;
         let images = payloads
             .iter()
             .map(|payload| {

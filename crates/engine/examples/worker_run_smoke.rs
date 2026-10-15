@@ -111,7 +111,7 @@ fn main() -> anyhow::Result<()> {
         .ranks,
         queue_depth: 2,
         max_message_bytes: 8 << 20,
-        kv_token_capacity: None,
+        cache_token_capacity: None,
         block_size: Some(256),
         max_batch_calls: 32,
         max_batch_tokens: 8192,

@@ -12,7 +12,7 @@
 //! checkpoint's Qwen3-VL processor operation for operation, in `f64` where
 //! they compute in Python floats, so that every rounding lands on the same
 //! side. The same rules are implemented for library callers by
-//! `uniserve_models/minimax_h3/processing.py`; both are tested against
+//! `uniserve/models/minimax_h3/processing.py`; both are tested against
 //! `tests/python/fixtures/minimax_h3_plan.json`. Rules the reference leaves
 //! open are fixed identically in both:
 //!

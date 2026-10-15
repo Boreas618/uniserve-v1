@@ -70,12 +70,12 @@ pub(crate) const MAX_FLOW_PREFIX_ROWS: usize = 1;
 
 /// Request-pool rows the runtime keeps outside `max_num_seqs`.
 ///
-/// A KV runtime with denoising keeps one row: a running request's
+/// A cache runtime with denoising keeps one row: a running request's
 /// multi-branch guidance prefix (`Scheduler::ensure_flow_prefix`) allocates
 /// its own row from the same request pool. Other runtimes keep none.
 pub(crate) fn flow_prefix_rows(info: &WorkerInfo) -> usize {
     usize::from(
-        info.uses_kv()
+        info.uses_cache()
             && info
                 .supported_calls
                 .contains(&CallKind::Media(MediaCall::Denoising)),
@@ -273,10 +273,10 @@ impl Scheduler {
         }
 
         // Storage and scheduler statistics share the resolved worker capacities.
-        let cache = KVCacheManager::from_worker_info(&info);
+        let cache = PrefixCacheManager::from_worker_info(&info);
         let stats = Arc::new(SchedulerStats::default());
-        stats.kv_cache.num_units.store(
-            cache.as_ref().map_or(0, KVCacheManager::usable_units),
+        stats.prefix_cache.num_units.store(
+            cache.as_ref().map_or(0, PrefixCacheManager::usable_units),
             Ordering::Relaxed,
         );
 
@@ -292,7 +292,7 @@ impl Scheduler {
             placement: placement::Placement::default(),
             storage: allocation::Storage {
                 cache,
-                encoder_cache: crate::kv::EncoderCacheManager::new(
+                encoder_cache: crate::prefix_cache::EncoderCacheManager::new(
                     generation_limits.encoder_cache_entries as usize,
                 ),
                 reserved_encoder_entries: 0,
@@ -339,9 +339,9 @@ impl Scheduler {
     }
 
     /// Enables or disables reusable prefix caching.
-    pub fn set_prefix_cache(&mut self, on: bool) {
+    pub fn set_prefix_reuse(&mut self, on: bool) {
         if let Some(cache) = self.storage.cache.as_mut() {
-            cache.set_prefix_cache(on);
+            cache.set_prefix_reuse(on);
         }
     }
 

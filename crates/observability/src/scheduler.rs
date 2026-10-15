@@ -136,12 +136,12 @@ pub struct SchedulerMetrics {
              blocked status). Sum of all reasons equals uniserve:num_requests_waiting."
     )]
     pub scheduler_waiting_by_reason: Family<WaitingReasonLabels, U64Gauge>,
-    /// Fraction of usable KV blocks that are not free; `1.0` means full.
+    /// Fraction of usable cache blocks that are not free; `1.0` means full.
     #[metric(
         name = "uniserve:kv_cache_usage_perc",
         help = "KV-cache usage. 1 means 100 percent usage"
     )]
-    pub kv_cache_usage: Family<EngineLabels, F64Gauge>,
+    pub prefix_cache_usage: Family<EngineLabels, F64Gauge>,
     /// Requests admitted into resident execution.
     #[metric(
         name = "uniserve:num_requests_admitted",

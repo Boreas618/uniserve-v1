@@ -643,7 +643,7 @@ mod tests {
         assert_eq!(
             ingest
                 .iter()
-                .map(|input| input.num_kv_tokens)
+                .map(|input| input.num_cache_tokens)
                 .collect::<Vec<_>>(),
             vec![Some(2304)]
         );
@@ -652,7 +652,7 @@ mod tests {
             policy
                 .feedback_encoders
                 .iter()
-                .map(|input| input.num_kv_tokens)
+                .map(|input| input.num_cache_tokens)
                 .collect::<Vec<_>>(),
             vec![Some(2305)]
         );
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(
             ingest
                 .iter()
-                .map(|input| input.num_kv_tokens)
+                .map(|input| input.num_cache_tokens)
                 .collect::<Vec<_>>(),
             vec![Some(2050), Some(2452),]
         );
@@ -690,14 +690,14 @@ mod tests {
             policy
                 .feedback_encoders
                 .iter()
-                .map(|input| input.num_kv_tokens)
+                .map(|input| input.num_cache_tokens)
                 .collect::<Vec<_>>(),
             vec![Some(1026)]
         );
     }
 
     /// SenseNova input images share one pixel budget per request, so an
-    /// image's KV tokens depend on how many input images the request
+    /// image's cache tokens depend on how many input images the request
     /// carries. The cases are shared with the worker's image preparation test.
     #[tokio::test]
     async fn sensenova_image_tokens_share_the_request_pixel_budget() {
@@ -710,7 +710,7 @@ mod tests {
             width: u32,
             height: u32,
             input_images: usize,
-            kv_tokens: u32,
+            cache_tokens: u32,
         }
         let fixture: Fixture = serde_json::from_str(include_str!(
             "../../../../tests/python/fixtures/sensenova_image_resize.json"
@@ -728,9 +728,9 @@ mod tests {
             assert_eq!(
                 ingest
                     .iter()
-                    .map(|input| input.num_kv_tokens)
+                    .map(|input| input.num_cache_tokens)
                     .collect::<Vec<_>>(),
-                vec![Some(case.kv_tokens)],
+                vec![Some(case.cache_tokens)],
                 "{}x{} among {} input images",
                 case.width,
                 case.height,
@@ -739,7 +739,7 @@ mod tests {
         }
     }
 
-    /// Bagel KV-token predictions equal the worker's resize for images whose
+    /// Bagel cache-token predictions equal the worker's resize for images whose
     /// resize scale is not one. The cases are shared with the worker's image
     /// preparation test, so both sides are checked against the same numbers.
     #[tokio::test]
@@ -752,8 +752,8 @@ mod tests {
         struct Case {
             width: u32,
             height: u32,
-            vae_kv_tokens: u32,
-            vit_kv_tokens: u32,
+            vae_cache_tokens: u32,
+            vit_cache_tokens: u32,
         }
         let fixture: Fixture = serde_json::from_str(include_str!(
             "../../../../tests/python/fixtures/bagel_image_resize.json"
@@ -772,9 +772,9 @@ mod tests {
             assert_eq!(
                 ingest
                     .iter()
-                    .map(|input| input.num_kv_tokens)
+                    .map(|input| input.num_cache_tokens)
                     .collect::<Vec<_>>(),
-                vec![Some(case.vae_kv_tokens), Some(case.vit_kv_tokens)],
+                vec![Some(case.vae_cache_tokens), Some(case.vit_cache_tokens)],
                 "input image {size:?}"
             );
 
@@ -783,8 +783,8 @@ mod tests {
                 .image_generation_for_dimensions(case.width, case.height)
                 .unwrap();
             assert_eq!(
-                policy.feedback_encoders[0].num_kv_tokens,
-                Some(case.vae_kv_tokens),
+                policy.feedback_encoders[0].num_cache_tokens,
+                Some(case.vae_cache_tokens),
                 "generated image {size:?}"
             );
         }

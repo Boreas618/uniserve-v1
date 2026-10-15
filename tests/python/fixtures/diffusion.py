@@ -6,14 +6,14 @@ from typing import Literal
 import torch
 from torch import nn
 
-from uniserve_models.diffusion import (
+from uniserve.diffusion import (
     CleanSampleEulerSolver,
     EulerSolver,
     make_schedule,
 )
-from uniserve_models.model import Denoiser, DenoiserInput
-from uniserve_models.nn import Linear
-from uniserve_models.tensors import BufferConfig, OutputLayout, TensorOutput
+from uniserve.models import Denoiser, DenoiserInput
+from uniserve.nn import Linear
+from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
 
 @dataclass(frozen=True)

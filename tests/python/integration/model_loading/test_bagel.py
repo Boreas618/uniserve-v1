@@ -5,17 +5,17 @@ import torch
 from torch.nn import functional as F
 
 from tests.python.fixtures.checkpoints import bagel_checkpoint, load_bagel
-from uniserve_models.bindings.context import ExecutionContext
-from uniserve_models.cache.units import UnitPool
-from uniserve_models.diffusion import normal_noise
-from uniserve_models.media import image
-from uniserve_models.model import LatentInput, TextInput, TextSize
-from uniserve_models.nn.attention import (
+from uniserve.bindings.context import ExecutionContext
+from uniserve.diffusion import normal_noise
+from uniserve.media import image
+from uniserve.models import LatentInput, TextInput, TextSize
+from uniserve.nn.attention import (
     AttentionBatch,
     PagedInput,
     SequenceLengths,
     VarlenInput,
 )
+from uniserve.prefix_cache.units import UnitPool
 
 pytestmark = pytest.mark.integration
 

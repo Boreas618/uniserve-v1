@@ -10,8 +10,8 @@
 !configs/**
 !crates
 !crates/**
-!uniserve_models
-!uniserve_models/**
+!uniserve
+!uniserve/**
 !uniserve_kernels
 !uniserve_kernels/**
 !uniserve_eval

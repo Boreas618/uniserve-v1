@@ -9,7 +9,7 @@ here are the ones the Rust plan tests assert.
 
 import pytest
 
-from uniserve_models.distributed import DeviceMesh
+from uniserve.distributed import DeviceMesh
 
 pytestmark = pytest.mark.unit
 

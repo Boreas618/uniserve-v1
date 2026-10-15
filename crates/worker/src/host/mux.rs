@@ -25,7 +25,7 @@ use crate::{Error, Result};
 pub(crate) const LENGTH_BYTES: usize = 8;
 
 /// Threads one serving encoder session uses; the encoded-size bound charges
-/// one slice header per thread per frame (`uniserve_models.media.codec`).
+/// one slice header per thread per frame (`uniserve.media.codec`).
 const ENCODER_THREADS: u64 = 8;
 
 /// Bound the MP4 bytes of one unit from the serving encoder (libx264,
@@ -147,7 +147,7 @@ impl MuxConfig {
     }
 }
 
-const CONTAINER: &str = "uniserve_models.media.codec.Container";
+const CONTAINER: &str = "uniserve.media.codec.Container";
 
 /// The library's container operations.
 #[derive(Clone)]

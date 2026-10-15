@@ -15,7 +15,7 @@
 //! token for the allowed list.
 //!
 //! The model worker applies the same processor order on device in
-//! `uniserve_models.sampling` and draws from the same Philox mapping
+//! `uniserve.sampling` and draws from the same Philox mapping
 //! ([`crate::philox`]), so a change to processor semantics here needs the
 //! matching change there for simulated runs to stay representative.
 

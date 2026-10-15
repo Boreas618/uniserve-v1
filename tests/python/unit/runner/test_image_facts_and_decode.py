@@ -8,14 +8,14 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from tests.python.fixtures.stub import load_stub
-from uniserve_models import interface
-from uniserve_models.bindings.context import Scratch
-from uniserve_models.media import image
-from uniserve_models.media.pixels import quantize_image_hwc
-from uniserve_models.processing import FlowPrompt, resolve_prefix
-from uniserve_models.runner.decoder import DecoderRunner
-from uniserve_models.runner.denoiser import DenoiserRunner
-from uniserve_models.runner.encoder import EncoderRunner
+from uniserve import interface
+from uniserve.bindings.context import Scratch
+from uniserve.media import image
+from uniserve.media.pixels import quantize_image_hwc
+from uniserve.processing import FlowPrompt, resolve_prefix
+from uniserve.runner.decoder import DecoderRunner
+from uniserve.runner.denoiser import DenoiserRunner
+from uniserve.runner.encoder import EncoderRunner
 
 pytestmark = pytest.mark.unit
 

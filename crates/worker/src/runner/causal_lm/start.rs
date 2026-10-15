@@ -1,7 +1,7 @@
 //! Startup of a rank's causal LM runners: bounds, bindings and owned storage.
 //!
 //! [`TextBounds`] derives every text bound from the worker configuration and
-//! the KV plan, once for capacity planning (bytes to reserve beside the KV
+//! the cache plan, once for capacity planning (bytes to reserve beside the cache
 //! pool, graph-bounded call limits) and again for allocation, so both agree.
 //! [`CausalLMRunners::start`] then creates one runner per execution stream
 //! serving text call kinds: it allocates the runner's columns and graph
@@ -31,7 +31,7 @@ use crate::runner::causal_lm::{
 };
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::scratch::Scratches;
-use crate::storage::{KVCache, KVPlan, OutputPool};
+use crate::storage::{CachePlan, OutputPool, PrefixCache};
 use crate::{Error, Result};
 
 use crate::parallel::{DwdpManager, ExpertUnion, PeerGroup};
@@ -43,7 +43,7 @@ pub(crate) const TEXT_KINDS: [CallKind; 3] = [
     CallKind::Forward(ForwardMode::Verify),
 ];
 
-/// Every bound of the text runners, derived from configuration and the KV
+/// Every bound of the text runners, derived from configuration and the cache
 /// plan.
 #[derive(Debug, Clone)]
 pub(crate) struct TextBounds {
@@ -60,13 +60,13 @@ pub(crate) struct TextBounds {
 }
 
 impl TextBounds {
-    /// Derive the bounds. `units` is the KV pool's unit count, sentinel
+    /// Derive the bounds. `units` is the cache pool's unit count, sentinel
     /// included, once fitted; before fitting, graph shapes are not bounded
     /// by the pool.
     pub(crate) fn new(
         config: &WorkerConfig,
         request_slots: usize,
-        cache: &KVPlan,
+        cache: &CachePlan,
         units: Option<u32>,
         cuda: bool,
     ) -> Result<Self> {
@@ -195,7 +195,7 @@ impl TextBounds {
 
 /// Tokens one text forward sends to each expert layer at most: the batch
 /// token bound or the largest decode graph bucket, whichever is larger.
-/// The runners' bounds never exceed it, before or after the KV pool fits.
+/// The runners' bounds never exceed it, before or after the cache pool fits.
 pub(crate) fn expert_tokens(config: &WorkerConfig) -> usize {
     let mut max_rows = config.max_batch_calls;
     let mut tokens = config.max_batch_tokens;
@@ -271,7 +271,7 @@ pub(crate) struct Startup<'a> {
     /// The model declares an image policy.
     pub(crate) image_processor: bool,
     pub(crate) lanes: &'a Lanes,
-    pub(crate) kv: Option<&'a KVCache>,
+    pub(crate) prefix_cache: Option<&'a PrefixCache>,
     pub(crate) components: &'a Components,
     /// The shared scratch of each stream the runners' contexts borrow.
     pub(crate) scratches: &'a mut Scratches,
@@ -314,17 +314,17 @@ impl CausalLMRunners {
         if texts.is_empty() {
             return Ok(None);
         }
-        let kv = startup
-            .kv
-            .ok_or_else(|| Error::Invalid("a causal language model requires a KV cache".into()))?;
+        let prefix_cache = startup.prefix_cache.ok_or_else(|| {
+            Error::Invalid("a causal language model requires a prefix cache".into())
+        })?;
         let config = startup.config;
         let device = texts[0].2;
         let cuda = device.cuda_index();
         let bounds = TextBounds::new(
             config,
             startup.request_slots,
-            kv.plan(),
-            Some(kv.planes().num_units()),
+            prefix_cache.plan(),
+            Some(prefix_cache.planes().num_units()),
             cuda.is_some(),
         )?;
         if let Some(experts) = startup.experts.as_ref()
@@ -340,13 +340,13 @@ impl CausalLMRunners {
         let dtype = model_dtype(&config.model_dtype)?;
 
         // The attention layers' view of the pool, bound once.
-        let pool = kv.pool(startup.interface)?;
+        let pool = prefix_cache.pool(startup.interface)?;
 
         let state = DecodeState::allocate(
             startup.request_slots,
             vocab,
             dtype,
-            kv.storage().verified_lengths().clone(),
+            prefix_cache.storage().verified_lengths().clone(),
             cuda,
             startup.preparation,
         )?;
@@ -437,7 +437,7 @@ impl CausalLMRunners {
                 }
                 None => None,
             };
-            let slot_tables = kv.storage().views();
+            let slot_tables = prefix_cache.storage().views();
             let slot_table = |name: &str| {
                 slot_tables
                     .iter()
@@ -517,7 +517,7 @@ impl CausalLMRunners {
                 }
                 _ => None,
             };
-            columns.push(kv.bind_units(startup.interface, stream.as_ref())?);
+            columns.push(prefix_cache.bind_units(startup.interface, stream.as_ref())?);
             let group = groups
                 .iter()
                 .position(|peers| peers.contains(&runners.len()))
@@ -597,13 +597,13 @@ impl CausalLMRunners {
     }
 }
 
-/// Device bytes the causal LM runners allocate beside the KV pool.
+/// Device bytes the causal LM runners allocate beside the cache pool.
 pub(crate) fn reserved_bytes(
     interface: &Interface,
     model: &LoadedModel,
     config: &WorkerConfig,
     request_slots: usize,
-    cache: &KVPlan,
+    cache: &CachePlan,
     image_processor: bool,
     streams: usize,
 ) -> Result<u64> {

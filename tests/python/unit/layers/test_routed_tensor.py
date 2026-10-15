@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_models.nn.routing import RoutedTensor, RouteSpan
+from uniserve.nn.routing import RoutedTensor, RouteSpan
 
 pytestmark = pytest.mark.unit
 

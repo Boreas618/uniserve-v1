@@ -12,7 +12,7 @@
 //! [`ImageGenerationConfig::required_features`] with
 //! [`GenerationLimits::covers`], and then runs
 //! [`GenerationRequest::validate_resources`] and
-//! [`GenerationRequest::max_kv_tokens`] against the loaded limits.
+//! [`GenerationRequest::max_cache_tokens`] against the loaded limits.
 
 use std::str::FromStr;
 
@@ -81,7 +81,7 @@ pub struct MultimodalInputs {
 ///
 /// Canvas token `j` sits at the model position that follows the prompt's
 /// logical positions by `j`. Every canvas token attends to the whole prompt
-/// and to every token of its own row, and the pass writes no KV. The rows of
+/// and to every token of its own row, and the pass writes nothing to the prefix cache. The rows of
 /// one request are independent computations over the same prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadoutRow {
@@ -173,9 +173,9 @@ pub struct ImageInput {
     /// Exclusive prompt-token position at the end of this image's marker gap.
     /// Equal positions preserve input order, including multiple images at one marker.
     pub position: u32,
-    /// Logical positions contributed after all encoders finish; independent of KV length.
+    /// Logical positions contributed after all encoders finish; independent of cache length.
     pub num_positions: u32,
-    /// Required encoder stages in context write order, with their KV contributions.
+    /// Required encoder stages in context write order, with their cache contributions.
     pub encoders: Vec<ImageEncoderInput>,
 }
 
@@ -193,21 +193,21 @@ impl ImageInput {
     }
 }
 
-/// One encoder input and its physical KV contribution.
+/// One encoder input and its physical cache contribution.
 ///
-/// `num_kv_tokens` is exact when known. Otherwise `max_kv_tokens` bounds
+/// `num_cache_tokens` is exact when known. Otherwise `max_cache_tokens` bounds
 /// the worker-selected length; absent limits use the loaded encoder capacity
-/// (see [`ImageEncoderInput::kv_token_capacity`]).
+/// (see [`ImageEncoderInput::cache_token_capacity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageEncoderInput {
     /// Model encoder consuming this image. List order determines context write order.
     pub encoder: ImageIngestStep,
-    /// Exact KV tokens this encoder writes, when known before execution.
-    pub num_kv_tokens: Option<u32>,
-    /// Upper bound on a worker-selected KV length. When both it and
-    /// `num_kv_tokens` are present, `GenerationRequest::validate` requires
-    /// `num_kv_tokens <= max_kv_tokens`.
-    pub max_kv_tokens: Option<u32>,
+    /// Exact cache tokens this encoder writes, when known before execution.
+    pub num_cache_tokens: Option<u32>,
+    /// Upper bound on a worker-selected cache length. When both it and
+    /// `num_cache_tokens` are present, `GenerationRequest::validate` requires
+    /// `num_cache_tokens <= max_cache_tokens`.
+    pub max_cache_tokens: Option<u32>,
 }
 
 /// One image ingest worker step.
@@ -368,13 +368,13 @@ pub struct ImageGenerationConfig {
     /// `GenerationRequest::validate` rejects requests whose text continues
     /// after an image.
     pub feedback_source: Option<FeedbackSource>,
-    /// Encoder order and KV contributions of a completed image entering context.
+    /// Encoder order and cache contributions of a completed image entering context.
     pub feedback_encoders: Vec<ImageEncoderInput>,
     /// Logical positions added after the final feedback encoder.
     pub num_feedback_positions: u32,
     /// Continuation input used when feedback does not sample a token.
     pub feedback_next_token: FeedbackNextToken,
-    /// Whether the final feedback KV write samples the next text token.
+    /// Whether the final feedback cache write samples the next text token.
     pub sample_feedback_continuation: bool,
 }
 
@@ -446,7 +446,7 @@ bitflags::bitflags! {
         const LATENT_ENCODE = 1 << 2;
         /// Diffusion denoising and image materialization.
         const IMAGE_GENERATION = 1 << 3;
-        /// Denoising passes of token canvases that read a prompt's KV cache
+        /// Denoising passes of token canvases that read a prompt's prefix cache
         /// without writing it.
         const TOKEN_DENOISING = 1 << 4;
     }
@@ -567,19 +567,19 @@ impl GenerationRequest {
         self.generates_images() && self.constraint == GenerationConstraint::GenOnly
     }
 
-    /// Maximum physical KV tokens required by the input, output budget, and image feedback.
+    /// Maximum physical cache tokens required by the input, output budget, and image feedback.
     ///
     /// Sums the prompt, the `max_und_tokens` budget, each context image's
-    /// encoder KV bounds, the feedback encoder bounds once per
+    /// encoder cache bounds, the feedback encoder bounds once per
     /// `ImageParams::max_images` when completed images feed back, and the
     /// negative prompt when the Gen branch is reachable. Saturation preserves
     /// conservative admission for host-sized token budgets.
     ///
     /// # Errors
     ///
-    /// Returns `GenerationResourceError::UnboundedImageKv` when a counted
-    /// encoder input resolves to a zero KV length.
-    pub fn max_kv_tokens(
+    /// Returns `GenerationResourceError::UnboundedImageCache` when a counted
+    /// encoder input resolves to a zero cache length.
+    pub fn max_cache_tokens(
         &self,
         limits: &GenerationLimits,
     ) -> Result<usize, GenerationResourceError> {
@@ -588,11 +588,11 @@ impl GenerationRequest {
             .images
             .iter()
             .try_fold(0usize, |total, image| {
-                Ok(total.saturating_add(encoder_kv_bound(&image.encoders, limits)?))
+                Ok(total.saturating_add(encoder_cache_bound(&image.encoders, limits)?))
             })?;
         let feedback =
             if self.continues_after_image() && self.image_generation.feedback_source.is_some() {
-                encoder_kv_bound(&self.image_generation.feedback_encoders, limits)?
+                encoder_cache_bound(&self.image_generation.feedback_encoders, limits)?
                     .saturating_mul(self.image.max_images as usize)
             } else {
                 0
@@ -702,12 +702,12 @@ impl GenerationRequest {
     }
 
     /// Checks reachable encoder work, image geometry, and guidance against loaded capacity.
-    /// Admission separately acquires KV, cache entries, and latent storage from their pools.
+    /// Admission separately acquires prefix cache, cache entries, and latent storage from their pools.
     ///
     /// # Errors
     ///
     /// Returns the first failure among, in check order: the
-    /// [`GenerationRequest::max_kv_tokens`] error; `MissingRuntimeBound` for a
+    /// [`GenerationRequest::max_cache_tokens`] error; `MissingRuntimeBound` for a
     /// reachable encoder kind whose feature-byte limit is zero;
     /// `MissingRuntimeBound` or `EncoderCacheCapacity` when reserved
     /// encoder-cache entries exceed `encoder_cache_entries`; the
@@ -718,7 +718,7 @@ impl GenerationRequest {
         &self,
         limits: &GenerationLimits,
     ) -> Result<(), GenerationResourceError> {
-        self.max_kv_tokens(limits)?;
+        self.max_cache_tokens(limits)?;
 
         // Each encoder kind reachable from context images or feedback needs
         // a nonzero feature-product size.
@@ -783,25 +783,25 @@ impl GenerationRequest {
     }
 }
 
-/// Sums [`ImageEncoderInput::kv_token_capacity`] over one image's encoder
+/// Sums [`ImageEncoderInput::cache_token_capacity`] over one image's encoder
 /// inputs, saturating instead of overflowing.
-fn encoder_kv_bound(
+fn encoder_cache_bound(
     inputs: &[ImageEncoderInput],
     limits: &GenerationLimits,
 ) -> Result<usize, GenerationResourceError> {
     inputs.iter().try_fold(0usize, |total, input| {
-        Ok(total.saturating_add(input.kv_token_capacity(limits)? as usize))
+        Ok(total.saturating_add(input.cache_token_capacity(limits)? as usize))
     })
 }
 
 impl ImageEncoderInput {
-    /// Maximum KV contribution of this encoder, resolving dynamic lengths from the model.
+    /// Maximum cache contribution of this encoder, resolving dynamic lengths from the model.
     ///
-    /// Uses `num_kv_tokens` when present, then `max_kv_tokens`, then the loaded
+    /// Uses `num_cache_tokens` when present, then `max_cache_tokens`, then the loaded
     /// grid-token capacity for the encoder kind. Fails with
-    /// `GenerationResourceError::UnboundedImageKv` when the resolved length is
+    /// `GenerationResourceError::UnboundedImageCache` when the resolved length is
     /// zero.
-    pub fn kv_token_capacity(
+    pub fn cache_token_capacity(
         &self,
         limits: &GenerationLimits,
     ) -> Result<u32, GenerationResourceError> {
@@ -810,11 +810,11 @@ impl ImageEncoderInput {
             ImageIngestStep::VitEncode => limits.max_vit_grid_tokens,
         };
         let tokens = self
-            .num_kv_tokens
-            .or(self.max_kv_tokens)
+            .num_cache_tokens
+            .or(self.max_cache_tokens)
             .unwrap_or(capacity);
         if tokens == 0 {
-            return Err(GenerationResourceError::UnboundedImageKv {
+            return Err(GenerationResourceError::UnboundedImageCache {
                 call: self.encoder.as_str(),
             });
         }
@@ -835,9 +835,9 @@ impl ImageIngestStep {
 /// Failures while deriving bounded generation resources.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenerationResourceError {
-    /// A worker-selected image KV length has no declared or loaded maximum.
+    /// A worker-selected image cache length has no declared or loaded maximum.
     #[error("{call} has a worker-selected KV length but the runtime declares no bound")]
-    UnboundedImageKv {
+    UnboundedImageCache {
         /// Encoder call missing a bound.
         call: &'static str,
     },
@@ -1073,15 +1073,15 @@ impl GenerationRequest {
             }
             validate_image_encoders(&image.encoders, image.num_positions)?;
             // A feature-injected image is a block of a context prefill whose
-            // later tokens follow it in the same call, so its KV length must
+            // later tokens follow it in the same call, so its cache length must
             // be known when the call is planned.
             if image.injects_features()
                 && image
                     .encoders
                     .iter()
-                    .any(|input| input.num_kv_tokens.is_none())
+                    .any(|input| input.num_cache_tokens.is_none())
             {
-                return Err(GenerationRequestError::FeatureImageKvUnknown);
+                return Err(GenerationRequestError::FeatureImageCacheUnknown);
             }
             if image.position as usize > context_tokens {
                 return Err(GenerationRequestError::ImagePositionBeyondPrompt {
@@ -1167,13 +1167,13 @@ fn validate_image_encoders(
         return Err(GenerationRequestError::ZeroImageLogicalPositions);
     }
     for input in inputs {
-        if input.num_kv_tokens == Some(0) || input.max_kv_tokens == Some(0) {
-            return Err(GenerationRequestError::ZeroImageKvBound);
+        if input.num_cache_tokens == Some(0) || input.max_cache_tokens == Some(0) {
+            return Err(GenerationRequestError::ZeroImageCacheBound);
         }
-        if let (Some(tokens), Some(max_tokens)) = (input.num_kv_tokens, input.max_kv_tokens)
+        if let (Some(tokens), Some(max_tokens)) = (input.num_cache_tokens, input.max_cache_tokens)
             && tokens > max_tokens
         {
-            return Err(GenerationRequestError::ImageKvExceedsCapacity { tokens, max_tokens });
+            return Err(GenerationRequestError::ImageCacheExceedsCapacity { tokens, max_tokens });
         }
     }
     Ok(())
@@ -1209,18 +1209,18 @@ pub enum GenerationRequestError {
     /// model positions.
     #[error("image inputs and feedback must consume at least one logical position")]
     ZeroImageLogicalPositions,
-    /// An explicit image KV length or capacity is zero.
+    /// An explicit image cache length or capacity is zero.
     #[error("image KV lengths and capacities must be positive")]
-    ZeroImageKvBound,
+    ZeroImageCacheBound,
     /// An exact image contribution must fit its declared capacity.
     #[error("image KV length {tokens} exceeds capacity {max_tokens}")]
-    ImageKvExceedsCapacity { tokens: u32, max_tokens: u32 },
-    /// A feature-injected input image does not declare the exact KV length
+    ImageCacheExceedsCapacity { tokens: u32, max_tokens: u32 },
+    /// A feature-injected input image does not declare the exact cache length
     /// of every encoder.
     #[error(
         "an input image whose encoders inject features must declare each encoder's exact KV length"
     )]
-    FeatureImageKvUnknown,
+    FeatureImageCacheUnknown,
     /// A suffix or round-close trigger contains no tokens.
     #[error("generation trigger patterns must not be empty")]
     EmptyTriggerPattern,
@@ -1335,13 +1335,13 @@ mod tests {
             feedback_encoders: vec![
                 ImageEncoderInput {
                     encoder: ImageIngestStep::VaeEncode,
-                    num_kv_tokens: None,
-                    max_kv_tokens: Some(64),
+                    num_cache_tokens: None,
+                    max_cache_tokens: Some(64),
                 },
                 ImageEncoderInput {
                     encoder: ImageIngestStep::VitEncode,
-                    num_kv_tokens: None,
-                    max_kv_tokens: Some(64),
+                    num_cache_tokens: None,
+                    max_cache_tokens: Some(64),
                 },
             ],
             sample_feedback_continuation: false,
@@ -1361,13 +1361,13 @@ mod tests {
                     encoders: vec![
                         ImageEncoderInput {
                             encoder: ImageIngestStep::VaeEncode,
-                            num_kv_tokens: None,
-                            max_kv_tokens: Some(64),
+                            num_cache_tokens: None,
+                            max_cache_tokens: Some(64),
                         },
                         ImageEncoderInput {
                             encoder: ImageIngestStep::VitEncode,
-                            num_kv_tokens: Some(32),
-                            max_kv_tokens: None,
+                            num_cache_tokens: Some(32),
+                            max_cache_tokens: None,
                         },
                     ],
                 }],
@@ -1459,7 +1459,7 @@ mod tests {
         // length, two feedback images through both bounded encoders, and the
         // negative prompt.
         assert_eq!(
-            request.max_kv_tokens(&runtime_limits()).unwrap(),
+            request.max_cache_tokens(&runtime_limits()).unwrap(),
             4 + 16 + 64 + 32 + 2 * (64 + 64) + 1
         );
         // The default 512x512 image over a downsample of 16 is a 32x32 grid.
@@ -1485,13 +1485,13 @@ mod tests {
             encoders: vec![
                 ImageEncoderInput {
                     encoder: ImageIngestStep::VaeEncode,
-                    num_kv_tokens: Some(1_026),
-                    max_kv_tokens: None,
+                    num_cache_tokens: Some(1_026),
+                    max_cache_tokens: None,
                 },
                 ImageEncoderInput {
                     encoder: ImageIngestStep::VitEncode,
-                    num_kv_tokens: Some(1_371),
-                    max_kv_tokens: None,
+                    num_cache_tokens: Some(1_371),
+                    max_cache_tokens: None,
                 },
             ],
         }];
@@ -1501,7 +1501,7 @@ mod tests {
         request.max_und_tokens = 256;
 
         assert_eq!(
-            request.max_kv_tokens(&runtime_limits()).unwrap(),
+            request.max_cache_tokens(&runtime_limits()).unwrap(),
             35 + 256 + 1_026 + 1_371
         );
     }
@@ -1510,13 +1510,13 @@ mod tests {
     fn request_capacity_rejects_unbounded_encoders_and_insufficient_model_limits() {
         let mut request = complete_request();
         let input = &mut request.multimodal_inputs.images[0].encoders[1];
-        input.num_kv_tokens = None;
-        input.max_kv_tokens = None;
+        input.num_cache_tokens = None;
+        input.max_cache_tokens = None;
         let mut limits = runtime_limits();
         limits.max_vit_grid_tokens = 0;
         assert_eq!(
             request.validate_resources(&limits),
-            Err(GenerationResourceError::UnboundedImageKv { call: "vit_encode" })
+            Err(GenerationResourceError::UnboundedImageCache { call: "vit_encode" })
         );
 
         // The remaining cases keep the unbounded ViT input, which resolves to
@@ -1598,12 +1598,12 @@ mod tests {
 
         // Exact contributions and capacities are validated before admission.
         for (tokens, capacity, error) in [
-            (Some(0), None, GenerationRequestError::ZeroImageKvBound),
-            (None, Some(0), GenerationRequestError::ZeroImageKvBound),
+            (Some(0), None, GenerationRequestError::ZeroImageCacheBound),
+            (None, Some(0), GenerationRequestError::ZeroImageCacheBound),
             (
                 Some(65),
                 Some(64),
-                GenerationRequestError::ImageKvExceedsCapacity {
+                GenerationRequestError::ImageCacheExceedsCapacity {
                     tokens: 65,
                     max_tokens: 64,
                 },
@@ -1611,34 +1611,34 @@ mod tests {
         ] {
             let mut request = complete_request();
             let input = &mut request.multimodal_inputs.images[0].encoders[0];
-            input.num_kv_tokens = tokens;
-            input.max_kv_tokens = capacity;
+            input.num_cache_tokens = tokens;
+            input.max_cache_tokens = capacity;
             assert_eq!(request.validate(), Err(error));
         }
 
         let mut exact_capacity = complete_request();
-        exact_capacity.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
+        exact_capacity.multimodal_inputs.images[0].encoders[0].num_cache_tokens = Some(64);
         assert_eq!(exact_capacity.validate(), Ok(()));
 
         // An image whose encoders all inject features joins a context
-        // prefill, so each encoder must declare its exact KV length; a
+        // prefill, so each encoder must declare its exact cache length; a
         // latent encoder's image may leave it to the worker.
         let mut injected = complete_request();
         injected.multimodal_inputs.images[0].encoders.truncate(1);
         injected.multimodal_inputs.images[0].encoders[0] = ImageEncoderInput {
             encoder: ImageIngestStep::VitEncode,
-            num_kv_tokens: None,
-            max_kv_tokens: Some(64),
+            num_cache_tokens: None,
+            max_cache_tokens: Some(64),
         };
         assert_eq!(
             injected.validate(),
-            Err(GenerationRequestError::FeatureImageKvUnknown)
+            Err(GenerationRequestError::FeatureImageCacheUnknown)
         );
-        injected.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
+        injected.multimodal_inputs.images[0].encoders[0].num_cache_tokens = Some(64);
         assert_eq!(injected.validate(), Ok(()));
         assert!(
             complete_request().multimodal_inputs.images[0].encoders[0]
-                .num_kv_tokens
+                .num_cache_tokens
                 .is_none()
         );
         assert_eq!(complete_request().validate(), Ok(()));
@@ -1697,7 +1697,7 @@ mod tests {
         request.image_generation = ImageGenerationConfig::default();
         request.multimodal_inputs.images[0].encoders.truncate(1);
         request.multimodal_inputs.images[0].encoders[0].encoder = ImageIngestStep::VitEncode;
-        request.multimodal_inputs.images[0].encoders[0].num_kv_tokens = Some(64);
+        request.multimodal_inputs.images[0].encoders[0].num_cache_tokens = Some(64);
         request.readout = vec![
             ReadoutRow {
                 token_ids: vec![11, 4, 12, 4, 13],
@@ -1736,8 +1736,8 @@ mod tests {
             request.required_features(),
             GenerationFeatures::TOKEN_DENOISING | GenerationFeatures::VISION_ENCODE
         );
-        // Its KV holds the prompt and image only; canvases write none.
-        assert_eq!(request.max_kv_tokens(&runtime_limits()).unwrap(), 4 + 64);
+        // Its cache holds the prompt and image only; canvases write none.
+        assert_eq!(request.max_cache_tokens(&runtime_limits()).unwrap(), 4 + 64);
     }
 
     #[test]

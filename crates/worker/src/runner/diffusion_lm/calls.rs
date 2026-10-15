@@ -22,7 +22,7 @@ use crate::{Error, Result};
 pub(crate) struct Sequence {
     /// Block tokens.
     pub(crate) query: usize,
-    /// Cached prefix tokens the block reads: its request's visible KV.
+    /// Cached prefix tokens the block reads: its request's visible prefix cache.
     pub(crate) prefix: u32,
     /// Position of the block's first token.
     pub(crate) position: u64,
@@ -75,11 +75,11 @@ pub(crate) fn rows_by_call(plan: &Batch) -> Result<Vec<Vec<usize>>> {
 }
 
 /// Check that `descriptors` read `slot`'s unchanged prefix of `visible`
-/// tokens without writing KV.
+/// tokens without writing the prefix cache.
 fn read_only(forward: &ForwardBatch, descriptors: &[usize], slot: u32, visible: u64) -> Result<()> {
     if descriptors.is_empty()
         || descriptors.iter().any(|&row| {
-            forward.write_kv[row]
+            forward.write_cache[row]
                 || forward.request_pool_indices[row] != slot
                 || u64::from(forward.seq_lens[row].saturating_sub(forward.query_lens[row]))
                     != visible
@@ -114,7 +114,7 @@ impl Readouts {
     }
 
     /// Append the readout `call` of the request in `slot`, whose accepted
-    /// visible KV is `visible` tokens and whose blocks start at logical
+    /// visible prefix cache is `visible` tokens and whose blocks start at logical
     /// position `position`. Returns the call's range of the invocation's
     /// candidates.
     pub(crate) fn add(
@@ -198,7 +198,7 @@ impl Readouts {
 }
 
 /// The denoising step `call` of `admission`'s request in `slot`, whose
-/// accepted visible KV is `visible` tokens and whose block starts at
+/// accepted visible prefix cache is `visible` tokens and whose block starts at
 /// logical position `position`. `served` is the sampling this worker steps
 /// blocks with (`None` on a rank that serves readouts only).
 pub(crate) fn step_row(
@@ -302,8 +302,8 @@ mod tests {
             readout,
             canvas,
             input_image: None,
-            kv_input: None,
-            kv_output: None,
+            cache_input: None,
+            cache_output: None,
         }
     }
 
@@ -431,7 +431,7 @@ mod tests {
                 .is_err()
         );
         let mut writing = forward(2, 6, &[5]);
-        writing.write_kv[0] = true;
+        writing.write_cache[0] = true;
         assert!(
             Readouts::new()
                 .add(&writing, &readout_call, &[0], 2, 6, 0)

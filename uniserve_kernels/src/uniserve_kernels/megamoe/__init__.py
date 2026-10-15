@@ -8,7 +8,7 @@ epilogue extended from SiLU to tanh-approximated GELU: the NVFP4 config and
 symmetric buffer take ``activation`` (``"silu"`` or ``"gelu_tanh"``), which
 the compiled kernel's name and cache key carry.
 
-This package is the single public boundary ``uniserve_models.backends``
+This package is the single public boundary ``uniserve.backends``
 imports from. It exposes the symmetric-buffer allocators and fused-launch
 entry points and talks only to the ``shim`` package (which adapts the raw
 kernel sources under ``src/``).

@@ -65,9 +65,9 @@ pub struct EngineSettings {
     /// The prefill tokens still travel as their own batch and numerical call.
     /// `0` disables co-scheduling.
     pub mixed_prefill_tokens: usize,
-    /// Reuse and retain prompt KV prefixes across requests. Per-request cache
+    /// Reuse and retain prompt cache prefixes across requests. Per-request cache
     /// policy can further restrict this deployment-wide setting.
-    pub prefix_cache: bool,
+    pub prefix_reuse: bool,
     /// Waiting queue policy used by the scheduler.
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length override. `None` derives the limit from
@@ -95,7 +95,7 @@ pub struct EngineSettings {
     /// `encoder->prefill=shm,prefill->decode=cuda_vmm`.
     pub transfer: TransferConfig,
     /// Number of independent replicas `workers` forms, as equal consecutive
-    /// blocks of groups. Each replica runs its own scheduler and KV pool, and
+    /// blocks of groups. Each replica runs its own scheduler and cache pool, and
     /// the engine client routes every request to one of them.
     pub data_parallel_size: usize,
     /// Whether the data-parallel replicas shard the model's routed experts,
@@ -114,7 +114,7 @@ impl Default for EngineSettings {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
-            prefix_cache: true,
+            prefix_reuse: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,
@@ -343,7 +343,7 @@ impl EngineSettings {
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
-    /// override before it reaches the scheduler or KV sizing math. It also
+    /// override before it reaches the scheduler or cache sizing math. It also
     /// rejects a `max_video_seconds` outside the video API's [4, 15] second
     /// range (`validate_video_capacity`) and any
     /// worker placement `WorkerConfig::validate_all` refuses.

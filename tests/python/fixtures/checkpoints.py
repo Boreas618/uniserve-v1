@@ -19,13 +19,14 @@ from transformers import (
     Qwen3MoeForCausalLM,
 )
 
-from uniserve_models import bagel, loading, siglip
-from uniserve_models import catalog as models
-from uniserve_models import sensenova_u1 as u1
-from uniserve_models.bagel import vae
-from uniserve_models.diffusion import NoiseScale
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.sensenova_u1 import flow, vision
+from uniserve import loading
+from uniserve.diffusion import NoiseScale
+from uniserve.loading import checkpoint, weights
+from uniserve.models import bagel, siglip
+from uniserve.models import registry as models
+from uniserve.models import sensenova_u1 as u1
+from uniserve.models.bagel import vae
+from uniserve.models.sensenova_u1 import flow, vision
 
 
 def qwen_checkpoint(root, tied=False, theta=1_000_000.0):

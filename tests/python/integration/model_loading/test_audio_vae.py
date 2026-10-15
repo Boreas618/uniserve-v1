@@ -9,10 +9,10 @@ from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (
 )
 from safetensors.torch import save_file
 
-from uniserve_models import loading
-from uniserve_models.loading import checkpoint, weights
-from uniserve_models.minimax_h3 import audio_vae
-from uniserve_models.minimax_h3.encoding import AudioEncoder
+from uniserve import loading
+from uniserve.loading import checkpoint, weights
+from uniserve.models.minimax_h3 import audio_vae
+from uniserve.models.minimax_h3.encoding import AudioEncoder
 
 pytestmark = pytest.mark.integration
 

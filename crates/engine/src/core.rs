@@ -84,7 +84,7 @@ pub struct WorkerConfig {
     /// Per-rank share of device storage available to this worker process.
     ///
     /// When set, `EngineCore::new` launches the group's ranks with it as
-    /// `WorkerProcessArgs::kv_storage_fraction` instead of the engine-wide
+    /// `WorkerProcessArgs::cache_storage_fraction` instead of the engine-wide
     /// default. Deployment files spell the field `memory_fraction`.
     ///
     /// Distinct WorkerGroups may share one physical GPU. Their configured
@@ -123,7 +123,7 @@ impl WorkerConfig {
 
     /// Checks a per-process device storage fraction: a group's
     /// `storage_fraction` or the engine-wide
-    /// `WorkerProcessArgs::kv_storage_fraction` default.
+    /// `WorkerProcessArgs::cache_storage_fraction` default.
     ///
     /// Each rank grants itself this share of every device's total storage,
     /// less what its process already holds and never more than the device
@@ -344,9 +344,9 @@ pub struct EngineConfig {
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as one mixed extend+decode forward. `0` disables mixing.
     pub mixed_prefill_tokens: usize,
-    /// Reuse and retain prompt KV prefixes across requests. Disabling this
-    /// does not remove the KV storage needed within an active request.
-    pub prefix_cache: bool,
+    /// Reuse and retain prompt cache prefixes across requests. Disabling this
+    /// does not remove the cache storage needed within an active request.
+    pub prefix_reuse: bool,
     /// Waiting queue policy for admitting/scheduling requests.
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length reported to the frontend.
@@ -414,7 +414,7 @@ impl EngineConfig {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
-            prefix_cache: true,
+            prefix_reuse: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
             workers: vec![WorkerConfig::placed(
@@ -477,7 +477,7 @@ impl EngineCore {
     /// workers, a configured transfer edge names an unconfigured worker,
     /// `WorkerGroup::spawn_all` fails to launch a group,
     /// `WorkerExecutor::try_new` refuses the launched groups, the workers of
-    /// a runtime with a KV cache hold too few request rows for
+    /// a runtime with a prefix cache hold too few request rows for
     /// `max_num_seqs` running requests, or the scheduler or its thread
     /// cannot be created.
     pub fn new(config: EngineConfig) -> anyhow::Result<Self> {
@@ -494,7 +494,7 @@ impl EngineCore {
     /// deployment and returns one engine core per replica.
     ///
     /// `config.workers` lists the replicas as equal consecutive blocks of
-    /// WorkerGroups. Each replica gets its own scheduler thread, executor, KV
+    /// WorkerGroups. Each replica gets its own scheduler thread, executor, cache
     /// pool, prefix cache and request rows over its own groups, the way
     /// SGLang runs one scheduler per data-parallel rank behind its
     /// `DataParallelController` and vLLM one engine core per data-parallel
@@ -657,9 +657,9 @@ impl EngineCore {
                     peers: peers.clone(),
                     queue_depth: worker.queue_depth,
                     max_request_pool_size,
-                    kv_storage_fraction: worker
+                    cache_storage_fraction: worker
                         .storage_fraction
-                        .unwrap_or(config.worker_process.kv_storage_fraction),
+                        .unwrap_or(config.worker_process.cache_storage_fraction),
                     transfer: transfer.clone(),
                     expert_parallel: config.expert_parallel.map(|exchange| {
                         crate::worker::ExpertParallelPlacement {
@@ -684,9 +684,9 @@ impl EngineCore {
                 peers: BTreeMap::new(),
                 queue_depth: worker.queue_depth,
                 max_request_pool_size,
-                kv_storage_fraction: worker
+                cache_storage_fraction: worker
                     .storage_fraction
-                    .unwrap_or(config.worker_process.kv_storage_fraction),
+                    .unwrap_or(config.worker_process.cache_storage_fraction),
                 transfer: transfers[0].clone(),
                 expert_parallel: config.expert_parallel.map(|exchange| {
                     crate::worker::ExpertParallelPlacement {
@@ -724,14 +724,14 @@ impl EngineCore {
 
             // A token runtime serves `max_num_seqs` running requests only while
             // its workers hold that many request rows beyond the reserve; the
-            // scheduler would otherwise lower the limit. Workers without a KV
+            // scheduler would otherwise lower the limit. Workers without a prefix
             // cache fit their request pools to device storage, and the
             // scheduler bounds their requests by the rows they report.
             let info = executor.info().runtime_info()?;
             let request_rows = info.request_slots as usize;
             let needed_rows = max_num_seqs + flow_prefix_rows(&info);
             anyhow::ensure!(
-                !info.uses_kv() || request_rows >= needed_rows,
+                !info.uses_cache() || request_rows >= needed_rows,
                 "the workers hold {request_rows} request rows, but {max_num_seqs} running \
                  requests need {needed_rows}"
             );
@@ -797,7 +797,7 @@ impl EngineCore {
             config.worker_process.model_dtype,
             config.generation_limits,
         )?;
-        sched.set_prefix_cache(config.prefix_cache);
+        sched.set_prefix_reuse(config.prefix_reuse);
         let info = sched.info().clone();
         let model_dtype = config.worker_process.model_dtype;
         let generation_limits = sched.generation_limits().clone();

@@ -268,7 +268,7 @@ pub struct Declarations {
 }
 
 /// The library class whose methods report a description's declarations.
-const DESCRIPTION: &str = "uniserve_models.interface.loading.Description";
+const DESCRIPTION: &str = "uniserve.interface.loading.Description";
 
 /// Split a concatenated column into consecutive runs of `lengths`.
 fn runs<T>(lengths: &[i64], values: Vec<T>) -> Vec<Vec<T>> {
@@ -481,7 +481,7 @@ impl Declarations {
     }
 
     /// Call kinds the components in `held` serve, with tensor transfer and,
-    /// for a causal LM, KV export and install.
+    /// for a causal LM, cache export and install.
     pub fn supported(&self, held: &[&str]) -> BTreeSet<CallKind> {
         let mut result = BTreeSet::from([CallKind::Transfer(TransferMode::Tensor)]);
         for &name in held {
@@ -492,8 +492,8 @@ impl Declarations {
                 .any(|call| call.is(Capability::CausalLm))
             {
                 result.extend([
-                    CallKind::Transfer(TransferMode::KvExport),
-                    CallKind::Transfer(TransferMode::KvInstall),
+                    CallKind::Transfer(TransferMode::CacheExport),
+                    CallKind::Transfer(TransferMode::CacheInstall),
                 ]);
             }
         }
@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn a_causal_lm_serves_token_calls_and_kv_transfers() {
+    fn a_causal_lm_serves_token_calls_and_cache_transfers() {
         let model = declarations(vec![(
             "model",
             vec![
@@ -628,8 +628,8 @@ mod tests {
             CallKind::Forward(ForwardMode::Decode),
             CallKind::Forward(ForwardMode::Verify),
             CallKind::Transfer(TransferMode::Tensor),
-            CallKind::Transfer(TransferMode::KvExport),
-            CallKind::Transfer(TransferMode::KvInstall),
+            CallKind::Transfer(TransferMode::CacheExport),
+            CallKind::Transfer(TransferMode::CacheInstall),
         ] {
             assert!(supported.contains(&kind), "{kind:?}");
         }

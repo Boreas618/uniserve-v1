@@ -323,7 +323,7 @@ def test_sensenova_generation_tower_serves_one_device_outputs(tmp_path: Path):
     """A generation tower on a second device leaves served outputs unchanged.
 
     The tower holds the flow route, the denoiser's own modules and the image
-    decoder; the rank's device keeps the text model and the KV cache. Image
+    decoder; the rank's device keeps the text model and the prefix cache. Image
     understanding, seeded generation (replaying captured denoising steps)
     and prompt scoring must equal those of the same rank on one device.
     """

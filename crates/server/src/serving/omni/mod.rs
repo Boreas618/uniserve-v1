@@ -6,7 +6,7 @@
 //! (`prompt_token_ids`, `negative_prompt_token_ids`, `multimodal_inputs`,
 //! `image`, and `image_generation`) and returns the output processor policy.
 //! [`prepare_generation_resources`] then resolves sampling, cache policy, and
-//! the KV budget for both profiles.
+//! the cache budget for both profiles.
 //!
 //! Input images arrive already resolved (`serving::media`): chat images in
 //! `chat_image_urls` order, text-prompt images in request order. Chat images,
@@ -533,7 +533,7 @@ fn tokenize_bagel_with_slots(
 /// Fails when the prompt length does not fit in `u32`, the prompt fills the
 /// model context while the request decodes text, sampling or stop controls
 /// are invalid, `GenerationRequest::validate_resources` rejects the request
-/// against the loaded limits, the KV requirement exceeds
+/// against the loaded limits, the cache requirement exceeds
 /// `ModelConfig::max_model_tokens` even after shrinking the text budget, or
 /// the final request fails `GenerationRequest::validate`.
 pub(super) fn prepare_generation_resources(
@@ -591,33 +591,34 @@ pub(super) fn prepare_generation_resources(
     generation
         .validate_resources(&processor.limits)
         .map_err(|error| error.to_string())?;
-    let mut max_kv_tokens = generation
-        .max_kv_tokens(&processor.limits)
+    let mut max_cache_tokens = generation
+        .max_cache_tokens(&processor.limits)
         .map_err(|error| error.to_string())?;
     // Shrink the text budget by the excess once; at least one text token must
     // remain. The check after this block covers requests that do not decode
     // text and so have no budget to shrink.
-    if max_kv_tokens > processor.config.max_model_tokens() as usize && generation.decodes_text() {
-        let excess = max_kv_tokens - processor.config.max_model_tokens() as usize;
+    if max_cache_tokens > processor.config.max_model_tokens() as usize && generation.decodes_text()
+    {
+        let excess = max_cache_tokens - processor.config.max_model_tokens() as usize;
         generation.max_und_tokens = generation.max_und_tokens
             .checked_sub(excess)
             .filter(|value| *value > 0)
             .ok_or_else(|| {
                 format!(
                     "generation context requires at least {} KV tokens, exceeding the {}-token runtime limit",
-                    max_kv_tokens.saturating_sub(generation.max_und_tokens),
+                    max_cache_tokens.saturating_sub(generation.max_und_tokens),
                     processor.config.max_model_tokens()
                 )
             })?;
-        max_kv_tokens = generation
-            .max_kv_tokens(&processor.limits)
+        max_cache_tokens = generation
+            .max_cache_tokens(&processor.limits)
             .map_err(|error| error.to_string())?;
     }
 
-    if max_kv_tokens > processor.config.max_model_tokens() as usize {
+    if max_cache_tokens > processor.config.max_model_tokens() as usize {
         return Err(format!(
             "generation requires {} KV tokens, exceeding the {}-token runtime limit",
-            max_kv_tokens,
+            max_cache_tokens,
             processor.config.max_model_tokens()
         )
         .into());

@@ -12,7 +12,7 @@ pub(crate) enum RowSource {
     /// draft tokens, at consecutive host positions from `position`: a
     /// continuation whose predecessor's token was never observed.
     Relay { drafts: Vec<u32>, position: u64 },
-    /// One token, its position and the slot's verified KV length gathered
+    /// One token, its position and the slot's verified cache length gathered
     /// from the slot's continuation state on the device: a decode row
     /// following its request's last committed selection.
     Indexed,
@@ -27,12 +27,12 @@ pub(crate) enum RowSource {
     },
 }
 
-/// One row of a text invocation: one call's query over its slot's KV.
+/// One row of a text invocation: one call's query over its slot's prefix cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TokenRow {
     pub(crate) slot: u32,
     pub(crate) source: RowSource,
-    /// Visible KV tokens before the query. A relayed decode's value bounds
+    /// Visible cache tokens before the query. A relayed decode's value bounds
     /// the device's verified length.
     pub(crate) prefix: u32,
     pub(crate) query: u32,

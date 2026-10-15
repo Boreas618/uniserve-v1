@@ -193,7 +193,7 @@ impl ServingRuntime {
 /// features at the position its placeholder run held, so the placeholders
 /// leave the prompt and each image enters at the count of text tokens before
 /// it. An image's soft tokens take one position each, and the vision encoder
-/// writes exactly that many KV entries. `images` are the request's decoded
+/// writes exactly that many cache entries. `images` are the request's decoded
 /// `x_images`, indexed by
 /// [`ImagePlacement::source`](crate::profile::diffusion_gemma::ImagePlacement).
 fn readout_request(prompt: &ReadoutPrompt, images: &[media::ImageInput]) -> GenerationRequest {
