@@ -146,7 +146,7 @@ impl Completions {
     fn serve(events: &Arc<EventPool>) -> Self {
         let jobs = JobQueues::single_lane().unwrap();
         let lane = jobs.clone();
-        events.set_submitter(Some(Box::new(move |device, events| {
+        events.set_submitter(Some(Box::new(move |device, _, events| {
             lane.after(CallKind::Forward(ForwardMode::Decode), device, events)
         })));
         Self {
