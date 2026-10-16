@@ -147,12 +147,15 @@ impl WorkerProcessArgs {
             None
         };
 
-        // Every rank connects to the head and registers: through the Unix
-        // socket from the head's host, and through the TCP port, at an
-        // address its host routes to, from any other.
-        let (local_address, remote_address) = {
-            let head = super::registry::lock(registry)?;
+        // Every rank connects to the head and registers as a member of this
+        // launch: through the Unix socket from the head's host, and through
+        // the TCP port, at an address its host routes to, from any other.
+        // Beginning the launch ends the group's earlier one, whose ranks the
+        // head refuses from here on.
+        let (generation, local_address, remote_address) = {
+            let mut head = super::registry::lock(registry)?;
             (
+                head.begin_launch(&self.worker_id),
                 head.address(None)?,
                 reachable.map(|host| head.address(Some(host))).transpose()?,
             )
@@ -199,6 +202,7 @@ impl WorkerProcessArgs {
                 remote.as_mut(),
                 Arc::clone(&cancel),
                 address,
+                generation,
             )?);
         }
 

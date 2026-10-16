@@ -192,8 +192,9 @@ fn supervise(
     }
 }
 
-/// Starts one rank, which connects to the head and receives its launch
-/// descriptor there.
+/// Starts one rank, which connects to the head, registers as a member of
+/// the launch `spawn.generation` names and receives its launch descriptor
+/// there.
 ///
 /// `store_listener` is the group's reserved collective store socket when this
 /// rank serves the store. The rank inherits it at the descriptor number this
@@ -209,6 +210,7 @@ fn start_rank(
         &spawn.head,
         &spawn.worker_id,
         spawn.rank,
+        spawn.generation,
     );
     for (name, value) in &spawn.environment {
         command.env(name, value);
