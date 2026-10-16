@@ -351,6 +351,7 @@ impl DiffusionLMRunner {
                 then.capture(Capture {
                     functions: self.methods.graphs.clone(),
                     pool: pool.clone(),
+                    peers: Vec::new(),
                     stream: stream.raw(),
                     device,
                     method: self.methods.call(function, arguments),

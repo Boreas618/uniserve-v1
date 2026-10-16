@@ -4,15 +4,32 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use uniserve_core::Canvas;
+use uniserve_ipc::{CallKind, MediaCall};
 
 use super::{DecodeImage, DecoderRunner, Segment, TrackUnits, UnitShape};
+use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoSize};
 use crate::runner::component::Component;
 use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::storage::LatentCache;
+use crate::stream::Issue;
 use crate::{Error, Result};
+
+/// The lane kinds of the video, audio and image decoders' jobs.
+const VIDEO: CallKind = CallKind::Media(MediaCall::VideoDecoding);
+const AUDIO: CallKind = CallKind::Media(MediaCall::AudioDecoding);
+const IMAGE: CallKind = CallKind::Media(MediaCall::ImageDecoding);
+
+/// Perform a startup `job` on the lane serving `kind` and wait for its
+/// completion.
+fn perform(lanes: &JobQueues, kind: CallKind, job: Job) -> Result<Completion> {
+    lanes
+        .block_on(kind, job, BLOCK_ON_TIMEOUT)?
+        .check()
+        .map_err(|failure| failure.error)
+}
 
 /// What the model answers about an admitted audio track decoded in some
 /// number of units.
@@ -59,12 +76,16 @@ impl DecoderRunners {
     }
 
     /// Warm the image decoder on one black `side` x `side` image whose
-    /// latent rows are the head of the step workspace of `latents`.
+    /// latent rows are the head of the step workspace of `latents`: one job
+    /// of the lane on `lanes` serving image decoding zeroes the rows,
+    /// decodes the image as serving records the decode and waits for the
+    /// stream.
     pub(crate) fn warm_image(
         &self,
         latents: Option<&LatentCache>,
         layout: Option<ImageDenoiserLayout>,
         side: u32,
+        lanes: &JobQueues,
     ) -> Result<()> {
         let (Some((_, decoder)), Some(latents), Some(layout)) = (&self.image, latents, layout)
         else {
@@ -72,10 +93,12 @@ impl DecoderRunners {
         };
         let units = layout.latent_rows(side, side)?;
         let workspace = latents.workspace()?;
-        workspace
-            .narrow(0, 0, i64::from(units))?
-            .zero(decoder.stream())?;
-        decoder.decode(
+        let job = Job::new();
+        let issue = job.on(decoder.stream());
+        workspace.narrow(0, 0, i64::from(units))?.zero(issue)?;
+        let mut returns = Vec::new();
+        // The staged pixels are discarded.
+        decoder.record_decode(
             &[DecodeImage {
                 sample: 0,
                 units,
@@ -84,22 +107,25 @@ impl DecoderRunners {
                 product: None,
             }],
             |_, _| Ok(()),
+            &job,
+            &mut returns,
         )?;
-        if let Some(stream) = decoder.stream() {
-            stream.synchronize()?;
-        }
-        Ok(())
+        issue.synchronize()?;
+        let mut completion = perform(lanes, IMAGE, job)?;
+        decoder.check_staged(returns, &mut completion)
     }
 
     /// Prepare and warm the video decoder's segments and every round shape
     /// of its unit ring, then the audio decoder's durations. Runs on every
     /// rank of the group in the same order, because rounds exchange
-    /// overlaps.
+    /// overlaps. Each warmup is a job of the decoder's lane on `lanes`,
+    /// which startup waits for.
     pub(crate) fn prepare_startup(
         &mut self,
         model: &VideoModel,
         plan: &MediaPlan,
         rank: usize,
+        lanes: &JobQueues,
     ) -> Result<()> {
         if let Some(decoder) = &mut self.video {
             decoder.runner.prepare_segments(&segments(model, plan)?)?;
@@ -136,7 +162,9 @@ impl DecoderRunners {
                                 count,
                             };
                             let rows = model.window_rows(frames, canvas, unit)?;
-                            decoder.runner.warm_unit(shape, rows, longest)?;
+                            let job = Job::new();
+                            decoder.runner.warm_unit(shape, rows, longest, &job)?;
+                            perform(lanes, VIDEO, job)?;
                             self.unit_shapes.push((shape, rows, longest));
                         }
                         cursor += count;
@@ -182,7 +210,9 @@ impl DecoderRunners {
                         total,
                         span: spans[run.end as usize - 1].end - spans[run.start as usize].start,
                     };
-                    audio.runner.warm_track(units, rows)?;
+                    let job = Job::new();
+                    audio.runner.warm_track(units, rows, &job)?;
+                    perform(lanes, AUDIO, job)?;
                     self.track_units.push((units, rows));
                 }
             }
@@ -209,24 +239,34 @@ impl DecoderRunners {
     }
 
     /// Capture the warmed unit shapes and track units, then refuse further
-    /// captures.
-    pub(crate) fn capture_startup(&mut self) -> Result<()> {
+    /// captures. Each capture is a job of the decoder's lane on `lanes`,
+    /// whose completion carries the graph; a last job waits for the stream
+    /// before the decoder is sealed.
+    pub(crate) fn capture_startup(&mut self, lanes: &JobQueues) -> Result<()> {
         if let Some(decoder) = &mut self.video {
             for (shape, rows, longest) in std::mem::take(&mut self.unit_shapes) {
-                decoder.runner.capture_unit(shape, rows, longest)?;
+                let job = Job::new();
+                if decoder.runner.capture_unit(shape, rows, longest, &job)? {
+                    let mut completion = perform(lanes, VIDEO, job)?;
+                    decoder.runner.complete_unit(shape, &mut completion)?;
+                }
             }
-            if let Some(stream) = decoder.runner.stream() {
-                stream.synchronize()?;
-            }
+            let job = Job::new();
+            job.on(decoder.runner.stream()).synchronize()?;
+            perform(lanes, VIDEO, job)?;
             decoder.runner.seal();
         }
         if let Some(audio) = &mut self.audio {
             for (units, rows) in std::mem::take(&mut self.track_units) {
-                audio.runner.capture_track(units, rows)?;
+                let job = Job::new();
+                if audio.runner.capture_track(units, rows, &job)? {
+                    let mut completion = perform(lanes, AUDIO, job)?;
+                    audio.runner.complete_track(units, &mut completion)?;
+                }
             }
-            if let Some(stream) = audio.runner.stream() {
-                stream.synchronize()?;
-            }
+            let job = Job::new();
+            job.on(audio.runner.stream()).synchronize()?;
+            perform(lanes, AUDIO, job)?;
             audio.runner.seal();
         }
         Ok(())

@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, ConditionTiles, VideoCondition};
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8, memset_d32};
+use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 use uniserve_ipc::{
     Batch as BatchPlan, Call, DimBound, LatentParams, OutputInfo, RasterAxes, ShapeBound,
     VideoDenoiserInfo,
@@ -55,7 +55,7 @@ use crate::executor::products::{OutputShape, Placement, bind_outputs};
 use crate::executor::video::{MediaBatch, Trajectories};
 use crate::executor::video::{Parts, latent_params, product_name, stream_of};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list, integers};
-use crate::lane::{Completion, Job};
+use crate::lane::{Capture, Completion, Job};
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};
@@ -1024,7 +1024,7 @@ impl DenoiserRunner {
                 count: 1,
             })?;
         }
-        let mode = video.run_conditioner(&stream, capacity, job)?;
+        let mode = video.run_conditioner(&stream, capacity, None, job)?;
 
         let mut refined = CopyBatch::new(SourceOrder::Stream);
         refined.push(target.address(), output, (count * output_row) as usize);
@@ -1147,7 +1147,7 @@ impl DenoiserRunner {
             })?;
         }
 
-        let mode = video.run_step(&self.methods, &stream, id, job)?;
+        let mode = video.run_step(&self.methods, &stream, id, None, job)?;
 
         let mut scatter = CopyBatch::new(SourceOrder::Stream);
         scatter.push(
@@ -1223,15 +1223,17 @@ impl DenoiserRunner {
         Ok(())
     }
 
-    /// Run one placeholder step of a startup layout on slot `slot`, whose
-    /// host sources a preparation filled, to prepare its kernels and plans
-    /// before any capture. The scratch's values are discarded.
-    ///
-    /// FIXME: startup issues this on the runner's stream at once and drains
-    /// it, from the thread that starts the rank; as a job of the lane it
-    /// would be recorded like the serving forward.
-    pub(crate) fn warm(&mut self, id: usize, slot: usize) -> Result<()> {
+    /// Record into `job` one placeholder step of startup layout `id` on
+    /// slot `slot`, whose host sources the job fills before
+    /// ([`Self::prepare_latents`]), to prepare its kernels and plans before
+    /// any capture: the copies of the sources into the step's scratch and
+    /// state buffers, the zero conditioning and evaluation index, the step
+    /// as serving records it, then the wait for the stream, after which
+    /// the slot's sources may be rewritten. The scratch's values are
+    /// discarded.
+    pub(crate) fn warm(&mut self, id: usize, slot: usize, job: &Job) -> Result<()> {
         let (_, stream) = self.cuda()?;
+        let issue = job.on(Some(&stream));
         let video = self.family.video_mut()?;
         let layout = video.layout(id)?;
         let mut copies = CopyBatch::new(SourceOrder::Stream);
@@ -1266,30 +1268,44 @@ impl DenoiserRunner {
             .position(|field| field.name == "text_condition")
             .ok_or_else(|| Error::Invariant("the envelope lacks text conditioning".into()))?;
         let text_bytes = bytes_of(&video.state[text]);
-        // SAFETY: the scratch and state buffers are owned by this runner; the
-        // stream is drained below before the slot's sources are reused.
+        // SAFETY: the scratch and state buffers are owned by this runner;
+        // the pinned sources are rewritten only by a later job, which the
+        // wait below orders behind these copies.
         unsafe {
-            copies.submit(&stream)?;
-            memset_d8(video.state[text].address(), 0, text_bytes as usize, &stream)?;
-            memset_d32(video.step.address(), 0, 2, &stream)?;
+            issue.copy(&copies)?;
+            issue.fill(Fill {
+                address: video.state[text].address(),
+                value: 0,
+                width: 1,
+                count: text_bytes as usize,
+            })?;
+            issue.fill(Fill {
+                address: video.step.address(),
+                value: 0,
+                width: 4,
+                count: 2,
+            })?;
         }
-        MethodCall::new(
-            &self.methods.denoise,
-            video.step_arguments(&self.methods, id)?,
-        )
-        .invoke()?;
+        // No layout is captured before every one is warmed: the step is the
+        // eager call.
+        video.run_step(&self.methods, &stream, id, None, job)?;
+        issue.synchronize()?;
+        // The job is performed before any capture is recorded.
         video.layout_mut(id)?.phase = Phase::Warmed;
-        stream.synchronize()?;
         Ok(())
     }
 
-    /// Capture a warmed startup layout's step into the runner's graph pool.
-    pub(crate) fn capture(&mut self, id: usize) -> Result<bool> {
+    /// Record into `job` the capture of a warmed startup layout's step into
+    /// the runner's graph pool; whether it records one: a runner without a
+    /// graph pool serves steps eagerly, and a captured layout is not
+    /// captured again. [`Self::complete_capture`] stores the graph from the
+    /// job's completion.
+    pub(crate) fn capture(&mut self, id: usize, job: &Job) -> Result<bool> {
         let (ordinal, stream) = self.cuda()?;
         let video = self.family.video_mut()?;
-        let Some(pool) = &video.pool_handle else {
+        if video.pool_handle.is_none() {
             return Ok(false);
-        };
+        }
         let layout = video.layout(id)?;
         if !layout.startup || layout.phase != Phase::Warmed {
             return Err(Error::Invariant(
@@ -1299,60 +1315,102 @@ impl DenoiserRunner {
         if video.graphs.contains(&id, None) {
             return Ok(false);
         }
-        let step = MethodCall::new(
-            &self.methods.denoise,
-            video.step_arguments(&self.methods, id)?,
-        );
-        let graph = self
-            .capture
-            .capture(&pool.value, stream.raw(), ordinal, || {
-                step.invoke().map(drop)
-            })?;
-        video.graphs.insert(id, None, graph)?;
-        video.graphs.record(GraphMode::Capture);
-        Ok(true)
+        let mode = video.run_step(
+            &self.methods,
+            &stream,
+            id,
+            Some((&self.capture, ordinal)),
+            job,
+        )?;
+        Ok(mode == GraphMode::Capture)
     }
 
-    /// Warm the conditioner at every capacity (largest first) on zero
-    /// features, then capture each.
-    ///
-    /// FIXME: startup issues this on the runner's stream at once and drains
-    /// it, from the thread that starts the rank; as a job of the lane it
-    /// would be recorded like the serving forward.
-    pub(crate) fn warm_conditioner(&mut self, capture: bool) -> Result<()> {
-        let (ordinal, stream) = self.cuda()?;
+    /// Store the step graph the job of [`Self::capture`] captured for
+    /// layout `id`.
+    pub(crate) fn complete_capture(
+        &mut self,
+        id: usize,
+        completion: &mut Completion,
+    ) -> Result<()> {
         let video = self.family.video_mut()?;
-        let Some(conditioner) = &mut video.conditioner else {
-            return Ok(());
+        video.graphs.insert(id, None, completion.captured()?)?;
+        video.graphs.record(GraphMode::Capture);
+        Ok(())
+    }
+
+    /// Record into `job` the conditioner's warmup at every capacity
+    /// (largest first) on zero features, each forward as serving records
+    /// it, then the wait for the stream; with `capture`, then the capture
+    /// of each capacity. Returns the captured capacities, in order, whose
+    /// graphs [`Self::complete_conditioner`] stores from the job's
+    /// completion.
+    pub(crate) fn warm_conditioner(&mut self, capture: bool, job: &Job) -> Result<Vec<u32>> {
+        let (ordinal, stream) = self.cuda()?;
+        let issue = job.on(Some(&stream));
+        let video = self.family.video_mut()?;
+        let Some(conditioner) = &video.conditioner else {
+            return Ok(Vec::new());
         };
-        let input_bytes = bytes_of(&conditioner.input);
+        let (input, input_bytes, lengths) = (
+            conditioner.input.address(),
+            bytes_of(&conditioner.input),
+            conditioner.lengths.address(),
+        );
+        let capacities: Vec<u32> = conditioner.runners.keys().rev().copied().collect();
         // SAFETY: the conditioner's buffers belong to this runner.
         unsafe {
-            memset_d8(
-                conditioner.input.address(),
-                0,
-                input_bytes as usize,
-                &stream,
-            )?;
+            issue.fill(Fill {
+                address: input,
+                value: 0,
+                width: 1,
+                count: input_bytes as usize,
+            })?;
         }
-        let capacities: Vec<u32> = conditioner.runners.keys().rev().copied().collect();
         for &capacity in &capacities {
             // SAFETY: as above.
-            unsafe { memset_d32(conditioner.lengths.address(), capacity, 1, &stream)? };
-            MethodCall::new(&conditioner.encode, conditioner.arguments(capacity)?).invoke()?;
-        }
-        stream.synchronize()?;
-        let (true, Some(pool)) = (capture, &video.pool_handle) else {
-            return Ok(());
-        };
-        for capacity in capacities {
-            let encode = MethodCall::new(&conditioner.encode, conditioner.arguments(capacity)?);
-            let graph = self
-                .capture
-                .capture(&pool.value, stream.raw(), ordinal, || {
-                    encode.invoke().map(drop)
+            unsafe {
+                issue.fill(Fill {
+                    address: lengths,
+                    value: capacity,
+                    width: 4,
+                    count: 1,
                 })?;
-            conditioner.graphs.insert(capacity, None, graph)?;
+            }
+            // No capacity is captured before every one is warmed: the
+            // forward is the eager call.
+            video.run_conditioner(&stream, capacity, None, job)?;
+        }
+        issue.synchronize()?;
+        if !capture || video.pool_handle.is_none() {
+            return Ok(Vec::new());
+        }
+        for &capacity in &capacities {
+            video.run_conditioner(&stream, capacity, Some((&self.capture, ordinal)), job)?;
+        }
+        Ok(capacities)
+    }
+
+    /// Store the conditioner graphs the job of [`Self::warm_conditioner`]
+    /// captured for `capacities`, in their order.
+    pub(crate) fn complete_conditioner(
+        &mut self,
+        capacities: Vec<u32>,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        if capacities.is_empty() {
+            return Ok(());
+        }
+        let conditioner = self
+            .family
+            .video_mut()?
+            .conditioner
+            .as_mut()
+            .ok_or_else(|| Error::Invariant("a captured conditioner is gone".into()))?;
+        for capacity in capacities {
+            conditioner
+                .graphs
+                .insert(capacity, None, completion.captured()?)?;
+            conditioner.graphs.record(GraphMode::Capture);
         }
         Ok(())
     }
@@ -1486,25 +1544,47 @@ impl VideoDenoiser {
     }
 
     /// Record the conditioner's forward at `capacity` on `stream`: the
-    /// launch of its graph or the eager call.
-    fn run_conditioner(&mut self, stream: &Stream, capacity: u32, job: &Job) -> Result<GraphMode> {
-        let capturing = self.pool_handle.is_some();
+    /// launch of its graph or the eager call. With `capture` (startup's
+    /// capture: the capture functions and the CUDA ordinal), a capacity
+    /// not captured yet is captured into the graph pool instead of called;
+    /// the job's completion carries the graph. A capture is counted when
+    /// its graph is stored.
+    fn run_conditioner(
+        &mut self,
+        stream: &Stream,
+        capacity: u32,
+        capture: Option<(&GraphFunctions, i32)>,
+        job: &Job,
+    ) -> Result<GraphMode> {
+        let pool = self.pool_handle.as_ref();
         let conditioner = self
             .conditioner
             .as_mut()
             .ok_or_else(|| Error::Unsupported("this rank holds no text conditioner".into()))?;
         // Without a graph pool every capacity runs eagerly.
-        let lookup = if capturing {
+        let lookup = if pool.is_some() {
             conditioner.graphs.lookup(&capacity, None)?
         } else {
             Lookup::Capture
         };
-        let mode = match lookup {
-            Lookup::Replay(graph) => {
+        let mode = match (lookup, capture, pool) {
+            (Lookup::Replay(graph), ..) => {
                 job.on(Some(stream)).launch(graph)?;
                 GraphMode::Replay
             }
-            Lookup::Capture => {
+            (Lookup::Capture, Some((functions, device)), Some(pool)) => {
+                job.capture(Capture {
+                    functions: functions.clone(),
+                    pool: pool.value.clone(),
+                    peers: Vec::new(),
+                    stream: stream.raw(),
+                    device,
+                    method: MethodCall::new(&conditioner.encode, conditioner.arguments(capacity)?),
+                    breaks: None,
+                });
+                GraphMode::Capture
+            }
+            (Lookup::Capture, ..) => {
                 job.call(MethodCall::new(
                     &conditioner.encode,
                     conditioner.arguments(capacity)?,
@@ -1512,7 +1592,9 @@ impl VideoDenoiser {
                 GraphMode::Eager
             }
         };
-        conditioner.graphs.record(mode);
+        if mode != GraphMode::Capture {
+            conditioner.graphs.record(mode);
+        }
         Ok(mode)
     }
 
@@ -1537,18 +1619,35 @@ impl VideoDenoiser {
     }
 
     /// Record a solver step of layout `id` on `stream`: the launch of its
-    /// graph or the eager call of `methods.denoise`.
+    /// graph or the eager call of `methods.denoise`. With `capture`
+    /// (startup's capture: the capture functions and the CUDA ordinal), a
+    /// layout not captured yet is captured into the graph pool instead of
+    /// called; the job's completion carries the graph. A capture is
+    /// counted when its graph is stored.
     fn run_step(
         &mut self,
         methods: &Methods,
         stream: &Stream,
         id: usize,
+        capture: Option<(&GraphFunctions, i32)>,
         job: &Job,
     ) -> Result<GraphMode> {
-        let mode = match self.graphs.lookup(&id, None) {
-            Ok(Lookup::Replay(graph)) => {
+        let mode = match (self.graphs.lookup(&id, None), capture, &self.pool_handle) {
+            (Ok(Lookup::Replay(graph)), ..) => {
                 job.on(Some(stream)).launch(graph)?;
                 GraphMode::Replay
+            }
+            (Ok(Lookup::Capture), Some((functions, device)), Some(pool)) => {
+                job.capture(Capture {
+                    functions: functions.clone(),
+                    pool: pool.value.clone(),
+                    peers: Vec::new(),
+                    stream: stream.raw(),
+                    device,
+                    method: MethodCall::new(&methods.denoise, self.step_arguments(methods, id)?),
+                    breaks: None,
+                });
+                GraphMode::Capture
             }
             // Transient layouts and uncaptured startup layouts run eagerly.
             _ => {
@@ -1559,7 +1658,9 @@ impl VideoDenoiser {
                 GraphMode::Eager
             }
         };
-        self.graphs.record(mode);
+        if mode != GraphMode::Capture {
+            self.graphs.record(mode);
+        }
         Ok(mode)
     }
 }

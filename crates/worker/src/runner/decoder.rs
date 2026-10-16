@@ -55,7 +55,7 @@ use crate::executor::video::{Parts, decode_range, publish_bound, stream_of};
 use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
-use crate::lane::Job;
+use crate::lane::{Capture, Completion, Job};
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::methods::{
@@ -186,16 +186,63 @@ impl DecoderRunner {
         Ok(self.image_decoder()?.range)
     }
 
-    /// Decode `images`, handing each image's staged pixels (in input
-    /// order) to `stage`, which must enqueue their consumption on the
-    /// runner's stream before it returns: the next sub-batch reuses the
-    /// staging bytes.
-    pub fn decode(
+    /// Decode `images` at once, for a caller outside a rank, which has no
+    /// lane: the decode as serving records it ([`Self::record_decode`]),
+    /// each image's staged pixels copied out to host memory behind its
+    /// sub-batch, before the next sub-batch reuses the staging bytes, all
+    /// performed on the calling thread. Returns each image's staged pixels,
+    /// in input order.
+    pub fn decode(&self, images: &[DecodeImage]) -> Result<Vec<StorageView>> {
+        let job = Job::new();
+        let issue = job.on(self.stream());
+        let device = self.device();
+        let mut staged = Vec::with_capacity(images.len());
+        let mut returns = Vec::new();
+        self.record_decode(
+            images,
+            |_, pixels| {
+                let bytes = pixels.nbytes() as usize;
+                let memory: Arc<dyn crate::ffi::Backing> = match device {
+                    Device::Cuda(index) => Memory::pinned(index, bytes)?,
+                    Device::Cpu => Memory::host(bytes),
+                };
+                let copy = StorageView::contiguous(memory, 0, DType::U8, pixels.shape())?;
+                let mut out = CopyBatch::new(SourceOrder::Stream);
+                out.push(copy.address(), pixels.address(), bytes);
+                // SAFETY: the staged pixels and their fresh copy both hold
+                // `bytes`; the copy follows its sub-batch's call in the job
+                // and precedes the next one, and the copy's memory lives in
+                // the returned view.
+                unsafe { issue.copy(&out) }?;
+                staged.push(copy);
+                Ok(())
+            },
+            &job,
+            &mut returns,
+        )?;
+        let mut completion = job.perform().check().map_err(|failure| failure.error)?;
+        self.check_staged(returns, &mut completion)?;
+        Ok(staged)
+    }
+
+    /// Check the byte counts the decode calls of a performed job returned
+    /// against what [`Self::record_decode`] expected of them, in order.
+    pub(crate) fn check_staged(
         &self,
-        images: &[DecodeImage],
-        stage: impl FnMut(usize, StorageView) -> Result<()>,
+        returns: Vec<Vec<i64>>,
+        completion: &mut Completion,
     ) -> Result<()> {
-        self.image_decoder()?.decode(images, stage)
+        let decoder = self.image_decoder()?;
+        for expected in returns {
+            let counts = completion.returned()?;
+            if counts != expected {
+                return Err(Error::Interface(format!(
+                    "{} staged {counts:?} bytes of images of {expected:?} bytes",
+                    decoder.decode.name()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Record the decoding of `images` into `job`: each sub-batch's call
@@ -239,17 +286,42 @@ impl DecoderRunner {
         self.video_decoder()?.read_window(frames, canvas, unit)
     }
 
-    /// Decode and reconstruct a zero latent as a media unit of `shape`
-    /// whose window reads `rows` rows, so kernels compile and the ring's
-    /// exchange of the round shape is prepared. Every ring member holding
-    /// a unit of the round calls it, in the same order.
-    pub(crate) fn warm_unit(&mut self, shape: UnitShape, rows: u64, longest: u32) -> Result<()> {
-        self.video_decoder()?.warm(shape, rows, longest)
+    /// Record into `job` the decode and reconstruction of a zero latent as
+    /// a media unit of `shape` whose window reads `rows` rows, so kernels
+    /// compile and the ring's exchange of the round shape is prepared.
+    /// Every ring member holding a unit of the round records it, in the
+    /// same order.
+    pub(crate) fn warm_unit(
+        &mut self,
+        shape: UnitShape,
+        rows: u64,
+        longest: u32,
+        job: &Job,
+    ) -> Result<()> {
+        self.video_decoder()?.warm(shape, rows, longest, job)
     }
 
-    /// Capture the forward of a warmed unit `shape`.
-    pub(crate) fn capture_unit(&mut self, shape: UnitShape, rows: u64, longest: u32) -> Result<()> {
-        self.video_decoder()?.capture(shape, rows, longest)
+    /// Record into `job` the capture of the forward of a warmed unit
+    /// `shape`; whether it records one. [`Self::complete_unit`] stores the
+    /// graph from the job's completion.
+    pub(crate) fn capture_unit(
+        &mut self,
+        shape: UnitShape,
+        rows: u64,
+        longest: u32,
+        job: &Job,
+    ) -> Result<bool> {
+        self.video_decoder()?.capture(shape, rows, longest, job)
+    }
+
+    /// Store the graph the job of [`Self::capture_unit`] captured for
+    /// `shape`.
+    pub(crate) fn complete_unit(
+        &mut self,
+        shape: UnitShape,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        self.video_decoder()?.complete_capture(shape, completion)
     }
 
     /// Decode and reconstruct media unit `unit` of a `frames`-frame video
@@ -283,15 +355,33 @@ impl DecoderRunner {
         self.audio_decoder()?.prepare(latent_frames)
     }
 
-    /// Decode `units` of a zero track whose complete latent has `rows`
-    /// rows, so kernels compile before any capture.
-    pub(crate) fn warm_track(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
-        self.audio_decoder()?.warm(units, rows)
+    /// Record into `job` the decode of `units` of a zero track whose
+    /// complete latent has `rows` rows, so kernels compile before any
+    /// capture.
+    pub(crate) fn warm_track(&mut self, units: TrackUnits, rows: u64, job: &Job) -> Result<()> {
+        self.audio_decoder()?.warm(units, rows, job)
     }
 
-    /// Capture the forward of warmed track `units`.
-    pub(crate) fn capture_track(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
-        self.audio_decoder()?.capture(units, rows)
+    /// Record into `job` the capture of the forward of warmed track
+    /// `units`; whether it records one. [`Self::complete_track`] stores the
+    /// graph from the job's completion.
+    pub(crate) fn capture_track(
+        &mut self,
+        units: TrackUnits,
+        rows: u64,
+        job: &Job,
+    ) -> Result<bool> {
+        self.audio_decoder()?.capture(units, rows, job)
+    }
+
+    /// Store the graph the job of [`Self::capture_track`] captured for
+    /// `units`.
+    pub(crate) fn complete_track(
+        &mut self,
+        units: TrackUnits,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        self.audio_decoder()?.complete_capture(units, completion)
     }
 
     /// Decode `units` of a track into `out` (`[span, 2]` int16). `latent`
@@ -459,38 +549,6 @@ impl ImageDecoder {
             first = end;
         }
         Ok(chunks)
-    }
-
-    /// Decode `images` at once, handing each image's staged pixels (in
-    /// input order) to `stage`, which must enqueue their consumption on
-    /// the runner's stream before it returns: the next sub-batch reuses
-    /// the staging bytes.
-    fn decode(
-        &self,
-        images: &[DecodeImage],
-        mut stage: impl FnMut(usize, StorageView) -> Result<()>,
-    ) -> Result<()> {
-        for chunk in self.chunks(images)? {
-            let counts =
-                crate::ffi::integers(MethodCall::new(&self.decode, chunk.arguments).invoke()?)
-                    .map_err(|error| Error::numerical(self.decode.name(), &error))?;
-            let decoded = &images[chunk.images.clone()];
-            if counts != pixel_counts(decoded) {
-                return Err(Error::Interface(format!(
-                    "{} staged {counts:?} bytes of images of {:?} bytes",
-                    self.decode.name(),
-                    pixel_counts(decoded)
-                )));
-            }
-            for ((index, image), &offset) in chunk.images.zip(decoded).zip(&chunk.offsets) {
-                stage(
-                    index,
-                    self.staging
-                        .narrow(0, offset as i64, image.pixel_bytes() as i64)?,
-                )?;
-            }
-        }
-        Ok(())
     }
 
     /// Record the decoding of `images` into `job`: each sub-batch's call,
@@ -1032,10 +1090,6 @@ impl VideoDecoder {
         })
     }
 
-    pub(crate) fn stream(&self) -> &Stream {
-        &self.stream
-    }
-
     /// Construct the runner of every segment, the largest first.
     ///
     /// Startup alone constructs (`DecoderRunners::prepare_startup`), for
@@ -1130,42 +1184,110 @@ impl VideoDecoder {
             .ok_or_else(|| Error::Invalid("the rank admits no video with this media unit".into()))
     }
 
-    /// Decode and reconstruct a zero latent as a unit of `shape` whose
-    /// window reads `rows` rows, so kernels compile and the ring's exchange
-    /// of the round shape is prepared, then capture the forward when the
-    /// runner captures. Every member holding a unit of the round calls it,
-    /// in the same order. The padding slot's overlap serves as the retained
-    /// overlap.
-    ///
-    /// FIXME: startup issues this on the runner's stream at once and drains
-    /// it, from the thread that starts the rank; as a job of the lane it
-    /// would be recorded like the serving forward.
-    pub(crate) fn warm(&mut self, shape: UnitShape, rows: u64, longest: u32) -> Result<()> {
-        self.latent.zero(Some(self.stream()))?;
-        self.rows.zero(Some(self.stream()))?;
-        self.retained.zero(Some(self.stream()))?;
-        MethodCall::new(&self.class.forward, self.arguments(shape, rows, longest)?).invoke()?;
-        self.stream().synchronize()?;
+    /// Record into `job` the decode and reconstruction of a zero latent as
+    /// a unit of `shape` whose window reads `rows` rows, the forward as
+    /// serving records it, so kernels compile and the ring's exchange of
+    /// the round shape is prepared, then the wait for the stream. Every
+    /// member holding a unit of the round records it, in the same order.
+    /// The forward's tensors are zero: the latent, the window rows and the
+    /// retained overlap.
+    pub(crate) fn warm(
+        &mut self,
+        shape: UnitShape,
+        rows: u64,
+        longest: u32,
+        job: &Job,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
+        self.latent.zero(issue)?;
+        self.rows.zero(issue)?;
+        self.retained.zero(issue)?;
+        // No shape is captured before every shape is warmed: the forward
+        // is the eager call.
+        self.forward(shape, rows, longest, false, job)?;
+        issue.synchronize()
+    }
+
+    /// Record into `job` the capture of the forward of a warmed `shape`;
+    /// whether it records one: a decoder without a graph pool serves every
+    /// shape eagerly, and a captured shape is not captured again.
+    pub(crate) fn capture(
+        &mut self,
+        shape: UnitShape,
+        rows: u64,
+        longest: u32,
+        job: &Job,
+    ) -> Result<bool> {
+        if self.pool.is_none() || self.graphs.contains(&shape, None) {
+            return Ok(false);
+        }
+        Ok(self.forward(shape, rows, longest, true, job)? == GraphMode::Capture)
+    }
+
+    /// Store the graph the job of [`Self::capture`] captured for `shape`.
+    pub(crate) fn complete_capture(
+        &mut self,
+        shape: UnitShape,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        self.graphs.insert(shape, None, completion.captured()?)?;
+        self.graphs.record(GraphMode::Capture);
         Ok(())
     }
 
-    /// Capture the forward of a warmed `shape`.
-    pub(crate) fn capture(&mut self, shape: UnitShape, rows: u64, longest: u32) -> Result<()> {
-        let Some(pool) = &self.pool else {
-            return Ok(());
+    /// Record in `job` the forward of a unit of `shape` whose window reads
+    /// `rows` latent rows, on the decoder's stream: the launch of the
+    /// shape's captured graph, or the eager call of `DecoderRunner.decode`,
+    /// which serves a shape startup did not capture. With `capture`, a
+    /// shape not captured yet is captured instead of called (startup's
+    /// capture of a warmed shape): the job's completion carries the graph
+    /// ([`Self::complete_capture`]). A capture is counted when its graph is
+    /// stored.
+    fn forward(
+        &mut self,
+        shape: UnitShape,
+        rows: u64,
+        longest: u32,
+        capture: bool,
+        job: &Job,
+    ) -> Result<GraphMode> {
+        let method = |decoder: &Self| -> Result<MethodCall> {
+            Ok(MethodCall::new(
+                &decoder.class.forward,
+                decoder.arguments(shape, rows, longest)?,
+            ))
         };
-        if self.graphs.contains(&shape, None) {
-            return Ok(());
+        let mode = match self.graphs.lookup(&shape, None) {
+            Ok(Lookup::Replay(graph)) => {
+                job.on(Some(&self.stream)).launch(graph)?;
+                GraphMode::Replay
+            }
+            Ok(Lookup::Capture) if capture => {
+                let pool = self.pool.as_ref().ok_or_else(|| {
+                    Error::Invariant("a video decoder captures into its graph pool".into())
+                })?;
+                job.capture(Capture {
+                    functions: self.capture.clone(),
+                    pool: pool.value.clone(),
+                    peers: Vec::new(),
+                    stream: self.stream.raw(),
+                    device: self.device,
+                    method: method(self)?,
+                    breaks: None,
+                });
+                GraphMode::Capture
+            }
+            // A shape startup did not capture runs on the Python thread.
+            _ => {
+                job.call(method(self)?);
+                GraphMode::Eager
+            }
+        };
+        if mode != GraphMode::Capture {
+            self.graphs.record(mode);
         }
-        let forward = MethodCall::new(&self.class.forward, self.arguments(shape, rows, longest)?);
-        let graph = self
-            .capture
-            .capture(&pool.value, self.stream.raw(), self.device, || {
-                forward.invoke().map(drop)
-            })?;
-        self.graphs.insert(shape, None, graph)?;
-        self.graphs.record(GraphMode::Capture);
-        Ok(())
+        Ok(mode)
     }
 
     /// Decode and reconstruct media unit `unit` of a `frames`-frame video
@@ -1224,21 +1346,7 @@ impl VideoDecoder {
         // on this stream.
         unsafe { issue.copy(&inputs) }?;
 
-        let mode = match self.graphs.lookup(&shape, None) {
-            Ok(Lookup::Replay(graph)) => {
-                issue.launch(graph)?;
-                GraphMode::Replay
-            }
-            // A shape startup did not capture runs on the Python thread.
-            _ => {
-                job.call(MethodCall::new(
-                    &self.class.forward,
-                    self.arguments(shape, rows, longest)?,
-                ));
-                GraphMode::Eager
-            }
-        };
-        self.graphs.record(mode);
+        let mode = self.forward(shape, rows, longest, false, job)?;
 
         let frame_bytes = u64::from(canvas.height) * u64::from(canvas.width) * 3;
         let mut outputs = CopyBatch::new(SourceOrder::Stream);
@@ -1335,10 +1443,6 @@ impl AudioDecoder {
         })
     }
 
-    pub(crate) fn stream(&self) -> &Stream {
-        &self.stream
-    }
-
     /// Construct the runner of tracks of `latent_frames` latent frames.
     ///
     /// Startup alone constructs (`DecoderRunners::prepare_startup`), for
@@ -1371,36 +1475,91 @@ impl AudioDecoder {
         ])
     }
 
-    /// Decode `units` of a zero track whose complete latent has `rows`
-    /// rows, so kernels compile before any capture.
-    ///
-    /// FIXME: startup issues this on the runner's stream at once and drains
-    /// it, from the thread that starts the rank; as a job of the lane it
-    /// would be recorded like the serving forward.
-    pub(crate) fn warm(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
-        self.latent.zero(Some(self.stream()))?;
-        MethodCall::new(&self.class.forward, self.arguments(units, rows)?).invoke()?;
-        self.stream().synchronize()?;
+    /// Record into `job` the decode of `units` of a zero track whose
+    /// complete latent has `rows` rows, the forward as serving records it,
+    /// so kernels compile before any capture, then the wait for the stream.
+    pub(crate) fn warm(&mut self, units: TrackUnits, rows: u64, job: &Job) -> Result<()> {
+        let stream = self.stream.clone();
+        let issue = job.on(Some(&stream));
+        self.latent.zero(issue)?;
+        // No units are captured before every unit is warmed: the forward is
+        // the eager call.
+        self.forward(units, rows, false, job)?;
+        issue.synchronize()
+    }
+
+    /// Record into `job` the capture of the forward of warmed `units`;
+    /// whether it records one: a decoder without a graph pool serves every
+    /// track eagerly, and captured units are not captured again.
+    pub(crate) fn capture(&mut self, units: TrackUnits, rows: u64, job: &Job) -> Result<bool> {
+        if self.pool.is_none() || self.graphs.contains(&units, None) {
+            return Ok(false);
+        }
+        Ok(self.forward(units, rows, true, job)? == GraphMode::Capture)
+    }
+
+    /// Store the graph the job of [`Self::capture`] captured for `units`.
+    pub(crate) fn complete_capture(
+        &mut self,
+        units: TrackUnits,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        self.graphs.insert(units, None, completion.captured()?)?;
+        self.graphs.record(GraphMode::Capture);
         Ok(())
     }
 
-    /// Capture the forward of warmed `units`.
-    pub(crate) fn capture(&mut self, units: TrackUnits, rows: u64) -> Result<()> {
-        let Some(pool) = &self.pool else {
-            return Ok(());
+    /// Record in `job` the forward of `units` of a track whose complete
+    /// latent has `rows` rows, on the decoder's stream: the launch of the
+    /// units' captured graph, or the eager call of `DecoderRunner.decode`,
+    /// which serves units startup did not capture. With `capture`, units
+    /// not captured yet are captured instead of called (startup's capture
+    /// of warmed units): the job's completion carries the graph
+    /// ([`Self::complete_capture`]). A capture is counted when its graph is
+    /// stored.
+    fn forward(
+        &mut self,
+        units: TrackUnits,
+        rows: u64,
+        capture: bool,
+        job: &Job,
+    ) -> Result<GraphMode> {
+        let method = |decoder: &Self| -> Result<MethodCall> {
+            Ok(MethodCall::new(
+                &decoder.class.forward,
+                decoder.arguments(units, rows)?,
+            ))
         };
-        if self.graphs.contains(&units, None) {
-            return Ok(());
+        let mode = match self.graphs.lookup(&units, None) {
+            Ok(Lookup::Replay(graph)) => {
+                job.on(Some(&self.stream)).launch(graph)?;
+                GraphMode::Replay
+            }
+            Ok(Lookup::Capture) if capture => {
+                let pool = self.pool.as_ref().ok_or_else(|| {
+                    Error::Invariant("an audio decoder captures into its graph pool".into())
+                })?;
+                job.capture(Capture {
+                    functions: self.capture.clone(),
+                    pool: pool.value.clone(),
+                    peers: Vec::new(),
+                    stream: self.stream.raw(),
+                    device: self.device,
+                    method: method(self)?,
+                    breaks: None,
+                });
+                GraphMode::Capture
+            }
+            // Units startup did not capture run on the Python thread.
+            _ => {
+                job.call(method(self)?);
+                GraphMode::Eager
+            }
+        };
+        if mode != GraphMode::Capture {
+            self.graphs.record(mode);
         }
-        let forward = MethodCall::new(&self.class.forward, self.arguments(units, rows)?);
-        let graph = self
-            .capture
-            .capture(&pool.value, self.stream.raw(), self.device, || {
-                forward.invoke().map(drop)
-            })?;
-        self.graphs.insert(units, None, graph)?;
-        self.graphs.record(GraphMode::Capture);
-        Ok(())
+        Ok(mode)
     }
 
     /// Decode `units` of a track into `out` (`[span, 2]` int16). `latent`
@@ -1435,21 +1594,7 @@ impl AudioDecoder {
         // and was waited for on this stream.
         unsafe { issue.copy(&input) }?;
 
-        let mode = match self.graphs.lookup(&units, None) {
-            Ok(Lookup::Replay(graph)) => {
-                issue.launch(graph)?;
-                GraphMode::Replay
-            }
-            // Units startup did not capture run on the Python thread.
-            _ => {
-                job.call(MethodCall::new(
-                    &self.class.forward,
-                    self.arguments(units, rows)?,
-                ));
-                GraphMode::Eager
-            }
-        };
-        self.graphs.record(mode);
+        let mode = self.forward(units, rows, false, job)?;
 
         let mut output = CopyBatch::new(SourceOrder::Stream);
         output.push(

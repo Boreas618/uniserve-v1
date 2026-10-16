@@ -3,20 +3,33 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_ipc::{BufferId, RequestKey};
+use uniserve_ipc::{BufferId, CallKind, MediaCall, RequestKey};
 
 use super::image::DenoiseRow;
 use super::{DenoiserRunner, Evicted, VideoModel};
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::Handle;
-use crate::lane::{Completion, Job};
+use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
-use crate::runner::causal_lm::warmup::with_scratch;
+use crate::runner::causal_lm::warmup::{install_scratch, release_scratch};
 use crate::runner::component::Component;
 use crate::storage::{LatentCache, PrefixCache, UnitColumn};
+use crate::stream::Issue;
 use crate::{Error, Result};
+
+/// The lane kind of a denoiser's jobs.
+const DENOISING: CallKind = CallKind::Media(MediaCall::Denoising);
+
+/// Perform a startup `job` on the lane serving denoising and wait for its
+/// completion.
+fn perform(lanes: &JobQueues, job: Job) -> Result<Completion> {
+    lanes
+        .block_on(DENOISING, job, BLOCK_ON_TIMEOUT)?
+        .check()
+        .map_err(|failure| failure.error)
+}
 
 /// Prefix tokens of each scratch slot a captured denoising step reads; host
 /// prefix lengths are rebound when the step replays.
@@ -69,12 +82,15 @@ impl DenoiserRunners {
         }
     }
 
-    /// Capture the image denoiser's configured steps over scratch prefix cache of
-    /// `prefix_cache`, with their samples in the step workspace of `latents`.
+    /// Capture the image denoiser's configured steps over scratch prefix
+    /// cache of `prefix_cache`, with their samples in the step workspace of
+    /// `latents`, as jobs of the lane on `lanes` serving denoising; a last
+    /// job waits for the stream.
     pub(crate) fn capture_flow(
         &mut self,
         latents: Option<&LatentCache>,
         prefix_cache: Option<&mut PrefixCache>,
+        lanes: &JobQueues,
     ) -> Result<()> {
         let (Some(prefix_cache), Some(latents)) = (
             prefix_cache.filter(|_| !self.flow_pools.is_empty()),
@@ -85,12 +101,12 @@ impl DenoiserRunners {
         let pools = self.flow_pools.clone();
         let shapes = self.flow.clone();
         for shape in &shapes {
-            self.capture_step(shape, &pools, latents, prefix_cache)?;
+            self.capture_step(shape, &pools, latents, prefix_cache, lanes)?;
         }
         if let Some((_, denoiser)) = &self.image {
-            if let Some(stream) = denoiser.stream() {
-                stream.synchronize()?;
-            }
+            let job = Job::new();
+            job.on(denoiser.stream()).synchronize()?;
+            perform(lanes, job)?;
             tracing::info!(
                 target: "uniserve_worker.warmup",
                 "captured {} image denoising graphs",
@@ -103,13 +119,18 @@ impl DenoiserRunners {
     /// Capture one denoising step: `shape.images` images placed in the
     /// step workspace as serving places them (consecutive whole pages from
     /// its start), each evaluating `shape.branches` guidance branches over
-    /// one scratch slot's prefix.
+    /// one scratch slot's prefix. Three jobs of the lane serving denoising:
+    /// one zeroes the samples and installs the scratch tables, one warms
+    /// and captures the step, whose completion carries the graph, and one
+    /// clears the tables and resets the scratch units, whether or not the
+    /// step succeeded.
     fn capture_step(
         &mut self,
         shape: &FlowShape,
         pools: &[Arc<GraphPool<Handle>>],
         latents: &LatentCache,
         prefix_cache: &mut PrefixCache,
+        lanes: &JobQueues,
     ) -> Result<()> {
         let page_units = latents.pool.page_units() as u32;
         let workspace = latents.workspace()?.clone();
@@ -119,10 +140,11 @@ impl DenoiserRunners {
         let units = denoiser.layout()?.latent_rows(shape.height, shape.width)?;
         let padded = units.div_ceil(page_units) * page_units;
         let stream = denoiser.stream().cloned();
+        let before = Job::new();
         // Captured samples start from zeros, as fresh scratch pages do.
         workspace
             .narrow(0, 0, i64::from(padded) * shape.images as i64)?
-            .zero(stream.as_ref())?;
+            .zero(before.on(stream.as_ref()))?;
         let prefix = CAPTURE_PREFIX;
         let mut rows = Vec::with_capacity(shape.images * shape.branches);
         for image in 0..shape.images {
@@ -140,9 +162,26 @@ impl DenoiserRunners {
             }
         }
         let lengths = vec![prefix; shape.images];
-        with_scratch(prefix_cache, &lengths, stream.as_ref(), |prefix_cache| {
-            denoiser.capture_step(&rows, prefix_cache, pools, &mut || Ok(()))
-        })
+        let scratch = install_scratch(prefix_cache, &lengths, before.on(stream.as_ref()))?;
+        perform(lanes, before)?;
+
+        let job = Job::new();
+        let stepped = match denoiser.capture_step(&rows, prefix_cache, pools, &job) {
+            Ok(Some(captured)) => perform(lanes, job).and_then(|mut completion| {
+                denoiser.complete_step(captured, &mut completion, &mut || Ok(()))
+            }),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        let after = Job::new();
+        let released = release_scratch(
+            prefix_cache,
+            scratch,
+            lengths.len(),
+            after.on(stream.as_ref()),
+        );
+        let performed = perform(lanes, after).map(drop);
+        stepped.and(released).and(performed)
     }
 
     /// Seal the image denoiser's graphs.
@@ -208,8 +247,15 @@ impl DenoiserRunners {
     }
 
     /// Prepare and warm every startup layout (the largest first, so it
-    /// sizes the shared workspace) and the conditioner capacities.
-    pub(crate) fn prepare_startup(&mut self, model: &VideoModel, plan: &MediaPlan) -> Result<()> {
+    /// sizes the shared workspace) and the conditioner capacities. Each
+    /// warmup is a job of the denoiser's lane on `lanes`, which startup
+    /// waits for.
+    pub(crate) fn prepare_startup(
+        &mut self,
+        model: &VideoModel,
+        plan: &MediaPlan,
+        lanes: &JobQueues,
+    ) -> Result<()> {
         if let Some(denoiser) = &mut self.video {
             let runner = &mut denoiser.runner;
             let mut ids = Vec::new();
@@ -232,31 +278,46 @@ impl DenoiserRunners {
                     key.canvas,
                     key.text_rows.min(plan.max_text_tokens),
                 );
-                // The placeholder's host sources are filled, at once, before
-                // its layout warms.
+                // The placeholder's host sources are filled, then its
+                // layout's step warms from them, in one job.
                 let job = Job::new();
                 runner.prepare_latents(id, 1, &size, 0, &job)?;
-                job.perform().check().map_err(|failure| failure.error)?;
-                runner.warm(id, 1)?;
+                runner.warm(id, 1, &job)?;
+                perform(lanes, job)?;
             }
-            runner.warm_conditioner(false)?;
+            let job = Job::new();
+            runner.warm_conditioner(false, &job)?;
+            perform(lanes, job)?;
         }
         Ok(())
     }
 
     /// Capture the startup layouts and conditioner capacities, then refuse
-    /// further captures.
-    pub(crate) fn capture_startup(&mut self, model: &VideoModel, plan: &MediaPlan) -> Result<()> {
+    /// further captures. Each layout's capture is a job of the denoiser's
+    /// lane on `lanes`, whose completion carries the graph; a last job
+    /// warms and captures the conditioner capacities and waits for the
+    /// stream before the runner is sealed.
+    pub(crate) fn capture_startup(
+        &mut self,
+        model: &VideoModel,
+        plan: &MediaPlan,
+        lanes: &JobQueues,
+    ) -> Result<()> {
         if let Some(denoiser) = &mut self.video {
             let runner = &mut denoiser.runner;
             for layout in &plan.layouts {
                 let id = runner.prepare_startup(model, *layout)?;
-                runner.capture(id)?;
+                let job = Job::new();
+                if runner.capture(id, &job)? {
+                    let mut completion = perform(lanes, job)?;
+                    runner.complete_capture(id, &mut completion)?;
+                }
             }
-            runner.warm_conditioner(true)?;
-            if let Some(stream) = runner.stream() {
-                stream.synchronize()?;
-            }
+            let job = Job::new();
+            let capacities = runner.warm_conditioner(true, &job)?;
+            job.on(runner.stream()).synchronize()?;
+            let mut completion = perform(lanes, job)?;
+            runner.complete_conditioner(capacities, &mut completion)?;
             runner.seal();
         }
         Ok(())

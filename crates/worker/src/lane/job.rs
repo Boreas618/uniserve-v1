@@ -143,8 +143,12 @@ enum Call {
 /// method, `capture_end`, on the Python thread.
 pub(crate) struct Capture {
     pub(crate) functions: GraphFunctions,
-    /// The pool the captured allocations live in.
+    /// The pool the captured allocations on the stream's device live in.
     pub(crate) pool: Handle,
+    /// The pool of each other device the method's modules run on (a
+    /// generation tower), with its device; empty for a method on one
+    /// device.
+    pub(crate) peers: Vec<(i32, Handle)>,
     /// The raw handle and device of the stream the method issues on.
     pub(crate) stream: usize,
     pub(crate) device: i32,
@@ -604,13 +608,15 @@ impl Call {
                 let Capture {
                     functions,
                     pool,
+                    peers,
                     stream,
                     device,
                     method,
                     breaks,
                 } = capture;
-                let captured =
-                    functions.capture(&pool, stream, device, || method.invoke().map(drop));
+                let captured = functions.capture_with_peers(&pool, &peers, stream, device, || {
+                    method.invoke().map(drop)
+                });
 
                 // The breaks the method reached belong to this capture,
                 // whether or not it succeeded.
