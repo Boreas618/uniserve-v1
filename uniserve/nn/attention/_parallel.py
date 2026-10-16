@@ -180,7 +180,7 @@ class ParallelAttention(torch.nn.Module):
         """Borrow this invocation's context tensors from the caller's scope."""
         if self.context_group.size == 1:
             return None
-        buffers = _CONTEXT.get().get(self)
+        buffers = context_bindings.get().get(self)
         if buffers is None:
             raise RuntimeError(
                 "context attention requires bound numerical buffers"
@@ -245,7 +245,7 @@ class ParallelAttention(torch.nn.Module):
     @property
     def output_buffers(self) -> OutputBuffers:
         """Borrow fused row-output destinations from the active caller."""
-        buffers = _OUTPUT.get().get(self)
+        buffers = output_bindings.get().get(self)
         if buffers is None:
             raise RuntimeError(
                 "parallel attention requires bound output buffers"
@@ -323,29 +323,16 @@ class ParallelAttention(torch.nn.Module):
 
 
 # Call-scoped buffer bindings: layers borrow caller-owned storage through these
-# context variables instead of holding references between invocations.
-_CONTEXT: ContextVar[Mapping[ParallelAttention, AttentionBuffers]] = ContextVar(
-    "parallel_attention_context", default={}
+# context variables instead of holding references between invocations. An
+# execution context installs its tables here for each activation; physical
+# backing and graph lifetime remain the installer's obligation, and a nested
+# installation restores the enclosing bindings when it is reset.
+context_bindings: ContextVar[Mapping[ParallelAttention, AttentionBuffers]] = (
+    ContextVar("parallel_attention_context", default={})
 )
-_OUTPUT: ContextVar[Mapping[ParallelAttention, OutputBuffers]] = ContextVar(
-    "parallel_attention_output", default={}
+output_bindings: ContextVar[Mapping[ParallelAttention, OutputBuffers]] = (
+    ContextVar("parallel_attention_output", default={})
 )
-
-
-@contextmanager
-def output_scope(
-    bindings: Mapping[ParallelAttention, OutputBuffers],
-) -> Iterator[None]:
-    """Bind caller-owned output views until its kernels and readers complete.
-
-    Nested scopes restore their enclosing bindings on normal and exceptional
-    exit. Physical backing and graph lifetime remain the caller's obligation.
-    """
-    token = _OUTPUT.set(bindings)
-    try:
-        yield
-    finally:
-        _OUTPUT.reset(token)
 
 
 @contextmanager
@@ -359,8 +346,8 @@ def context_scope(
     including when computation raises. Shared weights can use independent
     allocations in separate runtime owners.
     """
-    token = _CONTEXT.set(bindings)
+    token = context_bindings.set(bindings)
     try:
         yield
     finally:
-        _CONTEXT.reset(token)
+        context_bindings.reset(token)

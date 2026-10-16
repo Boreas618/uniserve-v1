@@ -11,15 +11,15 @@ traceable through captured graphs.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
 from typing import Any, Protocol
 
 import torch
 import torch.distributed as dist
 
-from uniserve.profiling import profile_range
+from uniserve.profiling import profile_range, ranges_active
 
 
 class StreamCollectives(Protocol):
@@ -60,26 +60,31 @@ class StreamCollectives(Protocol):
     def close(self) -> None: ...
 
 
-_BOUND_COLLECTIVES: ContextVar[Mapping[str, StreamCollectives] | None] = (
+# The communication resources of the running numerical invocation, by
+# communicator name; an execution context installs its ``collectives`` here
+# for each activation. ``None`` selects initialized process-group
+# communication on an ordinary device stream. A mapping selects explicit
+# stream bindings and must cover every used communicator, including when it
+# is empty.
+stream_bindings: ContextVar[Mapping[str, StreamCollectives] | None] = (
     ContextVar("stream_collectives", default=None)
 )
 
+_NO_RANGE = nullcontext()
 
-@contextmanager
-def stream_collective_scope(
-    bindings: Mapping[str, StreamCollectives] | None,
-) -> Iterator[None]:
-    """Select communication resources for one numerical invocation.
 
-    ``None`` selects initialized process-group communication on an ordinary
-    device stream. A mapping selects explicit stream bindings and must cover
-    every used communicator, including when that mapping is empty.
+def _launch_range(kind: str, group_name: str) -> AbstractContextManager[None]:
+    """Profile one collective launch; the span is named only when emitted.
+
+    The range covers the launch rather than the transfer, which is what a
+    profile correlates a device kernel back to.
     """
-    token = _BOUND_COLLECTIVES.set(bindings)
-    try:
-        yield
-    finally:
-        _BOUND_COLLECTIVES.reset(token)
+    if not ranges_active():
+        return _NO_RANGE
+    return profile_range(
+        f"uniserve.collective kind={kind} group={group_name} "
+        f"rank={dist.get_rank()}"
+    )
 
 
 def stream_collectives(group_name: str) -> StreamCollectives | None:
@@ -92,7 +97,7 @@ def stream_collectives(group_name: str) -> StreamCollectives | None:
     caller selects an explicit stream scope, every used group must belong to it;
     falling back would enqueue communication on a different execution stream.
     """
-    bindings = _BOUND_COLLECTIVES.get()
+    bindings = stream_bindings.get()
     if bindings is None:
         return None
     try:
@@ -138,15 +143,8 @@ class Transfer:
 def start_all_gather(
     output: torch.Tensor, input: torch.Tensor, group
 ) -> Transfer:
-    """Publish a gather into backend-ordered ``output`` and return it.
-
-    The range covers the launch rather than the transfer, which is what a
-    profile correlates a device kernel back to.
-    """
-    with profile_range(
-        f"uniserve.collective kind=all_gather_start "
-        f"group={group.group_name} rank={dist.get_rank()}"
-    ):
+    """Publish a gather into backend-ordered ``output`` and return it."""
+    with _launch_range("all_gather_start", group.group_name):
         bound = stream_collectives(group.group_name)
         if bound is not None:
             work = bound.start_all_gather(output, input)
@@ -176,10 +174,7 @@ def all_gather_into_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
 ) -> None:
     """Gather equal contributions into ``output`` in backend rank order."""
-    with profile_range(
-        f"uniserve.collective kind=all_gather group={group_name} "
-        f"rank={dist.get_rank()}"
-    ):
+    with _launch_range("all_gather", group_name):
         group = process_group(group_name)
         # In-place AllGather registers one stable allocation for both source
         # and destination. Symmetric workspaces can then use NCCL copy engines.
@@ -212,10 +207,7 @@ def all_to_all_single_into(
     group_name: str,
 ) -> None:
     """Exchange leading-axis partitions in backend rank order."""
-    with profile_range(
-        f"uniserve.collective kind=all_to_all group={group_name} "
-        f"rank={dist.get_rank()}"
-    ):
+    with _launch_range("all_to_all", group_name):
         bound = stream_collectives(group_name)
         if bound is not None:
             bound.all_to_all(output, input, output_splits, input_splits)
@@ -247,10 +239,7 @@ def _all_to_all_single_into_fake(
 @torch.library.custom_op("uniserve::all_reduce_max", mutates_args=("value",))
 def all_reduce_max(value: torch.Tensor, group_name: str) -> None:
     """Reduce ``value`` in place to its elementwise maximum."""
-    with profile_range(
-        f"uniserve.collective kind=all_reduce_max group={group_name} "
-        f"rank={dist.get_rank()}"
-    ):
+    with _launch_range("all_reduce_max", group_name):
         bound = stream_collectives(group_name)
         if bound is not None:
             bound.all_reduce(value, "max")
@@ -279,10 +268,7 @@ def send_recv(
 ) -> None:
     """Send ``value`` bytes to ``dst`` and receive ``output`` from ``src``."""
     group = process_group(group_name)
-    with profile_range(
-        f"uniserve.collective kind=send_recv group={group_name} "
-        f"rank={dist.get_rank()}"
-    ):
+    with _launch_range("send_recv", group_name):
         bound = stream_collectives(group_name)
         if bound is not None:
             bound.send_recv(output, value, dst, src)
@@ -495,8 +481,8 @@ class NativeCollectives:
 def group_collectives(groups, collectives: Sequence[NativeCollectives]) -> dict:
     """The stream collectives of ``groups`` by group name.
 
-    The result is what :func:`stream_collective_scope` takes for an
-    execution context.
+    The result is the ``collectives`` an execution context installs into
+    :data:`stream_bindings` for each activation.
 
     ``collectives`` holds one stream's collectives of each communicator.
     Every multi-member communicator of ``groups`` must have one: within an

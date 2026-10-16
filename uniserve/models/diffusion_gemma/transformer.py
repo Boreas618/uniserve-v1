@@ -9,6 +9,8 @@ only the attention inputs differ.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from torch import nn
 
@@ -334,5 +336,13 @@ class Backbone(TransformerDecoder):
         substitute image features after this scaling.
         """
         embedded = super().embed_input_ids(input_ids)
-        scale = torch.tensor(self.embedding_scale, dtype=embedded.dtype).item()
-        return embedded * scale
+        return embedded * _rounded(self.embedding_scale, embedded.dtype)
+
+
+@functools.cache
+def _rounded(value: float, dtype: torch.dtype) -> float:
+    """``value`` rounded to the nearest number ``dtype`` represents.
+
+    Resolved once per value and dtype; a call then makes no tensor.
+    """
+    return torch.tensor(value, dtype=dtype).item()

@@ -21,7 +21,7 @@ import functools
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from types import GenericAlias, MappingProxyType
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -45,8 +45,6 @@ if TYPE_CHECKING:
         OutputBuffers,
         ParallelAttention,
     )
-
-_T = TypeVar("_T")
 
 # Owners whose asynchronous accesses could not be proven finished. An aborted
 # context retains them until the process exits instead of releasing storage
@@ -645,13 +643,114 @@ def _empty() -> Mapping:
     return MappingProxyType({})
 
 
-def _install(
-    stack: contextlib.ExitStack,
-    variable: contextvars.ContextVar[_T],
-    values: _T,
-) -> None:
-    """Set ``variable`` to ``values`` until ``stack`` unwinds."""
-    stack.callback(variable.reset, variable.set(values))
+class _Variables:
+    """Context variables set to given values until exit restores them."""
+
+    __slots__ = ("_tokens", "_values")
+
+    def __init__(
+        self, values: tuple[tuple[contextvars.ContextVar, Any], ...]
+    ) -> None:
+        self._values = values
+        self._tokens: list[contextvars.Token] = []
+
+    def __enter__(self) -> None:
+        tokens = self._tokens
+        for variable, value in self._values:
+            tokens.append(variable.set(value))
+
+    def __exit__(self, *exc_info: object) -> None:
+        tokens, self._tokens = self._tokens, []
+        for token in reversed(tokens):
+            token.var.reset(token)
+
+
+class _Ordering:
+    """On exit, order ``consumer`` after the work enqueued on ``producer``."""
+
+    __slots__ = ("_consumer", "_producer")
+
+    def __init__(
+        self, producer: torch.cuda.Stream, consumer: torch.cuda.Stream
+    ) -> None:
+        self._producer, self._consumer = producer, consumer
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc_info: object) -> None:
+        _order(self._producer, self._consumer)
+
+
+class _Activation:
+    """One call's entry into an :class:`ExecutionContext`.
+
+    Entering selects the context's device and stream (and, for a module
+    tree placed on another device, its delivery stream there), sets the
+    context variables to the context's binding tables and opens its device
+    transfers and weight prefetch; exiting closes each in reverse order,
+    also when the call raised, and raises the first failure among them.
+    Which variables and tables these are is resolved when the context is
+    constructed, so an activation does only this per-call work.
+    """
+
+    __slots__ = ("_context", "_entered")
+
+    def __init__(self, context: ExecutionContext) -> None:
+        self._context = context
+        # Context managers entered so far, exited in reverse.
+        self._entered: list[contextlib.AbstractContextManager] = []
+
+    def _enter(self, manager: contextlib.AbstractContextManager) -> None:
+        manager.__enter__()
+        self._entered.append(manager)
+
+    def __enter__(self) -> ExecutionContext:
+        context = self._context
+        context._require_open()
+        try:
+            stream = context.stream
+            if stream is not None:
+                self._enter(torch.cuda.device(stream.device))
+                self._enter(torch.cuda.stream(stream))
+                if context.device != stream.device:
+                    # A module placed on another device computes on its
+                    # delivery stream there, between the context's stream's
+                    # prior work and its next.
+                    delivery = context._transfers.stream(stream, context.device)
+                    _order(stream, delivery)
+                    self._enter(_Ordering(delivery, stream))
+                    self._enter(torch.cuda.device(context.device))
+                    self._enter(torch.cuda.stream(delivery))
+            self._enter(_Variables(context._variables))
+            transfers = context._transfers.scope()
+            if transfers is not None:
+                self._enter(transfers)
+            if context.weights is not None:
+                self._enter(context.weights.activate())
+        except BaseException as error:
+            self._exit(type(error), error, error.__traceback__)
+            raise
+        return context
+
+    def __exit__(self, kind, error, traceback) -> None:
+        self._exit(kind, error, traceback)
+
+    def _exit(self, kind, error, traceback) -> None:
+        entered, self._entered = self._entered, []
+        failure: BaseException | None = None
+        for manager in reversed(entered):
+            try:
+                manager.__exit__(kind, error, traceback)
+            except BaseException as caught:
+                if failure is None:
+                    failure = caught
+                else:
+                    failure.add_note(
+                        f"Activation cleanup also failed: {caught!r}"
+                    )
+        if failure is not None:
+            raise failure
 
 
 class ExecutionContext:
@@ -760,6 +859,29 @@ class ExecutionContext:
         self._closed = False
         self._max_tokens: int | None = None
         self._clear_bindings()
+
+        # The context variables an activation sets and the values it sets
+        # them to. The tables are cleared in place, never replaced, so the
+        # pairs hold for the context's lifetime.
+        from uniserve.distributed.collectives import stream_bindings
+        from uniserve.nn import _binding
+        from uniserve.nn.attention._parallel import (
+            context_bindings,
+            output_bindings,
+        )
+
+        self._variables: tuple[tuple[contextvars.ContextVar, Any], ...] = (
+            (stream_bindings, self.collectives),
+            (output_bindings, self._vsa_output),
+            (context_bindings, self._vsa_context),
+            (_binding.matmul, self._operators),
+            (_binding.merged_matmul, self._merged),
+            (_binding.attention, self._attention),
+            (_binding.vsa, self._vsa),
+            (_binding.moe, self._moe),
+            (_binding.attention_storage, self._exchange),
+            (_binding.linear_chunks, self._chunks),
+        )
 
     # Binding tables an activation installs into context variables. They are
     # cleared in place, so an activation entered before ``prepare`` sees the
@@ -1313,48 +1435,12 @@ class ExecutionContext:
                         records.append({"path": path, **record})
         return records
 
-    @contextlib.contextmanager
-    def activate(self) -> Iterator[ExecutionContext]:
-        """Enter the bindings, transfers and stream for one call."""
-        from uniserve.distributed.collectives import (
-            stream_collective_scope,
-        )
-        from uniserve.nn import _binding
-        from uniserve.nn.attention._parallel import (
-            context_scope,
-            output_scope,
-        )
+    def activate(self) -> _Activation:
+        """Enter the bindings, transfers and stream for one call.
 
-        self._require_open()
-        with contextlib.ExitStack() as stack:
-            if self.stream is not None:
-                stack.enter_context(torch.cuda.device(self.stream.device))
-                stack.enter_context(torch.cuda.stream(self.stream))
-                if self._device != self.stream.device:
-                    # A module placed on another device computes on its
-                    # delivery stream there, between the context's stream's
-                    # prior work and its next.
-                    delivery = self._transfers.stream(self.stream, self._device)
-                    _order(self.stream, delivery)
-                    stack.callback(_order, delivery, self.stream)
-                    stack.enter_context(torch.cuda.device(self._device))
-                    stack.enter_context(torch.cuda.stream(delivery))
-            stack.enter_context(stream_collective_scope(self.collectives))
-            transfers = self._transfers.scope()
-            if transfers is not None:
-                stack.enter_context(transfers)
-            stack.enter_context(output_scope(self._vsa_output))
-            stack.enter_context(context_scope(self._vsa_context))
-            _install(stack, _binding.matmul, self._operators)
-            _install(stack, _binding.merged_matmul, self._merged)
-            _install(stack, _binding.attention, self._attention)
-            _install(stack, _binding.vsa, self._vsa)
-            _install(stack, _binding.moe, self._moe)
-            _install(stack, _binding.attention_storage, self._exchange)
-            _install(stack, _binding.linear_chunks, self._chunks)
-            if self.weights is not None:
-                stack.enter_context(self.weights.activate())
-            yield self
+        Use as ``with context.activate():``; entering returns the context.
+        """
+        return _Activation(self)
 
     def idle(self) -> bool:
         """Report whether every stream this context used has drained."""
