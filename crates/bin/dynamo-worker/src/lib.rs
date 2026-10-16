@@ -19,6 +19,43 @@
 //! route uses, and a successful request yields one terminal response object
 //! carrying the single MP4 artifact.
 //! UniServe's own HTTP listener is never started.
+//!
+//! # Running it end to end
+//!
+//! No test of this repository launches the worker: it needs Dynamo's
+//! frontend (the `ai-dynamo` 1.5.0 Python package, the release of the pinned
+//! `dynamo-backend-common`), a complete FastH3 checkpoint and four GPUs.
+//! `docs/minimax_h3/dynamo.md` installs the frontend environment and builds
+//! the worker. On one host, file discovery and Dynamo's default TCP request
+//! plane and ZMQ event plane need neither etcd nor NATS. From the repository
+//! root:
+//!
+//! ```bash
+//! export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV=$PWD/artifacts/dynamo/discovery
+//! artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
+//!   --http-host 127.0.0.1 --http-port 18090 \
+//!   --namespace uniserve-fasth3 --discovery-backend file &
+//! target/release/uniserve-dynamo-worker \
+//!   --namespace uniserve-fasth3 \
+//!   --model-path "$UNISERVE_FAST_H3_MODEL" --served-model-name FastH3 \
+//!   --worker-python "$PWD/.venv/bin/python" \
+//!   --workers configs/minimax_h3/fasth3-ulysses4.json \
+//!   --max-model-len 16384 --max-video-seconds 15 \
+//!   --max-running-requests 2 --quantization-config '{"mode":"quality"}' &
+//! # Once `curl -fsS http://127.0.0.1:18090/v1/models` lists FastH3:
+//! curl --fail-with-body --max-time 600 http://127.0.0.1:18090/v1/videos \
+//!   -H 'Content-Type: application/json' -d '{"model": "FastH3",
+//!   "prompt": "A red fox trots across a snowy meadow at sunrise, its breath steaming, while birds call from the pines.",
+//!   "seconds": 5, "size": "1344x768", "response_format": "b64_json",
+//!   "output_format": "mp4", "nvext": {"seed": 42, "num_inference_steps": 8}}'
+//! ```
+//!
+//! The response's `data[0].b64_json` decodes to a 1344x768 24 fps H.264
+//! video of 124 frames with 32 kHz AAC audio. This request maps onto the
+//! same `t2va` request as a `/v1/videos` request to `uniserve serve` with the
+//! same deployment, prompt, seed, canvas and duration, and returns the same
+//! MP4. SIGINT to the worker unregisters it from discovery, shuts the engine
+//! and its ranks down and exits with status 0.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -107,20 +144,15 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     max_running_requests: usize,
 
-    #[arg(long, default_value = r#"{}"#, value_parser = parse_json_object)]
+    #[arg(
+        long,
+        default_value = r#"{}"#,
+        value_parser = WorkerProcessArgs::parse_quantization_config
+    )]
     quantization_config: Value,
 
     #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
     graph_policy: String,
-}
-
-/// Parses a command-line value that must be a JSON object.
-fn parse_json_object(raw: &str) -> Result<Value, String> {
-    let value: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
-    value
-        .is_object()
-        .then_some(value)
-        .ok_or_else(|| "expected a JSON object".to_string())
 }
 
 /// Dynamo `RawEngine` serving FastH3 video generation from an in-process

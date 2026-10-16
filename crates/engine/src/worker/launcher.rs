@@ -14,11 +14,13 @@
 //!
 //! The messages are `uniserve_ipc::launcher`'s, which the `uniserve-host`
 //! binary shares, carried as frames on the connection the launcher registered
-//! on (`registry::RankRegistry`). A `Stop` ends a group's generation before
-//! the group is relaunched under the next one. A launcher may report an exit
-//! of a stopped rank before it reads the `Stop`, and the head may read that
-//! report only after the relaunch, so an exit is attributed to a group only
-//! when it names the group's current generation.
+//! on (`registry::RankRegistry`). Each rank's launch names the generation of
+//! its group's launch, which the rank registry numbers. A `Stop` ends a
+//! group's launch before the group is relaunched under the next generation.
+//! A launcher may report an exit of a stopped rank before it reads the
+//! `Stop`, and the head may read that report only after the relaunch, so an
+//! exit is attributed to a group only when it names the generation of the
+//! group's running launch.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -49,32 +51,37 @@ struct Launcher {
     channel: Channel,
 }
 
-/// Rank exits read from the launchers and not yet taken, and the generation
-/// each worker group is launched under.
+/// Rank exits read from the launchers and not yet taken, and the launch of
+/// each worker group the launchers are running.
 ///
 /// A launcher reports every group's ranks on one connection, and each group
-/// takes its own. Only exits of a group's current generation are kept, so a
+/// takes its own. Only exits of a group's running launch are kept, so a
 /// report of a rank a stop ended is never attributed to its relaunch.
 #[derive(Default)]
 struct ExitReports {
-    /// Each group's current generation; a group absent here has never been
-    /// stopped and is in generation zero.
-    generations: HashMap<String, u64>,
-    /// Exits of each group's current generation, with the host that
-    /// reported each, by worker group.
+    /// The generation of each group's running launch: the one its latest
+    /// spawn named, until a stop ends it.
+    running: HashMap<String, u64>,
+    /// Exits of each group's running launch, with the host that reported
+    /// each, by worker group.
     reported: HashMap<String, Vec<(String, RankExit)>>,
 }
 
 impl ExitReports {
-    /// Returns the generation `worker_id`'s launches currently carry.
-    fn generation(&self, worker_id: &str) -> u64 {
-        self.generations.get(worker_id).copied().unwrap_or(0)
+    /// Records that `worker_id`'s ranks are being launched under
+    /// `generation`. The exits kept for an earlier launch of the group are
+    /// discarded.
+    fn launch(&mut self, worker_id: &str, generation: u64) {
+        if self.running.insert(worker_id.to_owned(), generation) != Some(generation) {
+            self.reported.remove(worker_id);
+        }
     }
 
     /// Keeps one exit a launcher on `host` reported for its group, or
-    /// discards it when it names a generation a stop has ended.
+    /// discards it when it names another launch than the group's running
+    /// one.
     fn file(&mut self, host: &str, exit: RankExit) {
-        if exit.generation != self.generation(&exit.worker_id) {
+        if self.running.get(&exit.worker_id) != Some(&exit.generation) {
             tracing::debug!(
                 host,
                 worker = %exit.worker_id,
@@ -95,10 +102,10 @@ impl ExitReports {
         self.reported.remove(worker_id).unwrap_or_default()
     }
 
-    /// Ends `worker_id`'s current generation: its kept exits are discarded,
-    /// as is every exit of that generation read later.
-    fn end_generation(&mut self, worker_id: &str) {
-        *self.generations.entry(worker_id.to_owned()).or_default() += 1;
+    /// Ends `worker_id`'s running launch: its kept exits are discarded, as is
+    /// every exit of it read later.
+    fn stop(&mut self, worker_id: &str) {
+        self.running.remove(worker_id);
         self.reported.remove(worker_id);
     }
 }
@@ -262,16 +269,11 @@ impl LauncherRegistry {
         }
     }
 
-    /// Sends one rank's launch to the launcher that owns its host. `launch`
-    /// states the rank's spawn for the generation `worker_id`'s launches
-    /// currently carry, which only the registry knows.
-    pub(crate) fn spawn_remote(
-        &mut self,
-        host: &str,
-        worker_id: &str,
-        launch: impl FnOnce(u64) -> RankSpawn,
-    ) -> anyhow::Result<()> {
-        let spawn = launch(self.exits.generation(worker_id));
+    /// Sends one rank's launch to the launcher that owns its host. The
+    /// spawn's generation becomes the one its group's exits are attributed
+    /// to.
+    pub(crate) fn spawn_remote(&mut self, host: &str, spawn: RankSpawn) -> anyhow::Result<()> {
+        self.exits.launch(&spawn.worker_id, spawn.generation);
         let launcher = self
             .hosts
             .get_mut(host)
@@ -303,14 +305,14 @@ impl LauncherRegistry {
     /// Stops one worker group's ranks on every launcher, ahead of relaunching
     /// the group; the launchers stay connected for the other groups.
     ///
-    /// The group's generation ends first, even if a stop cannot be sent: its
+    /// The group's launch ends first, even if a stop cannot be sent: its
     /// exits already collected are discarded, and so is any exit of the
     /// stopped ranks read later, including one a launcher wrote before it
     /// read the stop. The launcher drops the stopped ranks from its
     /// supervision before terminating them, so a rank still running at the
     /// stop is not reported at all.
     pub(crate) fn stop_worker(&mut self, worker_id: &str) -> anyhow::Result<()> {
-        self.exits.end_generation(worker_id);
+        self.exits.stop(worker_id);
         let stop = Instruction::Stop {
             worker_id: worker_id.to_owned(),
         };
@@ -351,12 +353,13 @@ pub(crate) struct RemoteHost<'a> {
 
 impl RemoteHost<'_> {
     /// Sends one rank's launch to this host's launcher. The rank connects to
-    /// the head at `head`.
+    /// the head at `head` and registers as a member of launch `generation`.
     pub(crate) fn deliver(
         &mut self,
         rank: u32,
         python: &std::path::Path,
         worker_id: &str,
+        generation: u64,
         head: &str,
         command: &std::process::Command,
     ) -> anyhow::Result<()> {
@@ -379,14 +382,17 @@ impl RemoteHost<'_> {
             .registry
             .lock()
             .map_err(|_| anyhow::anyhow!("the launcher registry is poisoned"))?;
-        registry.spawn_remote(self.host, worker_id, |generation| RankSpawn {
-            rank,
-            worker_id: worker_id.to_owned(),
-            generation,
-            python: python.to_owned(),
-            head: head.to_owned(),
-            environment,
-        })
+        registry.spawn_remote(
+            self.host,
+            RankSpawn {
+                rank,
+                worker_id: worker_id.to_owned(),
+                generation,
+                python: python.to_owned(),
+                head: head.to_owned(),
+                environment,
+            },
+        )
     }
 }
 
@@ -451,17 +457,20 @@ mod tests {
         }
     }
 
-    /// Launches one rank of `worker_id` on host `b`.
-    fn spawn(registry: &mut LauncherRegistry, worker_id: &str, rank: u32) {
+    /// Launches one rank of launch `generation` of `worker_id` on host `b`.
+    fn spawn(registry: &mut LauncherRegistry, worker_id: &str, rank: u32, generation: u64) {
         registry
-            .spawn_remote("b", worker_id, |generation| RankSpawn {
-                rank,
-                worker_id: worker_id.to_owned(),
-                generation,
-                python: "python3".to_owned(),
-                head: "127.0.0.1:1".to_owned(),
-                environment: HashMap::new(),
-            })
+            .spawn_remote(
+                "b",
+                RankSpawn {
+                    rank,
+                    worker_id: worker_id.to_owned(),
+                    generation,
+                    python: "python3".to_owned(),
+                    head: "127.0.0.1:1".to_owned(),
+                    environment: HashMap::new(),
+                },
+            )
             .expect("the rank is launched");
     }
 
@@ -498,7 +507,7 @@ mod tests {
 
         // Both ranks are launched, and then both exit.
         for (worker, rank) in [("model", 5), ("host", 1)] {
-            spawn(&mut registry, worker, rank);
+            spawn(&mut registry, worker, rank, 1);
         }
         for status in ["exit status: 1", "exit status: 2"] {
             let Instruction::Spawn(launched) = receive(&mut launcher) else {
@@ -533,7 +542,7 @@ mod tests {
         );
     }
 
-    /// A stop ends a group's generation: an exit its launcher reported for a
+    /// A stop ends a group's launch: an exit its launcher reported for a
     /// stopped rank before reading the stop, and which the head has not read
     /// when it relaunches the group, is not attributed to the relaunch,
     /// while an exit of a relaunched rank is.
@@ -543,7 +552,7 @@ mod tests {
         let mut registry = registry(&head);
 
         // The failed rank's exit is written before the stop is read.
-        spawn(&mut registry, "model", 5);
+        spawn(&mut registry, "model", 5, 1);
         let Instruction::Spawn(failed) = receive(&mut launcher) else {
             panic!("the head launches a rank");
         };
@@ -552,7 +561,7 @@ mod tests {
             .expect("the launcher reports the failed rank");
 
         registry.stop_worker("model").expect("the stop is sent");
-        spawn(&mut registry, "model", 5);
+        spawn(&mut registry, "model", 5, 2);
         assert_eq!(
             receive::<Instruction>(&mut launcher),
             Instruction::Stop {

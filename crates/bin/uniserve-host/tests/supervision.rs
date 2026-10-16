@@ -174,22 +174,25 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
 
     // The rank's module accepts one peer on the socket it inherits at the
     // number the reservation reported, which is how a collective store serves
-    // on an inherited socket. The head names that number in the rank's launch
-    // descriptor; this stand-in is given it in its environment. The package
-    // is regular so it shadows any installed worker package.
+    // on an inherited socket, and answers it with the launch generation its
+    // command line names, which a rank registers under. The head names the
+    // socket's number in the rank's launch descriptor; this stand-in is given
+    // it in its environment. The package is regular so it shadows any
+    // installed worker package.
     let modules = tempfile::tempdir().unwrap();
     let package = modules.path().join("uniserve");
     std::fs::create_dir(&package).unwrap();
     std::fs::write(package.join("__init__.py"), "").unwrap();
     std::fs::write(
         package.join("worker.py"),
-        "import os, socket\n\
+        "import os, socket, sys\n\
          store = socket.socket(fileno=int(os.environ['STORE_FD']))\n\
          peer, _ = store.accept()\n\
-         peer.sendall(b'served\\n')\n",
+         generation = sys.argv[sys.argv.index('--generation') + 1]\n\
+         peer.sendall(f'served {generation}\\n'.encode())\n",
     )
     .unwrap();
-    let mut rank = spawn("group", 0, 0, "python3");
+    let mut rank = spawn("group", 0, 4, "python3");
     rank.environment = HashMap::from([
         (
             "PYTHONPATH".to_owned(),
@@ -207,13 +210,13 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
         .unwrap();
     let mut served = String::new();
     std::io::BufRead::read_line(&mut std::io::BufReader::new(peer), &mut served).unwrap();
-    assert_eq!(served, "served\n");
+    assert_eq!(served, "served 4\n");
 
     assert_eq!(
         exit(&mut head),
         RankExit {
             worker_id: "group".into(),
-            generation: 0,
+            generation: 4,
             rank: 0,
             status: "exit status: 0".into(),
         }

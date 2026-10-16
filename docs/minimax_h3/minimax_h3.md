@@ -136,7 +136,7 @@ The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`.
 
 ### Two hosts
 
-The two-host files name their hosts `rank-0` and `rank-1`. Start the head on `rank-0` with `--host-identity rank-0`; it logs `awaiting a launcher for each host this instance does not run on address="0.0.0.0:<port>"`. Then start the launcher on the other host with the same environment, checkpoint path and build:
+The two-host files name their hosts `rank-0` and `rank-1`. Start the head on `rank-0` with `--host-identity rank-0`; it logs `awaiting a launcher for each host this instance does not run on address="0.0.0.0:<port>"`. Then start the launcher on the other host with the same environment, checkpoint path and build; the head refuses a launcher or rank compiled from other sources and names both builds:
 
 ```bash
 NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity rank-1

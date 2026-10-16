@@ -2,7 +2,8 @@
 //! rank starts.
 //!
 //! A rank connects to the head before it loads anything. Its first frame is
-//! its [`Registration`]; the head answers with the rank's
+//! its [`Registration`], which names the rank, the launch of its group it was
+//! started for and its build; the head answers with the rank's
 //! [`LaunchDescriptor`]. The same connection then carries requests and
 //! responses, and its close is the rank's signal to exit: the service
 //! observes it while the rank serves, and [`HeadWatch`] while it starts.
@@ -22,7 +23,8 @@ use crate::{Error, Result};
 /// The head answers once every rank of the launch has registered, which may
 /// take as long as its slowest peer needs to start, so the wait has no
 /// deadline. It ends when the head closes the connection: the head refuses
-/// the registration, gives up the launch, or is gone.
+/// the registration (a rank of a launch its group has since replaced, or of
+/// another build), gives up the launch, or is gone.
 ///
 /// The function uses nothing but its arguments, so any thread may call it.
 pub fn register(arguments: &Arguments) -> Result<(Channel, LaunchDescriptor)> {
@@ -32,6 +34,7 @@ pub fn register(arguments: &Arguments) -> Result<(Channel, LaunchDescriptor)> {
         .send(&Registration::Rank {
             worker_id: arguments.worker_id.clone(),
             rank: arguments.rank,
+            generation: arguments.generation,
             version: VERSION.to_owned(),
         })
         .map_err(failed)?;
