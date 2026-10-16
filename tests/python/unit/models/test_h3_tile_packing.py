@@ -1,18 +1,25 @@
-"""A sparse H3 layout's extent sizes the tables of its tile packing.
+"""A sparse H3 layout's extent sizes the tables of its packing.
 
 ``tile_extent`` sizes the ``[text | audio | tiled video | padding]`` rows of
 a layout from its prompt length, frame count, canvas and alignment;
-``tile_packing`` fills the tables of the same rows. A denoiser evaluates a
-layout from the extent alone, so both must describe the same rows.
+``tile_packing`` fills the tables of the same rows. ``region_extent`` and
+``region_packing`` do the same for a multi-region layout. A denoiser
+evaluates a layout from the extent alone, including which audio and video
+rows fall below a rank's shard boundary, so both must describe the same
+rows.
 """
 
 import dataclasses
 
 import pytest
+import torch
 
 from uniserve.media import image
 from uniserve.models.minimax_h3.packing import (
+    RegionExtent,
     TileExtent,
+    region_extent,
+    region_packing,
     tile_extent,
     tile_packing,
 )
@@ -89,3 +96,94 @@ def test_an_extent_refuses_what_its_packing_refuses(layout):
     for size in (tile_extent, tile_packing):
         with pytest.raises(ValueError):
             size(**arguments)
+
+
+REGION_LAYOUTS = [
+    # Text and condition capacities, tile and alignment of OmniRef layouts,
+    # including a canvas whose token grid ends inside the 4x4x8 tiles.
+    {
+        "num_frames": 124,
+        "canvas": WIDE,
+        "text_rows": 8192,
+        "condition_rows": 49152,
+        "tile": 128,
+        "token_multiple": 512,
+    },
+    {
+        "num_frames": 22,
+        "canvas": image.Config(256, 448),
+        "text_rows": 256,
+        "condition_rows": 0,
+        "tile": 128,
+        "token_multiple": 128,
+    },
+    {
+        "num_frames": 39,
+        "canvas": image.Config(704, 1248),
+        "text_rows": 128,
+        "condition_rows": 384,
+        "tile": 64,
+        "token_multiple": 256,
+    },
+]
+
+
+@pytest.mark.parametrize("layout", REGION_LAYOUTS)
+def test_a_region_extent_sizes_its_packing(layout):
+    extent = region_extent(**layout)
+    packing = region_packing(**layout)
+
+    for field in dataclasses.fields(RegionExtent):
+        assert getattr(packing, field.name) == getattr(extent, field.name)
+    assert extent.padded_tokens % layout["token_multiple"] == 0
+    assert packing.video_valid_sizes.shape == (extent.video_tiles,)
+    frames, height, width = extent.video_grid
+    assert int(packing.video_valid_sizes.sum()) == frames * height * width
+    video_end = extent.video_start + extent.video_tiles * extent.tile
+    assert int(packing.video_indices.min()) == extent.video_start
+    assert int(packing.video_indices.max()) < video_end <= extent.padded_tokens
+
+
+def _counted_below(extent, packing, tile):
+    """Each tile boundary's audio and video rows below it: by the extent
+    and by the packing's tables.
+    """  # noqa: D205
+    boundaries = torch.arange(0, extent.padded_tokens + 1, tile)
+    counted = [
+        (extent.audio_rows_below(row), extent.video_rows_below(row))
+        for row in boundaries.tolist()
+    ]
+    tabled = list(
+        zip(
+            torch.searchsorted(packing.audio_indices, boundaries).tolist(),
+            torch.searchsorted(packing.video_indices, boundaries).tolist(),
+            strict=True,
+        )
+    )
+    return counted, tabled
+
+
+@pytest.mark.parametrize("layout", REGION_LAYOUTS)
+def test_a_region_extent_counts_the_rows_below_each_tile_boundary(layout):
+    extent = region_extent(**layout)
+    counted, tabled = _counted_below(
+        extent, region_packing(**layout), extent.tile
+    )
+    assert counted == tabled
+    with pytest.raises(ValueError):
+        extent.video_rows_below(extent.video_start + 1)
+
+
+@pytest.mark.parametrize("num_frames", [22, 124, 362])
+def test_a_tile_extent_counts_the_rows_below_each_tile_boundary(num_frames):
+    layout = {
+        "num_text_tokens": 300,
+        "num_frames": num_frames,
+        "canvas": image.Config(704, 1248),
+        "token_multiple": 512,
+        "text_rows": 512,
+    }
+    counted, tabled = _counted_below(
+        tile_extent(**layout), tile_packing(**layout), 64
+    )
+    assert counted == tabled

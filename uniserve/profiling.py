@@ -1,7 +1,11 @@
 """Profiling of the numerical library: spans, profiler windows, kernel table.
 
 - :func:`profile_range` emits optional PyTorch and NVTX spans around
-  numerical and infrastructure calls.
+  numerical and infrastructure calls; :func:`ranges_active` tells a caller
+  whose span name is costly to build whether a span would be emitted.
+  NVTX spans follow ``UNISERVE_NVTX`` (``1``, ``true``, ``yes`` or ``on``),
+  read once when this module is imported, as the native executor reads it
+  once per process.
 - :func:`start_profiler` and :func:`stop_profiler` open and close a torch
   profiler window. The worker owns capture windows, step counting and trace
   naming; these functions start the installed PyTorch profiler and export
@@ -17,14 +21,13 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
-
-from .env import flag_from_value
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +39,47 @@ except ImportError:
 else:
     torch = _torch_module
 
-_NVTX_ENV = "UNISERVE_NVTX"
+# Whether NVTX spans are requested for this process. The switch is the one
+# the native executor reads (``crates/worker/src/profiling``), with the same
+# accepted values.
+_NVTX_RANGES = os.environ.get("UNISERVE_NVTX", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# Whether a torch profiler window is open; windows open and close at run
+# time, so this is asked per span.
+_profiler_enabled: Callable[[], bool] = (
+    torch.autograd._profiler_enabled if torch is not None else lambda: False
+)
+
 _NULL_CONTEXT = nullcontext()
+
+
+def ranges_active() -> bool:
+    """Whether :func:`profile_range` currently emits any span."""
+    return (_NVTX_RANGES and _nvtx_available()) or _profiler_enabled()
 
 
 def profile_range(debug_name: str):
     """Emit a torch-profiler span and/or NVTX range when profiling is active."""
-    record = _torch_profiler_enabled()
-    nvtx = _nvtx_ranges_enabled()
+    record = _profiler_enabled()
+    nvtx = _NVTX_RANGES and _nvtx_available()
     if not record and not nvtx:
         return _NULL_CONTEXT
     return _profile_range_impl(debug_name, record=record, nvtx=nvtx)
+
+
+@functools.cache
+def _nvtx_available() -> bool:
+    """Whether this torch build and host emit NVTX ranges (CUDA devices).
+
+    Asked once, and only once spans are requested, so importing this module
+    never initializes the CUDA driver.
+    """
+    return torch is not None and torch.cuda.is_available()
 
 
 @contextmanager
@@ -57,30 +90,14 @@ def _profile_range_impl(
 
     Around one code region.
     """
+    assert torch is not None
     with ExitStack() as stack:
-        if record and torch is not None:
+        if record:
             stack.enter_context(torch.profiler.record_function(debug_name))
-        if nvtx and torch is not None:
+        if nvtx:
             torch.cuda.nvtx.range_push(debug_name)
             stack.callback(torch.cuda.nvtx.range_pop)
         yield
-
-
-def _torch_profiler_enabled() -> bool:
-    """Return whether PyTorch autograd profiling is currently active."""
-    if torch is None:
-        return False
-    enabled = getattr(torch.autograd, "_profiler_enabled", None)
-    return bool(enabled()) if callable(enabled) else False
-
-
-def _nvtx_ranges_enabled() -> bool:
-    """Return whether environment policy enables NVTX range emission."""
-    if torch is None:
-        return False
-    if not torch.cuda.is_available():
-        return False
-    return flag_from_value(os.environ.get(_NVTX_ENV))
 
 
 def start_profiler(

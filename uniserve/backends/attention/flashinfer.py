@@ -4,15 +4,16 @@ FlashInfer attention with explicit host planning and graph-stable page
 metadata.
 """
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import Any
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
+from uniserve_kernels.host_memory import record_host_usage
 
 from uniserve.nn.attention.inputs import (
     DenseInput,
@@ -30,25 +31,107 @@ from . import Operator as _Operator
 __all__ = ["Backend", "Config"]
 
 
-@contextmanager
-def _plan_workspace(wrapper: Any) -> Iterator[None]:
-    """Give a native plan an immutable pinned upload generation.
+@dataclass(eq=False, slots=True)
+class _Upload:
+    """One generation of a plan's page-locked host sources.
 
-    FlashInfer writes this host workspace and enqueues its DMA directly. Its
-    next plan may run before the previous upload has reached the device. A fresh
-    allocation plus allocator stream tracking protects both reuse and teardown
-    while allowing CPU planning to continue asynchronously.
+    ``workspace`` is the native planner's int workspace, which it writes and
+    copies to the device itself. ``arrays`` and ``tensors`` are NumPy and
+    torch views of one int32 ``values`` block holding the plan's metadata
+    arrays, which the plan fills and copies with ``Tensor.copy_``. ``event``
+    follows the generation's last copies on the stream; ``streams`` holds
+    the streams recorded on ``workspace``'s allocator block.
     """
-    from uniserve_kernels.host_memory import record_host_usage
 
-    source = torch.empty_like(
-        wrapper._pin_memory_int_workspace_buffer, pin_memory=True
-    )
-    wrapper._pin_memory_int_workspace_buffer = source
-    try:
-        yield
-    finally:
-        record_host_usage(source, torch.cuda.current_stream(wrapper.device))
+    workspace: torch.Tensor
+    values: torch.Tensor
+    arrays: dict[str, np.ndarray]
+    tensors: dict[str, torch.Tensor]
+    event: torch.cuda.Event = field(default_factory=torch.cuda.Event)
+    streams: set[int] = field(default_factory=set)
+
+
+class _Uploads:
+    """Page-locked host sources of one native wrapper's plans, reused in turn.
+
+    A plan writes host memory that copies enqueued on the current stream read
+    only when the stream reaches them: FlashInfer's planner writes the
+    wrapper's int workspace (``_pin_memory_int_workspace_buffer``) and
+    enqueues its own copy, and the plan's metadata arrays are copied into
+    the wrapper's graph-stable device buffers. The wrapper's next plan may
+    start on the host before the stream has reached those copies, so plans
+    take generations of these sources in turn. A generation is rewritten
+    only once the event recorded behind its copies has completed; a new one
+    is allocated only while the oldest is still in flight. The generations
+    thus grow to the depth by which the host leads the stream and are
+    reused without allocating afterwards.
+
+    ``lengths`` names each metadata array and its int32 length, fixed by the
+    plan's sequence count. The first generation adopts the page-locked
+    workspace the wrapper allocated itself.
+    """
+
+    def __init__(self, wrapper: Any, lengths: Mapping[str, int]) -> None:
+        self._wrapper = wrapper
+        self._lengths = dict(lengths)
+        self._generations = [
+            self._generation(wrapper._pin_memory_int_workspace_buffer)
+        ]
+        self._next = 0
+
+    def _generation(self, workspace: torch.Tensor | None = None) -> _Upload:
+        # Ordinary tensors: plans are bound in and out of inference mode.
+        with torch.inference_mode(False):
+            if workspace is None:
+                workspace = torch.empty_like(
+                    self._generations[0].workspace, pin_memory=True
+                )
+            values = torch.empty(
+                sum(self._lengths.values()), dtype=torch.int32, pin_memory=True
+            )
+            bounds = tuple(accumulate(self._lengths.values(), initial=0))
+            tensors = {
+                name: values[start:stop]
+                for name, start, stop in zip(
+                    self._lengths, bounds[:-1], bounds[1:], strict=True
+                )
+            }
+        return _Upload(
+            workspace,
+            values,
+            {name: view.numpy() for name, view in tensors.items()},
+            tensors,
+        )
+
+    def acquire(self) -> _Upload:
+        """Install a retired generation into the wrapper for one plan.
+
+        The oldest generation is reused once its copies have completed;
+        otherwise a new one is allocated. The caller fills the generation's
+        ``arrays``, enqueues every copy of the plan from them and then
+        calls :meth:`release`, also when planning fails.
+        """
+        upload = self._generations[self._next]
+        if not upload.event.query():
+            # Every generation is in flight: the host leads the stream by
+            # more plans than before.
+            upload = self._generation()
+            self._generations.insert(self._next, upload)
+        self._next = (self._next + 1) % len(self._generations)
+        self._wrapper._pin_memory_int_workspace_buffer = upload.workspace
+        return upload
+
+    def release(self, upload: _Upload) -> None:
+        """Mark the end of a plan's copies from ``upload`` on the stream."""
+        stream = torch.cuda.current_stream(self._wrapper.device)
+        upload.event.record(stream)
+        if stream.cuda_stream not in upload.streams:
+            # The native copy bypasses PyTorch's copy operator. Recording
+            # the stream on the allocator block keeps the workspace from
+            # being reused for another allocation before copies still
+            # pending when this plan is released complete.
+            record_host_usage(upload.workspace, stream)
+            upload.streams.add(stream.cuda_stream)
 
 
 @dataclass(frozen=True)
@@ -107,14 +190,6 @@ def _page_indices(
             other=0,
         )
         tl.store(indices + start + offset, values, offset < count)
-
-
-def _host(values):
-    """Build a pinned int32 CPU tensor.
-
-    Build a pinned int32 CPU tensor for a non-blocking plan metadata upload.
-    """
-    return torch.tensor(values, dtype=torch.int32, pin_memory=True)
 
 
 class _PagePlan:
@@ -200,6 +275,19 @@ class _PagePlan:
                     mask_indptr_buf=self.mask_offsets,
                 )
 
+        # Host metadata of one plan, by array: lengths follow the fixed
+        # sequence count.
+        lengths = {"counts": count, "indptr": count + 1, "last": count}
+        if not decode:
+            lengths |= {"query_offsets": count + 1, "keys": count}
+        if custom:
+            lengths |= {
+                "mask_offsets": count + 1,
+                "key_offsets": count + 1,
+                "causal": count,
+            }
+        self._uploads = _Uploads(self.wrapper, lengths)
+
     def bind(self, owner, queries, keys, table, *, causal):
         # Host page counts and last-page lengths come from declared lengths;
         # physical page IDs are refreshed on device by fill().
@@ -207,31 +295,33 @@ class _PagePlan:
             (length + table.block_size - 1) // table.block_size
             for length in keys
         )
-        indptr = _host(tuple(accumulate(counts, initial=0)))
-        last = _host(
-            tuple(
+        upload = self._uploads.acquire()
+        try:
+            host, tensors = upload.arrays, upload.tensors
+            host["counts"][:] = counts
+            host["indptr"][:] = tuple(accumulate(counts, initial=0))
+            host["last"][:] = tuple(
                 (length - 1) % table.block_size + 1 if length else 0
                 for length in keys
             )
-        )
+            indptr, last = tensors["indptr"], tensors["last"]
 
-        self.counts.copy_(_host(counts), non_blocking=True)
-        self.indptr.copy_(indptr, non_blocking=True)
-        self.last.copy_(last, non_blocking=True)
-        self.fill(table)
+            self.counts.copy_(tensors["counts"], non_blocking=True)
+            self.indptr.copy_(indptr, non_blocking=True)
+            self.last.copy_(last, non_blocking=True)
+            self.fill(table)
 
-        options = {
-            "q_data_type": owner.dtype,
-            "kv_data_type": owner.dtype,
-            "non_blocking": True,
-            "fixed_split_size": (
-                owner.config.decode_split_tile_size
-                if self.decode
-                else owner.config.prefill_split_tile_size
-            ),
-            "disable_split_kv": owner.config.disable_split_kv,
-        }
-        with _plan_workspace(self.wrapper):
+            options = {
+                "q_data_type": owner.dtype,
+                "kv_data_type": owner.dtype,
+                "non_blocking": True,
+                "fixed_split_size": (
+                    owner.config.decode_split_tile_size
+                    if self.decode
+                    else owner.config.prefill_split_tile_size
+                ),
+                "disable_split_kv": owner.config.disable_split_kv,
+            }
             if self.decode:
                 self.wrapper.plan(
                     indptr,
@@ -244,8 +334,10 @@ class _PagePlan:
                     **options,
                 )
             else:
+                host["query_offsets"][:] = tuple(accumulate(queries, initial=0))
+                host["keys"][:] = keys
                 self.wrapper.plan(
-                    _host(tuple(accumulate(queries, initial=0))),
+                    tensors["query_offsets"],
                     indptr,
                     self.indices[: sum(counts)],
                     last,
@@ -255,30 +347,36 @@ class _PagePlan:
                     table.block_size,
                     causal=all(causal) if self.mask is None else False,
                     packed_custom_mask=self.mask,
-                    seq_lens=_host(keys),
+                    seq_lens=tensors["keys"],
                     **options,
                 )
 
-        if self.mask is not None:
-            assert (
-                self.mask_offsets is not None
-                and self.key_offsets is not None
-                and self.causal is not None
-            )
-            byte_offsets = tuple(
-                accumulate(
-                    (
-                        (q * k + 7) // 8
-                        for q, k in zip(queries, keys, strict=True)
-                    ),
-                    initial=0,
+            if self.mask is not None:
+                assert (
+                    self.mask_offsets is not None
+                    and self.key_offsets is not None
+                    and self.causal is not None
                 )
-            )
-            self.mask_offsets.copy_(_host(byte_offsets), non_blocking=True)
-            self.key_offsets.copy_(
-                _host(tuple(accumulate(keys, initial=0))), non_blocking=True
-            )
-            self.causal.copy_(_host(causal), non_blocking=True)
+                host["mask_offsets"][:] = tuple(
+                    accumulate(
+                        (
+                            (q * k + 7) // 8
+                            for q, k in zip(queries, keys, strict=True)
+                        ),
+                        initial=0,
+                    )
+                )
+                host["key_offsets"][:] = tuple(accumulate(keys, initial=0))
+                host["causal"][:] = causal
+                self.mask_offsets.copy_(
+                    tensors["mask_offsets"], non_blocking=True
+                )
+                self.key_offsets.copy_(
+                    tensors["key_offsets"], non_blocking=True
+                )
+                self.causal.copy_(tensors["causal"], non_blocking=True)
+        finally:
+            self._uploads.release(upload)
 
     def fill(self, table):
         """Refresh device page IDs from the current block table."""
@@ -441,6 +539,13 @@ class _RaggedPlan:
             mask_indptr_buf=self.mask_offsets,
             backend=owner.config.prefill_backend,
         )
+        lengths = {
+            "query_offsets": self.count + 1,
+            "key_offsets": self.count + 1,
+        }
+        if custom:
+            lengths |= {"mask_offsets": self.count + 1, "causal": self.count}
+        self._uploads = _Uploads(self.wrapper, lengths)
 
     def bind(self, owner, batch):
         queries, keys = batch.queries.host, batch.keys.host
@@ -449,10 +554,14 @@ class _RaggedPlan:
             if isinstance(batch, VarlenInput)
             else (False,) * self.count
         )
-        with _plan_workspace(self.wrapper):
+        upload = self._uploads.acquire()
+        try:
+            host, tensors = upload.arrays, upload.tensors
+            host["query_offsets"][:] = tuple(accumulate(queries, initial=0))
+            host["key_offsets"][:] = tuple(accumulate(keys, initial=0))
             self.wrapper.plan(
-                _host(tuple(accumulate(queries, initial=0))),
-                _host(tuple(accumulate(keys, initial=0))),
+                tensors["query_offsets"],
+                tensors["key_offsets"],
                 owner.num_heads,
                 owner.num_kv_heads,
                 owner.head_dim,
@@ -464,22 +573,28 @@ class _RaggedPlan:
                 fixed_split_size=owner.config.prefill_split_tile_size,
                 disable_split_kv=owner.config.disable_split_kv,
             )
-        if self.mask is not None:
-            # The native packed-mask plan derives bit offsets from Q/K indptr.
-            # Its kernel consumes byte offsets, with each sequence padded to a
-            # whole byte; install those explicit offsets after native planning.
-            assert self.mask_offsets is not None and self.causal is not None
-            offsets = tuple(
-                accumulate(
-                    (
-                        (q * k + 7) // 8
-                        for q, k in zip(queries, keys, strict=True)
-                    ),
-                    initial=0,
+            if self.mask is not None:
+                # The native packed-mask plan derives bit offsets from Q/K
+                # indptr. Its kernel consumes byte offsets, with each
+                # sequence padded to a whole byte; install those explicit
+                # offsets after native planning.
+                assert self.mask_offsets is not None and self.causal is not None
+                host["mask_offsets"][:] = tuple(
+                    accumulate(
+                        (
+                            (q * k + 7) // 8
+                            for q, k in zip(queries, keys, strict=True)
+                        ),
+                        initial=0,
+                    )
                 )
-            )
-            self.mask_offsets.copy_(_host(offsets), non_blocking=True)
-            self.causal.copy_(_host(causal), non_blocking=True)
+                host["causal"][:] = causal
+                self.mask_offsets.copy_(
+                    tensors["mask_offsets"], non_blocking=True
+                )
+                self.causal.copy_(tensors["causal"], non_blocking=True)
+        finally:
+            self._uploads.release(upload)
 
     def run(self, q, k, v, batch, *, scale, out=None, lse=False):
         if self.mask is not None:

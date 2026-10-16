@@ -248,6 +248,8 @@ class TileExtent:
         latent_height: Latent raster height before patching.
         latent_width: Latent raster width before patching.
         audio_frames: Audio latent frames per stereo channel.
+        video_grid: (time, height, width) token grid of the video, which
+            its 4x4x4 tiles cover tile-major (``tile_order``).
     """  # noqa: D205
 
     num_tokens: int
@@ -258,6 +260,32 @@ class TileExtent:
     latent_height: int
     latent_width: int
     audio_frames: int
+    video_grid: tuple[int, int, int]
+
+    @property
+    def audio_rows(self) -> int:
+        """Audio rows, both stereo channels."""
+        return AUDIO_CHANNELS * self.audio_frames
+
+    @property
+    def audio_start(self) -> int:
+        """First audio row, after the text region."""
+        return (self.prefix_tiles - math.ceil(self.audio_rows / 64)) * 64
+
+    def audio_rows_below(self, row: int) -> int:
+        """Audio rows packed before packed row ``row``."""
+        return min(max(row - self.audio_start, 0), self.audio_rows)
+
+    def video_rows_below(self, row: int) -> int:
+        """Video rows packed before packed row ``row``, a tile boundary."""
+        return _video_rows_below(
+            row,
+            start=self.prefix_tiles * 64,
+            tile=64,
+            tiles=self.video_tiles,
+            grid=self.video_grid,
+            shape=(4, 4, 4),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +453,7 @@ def tile_extent(
         latent_height=latent_height,
         latent_width=latent_width,
         audio_frames=audio_frames,
+        video_grid=grid,
     )
 
 
@@ -603,6 +632,7 @@ def tile_packing(
         latent_height=latent_height,
         latent_width=latent_width,
         audio_frames=audio_frames,
+        video_grid=extent.video_grid,
         position_ids=positions,
         token_tags=tags,
         text_indices=text_indices,
@@ -980,6 +1010,56 @@ def tile_order(
     return raster, inside.sum(axis=1, dtype=np.int32)
 
 
+def tiled_rows(
+    grid: tuple[int, int, int], shape: tuple[int, int, int], tiles: int
+) -> int:
+    """Rows of the first ``tiles`` tiles of ``tile_order(grid, shape)``.
+
+    Counts the grid cells those tiles cover without ordering the rows:
+    the whole tile slabs of frames, then the whole tile rows of the next
+    slab, then the leading tiles of its next tile row. ``tiles`` is clamped
+    to the grid's tiles.
+    """
+    frames, height, width = grid
+    tile_t, tile_h, tile_w = shape
+    across_h, across_w = math.ceil(height / tile_h), math.ceil(width / tile_w)
+    total = math.ceil(frames / tile_t) * across_h * across_w
+    slabs, rest = divmod(min(max(tiles, 0), total), across_h * across_w)
+    lines, columns = divmod(rest, across_w)
+    rows = min(slabs * tile_t, frames) * height * width
+    if rest:
+        depth = min(tile_t, frames - slabs * tile_t)
+        rows += depth * min(lines * tile_h, height) * width
+        rows += (
+            depth
+            * min(tile_h, height - lines * tile_h)
+            * min(columns * tile_w, width)
+        )
+    return rows
+
+
+def _video_rows_below(
+    row: int,
+    *,
+    start: int,
+    tile: int,
+    tiles: int,
+    grid: tuple[int, int, int],
+    shape: tuple[int, int, int],
+) -> int:
+    """Video rows of a tile-major video region below packed row ``row``.
+
+    The region's ``tiles`` tiles of ``tile`` rows start at ``start``, each
+    holding its valid rows at its front, in ``tile_order(grid, shape)``.
+
+    Raises:
+        ValueError: ``row`` is not a tile boundary of the region.
+    """
+    if (row - start) % tile:
+        raise ValueError("video rows are counted below tile boundaries")
+    return tiled_rows(grid, shape, min(max((row - start) // tile, 0), tiles))
+
+
 def _video_grid(
     frames: int, latent_height: int, latent_width: int
 ) -> tuple[int, int, int]:
@@ -1013,8 +1093,8 @@ def region_tiles(segment: Segment, tile: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class RegionPacking:
-    """Row extents of one multi-region sparse layout.
+class RegionExtent:
+    """Row and tile counts of one multi-region sparse layout.
 
     ``[text | conditions | target audio | target video | padding]``, each
     region whole tiles of ``tile`` rows. Text and conditions are capacities
@@ -1023,16 +1103,17 @@ class RegionPacking:
     video's rows are tile-major over its token grid (``tile_order``) and the
     stereo audio rows are channel-major.
 
+    The counts follow from the frame count, the canvas, the capacities and
+    the alignment alone (``region_extent``), so evaluating a layout builds
+    no tables; ``RegionPacking`` adds the tables of the same rows.
+
     Attributes:
         tile: Rows of one tile, a key of ``VIDEO_TILE_SHAPES``.
         text_rows: Text capacity, whole tiles.
         condition_rows: Condition capacity, whole tiles.
         audio_rows: Generated audio rows, both stereo channels.
-        video_indices: [video rows] int64 packed row of each generated video
-            row, ascending.
-        video_raster_indices: [video rows] int64 raster row of each entry of
-            ``video_indices``.
-        video_valid_sizes: [video tiles] int32 rows of each video tile.
+        video_grid: (time, height, width) token grid of the generated video.
+        video_tiles: Tiles of the generated video, including partial tiles.
         padded_tokens: All rows, a multiple of the layout's alignment.
     """
 
@@ -1040,9 +1121,8 @@ class RegionPacking:
     text_rows: int
     condition_rows: int
     audio_rows: int
-    video_indices: torch.Tensor
-    video_raster_indices: torch.Tensor
-    video_valid_sizes: torch.Tensor
+    video_grid: tuple[int, int, int]
+    video_tiles: int
     padded_tokens: int
 
     @property
@@ -1059,6 +1139,43 @@ class RegionPacking:
         )
 
     @property
+    def zero_row(self) -> int:
+        """Row of the prefix source that holds zeros (see ``region_tables``)."""
+        return self.text_rows + self.condition_rows
+
+    def audio_rows_below(self, row: int) -> int:
+        """Generated audio rows packed before packed row ``row``."""
+        return min(max(row - self.audio_start, 0), self.audio_rows)
+
+    def video_rows_below(self, row: int) -> int:
+        """Generated video rows packed before ``row``, a tile boundary."""
+        return _video_rows_below(
+            row,
+            start=self.video_start,
+            tile=self.tile,
+            tiles=self.video_tiles,
+            grid=self.video_grid,
+            shape=VIDEO_TILE_SHAPES[self.tile],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RegionPacking(RegionExtent):
+    """CPU tables of the generated rows of one multi-region sparse layout.
+
+    Attributes:
+        video_indices: [video rows] int64 packed row of each generated video
+            row, ascending.
+        video_raster_indices: [video rows] int64 raster row of each entry of
+            ``video_indices``.
+        video_valid_sizes: [video tiles] int32 rows of each video tile.
+    """
+
+    video_indices: torch.Tensor
+    video_raster_indices: torch.Tensor
+    video_valid_sizes: torch.Tensor
+
+    @property
     def audio_indices(self) -> torch.Tensor:
         """[audio rows] int64 packed rows of the generated audio, ascending."""
         return torch.arange(
@@ -1067,13 +1184,8 @@ class RegionPacking:
             dtype=torch.int64,
         )
 
-    @property
-    def zero_row(self) -> int:
-        """Row of the prefix source that holds zeros (see ``region_tables``)."""
-        return self.text_rows + self.condition_rows
 
-
-def region_packing(
+def region_extent(
     *,
     num_frames: int,
     canvas: image.Config,
@@ -1081,7 +1193,7 @@ def region_packing(
     condition_rows: int,
     tile: int,
     token_multiple: int,
-) -> RegionPacking:
+) -> RegionExtent:
     """Size the multi-region layout of one frame count, canvas and capacity.
 
     ``token_multiple``, a multiple of ``tile``, aligns the padded row count so
@@ -1112,24 +1224,66 @@ def region_packing(
     grid = _video_grid(
         video_latent_frames(num_frames), latent_height, latent_width
     )
-    raster, sizes = tile_order(grid, VIDEO_TILE_SHAPES[tile])
+    video_tiles = math.prod(
+        math.ceil(extent / size)
+        for extent, size in zip(grid, VIDEO_TILE_SHAPES[tile], strict=True)
+    )
     audio_rows = AUDIO_CHANNELS * audio_latent_frames(num_frames)
     video_start = (
         text_rows + condition_rows + math.ceil(audio_rows / tile) * tile
     )
-    offsets = np.arange(tile, dtype=np.int64)[None, :]
-    rows = video_start + np.arange(sizes.size, dtype=np.int64)[:, None] * tile
-    video_indices = (rows + offsets)[offsets < sizes[:, None]]
-    end = video_start + sizes.size * tile
-    return RegionPacking(
+    end = video_start + video_tiles * tile
+    return RegionExtent(
         tile=tile,
         text_rows=text_rows,
         condition_rows=condition_rows,
         audio_rows=audio_rows,
+        video_grid=grid,
+        video_tiles=video_tiles,
+        padded_tokens=math.ceil(end / token_multiple) * token_multiple,
+    )
+
+
+def region_packing(
+    *,
+    num_frames: int,
+    canvas: image.Config,
+    text_rows: int,
+    condition_rows: int,
+    tile: int,
+    token_multiple: int,
+) -> RegionPacking:
+    """Build the tables of the rows ``region_extent`` sizes.
+
+    The arguments are ``region_extent``'s, which sizes the rows and raises
+    for the same arguments.
+    """
+    extent = region_extent(
+        num_frames=num_frames,
+        canvas=canvas,
+        text_rows=text_rows,
+        condition_rows=condition_rows,
+        tile=tile,
+        token_multiple=token_multiple,
+    )
+    raster, sizes = tile_order(extent.video_grid, VIDEO_TILE_SHAPES[tile])
+    offsets = np.arange(tile, dtype=np.int64)[None, :]
+    rows = (
+        extent.video_start
+        + np.arange(sizes.size, dtype=np.int64)[:, None] * tile
+    )
+    video_indices = (rows + offsets)[offsets < sizes[:, None]]
+    return RegionPacking(
+        tile=extent.tile,
+        text_rows=extent.text_rows,
+        condition_rows=extent.condition_rows,
+        audio_rows=extent.audio_rows,
+        video_grid=extent.video_grid,
+        video_tiles=extent.video_tiles,
+        padded_tokens=extent.padded_tokens,
         video_indices=torch.from_numpy(video_indices),
         video_raster_indices=torch.from_numpy(raster),
         video_valid_sizes=torch.from_numpy(sizes),
-        padded_tokens=math.ceil(end / token_multiple) * token_multiple,
     )
 
 
