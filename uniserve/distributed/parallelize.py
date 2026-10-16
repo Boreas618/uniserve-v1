@@ -70,7 +70,9 @@ def _communication_axes(module, mesh, attention):
             if mesh.size(selected) > 1:
                 required.add(selected)
 
-        if child is not module and isinstance(child, Encoder):
+        # An encoder, bound on its own or inside its caller, attends its
+        # complete samples (see parallelize_).
+        if isinstance(child, Encoder):
             config = AttentionParallelConfig()
         head = None if config.heads is None else config.heads.axis
         context = None if config.context is None else config.context.gather_axis
@@ -78,7 +80,11 @@ def _communication_axes(module, mesh, attention):
         if isinstance(child, (Denoiser, TransformerDecoder)):
             add("pp")
             add(*tokens)
-        if isinstance(child, (Attention, VsaAttention, RegionAttention)):
+        # A replicated attention layer attends its complete heads and tokens
+        # locally, so it joins neither attention axis.
+        if isinstance(child, (VsaAttention, RegionAttention)) or (
+            isinstance(child, Attention) and not child.replicated
+        ):
             add(head)
             add(context)
         if isinstance(child, FusedMoE):
@@ -275,6 +281,22 @@ def parallelize_(
     if mesh.rank not in mesh.ranks:
         raise ValueError("a nonparticipating rank cannot bind resident layers")
 
+    # Deferred import: uniserve.models depends on the modules bound here.
+    from uniserve.models import (
+        CausalLM,
+        DiffusionLM,
+        Encoder,
+        TransformerDecoder,
+    )
+
+    # An encoder consumes complete samples through its own numerical call,
+    # whether it is bound as a component's entry module or inside a
+    # surrounding module. The component's token partition does not partition
+    # those input documents; each sequence coordinate receives the same
+    # refined features. Its tensor-parallel partition still applies.
+    if isinstance(module, Encoder):
+        attention = AttentionParallelConfig()
+
     # Token axes named by the attention config must be declared by the mesh
     # and stay distinct from the channel (tp) and stage (pp) partitions.
     selected = set()
@@ -287,17 +309,7 @@ def parallelize_(
             "attention requires distinct token axes declared by the mesh"
         )
 
-    # Deferred import: uniserve.models depends on the modules bound here.
-    from uniserve.models import (
-        CausalLM,
-        DiffusionLM,
-        Encoder,
-        TransformerDecoder,
-    )
-
-    # An encoder consumes complete samples through its own numerical call.
-    # A surrounding denoiser's token partition does not partition those input
-    # documents; each sequence coordinate receives the same refined features.
+    # A nested encoder is bound on its own, without the token partition.
     modules = []
     seen = {id(nested) for child in exclude for nested in child.modules()}
 
@@ -500,6 +512,13 @@ def parallelize_(
                     raise ValueError(
                         "attention cannot change its mathematical partition"
                     )
+                continue
+
+            if child.replicated:
+                # Its projections keep every channel on each rank, so the
+                # layer's construction already holds every head and token.
+                child._parallel_mesh = mesh
+                child._attention_parallel = attention
                 continue
 
             if child.num_heads % group.size:

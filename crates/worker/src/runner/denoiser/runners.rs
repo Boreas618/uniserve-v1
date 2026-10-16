@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use uniserve_ipc::{BufferId, CallKind, MediaCall, RequestKey};
 
-use super::image::DenoiseRow;
+use super::image::{ConditionRow, DenoiseRow};
 use super::{DenoiserRunner, Evicted, VideoModel};
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
@@ -114,6 +114,89 @@ impl DenoiserRunners {
             );
         }
         Ok(())
+    }
+
+    /// Run the image denoiser's eager calls once over scratch prefix cache
+    /// of `prefix_cache`, with samples in the step workspace of `latents`,
+    /// as jobs of the lane serving denoising: one denoising step of the
+    /// smallest image (two latent patches a side) over a slot's prefix,
+    /// and, when the model `conditions` on latent images, the write of a
+    /// zero latent image's K/V after that prefix.
+    ///
+    /// Serving evaluates every step no graph holds, and every latent
+    /// conditioning, eagerly. Running each call here selects and compiles
+    /// the kernels of its attention inputs (a segmented read of the prefix,
+    /// and non-causal paged rows) before the first image request; kernel
+    /// choice depends on the input class, not on lengths. Four jobs: one
+    /// zeroes the samples and installs the scratch table, one evaluates
+    /// the step, one writes the conditioning, and one clears the table and
+    /// resets its units whether or not the calls succeeded.
+    pub(crate) fn warm_image(
+        &mut self,
+        latents: Option<&LatentCache>,
+        prefix_cache: Option<&mut PrefixCache>,
+        conditions: bool,
+        lanes: &JobQueues,
+    ) -> Result<()> {
+        let (Some((_, denoiser)), Some(latents), Some(prefix_cache)) =
+            (&mut self.image, latents, prefix_cache)
+        else {
+            return Ok(());
+        };
+        let layout = *denoiser.layout()?;
+        let side = 2 * layout.downsample;
+        let units = layout.latent_rows(side, side)?;
+        let prefix = CAPTURE_PREFIX as u32;
+        // The step reads the prefix; the conditioning writes its sequence
+        // after it.
+        let length = prefix
+            + if conditions {
+                layout.sequence_length(side, side)?
+            } else {
+                0
+            };
+        let samples = latents.workspace()?.narrow(0, 0, i64::from(units))?;
+        let stream = denoiser.stream().cloned();
+
+        let before = Job::new();
+        samples.zero(before.on(stream.as_ref()))?;
+        let scratch =
+            install_scratch(prefix_cache, &[length as usize], before.on(stream.as_ref()))?;
+        perform(lanes, before)?;
+
+        let step = Job::new();
+        let row = DenoiseRow {
+            sample: 0,
+            units,
+            height: side,
+            width: side,
+            slot: 1,
+            prefix,
+            temporal: u64::from(prefix),
+            timestep: 0.5,
+        };
+        let mut warmed = denoiser
+            .predict(&[row], prefix_cache, None, &step)
+            .and_then(|_| perform(lanes, step).map(drop));
+        if conditions && warmed.is_ok() {
+            let job = Job::new();
+            let condition = ConditionRow {
+                features: samples,
+                height: side,
+                width: side,
+                slot: 1,
+                prefix,
+                position: u64::from(prefix),
+            };
+            warmed = denoiser
+                .condition_latents(&[condition], prefix_cache, &job)
+                .and_then(|()| perform(lanes, job).map(drop));
+        }
+
+        let after = Job::new();
+        let released = release_scratch(prefix_cache, scratch, 1, after.on(stream.as_ref()));
+        let performed = perform(lanes, after).map(drop);
+        warmed.and(released).and(performed)
     }
 
     /// Capture one denoising step: `shape.images` images placed in the

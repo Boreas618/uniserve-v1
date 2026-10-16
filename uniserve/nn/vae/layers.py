@@ -49,13 +49,18 @@ class ResidualBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """Add full spatial attention, with channels forming a single head."""
+    """Add full spatial attention, with channels forming a single head.
+
+    The convolutions keep every channel of a complete feature map on each
+    rank, so the attention is replicated: a parallel binding of a surrounding
+    component partitions neither its head nor its spatial tokens.
+    """
 
     def __init__(self, channels: int, *, groups: int = 32, eps: float = 1e-6):
         super().__init__()
         self.norm = nn.GroupNorm(groups, channels, eps=eps)
         self.qkv = nn.Conv2d(channels, 3 * channels, 1)
-        self.attention = Attention(1, 1, channels)
+        self.attention = Attention(1, 1, channels, replicated=True)
         self.output = nn.Conv2d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

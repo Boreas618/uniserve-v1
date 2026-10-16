@@ -281,6 +281,17 @@ impl ImageModel {
             decoder_range,
         })
     }
+
+    /// Whether text rows carry three rotary axes: a model with an image
+    /// denoiser (whose sequences place latent images spatially) or one
+    /// placing vision features spatially. Others read one temporal axis.
+    pub(crate) fn spatial_positions(&self) -> bool {
+        self.denoiser.is_some()
+            || self
+                .processing
+                .and_then(|processing| processing.injection)
+                .is_some_and(|injection| injection.positions == PositionLayout::TemporalSpatial)
+    }
 }
 
 /// The host functions of the image policy.
