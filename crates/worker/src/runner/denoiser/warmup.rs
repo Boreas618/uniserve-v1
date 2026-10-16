@@ -9,13 +9,32 @@ pub(crate) struct DenoiserWarmup;
 
 impl WarmupHooks for DenoiserWarmup {
     fn prepare(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
+        let lanes = backend.job_queues().clone();
         if backend.serves_video() {
-            let lanes = backend.job_queues().clone();
             let parts = backend.media_parts()?;
             parts
                 .denoisers
                 .prepare_startup(&parts.video.model, &parts.video.plan, &lanes)
                 .map_err(|error| WorkerError::classify(error, Some("warmup")))?;
+        } else {
+            let parts = backend.parts();
+            if let Some(image) = parts.image {
+                let prefix_cache = parts
+                    .storage
+                    .and_then(|storage| storage.prefix_cache.as_mut());
+                // A model with a latent tower writes encoded latent images
+                // into its prompts through the denoiser.
+                let conditions = image
+                    .model
+                    .processing
+                    .is_some_and(|processing| processing.vae);
+                image
+                    .denoisers
+                    .warm_image(image.latents.as_deref(), prefix_cache, conditions, &lanes)
+                    .map_err(|error| {
+                        WorkerError::classify(error, Some("image warmup")).with_phase("warmup")
+                    })?;
+            }
         }
         Ok(())
     }

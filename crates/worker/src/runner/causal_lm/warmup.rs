@@ -30,14 +30,18 @@ use uniserve_ipc::{
 
 use std::sync::Arc;
 
-use super::CausalLMRunners;
+use super::context::{block_row, next_position, text_row};
+use super::{CausalLMRunners, Embeddings};
 use crate::cuda_graph::capture_order;
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
+use crate::ffi::Backing;
 use crate::lane::{BLOCK_ON_TIMEOUT, Job, JobQueues};
 use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
+use crate::runner::denoiser::image_model::ImageModel;
+use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{PrefixCache, ScratchUnits};
 use crate::stream::Issue;
 use crate::warmup::{Scenarios, WarmupHooks};
@@ -53,6 +57,7 @@ impl WarmupHooks for CausalLMWarmup {
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         let lanes = backend.job_queues().clone();
         let parts = backend.parts();
+        let image = parts.image.as_ref().map(|image| *image.facts());
         let (Some(runtime), Some(storage)) = (parts.text, parts.storage) else {
             return Ok(());
         };
@@ -64,6 +69,16 @@ impl WarmupHooks for CausalLMWarmup {
             .warmup(prefix_cache, self.row_tokens, parts.experts, &lanes)
             .map_err(|error| {
                 WorkerError::classify(error, Some("text graph capture")).with_phase("warmup")
+            })?;
+        // Dedicated expert ranks follow these eager steps as announced
+        // warmup steps, as they follow the captures' eager warmups.
+        let Some(image) = image else {
+            return Ok(());
+        };
+        runtime
+            .warm_context(prefix_cache, &image, parts.experts, &lanes)
+            .map_err(|error| {
+                WorkerError::classify(error, Some("text context warmup")).with_phase("warmup")
             })
     }
 
@@ -226,6 +241,7 @@ impl CausalLMRunners {
                     (group, peer),
                     prefix_cache,
                     rows,
+                    &[],
                     decode,
                     capacity,
                     job,
@@ -350,10 +366,126 @@ impl CausalLMRunners {
         stepped.and(released).and(performed)
     }
 
+    /// Run the eager context prefills of every runner whose rows place
+    /// vision features, over scratch tables of slot 1, on a model whose
+    /// image facts are `image`.
+    ///
+    /// A context prefill writes a vision block (non-causal rows that attend
+    /// to all of themselves, at explicit positions, their features replacing
+    /// the placeholder embeddings) whole, either in a chunk with prompt text
+    /// before it or alone. It always runs eagerly, so no capture prepares
+    /// its attention inputs; each of the two compositions runs here once,
+    /// so that the kernels serving them are selected and compiled before
+    /// the first image request. A block of four features in a 2 x 2 grid stands for
+    /// every image: kernel choice depends on the attention input class,
+    /// not on lengths.
+    fn warm_context(
+        &mut self,
+        prefix_cache: &mut PrefixCache,
+        image: &ImageModel,
+        experts: Option<&Arc<ExpertUnion>>,
+        lanes: &JobQueues,
+    ) -> Result<()> {
+        const FEATURES: usize = 4;
+        let Some(injection) = image.processing.and_then(|processing| processing.injection) else {
+            return Ok(());
+        };
+        let spatial = image.spatial_positions();
+        // A prompt token at position 0, then the block from position 1; the
+        // second block starts where the first one's positions end.
+        let first = injection.block(FEATURES, 1, false, Some([2, 2]))?;
+        let width = first.len();
+        let text = text_row(1, &[0], 0, 0, TokenSelection::Cache, spatial)?;
+        let mixed = block_row(first.clone(), 1, 1, spatial, TokenSelection::LastLogits)?;
+        let next = next_position(&mixed)?;
+        let second = injection.block(FEATURES, next, false, Some([2, 2]))?;
+        let alone = block_row(
+            second.clone(),
+            1,
+            1 + width as u64,
+            spatial,
+            TokenSelection::LastLogits,
+        )?;
+        let lengths = [1 + width + second.len()];
+
+        for index in 0..self.runners.len() {
+            let dimensions = self.runners[index].dimensions();
+            if !dimensions.embeddings {
+                continue;
+            }
+            let (group, peer) = self.locate(index)?;
+            let kind = self.kind(group)?;
+            let stream = self.runners[index].stream().cloned();
+            let stream = stream.as_ref();
+
+            // Zero features, in the embedding column's dtype, stand for an
+            // encoder's: their values do not choose kernels.
+            let bytes = FEATURES * dimensions.hidden * dimensions.dtype.bytes();
+            let memory: Arc<dyn Backing> = match self.runners[index].device() {
+                Some(device) => Memory::device(device, bytes)?,
+                None => Memory::host(bytes),
+            };
+            let features = StorageView::contiguous(
+                memory,
+                0,
+                dimensions.dtype,
+                &[FEATURES as i64, dimensions.hidden as i64],
+            )?;
+            let zeroed = Job::new();
+            features.zero(zeroed.on(stream))?;
+            lanes
+                .block_on(kind, zeroed, BLOCK_ON_TIMEOUT)?
+                .check()
+                .map_err(|failure| failure.error)?;
+
+            let embeddings = |token: usize| {
+                [Embeddings {
+                    token,
+                    values: features.clone(),
+                }]
+            };
+            let (text, mixed, alone) = (text.clone(), mixed.clone(), alone.clone());
+            self.warmup_bucket(
+                lanes,
+                kind,
+                prefix_cache,
+                &lengths,
+                stream,
+                |runtime, prefix_cache, _| {
+                    runtime.warmup_step(
+                        experts,
+                        lanes,
+                        (group, peer),
+                        prefix_cache,
+                        &[text, mixed],
+                        &embeddings(1 + first.features.start),
+                        false,
+                        None,
+                        Job::new(),
+                    )?;
+                    runtime.warmup_step(
+                        experts,
+                        lanes,
+                        (group, peer),
+                        prefix_cache,
+                        &[alone],
+                        &embeddings(second.features.start),
+                        false,
+                        None,
+                        Job::new(),
+                    )
+                },
+            )?;
+        }
+        tracing::info!(target: "uniserve_worker.warmup", "warmed text context prefills");
+        Ok(())
+    }
+
     /// One warmup step of `rows` on microbatch `peer` of `group`, as a job
-    /// of the group's lane; the group's other microbatches join. `capacity`
-    /// forces the expert step capacity. The step continues `job`, which
-    /// holds what the device does before it.
+    /// of the group's lane; the group's other microbatches join. `embeddings`
+    /// replace the embeddings of the rows' feature tokens. `capacity` forces
+    /// the expert step capacity. The step continues `job`, which holds what
+    /// the device does before it.
     #[expect(
         clippy::too_many_arguments,
         reason = "one warmup step's shape and owners"
@@ -365,6 +497,7 @@ impl CausalLMRunners {
         (group, peer): (usize, usize),
         prefix_cache: &mut PrefixCache,
         rows: &[TokenRow],
+        embeddings: &[Embeddings],
         decode: bool,
         capacity: Option<usize>,
         job: Job,
@@ -380,7 +513,7 @@ impl CausalLMRunners {
             finish_ids: &[],
             sampling: None,
             prompt: &prompt,
-            embeddings: &[],
+            embeddings,
         };
         let mut requests: Vec<Option<StepRequest<'_>>> =
             (0..self.groups[group].len()).map(|_| None).collect();
