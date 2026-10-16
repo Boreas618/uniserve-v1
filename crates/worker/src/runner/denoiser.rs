@@ -15,8 +15,9 @@
 //! A video request's samples live in the latent pool: two banks of pages
 //! whose slot owns `pages` consecutive pages after page 0. A solver step
 //! gathers the committed bank's pages into the runner's sample scratch,
-//! copies the request's state (its slot rows of every state table and of
-//! the retained conditioning) into the fixed state buffers, writes the
+//! copies the request's state (its slot rows of every state table and, on
+//! the pipeline stage holding the text conditioner, of the retained
+//! conditioning) into the fixed state buffers, writes the
 //! evaluation index, launches the layout's captured graph (or runs
 //! `DenoiserRunner.denoise` of `uniserve.runner.denoiser` on the
 //! Python thread) and scatters the scratch into the other bank. Every one of
@@ -956,9 +957,20 @@ impl DenoiserRunner {
         LatentUpdate::for_call(slot, call, params)
     }
 
+    /// Whether this rank retains a request's conditioning: whether it holds
+    /// the text conditioner. A model declares the conditioner on the
+    /// pipeline stage whose forward reads the retained conditioning (the
+    /// first); a later stage receives that stage's hidden rows, the refined
+    /// prompt among them, through the forward's pipeline communication, so
+    /// it neither refines the prompt nor supplies conditioning to its steps.
+    pub(crate) fn conditions(&self) -> bool {
+        matches!(&self.family, Family::Video(video) if video.conditioner.is_some())
+    }
+
     /// Refine a request's prompt features and retain them in its slot's
     /// conditioning: `features` holds the prompt's `count` rows; the rows of
-    /// the layout's conditioning past the prompt become zero.
+    /// the layout's conditioning past the prompt become zero. Only a rank
+    /// that [`Self::conditions`] refines.
     pub(crate) fn condition(
         &mut self,
         id: usize,
@@ -973,9 +985,10 @@ impl DenoiserRunner {
         let (rows, width) = layout.fields.text_condition;
         let target = video.banks.slot("text_condition", slot as u32)?;
         let Some(buffers) = &video.conditioner else {
-            return Err(Error::Unsupported(
-                "this pipeline stage holds no text conditioner".into(),
-            ));
+            return Err(Error::Invariant(format!(
+                "{}: a rank without the text conditioner refines no prompt",
+                self.owner
+            )));
         };
         let capacity = buffers
             .runners
@@ -1432,15 +1445,22 @@ impl VideoDenoiser {
             ));
         }
         let mut copies = Vec::new();
+        // A step reads the slot's retained conditioning only where the
+        // conditioner retains it (`DenoiserRunner::conditions`); on a later
+        // pipeline stage the step's conditioning buffer keeps the zeros its
+        // warmup wrote, and its forward reads none of it.
+        let retained = self.conditioner.as_ref().map(|_| {
+            (
+                "text_condition".to_owned(),
+                fields.text_condition.0 * fields.text_condition.1 * 2,
+            )
+        });
         let tables = fields
             .state
             .iter()
             .filter(|field| !field.sample)
             .map(|field| (field.name.clone(), field.bytes()))
-            .chain(std::iter::once((
-                "text_condition".to_owned(),
-                fields.text_condition.0 * fields.text_condition.1 * 2,
-            )));
+            .chain(retained);
         for (name, bytes) in tables {
             let index = self
                 .envelope
@@ -1666,7 +1686,8 @@ impl VideoDenoiser {
 }
 
 /// Initialize a request's trajectory: its prepared sources, its refined
-/// prompt and its encoded conditions.
+/// prompt where this rank retains conditioning
+/// ([`DenoiserRunner::conditions`]) and its encoded conditions.
 pub(crate) fn prepare(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
@@ -1694,10 +1715,22 @@ pub(crate) fn prepare(
             "video preparation reads its conditioning and its conditions".into(),
         ));
     }
+    let refines = parts
+        .denoisers
+        .video
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?
+        .runner
+        .conditions();
     let store = parts.owners().store;
     let stream = stream_of(batch)?;
     let issue = job.on(Some(&stream));
-    let features = batch.read(store, &call.inputs[0], call.call_id, issue)?;
+    // A pipeline stage without the conditioner leaves the prompt features
+    // unread: its forward receives the refined prompt among the preceding
+    // stage's hidden rows.
+    let features = refines
+        .then(|| batch.read(store, &call.inputs[0], call.call_id, issue))
+        .transpose()?;
     let conditions: Vec<Arc<crate::ProductRead>> = call.inputs[1..]
         .iter()
         .map(|input| batch.read(store, input, call.call_id, issue))
@@ -1712,15 +1745,17 @@ pub(crate) fn prepare(
         .runner
         .prepare_latents(id, slot, &size, seed, job)?;
     let update = denoiser.runner.initialize(id, slot, call, params, job)?;
-    let value = features.value();
-    let count = u64::from(size.tokens);
-    if value.shape().first().copied() != Some(count as i64) {
-        return Err(Error::Invalid(
-            "prompt features disagree with the request's prompt".into(),
-        ));
+    if let Some(features) = features {
+        let value = features.value();
+        let count = u64::from(size.tokens);
+        if value.shape().first().copied() != Some(count as i64) {
+            return Err(Error::Invalid(
+                "prompt features disagree with the request's prompt".into(),
+            ));
+        }
+        let mode = denoiser.runner.condition(id, slot, value, count, job)?;
+        batch.record(mode);
     }
-    let mode = denoiser.runner.condition(id, slot, value, count, job)?;
-    batch.record(mode);
     if conditioned {
         let request = parts.video.request(slot, call.request_key)?;
         let latents = condition_latents(&request.conditions, &conditions)?;

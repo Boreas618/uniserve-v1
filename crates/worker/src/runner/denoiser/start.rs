@@ -7,7 +7,7 @@ use super::runners::DenoiserRunners;
 use super::{Conditioning, DenoiserRunner};
 use crate::config::placement::Placed;
 use crate::executor::video::extent;
-use crate::ffi::{DType, Device, Interpreter};
+use crate::ffi::{Device, Interpreter};
 use crate::runner::component::{Component, DENOISER_GRAPHS, VideoSetup, placed_device};
 use crate::{Error, Result};
 
@@ -23,25 +23,6 @@ impl DenoiserRunners {
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
         let device = placed_device(placed);
-        // The text features the denoiser's conditioner reads.
-        let conditioning = info
-            .components
-            .iter()
-            .flat_map(|component| &component.outputs)
-            .find(|output| output.name == "conditioning")
-            .map(|output| -> Result<(u64, DType)> {
-                let width = output
-                    .shape_bound
-                    .dims
-                    .get(1)
-                    .map(extent)
-                    .ok_or_else(|| Error::Interface("text features are rows".into()))?;
-                Ok((
-                    width,
-                    crate::storage::memory::parse_dtype(output.dtype.storage_name())?,
-                ))
-            })
-            .transpose()?;
         let envelope = setup
             .capacity
             .envelope
@@ -62,20 +43,39 @@ impl DenoiserRunners {
                 break;
             }
         }
-        let conditioning = match (conditioner, conditioning) {
-            (Some(call), Some((width, dtype))) => Some(Conditioning {
-                path: call.path.clone(),
-                capacities: plan.text_capacities.clone(),
-                width,
-                dtype,
-            }),
-            (Some(_), None) => {
-                return Err(Error::Unsupported(
-                    "the text conditioner has no text encoder features".into(),
-                ));
-            }
-            (None, _) => None,
-        };
+        let conditioning = conditioner
+            .map(|call| -> Result<Conditioning> {
+                // The conditioner reads the text encoder's prompt features.
+                // Every rank plans the products of all the deployment's
+                // components, whichever its worker holds (the capacity's
+                // `outputs`), so a denoiser placed on a worker apart from
+                // the text encoder sizes its input from the same declaration
+                // as one beside it; the features reach it as a product.
+                let features = setup
+                    .capacity
+                    .outputs
+                    .values()
+                    .flatten()
+                    .find(|output| output.name == "conditioning")
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "the text conditioner has no text encoder features".into(),
+                        )
+                    })?;
+                let width = features
+                    .shape_bound
+                    .dims
+                    .get(1)
+                    .map(extent)
+                    .ok_or_else(|| Error::Interface("text features are rows".into()))?;
+                Ok(Conditioning {
+                    path: call.path.clone(),
+                    capacities: plan.text_capacities.clone(),
+                    width,
+                    dtype: crate::storage::memory::parse_dtype(features.dtype.storage_name())?,
+                })
+            })
+            .transpose()?;
         let Device::Cuda(index) = device else {
             return Err(Error::Unsupported(
                 "the video denoiser computes on CUDA".into(),
