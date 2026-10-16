@@ -466,7 +466,10 @@ class AttentionProjection(nn.Module):
         self.shortcut = nn.Linear(width, channels)
         self.attention_norm = nn.LayerNorm(width)
         self.qkv = nn.Linear(width, 3 * width)
-        self.attention = Attention(heads, heads, width // heads)
+        # The plain projection computes every head on each rank.
+        self.attention = Attention(
+            heads, heads, width // heads, replicated=True
+        )
         self.attention_output = nn.Linear(channels, channels)
         self.mlp_norm = nn.LayerNorm(channels)
         self.mlp = GeGLU(channels, 2 * channels)

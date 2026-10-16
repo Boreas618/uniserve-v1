@@ -80,8 +80,10 @@ def entry_points(config: Config):
     Token embedding runs on the first pipeline stage, the only one pipeline
     binding keeps the embedding on, and logits on the last, the only one it
     keeps the vocabulary head on; both join only the tensor-parallel group.
-    The backbone forwards join the tensor, sequence and pipeline groups, and
-    the media methods join no communication group.
+    The backbone forwards join the tensor, sequence and pipeline groups. The
+    media methods declare no group: the vision tower communicates over the
+    tensor-parallel group its layers are partitioned on, and the latent
+    codec, whose convolutions and attention are replicated, over none.
     """
     return MappingProxyType(
         {

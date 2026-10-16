@@ -1,8 +1,13 @@
-"""Public attention preserves token order, GQA replication and empty shards."""
+"""Public attention preserves token order, GQA replication and empty shards.
+
+Replicated attention keeps its complete heads and tokens on every rank, and
+an encoder its complete samples.
+"""
 
 import pytest
 import torch
 import torch.multiprocessing as mp
+from torch import nn
 from torch.nn import functional as F
 
 from tests.python.fixtures.distributed import (
@@ -12,15 +17,17 @@ from tests.python.fixtures.distributed import (
 )
 from uniserve import cuda_graph
 from uniserve.bindings.context import ExecutionContext
-from uniserve.distributed import DeviceMesh, parallelize_
-from uniserve.models import TextSize
+from uniserve.distributed import DeviceMesh, communication_axes, parallelize_
+from uniserve.models import Encoder, TextSize
 from uniserve.nn.attention import (
     Attention,
     AttentionBatch,
     AttentionParallelConfig,
+    DenseInput,
     PagedInput,
     Ulysses,
 )
+from uniserve.nn.vae import AttentionBlock
 from uniserve.prefix_cache import Config, mha
 from uniserve.prefix_cache.units import UnitPool
 
@@ -113,6 +120,90 @@ def _run(rank, listener):
 def test_ulysses_paged_attention_values():
     with rendezvous() as listener:
         mp.spawn(_run, args=(listener,), nprocs=4, join=True)
+
+
+def _replicated(rank, listener):
+    with process_world(rank, 2, listener) as world:
+        # A component partitioned over two ranks along its channels, and one
+        # partitioned along its tokens.
+        layouts = (
+            (("tp",), AttentionParallelConfig()),
+            (("ulysses",), AttentionParallelConfig(heads=Ulysses())),
+        )
+        generator = torch.Generator().manual_seed(29)
+        # [batch, channels, height, width] complete feature maps.
+        pixels = torch.randn(2, 64, 5, 3, generator=generator)
+        for axes, attention in layouts:
+            mesh = bind_mesh(
+                world,
+                DeviceMesh(ranks=(1, 0), shape=(2,), axes=axes, rank=rank),
+            )
+            block = AttentionBlock(64)
+            with torch.no_grad():
+                for parameter in block.parameters():
+                    parameter.copy_(
+                        torch.randn(parameter.shape, generator=generator) / 8
+                    )
+            expected = block(pixels)
+
+            # The single-head spatial attention communicates over no axis and
+            # computes on each rank what one device computes.
+            assert communication_axes(block, mesh, attention=attention) == ()
+            parallelize_(block, mesh, attention=attention)
+            torch.testing.assert_close(block(pixels), expected)
+
+
+def test_replicated_attention_keeps_heads_and_tokens_on_every_rank():
+    with rendezvous() as listener:
+        mp.spawn(_replicated, args=(listener,), nprocs=2, join=True)
+
+
+class _SelfAttention(nn.Module):
+    """Two-head dense self-attention over ``[samples, tokens, 8]`` inputs."""
+
+    def __init__(self):
+        super().__init__()
+        self.attention = Attention(2, 2, 4)
+
+    def forward(self, samples: torch.Tensor) -> torch.Tensor:
+        count, tokens, _ = samples.shape
+        # [samples, heads, tokens, head_dim], used as query, key and value.
+        heads = samples.view(count, tokens, 2, 4).transpose(1, 2)
+        attended = self.attention(
+            heads,
+            heads,
+            heads,
+            AttentionBatch.single(DenseInput(False, None)),
+        )
+        return attended.transpose(1, 2).reshape(count, tokens, 8)
+
+
+def _encoder(rank, listener):
+    with process_world(rank, 2, listener) as world:
+        mesh = bind_mesh(
+            world,
+            DeviceMesh(ranks=(1, 0), shape=(2,), axes=("ulysses",), rank=rank),
+        )
+        attention = AttentionParallelConfig(heads=Ulysses())
+        samples = torch.randn(
+            3, 5, 8, generator=torch.Generator().manual_seed(31)
+        )
+        encoder = Encoder(_SelfAttention())
+        expected = encoder.encode(samples)
+
+        # An encoder bound as a component's own module, under the
+        # component's token partition, still encodes complete samples.
+        assert communication_axes(encoder, mesh, attention=attention) == ()
+        parallelize_(encoder, mesh, attention=attention)
+        for actual, wanted in zip(
+            encoder.encode(samples), expected, strict=True
+        ):
+            torch.testing.assert_close(actual, wanted)
+
+
+def test_encoder_keeps_complete_samples_under_token_partition():
+    with rendezvous() as listener:
+        mp.spawn(_encoder, args=(listener,), nprocs=2, join=True)
 
 
 def _context(rank, listener, gpu):

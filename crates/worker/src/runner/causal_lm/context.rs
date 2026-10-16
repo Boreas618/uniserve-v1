@@ -29,7 +29,7 @@ use crate::runner::causal_lm::{RowSource, TokenRow};
 use crate::runner::denoiser::image::ConditionRow;
 use crate::runner::denoiser::image_model::GridKey;
 use crate::runner::denoiser::image_model::ROPE_ADVANCE;
-use crate::runner::vision::{BlockPositions, PositionLayout};
+use crate::runner::vision::{BlockPositions, PositionLayout, VisionBlock};
 use crate::storage::memory::StorageView;
 use crate::storage::{BlockTables, Metadata, ProductRead, ProductStore};
 use crate::stream::Issue;
@@ -69,18 +69,11 @@ pub(super) struct Sources<'a, I> {
 }
 
 impl<I> Sources<'_, I> {
-    /// Whether rows carry three rotary axes: models with an image denoiser
-    /// (whose sequences place latent images spatially) and models placing
-    /// vision features spatially. Others read one temporal axis.
+    /// Whether rows carry three rotary axes
+    /// ([`crate::runner::denoiser::image_model::ImageModel::spatial_positions`]).
     fn spatial(&self) -> bool {
-        self.image.is_some_and(|image| {
-            image.facts().denoiser.is_some()
-                || image
-                    .facts()
-                    .processing
-                    .and_then(|processing| processing.injection)
-                    .is_some_and(|injection| injection.positions == PositionLayout::TemporalSpatial)
-        })
+        self.image
+            .is_some_and(|image| image.facts().spatial_positions())
     }
 }
 
@@ -122,7 +115,7 @@ fn consume(
 }
 
 /// The temporal position after a row.
-fn next_position(row: &TokenRow) -> Result<u64> {
+pub(super) fn next_position(row: &TokenRow) -> Result<u64> {
     let temporal = match &row.source {
         RowSource::Placed { positions, .. } => positions[0].iter().copied().max(),
         RowSource::Host { position, tokens } => Some(*position as i64 + tokens.len() as i64 - 1),
@@ -133,7 +126,9 @@ fn next_position(row: &TokenRow) -> Result<u64> {
         .ok_or_else(|| Error::Invariant("a context row has no positions".into()))
 }
 
-fn text_row(
+/// The row of prompt `tokens` after `prefix` visible tokens of `slot`, at
+/// consecutive temporal positions from `position` and zero spatial ones.
+pub(super) fn text_row(
     slot: u32,
     tokens: &[u32],
     prefix: u64,
@@ -222,6 +217,21 @@ fn vision_row(
         PositionLayout::Temporal | PositionLayout::Sequential => None,
     };
     let block = injection.block(tokens as usize, position, close_image, grid)?;
+    let first = block.features.start;
+    let row = block_row(block, slot, prefix, sources.spatial(), selection)?;
+    Ok((row, first, values.clone()))
+}
+
+/// The row of `block` after `prefix` visible tokens of `slot`: its marker
+/// and placeholder tokens at the block's positions, attending to all of
+/// itself. `spatial` gives the row three rotary axes.
+pub(super) fn block_row(
+    block: VisionBlock,
+    slot: u32,
+    prefix: u64,
+    spatial: bool,
+    selection: TokenSelection,
+) -> Result<TokenRow> {
     let count = block.len();
     let positions = match block.positions {
         BlockPositions::Linear(values) => [values, vec![0; count], vec![0; count]],
@@ -234,24 +244,20 @@ fn vision_row(
             u32::try_from(token).map_err(|_| Error::Invalid("vision marker overflows".into()))
         })
         .collect::<Result<_>>()?;
-    Ok((
-        TokenRow {
-            slot,
-            source: RowSource::Placed {
-                tokens,
-                positions,
-                spatial: sources.spatial(),
-            },
-            prefix: narrow(prefix)?,
-            query: narrow(count as u64)?,
-            selection,
-            gated: false,
-            force_finish: false,
-            causal: false,
+    Ok(TokenRow {
+        slot,
+        source: RowSource::Placed {
+            tokens,
+            positions,
+            spatial,
         },
-        block.features.start,
-        values.clone(),
-    ))
+        prefix: narrow(prefix)?,
+        query: narrow(count as u64)?,
+        selection,
+        gated: false,
+        force_finish: false,
+        causal: false,
+    })
 }
 
 /// The rows of a context prefill: its prompt runs and vision blocks, the

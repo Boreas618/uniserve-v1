@@ -26,6 +26,12 @@ class Attention(nn.Module):
     assigns local query/KV heads, token ownership and the global cache-head IDs.
     Cache state and mutable kernel resources are borrowed from the active call.
 
+    ``replicated`` declares a layer whose Q/K/V every rank computes whole from
+    complete samples, as an autoencoder's convolutions over a complete feature
+    map do. Parallel binding then keeps every head and token on each rank;
+    otherwise it partitions the heads as the tensor-parallel projections that
+    produce them and the tokens along the attention axes.
+
     ``window`` bounds the visible history in tokens; ``None`` reads the whole
     history. Queries align to the end of their key sequence, so a paged query
     token ``i`` sits at ``prefix + i`` and a sequence's query tokens are its
@@ -51,6 +57,7 @@ class Attention(nn.Module):
         scale: float | None = None,
         cache_name: str | None = None,
         window: int | None = None,
+        replicated: bool = False,
     ):
         super().__init__()
         if (
@@ -76,6 +83,7 @@ class Attention(nn.Module):
         ):
             raise ValueError("cache names must identify a numerical layer path")
         self.cache_name = cache_name
+        self.replicated = replicated
         self.local_heads = num_heads
         self.local_kv_heads = num_kv_heads
         self.head_indices = tuple(range(num_kv_heads))
