@@ -279,30 +279,12 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             });
             sample += rows;
         }
-        let mut staged = vec![None; images.len()];
-        runner.decode(&images, |index, pixels| {
-            // Copy the staged bytes out before the next sub-batch reuses
-            // them, as a device-to-host copy on the runner's stream would.
-            let memory = Memory::host(pixels.nbytes() as usize);
-            // SAFETY: host staging and a fresh host allocation of its size.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    pixels.address() as *const u8,
-                    memory.address() as *mut u8,
-                    pixels.nbytes() as usize,
-                );
-            }
-            staged[index] = Some(StorageView::contiguous(
-                memory as Arc<_>,
-                0,
-                DType::U8,
-                pixels.shape(),
-            )?);
-            Ok(())
-        })?;
+        // Each image's staged bytes, copied out before the next sub-batch
+        // reuses them.
+        let staged = runner.decode(&images)?;
         let mut results = Vec::new();
         for (image, pixels) in images.iter().zip(staged) {
-            results.push(Any::from(pixels.expect("staged image").to_tensor()?));
+            results.push(Any::from(pixels.to_tensor()?));
             let product = image.product.as_ref().expect("product");
             results.push(Any::from(view(
                 product,
