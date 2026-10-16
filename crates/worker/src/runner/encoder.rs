@@ -91,7 +91,7 @@ use crate::executor::video::{
     row_width, stream_of,
 };
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
-use crate::lane::{Completion, Job};
+use crate::lane::{Capture, Completion, Job};
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::methods::{
@@ -1059,19 +1059,22 @@ impl EncoderRunner {
             .map(|packed| packed.grids.address() as usize)
     }
 
-    /// Encode one black `side` x `side` image through the model's input
-    /// transform and discard it: the startup warmup of an unpacked image
-    /// encoder (packed vision encoders warm by capturing). A latent encoder
-    /// that samples its posterior encodes with zero noise.
-    pub fn warm(&self, side: u32) -> Result<()> {
-        match (&self.info, &self.packed) {
-            (EncoderInfo::Vision(_), None) | (EncoderInfo::Latent(_), _) => {
-                self.methods.warm.invoke(&[
-                    self.methods.runner.view(),
-                    (&Any::from(i64::from(side))).into(),
-                ])
-            }
-            _ => Ok(()),
+    /// Record into `job` the encoding of one black `side` x `side` image
+    /// through the model's input transform, discarded: the startup warmup
+    /// of an unpacked image encoder (packed vision encoders warm by
+    /// capturing), one eager call of the Python half's `warm`. A latent
+    /// encoder that samples its posterior encodes with zero noise.
+    pub(crate) fn warm(&self, side: u32, job: &Job) {
+        if let (EncoderInfo::Vision(_), None) | (EncoderInfo::Latent(_), _) =
+            (&self.info, &self.packed)
+        {
+            job.call(MethodCall::new(
+                &self.methods.warm,
+                vec![
+                    Argument::Handle(self.methods.runner.clone()),
+                    Argument::Integer(i64::from(side)),
+                ],
+            ));
         }
     }
 
@@ -1372,19 +1375,7 @@ impl EncoderRunner {
             unsafe { issue.copy(&rows_in) }?;
 
             let arguments = self.packed_arguments(slots)?;
-            let mode = match (self.graph(EncoderGraph::Packed { slots })?, &stream) {
-                (Some(graph), Some(_)) => {
-                    issue.launch(graph)?;
-                    GraphMode::Replay
-                }
-                _ => {
-                    job.call(MethodCall::new(&self.methods.encode, arguments));
-                    GraphMode::Eager
-                }
-            };
-            if let Some(table) = &mut self.graphs {
-                table.record(mode);
-            }
+            let mode = self.forward(EncoderGraph::Packed { slots }, arguments, None, job)?;
 
             // Slot `i` holds image `i`'s features in its leading rows; the
             // features and the product share their dtype, so the rows are
@@ -1535,28 +1526,16 @@ impl EncoderRunner {
                 arguments.push(Argument::Tensor(positions.clone()));
                 arguments.push(Argument::Tensor(rows.clone()));
                 job.call(MethodCall::new(&encode, arguments));
-                GraphMode::Eager
+                self.count(GraphMode::Eager)
             }
             // Without configured capacities a prompt is encoded at its
             // exact length, which no graph serves.
             None if self.text_capacities.is_empty() => {
                 job.call(MethodCall::new(&encode, arguments));
-                GraphMode::Eager
+                self.count(GraphMode::Eager)
             }
-            None => match self.graph(EncoderGraph::Text { capacity })? {
-                Some(graph) => {
-                    issue.launch(graph)?;
-                    GraphMode::Replay
-                }
-                None => {
-                    job.call(MethodCall::new(&encode, arguments));
-                    GraphMode::Eager
-                }
-            },
+            None => self.forward(EncoderGraph::Text { capacity }, arguments, None, job)?,
         };
-        if let Some(table) = &mut self.graphs {
-            table.record(mode);
-        }
         if final_stage {
             // The features and the product share the model dtype, so the
             // prompt's rows are copied as they are.
@@ -1585,20 +1564,82 @@ impl EncoderRunner {
         })
     }
 
+    /// Count a forward of `mode` in the graph table, when the encoder has
+    /// one; returns the mode.
+    fn count(&mut self, mode: GraphMode) -> GraphMode {
+        if let Some(table) = &mut self.graphs {
+            table.record(mode);
+        }
+        mode
+    }
+
+    /// Record in `job` the forward of `key`, whose `encode` takes
+    /// `arguments`, on the encoder's stream: the launch of the key's
+    /// captured graph, or the eager call. Startup's capture passes the
+    /// graph `pool`: the eager call then warms the key, so kernels compile
+    /// outside the capture, and the key is captured behind it; the job's
+    /// completion carries the graph. A capture is counted when its graph is
+    /// stored.
+    fn forward(
+        &mut self,
+        key: EncoderGraph,
+        arguments: Vec<Argument>,
+        pool: Option<&GraphPool<Handle>>,
+        job: &Job,
+    ) -> Result<GraphMode> {
+        let stream = self.stream.clone();
+        let graph = match pool {
+            Some(_) => None,
+            None => self.graph(key)?,
+        };
+        let mode = match (graph, &stream) {
+            (Some(graph), Some(_)) => {
+                job.on(stream.as_ref()).launch(graph)?;
+                GraphMode::Replay
+            }
+            _ => {
+                let capture = match (pool, &stream, self.device) {
+                    (Some(pool), Some(stream), Device::Cuda(device)) => Some(Capture {
+                        functions: self.methods.capture.clone(),
+                        pool: pool.value.clone(),
+                        peers: Vec::new(),
+                        stream: stream.raw(),
+                        device,
+                        method: MethodCall::new(&self.methods.encode, arguments.clone()),
+                        breaks: None,
+                    }),
+                    _ => None,
+                };
+                job.call(MethodCall::new(&self.methods.encode, arguments));
+                match capture {
+                    Some(capture) => {
+                        job.capture(capture);
+                        GraphMode::Capture
+                    }
+                    None => GraphMode::Eager,
+                }
+            }
+        };
+        if mode != GraphMode::Capture {
+            self.count(mode);
+        }
+        Ok(mode)
+    }
+
     /// Warm and, with `pool`, capture every graph this encoder launches:
     /// packed slot counts `capacity..=1` and text capacities, largest
-    /// first. `check` runs after each capture (the graph storage budget);
-    /// a failed check releases that graph. Without a pool the same
-    /// forwards run once on the Python thread, so lazy initialization
-    /// precedes serving.
-    ///
-    /// FIXME: startup issues this on the runner's stream at once and drains
-    /// it, from the thread that starts the rank; as a job of the lane it
-    /// would be recorded like the serving forward.
-    pub fn capture(
+    /// first. Each forward is one job, as serving records it: its input
+    /// writes, its eager call and, with a pool, its capture. `perform`
+    /// performs a job and returns its completion: at a rank's startup the
+    /// encoder's lane performs it, outside a rank the calling thread
+    /// ([`Self::capture`]). `check` runs after each capture (the graph
+    /// storage budget); a failed check releases that graph. Without a pool
+    /// the same forwards run once, so lazy initialization precedes serving.
+    pub(crate) fn capture_with(
         &mut self,
         pool: Option<&Arc<GraphPool<Handle>>>,
         check: &mut dyn FnMut() -> Result<()>,
+        perform: &mut dyn FnMut(Job) -> Result<Completion>,
     ) -> Result<()> {
         if let Some(pool) = pool
             && Device::Cuda(pool.device) != self.device
@@ -1608,6 +1649,8 @@ impl EncoderRunner {
             ));
         }
         // The forwards to capture, largest first, each with its arguments.
+        // The first forward's job writes what every forward reads.
+        let mut job = Job::new();
         let mut forwards = Vec::new();
         match (&self.info, &self.packed, &self.text) {
             (EncoderInfo::Vision(vision), Some(packed), _) => {
@@ -1626,7 +1669,8 @@ impl EncoderRunner {
                 }
             }
             (EncoderInfo::Text(_), _, Some(text)) => {
-                text.tokens.zero(self.stream.as_ref())?;
+                // Every capacity encodes the zero prompt.
+                text.tokens.zero(job.on(self.stream.as_ref()))?;
                 for &capacity in self.text_capacities.iter().rev() {
                     forwards.push((
                         EncoderGraph::Text { capacity },
@@ -1638,29 +1682,24 @@ impl EncoderRunner {
             _ => {}
         }
         for (key, grids, arguments) in forwards {
+            let recorded = std::mem::take(&mut job);
             if let (EncoderGraph::Packed { slots }, Some(grids), Some(packed)) =
                 (key, &grids, &self.packed)
             {
                 packed
                     .grids
                     .prefix(2 * slots as i64)?
-                    .upload(grids, self.stream.as_ref())?;
+                    .upload(grids, recorded.on(self.stream.as_ref()))?;
             }
-            // An eager forward first, so kernels compile outside the
-            // capture.
-            MethodCall::new(&self.methods.encode, arguments.clone()).invoke()?;
-            let (Some(pool), Some(stream), Device::Cuda(device)) =
-                (pool, &self.stream, self.device)
-            else {
+            let mode = self.forward(key, arguments, pool.map(Arc::as_ref), &recorded)?;
+            let mut completion = perform(recorded)?;
+            if mode != GraphMode::Capture {
                 continue;
-            };
-            let capture = &self.methods.capture;
-            let encode = MethodCall::new(&self.methods.encode, arguments);
-            let graph = capture.capture(&pool.value, stream.raw(), device, || {
-                encode.invoke().map(drop)
-            })?;
+            }
+            let graph = completion.captured()?;
             if let Err(error) = check() {
-                if let Err(cleanup) = capture.release.invoke(&[graph.handle().view()]) {
+                let release = &self.methods.capture.release;
+                if let Err(cleanup) = release.invoke(&[graph.handle().view()]) {
                     tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
                 }
                 return Err(error);
@@ -1669,9 +1708,23 @@ impl EncoderRunner {
                 .as_mut()
                 .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
                 .insert(key, None, graph)?;
+            self.count(GraphMode::Capture);
         }
         self.capturing = pool.is_some();
         Ok(())
+    }
+
+    /// [`Self::capture_with`] for a caller outside a rank, which has no
+    /// lane: each job is performed on the calling thread, as
+    /// [`Self::encode`] performs its job.
+    pub fn capture(
+        &mut self,
+        pool: Option<&Arc<GraphPool<Handle>>>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.capture_with(pool, check, &mut |job| {
+            job.perform().check().map_err(|failure| failure.error)
+        })
     }
 
     /// Refuse further captures: serving replays what startup captured.

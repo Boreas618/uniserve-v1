@@ -21,13 +21,13 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{
-    CopyBatch, DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, SourceOrder, Stream, Strided,
+    CopyBatch, DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, SourceOrder, Strided,
 };
 
 use crate::ffi::{
     Backing, DType, Device, Function, Handle, Interpreter, Tensor, contiguous_strides, export,
 };
-use crate::stream::Issue;
+use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
 /// One allocation owned by the worker.
@@ -604,28 +604,28 @@ impl StorageView {
         unsafe { stream.copy(&batch) }
     }
 
-    /// Zero this contiguous view, in `stream` order for device memory.
-    pub fn zero(&self, stream: Option<&Stream>) -> Result<()> {
+    /// Zero this contiguous view, in the order of what `stream` issues for
+    /// device memory (a stream at once, or a job's recorder).
+    pub fn zero(&self, stream: impl Issue) -> Result<()> {
         if !self.is_contiguous() {
             return Err(Error::Invariant(
                 "only a contiguous view is zeroed".to_owned(),
             ));
         }
-        let bytes = self.nbytes() as usize;
-        match (self.device(), stream) {
-            // SAFETY: the bytes lie in this view.
-            (Device::Cuda(_), Some(stream)) => {
-                unsafe { uniserve_cuda::memset_d8(self.address(), 0, bytes, stream) }
-                    .map_err(Error::from)
-            }
-            (Device::Cpu | Device::CudaHost, None) => {
-                // SAFETY: the bytes lie in this view's host memory.
-                unsafe { std::ptr::write_bytes(self.address() as *mut u8, 0, bytes) };
-                Ok(())
-            }
-            _ => Err(Error::Invariant(
+        if matches!(self.device(), Device::Cuda(_)) != stream.stream().is_some() {
+            return Err(Error::Invariant(
                 "fills use a stream exactly for device memory".to_owned(),
-            )),
+            ));
+        }
+        // SAFETY: the bytes lie in this view, which its owner keeps until
+        // the fill ran.
+        unsafe {
+            stream.fill(Fill {
+                address: self.address(),
+                value: 0,
+                width: 1,
+                count: self.nbytes() as usize,
+            })
         }
     }
 

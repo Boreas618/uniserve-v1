@@ -3,14 +3,35 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uniserve_ipc::CallKind;
+use uniserve_ipc::{CallKind, MediaCall};
 
 use super::EncoderRunner;
 use crate::cuda_graph::GraphPool;
 use crate::ffi::Handle;
+use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::component::Component;
+use crate::stream::Issue;
 use crate::{Error, Result};
+
+/// Perform a startup `job` on the lane serving `kind` and wait for its
+/// completion.
+fn perform(lanes: &JobQueues, kind: CallKind, job: Job) -> Result<Completion> {
+    lanes
+        .block_on(kind, job, BLOCK_ON_TIMEOUT)?
+        .check()
+        .map_err(|failure| failure.error)
+}
+
+/// The call kind image encoder `index` is routed for: the lane serving it
+/// performs the encoder's startup jobs.
+fn routed(routes: &HashMap<(String, CallKind), usize>, index: usize) -> Result<CallKind> {
+    routes
+        .iter()
+        .find(|(_, routed)| **routed == index)
+        .map(|((_, kind), _)| *kind)
+        .ok_or_else(|| Error::Invariant("an image encoder serves no call kind".into()))
+}
 
 /// The encoder runners of a rank.
 #[derive(Default)]
@@ -61,23 +82,32 @@ impl EncoderRunners {
     }
 
     /// Warm every unpacked image encoder on one black `side` x `side`
-    /// image, in construction order, as serving prepares its images.
-    pub(crate) fn warm_image(&self, side: u32) -> Result<()> {
-        for runner in &self.image {
-            runner.warm(side)?;
-            if let Some(stream) = runner.stream() {
-                stream.synchronize()?;
-            }
+    /// image, in construction order, as serving prepares its images: one
+    /// job of the lane on `lanes` serving the call kind the encoder is
+    /// routed for, which also waits for the encoder's stream.
+    pub(crate) fn warm_image(&self, side: u32, lanes: &JobQueues) -> Result<()> {
+        for (index, runner) in self.image.iter().enumerate() {
+            let kind = routed(&self.routes, index)?;
+            let job = Job::new();
+            runner.warm(side, &job);
+            job.on(runner.stream()).synchronize()?;
+            perform(lanes, kind, job)?;
         }
         Ok(())
     }
 
-    /// Capture every packed vision encoder's graphs into its pool.
-    pub(crate) fn capture_packed(&mut self) -> Result<()> {
+    /// Capture every packed vision encoder's graphs into its pool, each
+    /// forward a job of the lane on `lanes` serving the call kind the
+    /// encoder is routed for.
+    pub(crate) fn capture_packed(&mut self, lanes: &JobQueues) -> Result<()> {
         for (index, runner) in self.image.iter_mut().enumerate() {
-            if let Some(pool) = self.pools.get(&index) {
-                runner.capture(Some(pool), &mut || Ok(()))?;
-            }
+            let Some(pool) = self.pools.get(&index) else {
+                continue;
+            };
+            let kind = routed(&self.routes, index)?;
+            runner.capture_with(Some(pool), &mut || Ok(()), &mut |job| {
+                perform(lanes, kind, job)
+            })?;
         }
         Ok(())
     }
@@ -89,17 +119,21 @@ impl EncoderRunners {
         }
     }
 
-    /// Capture the text encoder's prompt capacities, then refuse further
-    /// captures.
-    pub(crate) fn capture_text(&mut self) -> Result<()> {
+    /// Capture the text encoder's prompt capacities, each forward a job of
+    /// the text encoder's lane on `lanes`, then refuse further captures
+    /// once a last job waited for the stream.
+    pub(crate) fn capture_text(&mut self, lanes: &JobQueues) -> Result<()> {
         if let Some(text) = &mut self.text {
+            let kind = CallKind::Media(MediaCall::TextEncoding);
             // Prompt capacities are warmed and captured largest first, the
             // same order on every rank of a tensor-parallel encoder.
             text.runner
-                .capture(self.text_pool.as_ref(), &mut || Ok(()))?;
-            if let Some(stream) = text.runner.stream() {
-                stream.synchronize()?;
-            }
+                .capture_with(self.text_pool.as_ref(), &mut || Ok(()), &mut |job| {
+                    perform(lanes, kind, job)
+                })?;
+            let job = Job::new();
+            job.on(text.runner.stream()).synchronize()?;
+            perform(lanes, kind, job)?;
             text.runner.seal();
             if let Some(vision) = &mut self.vision {
                 vision.seal();

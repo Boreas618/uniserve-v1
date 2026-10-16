@@ -131,23 +131,6 @@ pub(crate) fn release_scratch(
     cleared.and(finished)
 }
 
-/// Install scratch tables of `lengths` tokens for slots `1..`, run
-/// `operation`, then clear the tables and reset the scratch units, issuing
-/// on `stream` at once: for a capture that issues its own stream work.
-pub(crate) fn with_scratch<T>(
-    prefix_cache: &mut PrefixCache,
-    lengths: &[usize],
-    stream: Option<&uniserve_cuda::Stream>,
-    operation: impl FnOnce(&mut PrefixCache) -> Result<T>,
-) -> Result<T> {
-    let scratch = install_scratch(prefix_cache, lengths, stream)?;
-    let result = operation(prefix_cache);
-    let released = release_scratch(prefix_cache, scratch, lengths.len(), stream);
-    let value = result?;
-    released?;
-    Ok(value)
-}
-
 /// Rows of `lengths` host tokens for consecutive slots from `first`.
 fn rows(
     first: usize,

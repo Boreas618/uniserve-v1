@@ -48,7 +48,7 @@ use crate::executor::image::ImageParts;
 use crate::executor::image::{ImageBatch, Planned, Progress, Resume};
 use crate::executor::transfer::latents;
 use crate::ffi::{DType, Function, Handle, Interpreter, integer_list};
-use crate::lane::{Completion, Job, Value};
+use crate::lane::{Capture, Completion, Job, Value};
 use crate::parallel::ExpertUnion;
 use crate::parallel::joins::GraphFunctions;
 use crate::request::diffusion::{BranchSet, BranchSource, GuidancePlan, Prefix};
@@ -443,14 +443,46 @@ impl DenoiserRunner {
 
     /// Evaluate the denoising rows of one step. Rows of one image share
     /// samples; their attention reads `prefix_cache`'s pages.
+    ///
+    /// Startup's capture passes the pools of the step's graph: the one on
+    /// the runner's device and one on each other device the network's
+    /// modules run on (a generation tower). The eager evaluation then
+    /// warms the step, gathering the geometry the graph reads, and the
+    /// step is captured behind it; the job's completion carries the graph
+    /// ([`Self::complete_step`]). A capture is counted when its graph is
+    /// stored.
     pub(crate) fn predict(
         &mut self,
         rows: &[DenoiseRow],
         prefix_cache: &mut PrefixCache,
+        capture: Option<&[Arc<GraphPool<Handle>>]>,
         job: &Job,
     ) -> Result<Predicted> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
+        // The pools a capture records into: the device's, and each peer's.
+        let capture = match capture {
+            None => None,
+            Some(pools) => {
+                let (Some(ordinal), Some(stream)) = (self.device.cuda_index(), &stream) else {
+                    return Err(Error::Invariant(
+                        "a denoiser captures on its CUDA stream".into(),
+                    ));
+                };
+                let pool = pools
+                    .iter()
+                    .find(|pool| pool.device == ordinal)
+                    .ok_or_else(|| {
+                        Error::Invariant("a denoiser graph has no pool on its device".into())
+                    })?;
+                let peers: Vec<(i32, Handle)> = pools
+                    .iter()
+                    .filter(|pool| pool.device != ordinal)
+                    .map(|pool| (pool.device, pool.value.clone()))
+                    .collect();
+                Some((pool.value.clone(), peers, stream.raw(), ordinal))
+            }
+        };
         let image = self.family.image_mut()?;
         let positions = rows
             .iter()
@@ -474,14 +506,15 @@ impl DenoiserRunner {
             })
             .collect();
 
-        // A captured shape is launched when the rows match it exactly.
+        // A captured shape is launched when the rows match it exactly. A
+        // captured or capturing step reads its attention at the graphs'
+        // widths.
         let captured = match DiffusionShape::of(rows) {
             Some(shape) if image.capturing && image.graphs.contains(&shape, None) => Some(shape),
             _ => None,
         };
-        let widths = captured
-            .as_ref()
-            .map(|_| image.capacity.graph_widths.clone());
+        let widths =
+            (captured.is_some() || capture.is_some()).then(|| image.capacity.graph_widths.clone());
         image
             .attention
             .stage(&attention, prefix_cache, widths.as_deref(), issue)?;
@@ -493,20 +526,37 @@ impl DenoiserRunner {
             },
             _ => None,
         };
-        let mode = match graph {
-            Some(graph) => {
+        let mode = match (graph, capture) {
+            (Some(graph), _) => {
                 if image.plans_attention {
                     job.call(MethodCall::new(&image.plan_denoise, arguments));
                 }
                 issue.launch(graph)?;
                 GraphMode::Replay
             }
-            None => {
+            (None, Some((pool, peers, stream, device))) => {
+                // The eager evaluation warms the capture, which records the
+                // same call without executing it.
+                job.call(MethodCall::new(&self.methods.denoise, arguments.clone()));
+                job.capture(Capture {
+                    functions: self.capture.clone(),
+                    pool,
+                    peers,
+                    stream,
+                    device,
+                    method: MethodCall::new(&self.methods.denoise, arguments),
+                    breaks: None,
+                });
+                GraphMode::Capture
+            }
+            (None, None) => {
                 job.call(MethodCall::new(&self.methods.denoise, arguments));
                 GraphMode::Eager
             }
         };
-        image.graphs.record(mode);
+        if mode != GraphMode::Capture {
+            image.graphs.record(mode);
+        }
         Ok(Predicted { mode, offsets })
     }
 
@@ -618,83 +668,50 @@ impl DenoiserRunner {
         Ok(())
     }
 
-    /// Capture the denoising step that evaluates `rows` after an eager
-    /// evaluation of them (its warmup), which gathered the geometry the
-    /// graph reads. `pools` holds the owner's allocator pool on the
-    /// runner's device and one on each other device the network's modules
-    /// run on (a generation tower). `check` runs after the capture (the
-    /// graph storage budget); a failed check releases it.
-    pub fn capture_step(
+    /// Record into `job` the capture of the denoising step that evaluates
+    /// `rows`, behind an eager evaluation of them (its warmup), both as
+    /// serving records the step ([`Self::predict`]). `pools` holds the
+    /// owner's allocator pool on the runner's device and one on each other
+    /// device the network's modules run on (a generation tower). Returns
+    /// the step's shape, whose graph [`Self::complete_step`] stores from
+    /// the job's completion; `None` for a shape captured already, which
+    /// records nothing.
+    pub(crate) fn capture_step(
         &mut self,
         rows: &[DenoiseRow],
         prefix_cache: &mut PrefixCache,
         pools: &[Arc<GraphPool<Handle>>],
-        check: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
-        let image = self.family.image_mut()?;
+        job: &Job,
+    ) -> Result<Option<DiffusionShape>> {
         let shape = DiffusionShape::of(rows).ok_or_else(|| {
             Error::Invalid("a captured denoising step evaluates rows of one image size".into())
         })?;
-        if image.graphs.contains(&shape, None) {
-            return Ok(());
+        if self.family.image()?.graphs.contains(&shape, None) {
+            return Ok(None);
         }
-        let positions = rows
-            .iter()
-            .map(|row| image.layout.positions(row.height, row.width, row.temporal))
-            .collect::<Result<Vec<_>>>()?;
-        let (_, _, described) = image.stage_rows(
-            &self.owner,
-            rows.iter().zip(positions).map(|(row, positions)| {
-                (row.sample, row.height, row.width, positions, row.timestep)
-            }),
-            self.stream.as_ref(),
-        )?;
-        let attention: Vec<AttentionRow> = rows
-            .iter()
-            .zip(&described)
-            .map(|(row, described)| AttentionRow {
-                slot: row.slot,
-                prefix: row.prefix,
-                query: described[5] as u32,
-                write: false,
-            })
-            .collect();
-        image.attention.stage(
-            &attention,
-            prefix_cache,
-            Some(&image.capacity.graph_widths),
-            self.stream.as_ref(),
-        )?;
-        // The warmup evaluation, then the capture of the same forward.
-        let arguments = image.arguments(&self.methods.runner, &described);
-        MethodCall::new(&self.methods.denoise, arguments.clone()).invoke()?;
-        let (Some(ordinal), Some(stream)) = (self.device.cuda_index(), &self.stream) else {
-            return Err(Error::Invariant(
-                "a denoiser captures on its CUDA stream".into(),
-            ));
-        };
-        let pool = pools
-            .iter()
-            .find(|pool| pool.device == ordinal)
-            .ok_or_else(|| Error::Invariant("a denoiser graph has no pool on its device".into()))?;
-        let peers: Vec<(i32, Handle)> = pools
-            .iter()
-            .filter(|pool| pool.device != ordinal)
-            .map(|pool| (pool.device, pool.value.clone()))
-            .collect();
-        let capture = &self.capture;
-        let denoise = MethodCall::new(&self.methods.denoise, arguments);
-        let graph =
-            capture.capture_with_peers(&pool.value, &peers, stream.raw(), ordinal, || {
-                denoise.invoke().map(drop)
-            })?;
+        self.predict(rows, prefix_cache, Some(pools), job)?;
+        Ok(Some(shape))
+    }
+
+    /// Store the graph the job of [`Self::capture_step`] captured for
+    /// `shape`. `check` runs first (the graph storage budget); a failed
+    /// check releases the graph. Serving then launches the captured steps.
+    pub(crate) fn complete_step(
+        &mut self,
+        shape: DiffusionShape,
+        completion: &mut Completion,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let graph = completion.captured()?;
         if let Err(error) = check() {
-            if let Err(cleanup) = capture.release.invoke(&[graph.handle().view()]) {
+            if let Err(cleanup) = self.capture.release.invoke(&[graph.handle().view()]) {
                 tracing::warn!(target: "uniserve_worker.graphs", "{}: releasing a refused graph failed: {cleanup}", self.owner);
             }
             return Err(error);
         }
+        let image = self.family.image_mut()?;
         image.graphs.insert(shape, None, graph)?;
+        image.graphs.record(GraphMode::Capture);
         image.capturing = true;
         Ok(())
     }
@@ -1736,7 +1753,7 @@ impl ImageBatch<'_> {
             let denoiser = self.parts.denoiser_mut().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
             })?;
-            let predicted = denoiser.predict(rows, prefix_cache, job)?;
+            let predicted = denoiser.predict(rows, prefix_cache, None, job)?;
             let mode = predicted.mode.as_str();
             *stats.mode_counts.entry(mode.into()).or_default() += 1;
             if predicted.mode == GraphMode::Replay {
