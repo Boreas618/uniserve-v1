@@ -72,6 +72,7 @@ from .packing import (
     AUDIO_TAG,
     VIDEO_TILE_SHAPES,
     DensePacking,
+    RegionExtent,
     RegionPacking,
     TileExtent,
     TilePacking,
@@ -81,6 +82,7 @@ from .packing import (
     dense_tables,
     latent_raster,
     patchify_video,
+    region_extent,
     region_packing,
     region_tables,
     region_tiles,
@@ -669,22 +671,29 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             token_multiple=128 * self.sequence_group().size,
         )
 
-    def _region_packing(self, layout: DenoiserSize) -> RegionPacking:
+    def _region_rows(self, layout: DenoiserSize) -> dict[str, Any]:
         # Every rank's shard holds a whole number of tiles.
-        return region_packing(
-            num_frames=layout.num_frames,
-            canvas=layout.canvas,
-            text_rows=layout.num_text_tokens,
-            condition_rows=layout.condition_rows,
-            tile=self._tile,
-            token_multiple=self._tile * self.sequence_group().size,
-        )
+        return {
+            "num_frames": layout.num_frames,
+            "canvas": layout.canvas,
+            "text_rows": layout.num_text_tokens,
+            "condition_rows": layout.condition_rows,
+            "tile": self._tile,
+            "token_multiple": self._tile * self.sequence_group().size,
+        }
+
+    def _region_extent(self, layout: DenoiserSize) -> RegionExtent:
+        # The row and tile counts alone, as ``_tile_extent``.
+        return region_extent(**self._region_rows(layout))
+
+    def _region_packing(self, layout: DenoiserSize) -> RegionPacking:
+        return region_packing(**self._region_rows(layout))
 
     def _padded_tokens(self, layout: DenoiserSize) -> int:
         if self.dense:
             return self._dense_packing(layout).padded_tokens
         if self.regional:
-            return self._region_packing(layout).padded_tokens
+            return self._region_extent(layout).padded_tokens
         return self._tile_extent(layout).padded_tokens
 
     def _token_slice(self, padded_tokens: int) -> slice:
@@ -741,7 +750,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         """Each modality's canonical rows this rank holds in layout ``size``.
 
         Every modality's packed rows ascend, so the rows falling in this
-        rank's token slice are one contiguous range of the sample.
+        rank's token slice are one contiguous range of the sample. A sparse
+        layout's shard boundaries are tile boundaries, below which its extent
+        counts each modality's rows without building the packing's tables.
         """
         if self.dense:
             packing = self._dense_packing(size)
@@ -755,21 +766,22 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 high = min(max(interval.stop - start, 0), count)
                 result[name] = slice(low, high)
             return result
-        tiles = (
-            self._region_packing(size)
+        extent = (
+            self._region_extent(size)
             if self.regional
-            else self._tile_packing(size)
+            else self._tile_extent(size)
         )
-        interval = self._token_slice(tiles.padded_tokens)
-        result = {}
-        for name, indices in (
-            ("video", tiles.video_indices),
-            ("audio", tiles.audio_indices),
-        ):
-            start = int(torch.searchsorted(indices, interval.start))
-            stop = int(torch.searchsorted(indices, interval.stop))
-            result[name] = slice(start, stop)
-        return result
+        interval = self._token_slice(extent.padded_tokens)
+        return {
+            "video": slice(
+                extent.video_rows_below(interval.start),
+                extent.video_rows_below(interval.stop),
+            ),
+            "audio": slice(
+                extent.audio_rows_below(interval.start),
+                extent.audio_rows_below(interval.stop),
+            ),
+        }
 
     def output_layout(self, size: DenoiserSize) -> Mapping[str, OutputLayout]:
         """Locate this rank's predicted rows for requests of one layout.
@@ -823,7 +835,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             for name, layout in self.output_layout(size).items()
         }
         width = self._rotary_width()
-        packing: DensePacking | RegionPacking | TileExtent
+        packing: DensePacking | RegionExtent | TileExtent
         if self.dense:
             packing = self._dense_packing(size)
             rows = packing.padded_tokens // self.sequence_group().size
@@ -837,7 +849,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 "visible_end": BufferConfig((1, 1), torch.int32),
             }
         if self.regional:
-            packing = self._region_packing(size)
+            packing = self._region_extent(size)
             rows = packing.padded_tokens
             local = rows // self.sequence_group().size
             tiles = rows // packing.tile
@@ -1272,7 +1284,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 "request state"
             )
         attention: AttentionInput | SequenceInput | RegionInput
-        packing: DensePacking | RegionPacking
+        packing: DensePacking | RegionExtent
         if self.dense:
             packing = self._dense_packing(size)
             tokens = packing.padded_tokens
@@ -1297,7 +1309,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
             prefix_rows = self.text_condition_rows(size)
         elif self.regional:
-            packing = self._region_packing(size)
+            packing = self._region_extent(size)
             tokens = packing.padded_tokens
             attention = RegionInput(
                 self._token_slice(tokens),
