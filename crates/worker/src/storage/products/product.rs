@@ -302,7 +302,7 @@ impl<T, C> Buffer<T, C> {
         }
         if self.state == WriteState::Reserved {
             return Err(Error::Invariant(
-                "completion packing found an unpublished device product".into(),
+                "a write is validated before its producer published it".into(),
             ));
         }
         Ok(())
