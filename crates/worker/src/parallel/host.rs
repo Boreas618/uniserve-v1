@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
-/// How long startup waits for every member to join the mesh. It matches
-/// torch's default collective timeout, which the previous Gloo path used.
+/// How long startup waits for every member to join the mesh: torch's
+/// default collective timeout.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Messages at most this long are written before reading without a helper
