@@ -7,9 +7,20 @@ use std::time::{Duration, Instant};
 use uniserve_ipc::{Listener, Registration, VERSION};
 use uniserve_worker::launch::{Arguments, register};
 
-/// The command line of rank 3 of worker `text`, for a head at `head`.
+/// The command line of rank 3 of worker `text`'s second launch, for a head
+/// at `head`.
 fn arguments(head: &str) -> Arguments {
-    Arguments::parse(&["--head", head, "--worker-id", "text", "--rank", "3"]).unwrap()
+    Arguments::parse(&[
+        "--head",
+        head,
+        "--worker-id",
+        "text",
+        "--rank",
+        "3",
+        "--generation",
+        "2",
+    ])
+    .unwrap()
 }
 
 /// A rank waits for its launch descriptor for as long as the head keeps the
@@ -57,6 +68,7 @@ fn the_wait_for_the_descriptor_ends_when_the_head_closes() {
         Registration::Rank {
             worker_id: "text".into(),
             rank: 3,
+            generation: 2,
             version: VERSION.into(),
         }
     );

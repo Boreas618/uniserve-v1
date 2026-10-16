@@ -1,7 +1,8 @@
 //! The launch descriptor a rank process is started with.
 //!
-//! A rank is started with the head's address and its own identity, and the
-//! head answers the rank's registration with one [`LaunchDescriptor`], which
+//! A rank is started with the head's address, its own identity and the launch
+//! it belongs to, and the head answers the rank's registration with one
+//! [`LaunchDescriptor`], which
 //! carries every other launch value. The rank's runtime validates and
 //! resolves the raw values once, before any model work, and reports a
 //! violation as a usage error.
@@ -27,10 +28,17 @@ use crate::LaneConfig;
 
 /// The command that starts one rank with the interpreter `python`.
 ///
-/// argv carries the address of the head the rank connects to and the rank's
-/// identity, its worker group and its rank, which its registration states.
-/// The caller adds the environment and any inherited sockets.
-pub fn rank_command(python: impl AsRef<OsStr>, head: &str, worker_id: &str, rank: u32) -> Command {
+/// argv carries the address of the head the rank connects to and what its
+/// registration states: the rank's identity, its worker group and its rank,
+/// and the `generation` of the group's launch it belongs to. The caller adds
+/// the environment and any inherited sockets.
+pub fn rank_command(
+    python: impl AsRef<OsStr>,
+    head: &str,
+    worker_id: &str,
+    rank: u32,
+    generation: u64,
+) -> Command {
     let mut command = Command::new(python);
     command
         .arg("-m")
@@ -40,7 +48,9 @@ pub fn rank_command(python: impl AsRef<OsStr>, head: &str, worker_id: &str, rank
         .arg("--worker-id")
         .arg(worker_id)
         .arg("--rank")
-        .arg(rank.to_string());
+        .arg(rank.to_string())
+        .arg("--generation")
+        .arg(generation.to_string());
     command
 }
 

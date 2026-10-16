@@ -12,8 +12,9 @@
 //! `UNISERVE_WORKER_PYTHON` or the repository's `.venv/bin/python`. Several
 //! tests replace that interpreter with a small wrapper script that records a
 //! rank's process id, exits a chosen rank, starts a relaunched rank as a
-//! stand-in that reports changed worker info, registers under another build,
-//! or holds a rank's exit until its peers have closed.
+//! stand-in that reports changed worker info, registers under another build
+//! or for an earlier launch, or holds a rank's exit until its peers have
+//! closed.
 //!
 //! Faults are injected at the OS boundary: `/proc/thread-self/children` and
 //! `/proc/<pid>/cmdline` locate a rank process, and `PausedProcess` stops,
@@ -83,8 +84,8 @@ struct RawHead {
 }
 
 impl RawHead {
-    /// Starts the stub worker as a raw process, outside any group, and
-    /// answers its registration with `descriptor`.
+    /// Starts the stub worker as a raw process, outside any group, as a
+    /// member of launch 1, and answers its registration with `descriptor`.
     ///
     /// The head listens at `address`, so the rank reaches it over a Unix
     /// socket (`unix:<path>`) or over TCP (`127.0.0.1:0`).
@@ -98,6 +99,7 @@ impl RawHead {
             .args(["--head", &listener.addresses()[0]])
             .args(["--worker-id", &descriptor.worker_id])
             .args(["--rank", &descriptor.rank.to_string()])
+            .args(["--generation", "1"])
             .spawn()?;
         let registered = (|| -> anyhow::Result<Self> {
             // A worker that fails before registering never connects, so the
@@ -124,6 +126,7 @@ impl RawHead {
                     == uniserve_ipc::Registration::Rank {
                         worker_id: descriptor.worker_id.clone(),
                         rank: descriptor.rank,
+                        generation: 1,
                         version: uniserve_ipc::VERSION.into(),
                     },
                 "the rank registered as {registration:?}"
@@ -1133,32 +1136,47 @@ fn command_batch(batch_id: u64, command: BatchCommand) -> Batch {
     Batch::new(batch_id, Vec::new(), Vec::new()).with_commands(vec![command])
 }
 
-/// The head and its ranks must be one build, since the message types are the
-/// only definition of their protocol. A rank states its build when it
-/// registers, and a launch fails by naming a rank of another one.
-#[test]
-fn launch_refuses_a_rank_of_another_build() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    // The stand-in registers as the rank it was started as, under a build
-    // the head is not, and then waits for the head to close. The frames are
-    // encoded here, one per rank of the group.
-    let mut args = rank_group_args(8 << 20);
-    let frames = (0..args.ranks.len())
+/// Encodes one registration frame per rank of `args`'s group, as `stated`
+/// gives it for each rank, in the hexadecimal form a wrapper script embeds.
+fn registration_frames(
+    args: &WorkerProcessArgs,
+    stated: impl Fn(u32) -> uniserve_ipc::Registration,
+) -> anyhow::Result<Vec<String>> {
+    (0..args.ranks.len())
         .map(|rank| {
-            let registration = uniserve_ipc::Registration::Rank {
-                worker_id: args.worker_id.clone(),
-                rank: rank as u32,
-                version: "0.0.0-other".into(),
-            };
-            let frame = uniserve_ipc::Frame::encode(&registration)?;
+            let frame = uniserve_ipc::Frame::encode(&stated(rank as u32))?;
             Ok(frame
                 .as_bytes()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>())
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect()
+}
+
+/// The head and its ranks must be one build, since the message types are the
+/// only definition of their protocol and their encoding is positional. A rank
+/// states its build when it registers, and a launch fails by naming a rank of
+/// another one, including another build of the same package version.
+#[test]
+fn launch_refuses_a_rank_of_another_build() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The stand-in registers as the rank it was started as, for the launch
+    // it was started for, under a build of the head's package version that
+    // the head is not, and then waits for the head to close.
+    let other = format!("{}+0123456789abcdef", env!("CARGO_PKG_VERSION"));
+    anyhow::ensure!(
+        other != uniserve_ipc::VERSION,
+        "the stand-in's build is the head's"
+    );
+    let mut args = rank_group_args(8 << 20);
+    let frames = registration_frames(&args, |rank| uniserve_ipc::Registration::Rank {
+        worker_id: args.worker_id.clone(),
+        rank,
+        generation: 1,
+        version: other.clone(),
+    })?;
     let directory = tempfile::tempdir()?;
     let wrapper = directory.path().join("worker");
     std::fs::write(
@@ -1175,9 +1193,71 @@ fn launch_refuses_a_rank_of_another_build() -> anyhow::Result<()> {
         Err(error) => format!("{error:#}"),
     };
     assert!(
-        reported.contains("0.0.0-other") && reported.contains(uniserve_ipc::VERSION),
+        reported.contains(&other) && reported.contains(uniserve_ipc::VERSION),
         "launch failure did not name both builds: {reported}"
     );
+    Ok(())
+}
+
+/// A group relaunched after it lost a rank takes only ranks of the relaunch.
+/// A rank that registers for the launch the group lost is refused: the head
+/// closes its connection, the relaunch completes and the group serves again.
+#[test]
+fn a_relaunch_refuses_a_rank_of_the_launch_it_replaced() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Each wrapper rank records its process id. When it is started for the
+    // relaunch (launch 2), it first registers as the same rank of launch 1
+    // on a connection of its own, waits until the head closes that
+    // connection, records `<rank>.refused`, and then runs the stub worker,
+    // which registers for the relaunch. Had the head taken the stale
+    // registration, it would have answered it instead of closing, and the
+    // relaunch would have failed on a rank registered twice.
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("python");
+    let python = serde_json::to_string(&worker_python())?;
+    let records = serde_json::to_string(&directory.path())?;
+    let mut args = rank_group_args(8 << 20);
+    let frames = registration_frames(&args, |rank| uniserve_ipc::Registration::Rank {
+        worker_id: args.worker_id.clone(),
+        rank,
+        generation: 1,
+        version: uniserve_ipc::VERSION.into(),
+    })?;
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, socket, sys\nfrom pathlib import Path\nrecords = Path({records})\nframes = {frames:?}\nargument = lambda name: sys.argv[sys.argv.index(name) + 1]\nrank = argument('--rank')\n(records / (rank + '.pid')).write_text(str(os.getpid()))\nif argument('--generation') == '2':\n    stale = socket.socket(socket.AF_UNIX)\n    stale.connect(argument('--head').removeprefix('unix:'))\n    stale.sendall(bytes.fromhex(frames[int(rank)]))\n    stale.settimeout(60)\n    if stale.recv(4096) == b'':\n        (records / (rank + '.refused')).write_text('')\n    stale.close()\nos.execv({python}, [{python}, *sys.argv[1:]])\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    args.python = wrapper;
+    let mut worker = WorkerGroup::spawn(args)?;
+    let launched = worker.info().endpoint.incarnation.clone();
+
+    // Losing rank 0 relaunches the group.
+    let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+    let failure = worker
+        .poll_batch(Duration::from_secs(60))
+        .expect_err("rank loss must be reported");
+    assert!(
+        worker.is_ready(),
+        "the relaunch did not recover the group: {failure:#}"
+    );
+    assert_ne!(worker.info().endpoint.incarnation, launched);
+    for rank in 0..WORLD_SIZE {
+        assert!(
+            directory.path().join(format!("{rank}.refused")).exists(),
+            "rank {rank}'s registration for the replaced launch was not refused"
+        );
+    }
+    let served = execute(
+        &mut worker,
+        lifecycle_batch(1, vec![text_admission(31, 1, 1)?], Vec::new()),
+    )?;
+    assert_eq!(served.batch_id, 1);
+    worker.close()?;
     Ok(())
 }
 
@@ -3502,6 +3582,7 @@ fn media_rank() -> anyhow::Result<()> {
     server.send(&Registration::Rank {
         worker_id: argument("--worker-id")?.clone(),
         rank: argument("--rank")?.parse()?,
+        generation: argument("--generation")?.parse()?,
         version: uniserve_ipc::VERSION.into(),
     })?;
     let descriptor: LaunchDescriptor = loop {

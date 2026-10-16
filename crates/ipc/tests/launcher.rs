@@ -59,6 +59,7 @@ fn a_rank_and_a_launcher_register_with_the_same_first_frame() {
     let rank = Registration::Rank {
         worker_id: "model".into(),
         rank: 5,
+        generation: 2,
         version: VERSION.into(),
     };
     let launcher = Registration::Launcher {

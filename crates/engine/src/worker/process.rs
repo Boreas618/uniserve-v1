@@ -130,6 +130,20 @@ impl WorkerProcessArgs {
 
         "python3".into()
     }
+
+    /// Parses a quantization policy as a command line states it: a JSON
+    /// object such as `{"mode":"balanced"}`, where an empty object selects
+    /// the model's default policy.
+    ///
+    /// The signature suits a command-line value parser. Fails on text that is
+    /// not JSON, and on JSON that is not an object, such as an array or a
+    /// scalar.
+    pub fn parse_quantization_config(text: &str) -> anyhow::Result<Value> {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|error| anyhow::anyhow!("invalid JSON object: {error}"))?;
+        anyhow::ensure!(value.is_object(), "expected a JSON object");
+        Ok(value)
+    }
 }
 
 impl Default for WorkerProcessArgs {
@@ -555,7 +569,8 @@ pub(crate) struct RankSockets {
 }
 
 impl PendingRank {
-    /// Spawns one rank, which connects to the head at `head` and registers.
+    /// Spawns one rank, which connects to the head at `head` and registers as
+    /// a member of its group's launch `generation`.
     ///
     /// Nothing here waits for the rank. `rendezvous` is the group's
     /// collective store address, and `sockets.group` the socket this rank
@@ -581,12 +596,19 @@ impl PendingRank {
         remote: Option<&mut super::launcher::RemoteHost<'_>>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         head: &str,
+        generation: u64,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
         let max_payload = args.max_message_bytes.max(1);
         let world_size = args.world_size();
 
-        let mut cmd = uniserve_ipc::launch::rank_command(&args.python, head, &args.worker_id, rank);
+        let mut cmd = uniserve_ipc::launch::rank_command(
+            &args.python,
+            head,
+            &args.worker_id,
+            rank,
+            generation,
+        );
 
         // Torch and the numerical libraries read the host-relative pair; the
         // global pair names the rank's place in the whole process world.
@@ -626,7 +648,7 @@ impl PendingRank {
         // have used. The head derives both once, here, for either path.
         let child = match remote {
             Some(remote) => {
-                remote.deliver(rank, &args.python, &args.worker_id, head, &cmd)?;
+                remote.deliver(rank, &args.python, &args.worker_id, generation, head, &cmd)?;
                 None
             }
             None => Some(cmd.spawn().context("spawning the rank process")?),

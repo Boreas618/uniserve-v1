@@ -11,9 +11,10 @@
 //!   excludes ranks an [`Instruction::Stop`] ended;
 //! - the head sends [`Instruction`]s.
 //!
-//! Each worker group's launches carry a generation, which every
-//! [`RankSpawn`] names and the launcher echoes in that rank's [`RankExit`].
-//! The head ends a group's launch with a stop before it relaunches the group
+//! Each launch of a worker group has a generation, which every [`RankSpawn`]
+//! names: the launcher starts the rank with it, the rank states it in its
+//! registration, and the launcher echoes it in that rank's [`RankExit`]. The
+//! head ends a group's launch with a stop before it relaunches the group
 //! under the next generation, so an exit the launcher reported just before it
 //! read the stop is recognized as the stopped launch's rather than the
 //! relaunch's.
@@ -48,8 +49,8 @@ pub struct RankSpawn {
     pub rank: u32,
     /// Worker group the rank belongs to.
     pub worker_id: String,
-    /// The group generation the head is launching; the rank's exit report
-    /// carries it back.
+    /// The generation of the group's launch the rank belongs to, which the
+    /// rank states when it registers and its exit report carries back.
     pub generation: u64,
     /// Interpreter that runs the worker module.
     pub python: String,

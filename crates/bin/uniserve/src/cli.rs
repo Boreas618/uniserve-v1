@@ -595,7 +595,7 @@ pub(crate) struct WorkerProcessOptions {
     #[arg(
         long,
         default_value = r#"{}"#,
-        value_parser = parse_json_object,
+        value_parser = WorkerProcessArgs::parse_quantization_config,
         value_name = "JSON"
     )]
     pub quantization_config: serde_json::Value,
@@ -712,17 +712,6 @@ impl WorkerProcessOptions {
 /// parses values that must be objects.
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
-}
-
-/// Parses a JSON value for clap and rejects anything but an object, such as
-/// an array or a scalar.
-fn parse_json_object(value: &str) -> Result<Value, String> {
-    let parsed = parse_json::<Value>(value)?;
-    if parsed.is_object() {
-        Ok(parsed)
-    } else {
-        Err("expected a JSON object".to_string())
-    }
 }
 
 /// Parses a device storage fraction for clap, refusing a value outside the
