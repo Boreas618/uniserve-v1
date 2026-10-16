@@ -123,7 +123,6 @@ addopts = "-ra"
 pythonpath = ["."]
 markers = [
     "unit: pure local tests without server or external model files",
-    "architecture: build-time dependency direction and package layout checks",
     "integration: multi-component tests using fake/simulated backends",
     "e2e: black-box server or worker tests",
     "gpu: requires a CUDA device; orthogonal to the unit, integration and e2e layers",

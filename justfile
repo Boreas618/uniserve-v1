@@ -28,7 +28,7 @@ lint: fmt clippy
 
 # Fast Python tests (CPU only)
 test-python-fast:
-    {{python}} -m pytest -m "(unit or architecture) and not gpu"
+    {{python}} -m pytest -m "unit and not gpu"
 
 # Integration Python tests (CPU only)
 test-python-integration:

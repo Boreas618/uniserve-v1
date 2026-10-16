@@ -250,7 +250,8 @@ impl GroupPlan {
         Ok((plan, owns))
     }
 
-    /// Plan one mesh binding (`ProcessGroups.bind`).
+    /// Plan this rank's binding of `mesh`: the communicators of the
+    /// selected fibers that contain the rank.
     fn bind(
         &mut self,
         inputs: &PlanInputs<'_>,

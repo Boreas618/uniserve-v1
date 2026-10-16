@@ -5,9 +5,9 @@
 //! ceilings. They also predict the cache tokens an input or generated image
 //! occupies from its pixel dimensions, and the request carries that count as
 //! an exact `ImageEncoderInput::num_cache_tokens`. The predictions replicate the
-//! worker's image resize arithmetic in
-//! `uniserve_worker/model_executor/image_inputs.py` and must stay in step with
-//! it: the engine scheduler rejects a worker result whose cache length differs
+//! worker's image resize arithmetic (`PixelBounds` and `StrideResize` in
+//! `uniserve/processing.py`, configured by each family's `image_processor`)
+//! and must stay in step with it: the engine scheduler rejects a worker result whose cache length differs
 //! from the declared count (`image_kv_mismatch`).
 
 pub mod bagel;
