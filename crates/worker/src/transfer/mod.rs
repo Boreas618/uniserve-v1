@@ -32,6 +32,7 @@ mod read;
 mod registry;
 mod shm;
 mod spans;
+mod staging;
 mod ticket;
 mod transport;
 pub(crate) mod vmm;
