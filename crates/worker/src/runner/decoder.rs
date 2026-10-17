@@ -190,8 +190,9 @@ impl DecoderRunner {
     /// lane: the decode as serving records it ([`Self::record_decode`]),
     /// each image's staged pixels copied out to host memory behind its
     /// sub-batch, before the next sub-batch reuses the staging bytes, all
-    /// performed on the calling thread. Returns each image's staged pixels,
-    /// in input order.
+    /// performed on the calling thread, which then waits for the stream.
+    /// Returns each image's staged pixels, in input order, readable on the
+    /// host.
     pub fn decode(&self, images: &[DecodeImage]) -> Result<Vec<StorageView>> {
         let job = Job::new();
         let issue = job.on(self.stream());
@@ -220,6 +221,9 @@ impl DecoderRunner {
             &job,
             &mut returns,
         )?;
+        // Performing the job issues the copies; the returned host pixels
+        // are complete once the stream finished them.
+        issue.synchronize()?;
         let mut completion = job.perform().check().map_err(|failure| failure.error)?;
         self.check_staged(returns, &mut completion)?;
         Ok(staged)
