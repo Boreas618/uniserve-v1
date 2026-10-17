@@ -3571,6 +3571,11 @@ fn image_bytes(result: &uniserve_engine::BatchResult) -> anyhow::Result<Vec<u8>>
 /// prepare a trajectory plans its guidance when its first denoising step
 /// arrives) and denoises it to the image its own preparation of the same
 /// seed gives.
+///
+/// Both workers publish every version they write, and this head submits
+/// each batch only after the previous result and frees no version on the
+/// way: a step that writes over the bank of a published version two steps
+/// back runs without waiting for a Free.
 #[test]
 fn a_trajectory_prepared_on_another_worker_denoises_to_the_same_image() -> anyhow::Result<()> {
     use trajectory::{
@@ -3578,13 +3583,14 @@ fn a_trajectory_prepared_on_another_worker_denoises_to_the_same_image() -> anyho
     };
     use uniserve_engine::{ExecutionBatch, WorkerExecutor, WorkerId};
 
-    // The preparing worker publishes its trajectory versions to the
-    // denoising one over shared storage on their host; the denoising worker
-    // publishes nothing. Each holds every stub component and knows the
-    // other's: the components a published version's denoising may run on.
+    // Each worker publishes its trajectory versions to the other over
+    // shared storage on their host. Each holds every stub component and
+    // knows the other's: the components a published version's denoising
+    // may run on.
     let workers = ["prepare", "denoise"];
     let placement = single_rank_args("prepare", QUEUE_DEPTH);
-    let mut transfer = uniserve_engine::TransferConfig::parse("prepare->denoise=shm")?;
+    let mut transfer =
+        uniserve_engine::TransferConfig::parse("prepare->denoise=shm,denoise->prepare=shm")?;
     for worker in workers {
         let hosts = placement.ranks.iter().map(|rank| rank.node.clone());
         transfer

@@ -428,8 +428,15 @@ fn resolve(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Resolved> {
 /// The exports of trajectory versions in the banks the batch's latent
 /// preparation and denoising calls write: other ranks still reading a
 /// version keep its bank from being overwritten.
+///
+/// A denoising step writes the bank of the version two steps behind the
+/// one it reads, which its trajectory has moved past. That version is
+/// revoked here (`LatentPool::supersede`) rather than
+/// left published until its Free: the step then waits only for the reads
+/// other ranks already claimed, which finish by themselves, and never for
+/// a later batch of the head that would carry the Free.
 fn latent_hazards(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Vec<Arc<Retirement>>> {
-    let writes: Vec<(usize, &uniserve_ipc::LatentParams)> = plan
+    let writes: Vec<(usize, &uniserve_ipc::LatentParams, bool)> = plan
         .latent_params
         .iter()
         .filter_map(|params| {
@@ -440,20 +447,21 @@ fn latent_hazards(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Vec<A
                 call.code,
                 CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
             )
-            .then_some(params)
+            .then_some((params, call.code == CallKind::Media(MediaCall::Denoising)))
         })
-        .map(|params| {
+        .map(|(params, denoising)| {
             let slot = backend
                 .requests()
                 .get(params.request_key.request_id.0)?
                 .slot();
-            Ok((slot, params))
+            Ok((slot, params, denoising))
         })
         .collect::<Result<_>>()?;
     if writes.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(mut image) = backend.parts().image else {
+    let parts = backend.parts();
+    let Some(mut image) = parts.image else {
         return Ok(Vec::new());
     };
     let Ok((pool, _)) = image.latent_pool() else {
@@ -461,14 +469,28 @@ fn latent_hazards(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Vec<A
     };
     pool.reap();
     let mut hazards = Vec::new();
-    for (slot, params) in writes {
+    let mut superseded = Vec::new();
+    for (slot, params, denoising) in writes {
         let slot = pool.slot(slot as i64)?;
         let pages: Vec<usize> = params
             .page_table
             .iter()
             .map(|&page| page as usize)
             .collect();
+        if denoising {
+            superseded.extend(pool.supersede(slot, params.request_key, &pages));
+        }
         hazards.extend(pool.write_dependencies(slot, &pages));
+    }
+    if !superseded.is_empty() {
+        // A version is published through the product store's locations;
+        // revoking them stops new claims and lets each export retire once
+        // its claimed reads finished.
+        parts
+            .storage
+            .ok_or_else(|| Error::Invariant("published latents need storage owners".into()))?
+            .tensors
+            .revoke_buffer_exports(&superseded)?;
     }
     Ok(hazards)
 }

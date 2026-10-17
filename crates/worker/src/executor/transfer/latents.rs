@@ -5,7 +5,10 @@
 //! logical tensor `[latent_units, width]`, through the rank's export
 //! mechanisms (`TransferHandle::Latent`, carrying the version's image size
 //! and step); the pool keeps the bank from being overwritten until every
-//! location retired. Importing a version reads it into bank zero of the
+//! location retired. A version stays published until it is freed, or
+//! until its trajectory's denoising writes over its bank two steps later,
+//! which revokes it; the write then waits only for the reads already
+//! claimed. Importing a version reads it into bank zero of the
 //! pages the scheduler assigned the consuming request's slot; adopting the
 //! import makes it the slot's committed trajectory, which the consuming
 //! call then reads like one this rank computed.

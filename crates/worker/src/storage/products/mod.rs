@@ -570,6 +570,24 @@ impl ProductStore {
         lock(&self.state).release_calls(calls.iter().copied());
     }
 
+    /// Revoke the export locations registered for `buffers`: no reader
+    /// claims them from now on, and each export retires once the readers
+    /// that did have finished. The buffers' storage stays with its owner.
+    pub(crate) fn revoke_buffer_exports<'a>(
+        &self,
+        buffers: impl IntoIterator<Item = &'a BufferId>,
+    ) -> Result<()> {
+        let revoked: Vec<_> = {
+            let mut exports = lock(&self.exports);
+            buffers
+                .into_iter()
+                .filter_map(|buffer| exports.remove(buffer))
+                .flatten()
+                .collect()
+        };
+        exports::release(&revoked)
+    }
+
     /// Revoke the exports of released buffers and release the buffers.
     /// What follows a buffer's outstanding fences is deferred through
     /// `stream`.
@@ -578,15 +596,7 @@ impl ProductStore {
         buffers: &HashSet<BufferId>,
         stream: impl Issue,
     ) -> Result<()> {
-        let revoked: Vec<_> = {
-            let mut exports = lock(&self.exports);
-            buffers
-                .iter()
-                .filter_map(|buffer| exports.remove(buffer))
-                .flatten()
-                .collect()
-        };
-        exports::release(&revoked)?;
+        self.revoke_buffer_exports(buffers)?;
         let released: Vec<_> = {
             let mut state = lock(&self.state);
             let keys = state.release_buffers(buffers);

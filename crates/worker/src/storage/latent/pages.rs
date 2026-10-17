@@ -382,6 +382,41 @@ impl LatentPool {
         }
     }
 
+    /// Release `request`'s published versions that a denoising step's
+    /// write into `slot`'s next bank overwrites, and return their buffers,
+    /// whose transport locations the caller revokes.
+    ///
+    /// The next bank holds the version two steps behind the committed one:
+    /// the trajectory has moved past it, so its publication ends when the
+    /// trajectory writes over it, as it does when it is freed. Readers that
+    /// claimed it before keep the bank until they finished
+    /// ([`Self::write_dependencies`]); a later read finds it revoked. A
+    /// version of another request, or one not older than the committed
+    /// version, is left to its Free.
+    pub(crate) fn supersede(
+        &self,
+        slot: usize,
+        request: RequestKey,
+        pages: &[usize],
+    ) -> Vec<BufferId> {
+        let bank = self.next_bank(slot);
+        let committed = self.slots[slot].generation;
+        self.exports
+            .values()
+            .filter(|source| {
+                source.request_pool_idx == slot
+                    && source.bank == bank
+                    && source.buffer.owner == request
+                    && i64::from(source.buffer.generation) < committed
+                    && source.pages.iter().any(|page| pages.contains(page))
+            })
+            .filter_map(|source| {
+                let mut state = source.state();
+                (!std::mem::replace(&mut state.released, true)).then_some(source.buffer)
+            })
+            .collect()
+    }
+
     pub(crate) fn write_dependencies(&self, slot: usize, pages: &[usize]) -> Vec<Arc<Retirement>> {
         let bank = self.next_bank(slot);
         self.exports
@@ -916,6 +951,47 @@ mod tests {
         pool.reap();
         pool.require_writable(pool.next_bank(1), &[1])?;
         Ok(())
+    }
+
+    #[test]
+    fn a_denoising_write_supersedes_the_version_two_steps_back() -> Result<()> {
+        let mut pool = LatentPool::new(2, 3, 4)?;
+        let request = buffer(1).owner;
+        pool.require_initial(1, &[1])?;
+        let mut update = initial(1, &[1], 4);
+        pool.validate_updates(std::slice::from_ref(&update))?;
+        pool.apply_updates(std::slice::from_ref(&update));
+
+        // The prepared version is published, and one reader has claimed it.
+        let prepared = pool.current_bank(1, 0, 1, 4, 16, 64, &[1])?;
+        let source = Arc::new(pool.prepare_export(buffer(1), 1, prepared, vec![1])?);
+        pool.register_export(Arc::clone(&source));
+        let reader = Arc::new(Retirement::default());
+        pool.retain_export(&source, Arc::clone(&reader))?;
+
+        // The first step writes the other bank: nothing is superseded.
+        assert!(pool.supersede(1, request, &[1]).is_empty());
+        update.expected_generation = 1;
+        update.generation = 2;
+        update.step = 1;
+        pool.validate_updates(std::slice::from_ref(&update))?;
+        pool.apply_updates(&[update]);
+
+        // The second step writes over the prepared version, which ends its
+        // publication once, without a Free. The write still waits for the
+        // reader that claimed it.
+        assert_eq!(pool.next_bank(1), prepared);
+        assert_eq!(pool.supersede(1, request, &[1]), [buffer(1)]);
+        assert!(pool.supersede(1, request, &[1]).is_empty());
+        assert!(
+            pool.write_dependencies(1, &[1])
+                .iter()
+                .any(|signal| !signal.done())
+        );
+        assert!(pool.require_writable(prepared, &[1]).is_err());
+        reader.complete(Ok(()))?;
+        pool.reap();
+        pool.require_writable(prepared, &[1])
     }
 
     #[test]
