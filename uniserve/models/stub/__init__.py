@@ -12,6 +12,7 @@ from .inputs import DenoiserInput
 from .model import (
     STUB_EOS_TOKEN_ID,
     STUB_IMG_START_TOKEN_ID,
+    STUB_STALL_TOKEN_ID,
     Model,
     entry_points,
 )
@@ -25,5 +26,6 @@ __all__ = [
     "Model",
     "STUB_EOS_TOKEN_ID",
     "STUB_IMG_START_TOKEN_ID",
+    "STUB_STALL_TOKEN_ID",
     "entry_points",
 ]

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use uniserve_core::CallId;
 use uniserve_ipc::{
     Batch as BatchPlan, BatchCommand, BatchOutput, CallKind, ErrorCallIdentity, ForwardMode,
-    RequestKind, WorkerInfo, WorkerResponseError,
+    RequestKind, Stall, WorkerInfo, WorkerResponseError,
 };
 
 use super::batch::{self, Launched};
@@ -1646,6 +1646,31 @@ impl WorkerBackend {
             .map_err(lane_lost)?;
         self.joining = Some(submitted);
         Ok(None)
+    }
+
+    pub(crate) fn oldest_job(&self) -> Option<(JobId, std::time::Instant)> {
+        self.jobs.oldest()
+    }
+
+    pub(crate) fn stall(
+        &self,
+        job: JobId,
+        running: std::time::Duration,
+        batch: Option<(u64, &WorkerBatch)>,
+    ) -> Stall {
+        let (lane, method) = self.jobs.performing(job).unwrap_or_default();
+        Stall {
+            lane,
+            batch_id: batch.map(|(id, _)| id),
+            route: batch
+                .and_then(|(_, batch)| batch.route())
+                .map(|kind| kind.as_str().to_owned()),
+            method,
+            calls: batch
+                .map(|(_, batch)| batch.identities())
+                .unwrap_or_default(),
+            running_ms: u64::try_from(running.as_millis()).unwrap_or(u64::MAX),
+        }
     }
 }
 
