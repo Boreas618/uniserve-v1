@@ -299,6 +299,7 @@ class _FileWeight(Weight):
     source_name: str
 
     def read(self, region=None):
+        self.reader._prefetch()
         value = self.reader._read(self.source_name, _region(self.shape, region))
         self.reader._consumed.add(self.source_name)
         return value
@@ -478,6 +479,11 @@ class Reader:
         self._states: dict[Path, Mapping[str, torch.Tensor]] = {}
         self._consumed: set[str] = set()
         self._closed = False
+        # Whether the source files still have to be read into the page cache
+        # before the first tensor payload is read (``_prefetch``).
+        self._unfetched = io.mode != "dummy" and (
+            io.prefetch if io.prefetch is not None else io.mmap
+        )
         try:
             self._open()
         except BaseException:
@@ -496,12 +502,35 @@ class Reader:
         if self._closed:
             raise RuntimeError("checkpoint reader is closed")
 
+    def _prefetch(self):
+        """Read every source file into the page cache, once per reader.
+
+        Runs before the first tensor payload is read, so a reader opened for
+        metadata alone reads no payload. Each file is read front to back
+        with ordinary reads, ``num_threads`` files at a time (8 when unset);
+        mapped tensor reads then find their pages cached. Faulting a cold
+        mapping instead fetches it page by page: on a Lustre client, two
+        ranks faulting the same cold file in the same order wait on each
+        other's single-page reads and read it about twenty times slower than
+        one sequential reader. ``POSIX_FADV_WILLNEED`` is no substitute: it
+        is advisory, and a Lustre client does not populate its page cache
+        for it.
+
+        Raises:
+            OSError: A source file cannot be read.
+        """
+        if not self._unfetched:
+            return
+        self._unfetched = False
+        workers = min(len(self.source.files), self.io.num_threads or 8)
+        if not workers:
+            return
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # Consuming the results re-raises the first read error here.
+            for _ in executor.map(_populate, self.source.files):
+                pass
+
     def _open(self):
-        if self.io.mode != "dummy" and (
-            self.io.prefetch if self.io.prefetch is not None else self.io.mmap
-        ):
-            for path in self.source.files:
-                _advise(path, "POSIX_FADV_WILLNEED")
         count = self.io.num_threads or (1 if self.io.mmap else 8)
         with ThreadPoolExecutor(max_workers=count) as executor:
             indexes = executor.map(self._index, self.source.files)
@@ -825,6 +854,15 @@ def _load_torch(path, mmap):
         for name, tensor in value.items()
         if isinstance(tensor, torch.Tensor)
     }
+
+
+def _populate(path):
+    """Read one file front to back so its pages enter the page cache."""
+    # Reads into one reused buffer release the GIL for each 16 MiB chunk.
+    chunk = bytearray(16 << 20)
+    with path.open("rb", buffering=0) as handle:
+        while handle.readinto(chunk):
+            pass
 
 
 def _advise(path, kind):
