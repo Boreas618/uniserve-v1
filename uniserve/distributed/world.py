@@ -21,7 +21,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from uniserve.bindings.context import close_resources
+from uniserve.bindings.workspace import close_resources
 from uniserve.distributed import Communicator, DeviceMesh
 
 

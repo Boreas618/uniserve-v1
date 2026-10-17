@@ -465,7 +465,7 @@ impl PrefixCache {
             if let Some(task) = task
                 && let Err(cleanup) = task.cancel(true)
             {
-                tracing::warn!(target: "uniserve_worker.storage", "failed to withdraw a KV import task: {cleanup}");
+                tracing::warn!("failed to withdraw a KV import task: {cleanup}");
             }
         };
         if let Some(task) = &task {

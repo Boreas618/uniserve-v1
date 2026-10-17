@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 
 from tests.python.fixtures.stub import load_stub
-from uniserve.bindings.context import Scratch
+from uniserve.bindings.workspace import Scratch
 from uniserve.media.pixels import (
     prepare_host_image,
     prepare_tensor_image,

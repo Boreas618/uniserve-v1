@@ -1,0 +1,407 @@
+//! Capacity planning of a loaded rank ([`plan`]): the page size, request slots,
+//! cache units and latent pages its device budget holds, agreed over the group,
+//! with a video rank's slot layout, and the planned capacity reported once for
+//! operators.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use uniserve_core::ComponentConfig;
+use uniserve_cuda::HandleType;
+use uniserve_ipc::{CallKind, ComponentInfo};
+
+use super::loading::LoadedModel;
+use super::{endpoint, expert_exchange, exports_device_products};
+use crate::capacity::device::{DeviceBudget, total_bytes};
+use crate::capacity::plan::{LatentPlan, Plan, Report, TokenFacts, TokenLayout, page_size};
+use crate::capacity::video::VideoCapacity;
+use crate::config::placement::Capability;
+use crate::config::placement::Components;
+use crate::config::{Device, WorkerConfig, WorkerLaunch};
+use crate::ffi::DType;
+use crate::parallel::world::World;
+use crate::runner::causal_lm::start::{TextBounds, reserved_bytes};
+use crate::runner::denoiser::VideoModel;
+use crate::runner::denoiser::image_model::ImageModel;
+use crate::runner::diffusion_lm::{self};
+use crate::runner::encoder::EncoderInfo;
+use crate::runner::start::reserved_bytes as image_reserved_bytes;
+use crate::storage::{CachePlan, GroupShape, PrefixCache};
+use crate::{Error, Result};
+
+/// Block-table width that holds the longest admitted sequence in every
+/// group.
+pub(super) fn cache_width(shapes: &[GroupShape], max_sequence_tokens: usize) -> u32 {
+    shapes
+        .iter()
+        .map(|shape| shape.resident_width(max_sequence_tokens as u64))
+        .max()
+        .unwrap_or(1)
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+/// Report the planned capacity once, for operators.
+pub(super) fn log_capacity(config: &WorkerConfig, plan: &Plan) {
+    let info = &plan.info;
+    let prefix_cache = info.prefix_cache.as_ref().map_or_else(
+        || "no cache pool".to_owned(),
+        |cache| {
+            format!(
+                "{} cache units of {} bytes in {} groups",
+                cache.num_units,
+                cache.unit_bytes,
+                cache.groups.len()
+            )
+        },
+    );
+    tracing::info!(
+        "planned capacity: {prefix_cache}, KV page size {} tokens, {} request slots, {} calls and {} tokens per batch, {} latent pages, {} buffer pool bytes",
+        config.block_size.unwrap_or(0),
+        info.request_slots,
+        info.max_batch_calls,
+        info.max_batch_tokens,
+        info.latent_pages,
+        info.buffer_pool_bytes,
+    );
+}
+
+/// Bytes of the largest vision feature product the image policy admits: the
+/// feature rows of its largest image at the vision encoder's output width.
+/// Zero for a model without a vision encoder or an understanding transform.
+fn vision_feature_bytes(model: &LoadedModel, model_dtype: &str) -> Result<u64> {
+    let declarations = &model.declarations;
+    let Some(call) = declarations
+        .names()
+        .flat_map(|name| declarations.calls(name))
+        .find(|call| call.is(Capability::PatchEncoder))
+    else {
+        return Ok(0);
+    };
+    let dtype = DType::from_name(model_dtype)
+        .ok_or_else(|| Error::Unsupported(format!("unsupported model dtype {model_dtype:?}")))?;
+    let EncoderInfo::Vision(vision) = EncoderInfo::describe(model.handle(), &call.path, dtype)?
+    else {
+        return Ok(0);
+    };
+
+    // The encoder merges `downsample` patches on each axis into one feature.
+    let rows = u64::from(vision.image_patches / (vision.downsample * vision.downsample));
+    Ok(rows * u64::from(vision.output_size) * vision.output_dtype.bytes() as u64)
+}
+
+/// Resolve the rank's capacity on the loaded model.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the loaded rank's owners that capacity planning reads"
+)]
+pub(super) fn plan(
+    launch: &WorkerLaunch,
+    config: &mut WorkerConfig,
+    model: &LoadedModel,
+    image: &ImageModel,
+    world: &World,
+    budget: Option<&DeviceBudget>,
+    components: &Components,
+    unit_columns: usize,
+    video: Option<&VideoModel>,
+) -> Result<(Plan, Option<VideoCapacity>)> {
+    let device = config.device;
+    if let (Device::Cuda(index), Some(budget)) = (device, budget) {
+        config.pool_storage_bytes = Some(
+            budget
+                .budget(index, config.cache_storage_fraction)?
+                .available as usize,
+        );
+    }
+
+    let declarations = &model.declarations;
+    let text = declarations.has(Capability::CausalLm);
+    let prefix_cache_dtype = config.prefix_cache_dtype.clone();
+    let block_size = page_size(
+        config.block_size,
+        |size| {
+            if text {
+                CachePlan::reads_pages(
+                    model.handle(),
+                    &model.attention_backend,
+                    size,
+                    prefix_cache_dtype.as_deref(),
+                )
+            } else {
+                Ok(true)
+            }
+        },
+        &world.host,
+    )?;
+    config.block_size = Some(block_size);
+
+    let dedicated = config.role == "experts";
+    let held: Vec<&str> = launch.components.keys().map(String::as_str).collect();
+    let supported: Vec<CallKind> = if dedicated {
+        Vec::new()
+    } else {
+        let declared = declarations.supported(&held);
+        CallKind::ALL
+            .into_iter()
+            .filter(|kind| declared.contains(kind) && launch.supported_calls.contains(kind))
+            .collect()
+    };
+    if supported.is_empty() && !dedicated {
+        return Err(Error::Unsupported(
+            "worker model implements none of the requested call kinds".into(),
+        ));
+    }
+    let media_components = if dedicated {
+        BTreeMap::new()
+    } else {
+        declarations
+            .routes(&held)?
+            .into_iter()
+            .filter(|(kind, _)| supported.contains(&CallKind::Media(*kind)))
+            .collect()
+    };
+    let capacity = match video {
+        Some(video) => {
+            let sampling = launch.components.contains_key(&video.denoiser);
+            let denoising = components.get(&video.denoiser).is_some();
+            let decoding = components
+                .placed()
+                .iter()
+                .any(|placed| placed.has(Capability::VideoDecoder));
+            Some(crate::capacity::video::plan(
+                video, config, sampling, denoising, decoding,
+            )?)
+        }
+        None => None,
+    };
+    let infos: Vec<ComponentInfo> = launch
+        .components
+        .iter()
+        .map(
+            |(name, config): (&String, &ComponentConfig)| ComponentInfo {
+                name: name.clone(),
+                config: config.clone(),
+                // Only a video model's components publish products.
+                outputs: capacity
+                    .as_ref()
+                    .and_then(|capacity| capacity.outputs.get(name).cloned())
+                    .unwrap_or_default(),
+            },
+        )
+        .collect();
+    let fabric_handles = match device {
+        Device::Cuda(cuda) => HandleType::probe(cuda)? == HandleType::Fabric,
+        Device::Cpu => false,
+    };
+    let report = Report {
+        model_name: model.model_name.clone(),
+        endpoint: endpoint(&launch.worker_id, config.rank)?,
+        device: config.device.to_string(),
+        transfer_backends: launch.data_plane.backends.clone(),
+        device_exports: exports_device_products(launch),
+        fabric_handles,
+        attention_backend: model.attention_backend.clone(),
+        supported_calls: supported,
+        media_components,
+        components: infos,
+        weight_formats: model.weight_formats()?,
+        activation_formats: model.activation_formats()?,
+    };
+    if let (Some(video), Some(capacity)) = (video, capacity) {
+        let plan = video_layout(
+            report,
+            config,
+            launch,
+            declarations,
+            components,
+            video,
+            &capacity,
+            budget,
+            &world.host,
+        )?;
+        return Ok((plan, Some(capacity)));
+    }
+
+    let element_bytes = DType::from_name(&config.model_dtype)
+        .map(DType::bytes)
+        .ok_or_else(|| {
+            Error::Unsupported(format!("unsupported latent dtype {:?}", config.model_dtype))
+        })?;
+    // The longest image sequence an image denoiser accepts, in latent rows.
+    let image_tokens = image
+        .denoiser
+        .map_or(0, |layout| layout.max_sequence_tokens as usize);
+    let latent = image.denoiser.map(|layout| {
+        LatentPlan::image(
+            config.max_request_pool_size,
+            image_tokens,
+            config.cache_token_capacity,
+            block_size,
+            layout.width() as usize,
+            element_bytes,
+        )
+    });
+    let token_facts = TokenFacts {
+        image_processor: image.processing.is_some(),
+        vision_feature_bytes: vision_feature_bytes(model, &config.model_dtype)?,
+        latent_feature_bytes: latent.map_or(0, |plan| {
+            image_tokens as u64 * plan.latent_width as u64 * element_bytes as u64
+        }),
+        latent,
+    };
+    let mut layout = TokenLayout::new(report, config, launch.ipc.queue_depth, &token_facts)?;
+    // Every rank of a worker holding a causal LM component keeps the same
+    // cache pool, including ranks that hold only its other components: the
+    // worker advertises token work for all of its ranks, and they agree on
+    // one pool capacity.
+    let holds_text = held.iter().any(|name| {
+        declarations
+            .calls(name)
+            .iter()
+            .any(|call| call.is(Capability::CausalLm))
+    });
+    let cache = if text && !dedicated && holds_text {
+        let cache = CachePlan::plan(model.handle(), block_size, prefix_cache_dtype.as_deref())?;
+        let total = match device {
+            Device::Cuda(index) => total_bytes(index)?,
+            Device::Cpu => 0,
+        };
+        // The cache's fixed storage beside its units: block tables, import
+        // scratch and one unit index column per import worker and lane.
+        let shapes = cache.group_shapes()?;
+        let width = cache_width(&shapes, config.max_sequence_tokens);
+        let import_capacity = layout.info().max_unresolved_calls as usize;
+        let fixed = PrefixCache::fixed_bytes(
+            &cache,
+            0,
+            layout.info().request_slots,
+            width,
+            import_capacity,
+            unit_columns,
+        )?;
+        layout.reserve(config.device, fixed);
+        // The text runners' columns and the slot continuation state.
+        layout.reserve(
+            config.device,
+            reserved_bytes(
+                model,
+                config,
+                layout.info().request_slots as usize,
+                &cache,
+                image.processing.is_some(),
+                unit_columns,
+            )?,
+        );
+        // The image denoiser's columns and the image decoder's staging.
+        if image.denoiser.is_some() {
+            layout.reserve(
+                config.device,
+                image_reserved_bytes(
+                    config,
+                    layout.info().request_slots as usize,
+                    image.denoiser.as_ref(),
+                ),
+            );
+        }
+        // The diffusion LM runners' buffers, banks and sampler workspaces.
+        layout.reserve(
+            config.device,
+            diffusion_lm::reserved_bytes(
+                model,
+                components,
+                expert_exchange(launch),
+                config,
+                layout.info().request_slots as usize,
+                &cache,
+            )?,
+        );
+        let columns = PrefixCache::import_workers(import_capacity) + unit_columns;
+        layout.fit_cache(&cache, 8 * columns as u64, config, total, &world.host)?;
+        Some(Arc::new(cache))
+    } else {
+        None
+    };
+    let mut plan = layout.finish(config, cache);
+    if let (Some(cache), Some(info)) = (&plan.cache, &plan.info.prefix_cache) {
+        // Batches never exceed the largest captured graph bucket.
+        let bounds = TextBounds::new(
+            config,
+            plan.info.request_slots as usize,
+            cache,
+            Some(info.num_units),
+            device.is_cuda(),
+        )?;
+        let (prefill, decode) = bounds.graph_calls();
+        plan.bound_graph_calls(prefill, decode);
+    }
+    Ok((plan, None))
+}
+
+/// The layout of a video rank: request slots sized by every rank's storage
+/// for that many resident requests, agreed over the group.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the placement, model and capacity facts a video rank's layout reads"
+)]
+fn video_layout(
+    report: Report,
+    config: &mut WorkerConfig,
+    launch: &WorkerLaunch,
+    declarations: &crate::config::placement::Declarations,
+    components: &Components,
+    video: &VideoModel,
+    capacity: &VideoCapacity,
+    budget: Option<&DeviceBudget>,
+    group: &crate::parallel::host::HostGroup,
+) -> Result<Plan> {
+    let queue_depth = launch.ipc.queue_depth;
+    let deployment: Vec<&str> = if config.deployment_components.is_empty() {
+        launch.components.keys().map(String::as_str).collect()
+    } else {
+        config
+            .deployment_components
+            .iter()
+            .map(String::as_str)
+            .collect()
+    };
+    let routes = declarations.routes(&deployment)?;
+    let held: std::collections::BTreeSet<String> = components
+        .placed()
+        .iter()
+        .map(|placed| placed.name.clone())
+        .collect();
+    let local = crate::capacity::video::local_product_bytes(&capacity.outputs, &routes, &held);
+    let codec_ranks = launch
+        .components
+        .get("video_codec")
+        .map(|component| component.ranks.len());
+    if let (Device::Cuda(index), Some(budget)) = (config.device, budget) {
+        let available = budget
+            .budget(index, config.cache_storage_fraction)?
+            .available;
+        let maximum = config.max_request_pool_size;
+        let minimum = config.min_request_pool_size.min(maximum).max(1);
+        let facts = capacity.facts(video, maximum, local, codec_ranks)?;
+        let requirements = crate::capacity::plan::slot_requirements(
+            config,
+            queue_depth,
+            &facts,
+            exports_device_products(launch),
+            minimum,
+            maximum,
+        )?;
+        let slots = crate::capacity::plan::request_slots(&requirements, minimum, available, group)?;
+        config.max_request_pool_size = slots;
+        config.max_batch_calls = config.max_batch_calls.min(slots);
+        config.max_batch_tokens = config.max_batch_tokens.min(slots);
+    }
+    let facts = capacity.facts(video, config.max_request_pool_size, local, codec_ranks)?;
+    crate::capacity::plan::request_layout(
+        report,
+        config,
+        queue_depth,
+        &facts,
+        components.holds_host(),
+    )
+}

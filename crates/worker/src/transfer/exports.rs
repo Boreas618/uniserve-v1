@@ -186,7 +186,7 @@ impl Exports {
 fn discard(staged: impl IntoIterator<Item = (Arc<Transport>, Staged)>) {
     for (transport, export) in staged {
         if let Err(cleanup) = transport.discard(export) {
-            tracing::warn!(target: "uniserve_worker.transfer", "failed to give up a staged export: {cleanup}");
+            tracing::warn!("failed to give up a staged export: {cleanup}");
         }
     }
 }
@@ -195,7 +195,7 @@ fn discard(staged: impl IntoIterator<Item = (Arc<Transport>, Staged)>) {
 /// reported.
 fn revoke(locations: &[Location]) {
     if let Err(cleanup) = release(locations) {
-        tracing::warn!(target: "uniserve_worker.transfer", "failed to revoke an export after a failed export: {cleanup}");
+        tracing::warn!("failed to revoke an export after a failed export: {cleanup}");
     }
 }
 

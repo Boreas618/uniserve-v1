@@ -40,6 +40,7 @@
 //! which starts the lanes and closes every stream in dependency order.
 
 mod job;
+mod queue;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,8 +55,9 @@ use crate::ffi::Interpreter;
 use crate::stream::CUDAStream;
 use crate::{Error, Result, lock};
 
+pub(crate) use job::Completion;
 pub(crate) use job::{Capture, ExpertStep, ExpertVariant, Job, Recorder, Value};
-pub(crate) use job::{Completion, JobId, JobQueue};
+pub(crate) use queue::{JobId, JobQueue};
 
 /// One execution lane.
 pub(crate) struct Lane {
@@ -434,7 +436,7 @@ impl JobQueues {
         let id = self.name();
         let method = calls.method();
         let wake = if wake { self.wake().clone() } else { None };
-        let post = job::Post::new(id, self.shared.posted.clone(), wake);
+        let post = queue::Post::new(id, self.shared.posted.clone(), wake);
         Interpreter::submit(move || post.now(calls.perform()));
         // The Python thread is the performer after the lanes.
         self.submitted(self.shared.queues.len(), id, method);

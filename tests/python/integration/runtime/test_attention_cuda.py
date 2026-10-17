@@ -10,7 +10,7 @@ from uniserve_kernels.attention.merge import merge_attention_states
 
 from uniserve.backends.attention import flashinfer, resolve
 from uniserve.backends.attention.torch import Backend as TorchBackend
-from uniserve.bindings.context import TensorBuffers
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.models import TextSize
 from uniserve.nn.attention import (
     DenseInput,

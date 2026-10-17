@@ -253,7 +253,7 @@ impl Read {
         if queued.is_err()
             && let Err(cleanup) = task.cancel(true)
         {
-            tracing::warn!(target: "uniserve_worker.transfer", "failed to withdraw a transfer read: {cleanup}");
+            tracing::warn!("failed to withdraw a transfer read: {cleanup}");
         }
         queued
     }
@@ -352,7 +352,7 @@ impl Drop for Read {
             }),
         );
         if let Err(error) = deferred {
-            tracing::warn!(target: "uniserve_worker.transfer", "failed to retire transfer read fences: {error}");
+            tracing::warn!("failed to retire transfer read fences: {error}");
         }
     }
 }
@@ -703,7 +703,7 @@ pub(crate) fn submit(
     })();
     if let Err(error) = submitted {
         if let Err(cleanup) = task.cancel(true) {
-            tracing::warn!(target: "uniserve_worker.transfer", "failed to withdraw a transfer read: {cleanup}");
+            tracing::warn!("failed to withdraw a transfer read: {cleanup}");
         }
         return Err(error);
     }
