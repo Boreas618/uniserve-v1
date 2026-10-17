@@ -75,6 +75,10 @@ class Operator:
     captured launch therefore needs rebuilt before every replay. A provider
     whose kernels read every length, offset and table on the device only
     checks its inputs in ``bind``.
+
+    ``plans`` holds the launch plans that the call sites of one execution
+    context share (see :meth:`Backend.prepare`); an operator without a
+    shared mapping keeps its own.
     """
 
     reads_retired_tables = False
@@ -91,6 +95,7 @@ class Operator:
         cache,
         workspace,
         window=None,
+        plans=None,
     ):
         if (
             min(num_heads, num_kv_heads, head_dim) < 1
@@ -111,6 +116,7 @@ class Operator:
         self.size = size
         self.cache = cache
         self.workspace = workspace
+        self.plans = {} if plans is None else plans
         self._closed = False
 
         if cache is not None and cache.key.shape[2:] != (
@@ -306,6 +312,9 @@ class Operator:
         self._closed = True
         self.cache = None
         self.workspace = {}
+        # Shared plans belong to their execution context, which releases
+        # them; the operator only drops its reference.
+        self.plans = {}
 
 
 class Backend:
@@ -323,6 +332,13 @@ class Backend:
     # flags between graph replays. Fixed-mask providers retain their causal
     # and non-causal graphs without capturing an unsupported mixed variant.
     device_causality = False
+
+    # Whether serving records this provider's calls in CUDA graphs. A
+    # provider whose captured calls compute their live rows from device
+    # lengths is captured; one whose captured calls grow with their rows and
+    # capacity is not, and a rank serving with it runs eagerly
+    # (``--graph-policy auto``).
+    captures = True
 
     def reads_pages(
         self,
@@ -367,7 +383,17 @@ class Backend:
         cache: mha.State | None,
         workspace: Mapping[str, torch_lib.Tensor],
         window: int | None = None,
+        plans: dict | None = None,
     ) -> Operator:
+        """Prepare one call site's operator.
+
+        ``plans`` is a mapping that every attention call site of one
+        execution context passes, so that a provider planning each batch on
+        the host keeps one plan per layer shape and batch signature for all
+        of them: the layers of a forward bind the same batch, and they run
+        serially on the context's stream. ``None`` keeps the operator's
+        plans to itself.
+        """
         return self.operator_class(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -377,6 +403,7 @@ class Backend:
             cache=cache,
             workspace=workspace,
             window=window,
+            plans=plans,
         )
 
 

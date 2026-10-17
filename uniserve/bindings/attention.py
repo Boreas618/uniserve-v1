@@ -68,6 +68,7 @@ class AttentionBinding:
         table=None,
         *,
         derive_host_lengths=True,
+        plans=None,
     ):
         self.module, self.backend, self.cache, self.size = (
             module,
@@ -77,6 +78,9 @@ class AttentionBinding:
         )
         self.table = table
         self.derive_host_lengths = derive_host_lengths
+        # Launch plans shared by the context's call sites (see
+        # ``Backend.prepare``).
+        self.plans = plans
         self.device, self.dtype, self.allocate = device, dtype, allocate
         self.pages = (
             None if cache is None else attention_backend.CachePages.of(cache)
@@ -161,7 +165,9 @@ class AttentionBinding:
         provider = attention_backend.resolve(self.backend, device=self.device)
         requirements = provider.workspace_buffers(**options)
         operator = provider.prepare(
-            **options, workspace=self.allocate(requirements, self.device)
+            **options,
+            workspace=self.allocate(requirements, self.device),
+            plans=self.plans,
         )
         self.operators[dtype] = operator
         self.providers[dtype] = provider.name

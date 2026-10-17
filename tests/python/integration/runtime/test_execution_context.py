@@ -218,6 +218,121 @@ def test_replay_binding_still_rejects_inputs_outside_the_captured_contract():
             context.bind_attention(batch((2, 3), scale=2), replay=True)
 
 
+@pytest.mark.gpu
+@torch.inference_mode()
+def test_every_layer_of_a_replayed_forward_reads_its_own_cache():
+    # Four layers read two cache tables (a and b of head dimension 64, c and
+    # d of 128) through a provider that plans each batch on the host. Each
+    # layer binds the forward's batch and must attend over its own keys and
+    # values, eagerly and when the captured forward replays new lengths.
+    device, dtype = "cuda:0", torch.bfloat16
+    names = ("a", "b", "c", "d")
+    dims = {name: 64 if name in "ab" else 128 for name in names}
+    module = nn.ModuleDict(
+        {name: Attention(4, 2, dims[name], cache_name=name) for name in names}
+    )
+    config = Config(
+        {name: mha.Config(2, dims[name], (0, 1), dtype) for name in names}
+    )
+    cache = UnitPool.allocate(config, num_units=8, block_size=16, device=device)
+    generator = torch.Generator(device=device).manual_seed(811)
+    # Per layer: queries of four heads, keys and values of two.
+    inputs = {
+        name: tuple(
+            torch.randn(
+                5,
+                heads,
+                dims[name],
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+            for heads in (4, 2, 2)
+        )
+        for name in names
+    }
+    outputs = {name: torch.empty_like(inputs[name][0]) for name in names}
+    stream = torch.cuda.Stream(device=device)
+    tables = sorted({cache.table(name) for name in names})
+
+    def entries(counts):
+        result = {}
+        for number, table in enumerate(tables):
+            pages = cache.groups[cache.tables[table].group].page_tokens
+            result[table] = PagedInput.from_blocks(
+                blocks=((1 + 2 * number,), (2 + 2 * number,)),
+                query_lengths=counts,
+                prefix_lengths=(0, 0),
+                block_size=pages,
+                causal=True,
+                device=device,
+            )
+        return result
+
+    # The captured batch keeps its device tensors; its host lengths are
+    # derived from them at every binding.
+    captured = entries((2, 3))
+    first = captured[tables[0]]
+    queries = replace(first.queries, host=None)
+    prefixes = replace(first.prefixes, host=None)
+    captured = {
+        table: replace(entry, queries=queries, prefixes=prefixes)
+        for table, entry in captured.items()
+    }
+    attention = AttentionBatch(captured, queries)
+
+    def forward():
+        for name in names:
+            q, k, v = inputs[name]
+            module[name](q, k, v, attention, out=outputs[name])
+
+    with ExecutionContext(
+        module, cache=cache, attention="flashinfer", stream=stream
+    ) as context:
+        context.prepare(TextSize(5, 2))
+        context.bind_attention(attention)
+        forward()
+        graph = cuda_graph.capture(forward, stream=stream)
+        try:
+            for counts in ((2, 3), (4, 1), (1, 4)):
+                changed = entries(counts)
+                fresh = changed[tables[0]].queries
+                queries.values.copy_(fresh.values)
+                queries.offsets.copy_(fresh.offsets)
+                for table, entry in captured.items():
+                    entry.write_indices.copy_(changed[table].write_indices)
+                for _, _, v in inputs.values():
+                    v.mul_(0.75)
+                context.bind_attention(attention)
+                graph.replay()
+                stream.synchronize()
+                for name in names:
+                    expected = [
+                        F.scaled_dot_product_attention(
+                            q.transpose(0, 1).double(),
+                            k.transpose(0, 1).double(),
+                            v.transpose(0, 1).double(),
+                            is_causal=True,
+                            enable_gqa=True,
+                        )
+                        .transpose(0, 1)
+                        .to(dtype)
+                        for q, k, v in zip(
+                            *(value.split(counts) for value in inputs[name]),
+                            strict=True,
+                        )
+                    ]
+                    torch.testing.assert_close(
+                        outputs[name],
+                        torch.cat(expected),
+                        rtol=2e-2,
+                        atol=2e-2,
+                    )
+        finally:
+            stream.synchronize()
+            graph.release()
+
+
 class _SelfAttention(nn.Module):
     def __init__(self, device="cpu", dtype=torch.float32):
         super().__init__()

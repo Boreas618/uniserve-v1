@@ -652,7 +652,7 @@ fn execution(
         prefill_outputs: descriptor.prefill_outputs,
         flow_cuda_graph: descriptor.flow_cuda_graph,
         graph_policy: descriptor.graph_policy.clone(),
-        attention_backend: Some(descriptor.attention_backend.clone()),
+        attention_backend: descriptor.attention_backend,
         block_size: positive(descriptor.block_size.map(u64::from))?,
         cache_token_capacity: positive(descriptor.cache_token_capacity)?,
         prefix_cache_dtype,

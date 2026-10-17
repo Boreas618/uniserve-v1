@@ -138,7 +138,7 @@ impl Worker {
     /// Build the rank. On failure, everything built so far is released;
     /// the process world is abandoned, because peers may still be inside a
     /// collective.
-    pub(crate) fn start(launch: WorkerLaunch) -> std::result::Result<Self, WorkerError> {
+    pub(crate) fn start(mut launch: WorkerLaunch) -> std::result::Result<Self, WorkerError> {
         let device = launch.device();
         let context = match device {
             Device::Cuda(cuda) => {
@@ -166,11 +166,10 @@ impl Worker {
                 .map_err(phase("process groups"))?;
         }
 
-        let mut config = launch.execution.clone();
         let components = Components::new(
             &description.declarations,
             &launch.components,
-            config.rank,
+            launch.execution.rank,
             device,
             |name| world.meshes(name),
         );
@@ -196,14 +195,18 @@ impl Worker {
                 attention_ranks: union.attention_ranks,
                 dedicated,
             });
-        if description.video_decoder {
+        let loading = range(c"uniserve.worker.load", None);
+        let model = LoadedModel::load(description, &launch, meshes, experts, host_only)
+            .map_err(phase("load"))?;
+        // Every later graph decision of the rank reads the resolved policy.
+        launch.execution.graph_policy =
+            graph_policy(&launch.execution.graph_policy, &model).map_err(phase("load"))?;
+        let mut config = launch.execution.clone();
+        if model.video_decoder {
             config = config
                 .for_media_slots(launch.ipc.queue_depth)
                 .map_err(phase("load"))?;
         }
-        let loading = range(c"uniserve.worker.load", None);
-        let model = LoadedModel::load(description, &launch, meshes, experts, host_only)
-            .map_err(phase("load"))?;
         let image = ImageModel::describe(model.handle()).map_err(phase("load"))?;
         let video = if model.video_decoder {
             let denoiser = placed_denoiser(&model.declarations, &config.deployment_components)
@@ -1293,6 +1296,31 @@ fn plan(
         plan.bound_graph_calls(prefill, decode);
     }
     Ok((plan, None))
+}
+
+/// The graph policy a rank serves with.
+///
+/// `auto` captures CUDA graphs when serving captures the loaded attention
+/// provider's calls (`uniserve.backends.attention.Backend.captures`) and
+/// otherwise serves every call eagerly; `full` requires that capture; `off`
+/// never captures. Every rank of a group loads the same provider, so the
+/// group resolves one policy and captures the same shapes.
+fn graph_policy(configured: &str, model: &LoadedModel) -> Result<String> {
+    if model.attention_captures || configured == "off" {
+        return Ok(configured.to_owned());
+    }
+    if configured == "full" {
+        return Err(Error::Unsupported(format!(
+            "graph policy full requires an attention provider whose calls serving captures; the {} provider's are not",
+            model.attention_backend
+        )));
+    }
+    tracing::info!(
+        target: "uniserve_worker.launch",
+        "graph policy auto serves every call eagerly: the {} attention provider's calls are not captured",
+        model.attention_backend
+    );
+    Ok("off".to_owned())
 }
 
 /// Whether the rank publishes device products over CUDA VMM.

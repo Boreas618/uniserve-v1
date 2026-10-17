@@ -313,10 +313,18 @@ class _PagePlan:
                 "causal": count,
             }
         self._uploads = _Uploads(self.wrapper, lengths)
+        # Host metadata of the last completed plan.
+        self._planned: tuple | None = None
 
     def bind(self, owner, queries, keys, table, *, causal):
         # Host page counts and last-page lengths come from declared lengths;
         # physical page IDs are refreshed on device by fill().
+        metadata = (tuple(queries), tuple(keys), tuple(causal))
+        if metadata == self._planned:
+            # Every layer of a forward binds the same batch: the first one
+            # plans it, and the plan's device metadata already holds it.
+            return
+        self._planned = None
         counts = tuple(
             (length + table.block_size - 1) // table.block_size
             for length in keys
@@ -403,6 +411,7 @@ class _PagePlan:
                 self.causal.copy_(tensors["causal"], non_blocking=True)
         finally:
             self._uploads.release(upload)
+        self._planned = metadata
 
     def fill(self, table):
         """Refresh device page IDs from the current block table."""
@@ -572,6 +581,8 @@ class _RaggedPlan:
         if custom:
             lengths |= {"mask_offsets": self.count + 1, "causal": self.count}
         self._uploads = _Uploads(self.wrapper, lengths)
+        # Host metadata of the last completed plan.
+        self._planned: tuple | None = None
 
     def bind(self, owner, batch):
         queries, keys = batch.queries.host, batch.keys.host
@@ -580,6 +591,11 @@ class _RaggedPlan:
             if isinstance(batch, VarlenInput)
             else (False,) * self.count
         )
+        metadata = (tuple(queries), tuple(keys), tuple(causal))
+        if metadata == self._planned:
+            # Another layer of this forward planned the same batch.
+            return
+        self._planned = None
         upload = self._uploads.acquire()
         try:
             host, tensors = upload.arrays, upload.tensors
@@ -682,7 +698,20 @@ class _FlashInfer(_Operator):
             )
         self._single = flashinfer.single_prefill_with_kv_cache
         self._merge = flashinfer.merge_state
-        self._plans = {}
+        # Plans are shared (``plans``) by every operator of the same layer
+        # shape, configuration and float workspace: their native wrappers
+        # depend only on the batch's metadata, which every layer of a
+        # forward binds identically, and those layers run serially on the
+        # workspace's stream.
+        self._layer = (
+            "flashinfer",
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.dtype,
+            self.config,
+            self.workspace["scratch"].data_ptr(),
+        )
         self._paged = self._ragged = self._current = None
 
     def _page_plan(self, queries, keys, table, *, causal, custom=False):
@@ -692,6 +721,7 @@ class _FlashInfer(_Operator):
         # The cache key pins layout, table identity, and mode so captured
         # plans are only reused for replay-compatible invocations.
         signature = (
+            *self._layer,
             "paged",
             len(queries),
             sum(queries),
@@ -702,12 +732,12 @@ class _FlashInfer(_Operator):
             custom,
             False if custom else all(causal),
         )
-        plan = self._plans.get(signature)
+        plan = self.plans.get(signature)
         if plan is None:
             plan = _PagePlan(
                 self, queries=queries, table=table, decode=decode, custom=custom
             )
-            self._plans[signature] = plan
+            self.plans[signature] = plan
         plan.bind(self, queries, keys, table, causal=causal)
         return plan
 
@@ -718,6 +748,7 @@ class _FlashInfer(_Operator):
             else not batch.fully_visible
         )
         signature = (
+            *self._layer,
             "ragged",
             len(batch.queries.host),
             batch.queries.num_tokens,
@@ -727,10 +758,10 @@ class _FlashInfer(_Operator):
             if isinstance(batch, VarlenInput) and not custom
             else False,
         )
-        plan = self._plans.get(signature)
+        plan = self.plans.get(signature)
         if plan is None:
             plan = _RaggedPlan(self, batch, custom=custom)
-            self._plans[signature] = plan
+            self.plans[signature] = plan
         plan.bind(self, batch)
         return plan
 
@@ -915,7 +946,6 @@ class _FlashInfer(_Operator):
 
     def close(self):
         self._paged = self._ragged = self._current = None
-        self._plans.clear()
         super().close()
 
 
