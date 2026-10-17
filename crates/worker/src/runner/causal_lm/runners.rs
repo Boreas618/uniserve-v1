@@ -110,8 +110,9 @@ pub(crate) struct CausalLMRunners {
     pub(super) collectives: Vec<crate::parallel::StreamCollectives>,
     /// The unit reset column of each runner's stream.
     pub(super) columns: Vec<UnitColumn>,
-    /// The group serving each component's call kind.
-    pub(super) routes: HashMap<(String, CallKind), usize>,
+    /// The group serving each call kind of each component, looked up by the
+    /// component's name.
+    pub(super) routes: HashMap<String, HashMap<CallKind, usize>>,
     pub(super) state: DecodeState,
     pub(super) outputs: OutputPool,
     /// Global vocabulary of sampling.
@@ -123,7 +124,7 @@ pub(crate) struct CausalLMRunners {
 
 impl CausalLMRunners {
     pub(super) fn route(&self, component: &str, kind: CallKind) -> Option<usize> {
-        self.routes.get(&(component.to_owned(), kind)).copied()
+        self.routes.get(component)?.get(&kind).copied()
     }
 
     /// Seal every runner's graphs.
@@ -230,7 +231,7 @@ impl CausalLMRunners {
             let staged = stage(&self.runners[runner], request)?;
             let then = Job::new();
             let mode = self.runners[runner].forward(&staged, None, true, job, &then)?;
-            self.runners[runner].select(&staged, job)?;
+            self.runners[runner].select(&staged, request, job)?;
             job.append(then);
             return Ok(Step {
                 group,
@@ -279,14 +280,14 @@ impl CausalLMRunners {
         }
         let replay = experts.replays();
         let mut after = Vec::with_capacity(peers.len());
-        for (&runner, staged) in peers.iter().zip(&staged) {
-            after.push(match staged {
-                Some(staged) => {
+        for ((&runner, staged), request) in peers.iter().zip(&staged).zip(requests) {
+            after.push(match (staged, request) {
+                (Some(staged), Some(request)) => {
                     let selection = Job::new();
-                    self.runners[runner].select(staged, &selection)?;
+                    self.runners[runner].select(staged, request, &selection)?;
                     Some(selection)
                 }
-                None => None,
+                _ => None,
             });
         }
         let mut variants = Vec::with_capacity(capacities.len());
@@ -359,9 +360,9 @@ impl CausalLMRunners {
             .find(|(variant, _)| *variant == capacity)
             .ok_or_else(|| Error::Invariant("an expert step ran at an unplanned capacity".into()))?
             .1;
-        let peers = self.groups[step.group].clone();
-        let mut executed = Vec::with_capacity(peers.len());
-        for ((&runner, staged), mode) in peers.iter().zip(step.staged).zip(modes) {
+        let mut executed = Vec::with_capacity(step.staged.len());
+        for ((peer, staged), mode) in step.staged.into_iter().enumerate().zip(modes) {
+            let runner = self.groups[step.group][peer];
             executed.push(match (staged, mode) {
                 (Some(staged), Some(mode)) => {
                     Some(self.runners[runner].complete(staged, capacity, mode, completion)?)
@@ -375,9 +376,10 @@ impl CausalLMRunners {
     /// A call kind `group` serves, which names the lane its jobs run on.
     pub(crate) fn kind(&self, group: usize) -> Result<CallKind> {
         self.routes
-            .iter()
+            .values()
+            .flatten()
             .find(|(_, routed)| **routed == group)
-            .map(|((_, kind), _)| *kind)
+            .map(|(kind, _)| *kind)
             .ok_or_else(|| Error::Invariant("a text runner group serves no call kind".into()))
     }
 
@@ -772,9 +774,9 @@ fn reserve<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, 
         // batch's order in it.
         Err(error) => return (None, Pending::Failed(failed(error))),
     };
-    let rows = batch.reserve().map_err(&failed).and_then(|()| {
+    let rows = batch.reserve().map_err(&failed).and_then(|forward_rows| {
         if batch.batch.calls.iter().any(|state| state.active) {
-            batch.rows().map(Some).map_err(&failed)
+            batch.rows(&forward_rows).map(Some).map_err(&failed)
         } else {
             Ok(None)
         }

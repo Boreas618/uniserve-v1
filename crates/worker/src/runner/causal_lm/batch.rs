@@ -14,11 +14,14 @@
 //! recorded in the batch's job. A batch is a sequence of jobs, and between
 //! two of them it is [`Parked`], which borrows nothing.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{Batch as BatchPlan, DType, ForwardMode, RequestKey, TensorRef};
+use uniserve_ipc::{
+    Batch as BatchPlan, BlockTable, DType, ForwardMode, RequestKey, ShapeBound, TensorRef,
+};
 
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, CausalLMRunners};
@@ -51,6 +54,52 @@ pub(crate) struct TokenCall {
     pub(super) controls: Option<SamplingControls>,
     /// The call's prompt chunks, in order.
     pub(super) prompt: Vec<super::step::PromptScore>,
+}
+
+/// A batch plan's forward rows grouped by the call they belong to, each
+/// call's rows in row order: a counting sort of the rows' call indices.
+pub(super) struct ForwardRows {
+    /// Row indices, call by call.
+    rows: Vec<usize>,
+    /// Where each call's rows start in `rows`, then where the last call's
+    /// end.
+    starts: Vec<usize>,
+}
+
+impl ForwardRows {
+    /// Group the rows of `call_indices` among `calls` calls. A row naming
+    /// no call is invalid.
+    fn new(call_indices: &[u32], calls: usize) -> Result<Self> {
+        // Each call's row count at `starts[call + 1]`, summed into where
+        // each call's rows start.
+        let mut starts = vec![0; calls + 1];
+        for &call in call_indices {
+            let call = call as usize;
+            if call >= calls {
+                return Err(Error::Invalid("forward row names no call".into()));
+            }
+            starts[call + 1] += 1;
+        }
+        for call in 0..calls {
+            starts[call + 1] += starts[call];
+        }
+        // Placing a call's rows advances its start to the next call's;
+        // shifting the starts up by one restores them.
+        let mut rows = vec![0; call_indices.len()];
+        for (row, &call) in call_indices.iter().enumerate() {
+            let next = &mut starts[call as usize];
+            rows[*next] = row;
+            *next += 1;
+        }
+        starts.copy_within(0..calls, 1);
+        starts[0] = 0;
+        Ok(Self { rows, starts })
+    }
+
+    /// The forward rows of call `call`, in row order.
+    pub(super) fn of(&self, call: usize) -> &[usize] {
+        &self.rows[self.starts[call]..self.starts[call + 1]]
+    }
 }
 
 /// The owners a token batch borrows while one of its jobs is prepared or
@@ -308,8 +357,9 @@ impl<'a> TokenBatch<'a> {
     }
 
     /// Install tables, reset units, retain cache extents, bind products and
-    /// lease relayed predicates of the active calls.
-    pub(super) fn reserve(&mut self) -> Result<()> {
+    /// lease relayed predicates of the active calls. Returns the batch's
+    /// forward rows, grouped by call.
+    pub(super) fn reserve(&mut self) -> Result<ForwardRows> {
         let stream = self.job.on(self.batch.stream.as_ref());
         let plan = self.plan;
         let prefix_cache = self
@@ -326,12 +376,20 @@ impl<'a> TokenBatch<'a> {
             .filter(|state| state.active)
             .map(|state| state.slot as u32)
             .collect();
-        let assignments: Vec<_> = plan
-            .block_tables
-            .iter()
-            .filter(|table| active.contains(&table.request_pool_idx))
-            .cloned()
-            .collect();
+        // The plan's tables are installed as they are when every one is an
+        // active call's, as in a batch that skipped no call.
+        let installed = |table: &BlockTable| active.contains(&table.request_pool_idx);
+        let assignments: Cow<'_, [BlockTable]> = if plan.block_tables.iter().all(installed) {
+            Cow::Borrowed(&plan.block_tables)
+        } else {
+            Cow::Owned(
+                plan.block_tables
+                    .iter()
+                    .filter(|&table| installed(table))
+                    .cloned()
+                    .collect(),
+            )
+        };
         prefix_cache.install(&assignments, stream)?;
         let units: Vec<u32> = plan
             .new_cache_units
@@ -350,16 +408,12 @@ impl<'a> TokenBatch<'a> {
         // capacity bound: its device state decides the visible length when
         // it executes.
         let forward = &plan.forward;
-        let mut rows: Vec<Vec<usize>> = vec![Vec::new(); plan.calls.len()];
-        for (row, &call) in forward.call_indices.iter().enumerate() {
-            rows.get_mut(call as usize)
-                .ok_or_else(|| Error::Invalid("forward row names no call".into()))?
-                .push(row);
-        }
-        for ((call, state), call_rows) in plan.calls.iter().zip(&self.batch.calls).zip(&rows) {
+        let rows = ForwardRows::new(&forward.call_indices, plan.calls.len())?;
+        for (index, (call, state)) in plan.calls.iter().zip(&self.batch.calls).enumerate() {
             if !state.active {
                 continue;
             }
+            let call_rows = rows.of(index);
             let (&first, rest) = call_rows
                 .split_first()
                 .ok_or_else(|| Error::Invalid("a token call has no forward row".into()))?;
@@ -406,7 +460,8 @@ impl<'a> TokenBatch<'a> {
         }
 
         self.bind_products()?;
-        self.lease_predicates()
+        self.lease_predicates()?;
+        Ok(rows)
     }
 
     /// Bind token relays of active calls and completion and transition flags
@@ -420,7 +475,7 @@ impl<'a> TokenBatch<'a> {
             .zip(&self.batch.calls)
             .map(|(call, state)| (call.request_key, state.slot))
             .collect();
-        let mut groups: indexmap::IndexMap<(DType, String), Vec<(TensorRef, MemoryKind)>> =
+        let mut groups: indexmap::IndexMap<(DType, &ShapeBound), Vec<(TensorRef, MemoryKind)>> =
             indexmap::IndexMap::new();
         for (call, state) in plan.calls.iter().zip(&self.batch.calls) {
             if !call.outputs.is_empty()
@@ -441,7 +496,7 @@ impl<'a> TokenBatch<'a> {
             {
                 // One relay group per dtype and shape.
                 groups
-                    .entry((scalar.dtype, format!("{:?}", scalar.shape_bound)))
+                    .entry((scalar.dtype, &scalar.shape_bound))
                     .or_default()
                     .push((scalar.clone(), target));
             }
@@ -513,6 +568,24 @@ impl<'a> TokenBatch<'a> {
                 self.job.on(self.batch.stream.as_ref()),
             )?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_rows_group_each_calls_rows_in_row_order() -> Result<()> {
+        // Rows of calls 2, 0, 2, 3, 0 among four calls; call 1 has none.
+        let rows = ForwardRows::new(&[2, 0, 2, 3, 0], 4)?;
+        assert_eq!(rows.of(0), &[1, 4]);
+        assert!(rows.of(1).is_empty());
+        assert_eq!(rows.of(2), &[0, 2]);
+        assert_eq!(rows.of(3), &[3]);
+
+        assert!(ForwardRows::new(&[0, 4], 4).is_err());
         Ok(())
     }
 }
