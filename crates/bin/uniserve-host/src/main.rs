@@ -13,9 +13,11 @@
 //!
 //! Its ranks never outlive it. An orderly end of supervision terminates them,
 //! and on Linux the kernel kills each rank when the launcher dies by any other
-//! means. Its log output is diagnostics only: a launcher is often started over
-//! an SSH session whose pipe closes before the deployment stops, and a failed
-//! log write must not end supervision.
+//! means. A rank is its child (`RankChild`), so each exit it reaps, reported
+//! or terminated, first removes the CUDA driver memory a rank that did not
+//! end in order left behind. Its log output is diagnostics only: a launcher
+//! is often started over an SSH session whose pipe closes before the
+//! deployment stops, and a failed log write must not end supervision.
 //!
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
@@ -27,17 +29,24 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::AsRawFd;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
+use uniserve_ipc::launch::RankChild;
 use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report, Reservation};
 use uniserve_ipc::{Channel, IpcError, Registration, VERSION};
 
 /// Bounds how long a rank's exit waits to be reported: exit reporting must
 /// not depend on another instruction arriving.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often a running rank's NCCL names are noted
+/// (`RankChild::note_nccl_segments`). A rank reports that it is ready to the
+/// head, not to its launcher, so the launcher notes them while the rank
+/// lives; its communicators exist from its startup on.
+const SEGMENT_NOTE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Spawns and supervises the ranks an instance places on this host.
 #[derive(Parser, Debug)]
@@ -59,9 +68,11 @@ type RankKey = (String, u32);
 
 /// One rank this launcher owns.
 struct Rank {
-    child: Child,
+    child: RankChild,
     /// The group generation the rank's spawn named.
     generation: u64,
+    /// When the rank's NCCL names were last noted.
+    noted: std::time::Instant,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -220,13 +231,13 @@ fn start_rank(
         uniserve_ipc::launch::inherit_listener(&mut command, listener);
     }
 
-    let child = command
-        .spawn()
+    let child = RankChild::spawn(&mut command)
         .with_context(|| format!("spawning rank {} with {}", spawn.rank, spawn.python))?;
     tracing::debug!(rank = spawn.rank, host = %args.host_identity, "spawned");
     Ok(Rank {
         child,
         generation: spawn.generation,
+        noted: std::time::Instant::now(),
     })
 }
 
@@ -262,12 +273,17 @@ fn die_with_launcher(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn die_with_launcher(_command: &mut Command) {}
 
-/// Reports every rank that has exited since the last report and stops
-/// supervising it. A rank whose exit status cannot be read is reported as
-/// exited.
+/// Notes the NCCL names of each running rank every
+/// [`SEGMENT_NOTE_INTERVAL`], and reports every rank that has exited since
+/// the last report and stops supervising it. A rank whose exit status cannot
+/// be read is reported as exited.
 fn report_exits(head: &mut Channel, ranks: &mut HashMap<RankKey, Rank>) -> anyhow::Result<()> {
     let mut exited = Vec::new();
     for (key, owned) in ranks.iter_mut() {
+        if owned.noted.elapsed() >= SEGMENT_NOTE_INTERVAL {
+            owned.noted = std::time::Instant::now();
+            let _ = owned.child.note_nccl_segments();
+        }
         let status = match owned.child.try_wait() {
             Ok(Some(status)) => status.to_string(),
             Ok(None) => continue,

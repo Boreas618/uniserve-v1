@@ -18,6 +18,13 @@ pub struct EventFlags {
     /// to record and cannot be interprocess.
     pub timing: bool,
     /// The event can be exported with [`Event::ipc_handle`].
+    ///
+    /// The driver backs a context's interprocess events with shared memory
+    /// that it removes only when the context is destroyed. Creating the
+    /// first one therefore arranges for the process's contexts to be
+    /// destroyed when it exits by `exit`
+    /// (`PrimaryContext::reset_all_at_exit`), so a process that ends that
+    /// way, once nothing uses a device, leaves none of it behind.
     pub interprocess: bool,
     /// During stream capture, records and waits become explicit graph nodes
     /// (`CU_EVENT_RECORD_EXTERNAL` / `CU_EVENT_WAIT_EXTERNAL`), so the
@@ -151,6 +158,15 @@ impl Event {
                         "cuEventCreate",
                     )
                 })?;
+                if self.flags.interprocess {
+                    // A process exits by `exit` only once its threads are
+                    // done with the devices: a test harness after its last
+                    // test, a Python interpreter after its finalization. A
+                    // rank never does. An unregistered handler only leaves
+                    // the memory behind, so the event is not failed for it.
+                    // SAFETY: as above.
+                    let _ = unsafe { PrimaryContext::reset_all_at_exit() };
+                }
                 slot.insert(Arc::new(EventHandle {
                     raw,
                     context: stream.context(),

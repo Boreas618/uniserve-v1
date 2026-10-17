@@ -13,7 +13,10 @@
 //! A rank's connection is its liveness: the head treats a rank whose
 //! connection has closed as dead. A rank whose lane stays inside one job
 //! reports it unasked (`WorkerResponse::Stalled`), and the head fails that
-//! rank as it fails a dead one.
+//! rank as it fails a dead one. A rank this head started is its child, a
+//! `RankChild`, so whichever path reaps it (an observed exit, a kill at a
+//! deadline, a termination) first removes the CUDA driver memory a rank that
+//! did not end in order left behind.
 //!
 //! The host exchanges batch descriptors and bounded result values while
 //! tensors, cache pages, and latent storage remain worker-resident.
@@ -24,7 +27,6 @@
 
 use crate::executor::WorkerResult;
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::process::Child;
 use std::time::{Duration, Instant};
 
 use super::BatchSubmitError;
@@ -33,6 +35,7 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uniserve_ipc::Channel;
+use uniserve_ipc::launch::RankChild;
 use uniserve_ipc::{
     Batch, DEFAULT_COMPONENT, ExpertParallelDescriptor, LaunchDescriptor, WorkerInfo,
     WorkerRequest, WorkerResponse,
@@ -430,7 +433,7 @@ pub(super) struct RankProcess {
     /// another host is started by that host's launcher and its process is
     /// never visible here; its exit surfaces through the channel once the
     /// connection closes, as a transport error from a receive.
-    child: Option<Child>,
+    child: Option<RankChild>,
     /// Most requests outstanding at once on the rank.
     depth: usize,
     rank: u32,
@@ -484,11 +487,11 @@ pub(super) struct PendingRank {
 
 /// The process of a launched rank that has not been adopted yet, when this
 /// engine started it.
-struct PendingChild(Option<Child>);
+struct PendingChild(Option<RankChild>);
 
 impl PendingChild {
     /// Hands the process to the adopting rank, which owns its termination.
-    fn release(mut self) -> Option<Child> {
+    fn release(mut self) -> Option<RankChild> {
         self.0.take()
     }
 }
@@ -657,7 +660,7 @@ impl PendingRank {
                 remote.deliver(rank, &args.python, &args.worker_id, generation, head, &cmd)?;
                 None
             }
-            None => Some(cmd.spawn().context("spawning the rank process")?),
+            None => Some(RankChild::spawn(&mut cmd).context("spawning the rank process")?),
         };
 
         Ok(Self {
@@ -778,7 +781,16 @@ impl RankProcess {
         let info = match response {
             WorkerResponse::Info { info, .. } => info,
             WorkerResponse::Error { error, .. } => {
-                bail!("Worker startup failed: {}", error.message)
+                tracing::error!(
+                    rank = self.rank,
+                    "rank failed during startup: {}",
+                    error.message
+                );
+                bail!(
+                    "rank {} failed during startup: {}",
+                    self.rank,
+                    error.message
+                )
             }
             WorkerResponse::Result { result, .. } => {
                 // Receiving claims any media the result published, so the
@@ -793,6 +805,14 @@ impl RankProcess {
         self.info = info;
         self.starting = false;
         tracing::info!(?self.info, "worker ready");
+        // Warmup and capture have connected every communicator of a ready
+        // rank, so the NCCL names it maps now are those its reaping removes
+        // should it die without destroying them.
+        if let Some(child) = self.child.as_mut()
+            && let Err(error) = child.note_nccl_segments()
+        {
+            tracing::debug!(rank = self.rank, %error, "the rank's NCCL names could not be noted");
+        }
         Ok(true)
     }
 
@@ -1076,7 +1096,10 @@ impl RankProcess {
         let mut acknowledgment = None;
         // A rank started elsewhere is never observed to have exited here, so
         // shutdown drains its channel as it would a live local rank.
-        let exited = matches!(self.child.as_mut().map(Child::try_wait), Some(Ok(Some(_))));
+        let exited = matches!(
+            self.child.as_mut().map(RankChild::try_wait),
+            Some(Ok(Some(_)))
+        );
         if !exited {
             // Bound response draining so shutdown can advance to graceful termination
             // and, if necessary, forced process cleanup.
@@ -1103,7 +1126,10 @@ impl RankProcess {
             }
 
             // A rank still running after the drain is asked to shut down.
-            if !matches!(self.child.as_mut().map(Child::try_wait), Some(Ok(Some(_)))) {
+            if !matches!(
+                self.child.as_mut().map(RankChild::try_wait),
+                Some(Ok(Some(_)))
+            ) {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
                 req.set_call_id(Some(message_id));
@@ -1206,7 +1232,13 @@ pub(super) fn finish_startup(ranks: &mut [&mut RankProcess]) -> anyhow::Result<(
 
         if last_worker_check.elapsed() >= WORKER_CHECK_INTERVAL {
             for rank in ranks.iter_mut() {
-                rank.check_worker("Worker startup")?;
+                if let Err(lost) = rank.check_worker("Worker startup") {
+                    // A rank that reported its failure before it exited is
+                    // named by its own error, which its connection may still
+                    // hold.
+                    rank.poll_startup()?;
+                    return Err(lost);
+                }
             }
             last_worker_check = Instant::now();
         }

@@ -372,3 +372,127 @@ fn a_closed_log_pipe_does_not_end_supervision() {
         status.unwrap()
     );
 }
+
+/// The stand-in rank module of `a_reaped_rank_leaves_no_event_memory`: it
+/// creates an interprocess event, as a rank does when it exports a device
+/// product, which makes the CUDA driver create shared memory named for this
+/// process, records its process id and waits to be killed.
+#[cfg(target_os = "linux")]
+const EVENT_HOLDER: &str = "\
+import ctypes, os, time
+cuda = ctypes.CDLL('libcuda.so.1')
+device, context, event = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_void_p()
+assert cuda.cuInit(0) == 0
+assert cuda.cuDeviceGet(ctypes.byref(device), 0) == 0
+assert cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device) == 0
+assert cuda.cuCtxPushCurrent_v2(context) == 0
+# CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS
+assert cuda.cuEventCreate(ctypes.byref(event), 2 | 4) == 0
+with open(os.environ['RANK_PID_FILE'] + '.tmp', 'w') as file:
+    file.write(str(os.getpid()))
+os.rename(os.environ['RANK_PID_FILE'] + '.tmp', os.environ['RANK_PID_FILE'])
+time.sleep(600)
+";
+
+/// The interprocess-event memory the driver created for process `pid`, by
+/// its name in `/dev/shm` (`cuda.shm.<uid in hex>.<pid in hex>.<n>`).
+#[cfg(target_os = "linux")]
+fn event_memory(pid: libc::pid_t) -> Vec<std::path::PathBuf> {
+    // SAFETY: getuid has no preconditions.
+    let prefix = format!("cuda.shm.{:x}.{pid:x}.", unsafe { libc::getuid() });
+    std::fs::read_dir("/dev/shm")
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Has the launcher behind `head` spawn rank 0 of `group` as the
+/// [`EVENT_HOLDER`] module, and returns its process id once its event memory
+/// exists, with that memory.
+#[cfg(target_os = "linux")]
+fn hold_event(
+    head: &mut Channel,
+    group: &str,
+    modules: &std::path::Path,
+) -> (libc::pid_t, Vec<std::path::PathBuf>) {
+    let pid_file = modules.join(format!("{group}.pid"));
+    let mut rank = spawn(group, 0, 7, "python3");
+    rank.environment = HashMap::from([
+        (
+            "PYTHONPATH".to_owned(),
+            modules.to_str().unwrap().to_owned(),
+        ),
+        (
+            "RANK_PID_FILE".to_owned(),
+            pid_file.to_str().unwrap().to_owned(),
+        ),
+    ]);
+    head.send(&Instruction::Spawn(Box::new(rank))).unwrap();
+
+    let mut held = None;
+    assert!(
+        eventually(|| {
+            held = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .map(|pid| (pid, event_memory(pid)))
+                .filter(|(_, memory)| !memory.is_empty());
+            held.is_some()
+        }),
+        "the rank of {group} created no event memory"
+    );
+    held.unwrap()
+}
+
+/// A rank killed outside the launcher cannot destroy its CUDA contexts, so
+/// the driver's interprocess-event memory named for it stays in `/dev/shm`.
+/// The launcher removes exactly that memory when it reaps the rank, before
+/// it reports the exit, and leaves a live rank's; a stop that kills a rank
+/// removes that rank's memory too.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_reaped_rank_leaves_no_event_memory() {
+    let (_launcher, mut head) = start_launcher();
+    // The package is regular so it shadows any installed worker package.
+    let modules = tempfile::tempdir().unwrap();
+    let package = modules.path().join("uniserve");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(package.join("__init__.py"), "").unwrap();
+    std::fs::write(package.join("worker.py"), EVENT_HOLDER).unwrap();
+    let (killed, killed_memory) = hold_event(&mut head, "killed", modules.path());
+    // Should the test fail, dropping the launcher kills both stand-ins.
+    let (_, live_memory) = hold_event(&mut head, "live", modules.path());
+
+    // SAFETY: signal delivery to a stand-in this test started.
+    assert_eq!(unsafe { libc::kill(killed, libc::SIGKILL) }, 0);
+    let report = exit(&mut head);
+    assert_eq!(
+        (report.worker_id.as_str(), report.generation, report.rank),
+        ("killed", 7, 0)
+    );
+    assert!(
+        report.status.contains("SIGKILL"),
+        "unexpected exit status {}",
+        report.status
+    );
+    assert!(
+        killed_memory.iter().all(|path| !path.exists()),
+        "{killed_memory:?} outlived its rank"
+    );
+    assert!(
+        live_memory.iter().all(|path| path.exists()),
+        "a live rank lost {live_memory:?}"
+    );
+
+    head.send(&Instruction::Stop {
+        worker_id: "live".into(),
+    })
+    .unwrap();
+    assert!(
+        eventually(|| live_memory.iter().all(|path| !path.exists())),
+        "{live_memory:?} outlived its stopped rank"
+    );
+}

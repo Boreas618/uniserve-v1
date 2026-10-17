@@ -96,6 +96,16 @@ impl RawHead {
         address: &str,
         descriptor: &LaunchDescriptor,
     ) -> anyhow::Result<(Self, std::process::Child)> {
+        Self::launch_with(address, descriptor, std::process::Stdio::inherit())
+    }
+
+    /// [`Self::launch`] with the rank's log output (its standard error) sent
+    /// to `log`.
+    fn launch_with(
+        address: &str,
+        descriptor: &LaunchDescriptor,
+        log: std::process::Stdio,
+    ) -> anyhow::Result<(Self, std::process::Child)> {
         let listener = uniserve_ipc::Listener::bind(&[address])?;
         let mut child = std::process::Command::new(worker_python())
             .args(["-m", "uniserve.worker"])
@@ -103,6 +113,7 @@ impl RawHead {
             .args(["--worker-id", &descriptor.worker_id])
             .args(["--rank", &descriptor.rank.to_string()])
             .args(["--generation", "1"])
+            .stderr(log)
             .spawn()?;
         let registered = (|| -> anyhow::Result<Self> {
             // A worker that fails before registering never connects, so the
@@ -479,6 +490,98 @@ fn a_rank_exits_when_its_head_closes_the_connection() -> anyhow::Result<()> {
     exits_with_failure(child)
 }
 
+/// Runs one stub rank under `descriptor` that is sent a prefill of `token`,
+/// then loses its head once the forward was answered, or, for the stub's
+/// stalling token, once the stalled job was reported. Returns the rank's
+/// exit status, which it must reach within 30 seconds, and its log.
+fn lose_head(
+    directory: &Path,
+    descriptor: &LaunchDescriptor,
+    name: &str,
+    token: u32,
+) -> anyhow::Result<(std::process::ExitStatus, String)> {
+    use uniserve_ipc::{WorkerRequest, WorkerResponse};
+
+    let address = format!("unix:{}", directory.join(format!("{name}.sock")).display());
+    let log_path = directory.join(format!("{name}.log"));
+    let log = std::fs::File::create(&log_path)?;
+    let (mut head, mut child) = RawHead::launch_with(&address, descriptor, log.into())?;
+    let served = (|| -> anyhow::Result<()> {
+        let admission = text_admission(81, 1, 1)?;
+        let mut request = WorkerRequest::submit(token_batch(
+            1,
+            1,
+            admission.request_key,
+            Some(admission),
+            CallId::new(1, 0),
+            CallKind::Forward(ForwardMode::Prefill),
+            &[token],
+            UnitId(1),
+            0,
+        ));
+        request.set_call_id(Some(1));
+        head.send(&request)?;
+        // A stalled job's report answers no request, so it carries no
+        // identity.
+        let stalling = token == STUB_STALL;
+        let answered = head
+            .response(if stalling { 0 } else { 1 }, Duration::from_secs(60))?
+            .context("the rank neither answered nor reported its job")?;
+        anyhow::ensure!(
+            matches!(
+                (&answered, stalling),
+                (WorkerResponse::Result { .. }, false) | (WorkerResponse::Stalled { .. }, true)
+            ),
+            "the rank answered with {answered:?}"
+        );
+        Ok(())
+    })();
+    drop(head);
+    let status = wait_exit(&mut child, Duration::from_secs(30));
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    served?;
+    Ok((status?, std::fs::read_to_string(log_path)?))
+}
+
+/// A serving rank whose head is lost ends by what it has in flight. With
+/// nothing in flight, as once its last batch was answered, it closes without
+/// its peers and destroys its device contexts; with a job stuck in flight,
+/// here a forward that never returns, it ends at once from its control
+/// thread, since its Python thread waits in that job. Either way it exits
+/// promptly with status 1 and names the path in its log.
+#[test]
+fn a_rank_without_its_head_closes_when_idle_and_ends_at_once_when_stuck() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let descriptor = LaunchDescriptor {
+        stall_bound_ms: 500,
+        ..stub_launch_descriptor()
+    };
+
+    let (status, log) = lose_head(directory.path(), &descriptor, "idle", 7)?;
+    anyhow::ensure!(
+        status.code() == Some(1),
+        "the idle rank ended with {status}"
+    );
+    anyhow::ensure!(
+        log.contains("the head's channel failed with nothing in flight"),
+        "the idle rank did not close orphaned:\n{log}"
+    );
+
+    let (status, log) = lose_head(directory.path(), &descriptor, "stuck", STUB_STALL)?;
+    anyhow::ensure!(
+        status.code() == Some(1),
+        "the stuck rank ended with {status}"
+    );
+    anyhow::ensure!(
+        log.contains("the head's channel failed with work in flight"),
+        "the stuck rank did not abandon its work:\n{log}"
+    );
+    Ok(())
+}
+
 /// A two-rank group reports its launch in its Info, retires finished
 /// requests, refuses a repeated batch, and once closed reports nothing and
 /// refuses work.
@@ -661,6 +764,27 @@ fn a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow::
     assert!(
         message.contains("47"),
         "the failure did not name the rank's exit: {message}"
+    );
+    Ok(())
+}
+
+/// A rank whose startup fails reports its own error to the head, which
+/// names the rank and returns that error: here a checkpoint that does not
+/// exist.
+#[test]
+fn a_failed_startup_reaches_the_head_with_the_ranks_error() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let missing = directory.path().join("no-such-checkpoint");
+    let mut args = single_rank_args("failing", QUEUE_DEPTH);
+    args.stub = false;
+    args.model = missing.display().to_string();
+    let Err(error) = WorkerGroup::spawn(args) else {
+        anyhow::bail!("a rank with a missing checkpoint started");
+    };
+    let message = format!("{error:#}");
+    anyhow::ensure!(
+        message.contains("rank 0 failed during startup") && message.contains("no-such-checkpoint"),
+        "the head did not return the rank's error: {message}"
     );
     Ok(())
 }

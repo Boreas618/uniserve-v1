@@ -77,6 +77,11 @@ pub enum Error {
     /// Deferred releases failed since the previous [`crate::reclaim::flush`].
     #[error("{failed} deferred CUDA releases failed; first failure: {first}")]
     Reclaim { failed: usize, first: Box<Error> },
+
+    /// `atexit` refused the handler of
+    /// [`crate::PrimaryContext::reset_all_at_exit`].
+    #[error("cannot register the exit handler that destroys the device contexts")]
+    ExitHandler,
 }
 
 /// `CUDA_ERROR_OUT_OF_MEMORY`: the call could not allocate enough memory or
