@@ -28,6 +28,8 @@ struct Retained {
 // SAFETY: retaining, pushing and releasing a primary context are thread-safe
 // driver operations. The raw handle is only passed to the driver.
 unsafe impl Send for Retained {}
+// SAFETY: as for Send above; shared references only copy the immutable fields
+// out for those driver calls.
 unsafe impl Sync for Retained {}
 
 impl PrimaryContext {
@@ -36,8 +38,9 @@ impl PrimaryContext {
         let driver = driver()?;
         let handle = device.handle()?;
         let mut raw = std::ptr::null_mut();
-        // SAFETY: the driver writes the context handle for a valid device.
         driver.check(
+            // SAFETY: the driver writes the context handle to the local `raw` for
+            // `handle`, a valid device from `DeviceId::handle`.
             unsafe { (driver.primary_ctx_retain)(&mut raw, handle) },
             "cuDevicePrimaryCtxRetain",
         )?;
@@ -62,8 +65,9 @@ impl PrimaryContext {
     /// Makes this context current on the calling thread until the guard drops.
     pub fn enter(&self) -> Result<DeviceGuard> {
         let driver = driver()?;
-        // SAFETY: self retains the context for the guard's lifetime.
         driver.check(
+            // SAFETY: `self` retains the context, and the guard keeps a clone of it
+            // while the context is current.
             unsafe { (driver.ctx_push)(self.raw()) },
             "cuCtxPushCurrent_v2",
         )?;
@@ -123,18 +127,18 @@ impl PrimaryContext {
             let device = DeviceId(ordinal);
             let destroyed = device.handle().and_then(|handle| {
                 let (mut flags, mut active) = (0u32, 0i32);
-                // SAFETY: the driver writes the state of a valid device's
-                // primary context.
                 driver.check(
+                    // SAFETY: the driver writes the state of a valid device's
+                    // primary context to the locals `flags` and `active`.
                     unsafe { (driver.primary_ctx_get_state)(handle, &mut flags, &mut active) },
                     "cuDevicePrimaryCtxGetState",
                 )?;
                 if active == 0 {
                     return Ok(false);
                 }
-                // SAFETY: the caller guarantees that nothing uses the context
-                // again; the next retain would create a new one.
                 driver.check(
+                    // SAFETY: the caller guarantees that nothing uses the context
+                    // again; the next retain would create a new one.
                     unsafe { (driver.primary_ctx_reset)(handle) },
                     "cuDevicePrimaryCtxReset_v2",
                 )?;

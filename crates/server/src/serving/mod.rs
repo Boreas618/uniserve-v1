@@ -20,28 +20,21 @@
 //! response stream. Aggregate lifecycle counters reach the metrics route through
 //! [`RuntimeMetricsSnapshot::state_counts`].
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 mod assembly;
-/// Chat request rendering and structured output processing.
 pub mod chat;
 mod diffusion_gemma;
 pub(crate) use self::diffusion_gemma::canvas_sampling;
 mod input;
-/// Image reference resolution shared by every request path that accepts images.
 pub mod media;
 mod model;
 mod omni;
 mod preprocessing;
 mod sampling;
-/// TypeSafe System One decision readout for DiffusionGemma.
 pub mod systemone;
 #[cfg(test)]
 pub(crate) mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
 pub mod text;
-/// MiniMax-H3 condition ingestion: media sources, probing, planning and
-/// presentation.
 pub mod video;
 
 use std::borrow::Borrow;

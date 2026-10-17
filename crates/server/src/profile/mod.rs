@@ -14,8 +14,6 @@
 //! ([`diffusion_gemma`]), streaming reasoning and tool-call parsers
 //! ([`reasoning`], [`tools`]), and the tokenizer ([`tokenizer`]).
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 

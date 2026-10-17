@@ -1,4 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Shared benchmark drivers for streaming output parsers.
 
 use uniserve_server::profile::tools::Qwen3XmlToolParser;

@@ -33,7 +33,8 @@
 //!   start offset.
 
 use std::fmt;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -171,6 +172,122 @@ impl fmt::Display for RequestField {
             field => formatter.write_str(field.param()),
         }
     }
+}
+
+/// An aspect the canvas rule cannot resolve ([`canvas`]).
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum CanvasError {
+    /// A side is zero, negative or not a number.
+    #[error("aspect must be positive, got {width}:{height}")]
+    NonPositive {
+        /// The aspect's width.
+        width: f64,
+        /// The aspect's height.
+        height: f64,
+    },
+    /// The width-to-height ratio lies outside 1:4 to 4:1.
+    #[error("aspect {width}:{height} lies outside 1:4 to 4:1")]
+    OutOfRange {
+        /// The aspect's width.
+        width: f64,
+        /// The aspect's height.
+        height: f64,
+    },
+}
+
+/// A duration or media fact the rules cannot size.
+///
+/// The messages name what is wrong in request terms; [`plan_request`] and
+/// [`check_request`] attach the request field at fault
+/// ([`VideoInputError::Invalid`]).
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum RuleError {
+    /// A duration outside `[MIN_VIDEO_SECONDS, max_seconds]`, or not finite.
+    #[error(
+        "video duration must be a finite number of seconds in [{MIN_VIDEO_SECONDS}, {max_seconds}]"
+    )]
+    Duration {
+        /// The longest duration served.
+        max_seconds: f64,
+    },
+    /// An image or video frame whose sides differ by more than 200 times.
+    #[error("an aspect of {width}x{height} exceeds 200:1")]
+    VisionAspect {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+    },
+    /// Video frames smaller than one merged vision token.
+    #[error("video frames of {width}x{height} are too small")]
+    VisionFrames {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+    },
+    /// An image reference outside 1:4 to 4:1.
+    #[error("a reference image must lie within 1:4 and 4:1, got {width}x{height}")]
+    ReferenceAspect {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+    },
+    /// A reference video too short for one group of conditioner samples.
+    #[error(
+        "a reference video must sample at least {required} frames at {VIDEO_SAMPLE_FPS} fps, got {sampled}"
+    )]
+    SampledFrames {
+        /// Samples one group holds.
+        required: usize,
+        /// Samples the video yields.
+        sampled: usize,
+    },
+    /// A start offset at or past the end of a soundtrack.
+    #[error("start_time_seconds lies past the end of the audio track")]
+    AudioStart,
+    /// A soundtrack whose latent count exceeds `u32`.
+    #[error("the audio track is too long")]
+    AudioLength,
+    /// A reference video with fewer than one VAE window of frames after its
+    /// start offset.
+    #[error(
+        "a reference video needs at least {MIN_REFERENCE_FRAMES} frames at {VIDEO_FPS} fps after start_time_seconds, got {available}"
+    )]
+    ReferenceFrames {
+        /// Frames left on the 24 fps timeline.
+        available: u64,
+    },
+    /// A reference video whose display aspect sets no canvas.
+    #[error("the video's {0}")]
+    VideoCanvas(CanvasError),
+}
+
+/// A checkpoint's processor configs that [`VisionConfig::read`] cannot use.
+#[derive(Debug, thiserror::Error)]
+pub enum VisionConfigError {
+    /// A config file could not be read.
+    #[error("reading {}", path.display())]
+    Read {
+        /// The file.
+        path: PathBuf,
+        /// The read's failure.
+        #[source]
+        source: io::Error,
+    },
+    /// A config file is not a processor config.
+    #[error("parsing {}", path.display())]
+    Parse {
+        /// The file.
+        path: PathBuf,
+        /// The parse's failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The image and video processors patch differently.
+    #[error("the image and video processors disagree on the patch geometry")]
+    Geometry,
 }
 
 /// A video request the rules reject, or a failure while preparing valid
@@ -359,19 +476,21 @@ pub const fn rows_per_frame(canvas: Canvas) -> u32 {
 ///
 /// # Errors
 ///
-/// Returns a message when the ratio is not finite and positive or lies
+/// Returns [`CanvasError`] when the ratio is not finite and positive or lies
 /// outside 1:4 to 4:1.
-pub fn canvas(aspect_width: f64, aspect_height: f64) -> Result<Canvas, String> {
+pub fn canvas(aspect_width: f64, aspect_height: f64) -> Result<Canvas, CanvasError> {
     if !(aspect_width > 0.0 && aspect_height > 0.0) {
-        return Err(format!(
-            "aspect must be positive, got {aspect_width}:{aspect_height}"
-        ));
+        return Err(CanvasError::NonPositive {
+            width: aspect_width,
+            height: aspect_height,
+        });
     }
     let ratio = aspect_width / aspect_height;
     if !(MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO).contains(&ratio) {
-        return Err(format!(
-            "aspect {aspect_width}:{aspect_height} lies outside 1:4 to 4:1"
-        ));
+        return Err(CanvasError::OutOfRange {
+            width: aspect_width,
+            height: aspect_height,
+        });
     }
     let short_edge = f64::from(CANVAS_SHORT_EDGE);
     let (mut width, mut height) = if ratio >= 1.0 {
@@ -439,14 +558,13 @@ pub fn requested_frames(seconds: f64, fps: u32) -> u32 {
 ///
 /// # Errors
 ///
-/// Returns a message when `seconds` is not finite or lies outside
-/// `[MIN_VIDEO_SECONDS, max_video_seconds]`.
-pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> Result<u32, String> {
+/// Returns [`RuleError::Duration`] when `seconds` is not finite or lies
+/// outside `[MIN_VIDEO_SECONDS, max_video_seconds]`.
+pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> Result<u32, RuleError> {
     if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
-        return Err(format!(
-            "video duration must be a finite number of seconds in [{MIN_VIDEO_SECONDS}, \
-             {max_video_seconds}]"
-        ));
+        return Err(RuleError::Duration {
+            max_seconds: max_video_seconds,
+        });
     }
     let requested = requested_frames(seconds, VIDEO_FPS);
     // The frames up to the next count congruent to 5 modulo 17.
@@ -554,21 +672,25 @@ impl VisionConfig {
     ///
     /// # Errors
     ///
-    /// Returns a message when a file cannot be read or parsed, or when the
-    /// two configs disagree on the patch geometry.
-    pub fn read(image: &Path, video: &Path) -> Result<Self, String> {
-        let read = |path: &Path| -> Result<ProcessorFile, String> {
-            let text = std::fs::read_to_string(path)
-                .map_err(|error| format!("reading {}: {error}", path.display()))?;
-            serde_json::from_str(&text)
-                .map_err(|error| format!("parsing {}: {error}", path.display()))
+    /// Returns [`VisionConfigError`] when a file cannot be read or parsed, or
+    /// when the two configs disagree on the patch geometry.
+    pub fn read(image: &Path, video: &Path) -> Result<Self, VisionConfigError> {
+        let read = |path: &Path| -> Result<ProcessorFile, VisionConfigError> {
+            let text = std::fs::read_to_string(path).map_err(|source| VisionConfigError::Read {
+                path: path.to_owned(),
+                source,
+            })?;
+            serde_json::from_str(&text).map_err(|source| VisionConfigError::Parse {
+                path: path.to_owned(),
+                source,
+            })
         };
         let image = read(image)?;
         let video = read(video)?;
         let geometry =
             |file: &ProcessorFile| (file.patch_size, file.temporal_patch_size, file.merge_size);
         if geometry(&image) != geometry(&video) {
-            return Err("the image and video processors disagree on the patch geometry".to_owned());
+            return Err(VisionConfigError::Geometry);
         }
         Ok(Self {
             patch_size: image.patch_size,
@@ -594,8 +716,8 @@ impl VisionConfig {
     ///
     /// # Errors
     ///
-    /// Returns a message for an aspect beyond 200:1.
-    pub fn image_grid(&self, height: u32, width: u32) -> Result<VisionGrid, String> {
+    /// Returns [`RuleError::VisionAspect`] for an aspect beyond 200:1.
+    pub fn image_grid(&self, height: u32, width: u32) -> Result<VisionGrid, RuleError> {
         check_vision_aspect(height, width)?;
         let factor = f64::from(self.factor());
         let (height, width) = (f64::from(height), f64::from(width));
@@ -620,12 +742,17 @@ impl VisionConfig {
     ///
     /// # Errors
     ///
-    /// Returns a message for frames smaller than one merged token or an
-    /// aspect beyond 200:1.
-    pub fn video_grid(&self, frames: u32, height: u32, width: u32) -> Result<VisionGrid, String> {
+    /// Returns [`RuleError::VisionFrames`] for frames smaller than one merged
+    /// token and [`RuleError::VisionAspect`] for an aspect beyond 200:1.
+    pub fn video_grid(
+        &self,
+        frames: u32,
+        height: u32,
+        width: u32,
+    ) -> Result<VisionGrid, RuleError> {
         let factor = self.factor();
         if height < factor || width < factor {
-            return Err(format!("video frames of {width}x{height} are too small"));
+            return Err(RuleError::VisionFrames { width, height });
         }
         check_vision_aspect(height, width)?;
         let temporal = self.temporal_patch_size;
@@ -663,10 +790,10 @@ impl VisionConfig {
     }
 }
 
-fn check_vision_aspect(height: u32, width: u32) -> Result<(), String> {
+fn check_vision_aspect(height: u32, width: u32) -> Result<(), RuleError> {
     let (long, short) = (height.max(width), height.min(width));
     if f64::from(long) / f64::from(short) > 200.0 {
-        return Err(format!("an aspect of {width}x{height} exceeds 200:1"));
+        return Err(RuleError::VisionAspect { width, height });
     }
     Ok(())
 }
@@ -1034,12 +1161,11 @@ fn audio_latents(frames: u32) -> u32 {
 ///
 /// # Errors
 ///
-/// Returns a message when the image lies outside 1:4 to 4:1.
-pub fn reference_image_size(width: u32, height: u32) -> Result<Canvas, String> {
+/// Returns [`RuleError::ReferenceAspect`] when the image lies outside 1:4
+/// to 4:1.
+pub fn reference_image_size(width: u32, height: u32) -> Result<Canvas, RuleError> {
     if u64::from(width) > 4 * u64::from(height) || u64::from(height) > 4 * u64::from(width) {
-        return Err(format!(
-            "a reference image must lie within 1:4 and 4:1, got {width}x{height}"
-        ));
+        return Err(RuleError::ReferenceAspect { width, height });
     }
     let scale = f64::from(REFERENCE_IMAGE_SHORT_EDGE) / f64::from(width.min(height));
     Ok(Canvas {
@@ -1056,11 +1182,12 @@ pub fn reference_image_size(width: u32, height: u32) -> Result<Canvas, String> {
 ///
 /// # Errors
 ///
-/// Returns a message when fewer frames are sampled than one group holds.
+/// Returns [`RuleError::SampledFrames`] when fewer frames are sampled than
+/// one group holds.
 pub fn sample_video_frames(
     frames: u32,
     temporal_patch: u32,
-) -> Result<(Vec<u32>, Vec<f64>), String> {
+) -> Result<(Vec<u32>, Vec<f64>), RuleError> {
     let stride = f64::from(VIDEO_FPS) / VIDEO_SAMPLE_FPS;
     let mut indices: Vec<u32> = Vec::new();
     let mut cursor = 0.0_f64;
@@ -1078,11 +1205,10 @@ pub fn sample_video_frames(
     }
     let temporal_patch = temporal_patch as usize;
     if indices.len() < temporal_patch {
-        return Err(format!(
-            "a reference video must sample at least {temporal_patch} frames at \
-             {VIDEO_SAMPLE_FPS} fps, got {}",
-            indices.len()
-        ));
+        return Err(RuleError::SampledFrames {
+            required: temporal_patch,
+            sampled: indices.len(),
+        });
     }
     let mut timestamps: Vec<f64> = (0..indices.len())
         .map(|index| index as f64 / VIDEO_SAMPLE_FPS)
@@ -1113,16 +1239,18 @@ fn start_offset(seconds: f64, rate: f64) -> u64 {
 ///
 /// # Errors
 ///
-/// Returns a message when the offset lies past the end of the soundtrack.
+/// Returns [`RuleError::AudioStart`] when the offset lies past the end of
+/// the soundtrack and [`RuleError::AudioLength`] when its latents exceed
+/// `u32`.
 pub fn audio_clip(
     media: &AudioFacts,
     start_seconds: f64,
     frames: u32,
-) -> Result<AudioClip, String> {
+) -> Result<AudioClip, RuleError> {
     let rate = media.sample_rate;
     let start_sample = start_offset(start_seconds, f64::from(rate));
     if start_sample >= media.samples {
-        return Err("start_time_seconds lies past the end of the audio track".to_owned());
+        return Err(RuleError::AudioStart);
     }
     let available = media.samples - start_sample;
     // The reference truncates to `int(frames / 24 * rate)` samples.
@@ -1145,7 +1273,7 @@ pub fn audio_clip(
         samples,
         // The audio VAE pads the waveform to a whole hop.
         latents: u32::try_from(samples.div_ceil(u64::from(AUDIO_HOP)))
-            .map_err(|_| "the audio track is too long".to_owned())?,
+            .map_err(|_| RuleError::AudioLength)?,
     })
 }
 
@@ -1168,18 +1296,19 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 ///
 /// # Errors
 ///
-/// Returns a message when the display aspect lies outside 1:4 to 4:1, fewer
-/// than 22 frames remain after the offset, or the offset lies past the end of
-/// the soundtrack.
+/// Returns [`RuleError::VideoCanvas`] when the display aspect lies outside
+/// 1:4 to 4:1, [`RuleError::ReferenceFrames`] when fewer than 22 frames
+/// remain after the offset, and the errors of [`audio_clip`],
+/// [`sample_video_frames`] and [`VisionConfig::video_grid`].
 pub fn video_reference(
     media: &VideoFacts,
     start_seconds: f64,
     frames: u32,
     vision: &VisionConfig,
-) -> Result<(VideoClip, VideoVision), String> {
+) -> Result<(VideoClip, VideoVision), RuleError> {
     // Display sizes stay far below 2^53, so the conversions are exact.
     let size = canvas(media.display_width as f64, media.display_height as f64)
-        .map_err(|error| format!("the video's {error}"))?;
+        .map_err(RuleError::VideoCanvas)?;
     let frame_rate =
         f64::from(media.frame_rate.numerator) / f64::from(media.frame_rate.denominator);
     let fps = f64::from(VIDEO_FPS);
@@ -1192,10 +1321,7 @@ pub fn video_reference(
     let start_frame = start_offset(start_seconds, fps);
     let available = timeline.saturating_sub(start_frame);
     if available < u64::from(MIN_REFERENCE_FRAMES) {
-        return Err(format!(
-            "a reference video needs at least {MIN_REFERENCE_FRAMES} frames at {VIDEO_FPS} fps \
-             after start_time_seconds, got {available}"
-        ));
+        return Err(RuleError::ReferenceFrames { available });
     }
     let kept = u32::try_from(available).map_or(frames, |available| available.min(frames));
     // The VAE encodes the leading complete `17n + 5` frames.
@@ -1302,7 +1428,9 @@ pub fn named_canvas(
     if target.short_edge == CANVAS_SHORT_EDGE {
         return canvas(f64::from(width), f64::from(height))
             .map(Some)
-            .map_err(|error| VideoInputError::invalid(RequestField::TargetAspectRatio, error));
+            .map_err(|error| {
+                VideoInputError::invalid(RequestField::TargetAspectRatio, error.to_string())
+            });
     }
     bucket(target.short_edge, (width, height))
         .map(Some)
@@ -1397,8 +1525,9 @@ pub fn check_request(
 
     match target.duration_seconds {
         Some(seconds) => {
-            video_frame_count(seconds, limits.max_video_seconds)
-                .map_err(|error| VideoInputError::invalid(RequestField::TargetDuration, error))?;
+            video_frame_count(seconds, limits.max_video_seconds).map_err(|error| {
+                VideoInputError::invalid(RequestField::TargetDuration, error.to_string())
+            })?;
         }
         None => {
             let may_follow_audio = task == VideoTask::Ref2va
@@ -1570,7 +1699,9 @@ fn resolve_frames(
     if let Some(seconds) = target.duration_seconds {
         return video_frame_count(seconds, limits.max_video_seconds)
             .map(|frames| (seconds, frames))
-            .map_err(|error| VideoInputError::invalid(RequestField::TargetDuration, error));
+            .map_err(|error| {
+                VideoInputError::invalid(RequestField::TargetDuration, error.to_string())
+            });
     }
     let [(index, track, start_seconds)] = soundtracks else {
         return Err(VideoInputError::invalid(
@@ -1654,7 +1785,7 @@ fn plan_keyframe(
     let seen = if task == VideoTask::Fl2va {
         let grid = vision
             .image_grid(size.height, size.width)
-            .map_err(|error| VideoInputError::condition(index, error))?;
+            .map_err(|error| VideoInputError::condition(index, error.to_string()))?;
         Some(Vision::Image(ImageVision {
             grid,
             tokens: vision.block_tokens(grid),
@@ -1682,7 +1813,7 @@ fn plan_reference(
     frames: u32,
     vision: &VisionConfig,
 ) -> Result<ConditionPlan, VideoInputError> {
-    let reject = |error: String| VideoInputError::condition(index, error);
+    let reject = |error: RuleError| VideoInputError::condition(index, error.to_string());
     let plan = |prepared, seen, video_rows, audio_rows| ConditionPlan {
         index,
         condition_type: condition.condition_type,

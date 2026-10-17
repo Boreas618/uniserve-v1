@@ -34,7 +34,7 @@ use crate::ffi::{Backing, DType, MemoryKind};
 use crate::host::HostTask;
 use crate::storage::memory::StorageView;
 use crate::stream::Issue;
-use crate::{Error, EventPool, Outcome, Result};
+use crate::{Error, EventPool, Outcome, Result, lock};
 
 pub(crate) type BorrowedReads = Mutex<Option<HashMap<usize, Weak<Read>>>>;
 
@@ -87,7 +87,7 @@ impl Read {
     }
 
     fn lock(&self) -> MutexGuard<'_, ReadState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// Whether a result or an error is consumable.
@@ -243,7 +243,7 @@ impl Read {
     /// destination's handoff fence.
     ///
     /// The caller starts a read once the issuer it was submitted with
-    /// ([`submit`]) performed its work, so the fence's record is made: at
+    /// (`submit`) performed its work, so the fence's record is made: at
     /// once after a stream, from the job's completion on after a recorder.
     /// A read that was cancelled or already started stays as it is. When
     /// the task cannot be queued it is withdrawn.
@@ -327,10 +327,7 @@ impl Read {
     fn finish_borrow(&self) -> Result<()> {
         self.lock().ticket.release_consumers();
         if let Some(borrower) = self.borrower.as_ref().and_then(Weak::upgrade)
-            && let Some(reads) = borrower
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_mut()
+            && let Some(reads) = lock(&borrower).as_mut()
         {
             reads.remove(&(std::ptr::from_ref(self) as usize));
         }
@@ -343,7 +340,7 @@ impl Read {
                 Err(error) => state
                     .ticket
                     .retirement
-                    .complete(Err(Error::Transport(format!(
+                    .complete(Err(Error::transport(format!(
                         "borrowed transfer source release failed: {error}"
                     )))),
             }
@@ -433,7 +430,7 @@ impl ReadContext {
     /// The calling thread's copy stream on `device`.
     fn stream(&self, device: DeviceId) -> Result<Arc<Stream>> {
         let key = (std::thread::current().id(), device);
-        let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut streams = lock(&self.streams);
         if let Some(stream) = streams.get(&key) {
             return Ok(Arc::clone(stream));
         }
@@ -445,10 +442,7 @@ impl ReadContext {
     /// Release streams after every reader thread joined and every read
     /// retired.
     pub(crate) fn clear(&self) {
-        self.streams
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        lock(&self.streams).clear();
     }
 }
 
@@ -729,7 +723,7 @@ impl NativeRead {
                 let shared = Arc::new(error);
                 self.read.fail(Arc::clone(&shared));
                 if let Err(drained) = self.drain(streams, producer, fences, operands) {
-                    return Err(Error::Transport(format!(
+                    return Err(Error::transport(format!(
                         "{drained}; copy failed: {shared}"
                     )));
                 }

@@ -18,6 +18,8 @@ pub struct GraphExec {
 // each launch behind the earlier launches of the same executable. The handle
 // is never dereferenced by this crate.
 unsafe impl Send for GraphExec {}
+// SAFETY: as for Send above; a shared reference only reads the handle, which
+// `launch` passes to the driver.
 unsafe impl Sync for GraphExec {}
 
 impl GraphExec {

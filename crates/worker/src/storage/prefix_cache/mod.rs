@@ -49,7 +49,7 @@ use crate::transfer::{
     CacheImport, CacheImporter, ImportCopy, ImportEntry, ImportWorkspace, Retired, Retirement,
     Transports,
 };
-use crate::{Error, HostTask, Result};
+use crate::{Error, HostTask, Result, lock};
 
 /// The most import copy threads (and workspaces) a rank runs.
 const IMPORT_WORKERS: usize = 4;
@@ -221,7 +221,7 @@ impl PrefixCache {
     }
 
     /// The transfer and locations of `export`, once the work it was issued
-    /// with was performed ([`CacheExport::locate`]).
+    /// with was performed (`CacheExport::locate`).
     pub fn locate_export(&mut self, export: CacheExport) -> Result<(CacheTransfer, Vec<Location>)> {
         export.locate(&mut self.accesses)
     }
@@ -392,7 +392,7 @@ impl PrefixCache {
         self.release_prefixes(request, &slots, stream)
     }
 
-    /// Export a slot's visible cache extent (see [`cache_export::export`]). Its
+    /// Export a slot's visible cache extent (see `cache_export::export`). Its
     /// transfer and locations exist once the issuer's work was performed
     /// ([`Self::locate_export`]).
     #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
@@ -579,12 +579,7 @@ impl PrefixCache {
     /// Install the service wake fired when imports finish or retire.
     pub(crate) fn set_wake(&self, wake: Option<Wake>) {
         self.imports.lane.set_wake(wake.clone());
-        *self
-            .imports
-            .retired
-            .wake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = wake;
+        *lock(&self.imports.retired.wake) = wake;
     }
 
     /// Lend units `1..=count` as warmup scratch: no access may be pending,

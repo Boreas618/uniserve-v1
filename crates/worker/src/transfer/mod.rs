@@ -1,7 +1,7 @@
 //! Transfer admission, transports, readable results, and physical retirement.
 //!
 //! [`TransferCapacity`] holds a rank's transfer byte budget and read credits;
-//! each read's [`TransferTicket`] separates its consumable result from its
+//! each read's `TransferTicket` separates its consumable result from its
 //! physical retirement; the transfer pool runs reads on host threads; export
 //! tables register exported storage until its readers finished; the cache
 //! importer retains import destinations through their physical reads. All of

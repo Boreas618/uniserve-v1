@@ -2330,7 +2330,7 @@ impl Scheduler {
     pub(super) fn queue_completion(
         &mut self,
         mut record: uniserve_ipc::RequestOutput,
-        media: Result<Option<Arc<SharedMedia>>, String>,
+        media: Result<Option<Arc<SharedMedia>>, uniserve_core::SharedMediaError>,
     ) {
         let id = record.request_key.request_id;
         let call_id = record.call_id;
@@ -2359,7 +2359,9 @@ impl Scheduler {
         // the call return.
         let media = match media {
             Ok(media) => media,
-            Err(message) => {
+            Err(error) => {
+                // The client's message carries the failed step and its cause.
+                let message = format!("{:#}", anyhow::Error::new(error));
                 let event = EngineCoreOutput::ArtifactUnavailable { message };
                 if let Some(state) = self.media_state_mut(id) {
                     let _ = state.output.enqueue(event);

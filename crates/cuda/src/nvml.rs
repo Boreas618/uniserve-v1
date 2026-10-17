@@ -150,8 +150,9 @@ impl Nvml {
         let uuid = CString::new(device.uuid()?.to_string())
             .map_err(|_| Error::invalid("device UUIDs contain no NUL byte"))?;
         let mut handle = std::ptr::null_mut();
-        // SAFETY: the UUID is a NUL-terminated string; NVML writes one handle.
         self.api.check(
+            // SAFETY: the UUID is a NUL-terminated string that outlives the call;
+            // NVML writes one handle to the local `handle`.
             unsafe { (self.api.device_by_uuid)(uuid.as_ptr(), &mut handle) },
             "nvmlDeviceGetHandleByUUID",
         )?;
@@ -208,8 +209,9 @@ impl Nvml {
             version: NVML_MEMORY_V2,
             ..RawMemory::default()
         };
-        // SAFETY: NVML fills the versioned struct.
         self.api.check(
+            // SAFETY: NVML fills the local struct, whose version field names its
+            // `nvmlMemory_v2_t` layout; `handle` came from NVML for this device.
             unsafe { (self.api.memory_info)(handle, &mut memory) },
             "nvmlDeviceGetMemoryInfo_v2",
         )?;

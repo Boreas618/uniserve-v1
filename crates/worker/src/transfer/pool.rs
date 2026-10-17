@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use super::read::{NativeRead, PhysicalAccess};
 use super::{Notify, ReadReservation, TransferCapacity, notify};
 use crate::host::{HostAction, HostLane, HostTask};
-use crate::{Error, Outcome, Result};
+use crate::{Error, Outcome, Result, lock};
 
 /// A read action submitted through the common native host executor.
 pub(crate) struct TransferRead {
@@ -107,7 +107,7 @@ impl TransferPool {
     }
 
     fn state(&self) -> MutexGuard<'_, PoolState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     pub(crate) fn set_completion_wake(&self, wake: Option<Notify>) {
@@ -193,7 +193,7 @@ impl TransferPool {
         };
 
         let handed = {
-            let retirer = self.retirer.lock().unwrap_or_else(PoisonError::into_inner);
+            let retirer = lock(&self.retirer);
             let read = Retiring {
                 backend,
                 nbytes,
@@ -272,7 +272,7 @@ impl TransferPool {
             })
         });
         let wake = {
-            let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut state = lock(state);
             if let Some(error) = error.as_ref().filter(|_| late || retained) {
                 if state.error.is_none() {
                     state.error = Some(Arc::clone(error));
@@ -311,11 +311,7 @@ impl TransferPool {
         let mut errors = self.lane.close();
         // Every read task finished and handed its work over: the retirement
         // thread ends once it retired all of it.
-        let retirer = self
-            .retirer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let retirer = lock(&self.retirer).take();
         let joined = retirer.and_then(|Retirer { reads, thread }| {
             drop(reads);
             thread
@@ -341,10 +337,6 @@ impl TransferPool {
 }
 
 impl Drop for TransferPool {
-    #[expect(
-        clippy::mem_forget,
-        reason = "unknown device completion retains backing until process teardown"
-    )]
     fn drop(&mut self) {
         // Dropping the sender lets the retirement thread finish the reads
         // it holds and end; a destructor does not wait for it.
@@ -354,9 +346,11 @@ impl Drop for TransferPool {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
         );
-        let state = &mut *self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *lock(&self.state);
+        // An unretired read's device completion is unknown: its backing
+        // stays until the process exits.
         for read in state.unretired.drain(..) {
-            std::mem::forget(read);
+            crate::leak(read);
         }
     }
 }

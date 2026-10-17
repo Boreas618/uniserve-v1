@@ -14,7 +14,7 @@
 //! model's prompt framing and tokenizer).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use crate::ffi::{DType, Function, Handle, Interpreter, integers};
 use crate::lane::{Completion, Job};
@@ -22,7 +22,7 @@ use crate::request::diffusion::{BranchSource, Prefix};
 use crate::runner::encoder::ImagePreparation;
 use crate::runner::methods::{Argument, MethodCall};
 use crate::runner::vision::{FeatureInjection, FeatureLayout, PositionLayout};
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
 const DENOISER: &str = "uniserve.runner.denoiser.DenoiserRunner";
@@ -336,11 +336,7 @@ impl ImagePolicy {
     /// The vision tower's patch grid of an image, when it was asked
     /// ([`Self::ask_grid`]).
     pub(crate) fn grid(&self, key: GridKey) -> Option<[u32; 2]> {
-        self.grids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-            .copied()
+        lock(&self.grids).get(&key).copied()
     }
 
     /// Record in `job`, a job of the Python thread, the call asking the
@@ -371,10 +367,7 @@ impl ImagePolicy {
                 )));
             }
         };
-        self.grids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, grid);
+        lock(&self.grids).insert(key, grid);
         Ok(())
     }
 

@@ -1,5 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 //! Lane-occupancy scheduling and call graphs of video requests over the
 //! GPU-free simulator.
 //!
@@ -8,6 +6,8 @@
 //! result only when the scheduler waits for one, so every batch stays in
 //! flight until the scheduler blocks for a completion, and the record of
 //! submissions and resolutions is a function of scheduling decisions alone.
+
+#![cfg(test)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

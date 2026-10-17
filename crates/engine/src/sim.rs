@@ -15,8 +15,6 @@
 //! `control_plane` example drive the scheduler through it in place of GPU
 //! workers.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -106,6 +104,10 @@ impl SimExecutor {
     /// # Panics
     ///
     /// Panics if the simulator thread cannot be spawned.
+    #[expect(
+        clippy::expect_used,
+        reason = "a simulator without its thread cannot run; documented under Panics"
+    )]
     pub fn with_depth(mut engine: SimEngine, depth: usize) -> Self {
         let info = engine.info().clone();
         let results_on_wait = engine.results_on_wait;
@@ -327,7 +329,12 @@ impl Executor for SimExecutor {
                 .iter()
                 .filter(|command| !matches!(command, uniserve_ipc::BatchCommand::Start { .. }))
                 .nth(receipt.command_index as usize)
-                .expect("logical command has its registered payload");
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "command receipt {} names no command of its batch",
+                        receipt.command_index
+                    )
+                })?;
             use uniserve_ipc::BatchCommand;
             match command {
                 BatchCommand::Free { buffer } => self
@@ -1032,6 +1039,10 @@ impl SimEngine {
     /// # Panics
     ///
     /// Panics when the simulated worker does not expose a prefix cache.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test setter whose missing prefix cache is documented under Panics"
+    )]
     pub fn set_groups(&mut self, groups: Vec<uniserve_core::CacheGroup>) {
         self.info
             .prefix_cache
@@ -1045,6 +1056,10 @@ impl SimEngine {
     /// # Panics
     ///
     /// Panics when the simulated worker does not expose a prefix cache.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test setter whose missing prefix cache is documented under Panics"
+    )]
     pub fn set_num_units(&mut self, count: u32) {
         self.info
             .prefix_cache
@@ -1058,6 +1073,10 @@ impl SimEngine {
     /// # Panics
     ///
     /// Panics when the simulated worker does not expose a prefix cache.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test setter whose missing prefix cache is documented under Panics"
+    )]
     pub fn set_page_tokens(&mut self, tokens: u32) {
         for group in &mut self
             .info

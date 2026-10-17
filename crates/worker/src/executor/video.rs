@@ -460,7 +460,7 @@ impl HostCall {
                 for result in &results {
                     if let TaskOutput::Media(bytes) = &**result {
                         let source = MediaSource::publish(bytes).map_err(|error| {
-                            Error::Transport(format!("publishing media failed: {error}"))
+                            Error::transport_source("publishing media failed", error)
                         })?;
                         output.set_media(source)?;
                     }

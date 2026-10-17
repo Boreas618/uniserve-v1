@@ -14,7 +14,6 @@
 //! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
 //! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod core;
 mod executor;
 mod handle;
@@ -54,3 +53,16 @@ pub use crate::worker::{
     FlashInferBackendParseError, LaneConfig, WorkerExecutor, WorkerGroup, WorkerProcessArgs,
 };
 pub use uniserve_ipc::{AttentionBackend, DEFAULT_COMPONENT, VideoDenoiserInfo};
+
+/// Lock `mutex`, keeping the state a panicking holder left.
+///
+/// Every build profile sets `panic = "abort"`, so a holder's panic ends the
+/// process before another thread observes the poisoned lock. Only test
+/// builds, which ignore that setting and unwind, reach the recovery; it
+/// returns the guard rather than raising a second panic in the thread that
+/// locks next.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

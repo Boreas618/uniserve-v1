@@ -26,8 +26,6 @@
 //! request it accepts; `prompt` documents the text rules for the official
 //! inputs it does not.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 mod answer;
 mod error;
 mod plan;

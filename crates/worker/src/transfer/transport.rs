@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use uniserve_cuda::{DeviceId, Event, Stream};
 use uniserve_ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
@@ -33,7 +33,7 @@ use super::{
 };
 use crate::ffi::{DType, MemoryKind};
 use crate::stream::Issue;
-use crate::{Error, EventPool, Result};
+use crate::{Error, EventPool, Result, lock};
 
 /// Registered exports of one shared-memory or CUDA VMM endpoint.
 const REGISTERED_EXPORTS: usize = 256;
@@ -553,12 +553,7 @@ impl Transport {
     /// Join reads, drain borrowed consumers and retire every export. Fails,
     /// retaining storage, while remote readers still hold exports.
     pub(crate) fn close(&self) -> Result<()> {
-        let borrowed = self
-            .borrowed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .unwrap_or_default();
+        let borrowed = lock(&self.borrowed).take().unwrap_or_default();
         let mut result = match self.reads.close() {
             Some(error) => Err(Error::Shared(error)),
             None => Ok(()),

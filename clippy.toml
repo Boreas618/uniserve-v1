@@ -1,0 +1,6 @@
+# A failed unwrap in a test is the test's failure report. Clippy counts
+# `#[test]` functions and `#[cfg(test)]` items as tests; an integration test
+# crate whose helpers unwrap declares `#![cfg(test)]` (always true for it) so
+# that its helpers count too.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

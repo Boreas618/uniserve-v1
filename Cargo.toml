@@ -45,6 +45,8 @@ asynk-strim-attr = "0.1.0"
 # Dynamo currently pins 0.8.4 exactly, so the shared workspace range must include it.
 axum = { version = "0.8.4", features = ["multipart"] }
 base64 = "0.22.1"
+# Byte views of plain numeric slices handed to device copies.
+bytemuck = "1.25.0"
 bitflags = { version = "2.10.0", features = ["serde"] }
 bytes = "1.11.1"
 clap = { version = "4.5.38", features = ["derive", "env"] }
@@ -114,8 +116,12 @@ tvm-ffi = "=0.1.14-post1"
 clone_on_ref_ptr = "warn"
 large_futures = "warn"
 mem_forget = "warn"
-unwrap_used = "warn"
-expect_used = "warn"
+# Library code propagates errors; an invariant that makes a panic impossible
+# is stated with `#[expect(.., reason = "..")]` at the site. Tests unwrap
+# freely (`clippy.toml`).
+unwrap_used = "deny"
+expect_used = "deny"
+undocumented_unsafe_blocks = "deny"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

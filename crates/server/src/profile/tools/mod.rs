@@ -7,7 +7,6 @@
 //! back bytes it cannot classify yet, such as a partial marker or an
 //! incomplete tool call.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #[macro_use]
 mod error;
 mod gemma4;

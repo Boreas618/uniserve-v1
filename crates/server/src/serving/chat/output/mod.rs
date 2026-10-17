@@ -9,7 +9,6 @@
 //! `structured::OutputProcessor` to turn assistant events into content-block
 //! and tool-call serving events.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod gemma4;
 pub(crate) mod processor;
 mod qwen3;

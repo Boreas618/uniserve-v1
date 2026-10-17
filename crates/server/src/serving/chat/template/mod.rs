@@ -2,7 +2,6 @@
 //!
 //! The only renderer is the Hugging Face Jinja renderer in `renderer::hf`.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 /// Chat-template renderer implementations.
 pub mod renderer;
 

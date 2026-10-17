@@ -562,9 +562,10 @@ fn require_storage(state: &BatchInputs) -> Result<()> {
         match retirement.outcome() {
             Some(Outcome::Success(())) => {}
             Some(Outcome::Failed(error)) => {
-                return Err(Error::Transport(format!(
-                    "a cache access the batch overwrites failed to retire: {error}"
-                )));
+                return Err(Error::transport_source(
+                    "a cache access the batch overwrites failed to retire",
+                    error,
+                ));
             }
             Some(Outcome::Cancelled) | None => {
                 return Err(Error::Resource(

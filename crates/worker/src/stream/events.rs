@@ -12,7 +12,7 @@ use uniserve_ipc::Wake;
 use super::Issue;
 use crate::lane::{Completion, JobId};
 use crate::transfer::{DRAIN_LIMIT, drain_event};
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 type PoolKey = (DeviceId, bool, bool);
 
@@ -80,13 +80,13 @@ struct State {
 /// Storage owners record a fence after the last device access to their
 /// storage, retain a reference to it, and either release it once they
 /// know it completed or defer the storage's release until it has
-/// ([`Issue::defer`], [`defer`](Self::defer)).
+/// ([`Issue::defer`], `defer`).
 ///
 /// The pool asks the driver nothing. Deferred work waits for a job that
-/// holds its events ([`crate::lane::JobQueues::after`]): a lane orders the
+/// holds its events (`crate::lane::JobQueues::after`): a lane orders the
 /// job's completion behind the events, and whoever takes the lanes'
 /// completions hands the pool the ones of its jobs
-/// ([`owns`](Self::owns), [`complete`](Self::complete)). The work runs
+/// (`owns`, `complete`). The work runs
 /// there, on that thread, after the pool's lock is released, so it may use
 /// the pool again. The job is always submitted behind the job that records
 /// the events, on the same lane: a lane passes a wait on an event that has
@@ -94,15 +94,15 @@ struct State {
 ///
 /// - Work deferred while a job is recorded rides with that job, and the
 ///   job's submitter starts the waiting job right behind it
-///   ([`defer_submitted`](Self::defer_submitted)).
+///   (`defer_submitted`).
 /// - Work deferred outside any recording waits on events whose records
 ///   were made or are queued in jobs already submitted. On the thread that
-///   installed the [`Submitter`] its job is started at once; from any other
+///   installed the `Submitter` its job is started at once; from any other
 ///   thread it is kept, the installed wake is fired, and the submitter's
-///   thread starts it ([`submit_deferred`](Self::submit_deferred)).
+///   thread starts it (`submit_deferred`).
 ///
 /// At shutdown nobody takes completions: [`drain`](Self::drain) and
-/// [`close`](Self::close) wait for the events on the host, with a deadline.
+/// `close` wait for the events on the host, with a deadline.
 ///
 /// The lock guards bookkeeping only. A record, which calls the driver or
 /// appends to a job, is booked under the lock and made outside it. This is
@@ -146,7 +146,7 @@ impl EventPool {
     fn lock(&self) -> MutexGuard<'_, State> {
         // No owner's work runs under the lock: deferred work runs after
         // unlock.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// Install or clear the wake fired when work is deferred on another
@@ -417,7 +417,7 @@ impl EventPool {
     }
 
     /// Waits on the host for the events of all deferred work, at most
-    /// [`DRAIN_LIMIT`], and runs that work, until none is left: at
+    /// `DRAIN_LIMIT`, and runs that work, until none is left: at
     /// shutdown, when nobody takes the completions of the jobs it waits
     /// for. Work whose events did not complete in time stays deferred.
     pub fn drain(&self) -> Result<()> {
@@ -510,10 +510,6 @@ impl EventPool {
 }
 
 impl Drop for EventPool {
-    #[expect(
-        clippy::mem_forget,
-        reason = "unknown physical completion must retain deferred storage"
-    )]
     fn drop(&mut self) {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let mut deferrals = std::mem::take(&mut state.unsubmitted);
@@ -536,7 +532,7 @@ impl Drop for EventPool {
                 let _ = (deferral.owner)();
             }
         } else {
-            std::mem::forget(deferrals);
+            crate::leak(deferrals);
         }
     }
 }
@@ -642,7 +638,7 @@ fn submit_waiting(state: &mut State, deferral: Deferral) -> Result<()> {
     for ((_, waited), job) in lanes.into_iter().zip(started) {
         let owner = Arc::clone(&owner);
         let part: Deferred = Box::new(move || {
-            let mut joined = owner.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut joined = lock(&owner);
             joined.0 -= 1;
             match (joined.0, joined.1.take()) {
                 (0, Some(owner)) => {
@@ -814,7 +810,7 @@ mod tests {
     }
 
     fn transport(error: IpcError) -> Error {
-        Error::Transport(error.to_string())
+        Error::transport_source("the test channel", error)
     }
 
     /// A retained lease of device 0.
@@ -867,13 +863,10 @@ mod tests {
         let asked = Arc::clone(&lanes);
         let queues = jobs.clone();
         events.set_submitter(Some(Box::new(move |device, lane, events| {
-            asked
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(lane);
+            lock(&asked).push(lane);
             queues.after(DECODE, device, events)
         })));
-        let asked = || std::mem::take(&mut *lanes.lock().unwrap_or_else(PoisonError::into_inner));
+        let asked = || std::mem::take(&mut *lock(&lanes));
         let runs = Arc::new(AtomicUsize::new(0));
         let first = fence(&events)?;
         let second = fence(&events)?;

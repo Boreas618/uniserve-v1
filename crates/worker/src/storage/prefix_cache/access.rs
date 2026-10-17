@@ -385,7 +385,7 @@ mod tests {
         cache.release_exports(&[first]);
         left.complete(Ok(()))?;
         assert!(cache.require_reusable(&[(1, 0, 8)]).is_err());
-        right.complete(Err(Error::Transport("reader completion unknown".into())))?;
+        right.complete(Err(Error::transport("reader completion unknown")))?;
         assert!(cache.require_reusable(&[(1, 0, 8)]).is_err());
         assert!(cache.retirement_ready(
             &HashSet::new(),

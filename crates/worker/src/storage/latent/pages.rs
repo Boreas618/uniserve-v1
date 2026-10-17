@@ -1,12 +1,12 @@
 //! Paged diffusion trajectories and the physical lifetime of their two banks.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use uniserve_ipc::{BufferId, Call, CallKind, LatentParams, MediaCall, RequestKey};
 
 use crate::transfer::{ReadRef, Retirement};
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 #[derive(Default)]
 struct LatentSlot {
@@ -17,6 +17,22 @@ struct LatentSlot {
     units: usize,
     height: i64,
     width: i64,
+}
+
+/// The version of a slot's trajectory a call names, and the size of its
+/// latent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TrajectoryVersion {
+    /// The denoising step the latent holds.
+    pub step: i64,
+    /// The generation every commit of the trajectory advances.
+    pub generation: i64,
+    /// Latent units of the trajectory.
+    pub units: i64,
+    /// Latent raster height.
+    pub height: i64,
+    /// Latent raster width.
+    pub width: i64,
 }
 
 /// A batch's prepared trajectory commit or release. The executor validates
@@ -111,7 +127,7 @@ impl LatentImport {
     }
 
     fn state(&self) -> MutexGuard<'_, ImportState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 }
 
@@ -136,7 +152,7 @@ impl LatentExport {
     }
 
     fn state(&self) -> MutexGuard<'_, ExportState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// Whether transport readers may still read this version: it is not
@@ -286,23 +302,18 @@ impl LatentPool {
     }
 
     /// Check the trajectory addressed by a call and return its committed bank.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn current_bank(
         &self,
         slot: usize,
-        step: i64,
-        generation: i64,
-        units: i64,
-        height: i64,
-        width: i64,
+        trajectory: &TrajectoryVersion,
         pages: &[usize],
     ) -> Result<u8> {
         let current = &self.slots[slot];
-        if current.step != step
-            || current.generation != generation
-            || current.units as i64 != units
-            || current.height != height
-            || current.width != width
+        if current.step != trajectory.step
+            || current.generation != trajectory.generation
+            || current.units as i64 != trajectory.units
+            || current.height != trajectory.height
+            || current.width != trajectory.width
         {
             return Err(Error::Invalid(
                 "latent allocation does not name the committed trajectory".into(),
@@ -489,7 +500,13 @@ impl LatentPool {
         if state.adopted || state.transfers.is_empty() {
             return Err(Error::Invalid("latent import cannot be adopted".into()));
         }
-        self.validate_metadata(generation, step, write.units as i64, height, width)?;
+        self.validate_metadata(&TrajectoryVersion {
+            step,
+            generation,
+            units: write.units as i64,
+            height,
+            width,
+        })?;
         if generation != i64::from(write.buffer.generation) {
             return Err(Error::Invalid(
                 "latent import generation disagrees with its product".into(),
@@ -574,20 +591,19 @@ impl LatentPool {
                 units,
             )?;
 
+            let trajectory = |step, generation| TrajectoryVersion {
+                step,
+                generation,
+                units,
+                height,
+                width,
+            };
             if update.release {
-                self.current_bank(
-                    slot,
-                    update.step,
-                    update.generation,
-                    units,
-                    height,
-                    width,
-                    &pages,
-                )?;
+                self.current_bank(slot, &trajectory(update.step, update.generation), &pages)?;
                 continue;
             }
 
-            self.validate_metadata(update.generation, update.step, units, height, width)?;
+            self.validate_metadata(&trajectory(update.step, update.generation))?;
             if update.expected_generation == 0 {
                 if update.expected_step != 0 || update.step != 0 {
                     return Err(Error::Invalid(
@@ -601,11 +617,7 @@ impl LatentPool {
             } else {
                 self.current_bank(
                     slot,
-                    update.expected_step,
-                    update.expected_generation,
-                    units,
-                    height,
-                    width,
+                    &trajectory(update.expected_step, update.expected_generation),
                     &pages,
                 )?;
                 if update.step <= update.expected_step {
@@ -730,14 +742,14 @@ impl LatentPool {
         Ok(())
     }
 
-    fn validate_metadata(
-        &self,
-        generation: i64,
-        step: i64,
-        units: i64,
-        height: i64,
-        width: i64,
-    ) -> Result<()> {
+    fn validate_metadata(&self, trajectory: &TrajectoryVersion) -> Result<()> {
+        let TrajectoryVersion {
+            step,
+            generation,
+            units,
+            height,
+            width,
+        } = *trajectory;
         if generation < 1 || step < 0 || units < 1 || height < 1 || width < 1 {
             return Err(Error::Invalid(
                 "latent trajectory metadata is invalid".into(),
@@ -851,6 +863,22 @@ mod tests {
     use crate::EventPool;
     use crate::transfer::{Read, ReadRef, Retirement};
 
+    /// The first commit of a seven-unit and of a four-unit trajectory.
+    const SEVEN_UNITS: TrajectoryVersion = TrajectoryVersion {
+        step: 0,
+        generation: 1,
+        units: 7,
+        height: 16,
+        width: 112,
+    };
+    const FOUR_UNITS: TrajectoryVersion = TrajectoryVersion {
+        step: 0,
+        generation: 1,
+        units: 4,
+        height: 16,
+        width: 64,
+    };
+
     fn buffer(slot: u64) -> BufferId {
         BufferId {
             owner: RequestKey::new(1, RequestId(slot), 1),
@@ -906,9 +934,9 @@ mod tests {
         let updates = [initial(1, &[3, 1], 7), initial(2, &[4, 2], 7)];
         pool.validate_updates(&updates)?;
         pool.apply_updates(&updates);
-        assert_eq!(pool.current_bank(1, 0, 1, 7, 16, 112, &[3, 1])?, 1);
-        assert_eq!(pool.current_bank(2, 0, 1, 7, 16, 112, &[4, 2])?, 1);
-        assert!(pool.current_bank(1, 0, 1, 7, 16, 112, &[1, 3]).is_err());
+        assert_eq!(pool.current_bank(1, &SEVEN_UNITS, &[3, 1])?, 1);
+        assert_eq!(pool.current_bank(2, &SEVEN_UNITS, &[4, 2])?, 1);
+        assert!(pool.current_bank(1, &SEVEN_UNITS, &[1, 3]).is_err());
         Ok(())
     }
 
@@ -930,7 +958,7 @@ mod tests {
         let mut update = initial(1, &[1], 4);
         pool.validate_updates(std::slice::from_ref(&update))?;
         pool.apply_updates(std::slice::from_ref(&update));
-        let bank = pool.current_bank(1, 0, 1, 4, 16, 64, &[1])?;
+        let bank = pool.current_bank(1, &FOUR_UNITS, &[1])?;
         pool.require_writable(1 - bank, &[1])?;
         update.expected_generation = 1;
         update.generation = 2;
@@ -963,7 +991,7 @@ mod tests {
         pool.apply_updates(std::slice::from_ref(&update));
 
         // The prepared version is published, and one reader has claimed it.
-        let prepared = pool.current_bank(1, 0, 1, 4, 16, 64, &[1])?;
+        let prepared = pool.current_bank(1, &FOUR_UNITS, &[1])?;
         let source = Arc::new(pool.prepare_export(buffer(1), 1, prepared, vec![1])?);
         pool.register_export(Arc::clone(&source));
         let reader = Arc::new(Retirement::default());
@@ -1022,7 +1050,7 @@ mod tests {
         // are admitted.
         pool.adopt_import(&replacement, 1, 0, 16, 64);
         assert!(replacement.adopted());
-        assert_eq!(pool.current_bank(2, 0, 1, 4, 16, 64, &[1])?, 0);
+        assert_eq!(pool.current_bank(2, &FOUR_UNITS, &[1])?, 0);
         pool.release_slots(&[2])?;
         pool.reap();
         assert!(pool.require_initial(1, &[1]).is_err());
@@ -1039,7 +1067,7 @@ mod tests {
         pool.register_export(Arc::clone(&source));
         let retirement = Arc::new(Retirement::default());
         pool.retain_export(&source, Arc::clone(&retirement))?;
-        retirement.complete(Err(Error::Transport("reader completion unknown".into())))?;
+        retirement.complete(Err(Error::transport("reader completion unknown")))?;
         pool.release_exports(&[buffer(1)]);
         pool.release_slots(&[1])?;
         pool.reap();
@@ -1050,7 +1078,7 @@ mod tests {
         let updates = [initial(2, &[2], 4)];
         pool.validate_updates(&updates)?;
         pool.apply_updates(&updates);
-        assert_eq!(pool.current_bank(2, 0, 1, 4, 16, 64, &[2])?, 1);
+        assert_eq!(pool.current_bank(2, &FOUR_UNITS, &[2])?, 1);
         assert!(pool.retirement_ready(&HashSet::from([buffer(2).owner])));
         Ok(())
     }

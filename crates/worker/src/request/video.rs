@@ -6,8 +6,9 @@
 //! shapes, constants and captured graphs every request it holds shares
 //! (`VideoDenoiser.layout_size`/`holds`). [`MediaPlan`] fixes, at startup,
 //! the frame counts, canvases and prompt capacities a rank admits and the
-//! layouts it prepares; [`MediaPlan::admit`] resolves a request's exact size
-//! and the smallest prepared prompt capacity whose layout holds it.
+//! layouts it prepares; once the model sized a request, [`MediaPlan::select`]
+//! admits it in the layout of the smallest prepared prompt capacity that
+//! holds it.
 //!
 //! A request's condition rows are the request rules' count
 //! ([`VideoCondition::packed_rows`] under the denoiser's declared condition

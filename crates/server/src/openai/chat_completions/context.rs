@@ -6,8 +6,7 @@ use crate::openai::ChatCompletionRequest;
 ///
 /// The chat-completions route handler builds this before calling
 /// `ServingRuntime::generate_chat`, which takes the request by value, and
-/// passes the fields to `collect_chat_completion` or
-/// `chat_completion_chunk_stream`.
+/// passes it to `collect_chat_completion` or `chat_completion_chunk_stream`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatResponseContext {
     /// OpenAI-compatible response identifier.

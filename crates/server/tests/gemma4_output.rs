@@ -28,7 +28,7 @@
 //! follows the chat template's assistant grammar also records Transformers'
 //! `parse_response` of it (`hf`).
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::sync::Arc;
 

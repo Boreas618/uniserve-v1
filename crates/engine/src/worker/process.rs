@@ -595,7 +595,10 @@ impl PendingRank {
     ///
     /// Fails when the rank's host-relative values or its descriptor cannot
     /// be built, the remote delivery fails, or the process cannot be spawned.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one rank's launch: its arguments, sockets, host and generation"
+    )]
     pub(crate) fn spawn_rank(
         args: &WorkerProcessArgs,
         rank: u32,

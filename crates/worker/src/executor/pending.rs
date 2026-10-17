@@ -472,6 +472,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::storage::TrajectoryVersion;
     use crate::{LatentPool, LatentUpdate};
 
     fn call() -> Call {
@@ -548,7 +549,14 @@ mod tests {
             pool.validate_updates(std::slice::from_ref(&initial))?;
             pool.apply_updates(&[initial]);
             let generation = if transferred { 7 } else { 1 };
-            assert_eq!(pool.current_bank(1, 0, generation, 4, 16, 64, &[1])?, 1);
+            let committed = TrajectoryVersion {
+                step: 0,
+                generation,
+                units: 4,
+                height: 16,
+                width: 64,
+            };
+            assert_eq!(pool.current_bank(1, &committed, &[1])?, 1);
 
             call.code = CallKind::Media(MediaCall::Denoising);
             call.latent_input = call.latent_output.take();
@@ -561,7 +569,12 @@ mod tests {
             output.apply_latent_update(&update);
             pool.apply_updates(&[update]);
             let generation = if transferred { 19 } else { 3 };
-            assert_eq!(pool.current_bank(1, 2, generation, 4, 16, 64, &[1])?, 0);
+            let denoised = TrajectoryVersion {
+                step: 2,
+                generation,
+                ..committed
+            };
+            assert_eq!(pool.current_bank(1, &denoised, &[1])?, 0);
             assert_eq!(output.progress.flow_step, 2);
 
             if transferred {

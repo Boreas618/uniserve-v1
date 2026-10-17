@@ -1,4 +1,3 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 //! The DiffusionGemma (Gemma-4) tokenizer encodes and decodes as Hugging Face does.
 //!
 //! Gemma-4 tokenizes SentencePiece-style: a `Replace` normalizer turns spaces

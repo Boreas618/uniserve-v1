@@ -1,6 +1,6 @@
 //! A rank's registration with the head, against a head stand-in.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::time::{Duration, Instant};
 

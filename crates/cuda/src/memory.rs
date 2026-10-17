@@ -79,8 +79,9 @@ impl DeviceAllocation {
         let driver = driver()?;
 
         let mut address = 0;
-        // SAFETY: the driver writes the base of a new allocation.
         driver.check(
+            // SAFETY: the driver writes the base of a new allocation to the local
+            // `address`, in the context the guard made current.
             unsafe { (driver.mem_alloc)(&mut address, bytes) },
             "cuMemAlloc_v2",
         )?;
@@ -189,6 +190,8 @@ pub struct PinnedBuffer {
 // SAFETY: the buffer is plain host memory owned by this value. Shared access
 // exposes only its address and unsafe views whose callers exclude DMA races.
 unsafe impl Send for PinnedBuffer {}
+// SAFETY: as for Send above; safe methods of a shared reference only read the
+// address and length, and the host views are unsafe for the same reason.
 unsafe impl Sync for PinnedBuffer {}
 
 impl PinnedBuffer {
@@ -201,8 +204,9 @@ impl PinnedBuffer {
         let driver = driver()?;
 
         let mut pointer = std::ptr::null_mut();
-        // SAFETY: the driver writes the base of a new host allocation.
         driver.check(
+            // SAFETY: the driver writes the base of a new host allocation to the
+            // local `pointer`.
             unsafe { (driver.mem_host_alloc)(&mut pointer, bytes, CU_MEMHOSTALLOC_PORTABLE) },
             "cuMemHostAlloc",
         )?;
@@ -287,6 +291,8 @@ pub struct HostRegistration {
 // SAFETY: the registration only stores the address to unregister; it grants
 // no host access to the memory.
 unsafe impl Send for HostRegistration {}
+// SAFETY: as for Send above; shared references only read the address and
+// length, and unregistering needs exclusive access.
 unsafe impl Sync for HostRegistration {}
 
 impl HostRegistration {
@@ -303,8 +309,9 @@ impl HostRegistration {
         let _guard = context.enter()?;
         let driver = driver()?;
 
-        // SAFETY: the caller guarantees the range is mapped.
         driver.check(
+            // SAFETY: the caller guarantees the range is mapped and stays mapped
+            // until it is unregistered.
             unsafe {
                 (driver.mem_host_register)(
                     pointer.as_ptr().cast(),

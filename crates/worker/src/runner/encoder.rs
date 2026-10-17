@@ -15,7 +15,7 @@
 //!
 //! An image model's vision and latent encoders compute through the same
 //! Python class, constructed over a bound component by
-//! `EncoderRunner.bound` ([`EncoderRunner::bind`]):
+//! `EncoderRunner.bound` ([`EncoderRunner::image`]):
 //!
 //! | kind | module | methods |
 //! | --- | --- | --- |
@@ -23,9 +23,9 @@
 //! | [`EncoderInfo::Latent`] | `PatchAutoencoder` | `encode`, `prepare_resident`, `draw_noise`, `warm` |
 //!
 //! Such a runner receives its device's product arena once; an unpacked
-//! `encode` writes its results into product [`Region`]s of it, in the
-//! product's dtype, and returns the results' shapes, which the caller
-//! publishes.
+//! `encode` writes its results into the regions of it the scheduler placed
+//! them in ([`Placement`]), in the product's dtype, and returns the results'
+//! shapes, which the caller publishes.
 //!
 //! **Images.** An image's facts (`EncoderRunner.image_facts`: its canvas,
 //! patch grid and prepared pixel shape) are known before its pixels. Inline
@@ -814,7 +814,7 @@ impl EncoderRunner {
     /// The runner of an image model's vision or latent encoder: allocate
     /// the buffers of the encoder `info` describes and construct its Python
     /// half, whose execution context is prepared for
-    /// [`EncoderInfo::context_size`].
+    /// `EncoderInfo::context_size`.
     pub fn image(
         setup: &ImageSetup<'_>,
         info: EncoderInfo,
@@ -1703,7 +1703,7 @@ impl EncoderRunner {
         Ok(())
     }
 
-    /// [`Self::capture_with`] for a caller outside a rank, which has no
+    /// `Self::capture_with` for a caller outside a rank, which has no
     /// lane: each job is performed on the calling thread, as
     /// [`Self::encode`] performs its job.
     pub fn capture(

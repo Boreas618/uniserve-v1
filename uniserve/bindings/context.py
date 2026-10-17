@@ -7,9 +7,9 @@ every numerical call site, and installs those bindings into the
 
 Workspace backing comes from a :class:`Workspace`: it allocates with
 ``torch.empty``, borrows the shared scratch of its stream from a
-:class:`Scratch`, and takes memory torch cannot allocate, the peer-mapped
-storage of a symmetric field, from the allocation function it is constructed
-with.
+:class:`Scratch`, and maps the peer-mapped storage of a symmetric field over
+its communicator's torch process group
+(:func:`uniserve.distributed.symmetric.allocate_symmetric_storage`).
 """
 
 from __future__ import annotations
@@ -267,29 +267,18 @@ class Workspace:
 
     Shared scratch is grown and kept by a :class:`Scratch`; persistent
     fields are tensors of their own. A symmetric field, which every member
-    of a group maps, is memory torch cannot allocate and comes from
-    ``allocate``.
+    of a group maps, is memory torch cannot allocate: the workspace maps it
+    over the torch process group of the field's communicator, a collective
+    call every member makes at the same point.
 
     Args:
         scratch: The shared :class:`Scratch` contexts serialized on one
             stream borrow; ``None`` creates one this workspace owns.
-        allocate: ``allocate(ranks, dtype, shape)`` returns
-            ``[local, peer_0, ...]``: this rank's tensor of one symmetric
-            field and every member's peer-mapped view of it, in member
-            order. ``ranks`` are the members' process ranks and ``dtype``
-            the element type's name (``"float32"``). The call is collective:
-            every member makes it at the same point. ``None`` maps the field
-            over the torch process group of its communicator.
     """
 
-    def __init__(
-        self,
-        scratch: Scratch | None = None,
-        allocate: Callable[..., Any] | None = None,
-    ) -> None:
+    def __init__(self, scratch: Scratch | None = None) -> None:
         self._owns_scratch = scratch is None
         self._scratch = Scratch() if scratch is None else scratch
-        self._allocate = allocate
         self._allocations: list[TensorBuffers] = []
         # Peer-mapped allocations, retained until release.
         self._symmetric: list[Any] = []
@@ -311,30 +300,17 @@ class Workspace:
         local, symmetric = _split(requirement)
         tensors = dict(self.allocate(local, requirement.group.device))
         peers = {}
+        if symmetric:
+            from uniserve.distributed.symmetric import (
+                allocate_symmetric_storage,
+            )
         for name, config in symmetric.items():
-            if self._allocate is None:
-                from uniserve.distributed.symmetric import (
-                    allocate_symmetric_storage,
-                )
-
-                shared = allocate_symmetric_storage(
-                    requirement.group, config.shape, config.dtype
-                )
-                self._symmetric.append(shared)
-                tensors[name] = shared.local
-                peers[name] = tuple(shared.peers)
-            else:
-                views = [
-                    torch.from_dlpack(view)
-                    for view in self._allocate(
-                        list(requirement.group.ranks),
-                        str(config.dtype).removeprefix("torch."),
-                        list(config.shape),
-                    )
-                ]
-                self._symmetric.append(views)
-                tensors[name] = views[0]
-                peers[name] = tuple(views[1:])
+            shared = allocate_symmetric_storage(
+                requirement.group, config.shape, config.dtype
+            )
+            self._symmetric.append(shared)
+            tensors[name] = shared.local
+            peers[name] = tuple(shared.peers)
         return tensors, peers
 
     def release(self) -> None:

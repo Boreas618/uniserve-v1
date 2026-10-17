@@ -33,8 +33,6 @@
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
 //! - `image_artifact`: validation of worker-produced PNG artifacts.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 mod config;
 mod stats;
 pub(crate) mod stats_report;

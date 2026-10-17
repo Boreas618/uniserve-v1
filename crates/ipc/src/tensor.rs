@@ -9,7 +9,7 @@
 //! the [`TransferTransport`] a consumer opens. A published cache extent travels as
 //! a [`CacheTransfer`] identified by a [`BufferId`] alone.
 //!
-//! The validators here are the wire contract: a [`Frame`](crate::Frame) runs
+//! The validators here are the wire contract: a [`Frame`] runs
 //! them, through `Batch::validate` and `BatchOutput::validate`, whenever it
 //! encodes or decodes a batch or a batch result. A rank also checks a product's
 //! descriptor size estimate against [`MAX_TRANSFER_HANDLE_BYTES`] before it

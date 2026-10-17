@@ -1,6 +1,6 @@
 //! Frontend identity, cancellation, and drain across real preprocessing and output.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![cfg(test)]
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -256,19 +256,20 @@ async fn chat_admission_rejection_remains_a_bad_request() {
         .generate_chat("rejected-chat".into(), request)
         .await
         .unwrap();
-    let error = uniserve_server::openai::chat_completions::collect_chat_completion(
-        stream,
-        "rejected-chat".to_string(),
-        "sim-model".to_string(),
-        0,
-        false,
-        false,
-        false,
-        false,
-        false,
-    )
-    .await
-    .unwrap_err();
+    let context = uniserve_server::openai::chat_completions::ChatResponseContext {
+        request_id: "rejected-chat".to_string(),
+        response_model: "sim-model".to_string(),
+        include_usage: false,
+        requested_logprobs: false,
+        include_prompt_logprobs: false,
+        include_reasoning: false,
+        return_token_ids: false,
+        return_tokens_as_token_ids: false,
+    };
+    let error =
+        uniserve_server::openai::chat_completions::collect_chat_completion(stream, context, 0)
+            .await
+            .unwrap_err();
 
     assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(

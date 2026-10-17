@@ -7,7 +7,6 @@
 //! OpenAI-compatible requests into serving-runtime calls; the runtime and the
 //! engine own tokenization, scheduling, and generation.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod listener;
 mod middleware;
 mod routes;
