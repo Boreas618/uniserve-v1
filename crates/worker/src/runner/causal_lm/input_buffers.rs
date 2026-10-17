@@ -16,8 +16,8 @@
 //! | `row_columns` | i64 | `[(6 + Tb) * (R + 1) + T]` | Rust (row gather input) |
 //! | `causal_values` | i32 | `[R]` | Rust (mixed causality) |
 //! | `logit_rows` | i64 | `[T]` | Rust: token positions projected to logits |
-//! | `draws` | f32 | `[T]` | Rust: per candidate row |
-//! | `params` | f32 | `[T, 8]` | Rust: per candidate row |
+//! | `draws` | f32 | `[T]` | Rust: per candidate row, or per row of a decode that samples its rows |
+//! | `params` | f32 | `[T, 8]` | Rust: likewise |
 //! | `tasks` | i64 | `[2, R]` | Rust: per task slot and gate |
 //! | `commit` | i64 | `[8, R]` | Rust: per commit row |
 //! | `logits` | model | `[R, local vocab]` | steps: candidate logits |

@@ -7,14 +7,7 @@ import torch
 
 from uniserve.sampling.logprobs import LogprobRequest, prompt_logprobs
 from uniserve.sampling.select import (
-    FREQUENCY,
-    PARAMETER_COLUMNS,
-    PRESENCE,
-    REPETITION,
-    TEMPERATURE,
     TOKEN_CONTINUATION_BIT,
-    TOP_P,
-    TYPICAL_P,
     select_categorical,
 )
 from uniserve.sampling.state import (
@@ -23,6 +16,15 @@ from uniserve.sampling.state import (
     EXPLICIT,
     VERIFY,
     commit,
+)
+from uniserve.sampling.top_k import (
+    FREQUENCY,
+    PARAMETER_COLUMNS,
+    PRESENCE,
+    REPETITION,
+    TEMPERATURE,
+    TOP_P,
+    TYPICAL_P,
 )
 
 pytestmark = pytest.mark.unit
@@ -154,6 +156,33 @@ def test_an_accepted_terminal_draft_finishes_without_a_bonus_token() -> None:
     assert selection.finish.tolist() == [True]
     assert selection.continuation.tolist() == [False]
     assert selection.tagged.tolist() == [3]
+
+
+def test_reported_logprobs_score_the_unshaped_distribution() -> None:
+    # A top-k cutoff of two at temperature one half selects among tokens 0
+    # and 1; the four reported tokens keep the model's log probabilities.
+    logits = torch.tensor([[3.0, 2.0, 1.0, 0.0]])
+    params = _params(1, temperature=0.5)
+
+    selection = _select(
+        logits,
+        params,
+        top_ks=[2],
+        logprob_tasks=[0],
+        logprob_requests=[LogprobRequest(count=4, token_ids=())],
+    )
+
+    assert selection.tokens.tolist() == [0]
+    packed = selection.logprobs
+    assert packed is not None
+    # Selected token, score and rank, then four top ids, scores and ranks.
+    expected = torch.log_softmax(logits[0], dim=-1).tolist()
+    assert packed[3:7].tolist() == [0, 1, 2, 3]
+    scores = packed[7:11].to(torch.int32).view(torch.float32).tolist()
+    assert scores == pytest.approx(expected, rel=1e-6)
+    assert _selected_logprobs(packed, 1) == pytest.approx(
+        expected[:1], rel=1e-6
+    )
 
 
 def _selected_logprobs(packed: torch.Tensor, rows: int) -> list[float]:

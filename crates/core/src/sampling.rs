@@ -5,7 +5,9 @@
 //! input validation → allowed-token mask → suppression mask → penalties
 //! (repetition / frequency / presence over branch-local token counts) →
 //! logit bias → validation → temperature → top-k → top-p → min-p → typical →
-//! validation → argmax or inverse-CDF draw → gather logprobs.
+//! validation → argmax or inverse-CDF draw. Logprobs score the input row, the
+//! model's distribution before every processor: the processors decide which
+//! token is selected, not how likely the model found it.
 //!
 //! Sampling consumes logits, request parameters, recent-token counts, and token
 //! masks. It returns the selected token together with requested ranked scores.
@@ -45,8 +47,8 @@ const NEG_INF: f32 = f32::NEG_INFINITY;
 /// holds `(token_id, count)` pairs, `allowed` is an optional whitelist, and
 /// `suppress` lists tokens to mask. Token ids outside the vocabulary are
 /// ignored in every list, so a whitelist containing only such ids masks the
-/// whole row. Ranked candidates are gathered when `n_logprobs` is non-zero or
-/// `p` requests generated-token logprobs.
+/// whole row. Ranked candidates are gathered from the input row when
+/// `n_logprobs` is non-zero or `p` requests generated-token logprobs.
 ///
 /// `None` represents a deterministic invalid distribution: empty logits, or a
 /// row that, at the input or after the bias or truncation stages, holds a NaN
@@ -71,6 +73,9 @@ pub fn try_apply_sampling_counts(
     if !valid_distribution(logits) {
         return None;
     }
+    // Logprobs are scored against the model's distribution, the row before
+    // any processor.
+    let input = logits.to_vec();
 
     // Apply vocabulary eligibility constraints before any probability-derived
     // processor observes the logits.
@@ -232,12 +237,12 @@ pub fn try_apply_sampling_counts(
         sample_categorical(&probs, draw)
     };
 
-    // Score the sampled token and any requested alternatives against the final,
-    // masked distribution.
-    let logprobs = log_softmax(logits);
+    // Score the sampled token and any requested alternatives against the
+    // input row.
+    let logprobs = log_softmax(&input);
     let sampled_lp = logprobs.get(token as usize).copied().unwrap_or(NEG_INF);
     let top = if p.generated_logprobs_requested() || n_logprobs > 0 {
-        score_token_logprobs(logits, token, n_logprobs, &p.logprob_token_ids)
+        score_token_logprobs(&input, token, n_logprobs, &p.logprob_token_ids)
     } else {
         Vec::new()
     };
@@ -624,24 +629,33 @@ mod tests {
     }
 
     #[test]
-    fn masking_excludes_pruned_tokens_from_logprobs() {
-        // Ranked output includes only finite candidates. A top-k cutoff of two
-        // therefore limits even a five-entry request to two results.
-        let mut l = ramp_logits();
+    fn logprobs_score_the_distribution_before_its_cutoffs() {
+        // A top-k cutoff of two selects among two tokens, and a five-entry
+        // request still reports every token with the scores of the input
+        // row, as a request without the cutoff does.
         let p = SamplingParams {
             top_k: 2,
             ..Default::default()
         };
-        let out = sample_valid_fixture(&mut l, &p, &[], None, None, 5);
-        assert_eq!(out.top.len(), 2, "only the 2 survivors are reportable");
-        let reported: Vec<u32> = out.top.iter().map(|&(t, _, _)| t).collect();
-        assert!(
-            !reported.contains(&2),
-            "pruned token 2 excluded from logprobs"
+        let cut = sample_valid_fixture(&mut ramp_logits(), &p, &[], None, None, 5);
+        let whole = sample_valid_fixture(
+            &mut ramp_logits(),
+            &SamplingParams::default(),
+            &[],
+            None,
+            None,
+            5,
         );
-        assert!(
-            !reported.contains(&3),
-            "pruned token 3 excluded from logprobs"
+        let expected = log_softmax(&ramp_logits());
+
+        assert_eq!(cut.token, 0);
+        assert_eq!(cut.top, whole.top);
+        assert_eq!(cut.logprob, expected[0]);
+        assert_eq!(
+            cut.top,
+            (0..4)
+                .map(|token| (token, expected[token as usize], token + 1))
+                .collect::<Vec<_>>()
         );
     }
 

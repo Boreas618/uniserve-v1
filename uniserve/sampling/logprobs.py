@@ -1,9 +1,12 @@
 """Selected, top and requested token log probabilities in one packed column.
 
-``logprob_details`` scores shaped logits rows and packs every requesting
-row's fields into one int64 column that the worker reads back and decodes
+``logprob_details`` scores logits rows and packs every requesting row's
+fields into one int64 column that the worker reads back and decodes
 (``uniserve_worker::LogprobLayout``). ``prompt_logprobs`` scores a prompt
-chunk against the logits that predicted each of its tokens.
+chunk against the logits that predicted each of its tokens. Both score the
+model's distribution, the logits before any sampling control: a reported
+log probability is how likely the model found a token, whatever cutoffs,
+penalties or temperature selected it.
 """
 
 from __future__ import annotations
@@ -56,12 +59,12 @@ def logprob_details(
 ) -> torch.Tensor:
     """Score selected, top and requested tokens of the requesting rows.
 
-    Scores are ``log_softmax`` of the shaped logits. Ranks are 1-based
+    Scores are ``log_softmax`` of the logits rows. Ranks are 1-based
     competition ranks: one plus the number of strictly larger scores in the
     row, so equal scores share a rank.
 
     Args:
-        work: Shaped ``[rows, vocab]`` logits.
+        work: ``[rows, vocab]`` float logits.
         output_rows: Per requesting row, the ``work`` row that scored it.
         output_tokens: Per requesting row, the selected token.
         requests: Per requesting row, what it reports.

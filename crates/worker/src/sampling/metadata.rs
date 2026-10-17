@@ -13,6 +13,10 @@
 //! Tasks are reordered into groups; [`SamplingMetadata::position`] maps an input
 //! task to its output position (its column in the selection outputs).
 //!
+//! A decode forward whose rows all take the top-k sampler or the unshaped
+//! greedy path selects in its own graph instead: [`RowSampling`] holds its
+//! rows' draws and parameters in row order, and no sampling method follows.
+//!
 //! A token set crosses in the form the sampler indexes with. A per-task set
 //! (finish and transition tokens, reported logprob ids) is a row-major
 //! matrix of at least one column, padded with -1. A set applied to logits
@@ -24,13 +28,18 @@
 use indexmap::IndexMap;
 use uniserve_core::SamplingParams;
 
-use super::{SamplingControls, SamplingPath, TOKEN_VALUE_MASK};
+use super::{SamplingControls, SamplingPath, TOKEN_VALUE_MASK, top_k_width};
 use crate::storage::LogprobLayout;
 use crate::{Error, Result};
 
 /// Parameters per candidate row: temperature, top-p, min-p, typical-p,
-/// repetition, frequency and presence penalties, and one spare column.
+/// repetition, frequency and presence penalties, and the top-k width
+/// (`uniserve.sampling.top_k`'s columns).
 pub(crate) const PARAMETER_COLUMNS: usize = 8;
+
+/// The parameter row of a neutral row: a padding row of a decode forward
+/// that samples its rows (zero temperature, no cutoff, no penalty).
+const NEUTRAL: [f32; PARAMETER_COLUMNS] = [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0];
 
 /// One sampled call of an invocation.
 pub(crate) struct SampleTask<'a> {
@@ -260,7 +269,6 @@ impl SamplingMetadata {
     pub(crate) fn build(
         tasks: &[SampleTask<'_>],
         vocab: usize,
-        cuda: bool,
         logprob_base: usize,
         logprob_capacity: usize,
     ) -> Result<Self> {
@@ -273,7 +281,7 @@ impl SamplingMetadata {
         for (index, task) in tasks.iter().enumerate() {
             validate(task, vocab)?;
             paths
-                .entry(task.controls.path(task.params, vocab, cuda))
+                .entry(task.controls.path(task.params, vocab))
                 .or_default()
                 .push(index);
         }
@@ -319,7 +327,7 @@ impl SamplingMetadata {
                     None => draws.extend(std::iter::repeat_n(0.0, rows)),
                 }
                 for _ in 0..rows {
-                    params.extend_from_slice(&parameters(task.params));
+                    params.extend_from_slice(&parameters(task.params, vocab));
                 }
                 if task.params.generated_logprobs_requested() {
                     let (count, ids) = logprob_request(task.params, vocab);
@@ -397,6 +405,61 @@ impl SamplingMetadata {
     }
 }
 
+/// The draws and parameters of a decode forward whose rows the forward
+/// samples itself: one row per task, in task order, which is the forward's
+/// row order.
+pub(crate) struct RowSampling {
+    /// One draw per row; zero for a row that selects by argmax.
+    pub(crate) draws: Vec<f32>,
+    /// [`PARAMETER_COLUMNS`] parameters per row.
+    pub(crate) params: Vec<f32>,
+}
+
+impl RowSampling {
+    /// The rows of `tasks`, each of which takes the top-k sampler or the
+    /// unshaped greedy path with one candidate row.
+    pub(crate) fn build(tasks: &[SampleTask<'_>], vocab: usize) -> Result<Self> {
+        let mut draws = Vec::with_capacity(tasks.len());
+        let mut params = Vec::with_capacity(tasks.len() * PARAMETER_COLUMNS);
+        for task in tasks {
+            validate(task, vocab)?;
+            let own = matches!(
+                task.controls.path(task.params, vocab),
+                SamplingPath::TopK | SamplingPath::Greedy { suppressed: false }
+            );
+            if !own || task.rows() != 1 {
+                return Err(Error::Invariant(
+                    "a decode forward samples only top-k and greedy rows".into(),
+                ));
+            }
+            draws.push(task.draws.as_ref().map_or(0.0, |values| values[0]));
+            params.extend_from_slice(&parameters(task.params, vocab));
+        }
+        Ok(Self { draws, params })
+    }
+
+    /// `rows` neutral rows: zero draws, and parameters that select by
+    /// argmax without a cutoff or penalty.
+    pub(crate) fn neutral(rows: usize) -> Self {
+        Self {
+            draws: vec![0.0; rows],
+            params: NEUTRAL.repeat(rows),
+        }
+    }
+
+    /// The draws and parameters of `rows` forward rows: these rows, then
+    /// neutral padding rows.
+    pub(crate) fn padded(&self, rows: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut draws = self.draws.clone();
+        draws.resize(rows.max(draws.len()), 0.0);
+        let mut params = self.params.clone();
+        while params.len() < draws.len() * PARAMETER_COLUMNS {
+            params.extend_from_slice(&NEUTRAL);
+        }
+        (draws, params)
+    }
+}
+
 /// Top count and deduplicated in-range ids a call reports per position.
 pub(crate) fn logprob_request(params: &SamplingParams, vocab: usize) -> (usize, Vec<u32>) {
     let count = (params.n_logprobs as usize).min(vocab);
@@ -414,7 +477,10 @@ pub(crate) fn logprob_words(rows: usize, count: usize, requested: usize) -> usiz
     rows * (3 + 3 * count + 2 * requested)
 }
 
-fn parameters(params: &SamplingParams) -> [f32; PARAMETER_COLUMNS] {
+fn parameters(params: &SamplingParams, vocab: usize) -> [f32; PARAMETER_COLUMNS] {
+    // The top-k width inside the vocabulary, or zero without one; an
+    // integer far below 2^24, which f32 holds exactly.
+    let top_k = top_k_width(params, vocab);
     [
         params.temperature,
         params.top_p,
@@ -423,7 +489,7 @@ fn parameters(params: &SamplingParams) -> [f32; PARAMETER_COLUMNS] {
         params.repetition_penalty,
         params.frequency_penalty,
         params.presence_penalty,
-        0.0,
+        if top_k < vocab { top_k as f32 } else { 0.0 },
     ]
 }
 
@@ -493,7 +559,7 @@ mod tests {
             task(&greedy, 1, None),
             task(&stochastic, 2, Some(vec![0.5])),
         ];
-        let metadata = SamplingMetadata::build(&tasks, 100, false, 10, 1000)?;
+        let metadata = SamplingMetadata::build(&tasks, 100, 10, 1000)?;
         // Categorical tasks first (first appearance), then greedy.
         assert_eq!(
             (0..3)
@@ -530,9 +596,9 @@ mod tests {
         assert_eq!(metadata.logprob_end(), Some(32));
         assert_eq!(metadata.slots, vec![3, 3, 3]);
 
-        assert!(SamplingMetadata::build(&tasks, 100, false, 990, 1000).is_err());
+        assert!(SamplingMetadata::build(&tasks, 100, 990, 1000).is_err());
         let invalid = [task(&stochastic, 0, None)];
-        assert!(SamplingMetadata::build(&invalid, 100, false, 0, 1000).is_err());
+        assert!(SamplingMetadata::build(&invalid, 100, 0, 1000).is_err());
         Ok(())
     }
 }

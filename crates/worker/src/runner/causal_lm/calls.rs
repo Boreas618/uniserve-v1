@@ -12,7 +12,7 @@ use super::context::Media;
 use crate::executor::PendingOutput;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE as CACHE, FINISH_IDS, RowSource, TokenRow};
-use crate::sampling::SamplingControls;
+use crate::sampling::{SamplingControls, SamplingPath};
 use crate::storage::BlockTables;
 use crate::{Error, Result};
 
@@ -303,30 +303,45 @@ pub(super) fn finish(
     }
 }
 
-/// Whether a decode call can use the decode forward's greedy selection:
-/// unshaped greedy sampling without host masks, finish tokens the forward
-/// reads (`finish`, at most [`FINISH_IDS`]), a relayed continuation gate, a
-/// token relay output and no transition output.
-pub(super) fn greedy_eligible(
+/// How a decode forward selects its rows' tokens itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum OwnSelection {
+    /// The argmax of each row's logits.
+    Greedy,
+    /// Each row sampled from its top-k candidates under its own parameters
+    /// and draw; greedy rows are its zero-temperature rows.
+    TopK,
+}
+
+/// The selection a decode forward can make for a call itself, or `None`
+/// when the call needs a sampling method after the forward. The forward
+/// selects for a decode relayed by its slot's token, with a token relay
+/// output, no transition, finish tokens the forward reads (at most
+/// [`FINISH_IDS`]) and the unshaped greedy or the top-k sampler as `path`.
+pub(super) fn own_selection(
     call: &Call,
-    params: &SamplingParams,
     prepared: &Prepared,
-    finish: &[u32],
+    controls: &SamplingControls,
+    path: SamplingPath,
     token_output: bool,
     transition_output: bool,
-) -> bool {
-    let state = call.sampling_state.as_ref();
-    call.code == CallKind::Forward(ForwardMode::Decode)
-        && params.device_greedy()
-        && finish.len() <= FINISH_IDS
-        && params.allowed_token_ids.is_none()
-        && params.forced_token_ids.is_empty()
-        && !state.is_some_and(|state| {
-            state.allowed_token_ids.is_some()
-                || !state.suppressed_token_ids.is_empty()
-                || !state.transition_token_ids.is_empty()
-        })
-        && !transition_output
-        && prepared.tagged
-        && token_output
+) -> Option<OwnSelection> {
+    let transitions = call
+        .sampling_state
+        .as_ref()
+        .is_some_and(|state| !state.transition_token_ids.is_empty());
+    if call.code != CallKind::Forward(ForwardMode::Decode)
+        || controls.finish_token_ids.len() > FINISH_IDS
+        || transitions
+        || transition_output
+        || !prepared.tagged
+        || !token_output
+    {
+        return None;
+    }
+    match path {
+        SamplingPath::Greedy { suppressed: false } => Some(OwnSelection::Greedy),
+        SamplingPath::TopK => Some(OwnSelection::TopK),
+        SamplingPath::Greedy { suppressed: true } | SamplingPath::Categorical => None,
+    }
 }

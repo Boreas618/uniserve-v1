@@ -44,9 +44,9 @@ use uniserve_engine::{
 };
 use uniserve_ipc::{
     ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, BufferAllocation,
-    CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode,
-    ForwardBatch, ForwardMode, LatentParams, LaunchDescriptor, MediaCall, NewRequest, RequestKey,
-    ShapeBound, TensorRef, TransferMode,
+    CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, DType, DrawLayout,
+    ErrorCode, ForwardBatch, ForwardMode, LatentParams, LaunchDescriptor, MediaCall, NewRequest,
+    RequestKey, Rng, ShapeBound, TensorRef, TransferMode,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -1052,6 +1052,114 @@ fn a_rank_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()> {
     let closed_record = &closed.results[0].output;
     assert_eq!(closed_record.status, CallStatus::Error);
     assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidCall));
+    executor.close()?;
+    Ok(())
+}
+
+/// The first token a fresh request samples after the prompt `[7, 8]` at
+/// temperature 100 over the whole vocabulary: the stub's ±16 logits become
+/// nearly uniform, so the token is a function of the request's draw.
+fn sampled_first_token(
+    executor: &mut WorkerGroup,
+    batch_id: u64,
+    request_id: u64,
+    slot: u32,
+    seed: Option<u64>,
+) -> anyhow::Result<u32> {
+    let mut admission = text_admission(request_id, 1, slot)?;
+    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    sampling.temperature = 100.0;
+    sampling.seed = seed;
+    let mut batch = token_batch(
+        batch_id,
+        batch_id,
+        admission.request_key,
+        Some(admission),
+        CallId::new(batch_id, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7, 8],
+        UnitId(slot),
+        0,
+    );
+    // The draw at the position after the prompt.
+    batch.calls[0].rng = Some(Rng {
+        seed: seed.unwrap_or(0),
+        semantic_index_base: 2,
+        draw_layout: DrawLayout::TargetSampling,
+    });
+    let result = execute(executor, batch)?;
+    let record = &result.results[0].output;
+    assert_eq!(record.status, CallStatus::Ok);
+    Ok(record.committed_tokens[0])
+}
+
+#[test]
+fn a_seeded_request_repeats_under_another_identity() -> anyhow::Result<()> {
+    let mut executor = spawn_rank_group()?;
+
+    // Two requests with one seed draw the same token; another seed, and
+    // unseeded requests, draw their own.
+    let first = sampled_first_token(&mut executor, 1, 21, 1, Some(17))?;
+    let again = sampled_first_token(&mut executor, 2, 22, 2, Some(17))?;
+    let other = sampled_first_token(&mut executor, 3, 23, 3, Some(18))?;
+    let unseeded = sampled_first_token(&mut executor, 4, 24, 4, None)?;
+    let unseeded_other = sampled_first_token(&mut executor, 5, 25, 5, None)?;
+
+    assert_eq!(first, again);
+    assert_ne!(first, other);
+    assert_ne!(unseeded, unseeded_other);
+    executor.close()?;
+    Ok(())
+}
+
+/// The five top logprobs a fresh request reports for its first token after
+/// the prompt `[7, 8]`, selected greedily under the nucleus `top_p`.
+fn first_token_logprobs(
+    executor: &mut WorkerGroup,
+    batch_id: u64,
+    request_id: u64,
+    slot: u32,
+    top_p: f32,
+) -> anyhow::Result<Vec<uniserve_core::TokenLogprob>> {
+    let mut admission = text_admission(request_id, 1, slot)?;
+    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    sampling.top_p = top_p;
+    sampling.return_logprobs = true;
+    sampling.n_logprobs = 5;
+    let mut batch = token_batch(
+        batch_id,
+        batch_id,
+        admission.request_key,
+        Some(admission),
+        CallId::new(batch_id, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[7, 8],
+        UnitId(slot),
+        0,
+    );
+    batch.calls[0].bounds.max_completion_bytes = 4 + 6 * 12;
+    let result = execute(executor, batch)?;
+    let record = &result.results[0].output;
+    assert_eq!(record.status, CallStatus::Ok);
+    // The stub's head maps 8 to 1000.
+    assert_eq!(record.committed_tokens, vec![1000]);
+    Ok(record.top_logprobs.clone())
+}
+
+#[test]
+fn logprobs_report_the_model_distribution_under_a_cutoff() -> anyhow::Result<()> {
+    let mut executor = spawn_rank_group()?;
+
+    // The stub's successor holds nearly all mass, so a nucleus of one half
+    // keeps it alone; the five reported tokens are still the model's five
+    // most likely, with the model's log probabilities.
+    let cut = first_token_logprobs(&mut executor, 1, 31, 1, 0.5)?;
+    let whole = first_token_logprobs(&mut executor, 2, 32, 2, 1.0)?;
+
+    assert_eq!(cut.len(), 5);
+    assert_eq!(cut[0].token_id, 1000);
+    assert!(cut.iter().all(|entry| entry.logprob.is_finite()));
+    assert_eq!(cut, whole);
     executor.close()?;
     Ok(())
 }

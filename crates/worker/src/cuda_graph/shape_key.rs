@@ -9,8 +9,9 @@ use crate::{Error, Result};
 /// widths and tensors: the method and its scalar arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ShapeKey {
-    /// `decode` of a row bucket.
-    Decode { rows: usize },
+    /// `decode` of a row bucket, selecting greedily or, `sampled`, each
+    /// row from its top-k candidates.
+    Decode { rows: usize, sampled: bool },
     /// `prefill` of a row and token bucket, with outputs or writing only
     /// the prefix cache.
     Prefill {
