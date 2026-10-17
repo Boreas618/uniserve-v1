@@ -5,8 +5,9 @@
 //! with `cargo test -p uniserve-worker --test transports -- --ignored`.
 
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
 use std::ops::Range;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
@@ -372,6 +373,141 @@ fn observers_of_one_read_run_once_each() -> Result<()> {
     read.add_done_callback(observer);
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     exports::release(&locations)?;
+    transports.close()
+}
+
+/// The child half of the two-process shared-memory test reads this
+/// variable.
+const SHARED_LOCATOR: &str = "UNISERVE_TEST_SHM_LOCATOR";
+/// The line the consumer prints once it holds its claim on the export.
+const CLAIMED: &str = "shared export claimed";
+
+/// Producer half: export a host tensor through shared memory to consumer
+/// slot 1 of this host, run this test binary as the consumer, and require
+/// the export to keep its bytes while the consumer's claim is open and to
+/// return them once the consumer acknowledged it.
+#[test]
+fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result<()> {
+    let (transports, capacity, events) = transports(
+        &[TransportKind::Local, TransportKind::Shm],
+        "producer",
+        0,
+        1 << 12,
+        1 << 20,
+    )?;
+    let source = counting(&[4, 3])?;
+    let mut retirements = Vec::new();
+    let locations = located(&transports, &source, None, &[1], None, |retirement| {
+        retirements.push(retirement);
+        Ok(())
+    })?;
+    let (_, locator) = locations
+        .iter()
+        .find(|(_, locator)| TransportKind::of(locator) == TransportKind::Shm)
+        .ok_or(Error::State("no shared-memory location was exported"))?;
+
+    let locator = serde_json::to_string(locator)
+        .map_err(|error| Error::Invalid(format!("unserializable locator: {error}")))?;
+    let executable = std::env::current_exe()
+        .map_err(|error| Error::Invalid(format!("no test executable: {error}")))?;
+    let mut consumer = Command::new(executable)
+        .args([
+            "--exact",
+            "shared_export_consumer",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(SHARED_LOCATOR, locator)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::Invalid(format!("cannot run the consumer: {error}")))?;
+    let lost = || Error::State("the consumer's pipes are gone");
+    let mut output = BufReader::new(consumer.stdout.take().ok_or_else(lost)?);
+    let mut line = String::new();
+    while line.trim_end() != CLAIMED {
+        line.clear();
+        let read = output
+            .read_line(&mut line)
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        assert!(read > 0, "the consumer exited before it claimed the export");
+    }
+
+    // The consumer has read the export once and holds a second claim: the
+    // revoked export keeps its bytes until that claim is acknowledged.
+    exports::release(&locations)?;
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        events.drain()?;
+        transports.reap()?;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(capacity.used() > 0, "a claimed export returned its bytes");
+    assert!(!retirements.iter().all(|retirement| retirement.done()));
+
+    let mut input = consumer.stdin.take().ok_or_else(lost)?;
+    input
+        .write_all(b"\n")
+        .map_err(|error| Error::Transport(error.to_string()))?;
+    drop(input);
+    let status = consumer
+        .wait()
+        .map_err(|error| Error::Transport(error.to_string()))?;
+    assert!(status.success(), "the consumer process failed");
+
+    // Acknowledged: the export retires and its bytes return.
+    settle(&transports, &capacity, &events)?;
+    assert!(retirements.iter().all(|retirement| retirement.succeeded()));
+    transports.close()
+}
+
+/// Consumer half, run by
+/// `shared_exports_retire_once_another_process_acknowledged_its_reads`: copy
+/// the export, then borrow it in place until the producer answers.
+#[test]
+#[ignore = "runs as the consumer process of the shared-memory export test"]
+fn shared_export_consumer() -> Result<()> {
+    let Ok(locator) = std::env::var(SHARED_LOCATOR) else {
+        return Ok(());
+    };
+    let locator: Locator = serde_json::from_str(&locator)
+        .map_err(|error| Error::Invalid(format!("unreadable locator: {error}")))?;
+    let (transports, _, _) = transports(&[TransportKind::Shm], "consumer", 1, 1 << 12, 1 << 20)?;
+    let transport = transports
+        .get(TransportKind::Shm)
+        .ok_or(Error::State("no shared-memory transport is bound"))?;
+
+    // A copy read acknowledges its claim when its task retires.
+    let destination = zeros(&[2, 3])?;
+    let read = fetch(
+        transport,
+        &locator,
+        MemoryKind::Host,
+        Some(&destination),
+        Some(&[1..3, 0..3]),
+        None,
+    )?;
+    read.wait_ready();
+    assert_eq!(
+        values(&read.result(None::<&Stream>)?),
+        [3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    );
+    while !read.retirement().succeeded() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // A borrow holds its claim until it is dropped.
+    let borrowed = transport.borrow(&locator, None)?;
+    assert_eq!(borrowed.nbytes(), 48);
+    println!("{CLAIMED}");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| Error::Transport(error.to_string()))?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| Error::Transport(error.to_string()))?;
+    drop(borrowed);
     transports.close()
 }
 

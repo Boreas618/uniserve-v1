@@ -19,7 +19,7 @@ pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
 pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, GroupAxis};
-pub use prefix_cache::planes::CachePlanes;
+pub use prefix_cache::planes::{CachePlanes, UnitColumn};
 pub use prefix_cache::{PendingImport, PrefixCache};
 pub use products::{
     Metadata, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore, ValueRange,
@@ -30,6 +30,5 @@ pub(crate) use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 pub(crate) use output::{OutputLease, OutputPool};
 pub use pinned_pool::PinnedPool;
 pub(crate) use prefix_cache::block_tables::{AttentionRow, TablePages, table_pages};
-pub(crate) use prefix_cache::planes::UnitColumn;
 pub(crate) use prefix_cache::{ScratchUnits, TransferBases, UnitAccesses};
 pub(crate) use request_slots::{RequestSlots, SlotField};

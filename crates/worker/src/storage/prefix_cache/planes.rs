@@ -357,7 +357,7 @@ impl CachePlanes {
 ///
 /// A column is reused only in its stream's order: an upload for the next
 /// operation is ordered after the previous operation's kernels.
-pub(crate) struct UnitColumn {
+pub struct UnitColumn {
     units: StorageView,
     stream: Option<usize>,
     /// The library's `UnitResets` over the column and the pool's fields.

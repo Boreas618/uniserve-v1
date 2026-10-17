@@ -45,8 +45,8 @@ use uniserve_engine::{
 use uniserve_ipc::{
     ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, BufferAllocation,
     CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode,
-    ForwardBatch, ForwardMode, LaunchDescriptor, MediaCall, NewRequest, RequestKey, ShapeBound,
-    TensorRef, TransferMode,
+    ForwardBatch, ForwardMode, LatentParams, LaunchDescriptor, MediaCall, NewRequest, RequestKey,
+    ShapeBound, TensorRef, TransferMode,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -3117,6 +3117,474 @@ fn a_request_continues_on_the_worker_that_installed_its_cache() -> anyhow::Resul
             .context("request close did not retire")?
             .done
     );
+    executor.close()?;
+    Ok(())
+}
+
+/// The calls of a generated image's trajectory, as the scheduler plans a
+/// 32x32 image of `IMAGE_STEPS` steps without guidance for the stub: each
+/// builder returns a batch of one call, named by its batch id, whose
+/// outputs take the generations `generation` and `generation + 1`.
+mod trajectory {
+    use uniserve_ipc::BufferId;
+
+    use super::*;
+
+    /// Solver steps of the generated image.
+    pub(super) const IMAGE_STEPS: u32 = 2;
+    const SIDE: u32 = 32;
+    /// The stub's latent rows of a 32x32 image, and their bytes.
+    const LATENT_UNITS: u32 = 4;
+    const LATENT_BYTES: u64 = 6144;
+    const PROMPT: [u32; 3] = [5, 6, 7];
+    /// Cache tokens of the conditioning: the prompt and the token that
+    /// closes it.
+    const CONDITIONING: u32 = 4;
+
+    /// A text request with image parameters in `slot`, ending at the image
+    /// tokens.
+    pub(super) fn admission(request_id: u64, slot: u32) -> anyhow::Result<NewRequest> {
+        let ar = ArRequestParams {
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            negative_token_ids: Vec::new(),
+            finish_token_ids: vec![1000, 1007],
+            initial_position: 0,
+            canvas: None,
+        };
+        let image = uniserve_core::ImageParams {
+            steps: IMAGE_STEPS as u16,
+            height: SIDE,
+            width: SIDE,
+            seed: Some(7),
+            cfg_text_scale: 1.0,
+            ..uniserve_core::ImageParams::default()
+        };
+        Ok(NewRequest::new(
+            RequestKey::new(1, RequestId(request_id), 1),
+            slot,
+            Some(ar),
+            Some(image),
+            0,
+        )?)
+    }
+
+    fn output(key: RequestKey, batch: u64, index: u16, generation: u32, dtype: DType) -> TensorRef {
+        TensorRef {
+            request_key: key,
+            producer_call_id: CallId::new(batch, 0),
+            output_index: index,
+            generation,
+            dtype,
+            shape_bound: ShapeBound::default(),
+        }
+    }
+
+    fn latent(key: RequestKey, batch: u64, generation: u32) -> TensorRef {
+        TensorRef {
+            shape_bound: ShapeBound {
+                dims: vec![uniserve_ipc::DimBound::Device {
+                    max: (LATENT_BYTES / 2) as u32,
+                }],
+            },
+            ..output(key, batch, 0, generation, DType::BF16)
+        }
+    }
+
+    /// The coordinates of a call after the closed conditioning, at solver
+    /// step `flow_step`.
+    fn coordinates(flow_step: u32) -> CallCoordinates {
+        CallCoordinates {
+            logical_position: PROMPT.len() as u32,
+            cache_visible_len: CONDITIONING,
+            cache_computed_len: CONDITIONING,
+            flow_step,
+        }
+    }
+
+    fn params(key: RequestKey, batch: u64, page: u32, start: u32, count: u32) -> LatentParams {
+        LatentParams {
+            request_key: key,
+            call_id: CallId::new(batch, 0),
+            page_table: vec![page],
+            latent_units: LATENT_UNITS,
+            height: SIDE,
+            width: SIDE,
+            start_step: start,
+            step_count: count,
+        }
+    }
+
+    fn single(batch_id: u64, call: Call) -> Batch {
+        let mut batch = Batch::new(batch_id, Vec::new(), vec![call]);
+        batch.collective_seq = batch_id;
+        batch
+    }
+
+    /// Start `admission` and prefill its prompt into a page of `unit`.
+    pub(super) fn prompt(batch_id: u64, admission: &NewRequest, unit: UnitId) -> Batch {
+        let slot = admission.request_pool_idx;
+        let mut call = Call::new(
+            admission.request_key,
+            CallId::new(batch_id, 0),
+            CallKind::Forward(ForwardMode::Prefill),
+        );
+        call.component = "model".into();
+        call.input_token_ids = PROMPT.to_vec();
+        call.bounds = Bounds {
+            max_tokens: PROMPT.len() as u32,
+            max_cache_units: 1,
+            ..Bounds::default()
+        };
+        let mut batch = single(batch_id, call);
+        batch.commands = vec![BatchCommand::Start {
+            request: Box::new(admission.clone()),
+        }];
+        batch.block_tables = vec![BlockTable {
+            request_pool_idx: slot,
+            group_id: 0,
+            start_page: 0,
+            unit_ids: vec![unit],
+            allocated_tokens: 16,
+        }];
+        batch.new_cache_units = vec![CacheUnitAllocation {
+            request_pool_idx: slot,
+            group_id: 0,
+            unit_ids: vec![unit],
+        }];
+        batch.forward = ForwardBatch {
+            call_indices: vec![0],
+            request_pool_indices: vec![slot],
+            seq_lens: vec![PROMPT.len() as u32],
+            query_lens: vec![PROMPT.len() as u32],
+            write_cache: vec![true],
+        };
+        batch
+    }
+
+    /// Write the token that closes the conditioning into the cache after
+    /// the prompt, sampling nothing.
+    pub(super) fn close(batch_id: u64, key: RequestKey, slot: u32, generation: u32) -> Batch {
+        let mut call = Call::new(
+            key,
+            CallId::new(batch_id, 0),
+            CallKind::Forward(ForwardMode::Prefill),
+        );
+        call.component = "model".into();
+        call.coordinates = CallCoordinates {
+            logical_position: PROMPT.len() as u32,
+            cache_visible_len: PROMPT.len() as u32,
+            cache_computed_len: PROMPT.len() as u32,
+            flow_step: 0,
+        };
+        call.input_token_ids = vec![0];
+        call.completion_output = Some(output(key, batch_id, 0, generation, DType::U8));
+        call.bounds.max_tokens = 1;
+        let mut batch = single(batch_id, call);
+        batch.forward = ForwardBatch {
+            call_indices: vec![0],
+            request_pool_indices: vec![slot],
+            seq_lens: vec![CONDITIONING],
+            query_lens: vec![1],
+            write_cache: vec![true],
+        };
+        batch
+    }
+
+    /// Export the conditioning cache of `key` as buffer `(batch_id, 0)`.
+    pub(super) fn conditioning(
+        batch_id: u64,
+        key: RequestKey,
+        generation: u32,
+    ) -> (BufferId, Batch) {
+        let buffer = BufferId {
+            owner: key,
+            producer_call_id: CallId::new(batch_id, 0),
+            output_index: 0,
+            generation,
+        };
+        let mut call = Call::new(
+            key,
+            CallId::new(batch_id, 0),
+            CallKind::Transfer(TransferMode::CacheExport),
+        );
+        call.component = "model".into();
+        call.coordinates = coordinates(0);
+        call.cache_output = Some(buffer);
+        call.completion_output = Some(output(key, batch_id, 1, generation + 1, DType::U8));
+        call.bounds = Bounds {
+            max_transfer_bytes: 16,
+            ..Bounds::default()
+        };
+        (buffer, single(batch_id, call))
+    }
+
+    /// Draw the seeded initial latent of `key` into latent page `page`,
+    /// conditioned on `conditioning`.
+    pub(super) fn prepare(
+        batch_id: u64,
+        key: RequestKey,
+        conditioning: BufferId,
+        page: u32,
+        generation: u32,
+    ) -> (TensorRef, Batch) {
+        let initial = latent(key, batch_id, generation + 1);
+        let mut call = Call::new(
+            key,
+            CallId::new(batch_id, 0),
+            CallKind::Media(MediaCall::LatentPreparation),
+        );
+        call.component = "model".into();
+        call.coordinates = coordinates(0);
+        call.cache_input = Some(conditioning);
+        call.latent_output = Some(initial.clone());
+        call.completion_output = Some(output(key, batch_id, 1, generation, DType::U8));
+        call.rng = Some(uniserve_ipc::Rng {
+            seed: 7,
+            semantic_index_base: 1,
+            draw_layout: uniserve_ipc::DrawLayout::FlowNoise,
+        });
+        call.bounds = Bounds {
+            max_tokens: 1,
+            max_latent_bytes: LATENT_BYTES,
+            ..Bounds::default()
+        };
+        let mut batch = single(batch_id, call);
+        batch.latent_params = vec![params(key, batch_id, page, 0, 0)];
+        (initial, batch)
+    }
+
+    /// Denoise step `step` of the trajectory whose committed version is
+    /// `input`, in latent page `page`.
+    pub(super) fn denoise(
+        batch_id: u64,
+        slot: u32,
+        conditioning: BufferId,
+        input: &TensorRef,
+        page: u32,
+        step: u32,
+        generation: u32,
+    ) -> (TensorRef, Batch) {
+        let key = input.request_key;
+        let next = latent(key, batch_id, generation + 1);
+        let mut call = Call::new(
+            key,
+            CallId::new(batch_id, 0),
+            CallKind::Media(MediaCall::Denoising),
+        );
+        call.component = "model".into();
+        call.coordinates = coordinates(step);
+        call.cache_input = Some(conditioning);
+        call.latent_input = Some(input.clone());
+        call.latent_output = Some(next.clone());
+        call.completion_output = Some(output(key, batch_id, 1, generation, DType::U8));
+        call.bounds = Bounds {
+            max_tokens: 1,
+            max_latent_bytes: LATENT_BYTES,
+            ..Bounds::default()
+        };
+        let mut batch = single(batch_id, call);
+        // The conditioning, then the latent rows between their two commit
+        // marker tokens; denoising writes no cache.
+        batch.forward = ForwardBatch {
+            call_indices: vec![0],
+            request_pool_indices: vec![slot],
+            seq_lens: vec![CONDITIONING + LATENT_UNITS + 2],
+            query_lens: vec![LATENT_UNITS + 2],
+            write_cache: vec![false],
+        };
+        batch.latent_params = vec![params(key, batch_id, page, step, 1)];
+        (next, batch)
+    }
+
+    /// Decode the finished trajectory `input` to an image.
+    pub(super) fn decode(batch_id: u64, input: &TensorRef, page: u32, generation: u32) -> Batch {
+        let key = input.request_key;
+        let mut call = Call::new(
+            key,
+            CallId::new(batch_id, 0),
+            CallKind::Media(MediaCall::ImageDecoding),
+        );
+        call.component = "model".into();
+        call.coordinates = coordinates(IMAGE_STEPS);
+        call.latent_input = Some(input.clone());
+        call.completion_output = Some(output(key, batch_id, 2, generation, DType::U8));
+        // The base64 bound the scheduler derives for a 32x32 PNG.
+        call.bounds = Bounds {
+            max_tokens: 1,
+            max_completion_bytes: 1_406_380,
+            ..Bounds::default()
+        };
+        let mut batch = single(batch_id, call);
+        batch.latent_params = vec![params(key, batch_id, page, IMAGE_STEPS, 0)];
+        batch
+    }
+}
+
+/// Run `batch` on `worker` and require its one call to succeed.
+fn completed(
+    executor: &mut uniserve_engine::WorkerExecutor,
+    batch: Batch,
+    worker: &str,
+) -> anyhow::Result<uniserve_engine::BatchResult> {
+    let id = batch.batch_id;
+    let code = batch.calls[0].code;
+    executor.submit(place(batch, worker, Vec::new()))?;
+    let result = poll_logical(executor)?.with_context(|| format!("batch {id} did not complete"))?;
+    anyhow::ensure!(
+        result.batch_id == id,
+        "batch {} completed instead of {id}",
+        result.batch_id
+    );
+    let output = &result.results[0].output;
+    anyhow::ensure!(
+        output.status == CallStatus::Ok,
+        "{code:?} on {worker} ended {:?} ({:?})",
+        output.status,
+        output.error_code
+    );
+    Ok(result)
+}
+
+/// The encoded image a decoding batch's result carries.
+fn image_bytes(result: &uniserve_engine::BatchResult) -> anyhow::Result<Vec<u8>> {
+    let media = result.results[0]
+        .media
+        .clone()
+        .map_err(anyhow::Error::msg)?
+        .context("the decoding produced no image")?;
+    Ok(media.as_bytes().to_vec())
+}
+
+/// A trajectory one worker prepared reaches another worker as a latent
+/// transfer; that worker opens the trajectory from it (a rank that did not
+/// prepare a trajectory plans its guidance when its first denoising step
+/// arrives) and denoises it to the image its own preparation of the same
+/// seed gives.
+#[test]
+fn a_trajectory_prepared_on_another_worker_denoises_to_the_same_image() -> anyhow::Result<()> {
+    use trajectory::{
+        IMAGE_STEPS, admission, close, conditioning, decode, denoise, prepare, prompt,
+    };
+    use uniserve_engine::{ExecutionBatch, WorkerExecutor, WorkerId};
+
+    // The preparing worker publishes its trajectory versions to the
+    // denoising one over shared storage on their host; the denoising worker
+    // publishes nothing. Each holds every stub component and knows the
+    // other's: the components a published version's denoising may run on.
+    let workers = ["prepare", "denoise"];
+    let placement = single_rank_args("prepare", QUEUE_DEPTH);
+    let mut transfer = uniserve_engine::TransferConfig::parse("prepare->denoise=shm")?;
+    for worker in workers {
+        let hosts = placement.ranks.iter().map(|rank| rank.node.clone());
+        transfer
+            .worker_ranks
+            .insert(worker.into(), placement.ranks.len() as u32);
+        transfer.worker_hosts.insert(worker.into(), hosts.collect());
+    }
+    let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
+        let mut args = single_rank_args(worker_id, QUEUE_DEPTH);
+        args.transfer = transfer.clone();
+        args.peers = workers
+            .iter()
+            .map(|worker| ((*worker).to_owned(), args.components.clone()))
+            .collect();
+        WorkerGroup::spawn(args)
+    };
+    let mut executor = WorkerExecutor::try_new(
+        workers
+            .iter()
+            .map(|worker| Ok((WorkerId((*worker).into()), spawn(worker)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        transfer.clone(),
+    )?;
+
+    // The reference: request 2 is prepared, denoised and decoded on the
+    // denoising worker, in slot 2, cache unit 2 and latent page 2.
+    let reference = admission(2, 2)?;
+    let key = reference.request_key;
+    completed(&mut executor, prompt(1, &reference, UnitId(2)), "denoise")?;
+    completed(&mut executor, close(2, key, 2, 1), "denoise")?;
+    let (reference_conditioning, batch) = conditioning(3, key, 2);
+    completed(&mut executor, batch, "denoise")?;
+    let (mut version, batch) = prepare(4, key, reference_conditioning, 2, 4);
+    completed(&mut executor, batch, "denoise")?;
+    for step in 0..IMAGE_STEPS {
+        let batch_id = 5 + u64::from(step);
+        let (next, batch) = denoise(
+            batch_id,
+            2,
+            reference_conditioning,
+            &version,
+            2,
+            step,
+            6 + 2 * step,
+        );
+        completed(&mut executor, batch, "denoise")?;
+        version = next;
+    }
+    let expected = image_bytes(&completed(
+        &mut executor,
+        decode(7, &version, 2, 10),
+        "denoise",
+    )?)?;
+
+    // Request 1 has the reference's seed, so its initial latent is the
+    // reference's. Only the preparing worker draws it; both hold the
+    // request's conditioning.
+    let moved = admission(1, 1)?;
+    let key = moved.request_key;
+    completed(&mut executor, prompt(8, &moved, UnitId(1)), "prepare")?;
+    completed(&mut executor, close(9, key, 1, 1), "prepare")?;
+    let (prepared_conditioning, batch) = conditioning(10, key, 2);
+    completed(&mut executor, batch, "prepare")?;
+    let (mut version, batch) = prepare(11, key, prepared_conditioning, 1, 4);
+    completed(&mut executor, batch, "prepare")?;
+
+    completed(&mut executor, prompt(12, &moved, UnitId(1)), "denoise")?;
+    completed(&mut executor, close(13, key, 1, 6), "denoise")?;
+    let (denoising_conditioning, batch) = conditioning(14, key, 7);
+    completed(&mut executor, batch, "denoise")?;
+
+    // The first step reads the transferred version, which opens the
+    // trajectory on the denoising worker; the second reads the version the
+    // first wrote there.
+    for step in 0..IMAGE_STEPS {
+        let batch_id = 15 + u64::from(step);
+        let (next, batch) = denoise(
+            batch_id,
+            1,
+            denoising_conditioning,
+            &version,
+            1,
+            step,
+            9 + 2 * step,
+        );
+        completed(&mut executor, batch, "denoise")?;
+        version = next;
+    }
+    let image = image_bytes(&completed(
+        &mut executor,
+        decode(17, &version, 1, 13),
+        "denoise",
+    )?)?;
+    assert_eq!(
+        image, expected,
+        "the moved trajectory decoded another image"
+    );
+
+    for (batch_id, key) in [(18, key), (19, reference.request_key)] {
+        executor.submit(ExecutionBatch::new(
+            batch_id,
+            Vec::new(),
+            vec![finish(key)],
+            Vec::new(),
+        ))?;
+        let retired = poll_logical(&mut executor)?.context("request close did not retire")?;
+        assert!(retired.done);
+    }
     executor.close()?;
     Ok(())
 }

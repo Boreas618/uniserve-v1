@@ -373,12 +373,21 @@ impl PendingOutput {
             self.output.committed_tokens = vec![token_id(sampled)?];
             return Ok(());
         };
+        // The sampler accepts at most the drafted tokens and clamps its
+        // acceptance to a terminal prefix: a finish token among the drafts
+        // ends the commit there, so no accepted draft follows it.
+        let span = speculation
+            .terminal_prefix
+            .unwrap_or(speculation.draft_tokens.len());
         let accepted = usize::try_from(accepted)
             .ok()
-            .filter(|&count| count <= speculation.draft_tokens.len())
+            .filter(|&count| count <= span)
             .ok_or(Error::State(
                 "speculative acceptance count is outside the draft span",
             ))?;
+        // Short of a terminal prefix the sampled token follows the accepted
+        // drafts: the correction of the first rejected one, or the bonus
+        // token after a full match.
         let mut tokens = speculation.draft_tokens[..accepted].to_vec();
         if speculation
             .terminal_prefix
@@ -710,6 +719,135 @@ mod tests {
             // discarded response must have unlinked them.
             assert_eq!(readable(&locator.name, locator.bytes), delivered);
         }
+        Ok(())
+    }
+
+    /// Request coordinates before the verification: its first draft lies at
+    /// logical position 20, the sampling stream has made 5 draws and 10
+    /// tokens of the prefix cache are visible.
+    const POSITION: u64 = 20;
+    const DRAWS: u64 = 5;
+    const VISIBLE: u64 = 10;
+    /// The drafts the verification scores; 12 is a finish token where a
+    /// case says so.
+    const DRAFTS: [u32; 3] = [11, 12, 13];
+
+    /// A verification call's completion as a CPU lane's sampler captures
+    /// it: one valid, active row whose sampled token is `token` after
+    /// `accepted` accepted drafts.
+    fn sampling(token: i64, accepted: i64) -> Result<OutputBuffer> {
+        use crate::ffi::{Backing, DType};
+        use crate::storage::{Memory, OutputStorage, StorageView};
+
+        let words = [1_i64, 1, token, accepted];
+        let memory = Memory::host(size_of_val(&words));
+        // SAFETY: fresh host memory of exactly these words, owned here.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                words.as_ptr(),
+                memory.address() as *mut i64,
+                words.len(),
+            );
+        }
+        let column = StorageView::contiguous(
+            memory as std::sync::Arc<dyn Backing>,
+            0,
+            DType::I64,
+            &[words.len() as i64],
+        )?;
+
+        let mut buffer =
+            OutputBuffer::new(OutputStorage::allocate(None, words.len())?, 1, &[], false);
+        let events = crate::EventPool::default();
+        buffer.capture(&column, None::<&uniserve_cuda::Stream>, &events)?;
+        buffer.seal::<&uniserve_cuda::Stream>(&[], &events)?;
+        buffer.copies_finished();
+        buffer.readback()?;
+        Ok(buffer)
+    }
+
+    /// Resolve a verification of [`DRAFTS`] whose `initialized` cache extent
+    /// the forward wrote, with the sampler's `token` and `accepted` count.
+    fn verify(
+        terminal: Option<usize>,
+        initialized: u64,
+        token: i64,
+        accepted: i64,
+    ) -> Result<PendingOutput> {
+        let mut call = call();
+        call.code = CallKind::Forward(uniserve_ipc::ForwardMode::Verify);
+        call.coordinates.logical_position = POSITION as u32;
+        let previous = RequestProgress {
+            rng_counter: DRAWS,
+            ..RequestProgress::default()
+        };
+
+        let mut output = PendingOutput::new(&call, previous, 0)?;
+        output.set_speculation(DRAFTS.to_vec(), terminal, VISIBLE, initialized);
+        output.sampling_range = Some((0, SAMPLING_FIELDS, 0));
+        output.resolve(previous, &mut sampling(token, accepted)?)?;
+        Ok(output)
+    }
+
+    /// The forward initializes the cache for every draft and the bonus row.
+    const INITIALIZED: u64 = VISIBLE + DRAFTS.len() as u64 + 1;
+
+    #[test]
+    fn accepted_drafts_commit_with_the_correction_or_bonus_token() -> Result<()> {
+        // Two drafts match; the sampler's token corrects the third.
+        let output = verify(None, INITIALIZED, 99, 2)?;
+        assert_eq!(output.output.committed_tokens, [11, 12, 99]);
+        // Each committed token advances the position, the draws and the
+        // visible cache; the initialized extent is the forward's.
+        assert_eq!(output.output.position as u64, POSITION + 3);
+        assert_eq!(output.progress.rng_counter, DRAWS + 3);
+        assert_eq!(output.output.cache_visible_len as u64, VISIBLE + 3);
+        assert_eq!(output.output.cache_computed_len as u64, INITIALIZED);
+
+        // Every draft matches; the bonus token follows them.
+        let output = verify(None, INITIALIZED, 77, 3)?;
+        assert_eq!(output.output.committed_tokens, [11, 12, 13, 77]);
+        assert_eq!(output.output.cache_visible_len as u64, INITIALIZED);
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_draft_inside_the_accepted_prefix_ends_the_commit() -> Result<()> {
+        // 12 finishes the request: the prefix ending at it is two drafts
+        // long. Reaching it commits the prefix and nothing after it, not
+        // even the sampler's token.
+        let output = verify(Some(2), INITIALIZED, 12, 2)?;
+        assert_eq!(output.output.committed_tokens, [11, 12]);
+        assert_eq!(output.output.position as u64, POSITION + 2);
+        assert_eq!(output.output.cache_visible_len as u64, VISIBLE + 2);
+
+        // A rejection before the terminal draft commits its correction.
+        let output = verify(Some(2), INITIALIZED, 55, 1)?;
+        assert_eq!(output.output.committed_tokens, [11, 55]);
+        Ok(())
+    }
+
+    #[test]
+    fn acceptance_counts_outside_the_acceptable_span_are_rejected() {
+        // More accepted drafts than drafted, a negative count, and a count
+        // past the terminal prefix, which the sampler clamps to it: each
+        // would commit tokens the verification did not accept.
+        for (terminal, accepted) in [(None, 4), (None, -1), (Some(2), 3)] {
+            assert!(
+                verify(terminal, INITIALIZED, 7, accepted).is_err(),
+                "terminal prefix {terminal:?}, {accepted} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_tokens_never_exceed_the_initialized_cache() -> Result<()> {
+        // The forward initialized two tokens past the visible extent: two
+        // committed tokens fit, three do not.
+        let output = verify(None, VISIBLE + 2, 55, 1)?;
+        assert_eq!(output.output.committed_tokens, [11, 55]);
+        assert_eq!(output.output.cache_visible_len as u64, VISIBLE + 2);
+        assert!(verify(None, VISIBLE + 2, 99, 2).is_err());
         Ok(())
     }
 }

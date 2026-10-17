@@ -311,3 +311,232 @@ impl Drop for Service<'_> {
         self.executor.set_completion_wake(None);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use uniserve_core::{RequestId, SamplingParams};
+    use uniserve_ipc::{
+        ArRequestParams, Batch as Plan, BatchCommand, Channel, IpcError, Listener, NewRequest,
+        RequestKey, WorkerRequest, WorkerResponse,
+    };
+
+    use super::Service;
+    use crate::error::WorkerError;
+    use crate::executor::tests::rank;
+    use crate::{Error, ErrorCode};
+
+    type Result<T> = std::result::Result<T, WorkerError>;
+
+    /// How long the head waits for one response.
+    const RESPONSE_WAIT: Duration = Duration::from_secs(30);
+
+    fn transport(error: IpcError) -> WorkerError {
+        Error::Transport(error.to_string()).into()
+    }
+
+    /// The rank's end of a connection whose head end runs `head` on its
+    /// own thread, and the head's outcome once `serve` returned.
+    fn connect<T: Send + 'static>(
+        head: impl FnOnce(Channel) -> Result<T> + Send + 'static,
+        serve: impl FnOnce(&mut Channel) -> Result<()>,
+    ) -> Result<(Result<()>, Result<T>)> {
+        let listener = Listener::bind(&["127.0.0.1:0"]).map_err(transport)?;
+        let address = listener.addresses()[0].clone();
+        let head = std::thread::spawn(move || head(Channel::connect(&address).map_err(transport)?));
+
+        let deadline = Instant::now() + RESPONSE_WAIT;
+        let mut channel = loop {
+            if let Some(channel) = listener.try_accept().map_err(transport)? {
+                break channel;
+            }
+            if Instant::now() > deadline {
+                return Err(Error::State("the head did not connect").into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let served = serve(&mut channel);
+        // The rank closes its end, as it does when it exits.
+        drop(channel);
+        let outcome = head
+            .join()
+            .map_err(|_| WorkerError::from(Error::State("the head thread panicked")))?;
+        Ok((served, outcome))
+    }
+
+    /// The next response the head receives, or `None` once the rank has
+    /// closed the connection.
+    fn receive(channel: &mut Channel) -> Result<Option<WorkerResponse>> {
+        let deadline = Instant::now() + RESPONSE_WAIT;
+        loop {
+            match channel.try_recv() {
+                Ok(Some(response)) => return Ok(Some(response)),
+                Ok(None) => {}
+                Err(IpcError::Transport(_)) => return Ok(None),
+                Err(error) => return Err(transport(error)),
+            }
+            if Instant::now() > deadline {
+                return Err(Error::State("the rank neither responded nor closed").into());
+            }
+            match channel.wait(Duration::from_millis(100)) {
+                Ok(()) => {}
+                Err(IpcError::Transport(_)) => return Ok(None),
+                Err(error) => return Err(transport(error)),
+            }
+        }
+    }
+
+    /// Send `request` and receive the response the rank sends next.
+    fn ask(channel: &mut Channel, request: WorkerRequest) -> Result<WorkerResponse> {
+        channel.send(&request).map_err(transport)?;
+        receive(channel)?
+            .ok_or_else(|| Error::State("the rank closed the connection unanswered").into())
+    }
+
+    /// A Submit of a lifecycle batch starting request `id` in `slot`.
+    fn submit(message_id: u64, batch_id: u64, id: u64, slot: u32) -> Result<WorkerRequest> {
+        let ar = ArRequestParams {
+            sampling: SamplingParams::default(),
+            negative_token_ids: Vec::new(),
+            finish_token_ids: Vec::new(),
+            initial_position: 0,
+            canvas: None,
+        };
+        let request = NewRequest::new(
+            RequestKey::new(1, RequestId(id), 1),
+            slot,
+            Some(ar),
+            None,
+            0,
+        )
+        .map_err(|error| Error::Invalid(error.to_string()))?;
+        let mut batch = Plan::new(batch_id, Vec::new(), Vec::new());
+        batch.commands = vec![BatchCommand::Start {
+            request: Box::new(request),
+        }];
+        Ok(WorkerRequest::Submit {
+            message_id: Some(message_id),
+            batch: Box::new(batch),
+        })
+    }
+
+    /// Serve the connection with a rank without components that queues
+    /// two batches. No job of these batches stays in flight, so the stall
+    /// bound (here the default, half the head's 300 s result deadline)
+    /// is never reached.
+    fn serve(channel: &mut Channel) -> Result<()> {
+        let mut executor = rank(2, false)?;
+        let info = executor.backend().info().clone();
+        Service::new(
+            &mut executor,
+            channel,
+            info,
+            false,
+            Duration::from_secs(150),
+        )
+        .run()
+    }
+
+    #[test]
+    fn the_service_answers_each_request_and_acknowledges_close() -> Result<()> {
+        let head = |mut channel: Channel| -> Result<()> {
+            let info = ask(
+                &mut channel,
+                WorkerRequest::Info {
+                    message_id: Some(1),
+                },
+            )?;
+            assert!(matches!(
+                info,
+                WorkerResponse::Info { message_id: Some(1), info } if info.queue_depth == 2
+            ));
+
+            // An admitted batch is answered with its result.
+            let result = ask(&mut channel, submit(2, 1, 7, 1)?)?;
+            assert!(matches!(
+                result,
+                WorkerResponse::Result { message_id: Some(2), result } if result.batch_id == 1
+            ));
+
+            // A refused batch id and a failed batch are reported under their
+            // messages; neither stops the rank.
+            for (message_id, request) in [(3, submit(3, 1, 8, 2)?), (4, submit(4, 2, 8, 9)?)] {
+                let error = ask(&mut channel, request)?;
+                assert!(
+                    matches!(
+                        &error,
+                        WorkerResponse::Error { message_id: Some(id), error }
+                            if *id == message_id && !error.fatal
+                    ),
+                    "{error:?}"
+                );
+            }
+            let info = ask(
+                &mut channel,
+                WorkerRequest::Info {
+                    message_id: Some(5),
+                },
+            )?;
+            assert!(matches!(
+                info,
+                WorkerResponse::Info {
+                    message_id: Some(5),
+                    ..
+                }
+            ));
+
+            // Close is acknowledged, then the rank ends the connection.
+            let closed = ask(
+                &mut channel,
+                WorkerRequest::Close {
+                    message_id: Some(6),
+                },
+            )?;
+            assert_eq!(
+                closed,
+                WorkerResponse::Ok {
+                    message_id: Some(6)
+                }
+            );
+            assert_eq!(receive(&mut channel)?, None);
+            Ok(())
+        };
+
+        let (served, head) = connect(head, serve)?;
+        head?;
+        served
+    }
+
+    #[test]
+    fn the_service_stops_once_the_head_has_closed_its_connection() -> Result<()> {
+        // The head goes away without asking for anything.
+        let (served, head) = connect(
+            |channel: Channel| {
+                drop(channel);
+                Ok(())
+            },
+            serve,
+        )?;
+        head?;
+        let Err(error) = served else {
+            return Err(Error::State("the service outlived its head").into());
+        };
+        assert_eq!(error.code, ErrorCode::ComputeError);
+        Ok(())
+    }
+
+    #[test]
+    fn a_message_that_is_not_a_request_stops_the_service_unanswered() -> Result<()> {
+        let head = |mut channel: Channel| -> Result<bool> {
+            // A frame whose message is no request. The rank ends the
+            // connection without a response.
+            channel.send(&true).map_err(transport)?;
+            Ok(receive(&mut channel)?.is_none())
+        };
+        let (served, unanswered) = connect(head, serve)?;
+        assert!(served.is_err());
+        assert!(unanswered?, "the rank answered a message it could not read");
+        Ok(())
+    }
+}

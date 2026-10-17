@@ -9,6 +9,13 @@
 //! the producer's pages, exports the producer's slot through one transport,
 //! imports it into the consumer (converting when the layouts differ) and
 //! adopts it, then retires every access and returns both caches' tensors.
+//!
+//! `cache_lifecycle` drives one host cache through the lifecycle of a
+//! request's pages: installs and recycling, an export, an import that is
+//! abandoned and one that is adopted, a guidance prefix slot, and the
+//! release of the exports, the slots and the prefixes. After each step it
+//! hands Python the cache's live tensors and which slots' units another
+//! owner could reuse.
 
 #[path = "harness/config.rs"]
 pub mod config;
@@ -23,7 +30,7 @@ use uniserve_core::{CallId, RequestId, UnitId};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
 use uniserve_worker::ffi::{Function, Handle, Interpreter};
-use uniserve_worker::storage::{CachePlan, PrefixCache, StorageView};
+use uniserve_worker::storage::{CachePlan, PrefixCache, StorageView, UnitColumn};
 use uniserve_worker::transfer::exports;
 use uniserve_worker::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
 use uniserve_worker::{EventPool, Result};
@@ -259,4 +266,182 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     Ok(result)
 }
 
+/// The flattened unit ids of one slot's groups.
+fn flat(groups: &[Vec<UnitId>]) -> Vec<u32> {
+    groups.iter().flatten().map(|unit| unit.0).collect()
+}
+
+fn cache_lifecycle(
+    config: Map<FfiString, Any>,
+) -> std::result::Result<Map<FfiString, Any>, tvm_ffi::Error> {
+    lifecycle(Any::from(config)).map_err(failure)
+}
+
+/// Request slots of the lifecycle cache: the exporting slot 1, the
+/// importing slot 2 and the guidance prefix slot 3.
+const LIFECYCLE_SLOTS: u32 = 3;
+
+fn lifecycle(config: Any) -> Result<Map<FfiString, Any>> {
+    let config = Config::new("cache_lifecycle", config)?;
+    Interpreter::install_import(config.get("import")?);
+    let plan = Arc::new(CachePlan::read(Handle::new(config.value("plan")?)?)?);
+    let num_units = config.count("num_units")? as u32;
+    let tokens = config.count("tokens")? as u32;
+    let observe = Function::new("observe", config.get("observe")?);
+    let slots = config
+        .list("units")?
+        .into_iter()
+        .map(units)
+        .collect::<Result<Vec<_>>>()?;
+    let [source, destination, prefix] = slots.as_slice() else {
+        return Err(uniserve_worker::Error::Interface(
+            "cache_lifecycle field `units` names three slots' units".into(),
+        ));
+    };
+
+    // Host storage: every write is made at once, in call order.
+    let host = None::<&Stream>;
+    let mut cache = PrefixCache::new(
+        Arc::clone(&plan),
+        num_units,
+        LIFECYCLE_SLOTS,
+        64,
+        1,
+        None,
+        None,
+    )?;
+    let column = cache.bind_units(None)?;
+    let views = tensor_map(&cache.views()?)?;
+
+    // Whether another owner could reuse `units` now: recycling them is
+    // refused while an export, an import or an execution overlaps them.
+    // An unquantized single-dtype pool is recycled without writing.
+    let reusable = |cache: &mut PrefixCache, column: &UnitColumn, units: &[Vec<UnitId>]| {
+        cache.recycle(&flat(units), column, host).is_ok()
+    };
+    let step = |name: &str, facts: &[(&str, bool)]| -> Result<()> {
+        let facts: Map<FfiString, Any> = facts
+            .iter()
+            .map(|&(fact, value)| (FfiString::from(fact), Any::from(value)))
+            .collect();
+        observe.invoke(&[
+            AnyView::from(&Any::from(FfiString::from(name))),
+            AnyView::from(&views),
+            AnyView::from(&facts),
+        ])?;
+        Ok(())
+    };
+
+    // The scheduler assigns the exporting slot fresh units.
+    cache.install(&tables(1, source, tokens, &plan), host)?;
+    let free = reusable(&mut cache, &column, source);
+    step("installed", &[("source_reusable", free)])?;
+
+    // An export holds the units it reads until its readers retired.
+    let capacity = Arc::new(TransferCapacity::new(1 << 24, 16)?);
+    let events = EventPool::new();
+    let transports = Arc::new(Transports::new(
+        &[TransportKind::Local],
+        Arc::clone(&capacity),
+        Arc::clone(&events),
+        &TransportOptions {
+            source: endpoint(),
+            acknowledgment_slot: 0,
+            host_slots: HashSet::from([0]),
+            cross_host_consumers: false,
+            vmm_pool_bytes: 1 << 20,
+        },
+    )?);
+    let exported = buffer(0);
+    let export = cache.export(1, tokens, "consumer", exported, &transports, &[0], host)?;
+    let (transfer, locations) = cache.locate_export(export)?;
+    cache.validate_transfers(&[(exported, transfer.clone())], &[])?;
+    cache.apply_transfers(vec![(exported, transfer.clone())], vec![]);
+    let free = reusable(&mut cache, &column, source);
+    step("exported", &[("source_reusable", free)])?;
+
+    // An import reserves the units it resets until it retires, abandoned or
+    // adopted.
+    let assignments = tables(2, destination, tokens, &plan);
+    let reserve = |cache: &mut PrefixCache| {
+        let batch_tables = cache.tables().for_batch(2, &assignments)?;
+        cache.reserve_import(
+            Arc::new(transfer.clone()),
+            2,
+            batch_tables,
+            flat(destination),
+            Arc::clone(&transports),
+        )
+    };
+    let abandoned = reserve(&mut cache)?;
+    let free = reusable(&mut cache, &column, destination);
+    step("importing", &[("destination_reusable", free)])?;
+    cache.abandon_import(&abandoned)?;
+    wait(
+        || {
+            cache.reap_imports()?;
+            Ok(abandoned.retirement().done())
+        },
+        "the abandoned import's retirement",
+    )?;
+    let free = reusable(&mut cache, &column, destination);
+    step("abandoned", &[("destination_reusable", free)])?;
+
+    // The adopted import makes the exported extent the slot's verified
+    // prefix.
+    let import = reserve(&mut cache)?;
+    wait(|| Ok(import.done()), "the import copy")?;
+    cache.install(&assignments, host)?;
+    let installed = BufferId {
+        output_index: 1,
+        ..exported
+    };
+    let adopted = cache.adopt_import(&import, installed, host)?;
+    cache.apply_transfers(vec![], vec![(exported, installed, (*adopted).clone())]);
+    wait(
+        || {
+            cache.reap_imports()?;
+            Ok(import.retirement().done())
+        },
+        "the adopted import's retirement",
+    )?;
+    step("adopted", &[])?;
+
+    // A guidance prefix slot the request holds besides its own.
+    cache.install(&tables(3, prefix, tokens, &plan), host)?;
+    cache.retain_prefix(exported.owner, 3);
+    // Another request holds no prefix: releasing its prefixes finds none.
+    cache.release_request_prefixes(RequestKey::new(1, RequestId(2), 1), host)?;
+    step("prefixed", &[])?;
+
+    // The finished request's exports retire once revoked, which returns the
+    // units they read; then its slots and its prefix slot are released.
+    cache.release_calls(&[(exported.owner, exported.producer_call_id)]);
+    cache.release_exports(&[exported]);
+    exports::release(&locations)?;
+    wait(
+        || {
+            events.drain()?;
+            transports.reap()?;
+            Ok(capacity.used() == 0)
+        },
+        "the export's retirement",
+    )?;
+    let free = reusable(&mut cache, &column, source);
+    step("unexported", &[("source_reusable", free)])?;
+    cache.release_slots(&[1, 2], host)?;
+    cache.release_request_prefixes(exported.owner, host)?;
+    step("released", &[])?;
+
+    cache.close()?;
+    transports.close()?;
+    Ok([(
+        FfiString::from("exported_extent"),
+        Any::from(i64::from(transfer.exported_extent)),
+    )]
+    .into_iter()
+    .collect())
+}
+
 tvm_ffi::tvm_ffi_dll_export_typed_func!(cache_transfer, cache_transfer);
+tvm_ffi::tvm_ffi_dll_export_typed_func!(cache_lifecycle, cache_lifecycle);
