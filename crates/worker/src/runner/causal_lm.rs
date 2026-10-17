@@ -463,6 +463,10 @@ impl CausalLMRunner {
             "points",
             "transition",
         ];
+        // The top-k sampler's candidate width. The general samplers cut a
+        // row whose top-k width is at most it the way the top-k sampler
+        // does, so every sampler keeps the same tokens for it.
+        let width = candidates(self.buffers.dimensions.vocab);
         let mut calls = Vec::new();
         for group in &staged.sampling {
             // What decides finish and transition, and what a group that
@@ -510,6 +514,7 @@ impl CausalLMRunner {
                     &group.terminal_prefixes,
                 ]));
                 arguments.push(group.parameters.into());
+                arguments.push(width.into());
                 arguments.extend(shaping(true));
                 arguments.extend(self.tensors(&["hidden", "logit_rows", "draws", "params"])?);
                 arguments.extend(self.tensors(&outputs)?);
@@ -526,7 +531,7 @@ impl CausalLMRunner {
                         &self.functions.sample_greedy
                     }
                     SamplingPath::TopK => {
-                        arguments.push(candidates(self.buffers.dimensions.vocab).into());
+                        arguments.push(width.into());
                         arguments.push(group.parameters.into());
                         arguments.extend(lists(&decisions));
                         arguments.extend(self.tensors(&["logits", "draws", "params"])?);
@@ -535,6 +540,7 @@ impl CausalLMRunner {
                     }
                     SamplingPath::Categorical => {
                         arguments.push(group.parameters.into());
+                        arguments.push(width.into());
                         arguments.extend(shaping(false));
                         arguments.extend(self.tensors(&["logits", "draws", "params"])?);
                         arguments.extend(self.tensors(&outputs)?);

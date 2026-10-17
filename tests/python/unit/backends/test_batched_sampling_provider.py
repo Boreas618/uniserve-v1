@@ -150,12 +150,25 @@ def test_penalties_read_each_rows_slot_counts() -> None:
     assert tokens.tolist() == [0, 1]
 
 
-def test_the_top_k_sampler_selects_what_the_general_path_selects() -> None:
+@pytest.mark.parametrize(
+    "spread",
+    (
+        pytest.param(None, id="distinct-logits"),
+        # Logits on a coarse grid, as low-precision logits are: equal values
+        # straddle the top-k and nucleus cutoffs.
+        pytest.param(0.5, id="tied-logits"),
+    ),
+)
+def test_the_top_k_sampler_selects_what_the_general_path_selects(
+    spread,
+) -> None:
     # Random rows under every parameter the top-k sampler reads, sampled by
     # both selectors from the same draws.
     generator = torch.Generator().manual_seed(7)
     rows, vocab, width = 64, 300, 32
     logits = torch.randn((rows, vocab), generator=generator) * 3
+    if spread is not None:
+        logits = torch.round(logits / spread) * spread
     counts = torch.randint(0, 3, (rows, vocab), generator=generator)
     counts = counts.to(torch.int32)
     draws = torch.rand(rows, generator=generator)
@@ -183,6 +196,7 @@ def test_the_top_k_sampler_selects_what_the_general_path_selects() -> None:
         row_counts=[1] * rows,
         drafts=[],
         terminal_prefixes=[0] * rows,
+        candidates=width,
         top_ks=top_ks.tolist(),
         top_p_rows=[],
         min_p_rows=list(range(rows)),

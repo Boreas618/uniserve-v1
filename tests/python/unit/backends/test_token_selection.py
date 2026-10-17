@@ -37,6 +37,7 @@ def _select(logits, params, **controls):
         "row_counts": [rows],
         "drafts": [],
         "terminal_prefixes": [0],
+        "candidates": int(logits.shape[1]),
         "top_ks": [0] * rows,
         "top_p_rows": [],
         "min_p_rows": [],
