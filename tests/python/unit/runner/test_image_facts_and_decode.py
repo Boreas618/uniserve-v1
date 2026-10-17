@@ -8,7 +8,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from tests.python.fixtures.stub import load_stub
-from uniserve.bindings.context import Scratch
+from uniserve.bindings.workspace import Scratch
 from uniserve.media import image
 from uniserve.media.pixels import quantize_image_hwc
 from uniserve.processing import FlowPrompt, resolve_prefix

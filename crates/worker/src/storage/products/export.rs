@@ -260,7 +260,7 @@ impl ProductStore {
         });
         if let Err(error) = result {
             if let Err(cleanup) = exports::release(&locations) {
-                tracing::warn!(target: "uniserve_worker.storage", "failed to revoke a failed product export: {cleanup}");
+                tracing::warn!("failed to revoke a failed product export: {cleanup}");
             }
             exports.for_each(|export| export.revoke());
             return Err(error);

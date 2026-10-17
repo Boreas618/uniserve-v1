@@ -5,16 +5,23 @@
 //! columns `Batch::validate` expects, so a test can mutate a single field to
 //! exercise one rule.
 
+#![cfg(test)]
+
 use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::net::TcpListener;
+use std::time::{Duration, Instant};
 
-use uniserve_core::{CacheGroupKind, CfgRenorm, RequestId, UnitId};
-
-use super::*;
+use serde::Serialize;
+use uniserve_core::{
+    CacheGroup, CacheGroupKind, CfgRenorm, ImageParams, RequestId, SamplingParams, TokenLogprob,
+    UnitId,
+};
+use uniserve_ipc::*;
 
 /// Returns `message` as a receiver decodes it from the frame a sender made.
 fn round_trip<M: Serialize + serde::de::DeserializeOwned>(message: &M) -> M {
-    let sent = Frame::encode(message).unwrap().into_bytes();
-    Frame::from_bytes(sent).decode().unwrap()
+    Frame::encode(message).unwrap().decode().unwrap()
 }
 
 fn request_key() -> RequestKey {
@@ -2200,10 +2207,33 @@ fn a_frame_decodes_only_as_the_message_it_carries() {
         Err(IpcError::Encoding(_))
     ));
 
-    // A message cut short, as a frame of another build may be, is refused.
-    let whole = Frame::encode(&WorkerResponse::ok()).unwrap().into_bytes();
-    let cut = Frame::from_bytes(whole[..whole.len() - 1].to_vec());
-    assert!(cut.decode::<WorkerResponse>().is_err());
+    // A message cut short, as a frame of another build may be, is refused:
+    // the frame's length field counts the shortened message, so a channel
+    // receives it whole and its decoding fails.
+    let mut cut = Frame::encode(&WorkerResponse::ok()).unwrap().into_bytes();
+    cut.pop();
+    let length = u32::try_from(cut.len() - Frame::LENGTH_BYTES).unwrap();
+    cut[..Frame::LENGTH_BYTES].copy_from_slice(&length.to_le_bytes());
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut channel = Channel::connect(&listener.local_addr().unwrap().to_string()).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.write_all(&cut).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let received = loop {
+        match channel.try_recv::<WorkerResponse>() {
+            Ok(None) => {
+                assert!(Instant::now() < deadline, "the cut frame did not arrive");
+                channel.wait(Duration::from_millis(50)).unwrap();
+            }
+            received => break received,
+        }
+    };
+    assert!(
+        matches!(received, Err(IpcError::Encoding(_))),
+        "{received:?}"
+    );
 }
 
 #[test]

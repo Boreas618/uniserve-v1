@@ -176,7 +176,7 @@ impl<A: HostAction> HostTask<A> {
         if cancelled {
             drop(action);
             if let Err(error) = self.release_input() {
-                tracing::warn!(target: "uniserve_worker.host", "{lane}: releasing a withdrawn task's inputs failed: {error}");
+                tracing::warn!("{lane}: releasing a withdrawn task's inputs failed: {error}");
             }
             self.remove();
             return;
@@ -188,7 +188,9 @@ impl<A: HostAction> HostTask<A> {
             match &result {
                 Ok(_) => result = Err(cleanup),
                 Err(error) => {
-                    tracing::warn!(target: "uniserve_worker.host", "{lane}: releasing the inputs of a failed task also failed: {cleanup} (task: {error})")
+                    tracing::warn!(
+                        "{lane}: releasing the inputs of a failed task also failed: {cleanup} (task: {error})"
+                    )
                 }
             }
         }

@@ -13,11 +13,14 @@ use uniserve_core::CallId;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{BufferId, CallKind, ForwardMode, RequestKey, Wake};
 
+use super::cache_width;
 use crate::Result;
+use crate::capacity::plan::Plan;
+use crate::config::{WorkerConfig, WorkerLaunch};
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
-use crate::storage::{PrefixCache, ProductStore};
-use crate::stream::EventPool;
-use crate::transfer::Transports;
+use crate::storage::{BufferPool, PrefixCache, ProductStore};
+use crate::stream::{CUDAStream, EventPool, Streams};
+use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
 
 /// The call kind whose lane owns the stream slot releases are ordered on:
 /// token calls, which read the rows a release clears.
@@ -190,4 +193,98 @@ impl RequestStorage for RankStorage {
         self.tensors.close();
         result.and(self.events.close())
     }
+}
+
+/// Allocate the storage owners on the plan: device events, the product
+/// transports and the prefix cache of a text model, whose planes are reset on
+/// the device's preparation stream.
+pub(super) fn allocate_storage(
+    launch: &WorkerLaunch,
+    config: &WorkerConfig,
+    plan: &Plan,
+    streams: &Streams,
+) -> Result<RankStorage> {
+    let events = EventPool::new();
+    let kinds = launch
+        .data_plane
+        .backends
+        .iter()
+        .map(|name| TransportKind::parse(name))
+        .collect::<Result<Vec<_>>>()?;
+    let capacity = Arc::new(TransferCapacity::new(
+        plan.arena.transfer_bytes,
+        plan.arena.transfer_tickets,
+    )?);
+    let options = TransportOptions {
+        source: plan.info.endpoint.clone(),
+        acknowledgment_slot: launch.ipc.acknowledgment_slot as usize,
+        host_slots: launch
+            .ipc
+            .host_slots
+            .iter()
+            .map(|&slot| slot as usize)
+            .collect(),
+        cross_host_consumers: launch.ipc.products_cross_hosts,
+        vmm_pool_bytes: plan.arena.export_pool_bytes,
+    };
+    let exports = launch
+        .data_plane
+        .exports
+        .iter()
+        .map(|name| TransportKind::parse(name))
+        .collect::<Result<Vec<_>>>()?;
+    let transports = Arc::new(
+        Transports::new(&kinds, capacity, Arc::clone(&events), &options)?.with_exports(&exports)?,
+    );
+
+    // Products: scheduler-placed buffers in the buffer pool and scalar relay
+    // lanes, one per request slot and unresolved call, on the primary
+    // device where every binding computes.
+    let devices = vec![config.device.memory()];
+    let physical = plan.physical_buffer_pool_bytes.max(1);
+    let buffer_pool =
+        BufferPool::allocate(physical, physical < plan.info.buffer_pool_bytes, &devices)?;
+    let tensors = ProductStore::new(
+        plan.arena.tensor_store,
+        plan.arena.device_product_bytes.max(1) as usize,
+        plan.info.encoder_entry_bytes.max(1) as usize,
+        devices,
+        plan.info.request_slots as usize,
+        plan.info.max_unresolved_calls as usize + 1,
+        buffer_pool,
+        Arc::clone(&events),
+    )?;
+
+    let device = config.device.cuda();
+    let preparation = device.and_then(|cuda| streams.preparation(cuda));
+    let prefix_cache = match (&plan.cache, &plan.info.prefix_cache) {
+        (Some(cache), Some(info)) => Some(PrefixCache::new(
+            Arc::clone(cache),
+            info.num_units,
+            plan.info.request_slots,
+            cache_width(&cache.group_shapes()?, config.max_sequence_tokens),
+            plan.info.max_unresolved_calls as usize,
+            device,
+            preparation.map(CUDAStream::stream).transpose()?,
+        )?),
+        _ => None,
+    };
+    if let Some(stream) = preparation {
+        stream.synchronize()?;
+    }
+    // Slot releases order after the token batches that read them.
+    let release_stream = match device {
+        Some(cuda) => streams
+            .stream_for(CallKind::Forward(ForwardMode::Decode), cuda)
+            .map(|stream| stream.stream().cloned())
+            .transpose()?,
+        None => None,
+    };
+    Ok(RankStorage::new(
+        events,
+        tensors,
+        transports,
+        prefix_cache,
+        release_stream,
+    ))
 }

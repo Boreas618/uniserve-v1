@@ -77,10 +77,7 @@ impl HeadWatch {
                 // A failed wait is treated as a close: the connection can no
                 // longer be observed, so the rank cannot be left unwatched.
                 if hangup.wait(&cancelled).unwrap_or(true) {
-                    tracing::error!(
-                        target: "uniserve_worker.launch",
-                        "the head closed the connection while the rank was starting"
-                    );
+                    tracing::error!("the head closed the connection while the rank was starting");
                     super::end(1);
                 }
             })

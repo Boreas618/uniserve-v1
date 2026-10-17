@@ -319,10 +319,7 @@ impl ExpertUnion {
                 .filter_map(|peer| peer.graphs.get())
                 .map(JoinGraphs::len)
                 .sum::<usize>();
-        tracing::info!(
-            target: "uniserve_worker.warmup",
-            "captured {captured} expert join graphs for capacities {capacities:?}"
-        );
+        tracing::info!("captured {captured} expert join graphs for capacities {capacities:?}");
         Ok(())
     }
 }

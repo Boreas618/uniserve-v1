@@ -233,5 +233,5 @@ impl Drop for TransferPool {
 
 /// Log a read cleanup failure that has no caller left to return it to.
 fn report(error: &Error) {
-    tracing::warn!(target: "uniserve_worker.transfer", "transfer read cleanup failed: {error}");
+    tracing::warn!("transfer read cleanup failed: {error}");
 }
