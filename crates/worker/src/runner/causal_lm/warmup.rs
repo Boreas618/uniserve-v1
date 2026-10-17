@@ -6,9 +6,11 @@
 //! tables of reserved slots `1..=rows`; nothing else is resident during
 //! startup. A decode bucket first prefills one real token per row and
 //! commits its cache length, so the captured decode attends to
-//! model-produced K/V; that commit captures the bucket's commit graph. Every
-//! capture runs its step eagerly first, which also compiles the step's
-//! kernels.
+//! model-produced K/V; that commit captures the bucket's commit graph. A
+//! decode bucket has two graphs: one selecting greedily and one sampling
+//! each row from its top-k candidates, captured over neutral parameter
+//! rows (the sampler's kernels do not depend on the values). Every capture
+//! runs its step eagerly first, which also compiles the step's kernels.
 //!
 //! Each step and each commit is one job of the runner's lane: the eager
 //! call, then the capture, whose graph the job's completion carries. The
@@ -41,6 +43,7 @@ use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
 use crate::runner::denoiser::image_model::ImageModel;
+use crate::sampling::RowSampling;
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{PrefixCache, ScratchUnits};
 use crate::stream::Issue;
@@ -232,7 +235,8 @@ impl CausalLMRunners {
             let run = |runtime: &mut CausalLMRunners,
                        prefix_cache: &mut PrefixCache,
                        rows: &[TokenRow],
-                       decode: bool,
+                       mode: ForwardMode,
+                       row_sampling: Option<&RowSampling>,
                        capacity: Option<usize>,
                        job: Job| {
                 runtime.warmup_step(
@@ -240,9 +244,7 @@ impl CausalLMRunners {
                     lanes,
                     (group, peer),
                     prefix_cache,
-                    rows,
-                    &[],
-                    decode,
+                    (rows, &[], mode, row_sampling),
                     capacity,
                     job,
                 )
@@ -263,7 +265,15 @@ impl CausalLMRunners {
                         &lengths,
                         stream,
                         |runtime, prefix_cache, _| {
-                            run(runtime, prefix_cache, &rows, false, capacity, Job::new())
+                            run(
+                                runtime,
+                                prefix_cache,
+                                &rows,
+                                ForwardMode::Prefill,
+                                None,
+                                capacity,
+                                Job::new(),
+                            )
                         },
                     )?;
                 }
@@ -288,7 +298,8 @@ impl CausalLMRunners {
                                 runtime,
                                 prefix_cache,
                                 &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
-                                false,
+                                ForwardMode::Prefill,
+                                None,
                                 None,
                                 Job::new(),
                             )?;
@@ -307,15 +318,19 @@ impl CausalLMRunners {
                         runtime
                             .state
                             .set_predicates(&slots, false, after.on(stream))?;
+                        let neutral = RowSampling::neutral(size);
                         for capacity in variants(size) {
-                            run(
-                                runtime,
-                                prefix_cache,
-                                &rows(1, &lengths, 1, TokenSelection::LastLogits),
-                                true,
-                                capacity,
-                                std::mem::take(&mut job),
-                            )?;
+                            for row_sampling in [None, Some(&neutral)] {
+                                run(
+                                    runtime,
+                                    prefix_cache,
+                                    &rows(1, &lengths, 1, TokenSelection::LastLogits),
+                                    ForwardMode::Decode,
+                                    row_sampling,
+                                    capacity,
+                                    std::mem::take(&mut job),
+                                )?;
+                            }
                         }
                         Ok(())
                     },
@@ -457,9 +472,12 @@ impl CausalLMRunners {
                         lanes,
                         (group, peer),
                         prefix_cache,
-                        &[text, mixed],
-                        &embeddings(1 + first.features.start),
-                        false,
+                        (
+                            &[text, mixed],
+                            &embeddings(1 + first.features.start),
+                            ForwardMode::Prefill,
+                            None,
+                        ),
                         None,
                         Job::new(),
                     )?;
@@ -468,9 +486,12 @@ impl CausalLMRunners {
                         lanes,
                         (group, peer),
                         prefix_cache,
-                        &[alone],
-                        &embeddings(second.features.start),
-                        false,
+                        (
+                            &[alone],
+                            &embeddings(second.features.start),
+                            ForwardMode::Prefill,
+                            None,
+                        ),
                         None,
                         Job::new(),
                     )
@@ -481,11 +502,13 @@ impl CausalLMRunners {
         Ok(())
     }
 
-    /// One warmup step of `rows` on microbatch `peer` of `group`, as a job
-    /// of the group's lane; the group's other microbatches join. `embeddings`
-    /// replace the embeddings of the rows' feature tokens. `capacity` forces
-    /// the expert step capacity. The step continues `job`, which holds what
-    /// the device does before it.
+    /// One warmup step of `rows` in `mode` on microbatch `peer` of `group`,
+    /// as a job of the group's lane; the group's other microbatches join.
+    /// `embeddings` replace the embeddings of the rows' feature tokens. A
+    /// decode with `row_sampling` samples its rows with those draws and
+    /// parameters; without, it selects greedily. `capacity` forces the
+    /// expert step capacity. The step continues `job`, which holds what the
+    /// device does before it.
     #[expect(
         clippy::too_many_arguments,
         reason = "one warmup step's shape and owners"
@@ -496,21 +519,21 @@ impl CausalLMRunners {
         lanes: &JobQueues,
         (group, peer): (usize, usize),
         prefix_cache: &mut PrefixCache,
-        rows: &[TokenRow],
-        embeddings: &[Embeddings],
-        decode: bool,
+        (rows, embeddings, mode, row_sampling): (
+            &[TokenRow],
+            &[Embeddings],
+            ForwardMode,
+            Option<&RowSampling>,
+        ),
         capacity: Option<usize>,
         job: Job,
     ) -> Result<()> {
         let prompt = PromptChunks::default();
         let request = StepRequest {
-            mode: if decode {
-                ForwardMode::Decode
-            } else {
-                ForwardMode::Prefill
-            },
+            mode,
             rows,
             finish_ids: &[],
+            row_sampling,
             sampling: None,
             prompt: &prompt,
             embeddings,

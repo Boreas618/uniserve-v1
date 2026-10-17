@@ -23,8 +23,11 @@
 //! A decode forward evaluates one token per row from the slot state: its
 //! inputs are each row's slot, forced-finish flag and finish tokens, and a
 //! row whose token comes from the host has it written to its slot first.
-//! Its graph gathers, runs the model and selects greedily, so a greedy
-//! decode runs no Python. A decode bucket pads with rows of slot 0.
+//! Its graph gathers, runs the model and selects: greedily, or, in the
+//! bucket's sampling graph, each row from its top-k candidates with the
+//! row's parameters and draw, which are inputs too. A decode whose rows
+//! all select this way runs no Python. A decode bucket pads with rows of
+//! slot 0.
 //!
 //! A prefill forward evaluates rows of host tokens (prompt chunks and
 //! verification rows): its inputs are the rows' packed columns, tokens and
@@ -72,8 +75,7 @@ use crate::ffi::{DType, Handle};
 use crate::lane::{Capture, Completion, Job};
 use crate::request::decode_state::DecodeState;
 use crate::runner::attention::pack_rows;
-use crate::sampling::SamplingPath;
-use crate::sampling::{SamplingGroup, padded};
+use crate::sampling::{RowSampling, SamplingGroup, SamplingPath, candidates, padded};
 use crate::storage::memory::StorageView;
 use crate::storage::{AttentionRow, PrefixCache};
 use crate::stream::{Fill, Issue};
@@ -145,8 +147,11 @@ pub(crate) struct StepRequest<'a> {
     /// slice has none. A decode forward without `sampling` selects with
     /// them.
     pub(crate) finish_ids: &'a [[i64; FINISH_IDS]],
-    /// The tasks the runner's `sample` selects; absent when no row samples
-    /// or a decode forward's greedy selections are final.
+    /// The rows' draws and parameters of a decode forward that samples its
+    /// rows itself; absent when its own selection is greedy.
+    pub(crate) row_sampling: Option<&'a RowSampling>,
+    /// The tasks the runner's sampling methods select; absent when no row
+    /// samples or a decode forward's own selections are final.
     pub(crate) sampling: Option<SamplingColumns<'a>>,
     /// The prompt chunks the forward scores.
     pub(crate) prompt: &'a PromptChunks,
@@ -222,6 +227,11 @@ struct Plan {
     force: Vec<u8>,
     /// `[rows, FINISH_IDS]` finish tokens of a decode, padded with -1.
     finish_ids: Vec<i64>,
+    /// Candidates each row of a decode samples among, or zero for its
+    /// greedy selection; then the rows' draws and parameters.
+    candidates: usize,
+    draws: Vec<f32>,
+    params: Vec<f32>,
     logit_rows: Vec<i64>,
     /// `(token offset, slot)` device copies of a prefill row's first token
     /// from its slot's next input token.
@@ -367,12 +377,15 @@ impl CausalLMRunner {
                 plan.prefixes.as_slice().into(),
                 plan.starts.as_slice().into(),
                 capacity.into(),
+                plan.candidates.into(),
             ];
             arguments.extend(self.tensors(&[
                 "request_pool_indices",
                 "decode_force_finish",
                 "finish_ids",
                 "logits",
+                "draws",
+                "params",
                 "completion",
                 "continuation",
                 "tagged",
@@ -512,16 +525,12 @@ impl CausalLMRunner {
                         arguments.extend(self.tensors(&outputs)?);
                         &self.functions.sample_greedy
                     }
-                    SamplingPath::TopK(width) => {
-                        arguments.push((width as usize).into());
+                    SamplingPath::TopK => {
+                        arguments.push(candidates(self.buffers.dimensions.vocab).into());
                         arguments.push(group.parameters.into());
-                        arguments.push(group.min_p_rows.as_slice().into());
-                        arguments.extend(lists(&logprobs));
-                        arguments.push(group.logprob_offset.into());
                         arguments.extend(lists(&decisions));
                         arguments.extend(self.tensors(&["logits", "draws", "params"])?);
                         arguments.extend(self.tensors(&outputs)?);
-                        arguments.extend(self.tensors(&["logprobs"])?);
                         &self.functions.sample_top_k
                     }
                     SamplingPath::Categorical => {
@@ -749,7 +758,10 @@ impl CausalLMRunner {
                 cache_only,
             )? {
                 choice = Choice::Graph(if decode {
-                    ShapeKey::Decode { rows: bucket_rows }
+                    ShapeKey::Decode {
+                        rows: bucket_rows,
+                        sampled: request.row_sampling.is_some(),
+                    }
                 } else {
                     ShapeKey::Prefill {
                         rows: bucket_rows,
@@ -835,9 +847,16 @@ impl CausalLMRunner {
         force.resize(padded_rows, 0);
 
         // A decode reads its rows from the slot state: a row whose token or
-        // position comes from the host has it written to its slot.
+        // position comes from the host has it written to its slot. A decode
+        // that samples its rows reads each row's draw and parameters; its
+        // padding rows select greedily.
         let mut finish_ids = Vec::new();
         let mut slot_words = Vec::new();
+        let (mut sampled_candidates, mut draws, mut params) = (0, Vec::new(), Vec::new());
+        if let Some(sampled) = request.row_sampling.filter(|_| decode) {
+            sampled_candidates = candidates(dimensions.vocab);
+            (draws, params) = sampled.padded(padded_rows);
+        }
         if decode {
             finish_ids = vec![-1_i64; padded_rows * FINISH_IDS];
             for (row, ids) in request.finish_ids.iter().enumerate() {
@@ -963,6 +982,9 @@ impl CausalLMRunner {
             slots,
             force,
             finish_ids,
+            candidates: sampled_candidates,
+            draws,
+            params,
             logit_rows,
             relays,
             slot_words,
@@ -990,6 +1012,10 @@ impl CausalLMRunner {
             push(column("request_pool_indices")?, bytes(&plan.slots));
             push(column("decode_force_finish")?, &plan.force);
             push(column("finish_ids")?, bytes(&plan.finish_ids));
+            if plan.candidates > 0 {
+                push(column("draws")?, bytes_f32(&plan.draws));
+                push(column("params")?, bytes_f32(&plan.params));
+            }
             for (address, value) in &plan.slot_words {
                 push(*address, bytes(std::slice::from_ref(value)));
             }

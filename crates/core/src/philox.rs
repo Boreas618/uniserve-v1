@@ -13,7 +13,10 @@
 //! Layout:
 //!
 //! - key = a `splitmix` fold of `(session_seed, engine_id, request_id,
-//!   epoch, draw_layout)`, split into two 32-bit words;
+//!   epoch, draw_layout)`, split into two 32-bit words. A request's stream
+//!   ([`request_sampling_key`]) folds its seed alone when it has one, so a
+//!   seeded request draws the same values whenever it is sent, and its
+//!   lineage when it has none;
 //! - counter = `[semantic_token_index low, semantic_token_index high,
 //!   processor_stage, draw_index]`;
 //! - uniform = `(word0 >> 8) * 2^-24`, a 24-bit dyadic value in `[0, 1)`.
@@ -91,6 +94,26 @@ pub fn sampling_key(
         .fold(session_seed, splitmix_coordinate)
 }
 
+/// Derives the key of one request's stream in one draw space.
+///
+/// A seeded request's stream is a function of its seed alone: sending the
+/// same request again, on any engine and under any request identity, draws
+/// the same value at every semantic coordinate. An unseeded request's stream
+/// is its lineage's, `(engine_id, request_id, request_epoch)`, which keeps
+/// the streams of distinct requests apart.
+pub fn request_sampling_key(
+    seed: Option<u64>,
+    engine_id: u64,
+    request_id: u64,
+    request_epoch: u64,
+    draw_layout: u64,
+) -> u64 {
+    match seed {
+        Some(seed) => sampling_key(seed, 0, 0, 0, draw_layout),
+        None => sampling_key(0, engine_id, request_id, request_epoch, draw_layout),
+    }
+}
+
 /// Maps one Philox word to an exactly representable 24-bit uniform value.
 fn uniform_from_word(word: u32) -> f32 {
     ((word >> 8) as f32) * (1.0f32 / 16_777_216.0f32)
@@ -142,6 +165,37 @@ mod tests {
             let draw = sampling_uniform(key, coordinate, 0, 0);
             assert!((0.0..1.0).contains(&draw), "draw {draw} out of range");
         }
+    }
+
+    #[test]
+    fn a_seeded_request_stream_depends_on_its_seed_alone() {
+        let seeded = request_sampling_key(Some(7), 1, 2, 3, DRAW_LAYOUT_TARGET);
+        assert_eq!(
+            seeded,
+            request_sampling_key(Some(7), 4, 5, 6, DRAW_LAYOUT_TARGET)
+        );
+        assert_ne!(
+            seeded,
+            request_sampling_key(Some(8), 1, 2, 3, DRAW_LAYOUT_TARGET)
+        );
+        assert_ne!(
+            seeded,
+            request_sampling_key(Some(7), 1, 2, 3, DRAW_LAYOUT_PROPOSAL)
+        );
+        // Unseeded requests keep one stream per lineage.
+        let unseeded = request_sampling_key(None, 1, 2, 3, DRAW_LAYOUT_TARGET);
+        assert_eq!(
+            unseeded,
+            request_sampling_key(None, 1, 2, 3, DRAW_LAYOUT_TARGET)
+        );
+        assert_ne!(
+            unseeded,
+            request_sampling_key(None, 1, 5, 3, DRAW_LAYOUT_TARGET)
+        );
+        assert_ne!(
+            unseeded,
+            request_sampling_key(None, 1, 2, 4, DRAW_LAYOUT_TARGET)
+        );
     }
 
     #[test]

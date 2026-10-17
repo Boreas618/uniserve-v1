@@ -6,8 +6,9 @@ selectors take the tasks of one homogeneous group:
 
 - :func:`select_greedy`: argmax of each task's single row, optionally after
   masking suppressed tokens;
-- :func:`select_top_k`: the compiled fixed-``k`` sampler
-  (``uniserve.sampling.sample_top_k``);
+- :func:`select_top_k`: each task samples from its top-k candidates under
+  its own parameters (:func:`uniserve.sampling.top_k.sample_top_k`, which a
+  decode forward also captures);
 - :func:`select_categorical`: the general path that shapes logits
   (:func:`shape_logits`), inverts the categorical CDF with each row's
   precomputed semantic draw (argmax at zero temperature) and resolves
@@ -37,16 +38,20 @@ import torch
 
 from .categorical import sample_categorical
 from .logprobs import LogprobRequest, logprob_details
-from .top_k import sample_top_k, top_k_candidates
+from .top_k import (
+    MIN_P,
+    TEMPERATURE,
+    TOP_P,
+    TYPICAL_P,
+    penalize,
+    sample_top_k,
+    temperature_divisors,
+    top_k_candidates,
+)
 
 # Token relays carry continuation in bit 31 and the token in the low 31 bits.
 TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
-
-# Columns of the per-row float sampling parameters.
-TEMPERATURE, TOP_P, MIN_P, TYPICAL_P = 0, 1, 2, 3
-REPETITION, FREQUENCY, PRESENCE = 4, 5, 6
-PARAMETER_COLUMNS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,48 +193,27 @@ def select_top_k(
     draws: torch.Tensor,
     params: torch.Tensor,
     active: torch.Tensor,
-    top_k: int,
+    width: int,
     *,
-    min_p_rows: Sequence[int],
-    logprob_tasks: Sequence[int],
-    logprob_requests: Sequence[LogprobRequest],
+    counts: torch.Tensor,
+    slots: torch.Tensor,
     force_finish: Sequence[int],
     finish_ids: Sequence[int],
     transition_ids: Sequence[int],
     broadcast: Broadcast = None,
 ) -> Selection:
-    """Sample a group sharing one top-k width with the compiled kernel.
+    """Sample each task's single row from its top-k candidates.
 
-    Logprobs, when a task requests them (``logprob_tasks``, with one of
-    ``logprob_requests`` each), are scored from the general shaping path
-    while the kernel's tokens are kept; ``min_p_rows`` names the rows with a
-    minimum-probability cutoff for that path.
+    The tasks' shaping is decided by their parameter rows alone
+    (:func:`~uniserve.sampling.top_k.sample_top_k`); ``counts`` holds every
+    slot's committed token counts and ``slots`` each task's slot.
     """
-    tokens, valid = sample_top_k(
-        logits, draws, params[:, [TEMPERATURE, TOP_P, MIN_P]], int(top_k)
-    )
+    tokens, valid = sample_top_k(logits, draws, params, width, counts, slots)
     if broadcast is not None:
         broadcast(tokens)
     finish, continuation, tagged, transition = decisions(
         tokens, valid, active, force_finish, finish_ids, transition_ids
     )
-    packed = None
-    if len(logprob_tasks):
-        # Observations do not select another numerical sampler: even draws
-        # at a floating-point CDF boundary keep the kernel's chosen token.
-        work, _ = shape_logits(
-            logits,
-            params,
-            top_ks=[int(top_k)] * int(logits.shape[0]),
-            min_p_rows=min_p_rows,
-        )
-        packed = _logprobs(
-            work,
-            torch.arange(int(tokens.numel()), device=tokens.device),
-            tokens,
-            logprob_tasks,
-            logprob_requests,
-        )
     zeros = torch.zeros_like(tokens)
     return Selection(
         tokens,
@@ -241,7 +225,6 @@ def select_top_k(
         zeros,
         zeros + 1,
         transition,
-        packed,
     )
 
 
@@ -298,7 +281,9 @@ def select_categorical(
     draft token, or zero. The shaping arguments are those of
     :func:`shape_logits`, the decision arguments those of
     :func:`decisions`, and ``logprob_tasks`` names the tasks reporting one
-    of ``logprob_requests`` each.
+    of ``logprob_requests`` each. Reported logprobs are those of the
+    model's distribution, the unshaped ``logits``: the sampling controls
+    decide which token is selected, not how likely the model found it.
 
     Speculative tasks accept the longest prefix where row ``i``'s selection
     equals draft ``i``. Without a terminal prefix, the output row is the
@@ -426,7 +411,7 @@ def select_categorical(
     packed = None
     if len(logprob_tasks):
         packed = _logprobs(
-            work,
+            logits.float(),
             output - terminal.to(dtype=torch.long),
             tokens,
             logprob_tasks,
@@ -472,7 +457,8 @@ def shape_logits(
 
     Args:
         work: ``[rows, vocab]`` logits.
-        params: ``[rows, PARAMETER_COLUMNS]`` float parameters.
+        params: ``[rows, PARAMETER_COLUMNS]`` float parameters
+            (:mod:`uniserve.sampling.top_k`).
         top_ks: Per row, its top-k width, or zero without one.
         top_p_rows: Rows with a nucleus cutoff below one and no top-k width.
         min_p_rows: Rows with a minimum-probability cutoff.
@@ -506,24 +492,18 @@ def shape_logits(
             0, _index(suppressed, device), float("-inf")
         )
 
-    # Penalties apply to tokens with a positive count: repetition is
-    # multiplicative and sign-aware, frequency scales with the count and
-    # presence is flat. Masked (-inf) entries are preserved.
+    # Penalties apply to tokens with a positive count (see ``penalize``).
     if len(penalty_rows) and penalty_counts is not None:
         selected = _index(penalty_rows, device)
-        counts = penalty_counts.to(dtype=work.dtype)
-        values = params.index_select(0, selected)
-        repetition = values[:, REPETITION].unsqueeze(1)
-        frequency = values[:, FREQUENCY].unsqueeze(1)
-        presence = values[:, PRESENCE].unsqueeze(1)
-        current = work.index_select(0, selected)
-        seen = counts > 0
-        repeated = torch.where(
-            current > 0.0, current / repetition, current * repetition
+        work.index_copy_(
+            0,
+            selected,
+            penalize(
+                work.index_select(0, selected),
+                params.index_select(0, selected),
+                penalty_counts,
+            ),
         )
-        adjusted = repeated - frequency * counts - presence
-        apply = seen & ~torch.isneginf(current)
-        work.index_copy_(0, selected, torch.where(apply, adjusted, current))
 
     # Logit bias adds per-token offsets on top of the penalized logits.
     if len(bias):
@@ -534,13 +514,7 @@ def shape_logits(
         )
 
     # A zero temperature divides by one; callers select those rows by argmax.
-    temperatures = params[:, TEMPERATURE]
-    divisors = torch.where(
-        temperatures > 0.0,
-        temperatures,
-        torch.ones((), dtype=work.dtype, device=device),
-    )
-    work.div_(divisors.unsqueeze(1))
+    work.div_(temperature_divisors(params).unsqueeze(1))
 
     # Top-k truncation; top-p applies within each retained top-k set, so rows
     # sharing a width are truncated in one gather/sort pass. The candidates
@@ -622,7 +596,6 @@ def shape_logits(
 
 
 __all__ = [
-    "PARAMETER_COLUMNS",
     "TOKEN_CONTINUATION_BIT",
     "TOKEN_VALUE_MASK",
     "Selection",

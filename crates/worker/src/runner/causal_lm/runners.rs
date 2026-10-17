@@ -470,6 +470,7 @@ impl CausalLMRunners {
             mode: ForwardMode::Prefill,
             rows: &rows,
             finish_ids: &[],
+            row_sampling: None,
             sampling: None,
             prompt: &prompt,
             embeddings: &[],
