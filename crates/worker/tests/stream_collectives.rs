@@ -4,7 +4,7 @@
 //! `LD_LIBRARY_PATH=<site-packages>/nvidia/nccl/lib cargo test -p
 //! uniserve-worker --test stream_collectives -- --ignored`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::net::TcpListener;
 use std::time::Duration;
@@ -20,6 +20,8 @@ use uniserve_worker::storage::{Memory, StorageView};
 fn upload(values: &[f32], device: DeviceId, stream: &CUDAStream) -> StorageView {
     let memory = Memory::device(device, values.len() * 4).unwrap();
     let view = StorageView::whole(memory, DType::F32).unwrap();
+    // SAFETY: the view spans the `values.len() * 4` bytes of its allocation, and
+    // both it and `values` outlive the synchronization below.
     unsafe {
         memcpy_async(
             view.address(),
@@ -35,6 +37,8 @@ fn upload(values: &[f32], device: DeviceId, stream: &CUDAStream) -> StorageView 
 
 fn download(view: &StorageView, stream: &CUDAStream) -> Vec<f32> {
     let mut values = vec![0_f32; view.numel() as usize];
+    // SAFETY: `values` holds as many f32s as the view (every view here is a whole
+    // F32 allocation from `upload`), and both outlive the synchronization below.
     unsafe {
         memcpy_async(
             values.as_mut_ptr() as u64,

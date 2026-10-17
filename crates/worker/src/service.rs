@@ -369,7 +369,7 @@ impl<'a> Service<'a> {
 
     fn channel_error(&self, error: IpcError) -> WorkerError {
         self.channel_failed.set(true);
-        WorkerError::classify(Error::Transport(error.to_string()), None)
+        WorkerError::classify(Error::transport_source("the head channel", error), None)
     }
 }
 
@@ -400,7 +400,7 @@ mod tests {
     const RESPONSE_WAIT: Duration = Duration::from_secs(30);
 
     fn transport(error: IpcError) -> WorkerError {
-        Error::Transport(error.to_string()).into()
+        Error::transport_source("the test channel", error).into()
     }
 
     /// The rank's end of a connection whose head end runs `head` on its

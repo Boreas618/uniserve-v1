@@ -19,40 +19,51 @@ pub(crate) struct CacheCapacity {
     pub num_units: u64,
 }
 
+/// What a rank's cache pool is sized from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheDemand<'a> {
+    /// `(tokens per page, units per page)` of every cache group.
+    pub pages: &'a [(u32, u32)],
+    /// A configured token capacity, which sizes the pool instead of the
+    /// storage grant.
+    pub tokens: Option<u64>,
+    /// Device bytes of one unit, with what other owners keep per unit.
+    pub unit_bytes: u64,
+    /// The device storage grant, if the rank has one.
+    pub available_bytes: Option<u64>,
+    /// Units' worth of the grant that other storage occupies.
+    pub reserved_units: u64,
+}
+
 impl CacheCapacity {
     /// Explicit token capacity counts whole pages of every cache group.
-    /// Automatic sizing gives the pool the remaining complete units; both
-    /// modes must leave room for the sentinel and one page of every group.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn derive(
-        pages: &[(u32, u32)],
-        tokens: Option<u64>,
-        unit_bytes: u64,
-        available_bytes: Option<u64>,
-        floor: u64,
-        default_units: u64,
-        resident_copies: u64,
-        co_resident_units: u64,
-    ) -> Result<Self> {
+    /// Automatic sizing gives the pool the complete units the grant holds
+    /// beside the reserved ones; without a grant the pool takes
+    /// [`DEFAULT_NUM_UNITS`]. Every mode leaves room for the sentinel unit
+    /// and one page of every group.
+    pub(crate) fn derive(demand: &CacheDemand<'_>) -> Result<Self> {
+        let CacheDemand {
+            pages,
+            tokens,
+            unit_bytes,
+            available_bytes,
+            reserved_units,
+        } = *demand;
         if pages.is_empty()
             || pages
                 .iter()
                 .any(|&(tokens, units)| tokens == 0 || units == 0)
             || unit_bytes == 0
-            || floor == 0
-            || resident_copies == 0
         {
             return Err(Error::Invalid(
                 "KV capacity dimensions must be positive".into(),
             ));
         }
 
-        let minimum = floor.max(
-            1 + pages
-                .iter()
-                .map(|&(_, units)| u64::from(units))
-                .sum::<u64>(),
-        );
+        let minimum = 1 + pages
+            .iter()
+            .map(|&(_, units)| u64::from(units))
+            .sum::<u64>();
         let num_units = if let Some(tokens) = tokens {
             if tokens == 0 {
                 return Err(Error::Invalid(
@@ -61,8 +72,7 @@ impl CacheCapacity {
             }
             minimum.max(units_for_tokens(pages, tokens))
         } else if let Some(available) = available_bytes {
-            let units =
-                (available / unit_bytes).saturating_sub(co_resident_units) / resident_copies;
+            let units = (available / unit_bytes).saturating_sub(reserved_units);
             if units < minimum {
                 return Err(Error::Resource(
                     "device storage grant cannot hold the required KV pool",
@@ -70,12 +80,12 @@ impl CacheCapacity {
             }
             units
         } else {
-            minimum.max(default_units)
+            minimum.max(DEFAULT_NUM_UNITS)
         };
 
-        if available_bytes.is_some_and(|available| {
-            (resident_copies * num_units + co_resident_units) * unit_bytes > available
-        }) {
+        if available_bytes
+            .is_some_and(|available| (num_units + reserved_units) * unit_bytes > available)
+        {
             return Err(Error::Resource(
                 "configured KV storage exceeds the device storage grant",
             ));
@@ -147,21 +157,59 @@ pub(crate) fn export_pool_bytes(relay_bytes: u64) -> u64 {
     crate::transfer::vmm::pool::pool_bytes(relay_bytes, size_of::<i64>())
 }
 
+/// The batching bounds of a token worker's arena.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TokenBounds {
+    /// Submitted batches the rank holds at once.
+    pub depth: usize,
+    /// Calls per batch.
+    pub calls: usize,
+    /// Request slots.
+    pub requests: usize,
+    /// Scalar backing of one product slot, from the numerical store's dtype
+    /// schema.
+    pub scalar_bytes: u64,
+    /// Bytes one read of a product carries, at least one.
+    pub transfer_bytes_per_read: u64,
+    /// Whether the rank exports device products over CUDA VMM.
+    pub device_exports: bool,
+}
+
+/// The batching bounds of a media worker's arena.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestBounds {
+    /// Submitted batches the rank holds at once.
+    pub depth: usize,
+    /// Calls per batch.
+    pub calls: usize,
+    /// Request slots.
+    pub requests: usize,
+    /// Ranks of the deployment, every one of which may read this rank's
+    /// products.
+    pub ranks: usize,
+    /// Scalar backing of one product slot, from the numerical store's dtype
+    /// schema.
+    pub scalar_bytes: u64,
+    /// Bytes of the products one request retains on this rank.
+    pub product_bytes_per_request: u64,
+    /// Artifact imports one request may have in flight.
+    pub concurrent_imports: usize,
+    /// Whether the rank exports device products over CUDA VMM.
+    pub device_exports: bool,
+}
+
 impl ArenaCapacity {
     /// Tensor storage keeps six products per call and one batch beyond the
-    /// submitted window until its last reader retires. Scalar backing comes
-    /// from the numerical store's dtype schema, in bytes per product slot.
-    /// `device_exports` states whether the rank exports device products over
-    /// CUDA VMM.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn for_tokens(
-        depth: usize,
-        calls: usize,
-        requests: usize,
-        scalar_bytes: u64,
-        transfer_bytes_per_read: u64,
-        device_exports: bool,
-    ) -> Result<Self> {
+    /// submitted window until its last reader retires.
+    pub(crate) fn for_tokens(bounds: &TokenBounds) -> Result<Self> {
+        let TokenBounds {
+            depth,
+            calls,
+            requests,
+            scalar_bytes,
+            transfer_bytes_per_read,
+            device_exports,
+        } = *bounds;
         let window = call_window(depth, calls)?;
         let slots = depth * calls;
         let tensor_store = 6 * (slots + calls);
@@ -184,19 +232,17 @@ impl ArenaCapacity {
 
     /// A media rank retains every local product in full. Read tickets also
     /// cover assembly across all producing ranks, including stateless ranks.
-    /// `device_exports` states whether the rank exports device products over
-    /// CUDA VMM.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn for_requests(
-        depth: usize,
-        calls: usize,
-        requests: usize,
-        ranks: usize,
-        scalar_bytes: u64,
-        product_bytes_per_request: u64,
-        concurrent_imports: usize,
-        device_exports: bool,
-    ) -> Result<Self> {
+    pub(crate) fn for_requests(bounds: &RequestBounds) -> Result<Self> {
+        let RequestBounds {
+            depth,
+            calls,
+            requests,
+            ranks,
+            scalar_bytes,
+            product_bytes_per_request,
+            concurrent_imports,
+            device_exports,
+        } = *bounds;
         let window = request_tensor_window(depth, requests)?;
         let slots = (depth * calls).max(requests * concurrent_imports);
         let tensor_store = 6 * (slots + calls);

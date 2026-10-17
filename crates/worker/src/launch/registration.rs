@@ -28,7 +28,8 @@ use crate::{Error, Result};
 ///
 /// The function uses nothing but its arguments, so any thread may call it.
 pub fn register(arguments: &Arguments) -> Result<(Channel, LaunchDescriptor)> {
-    let failed = |error| Error::Transport(format!("registering with {}: {error}", arguments.head));
+    let failed =
+        |error| Error::transport_source(format!("registering with {}", arguments.head), error);
     let mut channel = Channel::connect(&arguments.head).map_err(failed)?;
     channel
         .send(&Registration::Rank {
@@ -68,7 +69,7 @@ pub(crate) struct HeadWatch {
 impl HeadWatch {
     /// Start watching the connection `hangup` observes.
     pub(crate) fn start(hangup: Hangup) -> Result<Self> {
-        let failed = |error| Error::Transport(format!("starting the head watch: {error}"));
+        let failed = |error| Error::transport_source("starting the head watch", error);
         let (cancel, cancelled) = UnixStream::pair().map_err(failed)?;
         let thread = std::thread::Builder::new()
             .name("uniserve-head-watch".into())

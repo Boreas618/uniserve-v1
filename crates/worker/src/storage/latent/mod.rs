@@ -19,7 +19,7 @@ mod memory;
 mod pages;
 
 pub use memory::LatentStorage;
-pub(crate) use pages::{LatentExport, LatentImport, LatentPool, LatentUpdate};
+pub(crate) use pages::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};
 
 use std::collections::HashSet;
 use uniserve_cuda::{CopyBatch, SourceOrder};

@@ -10,7 +10,6 @@
 //! to and register at, `rendezvous` the address a group's ranks meet at, and
 //! `launcher` the per-host launchers that start ranks placed on other hosts.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod executor;
 mod instance;
 mod launcher;

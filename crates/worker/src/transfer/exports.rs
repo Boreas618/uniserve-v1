@@ -31,7 +31,7 @@ pub type Location = (Arc<Transport>, Locator);
 /// accesses still retire asynchronously.
 ///
 /// The export's device work is issued to `stream` (see
-/// [`Transport::export`]). Its locations are complete once that work was
+/// `Transport::export`). Its locations are complete once that work was
 /// performed: [`Exports::locate`] gives them then.
 pub fn export(
     transports: &Transports,

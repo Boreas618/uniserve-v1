@@ -9,12 +9,13 @@
 //! block is free for the next lease.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use uniserve_cuda::DeviceId;
 
 use crate::Result;
 use crate::ffi::{Backing, MemoryKind};
+use crate::lock;
 use crate::storage::memory::Memory;
 
 /// Free blocks by device, and their total bytes.
@@ -52,7 +53,7 @@ impl Staging {
     pub(crate) fn lease(self: &Arc<Self>, device: DeviceId, bytes: usize) -> Result<Arc<Lease>> {
         let bytes = bytes.max(1);
         let reused = {
-            let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut free = lock(&self.free);
             let taken = free.blocks.get_mut(&device).and_then(|blocks| {
                 let index = blocks
                     .iter()
@@ -79,7 +80,7 @@ impl Staging {
     }
 
     fn give_back(&self, device: DeviceId, memory: Arc<Memory>) {
-        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut free = lock(&self.free);
         if free.bytes + memory.bytes() > self.retained {
             // Released outside the lock: the reclaimer frees it without
             // waiting for device work.

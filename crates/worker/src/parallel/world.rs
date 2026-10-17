@@ -279,14 +279,13 @@ impl World {
     /// Destroy the torch groups after every communication user retired.
     /// An aborted close keeps them until the process exits: a failed peer
     /// may never join the teardown.
-    #[allow(clippy::mem_forget)]
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let Some(destroy) = self.destroy.take() else {
             return Ok(());
         };
         self.components.clear();
         if aborted {
-            std::mem::forget(std::mem::replace(&mut self.torch, Handle::none()));
+            crate::leak(std::mem::replace(&mut self.torch, Handle::none()));
             return Ok(());
         }
         destroy.invoke(&[self.torch.view()])
@@ -329,13 +328,13 @@ fn store(group: &HostGroup, rendezvous: &RendezvousConfig) -> Result<Store> {
     };
     let address = group.broadcast_bytes(address.as_deref().map(str::as_bytes), 0)?;
     let address = String::from_utf8(address)
-        .map_err(|_| Error::Transport("the store address is not text".into()))?;
+        .map_err(|_| Error::transport("the store address is not text"))?;
     let (host, port) = address
         .rsplit_once(':')
-        .ok_or_else(|| Error::Transport("the store address must be host:port".into()))?;
+        .ok_or_else(|| Error::transport("the store address must be host:port"))?;
     let port: i64 = port
         .parse()
-        .map_err(|_| Error::Transport("the store port is invalid".into()))?;
+        .map_err(|_| Error::transport("the store port is invalid"))?;
     // The store takes ownership of the listening descriptor.
     let listen_fd = listener.map(|listener| i64::from(listener.into_raw_fd()));
     Ok(Store {

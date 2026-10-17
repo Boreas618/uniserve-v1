@@ -5,7 +5,7 @@
 //! assistant turns through the Qwen3 template, and key-order-preserving
 //! tool-argument formatting with `serde_json`-normalized numbers.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![cfg(test)]
 
 use std::collections::HashMap;
 

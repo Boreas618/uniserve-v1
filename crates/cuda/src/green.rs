@@ -21,6 +21,8 @@ pub struct GreenContext {
 // SAFETY: this immutable owner only passes its handle to thread-safe driver
 // calls (stream creation, resource queries, destruction).
 unsafe impl Send for GreenContext {}
+// SAFETY: as for Send above; the owner is immutable, so shared references only
+// read its handle and SM count.
 unsafe impl Sync for GreenContext {}
 
 impl GreenContext {
@@ -29,13 +31,15 @@ impl GreenContext {
         let mut descriptor = std::ptr::null_mut();
         let mut raw = std::ptr::null_mut();
 
-        // SAFETY: the resource was produced by the driver's split API.
         driver.check(
+            // SAFETY: the one resource passed was produced by the driver's split
+            // API; the driver writes the descriptor to the local `descriptor`.
             unsafe { (driver.dev_resource_generate_desc)(&mut descriptor, &mut resource, 1) },
             "cuDevResourceGenerateDesc",
         )?;
-        // SAFETY: the descriptor was generated above for this device.
         driver.check(
+            // SAFETY: the descriptor was generated above for this device; the
+            // driver writes the context handle to the local `raw`.
             unsafe {
                 (driver.green_ctx_create)(&mut raw, descriptor, device, CU_GREEN_CTX_DEFAULT_STREAM)
             },
@@ -55,8 +59,8 @@ impl GreenContext {
     fn resource(&self) -> Result<DevResource> {
         let driver = driver()?;
         let mut resource = DevResource::empty();
-        // SAFETY: self is live; the driver fills one resource.
         driver.check(
+            // SAFETY: self is live; the driver fills the local `resource`.
             unsafe {
                 (driver.green_ctx_get_dev_resource)(
                     self.raw,
@@ -83,8 +87,9 @@ impl Drop for GreenContext {
 pub(crate) fn context_sm_count(context: Handle) -> Result<u32> {
     let driver = driver()?;
     let mut resource = DevResource::empty();
-    // SAFETY: the caller's stream keeps the context alive.
     driver.check(
+        // SAFETY: the caller's stream keeps the context alive; the driver fills
+        // the local `resource`.
         unsafe { (driver.ctx_get_dev_resource)(context, &mut resource, CU_DEV_RESOURCE_TYPE_SM) },
         "cuCtxGetDevResource",
     )?;
@@ -99,8 +104,9 @@ fn split(resource: &DevResource, count: u32) -> Result<(DevResource, DevResource
     let mut group = DevResource::empty();
     let mut remainder = DevResource::empty();
     let mut groups = 1;
-    // SAFETY: all pointers address live resources; one group is requested.
     driver.check(
+        // SAFETY: all pointers address live resources; one group is requested,
+        // so the driver writes one group to the local `group`.
         unsafe {
             (driver.dev_sm_resource_split_by_count)(
                 &mut group,
@@ -139,8 +145,9 @@ pub(crate) fn partition(device: DeviceId, counts: &[u32]) -> Result<Vec<Stream>>
     let driver = driver()?;
     let ordinal = device.handle()?;
     let mut resource = DevResource::empty();
-    // SAFETY: the driver fills the device's SM resource.
     driver.check(
+        // SAFETY: the driver fills the local `resource` with the SM resource of
+        // the valid device `ordinal`.
         unsafe {
             (driver.device_get_dev_resource)(ordinal, &mut resource, CU_DEV_RESOURCE_TYPE_SM)
         },
@@ -173,8 +180,9 @@ pub(crate) fn partition(device: DeviceId, counts: &[u32]) -> Result<Vec<Stream>>
 
         let green = Arc::new(GreenContext::new(ordinal, lane)?);
         let mut raw = std::ptr::null_mut();
-        // SAFETY: the green context is live and retained by the new stream.
         driver.check(
+            // SAFETY: the green context is live and retained by the new stream;
+            // the driver writes the stream handle to the local `raw`.
             unsafe {
                 (driver.green_ctx_stream_create)(&mut raw, green.raw, CU_STREAM_NON_BLOCKING, 0)
             },

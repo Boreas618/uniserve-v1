@@ -69,7 +69,7 @@ impl PendingImport {
         match task.completion.outcome() {
             Some(Outcome::Success(_)) => Ok(()),
             Some(Outcome::Failed(error)) => {
-                Err(Error::Transport(format!("cache import failed: {error}")))
+                Err(Error::transport_source("cache import failed", error))
             }
             Some(Outcome::Cancelled) => Err(Error::Resource("cache import was cancelled")),
             None => Err(Error::State(

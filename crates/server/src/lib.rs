@@ -10,7 +10,6 @@
 //! processing to the capabilities the engine reports (`serving`). The HTTP
 //! layer (`http`) serves requests from the resulting [`AppState`].
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod config;
 /// Server-facing engine submission and health client.
 pub mod engine_client;
@@ -18,9 +17,7 @@ pub mod engine_client;
 pub mod http;
 /// OpenAI-compatible schemas and conversion helpers.
 pub mod openai;
-/// Model assets and behavior profiles.
 pub mod profile;
-/// Model-aware request admission and output streaming.
 pub mod serving;
 mod state;
 mod video_jobs;

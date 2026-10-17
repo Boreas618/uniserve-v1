@@ -20,8 +20,6 @@
 //! registry. Registration names are base names; `prometheus-client` appends
 //! `_total` to counters when encoding.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 use std::fmt;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;

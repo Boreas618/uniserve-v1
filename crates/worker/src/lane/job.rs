@@ -25,7 +25,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_cuda::{CopyBatch, DeviceGuard, DeviceId, Event, SourceOrder, Stream, StridedCopy};
@@ -37,7 +37,7 @@ use crate::parallel::joins::GraphFunctions;
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::runner::methods::MethodCall;
 use crate::stream::{Deferral, Deferred, EventPool, Fill, HostFunction, Issue, RowFill};
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// One item of work submitted to a lane. Every operation owns its data, so
 /// a job moves to the thread that performs it and its submitter goes on.
@@ -525,11 +525,13 @@ impl Operation {
         match self {
             Self::Copy { stream, copies, .. } => {
                 let stream = stream.as_ref();
-                // SAFETY: the recorder's caller keeps every range valid
-                // until the copies ran; sources read during the call are
-                // the operation's own bytes.
                 match &copies {
+                    // SAFETY: the recorder's caller keeps every range valid
+                    // until the copies ran; sources read during the call are
+                    // the operation's own bytes.
                     Copies::Linear(copies) => unsafe { stream.copy(copies) },
+                    // SAFETY: the recorder's caller keeps every range valid
+                    // until the copies ran.
                     Copies::Strided(copies) => unsafe { stream.copy_strided(copies) },
                 }
             }
@@ -1070,9 +1072,7 @@ impl Post {
     ) {
         // The completion stays reachable if the notice cannot be issued.
         let held = Arc::new(Mutex::new(Some(completion)));
-        let take = |held: &Mutex<Option<Completion>>| {
-            held.lock().unwrap_or_else(PoisonError::into_inner).take()
-        };
+        let take = |held: &Mutex<Option<Completion>>| lock(held).take();
         let issued = (|| -> Result<()> {
             let notification = notifications.stream(device)?;
             for event in events {
@@ -1285,6 +1285,7 @@ mod tests {
         // An attempt that fails after recording work: its storage is given
         // back, so its work is dropped from the job.
         let failed: Result<()> = issue.attempt(|| {
+            // SAFETY: a byte of the test's array, which outlives the job.
             unsafe { issue.fill(byte(&raw mut target[1], 6)) }?;
             Err(Error::State("the attempt failed"))
         });
@@ -1292,6 +1293,7 @@ mod tests {
 
         // What was recorded before and after it stays, as does an attempt
         // that succeeds.
+        // SAFETY: a byte of the test's array, which outlives the job.
         issue.attempt(|| unsafe { issue.fill(byte(&raw mut target[2], 7)) })?;
         assert_eq!(job.len(), 2);
         job.perform().check().unwrap();
@@ -1300,6 +1302,7 @@ mod tests {
         // A stream issued a failed attempt's work at once.
         let mut issued = 0_u8;
         let failed: Result<()> = None::<&Stream>.attempt(|| {
+            // SAFETY: a byte the test owns, filled at once while it is live.
             unsafe { None::<&Stream>.fill(byte(&raw mut issued, 9)) }?;
             Err(Error::State("the attempt failed"))
         });

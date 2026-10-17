@@ -7,7 +7,7 @@
 //! the batch that configured it independently of the task's thread. Python
 //! runs only inside the library functions a task calls.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use tvm_ffi::{Any, AnyView};
 use uniserve_core::VideoCondition;
@@ -18,7 +18,7 @@ use super::reader::{ConditionProducts, ConditionReader};
 use crate::ffi::{Backing, DType, Function, Interpreter, MemoryKind};
 use crate::storage::memory::StorageView;
 use crate::transfer::{SharedMapping, SharedRead};
-use crate::{Error, Outcome, Result};
+use crate::{Error, Outcome, Result, lock};
 
 /// A borrowed shared-memory payload exposed as host bytes. The mapping
 /// stays alive through every tensor viewing it.
@@ -58,7 +58,7 @@ impl UnitFrames {
         let bytes = u64::from(frames) * u64::from(height) * u64::from(width) * 3;
         match self {
             Self::Borrowed(read) => {
-                let read = read.lock().unwrap_or_else(PoisonError::into_inner);
+                let read = lock(read);
                 if (read.nbytes() as u64) < bytes {
                     return Err(Error::Invalid(
                         "decoded media unit holds fewer bytes than its frames".into(),
@@ -84,9 +84,7 @@ impl UnitFrames {
 
     fn release(&self) {
         if let Self::Borrowed(read) = self {
-            read.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .release();
+            lock(read).release();
         }
     }
 }

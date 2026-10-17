@@ -5,7 +5,7 @@
 //! [`Batch`] (`ExecutionBatch::into_protocol`, which validates it), projects
 //! it onto the calls each rank owns (`rank_projection`, which narrows forward
 //! rows with `ForwardBatch::select` and sets each call's `consumer_slots`),
-//! and sends it as the message of a [`Frame`](crate::Frame). A rank answers
+//! and sends it as the message of a [`Frame`]. A rank answers
 //! with one [`BatchOutput`] of per-call [`RequestOutput`] completions. The
 //! rank runtime (`uniserve-worker`) consumes these types directly.
 //!

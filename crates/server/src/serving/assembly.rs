@@ -98,7 +98,10 @@ struct TerminalAccounting {
 /// releases the text a SenseNova filter still holds back, because no later
 /// text can complete a delimiter. Returns `finished` unchanged for the caller
 /// to pass to [`emit_terminal`].
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one decoded update and the sinks of the stream it extends"
+)]
 async fn emit_text_update(
     context: &EmitContext<'_>,
     sink: &mut OutputSink,
@@ -244,10 +247,8 @@ pub(super) async fn assemble_chat_event_stream(
     } = assembly;
 
     // Decode raw engine events first, then apply the model-selected structured
-    // chat processor before exposing any public event. The `true` argument
-    // selects per-token decoded deltas rather than one accumulated delta at the
-    // end, and the decoder owns stop-string matching and engine
-    // acknowledgement on this path.
+    // chat processor before exposing any public event. The decoder owns
+    // stop-string matching and engine acknowledgement on this path.
     let started = event_context.started;
     let emit_context = EmitContext {
         request_id: &request_id,
@@ -262,7 +263,6 @@ pub(super) async fn assemble_chat_event_stream(
         generated_logprobs_requested,
         stream,
         decode_options,
-        true,
     );
     let output = processor.parse(decoded);
     let mut blocks = OutputProcessor::new();

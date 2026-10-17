@@ -1,10 +1,10 @@
 //! A rank's shared transfer byte budget and read credits.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{Notify, notify};
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 struct CapacityState {
     used: u64,
@@ -43,7 +43,7 @@ impl TransferCapacity {
     }
 
     fn state(&self) -> MutexGuard<'_, CapacityState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     pub(crate) fn capacity(&self) -> u64 {

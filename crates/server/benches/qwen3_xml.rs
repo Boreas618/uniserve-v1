@@ -1,4 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Throughput benchmarks for incremental Qwen XML tool-call parsing.
 //!
 //! Each fixture is split into fixed-size character chunks and streamed

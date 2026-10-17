@@ -155,8 +155,9 @@ macro_rules! memset {
         ) -> Result<()> {
             let _scope = stream.enter()?;
             let driver = driver()?;
-            // SAFETY: forwarded from the caller.
             driver.check(
+                // SAFETY: forwarded from the caller, who keeps the destination valid
+                // until the fill completes.
                 unsafe { (driver.$field)(destination, value, count, stream.handle()) },
                 $call,
             )
@@ -331,8 +332,9 @@ impl CopyBatch {
                 batched.push(destination, source, bytes);
                 continue;
             }
-            // SAFETY: forwarded from the caller.
             driver.check(
+                // SAFETY: forwarded from the caller, who keeps both ranges valid until
+                // the stream reaches the copy.
                 unsafe { (driver.memcpy_async)(destination, source, bytes, stream.handle()) },
                 "cuMemcpyAsync",
             )?;
@@ -579,9 +581,9 @@ impl PitchedBatch {
             }
             let source = Residence::of(copy.source)?;
             let operation = copy.unbatched(source)?;
-            // SAFETY: the driver reads the operation during the call only;
-            // the caller guarantees the addressed rows.
             driver.check(
+                // SAFETY: the driver reads the operation during the call only;
+                // the caller guarantees the addressed rows.
                 unsafe { (driver.memcpy_3d_async)(&raw const operation, stream.handle()) },
                 "cuMemcpy3DAsync_v2",
             )?;

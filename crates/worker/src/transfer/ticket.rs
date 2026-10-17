@@ -334,7 +334,7 @@ mod tests {
         };
 
         let (late, callbacks) =
-            ticket.fail_shared(Arc::new(Error::Transport("device copy failed".into())));
+            ticket.fail_shared(Arc::new(Error::transport("device copy failed")));
         notify(callbacks);
         assert!(late);
         assert_eq!(observed.shape(), vec![3]);

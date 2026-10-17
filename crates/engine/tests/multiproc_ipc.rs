@@ -22,7 +22,7 @@
 //! compiles only on Linux.
 
 #![cfg(target_os = "linux")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::fs::remove_file;
 use std::os::unix::fs::MetadataExt as _;
@@ -364,6 +364,7 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
         // of the job; the rank keeps serving until its head closes it.
         let pid = libc::pid_t::try_from(child.id())?;
         for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: kill takes only integer arguments and touches no memory of this process.
             anyhow::ensure!(unsafe { libc::kill(pid, signal) } == 0);
         }
         serve(2, 62, 2)?;
@@ -417,6 +418,7 @@ fn a_starting_rank_stops_on_interrupt_and_dies_of_termination() -> anyhow::Resul
             rendezvous.set_nonblocking(false)?;
             let (_peer, _) = rendezvous.accept()?;
             let pid = libc::pid_t::try_from(child.id())?;
+            // SAFETY: kill takes only integer arguments and touches no memory of this process.
             anyhow::ensure!(unsafe { libc::kill(pid, signal) } == 0);
             let status = wait_exit(&mut child, Duration::from_secs(30))?;
             if expect_interrupt {
@@ -988,6 +990,7 @@ fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result
         )?;
         let pid =
             std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+        // SAFETY: kill takes only integer arguments and touches no memory of this process.
         anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
 
         let failure = worker
@@ -1449,7 +1452,10 @@ fn poll_logical(
 /// to the single page `unit`, which the batch allocates only when
 /// `prefix_length` is zero; a continuation passes the same page and a nonzero
 /// prefix.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every field of the one-call batch a test sends"
+)]
 fn token_batch(
     batch_id: u64,
     collective_seq: u64,
@@ -1623,6 +1629,7 @@ fn a_relaunch_refuses_a_rank_of_the_launch_it_replaced() -> anyhow::Result<()> {
 
     // Losing rank 0 relaunches the group.
     let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+    // SAFETY: kill takes only integer arguments and touches no memory of this process.
     anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
     let failure = worker
         .poll_batch(Duration::from_secs(60))
@@ -1687,6 +1694,7 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     // boundary as a missing deployment prerequisite, without changing IPC.
     remove_file(wrapper)?;
     let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
+    // SAFETY: kill takes only integer arguments and touches no memory of this process.
     anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !engine.is_dead() && std::time::Instant::now() < deadline {
@@ -1918,6 +1926,7 @@ impl PausedProcess {
     fn new(pid: i32) -> anyhow::Result<Self> {
         anyhow::ensure!(pid > 0, "worker process id must be positive");
         anyhow::ensure!(
+            // SAFETY: kill takes only integer arguments and touches no memory of this process.
             unsafe { libc::kill(pid, libc::SIGSTOP) } == 0,
             "failed to pause the selected worker: {}",
             std::io::Error::last_os_error()
@@ -1938,6 +1947,7 @@ impl PausedProcess {
     fn resume(&mut self) -> anyhow::Result<()> {
         if let Some(pid) = self.0 {
             anyhow::ensure!(
+                // SAFETY: kill takes only integer arguments and touches no memory of this process.
                 unsafe { libc::kill(pid, libc::SIGCONT) } == 0,
                 "failed to resume the selected worker: {}",
                 std::io::Error::last_os_error()
@@ -1950,6 +1960,7 @@ impl PausedProcess {
     fn terminate(mut self) -> anyhow::Result<()> {
         let pid = self.0.context("selected worker is no longer paused")?;
         anyhow::ensure!(
+            // SAFETY: kill takes only integer arguments and touches no memory of this process.
             unsafe { libc::kill(pid, libc::SIGKILL) } == 0,
             "failed to terminate the selected worker: {}",
             std::io::Error::last_os_error()
@@ -4466,8 +4477,8 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
         // The receiver claims the POSIX name even when correlation, rank
         // ownership, or extent validation rejects the result. Retained
         // mappings keep the bytes.
-        // SAFETY: the rank handed off an immutable, completed export.
         assert!(
+            // SAFETY: the rank handed off an immutable, completed export.
             unsafe { uniserve_core::SharedMedia::open(published_name.trim(), 1) }.is_err(),
             "unclaimed media in {case}"
         );

@@ -60,10 +60,10 @@ fn serve(handle: &ShareableHandle) -> Result<(String, Option<DescriptorGrants>)>
     let grants = match handle {
         ShareableHandle::Descriptor(fd) => {
             let grants = DescriptorGrants::new(&endpoint)
-                .map_err(|error| Error::Transport(error.to_string()))?;
+                .map_err(|error| Error::transport_source("opening the descriptor grants", error))?;
             grants
                 .register(PEER_EXPORT, fd.as_raw_fd())
-                .map_err(|error| Error::Transport(error.to_string()))?;
+                .map_err(|error| Error::transport_source("granting a peer's descriptor", error))?;
             Some(grants)
         }
         ShareableHandle::Fabric(_) => None,
@@ -113,7 +113,9 @@ impl PeerStorage {
                         ShareableHandle::Descriptor(fd) => fd
                             .try_clone()
                             .map(ShareableHandle::Descriptor)
-                            .map_err(|error| Error::Transport(error.to_string())),
+                            .map_err(|error| {
+                                Error::transport_source("duplicating a peer's descriptor", error)
+                            }),
                     };
                 }
                 decode(node, payload)
@@ -124,7 +126,7 @@ impl PeerStorage {
         if let Some(grants) = grants {
             grants
                 .close()
-                .map_err(|error| Error::Transport(error.to_string()))?;
+                .map_err(|error| Error::transport_source("closing the descriptor grants", error))?;
         }
         let handles = handles?;
         barrier?;
@@ -168,7 +170,7 @@ mod tests {
         );
 
         let file = std::fs::File::open("/dev/null")
-            .map_err(|error| Error::Transport(error.to_string()))?;
+            .map_err(|error| Error::transport_source("opening a stand-in descriptor", error))?;
         let descriptor = ShareableHandle::Descriptor(file.into());
         let payload = encode("node-a", &descriptor, "uniserve-peer-x");
         assert!(matches!(
@@ -188,10 +190,10 @@ mod tests {
         // Any open file stands in for an allocation's process descriptor:
         // the grant passes the descriptor, not the allocation.
         let file = std::fs::File::open("/dev/null")
-            .map_err(|error| Error::Transport(error.to_string()))?;
+            .map_err(|error| Error::transport_source("opening a stand-in descriptor", error))?;
         let published = file
             .metadata()
-            .map_err(|error| Error::Transport(error.to_string()))?;
+            .map_err(|error| Error::transport_source("reading a descriptor's metadata", error))?;
         let handle = ShareableHandle::Descriptor(file.into());
         let (endpoint, grants) = serve(&handle)?;
         assert!(grants.is_some(), "a descriptor is served by a grant");
@@ -206,7 +208,7 @@ mod tests {
         };
         let received = std::fs::File::from(received)
             .metadata()
-            .map_err(|error| Error::Transport(error.to_string()))?;
+            .map_err(|error| Error::transport_source("reading a descriptor's metadata", error))?;
         assert_eq!(
             (received.dev(), received.ino()),
             (published.dev(), published.ino())

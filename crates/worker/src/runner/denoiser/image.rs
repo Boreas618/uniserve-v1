@@ -63,6 +63,7 @@ use crate::storage::AttentionRow;
 use crate::storage::LatentUpdate;
 use crate::storage::PrefixCache;
 use crate::storage::Scratch;
+use crate::storage::TrajectoryVersion;
 use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -238,11 +239,6 @@ fn allocate(
     // its stream drained; its launches run behind the fill on that stream.
     unsafe { view.zero(stream) }?;
     Ok(view)
-}
-
-fn bytes<T: Copy>(values: &[T]) -> &[u8] {
-    // SAFETY: plain integers or floats reinterpreted as their bytes.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
 
 impl DenoiserRunner {
@@ -800,9 +796,10 @@ impl ImageDenoiser {
             for (axis, values) in axes.iter().enumerate() {
                 self.positions
                     .select(0, axis as i64)?
-                    .upload(bytes(values), stream)?;
+                    .upload(bytemuck::cast_slice(values), stream)?;
             }
-            self.timesteps.upload(bytes(&times), stream)?;
+            self.timesteps
+                .upload(bytemuck::cast_slice(&times), stream)?;
         }
         Ok((tokens, offsets, described))
     }
@@ -1517,15 +1514,17 @@ impl ImageBatch<'_> {
                     .latent_input
                     .as_ref()
                     .map_or(0, |input| i64::from(input.generation));
-                let bank = latents.pool.current_bank(
-                    trajectory.slot,
-                    i64::from(params.start_step),
+                let committed = TrajectoryVersion {
+                    step: i64::from(params.start_step),
                     generation,
-                    i64::from(params.latent_units),
-                    i64::from(params.height),
-                    i64::from(params.width),
-                    &scratch.pages,
-                )?;
+                    units: i64::from(params.latent_units),
+                    height: i64::from(params.height),
+                    width: i64::from(params.width),
+                };
+                let bank =
+                    latents
+                        .pool
+                        .current_bank(trajectory.slot, &committed, &scratch.pages)?;
                 latents.gather(bank, scratch, job.on(stream.as_ref()))?;
             }
         }

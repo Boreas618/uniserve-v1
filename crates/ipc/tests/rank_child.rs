@@ -7,7 +7,8 @@
 //! `cargo test -p uniserve-ipc --test rank_child -- --ignored`), or after
 //! they map shared memory under NCCL's prefix, as a communicator's proxy
 //! does.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+#![cfg(test)]
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
@@ -87,8 +88,9 @@ fn a_killed_rank_leaves_no_event_memory_once_reaped() {
     let (mut killed, killed_memory) = Holder::start();
     let (mut live, live_memory) = Holder::start();
 
-    // SAFETY: signal delivery to this test's own child, which is unreaped.
     assert_eq!(
+        // SAFETY: kill takes integers only; the pid is this test's own
+        // unreaped child, so it names no other process.
         unsafe { libc::kill(killed.0.id() as libc::pid_t, libc::SIGKILL) },
         0
     );
@@ -160,8 +162,9 @@ fn a_killed_rank_leaves_none_of_its_nccl_names_once_reaped() {
     killed.0.note_nccl_segments().unwrap();
     live.0.note_nccl_segments().unwrap();
 
-    // SAFETY: signal delivery to this test's own child, which is unreaped.
     assert_eq!(
+        // SAFETY: kill takes integers only; the pid is this test's own
+        // unreaped child, so it names no other process.
         unsafe { libc::kill(killed.0.id() as libc::pid_t, libc::SIGKILL) },
         0
     );

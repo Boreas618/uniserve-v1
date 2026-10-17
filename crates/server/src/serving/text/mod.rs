@@ -3,8 +3,6 @@
 //! Model profiles own request tokenization; this module provides reusable text
 //! primitives for profiles and response assemblers.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 pub use error::{Error, Result};
 pub use output::{
     CollectedTextOutput, DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs,

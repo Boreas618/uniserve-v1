@@ -1,5 +1,4 @@
 //! Serializable statistics snapshots exchanged between workers, the engine,
 //! and the server's metrics exporter.
 
-/// Scheduler and worker statistics snapshots.
 pub mod stats;

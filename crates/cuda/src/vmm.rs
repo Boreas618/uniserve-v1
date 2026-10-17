@@ -4,14 +4,14 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 
 use crate::driver::{
     CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE, MemAccessDesc,
     MemAllocationProp, MemLocation, driver, in_context,
 };
 use crate::memory::DeviceAllocation;
-use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, reclaim};
+use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, lock, reclaim};
 
 const CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: i32 = 1;
 const CU_MEM_HANDLE_TYPE_FABRIC: i32 = 8;
@@ -51,7 +51,7 @@ impl HandleType {
     pub fn probe(device: DeviceId) -> Result<Self> {
         static PROBED: Mutex<BTreeMap<i32, HandleType>> = Mutex::new(BTreeMap::new());
 
-        let mut probed = PROBED.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut probed = lock(&PROBED);
         if let Some(handle_type) = probed.get(&device.0) {
             return Ok(*handle_type);
         }
@@ -71,8 +71,9 @@ impl HandleType {
         let driver = driver()?;
         let properties = MemAllocationProp::device(device.handle()?, self.raw());
         let mut granularity = 0;
-        // SAFETY: the driver reads the properties and writes one size_t.
         driver.check(
+            // SAFETY: the driver reads the local `properties` and writes one size_t
+            // to the local `granularity`.
             unsafe {
                 (driver.mem_get_allocation_granularity)(
                     &mut granularity,
@@ -133,8 +134,9 @@ impl ShareableHandle {
         match handle_type {
             HandleType::Fabric => {
                 let mut bytes = [0_u8; 64];
-                // SAFETY: a fabric handle is a 64-byte CUmemFabricHandle.
                 driver.check(
+                    // SAFETY: a fabric handle is a 64-byte CUmemFabricHandle, which
+                    // the driver writes to the local `bytes`.
                     unsafe {
                         (driver.mem_export_to_shareable_handle)(
                             bytes.as_mut_ptr().cast(),
@@ -149,8 +151,8 @@ impl ShareableHandle {
             }
             HandleType::Descriptor => {
                 let mut fd: i32 = -1;
-                // SAFETY: a POSIX handle is written as one int.
                 driver.check(
+                    // SAFETY: a POSIX handle is written as one int, to the local `fd`.
                     unsafe {
                         (driver.mem_export_to_shareable_handle)(
                             (&raw mut fd).cast(),
@@ -205,7 +207,7 @@ static RESERVED: Mutex<BTreeMap<u64, usize>> = Mutex::new(BTreeMap::new());
 /// in memory addressed through `cuMemMap` rather than a linear allocation or
 /// host memory.
 pub(crate) fn is_mapped(address: u64) -> bool {
-    let reserved = RESERVED.lock().unwrap_or_else(PoisonError::into_inner);
+    let reserved = lock(&RESERVED);
     reserved
         .range(..=address)
         .next_back()
@@ -246,8 +248,9 @@ impl VirtualRange {
     pub(crate) fn create(&mut self, bytes: usize, properties: &MemAllocationProp) -> Result<u64> {
         let driver = driver()?;
         let mut handle = 0;
-        // SAFETY: the driver reads the properties and writes one handle.
         driver.check(
+            // SAFETY: the driver reads the borrowed properties and writes one handle
+            // to the local `handle`.
             unsafe { (driver.mem_create)(&mut handle, bytes, properties, 0) },
             "cuMemCreate",
         )?;
@@ -263,17 +266,14 @@ impl VirtualRange {
     pub(crate) fn reserve(&mut self, bytes: usize, alignment: usize) -> Result<()> {
         let driver = driver()?;
         let mut address = 0;
-        // SAFETY: the driver writes the base of a new range.
         driver.check(
+            // SAFETY: the driver writes the base of a new range to the local `address`.
             unsafe { (driver.mem_address_reserve)(&mut address, bytes, alignment, 0, 0) },
             "cuMemAddressReserve",
         )?;
         self.address = address;
         self.reserved = bytes;
-        RESERVED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(address, bytes);
+        lock(&RESERVED).insert(address, bytes);
         Ok(())
     }
 
@@ -281,8 +281,8 @@ impl VirtualRange {
     pub(crate) fn map(&mut self, offset: usize, bytes: usize, handle: u64) -> Result<()> {
         let driver = driver()?;
         let address = self.address + offset as u64;
-        // SAFETY: the target lies inside the reserved range, unmapped so far.
         driver.check(
+            // SAFETY: the target lies inside the reserved range, unmapped so far.
             unsafe { (driver.mem_map)(address, bytes, 0, handle, 0) },
             "cuMemMap",
         )?;
@@ -334,10 +334,7 @@ impl Drop for VirtualRange {
             // The owner retired every access before dropping the range, and
             // the driver cannot hand the address out again until the queued
             // teardown frees it.
-            RESERVED
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&address);
+            lock(&RESERVED).remove(&address);
         }
 
         reclaim::defer(move || {
@@ -473,9 +470,9 @@ impl PeerMapping {
         let mut handles = Vec::with_capacity(parts.len());
         for part in parts {
             let mut handle = 0;
-            // SAFETY: the part's base address is a live VMM mapping; the
-            // driver writes one new reference to its physical allocation.
             driver.check(
+                // SAFETY: the part's base address is a live VMM mapping; the
+                // driver writes one new reference to its physical allocation.
                 unsafe {
                     (driver.mem_retain_allocation_handle)(
                         &mut handle,

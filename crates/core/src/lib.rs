@@ -7,7 +7,6 @@
 //! validation, prefix-cache descriptors, and the [`CommandWaker`] that interrupts
 //! an engine waiting for commands.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod allocation;
 pub use allocation::ByteAllocator;
 mod parallel;
@@ -25,9 +24,8 @@ pub mod codec;
 mod events;
 mod media;
 mod shared_memory;
-/// MiniMax-H3 video request rules and the conditions they describe.
 pub mod video;
-pub use media::{MediaSource, SharedMedia};
+pub use media::{MediaSource, SharedMedia, SharedMediaError};
 pub use shared_memory::SharedMemory;
 pub use video::{
     AudioClip, ConditionMedia, ConditionRole, ConditionTiles, ConditionVision, ImageFit,
@@ -35,7 +33,6 @@ pub use video::{
 };
 /// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;
-/// Counter-based Philox random-number generation.
 pub mod philox;
 /// Deterministic token sampling and log-probability scoring.
 pub mod sampling;

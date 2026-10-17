@@ -36,6 +36,7 @@ use thiserror_ext::AsReport as _;
 use tracing::{debug, error, info, trace};
 
 use crate::openai::ApiError;
+use crate::openai::chat_completions::ChatResponseContext;
 use crate::openai::logprobs::{decoded_logprobs_to_openai_chat, decoded_prompt_logprobs_to_maps};
 use crate::openai::utils::completion_token_count;
 
@@ -70,7 +71,7 @@ macro_rules! bail_server_error {
 
 /// Collects a chat event stream into one non-streaming response.
 ///
-/// The flags mirror the fields of `ChatResponseContext`. `created` is the
+/// `context` holds the response options the request chose; `created` is the
 /// response timestamp in UNIX seconds.
 ///
 /// When reasoning is present but `include_reasoning` is false, the response
@@ -85,18 +86,22 @@ macro_rules! bail_server_error {
 /// without an inline PNG, lacks output logprobs the response must include or
 /// prompt logprobs the request asked for, or fails to convert output
 /// logprobs.
-#[allow(clippy::too_many_arguments)]
 pub async fn collect_chat_completion(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
-    request_id: String,
-    response_model: String,
+    context: ChatResponseContext,
     created: u64,
-    requested_logprobs: bool,
-    include_prompt_logprobs: bool,
-    include_reasoning: bool,
-    return_token_ids: bool,
-    return_tokens_as_token_ids: bool,
 ) -> Result<ChatCompletionResponse, ApiError> {
+    // Usage is part of every non-streaming response.
+    let ChatResponseContext {
+        request_id,
+        response_model,
+        include_usage: _,
+        requested_logprobs,
+        include_prompt_logprobs,
+        include_reasoning,
+        return_token_ids,
+        return_tokens_as_token_ids,
+    } = context;
     let collected = collect_chat_events(stream).await?;
     let CollectedChatOutput {
         message,
@@ -386,8 +391,9 @@ async fn collect_chat_events(
 
 /// Converts one serving event stream into OpenAI chat-completion chunks.
 ///
-/// The flags mirror the fields of `ChatResponseContext`; `log_request` logs
-/// one summary line when the request finishes. The chunk sequence is an
+/// `context` holds the response options the request chose; `log_request`
+/// logs one summary line when the request finishes. Prompt logprobs are never
+/// streamed (`ChatResponseContext::include_prompt_logprobs`). The chunk sequence is an
 /// assistant-role start chunk, content, reasoning, tool-call, logprob, and
 /// image deltas, one chunk carrying `finish_reason`, and, with
 /// `include_usage`, a final usage chunk.
@@ -404,21 +410,24 @@ async fn collect_chat_events(
 /// a stream error, a `Failed` event, a `FinishStatus::Error` finish, an image
 /// without an inline PNG, or a logprob conversion failure. The stream ends
 /// after the first error.
-#[allow(clippy::too_many_arguments)]
 #[try_stream]
 pub async fn chat_completion_chunk_stream(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
-    request_id: String,
-    response_model: String,
+    context: ChatResponseContext,
     created: u64,
     log_request: bool,
-    include_usage: bool,
-    requested_logprobs: bool,
-    include_reasoning: bool,
-    return_token_ids: bool,
-    return_tokens_as_token_ids: bool,
     mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
+    let ChatResponseContext {
+        request_id,
+        response_model,
+        include_usage,
+        requested_logprobs,
+        include_prompt_logprobs: _,
+        include_reasoning,
+        return_token_ids,
+        return_tokens_as_token_ids,
+    } = context;
     pin_mut!(stream);
     let mut saw_tool_calls = false;
     let mut prompt_token_count = 0_usize;
@@ -1149,6 +1158,7 @@ mod tests {
     use futures::{StreamExt as _, stream};
 
     use super::chat_completion_chunk_stream;
+    use crate::openai::chat_completions::ChatResponseContext;
     use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
     use crate::serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
     use crate::serving::{FinishStatus, RequestOutput};
@@ -1224,20 +1234,20 @@ mod tests {
     /// Streams `thinking_response` with logprobs and token IDs requested and
     /// returns the streamed token IDs and the number of logprob positions.
     async fn streamed_metadata(include_reasoning: bool) -> (Vec<u32>, usize) {
-        let chunks = chat_completion_chunk_stream(
-            stream::iter(thinking_response()),
-            "r".to_string(),
-            "m".to_string(),
-            0,
-            false,
-            false,
-            true,
+        let context = ChatResponseContext {
+            request_id: "r".to_string(),
+            response_model: "m".to_string(),
+            include_usage: false,
+            requested_logprobs: true,
+            include_prompt_logprobs: false,
             include_reasoning,
-            true,
-            false,
-        )
-        .collect::<Vec<_>>()
-        .await;
+            return_token_ids: true,
+            return_tokens_as_token_ids: false,
+        };
+        let chunks =
+            chat_completion_chunk_stream(stream::iter(thinking_response()), context, 0, false)
+                .collect::<Vec<_>>()
+                .await;
 
         let mut token_ids = Vec::new();
         let mut logprob_positions = 0;

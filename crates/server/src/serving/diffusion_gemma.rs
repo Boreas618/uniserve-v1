@@ -262,8 +262,6 @@ mod tests {
     //! `TEXT_LEN` tokens. The tokenizer decodes every synthetic token to its own
     //! word, so each delta's text follows from its token ids.
 
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
     use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 

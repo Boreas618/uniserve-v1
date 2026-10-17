@@ -2,7 +2,7 @@
 //! few megabytes of memory on device 0; run them with
 //! `cargo test -p uniserve-cuda -- --ignored`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -97,9 +97,11 @@ fn fills_and_copies_round_trip_through_device_memory() {
     assert!(bytes[16..24].iter().all(|byte| *byte == 7));
     assert!(bytes[24..].iter().all(|byte| *byte == 0xa5));
 
-    // SAFETY: no copy is pending on the buffer.
     let pattern: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
+    // SAFETY: no copy is pending on the buffer.
     unsafe { host.as_mut_slice() }.copy_from_slice(&pattern);
+    // SAFETY: every range lies inside `first` or `host`, which outlive the
+    // synchronization below.
     unsafe {
         memcpy_async(first.address(), host.address(), 4096, &stream).unwrap();
         memset_d8(host.address(), 0, 4096, &stream).unwrap();
@@ -467,9 +469,11 @@ fn capturing_streams_report_capture_and_reject_storage_operations() {
         unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32;
     type DestroyGraph = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
 
-    // SAFETY: the signatures match cuda.h; relaxed mode (2) keeps the capture
-    // from interacting with other test threads.
+    // SAFETY: loading libcuda runs only the driver's own initializers.
     let library = unsafe { libloading::Library::new("libcuda.so.1") }.unwrap();
+    // SAFETY: the signatures match cuda.h, and `library` stays loaded while the
+    // copied function pointers are used; relaxed mode (2) keeps the capture
+    // from interacting with other test threads.
     let (begin, end, destroy) = unsafe {
         (
             *library
@@ -490,8 +494,8 @@ fn capturing_streams_report_capture_and_reject_storage_operations() {
 
     let mut batch = CopyBatch::new(SourceOrder::Stream);
     batch.push(device.address(), device.address() + 128, 64);
-    // SAFETY: rejected before any copy is enqueued.
     assert!(matches!(
+        // SAFETY: rejected before any copy is enqueued.
         unsafe { batch.submit(&stream) },
         Err(Error::Capturing { .. })
     ));
@@ -525,8 +529,10 @@ fn graph_executables_launch_on_full_device_and_partition_streams() {
     type Instantiate = unsafe extern "C" fn(*mut Raw, Raw, u64) -> i32;
     type Destroy = unsafe extern "C" fn(Raw) -> i32;
 
-    // SAFETY: the signatures match cuda.h.
+    // SAFETY: loading libcuda runs only the driver's own initializers.
     let library = unsafe { libloading::Library::new("libcuda.so.1") }.unwrap();
+    // SAFETY: the signatures match cuda.h, and `library` stays loaded while the
+    // copied function pointers are used.
     let (begin, end, instantiate, destroy_exec, destroy_graph) = unsafe {
         (
             *library

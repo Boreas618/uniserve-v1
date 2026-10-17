@@ -3,8 +3,8 @@
 //! process borrows them in place or copies them into its destination.
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError};
 
 use uniserve_ipc::{Locator, TransferTransport};
 
@@ -15,7 +15,7 @@ use super::transport::{ExportView, Transport, producer, read_destination, within
 use super::{ByteReservation, ReadReservation, Spans};
 use crate::ffi::MemoryKind;
 use crate::stream::Issue;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 impl Transport {
     pub(super) fn export_local(
@@ -94,8 +94,7 @@ impl Transport {
                 }
                 None => {
                     {
-                        let mut reads =
-                            self.borrowed.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut reads = lock(&self.borrowed);
                         let reads = reads
                             .as_mut()
                             .ok_or(Error::Resource("transfer pool is closed"))?;

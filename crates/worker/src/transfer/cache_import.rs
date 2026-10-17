@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use uniserve_ipc::{BufferId, RequestKey};
 
 use super::read::ReadRef;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 mod backend;
 mod copy;
@@ -90,7 +90,7 @@ impl CacheImport {
     }
 
     fn lock(&self) -> MutexGuard<'_, ImportState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 }
 
@@ -127,7 +127,7 @@ impl CacheImporter {
     }
 
     fn lock(&self) -> MutexGuard<'_, PoolState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// Reserve native cache intervals and register their owner in one critical

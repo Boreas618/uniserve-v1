@@ -139,7 +139,6 @@ pub(crate) fn prefill_units(pages: &[(usize, usize)], rows: usize, tokens: usize
 /// Build configured prefill captures that can serve an admitted batch.
 /// A row bucket needs an extra sequence for padding. Its first token bucket
 /// serves one token per live row; later buckets begin above the previous size.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_shapes(
     token_sizes: &[usize],
     row_sizes: &[usize],
@@ -184,6 +183,26 @@ pub(crate) fn prefill_shapes(
     shapes
 }
 
+/// The forward a text batch asks a graph for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextForward<'a> {
+    /// Query tokens of each row.
+    pub queries: &'a [usize],
+    /// Query tokens of the batch.
+    pub tokens: usize,
+    /// Whether the batch is a decode step.
+    pub decode: bool,
+    /// The attention's causality the batch's rows share; `None` when they
+    /// differ.
+    pub causal: Option<bool>,
+    /// Whether the rows carry input embeddings.
+    pub embeddings: bool,
+    /// Whether only each row's last logits are computed.
+    pub last_logits: bool,
+    /// Whether the forward only writes the cache.
+    pub cache_only: bool,
+}
+
 /// Immutable capture sizes of one text runner. The numerical backend owns
 /// graph objects and fixed buffers; this owner chooses their serving shape.
 pub(crate) struct TextShapes {
@@ -214,17 +233,19 @@ impl TextShapes {
     /// Return `(rows, tokens, decode, outputs)`, or None for eager prefill.
     /// Decode never borrows a prefill bucket. A cache-only prefill uses a
     /// hidden-state graph only when no cache-only graph family was captured.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn select(
         &self,
-        queries: &[usize],
-        tokens: usize,
-        decode: bool,
-        causal: Option<bool>,
-        embeddings: bool,
-        last_logits: bool,
-        cache_only: bool,
+        forward: &TextForward<'_>,
     ) -> Result<Option<(usize, usize, bool, bool)>> {
+        let TextForward {
+            queries,
+            tokens,
+            decode,
+            causal,
+            embeddings,
+            last_logits,
+            cache_only,
+        } = *forward;
         let rows = queries.len();
         if rows == 0 {
             return Err(Error::Invalid(
@@ -307,6 +328,24 @@ mod tests {
         assert!(lengths.iter().all(|&length| length <= 8));
     }
 
+    /// A causal prefill forward without embeddings, outputs at every position.
+    const PREFILL: TextForward<'static> = TextForward {
+        queries: &[],
+        tokens: 0,
+        decode: false,
+        causal: Some(true),
+        embeddings: false,
+        last_logits: false,
+        cache_only: false,
+    };
+
+    /// A causal decode step computing the last logits.
+    const DECODE: TextForward<'static> = TextForward {
+        decode: true,
+        last_logits: true,
+        ..PREFILL
+    };
+
     fn prefill(rows: usize, tokens: usize, causal: Option<bool>, outputs: bool) -> PrefillShape {
         PrefillShape {
             row_bucket: rows,
@@ -322,22 +361,40 @@ mod tests {
     fn decode_keeps_configured_order_and_never_uses_prefill_capacity() -> Result<()> {
         let shapes = TextShapes::new(vec![8, 4, 16], vec![prefill(32, 64, Some(true), true)]);
         assert_eq!(
-            shapes.select(&[1; 3], 3, true, Some(true), false, true, false)?,
+            shapes.select(&TextForward {
+                queries: &[1; 3],
+                tokens: 3,
+                ..DECODE
+            })?,
             Some((8, 8, true, true))
         );
         assert!(
             shapes
-                .select(&[1; 17], 17, true, Some(true), false, true, false)
+                .select(&TextForward {
+                    queries: &[1; 17],
+                    tokens: 17,
+                    ..DECODE
+                })
                 .is_err()
         );
         assert!(
             shapes
-                .select(&[1], 1, true, Some(false), false, true, false)
+                .select(&TextForward {
+                    queries: &[1],
+                    tokens: 1,
+                    causal: Some(false),
+                    ..DECODE
+                })
                 .is_err()
         );
         assert!(
             shapes
-                .select(&[1], 1, true, Some(true), false, false, false)
+                .select(&TextForward {
+                    queries: &[1],
+                    tokens: 1,
+                    last_logits: false,
+                    ..DECODE
+                })
                 .is_err()
         );
         Ok(())
@@ -355,40 +412,78 @@ mod tests {
             ],
         );
         assert_eq!(
-            shapes.select(&[2, 3], 5, false, Some(true), false, false, false)?,
+            shapes.select(&TextForward {
+                queries: &[2, 3],
+                tokens: 5,
+                ..PREFILL
+            })?,
             Some((4, 64, false, true))
         );
         assert_eq!(
-            shapes.select(&[2, 3], 5, false, Some(true), false, false, true)?,
+            shapes.select(&TextForward {
+                queries: &[2, 3],
+                tokens: 5,
+                cache_only: true,
+                ..PREFILL
+            })?,
             Some((4, 16, false, false))
         );
         assert_eq!(
-            shapes.select(&[2, 3], 5, false, None, false, false, false)?,
+            shapes.select(&TextForward {
+                queries: &[2, 3],
+                tokens: 5,
+                causal: None,
+                ..PREFILL
+            })?,
             Some((4, 32, false, true))
         );
         assert_eq!(
-            shapes.select(&[1; 4], 4, false, Some(true), false, true, false)?,
+            shapes.select(&TextForward {
+                queries: &[1; 4],
+                tokens: 4,
+                last_logits: true,
+                ..PREFILL
+            })?,
             Some((8, 16, false, true))
         );
         assert!(
             shapes
-                .select(&[2], 2, false, Some(true), true, false, false)
+                .select(&TextForward {
+                    queries: &[2],
+                    tokens: 2,
+                    embeddings: true,
+                    ..PREFILL
+                })
                 .is_err()
         );
         assert!(
             shapes
-                .select(&[0], 0, false, Some(true), false, false, false)
+                .select(&TextForward {
+                    queries: &[0],
+                    tokens: 0,
+                    ..PREFILL
+                })
                 .is_err()
         );
 
         let output_only = TextShapes::new(vec![], vec![prefill(2, 16, Some(true), true)]);
         assert_eq!(
-            output_only.select(&[2], 2, false, Some(true), false, false, true)?,
+            output_only.select(&TextForward {
+                queries: &[2],
+                tokens: 2,
+                cache_only: true,
+                ..PREFILL
+            })?,
             Some((2, 16, false, true))
         );
         let cache_only = TextShapes::new(vec![], vec![prefill(2, 16, Some(true), false)]);
         assert_eq!(
-            cache_only.select(&[2], 2, false, Some(true), false, true, false)?,
+            cache_only.select(&TextForward {
+                queries: &[2],
+                tokens: 2,
+                last_logits: true,
+                ..PREFILL
+            })?,
             None
         );
         Ok(())

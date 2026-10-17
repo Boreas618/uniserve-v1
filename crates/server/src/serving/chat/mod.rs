@@ -16,8 +16,6 @@
 //! the server's `reasoning_parsing` setting decides whether Qwen3 `<think>`
 //! sections become reasoning blocks.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 pub use crate::profile::reasoning::{ReasoningDelta, ReasoningError};
 pub use crate::profile::tools::ToolParserError;
 pub use crate::serving::text::{FinishReason, StopReason};
@@ -34,7 +32,6 @@ pub use template::renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer
 mod error;
 /// Structured assistant message content.
 pub mod event;
-/// Model-selected chat output processors.
 pub mod output;
 /// Chat messages, options, tools, and validation.
 pub mod request;

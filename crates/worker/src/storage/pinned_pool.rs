@@ -9,11 +9,12 @@
 //! A block is reused as soon as its last reference drops: a user whose
 //! device work reads a block retains a reference until that work completed.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use uniserve_cuda::DeviceId;
 
 use crate::Result;
 use crate::ffi::{Backing, MemoryKind};
+use crate::lock;
 use crate::storage::memory::Memory;
 
 /// The smallest block, so that small inputs share block sizes.
@@ -37,7 +38,7 @@ impl PinnedPool {
     }
 
     fn free(&self) -> MutexGuard<'_, Vec<Arc<Memory>>> {
-        self.free.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.free)
     }
 
     /// Lease a block of at least `bytes`: the smallest free block that

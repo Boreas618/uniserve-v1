@@ -8,7 +8,7 @@ use uniserve_cuda::Stream;
 use super::expert_union::ExpertUnion;
 use crate::ffi::{Handle, cooperative};
 use crate::stream::Issue;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 thread_local! {
     static CURRENT: RefCell<Option<(Arc<Microbatches>, usize)>> = const { RefCell::new(None) };
@@ -55,7 +55,7 @@ impl Microbatches {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     pub(crate) fn begin(&self, count: usize) -> Result<()> {
@@ -243,7 +243,7 @@ impl MicrobatchLanes {
                         job();
                     }
                 })
-                .map_err(|error| Error::Transport(format!("microbatch thread: {error}")))?;
+                .map_err(|error| Error::transport_source("microbatch thread", error))?;
             threads.push(LaneThread {
                 jobs: Some(sender),
                 thread: Some(thread),
@@ -524,7 +524,7 @@ impl ExpertUnion {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use super::*;
@@ -545,10 +545,7 @@ mod tests {
                     scope.spawn(move || {
                         owner.run(index, || {
                             for layer in 0..count {
-                                dispatches
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .push((index, layer));
+                                lock(dispatches).push((index, layer));
                                 yield_microbatch()?;
                             }
                             Ok::<_, Error>(count)
@@ -571,7 +568,7 @@ mod tests {
         // Collective peers must observe the same order even when individual
         // calls finish before the others; a finished call has no further turn.
         assert_eq!(
-            *dispatches.lock().unwrap_or_else(PoisonError::into_inner),
+            *lock(&dispatches),
             [(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2)]
         );
         Ok(())

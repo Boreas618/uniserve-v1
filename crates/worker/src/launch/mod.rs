@@ -1,11 +1,11 @@
 //! The rank process: arguments, registration, descriptor, signals and exit
 //! status.
 //!
-//! [`main`] is the body of the worker library's exported `main`. The thread
-//! the Python entry calls it on becomes the rank's Python thread
-//! ([`Interpreter`]): it serves the Python calls of every other thread until
-//! the control thread, which [`main`] starts and which runs the rank, has
-//! finished. [`main`] returns the process exit status:
+//! This module's `main` is the body of the worker library's exported
+//! `main`. The thread the Python entry calls it on becomes the rank's Python
+//! thread ([`Interpreter`]): it serves the Python calls of every other
+//! thread until the control thread, which `main` starts and which runs the
+//! rank, has finished. `main` returns the process exit status:
 //!
 //! | condition | status |
 //! | --- | --- |
@@ -21,9 +21,9 @@
 //! | close by the head, or after a fatal response | 0, after the rank's device contexts are destroyed |
 //!
 //! A rank that ends at once runs no teardown and does not destroy its
-//! device contexts ([`end`]). Every rank that does not close in order with
+//! device contexts (`end`). Every rank that does not close in order with
 //! its group removes the names of its CUDA driver's and NCCL's shared
-//! memory before it ends ([`release_names`]).
+//! memory before it ends (`release_names`).
 
 mod arguments;
 mod registration;
@@ -186,7 +186,7 @@ fn run(
                 // it until this value arrives.
                 let _ = finished.send(serve(arguments, signals));
             })
-            .map_err(|error| crate::Error::Transport(format!("control thread: {error}")))?;
+            .map_err(|error| crate::Error::transport_source("control thread", error))?;
 
         Ok::<_, Failure>(interpreter.run(&outcome).unwrap_or_else(|| {
             crate::Error::State("the control thread ended without a result").into()
@@ -251,7 +251,9 @@ fn serve(arguments: &Arguments, signals: &Signals) -> Ended {
     // process from the watch's thread.
     let hangup = match channel.hangup() {
         Ok(hangup) => hangup,
-        Err(error) => return crate::Error::Transport(error.to_string()).into(),
+        Err(error) => {
+            return crate::Error::transport_source("watching the head connection", error).into();
+        }
     };
     let mut starting = match HeadWatch::start(hangup) {
         Ok(watch) => Some(watch),

@@ -10,8 +10,6 @@
 //! parent module consumes. Every failure is reported as this module's
 //! [`Error`].
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 pub mod checkpoint;
 pub mod config;
 pub mod error;

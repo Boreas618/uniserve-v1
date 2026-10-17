@@ -2,7 +2,7 @@
 //! need a CUDA device for the microbatch streams; run them with
 //! `cargo test -p uniserve-worker --test microbatch_lanes -- --ignored`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::sync::{Arc, Mutex, PoisonError};
 

@@ -1250,7 +1250,10 @@ impl WorkerGroup {
 /// Naming a replica the request was not routed to is not only wasted: a
 /// producer publishes over every mechanism that reaches a named reader, so a
 /// replica on another host would make each product cross hosts unread.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the consuming worker's routing, components, peers and transfer placement"
+)]
 pub(crate) fn media_consumer_slots(
     consuming: &[uniserve_ipc::MediaCall],
     routing: &BTreeMap<uniserve_ipc::MediaCall, String>,

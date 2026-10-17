@@ -91,7 +91,7 @@ impl HuggingFaceTokenizer {
     /// A checkpoint may declare special tokens only in its configuration;
     /// MiniMax-H3's `<d>` dialogue marker is one. `transformers` registers
     /// them when it loads the tokenizer, so a prompt containing one encodes
-    /// it as a single token; [`register_declared_tokens`] states the rule.
+    /// it as a single token; `register_declared_tokens` states the rule.
     ///
     /// Returns a tokenizer error when either file cannot be read or parsed,
     /// or when `fastokens` cannot build the extended definition.

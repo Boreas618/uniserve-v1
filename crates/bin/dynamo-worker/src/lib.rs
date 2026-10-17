@@ -312,9 +312,9 @@ impl DynamoFastH3Engine {
             let _ = state.engine().shutdown().await;
             return Err(invalid_argument("checkpoint is not MiniMax H3"));
         }
-        if let Err(message) = check_fasth3(&capabilities, &self.rasters) {
+        if let Err(mismatch) = check_fasth3(&capabilities, &self.rasters) {
             let _ = state.engine().shutdown().await;
-            return Err(invalid_argument(message));
+            return Err(invalid_argument(mismatch.to_string()));
         }
         Ok(state)
     }
@@ -633,7 +633,8 @@ fn prepare_request(
     let seconds = request
         .seconds
         .map_or_else(|| DEFAULT_SECONDS.min(max_video_seconds), f64::from);
-    let frames = video_frame_count(seconds, max_video_seconds).map_err(invalid_argument)?;
+    let frames = video_frame_count(seconds, max_video_seconds)
+        .map_err(|error| invalid_argument(error.to_string()))?;
     let nvext = request.nvext.unwrap_or_default();
     reject_present("nvext.annotations", nvext.annotations.as_ref())?;
     reject_present("nvext.negative_prompt", nvext.negative_prompt.as_ref())?;
@@ -689,10 +690,24 @@ fn prepare_request(
     })
 }
 
+/// A deployment whose video capabilities are not the FastH3 contract.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the Dynamo worker serves FastH3 text-to-video at {served} only; this deployment serves tasks {tasks} on canvases {canvases}"
+)]
+struct DeploymentMismatch {
+    /// The canvases the worker serves, `WIDTHxHEIGHT` joined by commas.
+    served: String,
+    /// The deployment's `tasks` capability, as JSON.
+    tasks: String,
+    /// The deployment's `canvas.canvases` capability, as JSON.
+    canvases: String,
+}
+
 /// Checks that a deployment's video capabilities are FastH3's: `t2va` alone
 /// on exactly the canvases of `rasters`, the requests `prepare_request`
 /// builds.
-fn check_fasth3(capabilities: &Value, rasters: &VideoRasters) -> Result<(), String> {
+fn check_fasth3(capabilities: &Value, rasters: &VideoRasters) -> Result<(), DeploymentMismatch> {
     let tasks = &capabilities["tasks"];
     let canvases = &capabilities["canvas"]["canvases"];
     let expected: Vec<Value> = rasters
@@ -705,11 +720,11 @@ fn check_fasth3(capabilities: &Value, rasters: &VideoRasters) -> Result<(), Stri
     if *tasks == json!(["t2va"]) && served {
         return Ok(());
     }
-    Err(format!(
-        "the Dynamo worker serves FastH3 text-to-video at {} only; this deployment serves \
-         tasks {tasks} on canvases {canvases}",
-        served_sizes(rasters).join(", ")
-    ))
+    Err(DeploymentMismatch {
+        served: served_sizes(rasters).join(", "),
+        tasks: tasks.to_string(),
+        canvases: canvases.to_string(),
+    })
 }
 
 fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {

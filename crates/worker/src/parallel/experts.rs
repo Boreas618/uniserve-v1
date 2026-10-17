@@ -322,8 +322,8 @@ impl ExpertParallel {
                 .iter()
                 .map(|bytes| {
                     if !bytes.len().is_multiple_of(8) {
-                        return Err(Error::Transport(
-                            "expert source membership record is malformed".into(),
+                        return Err(Error::transport(
+                            "expert source membership record is malformed",
                         ));
                     }
                     Ok(bytes
@@ -339,9 +339,10 @@ impl ExpertParallel {
             } else {
                 let value = (group.rank() == 0).then(|| (max_tokens as u64).to_le_bytes());
                 let received = group.broadcast_bytes(value.as_ref().map(|value| &value[..]), 0)?;
-                let word: [u8; 8] = received.as_slice().try_into().map_err(|_| {
-                    Error::Transport("expert capacity broadcast is malformed".into())
-                })?;
+                let word: [u8; 8] = received
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::transport("expert capacity broadcast is malformed"))?;
                 u64::from_le_bytes(word) as usize
             };
             let ranks: Vec<usize> = group.ranks().to_vec();
@@ -459,7 +460,7 @@ impl ExpertParallel {
         let word: [u8; 8] = received
             .as_slice()
             .try_into()
-            .map_err(|_| Error::Transport("expert warmup announcement is malformed".into()))?;
+            .map_err(|_| Error::transport("expert warmup announcement is malformed"))?;
         Ok(u64::from_le_bytes(word) as usize)
     }
 
@@ -479,7 +480,7 @@ impl ExpertParallel {
             .iter()
             .map(|bytes| {
                 serde_json::from_slice::<serde_json::Value>(bytes)
-                    .map_err(|_| Error::Transport("an expert plan record is malformed".into()))
+                    .map_err(|_| Error::transport("an expert plan record is malformed"))
             })
             .collect::<Result<Vec<_>>>()?;
         let common = |plan: &serde_json::Value| {
@@ -595,7 +596,6 @@ fn ffi_error(error: &Error) -> tvm_ffi::Error {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -16,7 +16,7 @@ use crate::cuda_graph::GraphBreaks;
 use crate::ffi::{Function, Handle, Interpreter};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 #[derive(Default)]
 struct Call {
@@ -88,7 +88,7 @@ impl WeightPrefetch {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// The device the weights and their copy stream live on.
@@ -227,14 +227,12 @@ impl WeightPrefetch {
 }
 
 impl Drop for WeightPrefetch {
-    #[expect(
-        clippy::mem_forget,
-        reason = "unknown copy completion must retain peer mappings"
-    )]
     fn drop(&mut self) {
+        // After a failed close the copies' completion is unknown: the peer
+        // mappings they read stay until the process exits.
         if self.close().is_err() {
             let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-            std::mem::forget(state.backing.take());
+            crate::leak(state.backing.take());
         }
     }
 }
@@ -344,11 +342,8 @@ impl ExpertWeights {
                 ))
             }
             Err(error) => {
-                #[expect(
-                    clippy::mem_forget,
-                    reason = "peers may read published pages of a failed setup"
-                )]
-                std::mem::forget(storage);
+                // Peers may read the pages a failed setup published.
+                crate::leak(storage);
                 Err(error)
             }
         }
@@ -732,13 +727,12 @@ impl DwdpManager {
     /// Drain the copy stream and release the weights after every binding
     /// and graph retired. An aborted close keeps every mapping until exit:
     /// peers may still read this rank's pages.
-    #[allow(clippy::mem_forget)]
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         if std::mem::replace(&mut self.closed, true) {
             return Ok(());
         }
         if aborted {
-            std::mem::forget(Arc::clone(&self.weights));
+            crate::leak(Arc::clone(&self.weights));
             return Ok(());
         }
         self.weights.close()

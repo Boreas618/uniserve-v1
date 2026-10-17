@@ -106,7 +106,7 @@ impl Transport {
                 if let Err(error) = stream.synchronize() {
                     // The copy may still write the block: it never returns
                     // to the staging.
-                    retain(staging);
+                    crate::leak(staging);
                     return Err(error);
                 }
             }
@@ -127,16 +127,6 @@ impl Transport {
             bytes,
         })
     }
-}
-
-/// Keep staging whose device copy has an unknown completion until process
-/// teardown.
-#[expect(
-    clippy::mem_forget,
-    reason = "unknown device completion must retain the block it writes"
-)]
-fn retain(staging: ChannelBytes) {
-    std::mem::forget(staging);
 }
 
 /// Complete a staged channel export: its location with the bytes its copy

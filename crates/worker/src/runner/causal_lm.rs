@@ -70,7 +70,7 @@ use super::TokenSelection;
 use super::input_buffers::InputBuffers;
 use super::methods::{Argument, MethodCall, Methods};
 use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
-use crate::cuda_graph::{ShapeKey, TextShapes};
+use crate::cuda_graph::{ShapeKey, TextForward, TextShapes};
 use crate::ffi::{DType, Handle};
 use crate::lane::{Capture, Completion, Job};
 use crate::request::decode_state::DecodeState;
@@ -755,15 +755,17 @@ impl CausalLMRunner {
         let mut bucket = (live, live_tokens);
         if self.pool.is_some() && !multimodal {
             let queries: Vec<usize> = rows.iter().map(|row| row.query as usize).collect();
-            if let Some((bucket_rows, bucket_tokens, decode, outputs)) = self.shapes.select(
-                &queries,
-                live_tokens,
-                decode,
-                Some(true),
-                false,
-                last_logits,
-                cache_only,
-            )? {
+            if let Some((bucket_rows, bucket_tokens, decode, outputs)) =
+                self.shapes.select(&TextForward {
+                    queries: &queries,
+                    tokens: live_tokens,
+                    decode,
+                    causal: Some(true),
+                    embeddings: false,
+                    last_logits,
+                    cache_only,
+                })?
+            {
                 choice = Choice::Graph(if decode {
                     ShapeKey::Decode {
                         rows: bucket_rows,
@@ -1016,24 +1018,36 @@ impl CausalLMRunner {
         };
         let mut causal_values = Vec::new();
         if plan.mode == ForwardMode::Decode {
-            push(column("request_pool_indices")?, bytes(&plan.slots));
+            push(
+                column("request_pool_indices")?,
+                bytemuck::cast_slice(&plan.slots),
+            );
             push(column("decode_force_finish")?, &plan.force);
-            push(column("finish_ids")?, bytes(&plan.finish_ids));
+            push(
+                column("finish_ids")?,
+                bytemuck::cast_slice(&plan.finish_ids),
+            );
             if plan.candidates > 0 {
-                push(column("draws")?, bytes_f32(&plan.draws));
-                push(column("params")?, bytes_f32(&plan.params));
+                push(column("draws")?, bytemuck::cast_slice(&plan.draws));
+                push(column("params")?, bytemuck::cast_slice(&plan.params));
             }
             for (address, value) in &plan.slot_words {
-                push(*address, bytes(std::slice::from_ref(value)));
+                push(*address, bytemuck::cast_slice(std::slice::from_ref(value)));
             }
         } else {
-            push(column("row_columns")?, bytes(&plan.row_columns));
-            push(column("input_ids")?, bytes(&plan.token_ids));
+            push(
+                column("row_columns")?,
+                bytemuck::cast_slice(&plan.row_columns),
+            );
+            push(column("input_ids")?, bytemuck::cast_slice(&plan.token_ids));
             // Each axis is one row of the `[3, T]` column.
             let axis_words = plan.positions.len() / plan.axes.max(1);
             let stride = 8 * self.buffers.dimensions.tokens as u64;
             for (axis, values) in plan.positions.chunks(axis_words.max(1)).enumerate() {
-                push(column("positions")? + axis as u64 * stride, bytes(values));
+                push(
+                    column("positions")? + axis as u64 * stride,
+                    bytemuck::cast_slice(values),
+                );
             }
             if plan.causal.iter().any(|&value| value != plan.causal[0]) {
                 // Mixed causality is read from the device column.
@@ -1041,16 +1055,25 @@ impl CausalLMRunner {
             }
         }
         if !causal_values.is_empty() {
-            push(column("causal_values")?, bytes_i32(&causal_values));
+            push(
+                column("causal_values")?,
+                bytemuck::cast_slice(&causal_values),
+            );
         }
         if !plan.logit_rows.is_empty() {
-            push(column("logit_rows")?, bytes(&plan.logit_rows));
+            push(
+                column("logit_rows")?,
+                bytemuck::cast_slice(&plan.logit_rows),
+            );
         }
         if let Some(sampling) = &request.sampling {
-            push(column("draws")?, bytes_f32(sampling.draws));
-            push(column("params")?, bytes_f32(sampling.params));
-            push(column("tasks")?, bytes(sampling.slots));
-            push(column("tasks")? + 8 * rows, bytes(sampling.gates));
+            push(column("draws")?, bytemuck::cast_slice(sampling.draws));
+            push(column("params")?, bytemuck::cast_slice(sampling.params));
+            push(column("tasks")?, bytemuck::cast_slice(sampling.slots));
+            push(
+                column("tasks")? + 8 * rows,
+                bytemuck::cast_slice(sampling.gates),
+            );
         }
 
         // Vision features replace their tokens' embeddings: the mask is
@@ -1172,7 +1195,7 @@ impl CausalLMRunner {
         let stream = job.on(self.stream.as_ref());
         let mut batch = CopyBatch::new(SourceOrder::DuringCall);
         for (field, values) in fields.iter().enumerate() {
-            let source = bytes(values);
+            let source: &[u8] = bytemuck::cast_slice(values);
             batch.push(
                 base + (8 * capacity * field) as u64,
                 source.as_ptr() as u64,
@@ -1222,21 +1245,6 @@ impl CausalLMRunner {
 /// Integer lists as method arguments, in order.
 fn lists(values: &[&[i64]]) -> Vec<Argument> {
     values.iter().map(|&list| Argument::from(list)).collect()
-}
-
-fn bytes(values: &[i64]) -> &[u8] {
-    // SAFETY: plain integers reinterpreted as their bytes.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
-}
-
-fn bytes_i32(values: &[i32]) -> &[u8] {
-    // SAFETY: plain integers reinterpreted as their bytes.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
-}
-
-fn bytes_f32(values: &[f32]) -> &[u8] {
-    // SAFETY: plain floats reinterpreted as their bytes.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
 
 /// The element type of a model dtype name.

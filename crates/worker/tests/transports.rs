@@ -443,7 +443,7 @@ fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result
         line.clear();
         let read = output
             .read_line(&mut line)
-            .map_err(|error| Error::Transport(error.to_string()))?;
+            .map_err(|error| Error::transport_source("reading the consumer's output", error))?;
         assert!(read > 0, "the consumer exited before it claimed the export");
     }
 
@@ -462,11 +462,11 @@ fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result
     let mut input = consumer.stdin.take().ok_or_else(lost)?;
     input
         .write_all(b"\n")
-        .map_err(|error| Error::Transport(error.to_string()))?;
+        .map_err(|error| Error::transport_source("writing to the consumer", error))?;
     drop(input);
     let status = consumer
         .wait()
-        .map_err(|error| Error::Transport(error.to_string()))?;
+        .map_err(|error| Error::transport_source("waiting for the consumer", error))?;
     assert!(status.success(), "the consumer process failed");
 
     // Acknowledged: the export retires and its bytes return.
@@ -516,11 +516,11 @@ fn shared_export_consumer() -> Result<()> {
     println!("{CLAIMED}");
     std::io::stdout()
         .flush()
-        .map_err(|error| Error::Transport(error.to_string()))?;
+        .map_err(|error| Error::transport_source("writing to the producer", error))?;
     let mut answer = String::new();
     std::io::stdin()
         .read_line(&mut answer)
-        .map_err(|error| Error::Transport(error.to_string()))?;
+        .map_err(|error| Error::transport_source("reading the producer's answer", error))?;
     drop(borrowed);
     transports.close()
 }

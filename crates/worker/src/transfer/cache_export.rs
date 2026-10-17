@@ -120,7 +120,7 @@ struct GroupExport<'a> {
     visible: u32,
 }
 
-/// A slot's export while its issuer's work is outstanding ([`export`]): the
+/// A slot's export while its issuer's work is outstanding (`export`): the
 /// transfer record without its locations, and the export of every view.
 pub struct CacheExport {
     buffer: BufferId,

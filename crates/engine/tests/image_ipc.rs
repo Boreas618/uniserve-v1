@@ -13,7 +13,7 @@
 //! repository's `.venv/bin/python`.
 
 #![cfg(target_os = "linux")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -99,7 +99,7 @@ pub trait Issue: Copy {
     fn wait(&self, event: &Arc<Event>) -> Result<()>;
 
     /// Run `owner` once every one of `fences` completed: the release of
-    /// storage that the work they fence addressed ([`EventPool::defer`]).
+    /// storage that the work they fence addressed (`EventPool::defer`).
     /// Each fence is recorded by this issuer or was recorded before, and
     /// one retained reference of each goes with the deferral. A stream,
     /// which made its records already, hands the deferral to `events` at

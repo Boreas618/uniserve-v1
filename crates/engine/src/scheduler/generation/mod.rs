@@ -708,7 +708,10 @@ pub(super) fn plan_decode(
 /// encoder's `cache_token_capacity` cache tokens. `feedback` declares the completion
 /// predicate that feedback writes report. `sample_continuation` declares a
 /// sampled-token output, drawn at `sampling_index` when one is given.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one image extension's request, encoder input and sampling continuation"
+)]
 pub(super) fn plan_image_extend(
     limits: &uniserve_core::GenerationLimits,
     request: &GenerationRequest,

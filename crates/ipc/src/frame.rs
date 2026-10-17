@@ -20,7 +20,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::error::{IpcError, IpcResult};
+use crate::error::{EncodingError, IpcError, IpcResult};
 
 /// One message as a channel carries it: a length, then the encoding.
 pub struct Frame {
@@ -40,14 +40,14 @@ impl Frame {
         // Encode behind a placeholder length, which is known only afterwards.
         let mut bytes = vec![0_u8; Self::LENGTH_BYTES];
         rmp_serde::encode::write(&mut bytes, message)
-            .map_err(|error| IpcError::Encoding(format!("encoding a message: {error}")))?;
+            .map_err(|error| IpcError::Encoding(EncodingError::Encode(error)))?;
 
         let length = bytes.len() - Self::LENGTH_BYTES;
         let field = u32::try_from(length).map_err(|_| {
-            IpcError::Encoding(format!(
-                "a message of {length} bytes exceeds the largest frame of {} bytes",
-                u32::MAX
-            ))
+            IpcError::Encoding(EncodingError::Oversized {
+                length,
+                limit: u32::MAX as usize,
+            })
         })?;
         bytes[..Self::LENGTH_BYTES].copy_from_slice(&field.to_le_bytes());
         Ok(Self { bytes })
@@ -59,7 +59,7 @@ impl Frame {
     /// of another type or of another build.
     pub fn decode<M: DeserializeOwned>(&self) -> IpcResult<M> {
         rmp_serde::from_slice(&self.bytes[Self::LENGTH_BYTES..])
-            .map_err(|error| IpcError::Encoding(format!("decoding a message: {error}")))
+            .map_err(|error| IpcError::Encoding(EncodingError::Decode(error)))
     }
 
     /// Reads a length field: the bytes of encoded message that follow it.

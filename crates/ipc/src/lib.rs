@@ -15,8 +15,6 @@
 //! [`Registration`] and receives its [`LaunchDescriptor`]; the rank runtime
 //! (`uniserve-worker`) then serves its end until the connection closes.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -78,21 +76,17 @@ macro_rules! ensure_valid {
     };
 }
 
-/// The stream connection that carries frames, and its listener.
 pub mod channel;
 /// Failures at the channel boundary.
 pub mod error;
 /// The unit a channel carries: a length and one encoded message.
 pub mod frame;
-/// The launch descriptor shared by the engine, `uniserve-host` and the rank.
 pub mod launch;
-/// Messages between the head's engine and a host's `uniserve-host` launcher.
 pub mod launcher;
-/// A rank's registration with the head.
 pub mod registration;
 
 pub use channel::{Channel, Listener, Wake};
-pub use error::{IpcError, IpcResult};
+pub use error::{EncodingError, IpcError, IpcResult, TransportError};
 pub use frame::Frame;
 pub use launch::{ExpertParallelDescriptor, LaunchDescriptor};
 pub use registration::{Registration, VERSION};

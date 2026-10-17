@@ -7,7 +7,7 @@
 //! a local or CUDA VMM locator to the producer's storage directly.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 
 use uniserve_ipc::{Locator, TransferTransport, Wake};
 
@@ -15,7 +15,7 @@ use super::backing::{SourceRetirement, TransportBuffer};
 use super::registry::{BufferRegistry, RegisteredBuffer};
 use super::{Retirement, notify};
 use crate::host::HostLane;
-use crate::{Error, EventPool, Result};
+use crate::{Error, EventPool, Result, lock};
 
 /// A registered export's identity within its endpoint.
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -78,10 +78,7 @@ impl ExportTable {
             retirements: Mutex::new(None),
             wake: Mutex::new(None),
         });
-        ENDPOINTS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(endpoint.name.clone(), Arc::downgrade(&endpoint));
+        lock(&ENDPOINTS).insert(endpoint.name.clone(), Arc::downgrade(&endpoint));
         Ok(endpoint)
     }
 
@@ -90,7 +87,7 @@ impl ExportTable {
     }
 
     fn lock(&self) -> MutexGuard<'_, Table> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     fn key(&self, locator: &Locator) -> Result<SourceKey> {
@@ -183,9 +180,7 @@ impl ExportTable {
                 ));
             }
         };
-        let owner = ENDPOINTS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let owner = lock(&ENDPOINTS)
             .get(endpoint)
             .and_then(Weak::upgrade)
             .ok_or_else(|| Error::Invalid("local buffer has no live owner".into()))?;
@@ -220,18 +215,11 @@ impl ExportTable {
     }
 
     pub(crate) fn set_wake(&self, wake: Option<Wake>) {
-        let lane = self
-            .retirements
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let lane = lock(&self.retirements).clone();
         if let Some(lane) = lane {
             lane.set_wake(wake.clone());
         }
-        let previous = std::mem::replace(
-            &mut *self.wake.lock().unwrap_or_else(PoisonError::into_inner),
-            wake,
-        );
+        let previous = std::mem::replace(&mut *lock(&self.wake), wake);
         drop(previous);
     }
 
@@ -256,11 +244,7 @@ impl ExportTable {
 
         // Joining the lane must not hold the registry lock: retirement
         // observers may inspect returned storage.
-        let lane = self
-            .retirements
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let lane = lock(&self.retirements).take();
         if let Some(lane) = lane {
             for error in lane.close() {
                 result = result.and(Err(error));
@@ -271,7 +255,7 @@ impl ExportTable {
     }
 
     fn unregister(&self) {
-        let mut endpoints = ENDPOINTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut endpoints = lock(&ENDPOINTS);
         if endpoints
             .get(&self.name)
             .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
@@ -304,7 +288,7 @@ impl ExportTable {
         };
         if let Err(error) = result {
             if !retirement.done() {
-                notify(retirement.complete(Err(Error::Transport(format!(
+                notify(retirement.complete(Err(Error::transport(format!(
                     "transport reclamation failed: {error}"
                 ))))?);
             }
@@ -315,20 +299,12 @@ impl ExportTable {
 
     fn retire_on_lane(&self, action: SourceRetirement) -> Result<()> {
         let lane = {
-            let mut installed = self
-                .retirements
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut installed = lock(&self.retirements);
             match &*installed {
                 Some(lane) => Arc::clone(lane),
                 None => {
                     let lane = HostLane::new(256, 1, "uniserve-shm-retire")?;
-                    lane.set_wake(
-                        self.wake
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .clone(),
-                    );
+                    lane.set_wake(lock(&self.wake).clone());
                     let lane = Arc::new(lane);
                     *installed = Some(Arc::clone(&lane));
                     lane

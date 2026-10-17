@@ -1,5 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 //! End-to-end engine-loop lifecycle behavior over the GPU-free simulator.
 //!
 //! Each test drives a real `Scheduler` against `SimExecutor`/`SimEngine`,
@@ -25,6 +23,8 @@
 //!   `SchedulerStats` are snapshots that `Scheduler::publish_cache_stats`
 //!   refreshes as the loop runs, not when an event is sent, so they can trail
 //!   the event stream. The `prefix` counters are recorded at admission.
+
+#![cfg(test)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

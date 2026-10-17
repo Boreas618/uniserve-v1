@@ -265,7 +265,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// each one's node/device ranks, and the components placed on them.
     #[arg(long, value_name = "FILE", value_parser = WorkerConfig::read_all)]
     pub workers: Option<Box<[WorkerConfig]>>,
-    /// Directed product bindings: source[:rank]->destination[:rank]=mechanisms,
+    /// Directed product bindings: `source[:rank]->destination[:rank]=mechanisms`,
     /// where mechanisms names the edge's device mechanism, its host mechanism,
     /// or both joined by `+` with the device mechanism first (`cuda_vmm+shm`).
     #[arg(long)]

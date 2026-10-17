@@ -121,6 +121,8 @@ impl Listener {
         if fd < 0 {
             return Err(std::io::Error::from_raw_os_error(libc::EBADF));
         }
+        // SAFETY: F_GETFD only reads the descriptor flags of `fd`; the call takes no
+        // pointers and does not change who owns the descriptor.
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -136,15 +138,18 @@ impl Listener {
         socket.listen(libc::SOMAXCONN)?;
         socket.set_nonblocking(true)?;
 
-        // Any non-Unix family is treated as TCP. `into_raw_fd` releases the
-        // `Socket`'s ownership, so the std listener becomes the only owner.
+        // Any non-Unix family is treated as TCP.
         if socket.local_addr()?.is_unix() {
+            // SAFETY: `into_raw_fd` releases the `Socket`'s ownership of its open
+            // descriptor, so the std listener becomes the only owner.
             let std_listener = unsafe { StdUnixListener::from_raw_fd(socket.into_raw_fd()) };
             Ok(Self::Unix {
                 listener: UnixListener::from_std(std_listener)?,
                 _socket_file: None,
             })
         } else {
+            // SAFETY: as above, the std listener becomes the only owner of the open
+            // descriptor that `into_raw_fd` releases.
             let std_listener = unsafe { StdTcpListener::from_raw_fd(socket.into_raw_fd()) };
             Ok(Self::Tcp(TcpListener::from_std(std_listener)?))
         }

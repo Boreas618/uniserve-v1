@@ -1,4 +1,3 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Tokenizer abstraction, Hugging Face implementation, and incremental decoding.
 //!
 //! `HuggingFaceTokenizer` loads a model's `tokenizer.json` through `fastokens`

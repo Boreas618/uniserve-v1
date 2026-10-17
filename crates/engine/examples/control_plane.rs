@@ -5,9 +5,8 @@
 //! scheduler thread over `SimExecutor`; the run passes when every request
 //! finishes within the deadline, each text request emits at least one text
 //! token, and each image request emits at least one image. The process exits
-//! with status 1 on failure.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! with status 1 on failure, and reports an error when the simulation cannot
+//! start or a request is refused.
 
 use std::collections::HashMap;
 use std::thread;
@@ -21,10 +20,10 @@ use uniserve_core::{
 };
 use uniserve_engine::{EngineHandle, Scheduler, SimEngine, SimExecutor, SpecialTokenIds};
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let ctrl = SpecialTokenIds::default();
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let sched = Scheduler::new(executor, ctrl, 32).unwrap();
+    let sched = Scheduler::new(executor, ctrl, 32)?;
 
     // The scheduler runs on its own thread; this thread submits through the
     // handle and drains each request's event receiver, as a server would.
@@ -90,20 +89,18 @@ fn main() {
             readout: Vec::new(),
             canvas: None,
         };
-        request
-            .validate_resources(&limits)
-            .expect("bounded simulation request");
-        (id, request)
+        request.validate_resources(&limits)?;
+        anyhow::Ok((id, request))
     };
 
     for _ in 0..3 {
-        let (id, request) = mk(GenerationConstraint::UndOnly);
-        let rx = handle.submit(request).unwrap();
+        let (id, request) = mk(GenerationConstraint::UndOnly)?;
+        let rx = handle.submit(request)?;
         rxs.insert(id, ("text".to_string(), rx));
     }
     for _ in 0..2 {
-        let (id, request) = mk(GenerationConstraint::GenOnly);
-        let rx = handle.submit(request).unwrap();
+        let (id, request) = mk(GenerationConstraint::GenOnly)?;
+        let rx = handle.submit(request)?;
         rxs.insert(id, ("image".to_string(), rx));
     }
 

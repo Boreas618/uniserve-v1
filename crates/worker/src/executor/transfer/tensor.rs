@@ -24,7 +24,7 @@ use super::TransferBatch;
 use super::latents;
 use crate::executor::image::ImageParts;
 use crate::ffi::{DType, MemoryKind};
-use crate::storage::{OutputPlacement, ProductBuffer};
+use crate::storage::{OutputPlacement, ProductBuffer, TrajectoryVersion};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
@@ -152,15 +152,14 @@ impl TransferBatch<'_> {
                     .iter()
                     .map(|&page| page as usize)
                     .collect();
-                let bank = pool.current_bank(
-                    slot,
-                    i64::from(params.start_step),
-                    i64::from(input.generation),
-                    i64::from(params.latent_units),
-                    i64::from(params.height),
-                    i64::from(params.width),
-                    &pages,
-                )?;
+                let committed = TrajectoryVersion {
+                    step: i64::from(params.start_step),
+                    generation: i64::from(input.generation),
+                    units: i64::from(params.latent_units),
+                    height: i64::from(params.height),
+                    width: i64::from(params.width),
+                };
+                let bank = pool.current_bank(slot, &committed, &pages)?;
                 let version = latents::issue_export(
                     pool,
                     storage,

@@ -121,14 +121,13 @@ impl CUDAStream {
     /// The driver stream and its SM partition are released once every
     /// component sharing the handle has dropped its clone. Failed collective
     /// execution retains resources until process exit.
-    #[allow(clippy::mem_forget)]
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         // A closed stream keeps an unrecorded fence, which holds no driver
         // event.
         let unrecorded = Event::new(EventFlags::default());
         if aborted {
-            std::mem::forget(self.stream.take());
-            std::mem::forget(std::mem::replace(&mut self.ingress, unrecorded));
+            crate::leak(self.stream.take());
+            crate::leak(std::mem::replace(&mut self.ingress, unrecorded));
             return Ok(());
         }
 

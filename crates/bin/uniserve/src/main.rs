@@ -1,4 +1,3 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! UniServe command-line entry point and process lifecycle orchestration.
 //!
 //! `main` parses the command line, installs tracing, and builds the Tokio

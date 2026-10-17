@@ -327,8 +327,8 @@ mod tests {
         buffer.release();
         assert!(buffer.begin_reclaim(|_| Ok(true))?.is_some());
 
-        retirement.complete(Err(Error::Transport(
-            "reclamation could not establish device completion".into(),
+        retirement.complete(Err(Error::transport(
+            "reclamation could not establish device completion",
         )))?;
         drop(registry.take_finished());
         assert!(registry.get_mut(&key).is_some());

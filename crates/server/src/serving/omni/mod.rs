@@ -124,7 +124,10 @@ struct RenderedImage {
 /// `images` one to one, the prompt is empty, image controls are invalid, or
 /// the profile cannot size the image encoders or the requested output
 /// resolution.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one request's prompt, media and generation controls"
+)]
 pub(super) fn preprocess_sensenova(
     profile: &SenseNovaProfile,
     processor: &crate::serving::InputProcessor,
@@ -206,7 +209,10 @@ pub(super) fn preprocess_sensenova(
 /// # Errors
 ///
 /// Fails under the same kinds of conditions as [`preprocess_sensenova`].
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one request's prompt, media and generation controls"
+)]
 pub(super) fn preprocess_bagel(
     profile: &BagelProfile,
     processor: &crate::serving::InputProcessor,

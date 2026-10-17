@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tvm_ffi::{Any, AnyView};
 
 use crate::ffi::{Function, Handle, Interpreter};
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// Bytes of an encoded unit's length prefix.
 pub(crate) const LENGTH_BYTES: usize = 8;
@@ -220,7 +220,7 @@ impl MuxSession {
     }
 
     fn state(&self) -> MutexGuard<'_, MuxState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// Take the container out of the state for one call.

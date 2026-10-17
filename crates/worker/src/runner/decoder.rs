@@ -64,7 +64,8 @@ use crate::runner::methods::{
 use crate::runner::{ImageSetup, RunnerSetup, device_buffer};
 use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{
-    LatentUpdate, Metadata, OutputPlacement, ProductBuffer, RequestSlots, SlotField, ValueRange,
+    LatentUpdate, Metadata, OutputPlacement, ProductBuffer, RequestSlots, SlotField,
+    TrajectoryVersion, ValueRange,
 };
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
@@ -187,7 +188,7 @@ impl DecoderRunner {
     }
 
     /// Decode `images` at once, for a caller outside a rank, which has no
-    /// lane: the decode as serving records it ([`Self::record_decode`]),
+    /// lane: the decode as serving records it (`Self::record_decode`),
     /// each image's staged pixels copied out to host memory behind its
     /// sub-batch, before the next sub-batch reuses the staging bytes, all
     /// performed on the calling thread, which then waits for the stream.
@@ -496,11 +497,17 @@ impl ImageDecoder {
     /// The numerical calls that decode `images`: each decodes the longest
     /// prefix of the remaining images that fits the staging bytes.
     ///
-    /// FIXME: every sub-batch is one eager Python call. A graph per (size,
-    /// count) needs fixed latent rows, a runner-owned buffer of decoded
-    /// values with native copies to the product regions, and a bound on
-    /// the activations each captured size retains; a decoder on a
-    /// generation tower returns its pixels through a delivery stream.
+    /// Every sub-batch is one eager Python call, because a graph would
+    /// remove too little to pay for itself. Profiled on a GB200 with the
+    /// image milestone's requests, BAGEL's 512x512 decode keeps the device
+    /// busy for 21.7 ms of a 23.8 ms span, and the host issues it in about
+    /// 10 ms, ahead of the device: a replay could remove only the 2.0 to
+    /// 2.6 ms of idle time inside the span, 1% of a two-step request
+    /// (241 ms) and 0.05% of a 50-step one (4.9 s). SenseNova's decode is a
+    /// call of under 1.1 ms issuing eleven small operations. A graph per
+    /// (size, count) would also need fixed latent rows, a runner-owned
+    /// buffer of decoded values with native copies to the product regions,
+    /// and a bound on the activations each captured size retains.
     fn chunks(&self, images: &[DecodeImage]) -> Result<Vec<Chunk>> {
         let capacity = self.staging.numel() as usize;
         let mut chunks = Vec::new();
@@ -851,15 +858,16 @@ impl ImageBatch<'_> {
                     .latent_input
                     .as_ref()
                     .map_or(0, |input| i64::from(input.generation));
-                let bank = latents.pool.current_bank(
-                    slot,
-                    i64::from(params.start_step),
+                let trajectory = TrajectoryVersion {
+                    step: i64::from(params.start_step),
                     generation,
-                    i64::from(params.latent_units),
-                    i64::from(params.height),
-                    i64::from(params.width),
-                    &scratch.pages,
-                )?;
+                    units: i64::from(params.latent_units),
+                    height: i64::from(params.height),
+                    width: i64::from(params.width),
+                };
+                let bank = latents
+                    .pool
+                    .current_bank(slot, &trajectory, &scratch.pages)?;
                 latents.gather(bank, scratch, issue)?;
                 let product = call
                     .image_output

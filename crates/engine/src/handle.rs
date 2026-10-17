@@ -19,12 +19,13 @@
 //! on a match. Dropping an [`EventRx`] before a terminal event cancels the
 //! request at its acknowledged prefix.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use uniserve_core::{EngineCoreOutput, Request, RequestId};
+
+use crate::lock;
 
 /// Events a closing sender hands to its receiver, shared by the two ends of
 /// one request's event channel.
@@ -156,10 +157,7 @@ impl EventTx {
         }
         // The events are in place before this sender drops, so a receiver
         // that observes the closed channel also observes them.
-        self.handoff
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(events);
+        lock(&self.handoff).extend(events);
     }
 
     /// Attempts to publish an event without waiting for channel capacity.
@@ -283,10 +281,7 @@ impl EventRx {
 
     /// Removes the next event a closed sender handed over.
     fn take_handoff(&self) -> Option<EngineCoreOutput> {
-        self.handoff
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
+        lock(&self.handoff).pop_front()
     }
 
     /// Updates acknowledgement and completion state for a received event.

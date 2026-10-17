@@ -78,7 +78,7 @@ impl Rendezvous {
         // The launcher cleared close-on-exec only for this process's exec;
         // nothing this rank starts may inherit the socket.
         rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::CLOEXEC)
-            .map_err(|error| Error::Transport(format!("rendezvous socket: {error}")))?;
+            .map_err(|error| Error::transport_source("rendezvous socket", error))?;
         Ok(Self::serve(address, TcpListener::from(owned)))
     }
 }
@@ -135,13 +135,13 @@ impl HostGroup {
             let mut joined = Vec::with_capacity(size - 1);
             listener
                 .set_nonblocking(true)
-                .map_err(|error| transport("rendezvous listener", &error))?;
+                .map_err(|error| Error::transport_source("rendezvous listener", error))?;
             while joined.len() < size - 1 {
                 let stream = accept(&listener, deadline)?;
                 let hello = read_frame(&stream)?;
                 let (member, address) = parse_hello(&hello, size)?;
                 if member == 0 || peers[member].is_some() {
-                    return Err(Error::Transport(format!(
+                    return Err(Error::transport(format!(
                         "host group member {member} joined twice or claims the first index"
                     )));
                 }
@@ -160,24 +160,24 @@ impl HostGroup {
             let first = connect(&rendezvous.address, deadline)?;
             let interface = first
                 .local_addr()
-                .map_err(|error| transport("host group connection", &error))?
+                .map_err(|error| Error::transport_source("host group connection", error))?
                 .ip();
             let listener = TcpListener::bind(SocketAddr::new(interface, 0))
-                .map_err(|error| transport("host group listener", &error))?;
+                .map_err(|error| Error::transport_source("host group listener", error))?;
             let port = listener
                 .local_addr()
-                .map_err(|error| transport("host group listener", &error))?
+                .map_err(|error| Error::transport_source("host group listener", error))?
                 .port();
             write_frame(
                 &first,
                 format!("{rank}\n{}", SocketAddr::new(interface, port)).as_bytes(),
             )?;
             let table = String::from_utf8(read_frame(&first)?)
-                .map_err(|_| Error::Transport("host group address table is not text".into()))?;
+                .map_err(|_| Error::transport("host group address table is not text"))?;
             let table: Vec<&str> = table.split('\n').collect();
             if table.len() != size {
-                return Err(Error::Transport(
-                    "host group address table has the wrong size".into(),
+                return Err(Error::transport(
+                    "host group address table has the wrong size",
                 ));
             }
             peers[0] = Some(Arc::new(first));
@@ -189,18 +189,16 @@ impl HostGroup {
             }
             listener
                 .set_nonblocking(true)
-                .map_err(|error| transport("host group listener", &error))?;
+                .map_err(|error| Error::transport_source("host group listener", error))?;
             for _ in rank + 1..size {
                 let stream = accept(&listener, deadline)?;
                 let member = std::str::from_utf8(&read_frame(&stream)?)
                     .ok()
                     .and_then(|text| text.parse::<usize>().ok())
                     .filter(|&member| member > rank && member < size)
-                    .ok_or_else(|| {
-                        Error::Transport("host group peer sent no member index".into())
-                    })?;
+                    .ok_or_else(|| Error::transport("host group peer sent no member index"))?;
                 if peers[member].is_some() {
-                    return Err(Error::Transport(format!(
+                    return Err(Error::transport(format!(
                         "host group member {member} connected twice"
                     )));
                 }
@@ -238,7 +236,7 @@ impl HostGroup {
             stream
                 .set_read_timeout(timeout)
                 .and_then(|()| stream.set_write_timeout(timeout))
-                .map_err(|error| transport("host group connection", &error))?;
+                .map_err(|error| Error::transport_source("host group connection", error))?;
         }
         Ok(())
     }
@@ -330,7 +328,7 @@ impl HostGroup {
         for mut stream in self.peers.iter().flatten().map(|stream| &**stream) {
             stream
                 .write_all(frame)
-                .map_err(|error| transport("host group send", &error))?;
+                .map_err(|error| Error::transport_source("host group send", error))?;
         }
         records[self.rank * width..(self.rank + 1) * width].copy_from_slice(local);
         for (member, stream) in self.peers.iter().enumerate() {
@@ -341,15 +339,15 @@ impl HostGroup {
             let mut length = [0; 8];
             reader
                 .read_exact(&mut length)
-                .map_err(|error| transport("host group receive", &error))?;
+                .map_err(|error| Error::transport_source("host group receive", error))?;
             if u64::from_le_bytes(length) != width as u64 {
-                return Err(Error::Transport(format!(
+                return Err(Error::transport(format!(
                     "host group member {member} sent a record of another width"
                 )));
             }
             reader
                 .read_exact(&mut records[member * width..(member + 1) * width])
-                .map_err(|error| transport("host group receive", &error))?;
+                .map_err(|error| Error::transport_source("host group receive", error))?;
         }
         Ok(())
     }
@@ -397,9 +395,7 @@ impl HostGroup {
         let mut members: Vec<(i64, usize)> = Vec::new();
         for (member, record) in self.all_gather_bytes(&encoded)?.iter().enumerate() {
             let [other_color, other_key] = decode_integers(record)?[..] else {
-                return Err(Error::Transport(
-                    "host group split record is malformed".into(),
-                ));
+                return Err(Error::transport("host group split record is malformed"));
             };
             if other_color == color {
                 members.push((other_key, member));
@@ -440,15 +436,9 @@ impl HostGroup {
     }
 }
 
-fn transport(context: &str, error: &std::io::Error) -> Error {
-    Error::Transport(format!("{context}: {error}"))
-}
-
 fn decode_integers(bytes: &[u8]) -> Result<Vec<i64>> {
     if !bytes.len().is_multiple_of(8) {
-        return Err(Error::Transport(
-            "host group integer record is malformed".into(),
-        ));
+        return Err(Error::transport("host group integer record is malformed"));
     }
     Ok(bytes
         .as_chunks::<8>()
@@ -459,16 +449,16 @@ fn decode_integers(bytes: &[u8]) -> Result<Vec<i64>> {
 }
 
 fn parse_hello(hello: &[u8], size: usize) -> Result<(usize, String)> {
-    let text = std::str::from_utf8(hello)
-        .map_err(|_| Error::Transport("host group hello is not text".into()))?;
+    let text =
+        std::str::from_utf8(hello).map_err(|_| Error::transport("host group hello is not text"))?;
     let (member, address) = text
         .split_once('\n')
-        .ok_or_else(|| Error::Transport("host group hello is malformed".into()))?;
+        .ok_or_else(|| Error::transport("host group hello is malformed"))?;
     let member = member
         .parse::<usize>()
         .ok()
         .filter(|&member| member < size)
-        .ok_or_else(|| Error::Transport("host group hello names no member".into()))?;
+        .ok_or_else(|| Error::transport("host group hello names no member"))?;
     Ok((member, address.to_owned()))
 }
 
@@ -477,19 +467,19 @@ fn connect(address: &str, deadline: Instant) -> Result<TcpStream> {
     loop {
         let attempt = address
             .to_socket_addrs()
-            .map_err(|error| transport(address, &error))?
+            .map_err(|error| Error::transport_source(format!("resolving {address}"), error))?
             .find_map(|address| {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 TcpStream::connect_timeout(&address, remaining.max(CONNECT_INTERVAL)).ok()
             });
         if let Some(stream) = attempt {
-            stream
-                .set_nodelay(true)
-                .map_err(|error| transport(address, &error))?;
+            stream.set_nodelay(true).map_err(|error| {
+                Error::transport_source(format!("connecting to {address}"), error)
+            })?;
             return Ok(stream);
         }
         if Instant::now() >= deadline {
-            return Err(Error::Transport(format!(
+            return Err(Error::transport(format!(
                 "host group rendezvous at {address} did not accept before the deadline"
             )));
         }
@@ -512,18 +502,18 @@ fn accept(listener: &TcpListener, deadline: Instant) -> Result<TcpStream> {
                                 .max(CONNECT_INTERVAL),
                         ))
                     })
-                    .map_err(|error| transport("host group connection", &error))?;
+                    .map_err(|error| Error::transport_source("host group connection", error))?;
                 return Ok(stream);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
-                    return Err(Error::Transport(
-                        "host group members did not join before the deadline".into(),
+                    return Err(Error::transport(
+                        "host group members did not join before the deadline",
                     ));
                 }
                 std::thread::sleep(CONNECT_INTERVAL);
             }
-            Err(error) => return Err(transport("host group rendezvous", &error)),
+            Err(error) => return Err(Error::transport_source("host group rendezvous", error)),
         }
     }
 }
@@ -534,7 +524,7 @@ fn write_frame(mut stream: &TcpStream, value: &[u8]) -> Result<()> {
     stream
         .write_all(&length)
         .and_then(|()| stream.write_all(value))
-        .map_err(|error| transport("host group send", &error))
+        .map_err(|error| Error::transport_source("host group send", error))
 }
 
 /// Read one length-prefixed frame.
@@ -543,13 +533,13 @@ fn read_frame(stream: &TcpStream) -> Result<Vec<u8>> {
     let mut length = [0; 8];
     reader
         .read_exact(&mut length)
-        .map_err(|error| transport("host group receive", &error))?;
+        .map_err(|error| Error::transport_source("host group receive", error))?;
     let length = usize::try_from(u64::from_le_bytes(length))
-        .map_err(|_| Error::Transport("host group frame is too large".into()))?;
+        .map_err(|_| Error::transport("host group frame is too large"))?;
     let mut value = vec![0; length];
     reader
         .read_exact(&mut value)
-        .map_err(|error| transport("host group receive", &error))?;
+        .map_err(|error| Error::transport_source("host group receive", error))?;
     Ok(value)
 }
 
@@ -569,10 +559,10 @@ pub(crate) fn bind_beside(rendezvous: &str) -> Result<(TcpListener, String)> {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     };
     let listener = TcpListener::bind(SocketAddr::new(interface, 0))
-        .map_err(|error| transport("store listener", &error))?;
+        .map_err(|error| Error::transport_source("store listener", error))?;
     let port = listener
         .local_addr()
-        .map_err(|error| transport("store listener", &error))?
+        .map_err(|error| Error::transport_source("store listener", error))?
         .port();
     Ok((listener, format!("{host}:{port}")))
 }

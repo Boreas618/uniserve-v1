@@ -7,7 +7,7 @@
 //! Rust sends is a TVM-FFI value: integers, floats, strings, shapes, arrays,
 //! maps and handles. Rust's own storage crosses as handles too: each view
 //! is wrapped once as a torch tensor, which every call that takes the view
-//! receives ([`crate::storage::memory::StorageView::handle`]).
+//! receives (`crate::storage::memory::StorageView::handle`).
 //!
 //! One thread of a rank executes Python: the [`Interpreter`]. A [`Function`]
 //! may be called from any thread; the call is handed to the interpreter and

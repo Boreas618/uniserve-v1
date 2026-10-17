@@ -1,4 +1,3 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 //! System One readout plans for the published DiffusionGemma checkpoints.
 //!
 //! Every plan must equal, token for token, the golden plan of
@@ -11,6 +10,8 @@
 //! `UNISERVE_DIFFUSION_GEMMA_MODEL` (BF16) and
 //! `UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL` (NVFP4) and run only on request:
 //! `cargo test -p uniserve-server --test systemone_checkpoint -- --include-ignored`.
+
+#![cfg(test)]
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

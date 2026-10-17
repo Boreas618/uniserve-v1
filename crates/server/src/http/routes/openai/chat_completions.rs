@@ -57,18 +57,8 @@ pub(crate) async fn chat_completions(
     };
 
     if stream {
-        let chunk_stream = chat_completion_chunk_stream(
-            serve_stream,
-            response.request_id,
-            response.response_model,
-            created,
-            log_request,
-            response.include_usage,
-            response.requested_logprobs,
-            response.include_reasoning,
-            response.return_token_ids,
-            response.return_tokens_as_token_ids,
-        );
+        let chunk_stream =
+            chat_completion_chunk_stream(serve_stream, response, created, log_request);
         let sse_stream = chat_completion_sse_stream(chunk_stream).instrument(request_span);
 
         // Emit periodic SSE keep-alive comments so long prefills (no chunks yet)
@@ -77,19 +67,9 @@ pub(crate) async fn chat_completions(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        let response = match collect_chat_completion(
-            serve_stream,
-            response.request_id,
-            response.response_model,
-            created,
-            response.requested_logprobs,
-            response.include_prompt_logprobs,
-            response.include_reasoning,
-            response.return_token_ids,
-            response.return_tokens_as_token_ids,
-        )
-        .instrument(request_span.clone())
-        .await
+        let response = match collect_chat_completion(serve_stream, response, created)
+            .instrument(request_span.clone())
+            .await
         {
             Ok(response) => response,
             Err(error) => return error.into_response(),

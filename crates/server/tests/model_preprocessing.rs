@@ -1,5 +1,6 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 //! Model-profile prompt preprocessing and generation-policy integration behavior.
+
+#![cfg(test)]
 
 use std::collections::HashMap;
 use std::fs;

@@ -23,8 +23,6 @@
 //! Releasing memory never synchronizes on the dropping thread; see
 //! [`reclaim`].
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 mod context;
 mod copy;
 mod device;
@@ -56,6 +54,19 @@ pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use nvml::{Nvml, NvmlMemory};
 pub use stream::{CaptureStatus, Stream};
 pub use vmm::{HandleType, PeerMapping, ShareableHandle};
+
+/// Lock `mutex`, keeping the state a panicking holder left.
+///
+/// Every build profile sets `panic = "abort"`, so a holder's panic ends the
+/// process before another thread observes the poisoned lock. Only test
+/// builds, which ignore that setting and unwind, reach the recovery; it
+/// returns the guard rather than raising a second panic in the thread that
+/// locks next.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[cfg(test)]
 mod tests {

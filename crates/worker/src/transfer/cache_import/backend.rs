@@ -28,7 +28,7 @@ use crate::storage::{CachePlanes, GroupTable, UnitColumn};
 use crate::transfer::fetch;
 use crate::transfer::read::{Read, ReadRef};
 use crate::transfer::{Notify, Retirement, Spans, Transports, notify};
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// One import thread's stream, scratch and bound numerical operations.
 pub(crate) struct ImportWorkspace {
@@ -154,13 +154,7 @@ impl Retired {
                 notify(import.retirement.complete(Ok(()))?);
             }
         }
-        if changed
-            && let Some(wake) = self
-                .wake
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-        {
+        if changed && let Some(wake) = lock(&self.wake).as_ref() {
             wake.wake();
         }
         Ok(())
@@ -355,14 +349,14 @@ impl GroupCopy<'_> {
         let signal = Arc::new((Mutex::new(false), Condvar::new()));
         let notified = Arc::clone(&signal);
         let callback: Notify = Arc::new(move || {
-            *notified.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            *lock(&notified.0) = true;
             notified.1.notify_all();
         });
         let capacity = self.backend.transports.capacity();
         if let Some(callback) = capacity.notify_reads_returned(callback, returns) {
             callback();
         }
-        let mut returned = signal.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut returned = lock(&signal.0);
         while !*returned {
             self.backend.importer.require_active(&self.backend.write)?;
             returned = signal

@@ -35,7 +35,7 @@ impl HostAction for ImportCopy {
             // copy's own failure, if any, is reported with it.
             return Err(match copied {
                 Ok(()) => error,
-                Err(cause) => Error::Transport(format!(
+                Err(cause) => Error::transport(format!(
                     "{error}; cache import cleanup also failed: {cause}"
                 )),
             });

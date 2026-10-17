@@ -10,14 +10,14 @@
 //! encoding time on large generated images.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use crate::ffi::DType;
 use crate::host::HostAction;
 use crate::runner::encoder::{ImagePreparation, PreparedImage, Tower};
 use crate::storage::memory::StorageView;
 use crate::storage::{OutputLease, PinnedPool};
-use crate::{Error, Outcome, Result};
+use crate::{Error, Outcome, Result, lock};
 
 /// Encode `pixels` (`height * width * 3` bytes, HWC) as a base64 PNG of at
 /// most `maximum` bytes.
@@ -120,7 +120,7 @@ impl HostAction for ImageTask {
     type Output = ImageResult;
 
     fn run(&self) -> Result<ImageResult> {
-        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        let work = lock(&self.work);
         match &*work {
             ImageWork::Prepare {
                 preparation,
@@ -151,12 +151,9 @@ impl HostAction for ImageTask {
     }
 
     fn release(&self) -> Result<()> {
-        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        let work = lock(&self.work);
         if let ImageWork::Encode { lease, .. } = &*work {
-            lease
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .release_reader()?;
+            lock(lease).release_reader()?;
         }
         Ok(())
     }

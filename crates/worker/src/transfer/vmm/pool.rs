@@ -402,14 +402,12 @@ impl VmmPool {
 }
 
 impl Drop for VmmPool {
-    #[expect(
-        clippy::mem_forget,
-        reason = "unknown device completion must retain both DMA mappings"
-    )]
     fn drop(&mut self) {
+        // After a failed close the device completion is unknown: both DMA
+        // mappings stay until the process exits.
         if self.close().is_err() {
-            std::mem::forget(self.backing.take());
-            std::mem::forget(std::mem::take(&mut self.readback));
+            crate::leak(self.backing.take());
+            crate::leak(std::mem::take(&mut self.readback));
         }
     }
 }

@@ -39,14 +39,14 @@
 //!   prefix must hold every full-attention page before it and each
 //!   sliding-window group's window of pages just before it.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use uniserve_core::{CacheGroup, HashAlgo, Modality, UnitId};
 use uniserve_ipc::WorkerEndpoint;
+
+use crate::lock;
 
 mod encoder_cache;
 mod freeq;
@@ -1241,7 +1241,10 @@ impl PrefixCacheCoordinator {
     /// false, so the prompt can still be published as prefill completes.
     /// Returns `None` when the tables do not match the groups or are not
     /// empty.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one lookup's prompt, cache policy and source worker"
+    )]
     pub(crate) fn acquire_prefix(
         &self,
         pool: &BlockPool,
@@ -1335,7 +1338,10 @@ impl PrefixCacheCoordinator {
     /// caching is disabled, `cache_write` is false, or `hashes` is empty (a
     /// request excluded from prefix caching), and `false` when the tables or
     /// hashes do not match the groups.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one prompt's computed blocks, publication policy and source worker"
+    )]
     pub(crate) fn publish_prompt(
         &self,
         pool: &BlockPool,
@@ -1371,13 +1377,6 @@ impl PrefixCacheCoordinator {
         }
         true
     }
-}
-
-/// Locks the shared state and recovers it after poisoning.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

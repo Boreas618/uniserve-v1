@@ -79,7 +79,7 @@ pub enum Error {
     Reclaim { failed: usize, first: Box<Error> },
 
     /// `atexit` refused the handler of
-    /// [`crate::PrimaryContext::reset_all_at_exit`].
+    /// `PrimaryContext::reset_all_at_exit`.
     #[error("cannot register the exit handler that destroys the device contexts")]
     ExitHandler,
 }

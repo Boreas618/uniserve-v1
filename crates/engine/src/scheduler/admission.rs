@@ -30,6 +30,58 @@ pub(super) struct MediaOutput {
     pub(super) shape: ShapeBound,
 }
 
+/// Why the loaded media components cannot hold a request's product.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(super) enum MediaOutputError {
+    /// No loaded component serves the call that publishes the product.
+    #[error("no loaded component serves {0:?}")]
+    Unserved(MediaCall),
+    /// The serving component has no placement candidate.
+    #[error("component {0} has no loaded candidate")]
+    Unplaced(String),
+    /// The candidate's worker does not bind the component.
+    #[error("component {0} is not bound on its worker")]
+    Unbound(String),
+    /// The component declares no output of the product's name.
+    #[error("component {component} declares no {product} output")]
+    Undeclared {
+        component: String,
+        product: &'static str,
+    },
+    /// A raster-laid output lacks a static axis for one side of the canvas.
+    #[error("{product} of component {component} has no static {side} axis")]
+    RasterAxis {
+        component: String,
+        product: &'static str,
+        side: &'static str,
+    },
+    /// The request's canvas side is zero or exceeds the declared extent.
+    #[error(
+        "{product} of component {component} holds a {side} of at most {max} pixels, the request's canvas has {extent}"
+    )]
+    Raster {
+        component: String,
+        product: &'static str,
+        side: &'static str,
+        max: u32,
+        extent: u32,
+    },
+    /// A request-sized product's output has no device-sized axis.
+    #[error("{product} of component {component} has no request-sized axis")]
+    RequestAxis {
+        component: String,
+        product: &'static str,
+    },
+    /// The request's extent is zero or exceeds the device-sized maximum.
+    #[error("{product} of component {component} holds 1 to {max}, the request needs {extent}")]
+    Request {
+        component: String,
+        product: &'static str,
+        max: u32,
+        extent: u32,
+    },
+}
+
 impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
     ///
@@ -238,36 +290,39 @@ impl Scheduler {
     ///
     /// # Errors
     ///
-    /// Returns a message naming the product when no component serves its
-    /// call, the component declares no output of that name, the output has
+    /// Returns a [`MediaOutputError`] naming the product when no component
+    /// serves its call, the component declares no output of that name, the output has
     /// no device-sized axis for a request extent, or the request's extent or
     /// canvas is zero or exceeds the declared maximum. `enqueue_media`
     /// rejects such a request, and `admit_media` calls this again to size the
     /// reservation.
-    fn media_outputs(&self, graph: &VideoGraph) -> Result<Vec<MediaOutput>, String> {
+    fn media_outputs(&self, graph: &VideoGraph) -> Result<Vec<MediaOutput>, MediaOutputError> {
         let mut outputs = Vec::new();
         for product in graph.products() {
             let name = self
                 .info
                 .media_components
                 .get(&product.call)
-                .ok_or_else(|| format!("no loaded component serves {:?}", product.call))?;
+                .ok_or(MediaOutputError::Unserved(product.call))?;
             let (_, bound, info) = self
                 .placement
                 .component_candidates(self.executor.as_ref(), CallKind::Media(product.call), name)
                 .next()
-                .ok_or_else(|| format!("component {name} has no loaded candidate"))?;
+                .ok_or_else(|| MediaOutputError::Unplaced(name.clone()))?;
             let component = info
                 .components
                 .iter()
                 .find(|component| component.name == bound)
-                .ok_or_else(|| format!("component {bound} is not bound on its worker"))?;
+                .ok_or_else(|| MediaOutputError::Unbound(bound.to_owned()))?;
             let (index, output) = component
                 .outputs
                 .iter()
                 .enumerate()
                 .find(|(_, output)| output.name == product.name)
-                .ok_or_else(|| format!("component {name} declares no {} output", product.name))?;
+                .ok_or_else(|| MediaOutputError::Undeclared {
+                    component: name.clone(),
+                    product: product.name,
+                })?;
             let mut shape = output.shape_bound.clone();
             // A product laid out at the request's raster holds the canvas in
             // its raster axes, whose declared extents are the largest the
@@ -279,17 +334,20 @@ impl Scheduler {
                     (raster.width, canvas.width, "width"),
                 ] {
                     let Some(DimBound::Static(max)) = shape.dims.get(axis as usize).copied() else {
-                        return Err(format!(
-                            "{} of component {name} has no static {side} axis",
-                            product.name
-                        ));
+                        return Err(MediaOutputError::RasterAxis {
+                            component: name.clone(),
+                            product: product.name,
+                            side,
+                        });
                     };
                     if extent == 0 || extent > max {
-                        return Err(format!(
-                            "{} of component {name} holds a {side} of at most {max} pixels, the \
-                             request's canvas has {extent}",
-                            product.name
-                        ));
+                        return Err(MediaOutputError::Raster {
+                            component: name.clone(),
+                            product: product.name,
+                            side,
+                            max,
+                            extent,
+                        });
                     }
                     shape.dims[axis as usize] = DimBound::Static(extent);
                 }
@@ -299,20 +357,20 @@ impl Scheduler {
                     .dims
                     .iter_mut()
                     .find(|dim| matches!(dim, DimBound::Device { .. }))
-                    .ok_or_else(|| {
-                        format!(
-                            "{} of component {name} has no request-sized axis",
-                            product.name
-                        )
+                    .ok_or_else(|| MediaOutputError::RequestAxis {
+                        component: name.clone(),
+                        product: product.name,
                     })?;
                 let DimBound::Device { max } = *dim else {
                     unreachable!("the selected axis is device-sized");
                 };
                 if extent == 0 || extent > max {
-                    return Err(format!(
-                        "{} of component {name} holds 1 to {max}, the request needs {extent}",
-                        product.name
-                    ));
+                    return Err(MediaOutputError::Request {
+                        component: name.clone(),
+                        product: product.name,
+                        max,
+                        extent,
+                    });
                 }
                 *dim = DimBound::Static(extent);
             }
@@ -495,15 +553,15 @@ impl Scheduler {
         }
         let graph = match VideoGraph::new(&request) {
             Ok(graph) => graph,
-            Err(message) => {
-                reject(RejectionKind::Invalid, message);
+            Err(error) => {
+                reject(RejectionKind::Invalid, error.to_string());
                 return;
             }
         };
-        if let Err(message) = self.media_outputs(&graph) {
+        if let Err(error) = self.media_outputs(&graph) {
             reject(
                 RejectionKind::Invalid,
-                format!("loaded media components cannot hold the request: {message}"),
+                format!("loaded media components cannot hold the request: {error}"),
             );
             return;
         }

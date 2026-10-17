@@ -27,7 +27,7 @@ impl Signals {
     /// Install the startup disposition for SIGINT and SIGTERM.
     pub(crate) fn install() -> Result<Self> {
         let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
-            .map_err(|error| Error::Transport(format!("signal pipe: {error}")))?;
+            .map_err(|error| Error::transport_source("signal pipe", error))?;
         // The write end lives for the process: handlers may run until exit.
         let writer: &'static OwnedFd = Box::leak(Box::new(writer));
         let fd = writer.as_raw_fd();
@@ -40,7 +40,7 @@ impl Signals {
                     let _ = libc::write(fd, (&raw const byte).cast(), 1);
                 })
             }
-            .map_err(|error| Error::Transport(format!("installing a signal handler: {error}")))?;
+            .map_err(|error| Error::transport_source("installing a signal handler", error))?;
         }
 
         let serving = Arc::new(AtomicBool::new(false));
@@ -48,7 +48,7 @@ impl Signals {
         std::thread::Builder::new()
             .name("worker-signals".into())
             .spawn(move || dispatch(std::fs::File::from(reader), &policy))
-            .map_err(|error| Error::Transport(format!("signal thread: {error}")))?;
+            .map_err(|error| Error::transport_source("signal thread", error))?;
         Ok(Self { serving })
     }
 

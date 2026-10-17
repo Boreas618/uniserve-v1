@@ -1,8 +1,8 @@
 //! Shared operation results, waits, and completion observers.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// The operation's result. Physical storage requires a successful retirement
 /// signal; a task result alone does not establish that a device has stopped.
@@ -54,7 +54,7 @@ impl<C, T: Clone> Completion<C, T> {
     fn state(&self) -> MutexGuard<'_, State<C, T>> {
         // No user code mutates state under the lock. A panicking reference
         // visitor cannot leave a partially completed operation.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     pub fn done(&self) -> bool {
@@ -150,7 +150,7 @@ mod tests {
     fn failure_and_cancellation_do_not_retire_storage() -> Result<()> {
         let failed = Retirement::default();
         assert!(!failed.done());
-        failed.complete(Err(Error::Transport("device completion unknown".into())))?;
+        failed.complete(Err(Error::transport("device completion unknown")))?;
         assert!(failed.done());
         assert!(!failed.succeeded());
         let Some(Outcome::Failed(error)) = failed.outcome() else {

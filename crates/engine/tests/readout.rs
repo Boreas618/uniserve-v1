@@ -1,5 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 //! Readout requests on a block-diffusion runtime over the GPU-free simulator.
 //!
 //! A readout prefills its prompt without sampling, denoises its canvas rows
@@ -8,6 +6,8 @@
 //! The simulator reports `sim_candidate_logprob(request, token)` for each
 //! candidate, so the expected answer is known exactly. Tests observe calls at
 //! the executor boundary, the protocol the worker consumes.
+
+#![cfg(test)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

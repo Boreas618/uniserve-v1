@@ -73,7 +73,7 @@ struct FailedExport {
 pub(crate) enum Exported {
     Located(Box<Locator>),
     /// The export's location is complete once the work it issued was
-    /// performed ([`Transport::locate`]).
+    /// performed ([`crate::transfer::Transport::locate`]).
     Staged(Box<Staged>),
     /// The payload does not fit the device's export pool; another mechanism
     /// that reaches the consumers may carry it.
@@ -318,9 +318,9 @@ impl CudaExports {
             state.event = Some(Arc::clone(&ready));
             if let AllocationHandle::Descriptor(fd) = handle {
                 let grants = self.grants()?;
-                grants
-                    .register(&export_id, fd)
-                    .map_err(|error| Error::Transport(error.to_string()))?;
+                grants.register(&export_id, fd).map_err(|error| {
+                    Error::transport_source("granting an export's descriptor", error)
+                })?;
                 state.grants = Some(grants);
             }
 
@@ -387,7 +387,7 @@ impl CudaExports {
     /// the producer stream, then return the chunk, grant and bytes. A failed
     /// drain retains everything and fails every later export. A constructed
     /// backing is given up by its transport and retires through the event
-    /// pool ([`Transport::discard`]).
+    /// pool ([`crate::transfer::Transport::discard`]).
     fn abandon(&self, mut state: ExportState, issue: impl Issue, events: &EventPool) -> Result<()> {
         let cleanup = (|| -> Result<()> {
             // A stream issued the failed attempt's copies at once and
@@ -467,7 +467,7 @@ impl CudaExports {
         }
         let created = Arc::new(
             DescriptorGrants::new(self.endpoint.name())
-                .map_err(|error| Error::Transport(error.to_string()))?,
+                .map_err(|error| Error::transport_source("opening the descriptor grants", error))?,
         );
         *grants = Some(Arc::clone(&created));
         Ok(created)
@@ -504,11 +504,10 @@ impl CudaExports {
         }
         let grants = lock(&self.grants).take();
         if let Some(grants) = grants {
-            result = result.and(
-                grants
-                    .close()
-                    .map_err(|error| Error::Transport(error.to_string())),
-            );
+            result =
+                result.and(grants.close().map_err(|error| {
+                    Error::transport_source("closing the descriptor grants", error)
+                }));
         }
         result
     }
@@ -548,7 +547,7 @@ impl CudaExports {
     }
 
     /// The read of a CUDA VMM export into `destination` on `device`, for
-    /// the transport of `source` (see [`Transport::issue_fetch`]). A read
+    /// the transport of `source` (see [`crate::transfer::Transport::issue_fetch`]). A read
     /// of another process's export takes the imports of it this rank holds.
     pub(crate) fn read(
         &self,
@@ -615,10 +614,6 @@ impl CudaExports {
 }
 
 impl Drop for CudaExports {
-    #[expect(
-        clippy::mem_forget,
-        reason = "unresolved device access must retain its backing until process teardown"
-    )]
     fn drop(&mut self) {
         if let Some(failed) = self
             .failed
@@ -626,7 +621,9 @@ impl Drop for CudaExports {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            std::mem::forget(failed);
+            // Device access to a failed export never resolved: its backing
+            // stays until the process exits.
+            crate::leak(failed);
         }
     }
 }

@@ -139,7 +139,12 @@ fn supervise(
                 }
             }
             Err(IpcError::Transport(reason)) => {
-                tracing::info!(%reason, "head connection closed; terminating this host's ranks");
+                // The reason's cause, such as a reset connection, is its source.
+                let reason = anyhow::Error::new(reason);
+                tracing::info!(
+                    reason = format!("{reason:#}"),
+                    "head connection closed; terminating this host's ranks"
+                );
                 return Ok(());
             }
             Err(error) => return Err(error).context("decoding an instruction from the head"),

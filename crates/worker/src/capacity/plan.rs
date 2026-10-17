@@ -25,8 +25,8 @@ use uniserve_ipc::{
 };
 
 use super::{
-    ArenaCapacity, CacheCapacity, DEFAULT_NUM_UNITS, call_window, latent_pool_bytes,
-    request_tensor_window,
+    ArenaCapacity, CacheCapacity, CacheDemand, RequestBounds, TokenBounds, call_window,
+    latent_pool_bytes, request_tensor_window,
 };
 use crate::config::{Device, WorkerConfig, graph_padding_block_count};
 use crate::cuda_graph::graph_storage_budget_bytes;
@@ -356,14 +356,14 @@ impl TokenLayout {
         // Products, their buffer pool and the latent pool live on the primary
         // device, beside every binding; a generation tower holds only the
         // module weights placed on it.
-        let arena = ArenaCapacity::for_tokens(
-            queue_depth,
-            config.max_batch_calls,
-            config.max_request_pool_size,
-            product_scalar_bytes(),
-            feature_bytes,
+        let arena = ArenaCapacity::for_tokens(&TokenBounds {
+            depth: queue_depth,
+            calls: config.max_batch_calls,
+            requests: config.max_request_pool_size,
+            scalar_bytes: product_scalar_bytes(),
+            transfer_bytes_per_read: feature_bytes,
             device_exports,
-        )?;
+        })?;
         let mut fixed = BTreeMap::new();
         fixed.insert(
             config.device,
@@ -430,16 +430,13 @@ impl TokenLayout {
                 "automatic CUDA KV sizing requires a host storage grant".into(),
             ));
         }
-        let mut capacity = CacheCapacity::derive(
-            &pages,
+        let mut capacity = CacheCapacity::derive(&CacheDemand {
+            pages: &pages,
             tokens,
             unit_bytes,
-            available,
-            1,
-            DEFAULT_NUM_UNITS,
-            1,
+            available_bytes: available,
             reserved_units,
-        )?;
+        })?;
         // Every member allocates the same logical unit ids, bounded by the
         // smallest grant.
         capacity.num_units = group.all_reduce_min(&[capacity.num_units as i64])?[0] as u64;
@@ -497,16 +494,16 @@ pub(crate) fn request_layout(
         info.latent_page_units = narrow(plan.page_units, "latent page units")?;
         info.latent_pages = narrow(plan.num_pages, "latent pages")?;
     }
-    let arena = ArenaCapacity::for_requests(
-        queue_depth,
-        info.max_batch_calls as usize,
-        slots,
-        config.world_size,
-        product_scalar_bytes(),
-        media.local_product_bytes,
-        media.artifact_import_regions,
+    let arena = ArenaCapacity::for_requests(&RequestBounds {
+        depth: queue_depth,
+        calls: info.max_batch_calls as usize,
+        requests: slots,
+        ranks: config.world_size,
+        scalar_bytes: product_scalar_bytes(),
+        product_bytes_per_request: media.local_product_bytes,
+        concurrent_imports: media.artifact_import_regions,
         device_exports,
-    )?;
+    })?;
     info.host_lane_capacity = if host_components {
         1
     } else {
@@ -537,16 +534,16 @@ pub(crate) fn slot_requirements(
 ) -> Result<Vec<u64>> {
     let mut requirements = Vec::new();
     for count in minimum..=maximum {
-        let arena = ArenaCapacity::for_requests(
-            queue_depth,
-            config.max_batch_calls.min(count),
-            count,
-            config.world_size,
-            product_scalar_bytes(),
-            media.local_product_bytes,
-            0,
+        let arena = ArenaCapacity::for_requests(&RequestBounds {
+            depth: queue_depth,
+            calls: config.max_batch_calls.min(count),
+            requests: count,
+            ranks: config.world_size,
+            scalar_bytes: product_scalar_bytes(),
+            product_bytes_per_request: media.local_product_bytes,
+            concurrent_imports: 0,
             device_exports,
-        )?;
+        })?;
         let latent_bytes = match media.stored_latent() {
             Some(plan) => {
                 let pages = if plan.with_workspace {
@@ -580,6 +577,7 @@ mod tests {
     use uniserve_ipc::{DimBound, ShapeBound};
 
     use super::*;
+    use crate::capacity::DEFAULT_NUM_UNITS;
 
     fn group() -> HostGroup {
         HostGroup::single(0)

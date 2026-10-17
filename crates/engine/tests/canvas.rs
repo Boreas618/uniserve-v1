@@ -1,5 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 //! Block-diffusion text generation on the GPU-free simulator.
 //!
 //! A canvas-generating request prefills its prompt without sampling, then
@@ -14,6 +12,8 @@
 //! predicated on its completion; behind the step that stops the block it is
 //! a no-op. Tests observe calls at the executor boundary, the protocol the
 //! worker consumes.
+
+#![cfg(test)]
 
 use std::thread;
 use std::time::{Duration, Instant};

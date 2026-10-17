@@ -1,7 +1,7 @@
 //! Worker request and response envelopes.
 //!
 //! One [`WorkerRequest`] or [`WorkerResponse`] is the message of one
-//! [`Frame`](crate::Frame). Each envelope's optional `message_id` is the
+//! [`Frame`]. Each envelope's optional `message_id` is the
 //! request-response correlation identity: a rank answers a request under the
 //! identity it carried, and a transport that matches a response to its request
 //! reads the identity from the decoded envelope, taking `None` as zero. It is

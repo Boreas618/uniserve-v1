@@ -1,4 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Encoding and decoding throughput benchmarks for Hugging Face tokenizers.
 //!
 //! The fixture resolves `tokenizer.json` for `MODEL_ID` from the Hugging Face
@@ -6,7 +5,9 @@
 //! it is absent, so a cold cache needs network access. Encoding throughput is
 //! reported in input bytes and decoding throughput in token IDs.
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::error::Error;
+
+use criterion::{Criterion, Throughput, black_box};
 use hf_hub::api::sync::ApiBuilder;
 use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 
@@ -22,27 +23,27 @@ struct BenchFixture {
 }
 
 impl BenchFixture {
-    fn load() -> Self {
+    /// Load the tokenizer and encode and decode the sample once, so the
+    /// measured calls repeat calls known to succeed.
+    fn load() -> Result<Self, Box<dyn Error>> {
         let path = ApiBuilder::from_env()
             .with_progress(false)
-            .build()
-            .expect("build hf-hub api")
+            .build()?
             .model(MODEL_ID.to_string())
-            .get("tokenizer.json")
-            .expect("fetch tokenizer.json from hf-hub");
-        let tokenizer = HuggingFaceTokenizer::new(&path).expect("load configured tokenizer");
+            .get("tokenizer.json")?;
+        let tokenizer = HuggingFaceTokenizer::new(&path)?;
         let text = SAMPLE_TEXT.repeat(32);
-        let token_ids = tokenizer.encode(&text, false).expect("encode sample text");
-        Self {
+        let token_ids = tokenizer.encode(&text, false)?;
+        tokenizer.decode(&token_ids, false)?;
+        Ok(Self {
             tokenizer,
             text,
             token_ids,
-        }
+        })
     }
 }
 
-fn bench_encode(c: &mut Criterion) {
-    let fixture = BenchFixture::load();
+fn bench_encode(c: &mut Criterion, fixture: &BenchFixture) {
     let mut group = c.benchmark_group("tokenizer_encode");
     group.throughput(Throughput::Bytes(fixture.text.len() as u64));
     group.bench_function("configured", |b| {
@@ -50,14 +51,12 @@ fn bench_encode(c: &mut Criterion) {
             fixture
                 .tokenizer
                 .encode(black_box(&fixture.text), black_box(false))
-                .expect("encode sample text")
         })
     });
     group.finish();
 }
 
-fn bench_decode(c: &mut Criterion) {
-    let fixture = BenchFixture::load();
+fn bench_decode(c: &mut Criterion, fixture: &BenchFixture) {
     let mut group = c.benchmark_group("tokenizer_decode");
     group.throughput(Throughput::Elements(fixture.token_ids.len() as u64));
     group.bench_function("configured", |b| {
@@ -65,11 +64,17 @@ fn bench_decode(c: &mut Criterion) {
             fixture
                 .tokenizer
                 .decode(black_box(&fixture.token_ids), black_box(false))
-                .expect("decode sample tokens")
         })
     });
     group.finish();
 }
 
-criterion_group!(benches, bench_encode, bench_decode);
-criterion_main!(benches);
+/// Load the fixture once, then run both groups as `criterion_main!` would.
+fn main() -> Result<(), Box<dyn Error>> {
+    let fixture = BenchFixture::load()?;
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_encode(&mut criterion, &fixture);
+    bench_decode(&mut criterion, &fixture);
+    criterion.final_summary();
+    Ok(())
+}
