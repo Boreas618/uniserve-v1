@@ -8,16 +8,19 @@
 //! tasks: prefill and decode sample their last projected row, a
 //! verification every candidate row. A prefill chunk that scores its prompt
 //! projects all of its rows; they score its tokens, its last row also
-//! samples. A decode invocation whose calls all qualify uses the decode
-//! forward's greedy selections, made with each call's finish tokens;
-//! otherwise the tasks form the forward's [`SamplingMetadata`].
+//! samples. A decode invocation whose calls all qualify selects in the
+//! decode forward itself, with each call's finish tokens: greedily when
+//! every row is greedy, otherwise each row from its top-k candidates with
+//! its parameters and draw ([`RowSampling`]). Otherwise the tasks form the
+//! forward's [`SamplingMetadata`], whose sampling methods follow the
+//! forward.
 
 use uniserve_core::SamplingParams;
 use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::CausalLMRunners;
 use super::batch::TokenBatch;
-use super::calls::{self, Prepared};
+use super::calls::{self, OwnSelection, Prepared};
 use super::context::{self, Sources};
 use super::runners::Step;
 use crate::executor::image::ImageParts;
@@ -27,7 +30,7 @@ use crate::runner::causal_lm::{
 };
 use crate::runner::denoiser::image::ConditionRow;
 use crate::sampling::{
-    SampleTask, SamplingControls, SamplingMetadata, logprob_request, logprob_words,
+    RowSampling, SampleTask, SamplingControls, SamplingMetadata, logprob_request, logprob_words,
 };
 use crate::storage::LogprobLayout;
 use crate::storage::memory::StorageView;
@@ -59,7 +62,8 @@ pub(super) struct PromptScore {
 pub(super) struct Invoked {
     /// The runner that ran it.
     pub(super) runner: usize,
-    /// The tasks' plan; absent for greedy decode and unsampled calls.
+    /// The tasks' plan; absent where the decode forward selects itself and
+    /// for unsampled calls.
     pub(super) sampling: Option<SamplingMetadata>,
     pub(super) tasks: usize,
 }
@@ -131,9 +135,12 @@ struct Planned {
     runner: usize,
     rows: Vec<TokenRow>,
     embeddings: Vec<Embeddings>,
-    /// Each row's finish tokens when the decode forward's greedy
-    /// selections are final; empty otherwise.
+    /// Each row's finish tokens when the decode forward's own selections
+    /// are final; empty otherwise.
     finish_ids: Vec<[i64; FINISH_IDS]>,
+    /// The rows' draws and parameters when the decode forward samples its
+    /// rows itself.
+    row_sampling: Option<RowSampling>,
     sampling: Option<SamplingMetadata>,
     prompt: PromptChunks,
     tasks: usize,
@@ -145,6 +152,7 @@ impl Planned {
             mode,
             rows: &self.rows,
             finish_ids: &self.finish_ids,
+            row_sampling: self.row_sampling.as_ref(),
             sampling: self.sampling.as_ref().map(|metadata| SamplingColumns {
                 groups: &metadata.groups,
                 draws: &metadata.draws,
@@ -393,7 +401,9 @@ impl TokenBatch<'_> {
         let vocab = self.runtime.vocab;
         let dimensions = self.runtime.runners[runner].dimensions();
         let mut sampled = Vec::new();
-        let mut greedy = self.mode == ForwardMode::Decode;
+        // The decode forward selects every row itself when each call allows
+        // it, and samples when any row is not greedy.
+        let mut own = (self.mode == ForwardMode::Decode).then_some(OwnSelection::Greedy);
         let mut finish_ids = vec![[-1_i64; FINISH_IDS]; rows.len()];
         // Prompt chunks: call, candidate rows, first token and what
         // predicts the first token (see `PromptScore::continued`).
@@ -413,7 +423,7 @@ impl TokenBatch<'_> {
                 .ok_or_else(|| Error::Invariant("active call has no row".into()))?;
             let start = state.output.progress.logical_position;
             let Some(positions) = calls::sample_positions(call, prepared, start)? else {
-                greedy = false;
+                own = None;
                 continue;
             };
             let (controls, draws) = calls::controls(
@@ -424,14 +434,17 @@ impl TokenBatch<'_> {
                 prepared.drafts.clone(),
                 state.forward.transition_write.is_some(),
             )?;
-            greedy &= calls::greedy_eligible(
-                call,
-                admitted,
-                prepared,
-                &controls.finish_token_ids,
-                state.forward.token_write.is_some(),
-                state.forward.transition_write.is_some(),
-            );
+            let path = controls.path(admitted, vocab);
+            own = own
+                .zip(calls::own_selection(
+                    call,
+                    prepared,
+                    &controls,
+                    path,
+                    state.forward.token_write.is_some(),
+                    state.forward.transition_write.is_some(),
+                ))
+                .map(|(selection, call)| selection.max(call));
             // The call samples from its last row.
             let position = first_row + row_count - 1;
             for (id, &token) in finish_ids[position]
@@ -510,19 +523,24 @@ impl TokenBatch<'_> {
                 })
             })
             .collect::<Result<_>>()?;
-        // The decode forward's greedy selections are final only when every
+        // The decode forward's own selections are final only when every
         // call qualifies; otherwise its logits are sampled like any other.
-        greedy &= tasks.len() == inputs.len();
-        if !greedy {
+        if tasks.len() != inputs.len() {
+            own = None;
+        }
+        if own.is_none() {
             finish_ids.clear();
         }
-        let sampling = if tasks.is_empty() || greedy {
+        let row_sampling = match own {
+            Some(OwnSelection::TopK) => Some(RowSampling::build(&tasks, vocab)?),
+            Some(OwnSelection::Greedy) | None => None,
+        };
+        let sampling = if tasks.is_empty() || own.is_some() {
             None
         } else {
             Some(SamplingMetadata::build(
                 &tasks,
                 vocab,
-                self.batch.device.is_some(),
                 0,
                 dimensions.logprob_words(),
             )?)
@@ -584,6 +602,7 @@ impl TokenBatch<'_> {
             rows,
             embeddings,
             finish_ids,
+            row_sampling,
             sampling,
             prompt: prompt_chunks,
             tasks: task_count,

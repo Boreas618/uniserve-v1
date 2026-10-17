@@ -581,8 +581,8 @@ impl SimEngine {
                         rng.seed == sampling.seed.unwrap_or(0),
                         "call RNG seed disagrees with admitted sampling"
                     );
-                    let key = philox::sampling_key(
-                        rng.seed,
+                    let key = philox::request_sampling_key(
+                        sampling.seed,
                         call.request_key.engine_id,
                         request_id.0,
                         call.request_key.request_epoch,

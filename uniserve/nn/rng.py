@@ -1,11 +1,13 @@
 """Semantic counter-based random coordinates for deterministic execution.
 
-The token sampler draws through the canonical Philox4x32-10 mapping defined
-here and mirrored bit-for-bit by the Rust simulator in
-``crates/core/src/philox.rs``. A draw is addressed only by its
-request lineage and semantic coordinates, so the same coordinate yields the
-same uniform in every language and is independent of batch order, execution
-depth, accepted proposal length, completion order, and replay.
+The canonical Philox4x32-10 mapping is defined here and mirrored
+bit-for-bit by ``crates/core/src/philox.rs``, through which the worker draws
+the token sampler's uniforms. A draw is addressed only by its request's
+stream key and semantic coordinates, so the same coordinate yields the same
+uniform in every language and is independent of batch order, execution
+depth, accepted proposal length, completion order, and replay. A seeded
+request's stream key folds its seed alone, an unseeded request's its lineage
+(``request_sampling_key`` there).
 """
 
 from __future__ import annotations

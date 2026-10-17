@@ -10,9 +10,11 @@ everywhere. The tensors of one forward are parameters of its method.
 - :meth:`CausalLMRunner.decode` evaluates one token per row. It gathers
   each row's token, position and attention metadata from the slot state on
   the device, runs the model, projects the final-position logits and writes
-  the greedy selection with its finish decision. Every value that changes
-  between forwards is the contents of a tensor, so the method is captured
-  into one CUDA graph per row bucket and launched without Python.
+  each row's selection with its finish decision: the greedy selection, or
+  each row sampled from its top-k candidates under its own parameters and
+  draw. Every value that changes between forwards is the contents of a
+  tensor, so the method is captured into two CUDA graphs per row bucket,
+  one per selection, and launched without Python.
 - :meth:`CausalLMRunner.commit` installs a forward's accepted selections
   into the slot state; it is captured per row bucket the same way.
 - :meth:`CausalLMRunner.prefill` evaluates rows of any length (prompt
@@ -22,8 +24,11 @@ everywhere. The tensors of one forward are parameters of its method.
   position. It is captured per row and token bucket.
 - :meth:`CausalLMRunner.sample`, :meth:`CausalLMRunner.sample_top_k` and
   :meth:`CausalLMRunner.sample_greedy` select tokens from the logits a
-  forward projected, for tasks that do not use the greedy selection of
-  ``decode``: one call per group of tasks sharing a sampler.
+  forward projected, for tasks whose selection ``decode`` does not make:
+  one call per group of tasks sharing a sampler. ``sample_top_k`` is the
+  sampler ``decode`` captures; ``sample`` and ``sample_greedy`` apply what
+  the caller knows on the host (token sets, logit biases, draft tokens,
+  reported logprobs).
   :meth:`CausalLMRunner.verify` projects every position of a verification
   forward and selects with speculative acceptance, and
   :meth:`CausalLMRunner.prompt_logprobs` scores prompt tokens. These run
@@ -75,6 +80,7 @@ from uniserve.sampling.select import (
     select_top_k,
 )
 from uniserve.sampling.state import commit as commit_state
+from uniserve.sampling.top_k import sample_top_k
 
 __all__ = ["CausalLMRunner"]
 
@@ -434,10 +440,13 @@ class CausalLMRunner:
         prefixes: Sequence[int],
         starts: Sequence[int],
         expert_capacity: int,
+        candidates: int,
         slots: torch.Tensor,
         force_finish: torch.Tensor,
         finish_ids: torch.Tensor,
         logits: torch.Tensor,
+        draws: torch.Tensor,
+        params: torch.Tensor,
         completion: torch.Tensor,
         continuation: torch.Tensor,
         tagged: torch.Tensor,
@@ -448,10 +457,13 @@ class CausalLMRunner:
 
         Each row's token, position and cache are those of its slot; a row
         of slot 0 is padding. The forward writes every row's final-position
-        logits and its greedy selection: the token, whether the selection
-        is valid, whether the slot continues, and whether it finishes,
-        which it does when forced or when the token is one of the row's
-        finish ids.
+        logits and its selection: the token, whether the selection is
+        valid, whether the slot continues, and whether it finishes, which
+        it does when forced or when the token is one of the row's finish
+        ids. Without ``candidates`` the selection is greedy; with them each
+        row samples from its top-k candidates under its parameter row and
+        draw, its penalties reading its slot's committed token counts
+        (:func:`~uniserve.sampling.top_k.sample_top_k`).
 
         Args:
             rows: Rows evaluated, padding included.
@@ -462,11 +474,17 @@ class CausalLMRunner:
             expert_capacity: The agreed per-rank token capacity of the
                 expert step this forward runs as; zero for a model without
                 expert-parallel layers.
+            candidates: Candidates each row samples among, or zero for the
+                greedy selection.
             slots: ``[R]`` int64 request slots.
             force_finish: ``[R]`` uint8, rows that finish whatever they
                 select.
             finish_ids: ``[R, F]`` int64 finish tokens, padded with -1.
             logits: ``[R, local vocab]`` output, the final-position logits.
+            draws: ``[T]`` float32, each row's uniform draw (read with
+                ``candidates``).
+            params: ``[T, PARAMETER_COLUMNS]`` float32, each row's sampling
+                parameters (read with ``candidates``).
             completion: ``[4, R]`` int64 output: valid, active, token,
                 accepted drafts (zero).
             continuation: ``[R]`` uint8 output, the row continues.
@@ -502,9 +520,22 @@ class CausalLMRunner:
                     - 1
                 ).clamp_min(0)
                 values = self._project(hidden, indices, rows, logits[:rows])
-                maxima, tokens = greedy(values, self._vocab)
+                if int(candidates):
+                    tokens, valid = sample_top_k(
+                        self._gathered(values),
+                        draws[:rows],
+                        params[:rows],
+                        int(candidates),
+                        self._penalty_counts,
+                        slots[:rows],
+                    )
+                    # Every tensor-parallel rank installs the source rank's
+                    # selection.
+                    self._broadcast(tokens)
+                else:
+                    maxima, tokens = greedy(values, self._vocab)
+                    valid = torch.isfinite(maxima)
 
-                valid = torch.isfinite(maxima)
                 active = self._predicates.index_select(0, slots[:rows])
                 eligible = valid & active
                 listed = tokens.unsqueeze(1).eq(finish_ids[:rows]).any(dim=1)
@@ -812,13 +843,8 @@ class CausalLMRunner:
         self,
         first: int,
         rows: Sequence[int],
-        top_k: int,
+        candidates: int,
         parameters: int,
-        min_p_rows: Sequence[int],
-        logprob_tasks: Sequence[int],
-        logprob_counts: Sequence[int],
-        logprob_ids: Sequence[int],
-        logprob_offset: int,
         force_finish: Sequence[int],
         finish_ids: Sequence[int],
         transition_ids: Sequence[int],
@@ -831,19 +857,16 @@ class CausalLMRunner:
         tagged: torch.Tensor,
         points: torch.Tensor,
         transition: torch.Tensor,
-        logprobs: torch.Tensor,
     ) -> None:
-        """Sample each task of a group from its ``top_k`` largest logits.
+        """Sample each task of a group from its top-k candidates.
 
-        The group's tasks share the width ``top_k`` and take no token
-        masks, penalties or biases. ``parameters`` is the group's first row
-        of ``draws`` (``[T]`` float32) and ``params`` (``[T, 8]`` float32),
-        one row per task. ``min_p_rows`` names the tasks with a
-        minimum-probability cutoff. ``logprob_tasks`` names the tasks that
-        report logprobs: each its top ``logprob_counts`` entry and its row
-        of ``logprob_ids`` (row-major, padded with -1), packed into
-        ``logprobs`` from ``logprob_offset`` on. The other arguments are
-        those of :meth:`sample_greedy`.
+        The selection :meth:`decode` captures, run eagerly over the logits
+        of any forward. Each task's shaping is decided by its row of
+        ``params`` (``[T, PARAMETER_COLUMNS]`` float32) alone, its penalties
+        reading its slot's committed token counts; ``parameters`` is the
+        group's first row of ``params`` and ``draws`` (``[T]`` float32), one
+        row per task. ``candidates`` bounds every sampled task's top-k
+        width. The other arguments are those of :meth:`sample_greedy`.
         """
         first, count, parameters = int(first), len(rows), int(parameters)
         with torch.inference_mode(), self._context.activate():
@@ -852,10 +875,9 @@ class CausalLMRunner:
                 draws[parameters : parameters + count],
                 params[parameters : parameters + count],
                 self._active(tasks, first, count),
-                int(top_k),
-                min_p_rows=min_p_rows,
-                logprob_tasks=logprob_tasks,
-                logprob_requests=_requests(logprob_counts, logprob_ids),
+                int(candidates),
+                counts=self._penalty_counts,
+                slots=tasks[0, first : first + count],
                 force_finish=force_finish,
                 finish_ids=finish_ids,
                 transition_ids=transition_ids,
@@ -870,10 +892,6 @@ class CausalLMRunner:
                 points,
                 transition,
             )
-            if selection.logprobs is not None:
-                packed = selection.logprobs
-                offset = int(logprob_offset)
-                logprobs[offset : offset + int(packed.numel())].copy_(packed)
 
     def _select(
         self,
@@ -1031,8 +1049,15 @@ class CausalLMRunner:
                 penalties, and ``penalty_slots`` the request slot of each,
                 whose committed token counts the penalties read.
             bias: Scatter indices of the additive offsets ``bias_values``.
+            draws: ``[T]`` float32 uniform draws and ``params`` ``[T,
+                PARAMETER_COLUMNS]`` float32 parameters, one row per task
+                from row ``parameters`` on.
+            logprob_tasks: The tasks that report logprobs: each its top
+                ``logprob_counts`` entries and its row of ``logprob_ids``
+                (row-major, padded with -1), packed into ``logprobs`` from
+                ``logprob_offset`` on.
 
-        The other arguments are those of :meth:`sample_top_k`.
+        The other arguments are those of :meth:`sample_greedy`.
         """
         with torch.inference_mode(), self._context.activate():
             counts = (1,) * len(rows)
