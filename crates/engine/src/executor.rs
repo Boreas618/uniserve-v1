@@ -15,7 +15,6 @@
 //! slot, same-host slots, and whether products cross hosts) and the consumer
 //! slots stated on each producing call.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -420,7 +419,7 @@ pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
     pub output: uniserve_ipc::RequestOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
-    pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, String>,
+    pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, uniserve_core::SharedMediaError>,
 }
 
 /// A decoded physical result that owns media before routing or rank validation.
@@ -562,6 +561,12 @@ pub(crate) fn logical_result(
 }
 
 /// Dynamic error returned while polling or administering an executor.
+///
+/// Callers report executor failures rather than match them: the scheduler
+/// fails the affected calls and logs the error chain. The failures it acts
+/// on travel inside as typed errors and are recovered by downcasting: a
+/// worker's loss (`WorkerFailure`), a rank's execution error
+/// (`WorkerExecError`) and inputs no worker can route (`UnroutableInputs`).
 pub type ExecutorError = anyhow::Error;
 
 /// Backpressure and terminal failures returned by logical batch submission.

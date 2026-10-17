@@ -1,11 +1,11 @@
 //! CUDA events: completion fences, timing and interprocess handles.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use crate::driver::{CUDA_ERROR_NOT_READY, Handle, RawIpcEventHandle, driver, in_context};
 use crate::stream::{CaptureStatus, Retention};
-use crate::{DeviceId, Error, PrimaryContext, Result, Stream};
+use crate::{DeviceId, Error, PrimaryContext, Result, Stream, lock};
 
 const CU_EVENT_DISABLE_TIMING: u32 = 2;
 const CU_EVENT_INTERPROCESS: u32 = 4;
@@ -49,6 +49,8 @@ pub(crate) struct EventHandle {
 // SAFETY: CUDA event handles may be used from any host thread. The handle is
 // shared through Arc so every driver call holds it alive; only Drop destroys it.
 unsafe impl Send for EventHandle {}
+// SAFETY: as for Send above; shared references only pass the immutable
+// handles to thread-safe driver calls.
 unsafe impl Sync for EventHandle {}
 
 impl EventHandle {
@@ -110,10 +112,7 @@ impl Event {
     }
 
     pub(crate) fn current(&self) -> Option<Arc<EventHandle>> {
-        self.current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        lock(&self.current).clone()
     }
 
     fn driver_flags(&self) -> u32 {
@@ -145,7 +144,7 @@ impl Event {
             0
         };
 
-        let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut current = lock(&self.current);
         let handle = match &mut *current {
             Some(handle) if handle.context == stream.context() => handle,
             slot => {
@@ -223,8 +222,9 @@ impl Event {
         let end = end.current().ok_or(Error::NotRecorded)?;
         let driver = driver()?;
         let mut milliseconds = 0.0;
-        // SAFETY: both handles are live while the Arcs are held.
         driver.check(
+            // SAFETY: both handles are live while the Arcs are held; the driver
+            // writes one float to the local `milliseconds`.
             unsafe { (driver.event_elapsed_time)(&mut milliseconds, start.raw, end.raw) },
             "cuEventElapsedTime_v2",
         )?;

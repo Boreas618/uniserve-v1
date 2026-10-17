@@ -245,10 +245,10 @@ impl Profiler {
         match phase {
             Phase::Start => {
                 std::fs::create_dir_all(&self.config.output_dir).map_err(|error| {
-                    Error::Transport(format!(
-                        "creating {}: {error}",
-                        self.config.output_dir.display()
-                    ))
+                    Error::transport_source(
+                        format!("creating {}", self.config.output_dir.display()),
+                        error,
+                    )
                 })?;
                 let calls = Job::new();
                 calls.call_handle(self.start_call());

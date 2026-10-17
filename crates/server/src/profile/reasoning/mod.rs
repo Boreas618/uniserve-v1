@@ -9,8 +9,6 @@
 //! `serving::omni::output` configures it from a profile's
 //! `OutputFilterPolicy`.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 mod delimited;
 mod gemma4;
 mod qwen3;

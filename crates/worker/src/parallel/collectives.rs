@@ -1,7 +1,7 @@
 //! Stream-ordered NCCL collectives.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use tvm_ffi::{Any, AnyView};
 
@@ -10,7 +10,7 @@ use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
 
 use crate::config::Device;
 use crate::ffi::Interpreter;
-use crate::{CUDAStream, Error, Result};
+use crate::{CUDAStream, Error, Result, lock};
 
 /// The library class over one communicator's collective functions.
 const NATIVE_COLLECTIVES: &str = "uniserve.distributed.collectives.NativeCollectives";
@@ -293,7 +293,6 @@ impl StreamCommunicator {
 
     /// Close collectively after all borrowed graph and tensor accesses retire.
     /// Aborted execution retains handles, mappings and streams until process exit.
-    #[allow(clippy::mem_forget)]
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let Some(resources) = self.resources.take() else {
             return Ok(());
@@ -307,26 +306,24 @@ impl StreamCommunicator {
 
         // Without a completed destroy, the communicator, its transfer stream
         // and its context reference stay alive until process exit.
-        let retain = |transfer: CUDAStream| std::mem::forget(transfer);
-
         if aborted {
-            std::mem::forget(communicator);
-            retain(transfer);
+            crate::leak(communicator);
+            crate::leak(transfer);
             return Ok(());
         }
 
         if let Err(error) = transfer.synchronize() {
-            std::mem::forget(communicator);
-            retain(transfer);
+            crate::leak(communicator);
+            crate::leak(transfer);
             return Err(error);
         }
         // A failed destroy leaks the communicator's remaining resources.
         if let Err(error) = communicator.destroy() {
-            retain(transfer);
+            crate::leak(transfer);
             return Err(error.into());
         }
         if let Err(error) = transfer.close(false) {
-            retain(transfer);
+            crate::leak(transfer);
             return Err(error);
         }
         Ok(())
@@ -455,7 +452,7 @@ impl StreamCollectives {
                     bytes
                         .as_slice()
                         .try_into()
-                        .map_err(|_| Error::Transport("an NCCL unique id has 128 bytes".into()))?,
+                        .map_err(|_| Error::transport("an NCCL unique id has 128 bytes"))?,
                 )
             };
             // SAFETY: forwarded from the caller.
@@ -499,7 +496,7 @@ impl StreamCollectives {
     pub fn close(&mut self, aborted: bool) -> Result<()> {
         let mut failure = None;
         for group in self.groups.drain(..) {
-            let mut comm = group.comm.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut comm = lock(&group.comm);
             if let Err(error) = comm.close(aborted) {
                 failure.get_or_insert(error);
             }
@@ -635,7 +632,7 @@ fn functions(group: &GroupComm) -> CollectiveFunctions {
     let function = |call: Box<Call>| {
         let comm = Arc::clone(&group.comm);
         tvm_ffi::Function::from_packed(move |args: &[AnyView<'_>]| {
-            let mut comm = comm.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut comm = lock(&comm);
             call(&mut comm, args).map_err(|error| {
                 tvm_ffi::Error::new(tvm_ffi::RUNTIME_ERROR, &error.to_string(), "")
             })
@@ -673,7 +670,7 @@ fn functions(group: &GroupComm) -> CollectiveFunctions {
                 .ok_or_else(|| {
                     Error::Invariant("an asynchronous collective has an event".into())
                 })?;
-                let mut tokens = tokens.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut tokens = lock(&tokens);
                 tokens.0 += 1;
                 let token = tokens.0;
                 tokens.1.insert(token, event);
@@ -688,9 +685,7 @@ fn functions(group: &GroupComm) -> CollectiveFunctions {
                 let [token, stream] = args else {
                     return Err(Error::Invalid("wait takes a token and a stream".into()));
                 };
-                let event = tokens
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
+                let event = lock(&tokens)
                     .1
                     .remove(&integer(token)?)
                     .ok_or_else(|| Error::Invalid("unknown collective token".into()))?;

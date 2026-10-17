@@ -1,7 +1,7 @@
 //! ExportBacking storage and retirement of registered transport exports.
 
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use uniserve_cuda::Event;
 
@@ -11,7 +11,7 @@ use super::{
     notify,
 };
 use crate::host::HostAction;
-use crate::{Error, EventPool, Outcome, Result};
+use crate::{Error, EventPool, Outcome, Result, lock};
 use std::time::Instant;
 
 /// A device's VMM export pool, shared by the exports placed in it.
@@ -76,7 +76,7 @@ impl TransportBuffer {
     }
 
     fn lock(&self) -> MutexGuard<'_, ExportBacking> {
-        self.backing.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.backing)
     }
 
     /// The exported spans a process-local reader borrows.
@@ -143,12 +143,7 @@ impl TransportBuffer {
                     .grants
                     .as_ref()
                     .map(|grants| (Arc::clone(grants), source.export.clone()));
-                pool.lock().unwrap_or_else(PoisonError::into_inner).retire(
-                    chunk,
-                    &source.consumers,
-                    &source.event,
-                    grant,
-                )?;
+                lock(pool).retire(chunk, &source.consumers, &source.event, grant)?;
             }
         }
 
@@ -186,11 +181,7 @@ impl TransportBuffer {
             }
         };
         drop(copied);
-        let bytes = self
-            .bytes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let bytes = lock(&self.bytes).take();
         bytes.map_or(Ok(()), ByteReservation::release)
     }
 }
@@ -209,7 +200,7 @@ impl SourceRetirement {
         if let Some(completion) = &self.completion {
             let outcome = match &result {
                 Ok(()) => Ok(()),
-                Err(error) => Err(Error::Transport(format!(
+                Err(error) => Err(Error::transport(format!(
                     "transport storage retirement failed: {error}"
                 ))),
             };

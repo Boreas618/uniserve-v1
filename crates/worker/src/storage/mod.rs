@@ -26,7 +26,7 @@ pub use products::{
 };
 
 pub(crate) use latent::{LatentCache, Scratch};
-pub(crate) use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate};
+pub(crate) use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};
 pub(crate) use output::{OutputLease, OutputPool};
 pub use pinned_pool::PinnedPool;
 pub(crate) use prefix_cache::block_tables::{AttentionRow, TablePages, table_pages};

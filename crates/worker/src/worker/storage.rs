@@ -169,11 +169,10 @@ impl RequestStorage for RankStorage {
         }
     }
 
-    #[allow(clippy::mem_forget)]
     fn close(&mut self, aborted: bool) -> Result<()> {
         if aborted {
             // Device work may still address the pool and the staging.
-            std::mem::forget(self.prefix_cache.take());
+            crate::leak(self.prefix_cache.take());
             return Ok(());
         }
         // Revoke every published product, stop the imports reading through

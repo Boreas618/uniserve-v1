@@ -669,9 +669,10 @@ impl ProductStore {
                 }
                 for export in &value.exports {
                     if let Some(crate::Outcome::Failed(error)) = export.outcome() {
-                        return Err(Error::Transport(format!(
-                            "product export retirement failed: {error}"
-                        )));
+                        return Err(Error::transport_source(
+                            "product export retirement failed",
+                            error,
+                        ));
                     }
                 }
             }

@@ -337,7 +337,7 @@ mod tests {
     use crate::executor::PendingOutput;
     use crate::ffi::DType;
     use crate::request::RequestProgress;
-    use crate::storage::LatentUpdate;
+    use crate::storage::{LatentUpdate, TrajectoryVersion};
     use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 
     const SLOT: usize = 1;
@@ -432,11 +432,13 @@ mod tests {
         pool.apply_updates(&[update]);
         let bank = pool.current_bank(
             SLOT,
-            0,
-            1,
-            3,
-            16,
-            16,
+            &TrajectoryVersion {
+                step: 0,
+                generation: 1,
+                units: 3,
+                height: 16,
+                width: 16,
+            },
             &pages.iter().map(|&page| page as usize).collect::<Vec<_>>(),
         )?;
         let mut next = 0.0_f32;
@@ -527,7 +529,14 @@ mod tests {
         }
         adopt(&mut target, &input, None)?;
         assert!(input.adopted());
-        assert_eq!(target.current_bank(SLOT, 0, 2, 3, 16, 16, &[3, 1])?, 0);
+        let adopted = TrajectoryVersion {
+            step: 0,
+            generation: 2,
+            units: 3,
+            height: 16,
+            width: 16,
+        };
+        assert_eq!(target.current_bank(SLOT, &adopted, &[3, 1])?, 0);
         assert_eq!(
             values(&target_storage, 0, &[3, 1])?,
             (0..9).map(|value| value as f32).collect::<Vec<_>>()

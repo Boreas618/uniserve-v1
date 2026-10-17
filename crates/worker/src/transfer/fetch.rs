@@ -152,7 +152,7 @@ pub fn start(reads: &[Arc<Read>]) -> Result<()> {
     reads.iter().try_for_each(|read| read.start())
 }
 
-/// Read `region` of `tensor` into `destination`: [`plan`] then [`submit`],
+/// Read `region` of `tensor` into `destination`: `plan` then `submit`,
 /// whose caller starts the reads.
 pub fn fetch_tensor(
     tensor: &TensorTransfer,

@@ -1,7 +1,5 @@
 //! Claim semantics of `SharedMedia` exports.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::sync::Arc;
 use uniserve_core::{MediaSource, SharedMedia};
 
@@ -35,5 +33,6 @@ fn a_truncated_export_is_rejected_and_releases_its_named_storage() {
     // object: the rejected export does not retain named storage.
     // SAFETY: export completed every write and handed off ownership.
     assert!(unsafe { SharedMedia::open(&locator.name, 6) }.is_err());
+    // SAFETY: as above; nothing writes the export after its publisher finished.
     assert!(unsafe { SharedMedia::open(&locator.name, 5) }.is_err());
 }

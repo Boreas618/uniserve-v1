@@ -30,6 +30,8 @@ impl SharedMemory {
             return Err(io::Error::last_os_error());
         }
 
+        // SAFETY: shm_open succeeded, so `descriptor` is a new open descriptor that
+        // nothing else owns; the returned `File` becomes its only owner.
         Ok(unsafe { File::from_raw_fd(descriptor) })
     }
 
@@ -73,6 +75,7 @@ impl SharedMemory {
         // Reserve tmpfs pages before exposing a writable mapping. A sparse
         // allocation can otherwise raise SIGBUS during a later mapped write.
         // posix_fallocate returns its error number directly, without errno.
+        // SAFETY: `file` keeps the descriptor open for the call, which takes no pointers.
         let error = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
         if error != 0 {
             return Err(io::Error::from_raw_os_error(error));

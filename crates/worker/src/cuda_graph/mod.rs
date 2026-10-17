@@ -31,17 +31,17 @@ mod pool;
 mod shape_key;
 mod table;
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use tvm_ffi::Any;
 use uniserve_cuda::{GraphExec, Stream};
 
 use crate::ffi::Handle;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 pub use pool::GraphPool;
 pub(crate) use pool::{GraphStorage, graph_storage_budget_bytes, reserve_pools};
-pub(crate) use shape_key::{PrefillShape, ShapeKey, TextShapes, prefill_shapes};
+pub(crate) use shape_key::{PrefillShape, ShapeKey, TextForward, TextShapes, prefill_shapes};
 pub(crate) use table::{GraphTable, Lookup};
 
 /// How one numerical invocation ran.
@@ -78,15 +78,12 @@ pub(crate) struct GraphBreaks(Arc<Mutex<Vec<GraphBreak>>>);
 impl GraphBreaks {
     /// Note the break between the segment that just ended and the next.
     pub(crate) fn note(&self, work: GraphBreak) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(work);
+        lock(&self.0).push(work);
     }
 
     /// The breaks noted since the last call, in capture order.
     pub(crate) fn take(&self) -> Vec<GraphBreak> {
-        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        std::mem::take(&mut *lock(&self.0))
     }
 }
 

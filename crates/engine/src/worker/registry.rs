@@ -307,8 +307,6 @@ impl RankRegistry {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use super::*;
 
     /// Connects to the head and registers as one rank of launch `generation`.

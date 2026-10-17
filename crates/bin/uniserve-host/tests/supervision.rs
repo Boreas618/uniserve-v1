@@ -5,7 +5,8 @@
 //! `uniserve-host` binary against it, and exchanges the launcher's frames:
 //! its registration, instructions to the launcher, and reservation replies
 //! and rank exit reports back.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+#![cfg(test)]
 
 use std::collections::HashMap;
 use std::net::TcpStream;

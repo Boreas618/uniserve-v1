@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 
 use uniserve_ipc::Wake;
 
-use crate::{Completion, Error, Outcome, Result};
+use crate::{Completion, Error, Outcome, Result, lock};
 
 /// A one-shot observer of a host task's result.
 pub(crate) type HostCallback = Box<dyn FnOnce() + Send>;
@@ -51,7 +51,7 @@ pub(crate) struct HostTask<A: HostAction> {
 
 impl<A: HostAction> HostTask<A> {
     fn state(&self) -> MutexGuard<'_, TaskState<A>> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     pub(crate) fn configure(&self, action: A) -> Result<()> {
@@ -59,7 +59,7 @@ impl<A: HostAction> HostTask<A> {
             .lane
             .upgrade()
             .ok_or(Error::State("host task is no longer admitted"))?;
-        let lane = lane.lock().unwrap_or_else(PoisonError::into_inner);
+        let lane = lock(&lane);
         let mut state = self.state();
 
         if lane.closed || state.phase != Phase::Reserved {
@@ -78,7 +78,7 @@ impl<A: HostAction> HostTask<A> {
             .lane
             .upgrade()
             .ok_or(Error::State("host task is no longer admitted"))?;
-        let mut lane = lane.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut lane = lock(&lane);
         let mut state = self.state();
 
         if lane.closed || state.phase == Phase::Finished {
@@ -102,9 +102,7 @@ impl<A: HostAction> HostTask<A> {
     /// work. Running actions keep their capacity and input leases to completion.
     pub(crate) fn cancel(self: &Arc<Self>, abandon: bool) -> Result<bool> {
         let lane = self.lane.upgrade();
-        let mut lane = lane
-            .as_ref()
-            .map(|lane| lane.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut lane = lane.as_ref().map(|lane| lock(lane));
         let mut state = self.state();
 
         if matches!(state.phase, Phase::Running | Phase::Finished)
@@ -134,10 +132,6 @@ impl<A: HostAction> HostTask<A> {
     /// Release the action's inputs once their physical producer stopped. An
     /// unknown completion retains the action, and its inputs, for process
     /// teardown, independently of the task's result.
-    #[expect(
-        clippy::mem_forget,
-        reason = "unknown device completion cannot release a borrowed input"
-    )]
     fn release_input(&self) -> Result<()> {
         let Some(action) = self.state().action.take() else {
             return Ok(());
@@ -145,7 +139,7 @@ impl<A: HostAction> HostTask<A> {
         match action.input_outcome() {
             Outcome::Success(()) => action.release(),
             Outcome::Failed(_) | Outcome::Cancelled => {
-                std::mem::forget(action);
+                crate::leak(action);
                 Ok(())
             }
         }
@@ -214,7 +208,7 @@ impl<A: HostAction> HostTask<A> {
 
     fn remove(self: &Arc<Self>) -> Option<Wake> {
         let lane = self.lane.upgrade()?;
-        let mut lane = lane.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut lane = lock(&lane);
         lane.tasks.remove(&(Arc::as_ptr(self) as usize));
         lane.wake.clone()
     }
@@ -274,7 +268,7 @@ impl<A: HostAction> HostLane<A> {
                 Ok(thread) => threads.push(thread),
                 Err(error) => {
                     {
-                        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut state = lock(&state);
                         state.closed = true;
                         state.ready.notify_all();
                     }
@@ -295,7 +289,7 @@ impl<A: HostAction> HostLane<A> {
     }
 
     fn state(&self) -> MutexGuard<'_, LaneState<A>> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     pub(crate) fn set_wake(&self, wake: Option<Wake>) {
@@ -354,8 +348,7 @@ impl<A: HostAction> HostLane<A> {
             }
         }
         self.state().ready.notify_all();
-        let threads =
-            std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
+        let threads = std::mem::take(&mut *lock(&self.threads));
         for thread in threads {
             if thread.thread().id() == thread::current().id() {
                 errors.push(Error::State("host worker cannot join itself"));
@@ -380,10 +373,9 @@ impl<A: HostAction> Drop for HostLane<A> {
 fn run_worker<A: HostAction>(state: Arc<Mutex<LaneState<A>>>, ready: Arc<Condvar>) {
     loop {
         let mut state = ready
-            .wait_while(
-                state.lock().unwrap_or_else(PoisonError::into_inner),
-                |state| state.queue.is_empty() && !state.closed,
-            )
+            .wait_while(lock(&state), |state| {
+                state.queue.is_empty() && !state.closed
+            })
             .unwrap_or_else(PoisonError::into_inner);
         let Some(task) = state.queue.pop_front() else {
             return;
@@ -464,9 +456,7 @@ mod tests {
     #[test]
     fn inputs_of_an_unknown_completion_outlive_the_lane() -> Result<()> {
         assert!(!retained_after_close(Outcome::Success(()))?);
-        let unknown = Arc::new(Error::Transport(
-            "device access could not be drained".into(),
-        ));
+        let unknown = Arc::new(Error::transport("device access could not be drained"));
         assert!(retained_after_close(Outcome::Failed(unknown))?);
         assert!(retained_after_close(Outcome::Cancelled)?);
         Ok(())

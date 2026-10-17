@@ -162,11 +162,10 @@ impl JoinGraphs {
 
     /// Release the graphs after every stream they were launched on drained. An
     /// aborted close keeps them (and the storage they address) until exit.
-    #[allow(clippy::mem_forget)]
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let graphs = std::mem::take(&mut self.graphs);
         if aborted {
-            std::mem::forget(graphs);
+            crate::leak(graphs);
             return Ok(());
         }
         let mut failure = None;

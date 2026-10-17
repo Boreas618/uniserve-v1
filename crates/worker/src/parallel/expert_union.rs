@@ -64,7 +64,7 @@ use crate::stream::Streams;
 use crate::transfer::PeerStorage;
 use crate::warmup::WarmupHooks;
 use crate::worker::LoadedModel;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// The library module of expert exchanges.
 const MODULE: &str = "uniserve.distributed.experts";
@@ -241,7 +241,6 @@ impl ExpertUnion {
     /// and binding using them retired. Transport close is collective over
     /// the union; an aborted close never waits on peers and keeps every
     /// resource until the process exits.
-    #[allow(clippy::mem_forget)]
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         if std::mem::replace(&mut self.closed, true) {
             return Ok(());
@@ -263,7 +262,7 @@ impl ExpertUnion {
         if let Some(lanes) = &mut self.lanes {
             if aborted {
                 // A thread may be blocked on a failed peer.
-                std::mem::forget(self.lanes.take());
+                crate::leak(self.lanes.take());
             } else {
                 record(lanes.close());
             }
@@ -277,7 +276,7 @@ impl ExpertUnion {
         }
         let peers = std::mem::take(&mut self.microbatches);
         if aborted {
-            std::mem::forget(peers);
+            crate::leak(peers);
             return failure.map_or(Ok(()), Err);
         }
         for mut peer in peers {
@@ -461,9 +460,7 @@ impl ExpertUnion {
                     device,
                     bytes as usize,
                     start.node,
-                    &host
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    &lock(&host),
                 )?)
             } else {
                 None

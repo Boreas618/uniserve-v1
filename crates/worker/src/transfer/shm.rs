@@ -148,10 +148,11 @@ impl SharedBuffer {
         let size = SHM_HEADER_BYTES
             .checked_add(bytes.max(1))
             .ok_or_else(|| Error::Invalid("shared buffer is too large".into()))?;
-        let (storage, file) =
-            SharedMemory::create(size).map_err(|error| Error::Transport(error.to_string()))?;
+        let (storage, file) = SharedMemory::create(size)
+            .map_err(|error| Error::transport_source("creating a shared buffer", error))?;
         let mapping = Arc::new(
-            SharedMapping::new(&file, size).map_err(|error| Error::Transport(error.to_string()))?,
+            SharedMapping::new(&file, size)
+                .map_err(|error| Error::transport_source("mapping a shared buffer", error))?,
         );
 
         // Fresh POSIX storage is zero-filled: readiness is PENDING and all
@@ -295,15 +296,13 @@ impl SharedBuffer {
 }
 
 impl Drop for SharedBuffer {
-    #[expect(
-        clippy::mem_forget,
-        reason = "unknown device completion must retain its registered mapping"
-    )]
     fn drop(&mut self) {
+        // After a failed close the producer's completion is unknown: the
+        // registered mapping and its storage stay until the process exits.
         if self.close().is_err() {
-            std::mem::forget(self.registration.take());
-            std::mem::forget(Arc::clone(&self.mapping));
-            std::mem::forget(self.storage.take());
+            crate::leak(self.registration.take());
+            crate::leak(Arc::clone(&self.mapping));
+            crate::leak(self.storage.take());
         }
     }
 }
@@ -337,7 +336,7 @@ impl SharedRead {
                 Error::Invalid("shared buffer is no longer available".into())
             }
             io::ErrorKind::InvalidInput => Error::Invalid(error.to_string()),
-            _ => Error::Transport(error.to_string()),
+            _ => Error::transport_source("opening a shared buffer", error),
         })?;
         mapping
             .word(ACK_OFFSET + slot * size_of::<u32>())

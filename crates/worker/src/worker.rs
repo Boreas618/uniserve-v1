@@ -663,8 +663,7 @@ impl Worker {
             record(closed.map_err(WorkerError::from));
             if aborted {
                 // Batches may still reference device work.
-                #[allow(clippy::mem_forget)]
-                std::mem::forget(executor);
+                crate::leak(executor);
             }
         }
         self.graphs.close();
@@ -679,10 +678,8 @@ impl Worker {
             record(world.close(aborted).map_err(WorkerError::from));
         }
         if aborted {
-            #[allow(clippy::mem_forget)]
-            std::mem::forget(self.model.take());
-            #[allow(clippy::mem_forget)]
-            std::mem::forget(self.context.take());
+            crate::leak(self.model.take());
+            crate::leak(self.context.take());
         } else {
             // The model is released before the context its tensors live in.
             self.model = None;
@@ -1055,7 +1052,10 @@ fn vision_feature_bytes(model: &LoadedModel, model_dtype: &str) -> Result<u64> {
 }
 
 /// Resolve the rank's capacity on the loaded model.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the loaded rank's owners that capacity planning reads"
+)]
 fn plan(
     launch: &WorkerLaunch,
     config: &mut WorkerConfig,
@@ -1335,7 +1335,10 @@ fn exports_device_products(launch: &WorkerLaunch) -> bool {
 
 /// The layout of a video rank: request slots sized by every rank's storage
 /// for that many resident requests, agreed over the group.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the placement, model and capacity facts a video rank's layout reads"
+)]
 fn video_layout(
     report: Report,
     config: &mut WorkerConfig,

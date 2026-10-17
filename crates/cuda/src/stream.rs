@@ -59,6 +59,8 @@ pub struct Stream {
 // references only submit work or query state; destruction happens once, when
 // the last handle drops.
 unsafe impl Send for Stream {}
+// SAFETY: as for Send above; methods of a shared reference pass the immutable
+// handles only to thread-safe driver calls.
 unsafe impl Sync for Stream {}
 
 /// A driver stream this process created, destroyed on drop.
@@ -71,6 +73,8 @@ struct Created {
 // SAFETY: as for `Stream`; the driver accepts `cuStreamDestroy` from any host
 // thread.
 unsafe impl Send for Created {}
+// SAFETY: as for Send above; nothing reads the handle through a shared
+// reference, and only Drop passes it to the driver.
 unsafe impl Sync for Created {}
 
 impl Created {
@@ -139,8 +143,9 @@ impl Stream {
         let raw = raw as Handle;
         let driver = driver()?;
         let mut context = std::ptr::null_mut();
-        // SAFETY: the caller guarantees the stream is live.
         driver.check(
+            // SAFETY: the caller guarantees the stream is live; the driver writes
+            // its context to the local `context`.
             unsafe { (driver.stream_get_ctx)(raw, &mut context) },
             "cuStreamGetCtx",
         )?;
@@ -192,8 +197,9 @@ impl Stream {
         let driver = driver()?;
         let priority = self.priority()?;
         let mut green = std::ptr::null_mut();
-        // SAFETY: self is a live stream.
         driver.check(
+            // SAFETY: self is a live stream; the driver writes one handle to the
+            // local `green`.
             unsafe { (driver.stream_get_green_ctx)(self.raw, &mut green) },
             "cuStreamGetGreenCtx",
         )?;
@@ -214,8 +220,9 @@ impl Stream {
                 )
             })?;
         } else {
-            // SAFETY: the green context is live while self's retention is.
             driver.check(
+                // SAFETY: the green context is live while self's retention is; the
+                // driver writes the new stream to the local `raw`.
                 unsafe {
                     (driver.green_ctx_stream_create)(
                         &mut raw,
@@ -268,8 +275,9 @@ impl Stream {
     pub fn priority(&self) -> Result<i32> {
         let driver = driver()?;
         let mut priority = 0;
-        // SAFETY: self is a live stream; the driver writes one int.
         driver.check(
+            // SAFETY: self is a live stream; the driver writes one int to the local
+            // `priority`.
             unsafe { (driver.stream_get_priority)(self.raw, &mut priority) },
             "cuStreamGetPriority",
         )?;
@@ -280,8 +288,9 @@ impl Stream {
     pub fn is_partitioned(&self) -> Result<bool> {
         let driver = driver()?;
         let mut green = std::ptr::null_mut();
-        // SAFETY: self is a live stream; the driver writes one handle.
         driver.check(
+            // SAFETY: self is a live stream; the driver writes one handle to the
+            // local `green`.
             unsafe { (driver.stream_get_green_ctx)(self.raw, &mut green) },
             "cuStreamGetGreenCtx",
         )?;
@@ -300,8 +309,9 @@ impl Stream {
     pub fn capture_status(&self) -> Result<CaptureStatus> {
         let driver = driver()?;
         let mut status = 0;
-        // SAFETY: self is a live stream; the driver writes one enum value.
         driver.check(
+            // SAFETY: self is a live stream; the driver writes one enum value to
+            // the local `status`.
             unsafe { (driver.stream_is_capturing)(self.raw, &mut status) },
             "cuStreamIsCapturing",
         )?;

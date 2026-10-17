@@ -77,7 +77,7 @@ impl AllocationHandle {
             Self::Fabric(bytes) => Ok(ShareableHandle::Fabric(*bytes)),
             Self::Descriptor(_) => fetch_descriptor(endpoint, export)
                 .map(ShareableHandle::Descriptor)
-                .map_err(|error| Error::Transport(error.to_string())),
+                .map_err(|error| Error::transport_source("fetching an export's descriptor", error)),
         }
     }
 }

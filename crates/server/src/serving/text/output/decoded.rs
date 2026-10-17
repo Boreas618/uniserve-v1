@@ -90,14 +90,11 @@ pub enum DecodedTextEvent {
     },
     /// Newly decoded text and token metadata.
     ///
-    /// With intermediate output enabled, each non-terminal update covers the
-    /// tokens of one engine output event: one generated token, or a block of
-    /// tokens committed together (its text may be empty while the decoder
-    /// holds bytes back). The terminal update carries the flushed remainder
-    /// of the text and, when a stop string ended the stream, the tokens of
-    /// the event up to the matching one. Without intermediate output, a
-    /// single terminal update carries the complete text, token IDs, and
-    /// logprobs.
+    /// Each non-terminal update covers the tokens of one engine output event:
+    /// one generated token, or a block of tokens committed together (its text
+    /// may be empty while the decoder holds bytes back). The terminal update
+    /// carries the flushed remainder of the text and, when a stop string
+    /// ended the stream, the tokens of the event up to the matching one.
     TextDelta {
         /// Newly visible decoded text.
         delta: String,
@@ -112,8 +109,7 @@ pub enum DecodedTextEvent {
 
 /// Result of decoding one generated token.
 struct ArDecode {
-    /// Newly visible text; empty unless intermediate output is enabled and no
-    /// stop string matched.
+    /// Newly visible text; empty when a stop string matched.
     delta: String,
     /// Matched stop string and the byte offset of its start in
     /// `IncrementalDecoder::output`.
@@ -136,10 +132,6 @@ struct DecodeState<'a> {
     pending_token: Option<u32>,
     /// Generated text tokens consumed by the decoder.
     output_token_count: usize,
-    /// Token IDs and logprobs held for the single terminal update when
-    /// intermediate output is disabled.
-    accumulated_token_ids: Vec<u32>,
-    accumulated_logprobs: Option<DecodedLogprobs>,
 }
 
 impl DecodeState<'_> {
@@ -193,30 +185,20 @@ impl DecodeState<'_> {
     /// tokens received so far, the decoder has been flushed and truncated at
     /// the match, and the terminal `TextDelta`, covering the tokens through
     /// the matching one, has been yielded, so the caller must end the stream.
-    /// Otherwise the tokens are acknowledged to the engine and, with
-    /// intermediate output, yielded as one `TextDelta`.
-    #[allow(clippy::too_many_arguments)]
+    /// Otherwise the tokens are acknowledged to the engine and yielded as one
+    /// `TextDelta`.
     async fn consume_tokens(
         &mut self,
         tokenizer: &HuggingFaceTokenizer,
         prompt_token_count: usize,
         token_ids: &[u32],
         positions: Vec<PositionLogprobs>,
-        intermediate: bool,
         raw_stream: &mut EventRx,
         y: &mut TryYielder<DecodedTextEvent, Error>,
     ) -> Result<bool, Error> {
         let decoded_logprobs = (!positions.is_empty())
             .then(|| decode_logprobs(tokenizer, &positions, self.options.skip_special_tokens))
             .transpose()?;
-        if !intermediate && let Some(logprobs) = decoded_logprobs.as_ref() {
-            self.accumulated_logprobs
-                .get_or_insert_with(|| DecodedLogprobs {
-                    positions: Vec::new(),
-                })
-                .positions
-                .extend_from_slice(&logprobs.positions);
-        }
 
         let mut delta = String::new();
         for (index, &token_id) in token_ids.iter().enumerate() {
@@ -225,12 +207,8 @@ impl DecodeState<'_> {
                 token_id,
                 self.output_token_count,
                 &mut self.options,
-                intermediate,
             )?;
             self.output_token_count = self.output_token_count.saturating_add(1);
-            if !intermediate {
-                self.accumulated_token_ids.push(token_id);
-            }
             delta.push_str(&decoded.delta);
             let Some((stop_string, offset)) = decoded.stop else {
                 continue;
@@ -247,25 +225,12 @@ impl DecodeState<'_> {
                 offset
             });
             // `last_chunk` is the not-yet-emitted remainder of the truncated
-            // text; `text` is the complete truncated output.
-            let (last_chunk, text) = self.decoder.flush(truncate_to)?;
-            let (delta, token_ids, logprobs) = if intermediate {
-                (
-                    delta + last_chunk.unwrap_or_default().as_str(),
-                    token_ids[..=index].to_vec(),
-                    decoded_logprobs,
-                )
-            } else {
-                (
-                    text,
-                    std::mem::take(&mut self.accumulated_token_ids),
-                    self.accumulated_logprobs.take(),
-                )
-            };
+            // text.
+            let (last_chunk, _) = self.decoder.flush(truncate_to)?;
             y.yield_ok(DecodedTextEvent::TextDelta {
-                delta,
-                token_ids,
-                logprobs,
+                delta: delta + last_chunk.unwrap_or_default().as_str(),
+                token_ids: token_ids[..=index].to_vec(),
+                logprobs: decoded_logprobs,
                 finished: Some(Finished {
                     prompt_token_count,
                     output_token_count: self.output_token_count,
@@ -280,15 +245,13 @@ impl DecodeState<'_> {
             return Ok(true);
         }
         raw_stream.acknowledge_consumed_prefix();
-        if intermediate {
-            y.yield_ok(DecodedTextEvent::TextDelta {
-                delta,
-                token_ids: token_ids.to_vec(),
-                logprobs: decoded_logprobs,
-                finished: None,
-            })
-            .await;
-        }
+        y.yield_ok(DecodedTextEvent::TextDelta {
+            delta,
+            token_ids: token_ids.to_vec(),
+            logprobs: decoded_logprobs,
+            finished: None,
+        })
+        .await;
         Ok(false)
     }
 }
@@ -303,7 +266,6 @@ fn decode_one_token(
     token_id: u32,
     output_token_count: usize,
     options: &mut TextDecodeOptions,
-    intermediate: bool,
 ) -> Result<ArDecode, Error> {
     let new_bytes = decoder.push_token(token_id)?;
     let stop = if output_token_count + 1 > options.min_tokens as usize {
@@ -317,7 +279,7 @@ fn decode_one_token(
     } else {
         None
     };
-    let delta = if intermediate && stop.is_none() {
+    let delta = if stop.is_none() {
         decoder.next_chunk().unwrap_or_default()
     } else {
         String::new()
@@ -328,9 +290,8 @@ fn decode_one_token(
 /// Decodes one canonical generation event stream into text-runtime events.
 ///
 /// On success the stream yields exactly one `DecodedTextEvent::Start`, then
-/// `TextDelta` updates, the last of which carries `finished`. `intermediate`
-/// selects one update per generated token instead of a single accumulated
-/// terminal update. When `generated_logprobs_requested` is set, every
+/// `TextDelta` updates, one per engine output event, the last of which
+/// carries `finished`. When `generated_logprobs_requested` is set, every
 /// `TextToken` must be followed by a `TokenLogprobs` event for the same token
 /// whose first candidate is that token.
 ///
@@ -343,7 +304,6 @@ fn decode_one_token(
 /// protocol, [`Error::StreamClosedBeforeTerminalOutput`] when the channel
 /// closes without a terminal event, and a tokenizer error when decoding
 /// fails.
-#[allow(clippy::too_many_arguments)]
 #[try_stream]
 pub async fn decoded_text_event_stream(
     request_id: String,
@@ -353,7 +313,6 @@ pub async fn decoded_text_event_stream(
     generated_logprobs_requested: bool,
     mut raw_stream: EventRx,
     decode_options: TextDecodeOptions,
-    intermediate: bool,
     mut y: TryYielder<DecodedTextEvent, Error>,
 ) -> crate::serving::text::Result<()> {
     // The prompt seeds incremental decoding and supplies the expected prompt-
@@ -381,8 +340,6 @@ pub async fn decoded_text_event_stream(
         started: false,
         pending_token: None,
         output_token_count: 0,
-        accumulated_token_ids: Vec::new(),
-        accumulated_logprobs: None,
     };
 
     // Engine events form an ordered protocol: scheduling and optional prompt
@@ -467,7 +424,6 @@ pub async fn decoded_text_event_stream(
                         prompt_token_count,
                         &[id],
                         Vec::new(),
-                        intermediate,
                         &mut raw_stream,
                         &mut y,
                     )
@@ -508,7 +464,6 @@ pub async fn decoded_text_event_stream(
                         prompt_token_count,
                         &ids,
                         Vec::new(),
-                        intermediate,
                         &mut raw_stream,
                         &mut y,
                     )
@@ -541,7 +496,6 @@ pub async fn decoded_text_event_stream(
                         vec![PositionLogprobs {
                             entries: candidates,
                         }],
-                        intermediate,
                         &mut raw_stream,
                         &mut y,
                     )
@@ -580,16 +534,7 @@ pub async fn decoded_text_event_stream(
                 // Release the decoder's holdback untruncated: a stop-string
                 // match would have ended the stream in `consume_token`.
                 let (last_chunk, text) = state.decoder.flush(None)?;
-                let full_text = tracing::enabled!(Level::TRACE).then(|| text.clone());
-                let (delta, token_ids, logprobs) = if intermediate {
-                    (last_chunk.unwrap_or_default(), Vec::new(), None)
-                } else {
-                    (
-                        text,
-                        std::mem::take(&mut state.accumulated_token_ids),
-                        state.accumulated_logprobs.take(),
-                    )
-                };
+                let full_text = tracing::enabled!(Level::TRACE).then_some(text);
 
                 debug!(
                     ?finish_reason,
@@ -601,9 +546,9 @@ pub async fn decoded_text_event_stream(
                 }
 
                 y.yield_ok(DecodedTextEvent::TextDelta {
-                    delta,
-                    token_ids,
-                    logprobs,
+                    delta: last_chunk.unwrap_or_default(),
+                    token_ids: Vec::new(),
+                    logprobs: None,
                     finished: Some(Finished {
                         prompt_token_count,
                         output_token_count: completion_tokens,

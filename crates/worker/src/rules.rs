@@ -23,6 +23,7 @@ use uniserve_core::video::plan::{
 use uniserve_core::video::presentation::{self, Segment, Tokenizer};
 use uniserve_core::{Canvas, VideoTask};
 
+use crate::error::report;
 use crate::ffi::{integer_list, integers, is_none, list};
 
 type Result<T> = tvm_ffi::Result<T>;
@@ -73,7 +74,7 @@ fn rejection(error: VideoInputError) -> Result<Any> {
 fn video_canvas(aspect_width: f64, aspect_height: f64) -> Result<Array<Any>> {
     plan::canvas(aspect_width, aspect_height)
         .map(canvas_values)
-        .map_err(|message| value_error(&message))
+        .map_err(|error| value_error(&error.to_string()))
 }
 
 /// `video_frame_count(seconds, max_seconds) -> frames`: the generated frame
@@ -82,7 +83,7 @@ fn video_frame_count(seconds: f64, max_seconds: Option<f64>) -> Result<i64> {
     let max_seconds = max_seconds.unwrap_or(MAX_VIDEO_SECONDS);
     plan::video_frame_count(seconds, max_seconds)
         .map(i64::from)
-        .map_err(|message| value_error(&message))
+        .map_err(|error| value_error(&error.to_string()))
 }
 
 /// `video_aspect_ratios() -> [width, height, ...]`: the named aspect ratios
@@ -143,7 +144,7 @@ fn video_named_canvas(
 /// a checkpoint's image and video processor configs.
 fn video_vision_config(image: tvm_ffi::String, video: tvm_ffi::String) -> Result<Array<Any>> {
     let config = VisionConfig::read(Path::new(image.as_str()), Path::new(video.as_str()))
-        .map_err(|message| value_error(&message))?;
+        .map_err(|error| value_error(&report(&error)))?;
     let sizes = [
         config.image_min_pixels,
         config.image_max_pixels,

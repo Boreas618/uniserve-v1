@@ -110,12 +110,11 @@ impl<K: Eq + Hash + std::fmt::Debug> GraphTable<K> {
     /// the first failure. The caller has drained the streams that replay
     /// them. An aborted close keeps the Python graphs (and the inputs and
     /// pools they address) referenced until the process exits.
-    #[allow(clippy::mem_forget)]
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let graphs = std::mem::take(&mut self.graphs);
         self.sealed = true;
         if aborted {
-            std::mem::forget(graphs);
+            crate::leak(graphs);
             return Ok(());
         }
         let mut failure = None;

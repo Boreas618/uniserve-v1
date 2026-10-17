@@ -206,6 +206,9 @@ pub enum ModelResolutionError {
     /// Required numerical checkpoint metadata is missing or contradictory.
     #[error("invalid media checkpoint contract: {0}")]
     MediaContract(String),
+    /// The conditioner's processor configs cannot be read or disagree.
+    #[error("invalid media checkpoint contract")]
+    VisionConfig(#[source] uniserve_core::video::plan::VisionConfigError),
     /// A token-generating model has no chat-template resource.
     #[error("text-generation model requires a chat template")]
     MissingTemplate,
@@ -312,7 +315,7 @@ impl ModelConfig {
                     processor.push(pipeline.component_file("processor", name).await?);
                 }
                 let vision = VisionConfig::read(&processor[0], &processor[1])
-                    .map_err(ModelResolutionError::MediaContract)?;
+                    .map_err(ModelResolutionError::VisionConfig)?;
                 let model = Self::from_pipeline(
                     &served_name,
                     description,
@@ -883,7 +886,10 @@ impl InputProcessor {
     /// Returns `ServeError::UnsupportedFeature` from feature validation and
     /// `ServeError::Tokenize` for every failure during tokenization, validation, and resource
     /// sizing.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the validated fields of one generation request"
+    )]
     pub(super) fn preprocess_generation(
         &self,
         request_id: crate::serving::ServeRequestId,
@@ -1249,8 +1255,6 @@ fn stable_hash(value: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use std::fs;
 
     use serde_json::json;

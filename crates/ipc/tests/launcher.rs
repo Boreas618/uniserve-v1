@@ -1,7 +1,7 @@
 //! The launcher's registration, instructions and reports cross a channel as
 //! frames.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::collections::HashMap;
 

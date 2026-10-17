@@ -135,17 +135,24 @@ pub(crate) fn task_calls(task: VideoTask) -> Vec<MediaCall> {
         .collect()
 }
 
+/// A request whose product extent exceeds the protocol's `u32` dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the request's {quantity} exceed the protocol's extents")]
+pub(crate) struct ExtentError {
+    /// What the extent counts, in the request's terms ("condition pixels").
+    quantity: &'static str,
+}
+
 impl VideoGraph {
     /// Builds the graph of a request that passed `DiffusionRequest::validate`.
     ///
     /// # Errors
     ///
-    /// Returns a message when a product extent does not fit the protocol's
-    /// `u32` dimensions.
-    pub(crate) fn new(request: &DiffusionRequest) -> Result<Self, String> {
-        let extent = |name: &str, value: u64| {
-            u32::try_from(value)
-                .map_err(|_| format!("the request's {name} exceed the protocol's extents"))
+    /// Returns [`ExtentError`] when a product extent does not fit the
+    /// protocol's `u32` dimensions.
+    pub(crate) fn new(request: &DiffusionRequest) -> Result<Self, ExtentError> {
+        let extent = |quantity: &'static str, value: u64| {
+            u32::try_from(value).map_err(|_| ExtentError { quantity })
         };
         let conditions = &request.conditions;
         let pixels: u64 = conditions

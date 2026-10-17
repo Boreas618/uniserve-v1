@@ -63,7 +63,7 @@ use crate::request::video::{VideoLayout, VideoSize};
 use crate::runner::denoiser::image::ImageDenoiser;
 use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{RequestSlots, SlotField};
+use crate::storage::{RequestSlots, SlotField, TrajectoryVersion};
 use crate::stream::{Fill, Issue};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
 
@@ -1111,15 +1111,14 @@ impl DenoiserRunner {
         let video = self.family.video_mut()?;
         let pages = video.slot_pages(slot, params)?;
         let step = i64::from(params.start_step);
-        let read = video.pool.current_bank(
-            slot,
+        let trajectory = TrajectoryVersion {
             step,
-            step + 1,
-            i64::from(params.latent_units),
-            i64::from(params.height),
-            i64::from(params.width),
-            &pages,
-        )?;
+            generation: step + 1,
+            units: i64::from(params.latent_units),
+            height: i64::from(params.height),
+            width: i64::from(params.width),
+        };
+        let read = video.pool.current_bank(slot, &trajectory, &pages)?;
         let write = 1 - read;
         video.pool.require_writable(write, &pages)?;
         let first = pages[0] as u64;
@@ -2071,9 +2070,10 @@ struct SizingMethods {
 
 /// A video model's facts and sizing rules.
 ///
-/// FIXME: admission and planning size a request before any runner of its
-/// layout exists, so the facts record and the sizing functions are held
-/// here apart from `DenoiserRunner`; they go with the fact records.
+/// Admission and capacity planning size a request before any runner of its
+/// layout exists, so the facts and the sizing functions live in this record
+/// rather than in a `DenoiserRunner`. Planning, admission and the runners
+/// read them through its read-only methods.
 pub(crate) struct VideoModel {
     /// The component of the deployment's video denoiser.
     pub(crate) denoiser: String,

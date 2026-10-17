@@ -43,7 +43,7 @@ mod job;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -52,7 +52,7 @@ use uniserve_ipc::{CallKind, LaneConfig, Wake};
 
 use crate::ffi::Interpreter;
 use crate::stream::CUDAStream;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 pub(crate) use job::{Capture, ExpertStep, ExpertVariant, Job, Recorder, Value};
 pub(crate) use job::{Completion, JobId, JobQueue};
@@ -80,7 +80,7 @@ impl Lane {
         std::thread::Builder::new()
             .name(format!("lane-{index}"))
             .spawn(move || queue.run())
-            .map_err(|error| Error::Transport(format!("execution thread: {error}")))?;
+            .map_err(|error| Error::transport_source("execution thread", error))?;
 
         Ok(Self {
             config,
@@ -217,17 +217,11 @@ impl JobQueues {
     }
 
     fn arrived(&self) -> std::sync::MutexGuard<'_, VecDeque<(JobId, Completion)>> {
-        self.shared
-            .arrived
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        lock(&self.shared.arrived)
     }
 
     fn running(&self) -> std::sync::MutexGuard<'_, Vec<Running>> {
-        self.shared
-            .running
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        lock(&self.shared.running)
     }
 
     /// Note that job `id`, which calls `method`, was given to `performer`
@@ -448,10 +442,7 @@ impl JobQueues {
     }
 
     fn wake(&self) -> std::sync::MutexGuard<'_, Option<Wake>> {
-        self.shared
-            .wake
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        lock(&self.shared.wake)
     }
 
     /// The name of the next job.
@@ -541,7 +532,7 @@ mod tests {
         let notes = Arc::clone(notes);
         let job = Job::new();
         job.on(None).launch_host_fn(Box::new(move || {
-            let mut notes = notes.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut notes = lock(&notes);
             notes.push((name, std::thread::current().id()));
         }))?;
         Ok(job)
@@ -563,7 +554,7 @@ mod tests {
             assert_eq!(job, id);
             assert!(completion.check().is_ok());
         }
-        let notes = notes.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let notes = lock(&notes).clone();
         assert_eq!([notes[0].0, notes[1].0], ["first", "second"]);
         assert_ne!(notes[0].1, here);
         assert_eq!(notes[1].1, notes[0].1);
@@ -641,7 +632,7 @@ mod tests {
         let (job, completion) = next(&queues);
         assert_eq!(job, id);
         completion.check().map_err(|failure| failure.error)?;
-        let notes = notes.lock().unwrap_or_else(PoisonError::into_inner);
+        let notes = lock(&notes);
         assert_eq!(notes[..], [("job", here)]);
         Ok(())
     }

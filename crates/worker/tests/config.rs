@@ -1,7 +1,7 @@
 //! Launch descriptor resolution.
 
 #![recursion_limit = "256"]
-#![allow(clippy::unwrap_used)]
+#![cfg(test)]
 
 use serde_json::{Value, json};
 use uniserve_cuda::DeviceId;

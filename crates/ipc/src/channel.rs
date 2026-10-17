@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::error::{IpcError, IpcResult};
+use crate::error::{EncodingError, IpcError, IpcResult, TransportError};
 use crate::frame::Frame;
 
 /// The prefix of a Unix socket address; the rest is the socket's path.
@@ -55,8 +55,8 @@ const UNIX_PREFIX: &str = "unix:";
 pub const DEAD_PEER_SECS: libc::c_int = 60;
 
 /// Wraps an IO failure with what the channel was doing.
-fn transport(action: &str, error: std::io::Error) -> IpcError {
-    IpcError::Transport(format!("{action}: {error}"))
+fn transport(action: impl Into<std::borrow::Cow<'static, str>>, error: std::io::Error) -> IpcError {
+    IpcError::Transport(TransportError::io(action, error))
 }
 
 /// A connected stream of either kind.
@@ -194,7 +194,7 @@ impl FrameReader {
     /// Returns whether the peer closed the connection. Fails on a read error
     /// and on a close that leaves a partial frame; frames completed before
     /// the failure stay in `ready`.
-    fn fill(&mut self, stream: &mut Stream) -> IpcResult<bool> {
+    fn fill(&mut self, stream: &mut Stream) -> Result<bool, TransportError> {
         let mut chunk = [0u8; 64 * 1024];
         let mut closed = false;
         loop {
@@ -212,12 +212,12 @@ impl FrameReader {
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(error) => return Err(transport("reading a channel", error)),
+                Err(error) => return Err(TransportError::io("reading a channel", error)),
             }
         }
         if closed && !self.buffer.is_empty() {
-            return Err(IpcError::Transport(
-                "channel closed with an incomplete frame".into(),
+            return Err(TransportError::closed(
+                "channel closed with an incomplete frame",
             ));
         }
         Ok(closed)
@@ -257,12 +257,10 @@ impl FrameWriter {
     }
 
     /// Writes queued bytes until the queue empties or the socket would block.
-    fn flush(&mut self, stream: &mut Stream) -> IpcResult<()> {
+    fn flush(&mut self, stream: &mut Stream) -> Result<(), TransportError> {
         while let Some(frame) = self.pending.front() {
             match stream.write(&frame[self.offset..]) {
-                Ok(0) => {
-                    return Err(IpcError::Transport("channel closed while sending".into()));
-                }
+                Ok(0) => return Err(TransportError::closed("channel closed while sending")),
                 Ok(count) => {
                     self.offset += count;
                     if self.offset == frame.len() {
@@ -272,7 +270,7 @@ impl FrameWriter {
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
-                Err(error) => return Err(transport("sending on a channel", error)),
+                Err(error) => return Err(TransportError::io("sending on a channel", error)),
             }
         }
         Ok(())
@@ -398,14 +396,14 @@ pub struct Channel {
     bound: usize,
     /// Terminal failure, reported after the frames that arrived whole have
     /// been taken: an IO failure or the peer's close.
-    failure: Option<String>,
+    failure: Option<TransportError>,
     local: LocalWake,
 }
 
 impl Channel {
     /// Connects to a listening address.
     pub fn connect(address: &str) -> IpcResult<Self> {
-        let failed = |error| transport(&format!("connecting to {address}"), error);
+        let failed = |error| transport(format!("connecting to {address}"), error);
         let stream = match address.strip_prefix(UNIX_PREFIX) {
             Some(path) => Stream::Unix(UnixStream::connect(path).map_err(failed)?),
             None => Stream::Tcp(TcpStream::connect(address).map_err(failed)?),
@@ -479,13 +477,13 @@ impl Channel {
         let frame = Frame::encode(message)?.into_bytes();
         let length = frame.len() - Frame::LENGTH_BYTES;
         if length > self.bound {
-            return Err(IpcError::Encoding(format!(
-                "a message of {length} bytes exceeds the channel's {} byte bound",
-                self.bound
-            )));
+            return Err(IpcError::Encoding(EncodingError::Oversized {
+                length,
+                limit: self.bound,
+            }));
         }
         self.writer.pending.push_back(frame);
-        self.writer.flush(&mut self.stream)
+        Ok(self.writer.flush(&mut self.stream)?)
     }
 
     /// Takes the next message, if one has arrived.
@@ -633,13 +631,9 @@ impl Channel {
             return;
         }
         self.failure = match self.reader.fill(&mut self.stream) {
-            Ok(false) => self
-                .writer
-                .flush(&mut self.stream)
-                .err()
-                .map(|error| error.to_string()),
-            Ok(true) => Some("channel closed by its peer".into()),
-            Err(error) => Some(error.to_string()),
+            Ok(false) => self.writer.flush(&mut self.stream).err(),
+            Ok(true) => Some(TransportError::closed("channel closed by its peer")),
+            Err(error) => Some(error),
         };
     }
 }
@@ -696,7 +690,7 @@ enum Socket {
 
 impl Socket {
     fn bind(address: &str) -> IpcResult<Self> {
-        let failed = |error| transport(&format!("binding {address}"), error);
+        let failed = |error| transport(format!("binding {address}"), error);
         match address.strip_prefix(UNIX_PREFIX) {
             Some(path) => {
                 let listener = UnixListener::bind(path).map_err(failed)?;
@@ -827,7 +821,6 @@ impl Listener {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::{WorkerRequest, WorkerResponse, WorkerResponseError};
@@ -893,6 +886,8 @@ mod tests {
     fn restrict_send_buffer(channel: &Channel) {
         let capacity: libc::c_int = 4096;
         assert_eq!(
+            // SAFETY: the descriptor is the channel's open socket, and the option
+            // value points to the local `capacity`, whose size is the option length.
             unsafe {
                 libc::setsockopt(
                     channel.stream.as_raw_fd(),

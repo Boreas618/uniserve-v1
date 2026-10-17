@@ -78,8 +78,8 @@ impl DeviceId {
     pub fn count() -> Result<i32> {
         let driver = driver()?;
         let mut count = 0;
-        // SAFETY: the driver writes one int.
         driver.check(
+            // SAFETY: the driver writes one int to the local `count`.
             unsafe { (driver.device_get_count)(&mut count) },
             "cuDeviceGetCount",
         )?;
@@ -90,8 +90,9 @@ impl DeviceId {
     pub(crate) fn handle(self) -> Result<i32> {
         let driver = driver()?;
         let mut device = 0;
-        // SAFETY: the driver writes one CUdevice and validates the ordinal.
         driver.check(
+            // SAFETY: the driver writes one CUdevice to the local `device` and
+            // validates the ordinal.
             unsafe { (driver.device_get)(&mut device, self.0) },
             "cuDeviceGet",
         )?;
@@ -102,8 +103,9 @@ impl DeviceId {
         let driver = driver()?;
         let device = self.handle()?;
         let mut value = 0;
-        // SAFETY: the driver writes one int for a valid attribute and device.
         driver.check(
+            // SAFETY: the driver writes one int to the local `value` for a valid
+            // attribute and device.
             unsafe { (driver.device_get_attribute)(&mut value, attribute as i32, device) },
             "cuDeviceGetAttribute",
         )?;
@@ -114,8 +116,8 @@ impl DeviceId {
         let driver = driver()?;
         let device = self.handle()?;
         let mut bytes = [0; 16];
-        // SAFETY: the driver writes the 16-byte CUuuid.
         driver.check(
+            // SAFETY: the driver writes the 16-byte CUuuid to the local `bytes`.
             unsafe { (driver.device_get_uuid)(&mut bytes, device) },
             "cuDeviceGetUuid_v2",
         )?;
@@ -127,8 +129,9 @@ impl DeviceId {
         let driver = driver()?;
         let (device, peer) = (self.handle()?, peer.handle()?);
         let mut accessible = 0;
-        // SAFETY: the driver writes one int.
         driver.check(
+            // SAFETY: the driver writes one int to the local `accessible` for two
+            // valid devices.
             unsafe { (driver.device_can_access_peer)(&mut accessible, device, peer) },
             "cuDeviceCanAccessPeer",
         )?;
@@ -140,8 +143,9 @@ impl DeviceId {
         let _guard = DeviceGuard::new(self)?;
         let driver = driver()?;
         let (mut free, mut total) = (0, 0);
-        // SAFETY: the driver writes two size_t values for the current context.
         driver.check(
+            // SAFETY: the driver writes two size_t values to the locals `free` and
+            // `total` for the context the guard made current.
             unsafe { (driver.mem_get_info)(&mut free, &mut total) },
             "cuMemGetInfo_v2",
         )?;

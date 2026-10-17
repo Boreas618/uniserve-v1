@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use uniserve_core::TokenLogprob;
@@ -19,7 +19,7 @@ use crate::ffi::{Backing, DType, MemoryKind};
 use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Issue;
 use crate::transfer::{Spans, copy_planner};
-use crate::{Error, EventPool, Result};
+use crate::{Error, EventPool, Result, lock};
 
 mod logprobs;
 
@@ -691,10 +691,7 @@ impl OutputPool {
         let mut retired = 0;
         let mut index = 0;
         while index < self.active.len() {
-            let mut buffer = self.active[index]
-                .0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut buffer = lock(&self.active[index].0);
             if !buffer.retired() {
                 index += 1;
                 continue;
@@ -848,12 +845,12 @@ impl crate::executor::lifecycle::RequestStorage for OutputPool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::{Arc, Mutex};
 
     use super::{OutputBuffer, OutputPool};
     use crate::ffi::{Backing, DType};
     use crate::storage::memory::{Memory, StorageView};
-    use crate::{EventPool, Result};
+    use crate::{EventPool, Result, lock};
 
     /// A host column holding `values`, as a CPU lane's sampler produces it.
     fn column(values: &[i64]) -> Result<StorageView> {
@@ -882,17 +879,14 @@ mod tests {
         value: i64,
     ) -> Result<Arc<Mutex<OutputBuffer>>> {
         let lease = pool.lease(1, words, &[], false)?;
-        lease
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .capture(&column(&vec![value; words])?, None, &EventPool::default())?;
+        lock(&lease).capture(&column(&vec![value; words])?, None, &EventPool::default())?;
         Ok(lease)
     }
 
     /// Complete a leased batch and give its words back: its copies finished
     /// and its row was observed.
     fn retire(lease: &Arc<Mutex<OutputBuffer>>) -> Result<Vec<i64>> {
-        let mut buffer = lease.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut buffer = lock(lease);
         // Host captures are sealed on no stream.
         buffer.seal::<&uniserve_cuda::Stream>(&[], &EventPool::default())?;
         buffer.copies_finished();

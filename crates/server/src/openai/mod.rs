@@ -10,12 +10,10 @@
 //! lives in `crate::serving` (`InputProcessor::preprocess_chat_request`); the
 //! resulting `RequestOutput` stream comes back here for response assembly.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 /// Chat-completion validation and response assembly.
 pub mod chat_completions;
 /// OpenAI-compatible API errors.
 pub mod error;
-/// Collection of image-generation output into the OpenAI response.
 pub mod images;
 /// Token log-probability response values.
 pub mod logprobs;

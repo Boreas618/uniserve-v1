@@ -2,7 +2,7 @@
 //! other threads run. A process has one interpreter, so this file holds one test
 //! and runs in a process of its own.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(test)]
 
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;

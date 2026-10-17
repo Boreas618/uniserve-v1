@@ -11,8 +11,17 @@ use uniserve_ipc::{ErrorCallIdentity, WorkerResponseError};
 /// Invalid submissions and operations on unavailable worker state.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("{0}")]
-    Transport(String),
+    /// A socket, thread, shared-memory object or peer exchange failed, or a
+    /// peer sent what its protocol does not allow. `source` is the error
+    /// that caused it, when one did.
+    #[error("{what}")]
+    Transport {
+        /// What failed.
+        what: String,
+        /// The failure that caused it.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     /// A CUDA driver or NCCL call failed.
     #[error(transparent)]
     Cuda(#[from] uniserve_cuda::Error),
@@ -60,6 +69,27 @@ pub enum Error {
 }
 
 impl Error {
+    /// A transport failure without an underlying error, such as a malformed
+    /// message from a peer.
+    pub fn transport(what: impl Into<String>) -> Self {
+        Self::Transport {
+            what: what.into(),
+            source: None,
+        }
+    }
+
+    /// A transport failure `source` caused while the worker was doing
+    /// `what`.
+    pub fn transport_source(
+        what: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Transport {
+            what: what.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+
     /// Wrap an error raised while calling `function` through TVM-FFI.
     pub fn numerical(function: &str, error: &tvm_ffi::Error) -> Self {
         Self::Numerical {
@@ -309,8 +339,21 @@ fn error_message(error: &Error) -> String {
             };
             format!("{function}: {message}")
         }
-        other => other.to_string(),
+        other => report(other),
     }
+}
+
+/// `error` and each of its sources, joined by `: `: the message of a
+/// failure whose cause travels as its source.
+pub(crate) fn report(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn traceback(error: &Error) -> Option<String> {
@@ -351,7 +394,7 @@ fn kind_code(error: &Error) -> ErrorCode {
             ErrorCode::UnsupportedSetup
         }
         Error::Invariant(_) => ErrorCode::InvariantViolation,
-        Error::Transport(_) | Error::Cuda(_) | Error::State(_) => ErrorCode::ComputeError,
+        Error::Transport { .. } | Error::Cuda(_) | Error::State(_) => ErrorCode::ComputeError,
         Error::Numerical { kind, .. } => numerical_code(kind),
     }
 }

@@ -88,7 +88,7 @@ pub fn test_tools() -> Vec<Tool> {
 /// tool-call deltas.
 ///
 /// Panics if there are any parsing errors along the way.
-#[allow(
+#[expect(
     clippy::unwrap_used,
     reason = "this assertion helper intentionally panics on parser failures"
 )]

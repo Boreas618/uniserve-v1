@@ -9,13 +9,10 @@
 //! it reads lifecycle state and waits for control commands on the client's
 //! `requests` registry itself.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 mod error;
 /// Generation request lowering and submission support.
 pub mod generation;
 mod in_process;
-/// Export engine statistics as serving metrics.
 pub mod metrics;
 pub(crate) mod requests;
 

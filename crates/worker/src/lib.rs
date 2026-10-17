@@ -17,8 +17,6 @@
 //! collectives, and the image runners. Everything else is internal to the
 //! rank runtime.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-
 mod capacity;
 mod completion;
 pub mod config;
@@ -73,6 +71,21 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keep `value`, and every resource it owns, until the process exits.
+///
+/// An aborted close, or a release whose device completion is unknown,
+/// cannot tell when device work, a DMA engine or a peer rank stops
+/// addressing what `value` owns: releasing it could hand memory, a mapping
+/// or a stream that is still in use to a new owner. The value is leaked
+/// instead, and process exit returns its resources to the driver.
+#[expect(
+    clippy::mem_forget,
+    reason = "resources whose last device access is unknown must outlive it"
+)]
+pub(crate) fn leak<T>(value: T) {
+    std::mem::forget(value);
 }
 
 /// The library's exported entry point, `main(argv, import) -> int`.

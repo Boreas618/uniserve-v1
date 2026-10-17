@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{
@@ -28,7 +28,7 @@ use crate::ffi::{
     Backing, DType, Function, Handle, Interpreter, MemoryKind, Tensor, contiguous_strides, export,
 };
 use crate::stream::{Fill, Issue};
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// One allocation owned by the worker.
 pub struct Memory {
@@ -73,10 +73,7 @@ impl Memory {
         let memory = Arc::new(Self {
             kind: Kind::Device(allocation),
         });
-        EXPORTABLE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(address, Arc::downgrade(&memory));
+        lock(&EXPORTABLE).insert(address, Arc::downgrade(&memory));
         Ok(memory)
     }
 
@@ -127,7 +124,7 @@ impl Memory {
     /// The live exportable allocation containing `address`, with the
     /// address's byte offset inside it.
     pub(crate) fn exportable_containing(address: u64) -> Option<(Arc<Self>, u64)> {
-        let registry = EXPORTABLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let registry = lock(&EXPORTABLE);
         let (&base, memory) = registry.range(..=address).next_back()?;
         let memory = memory.upgrade()?;
         (address < base + memory.bytes() as u64).then(|| (memory, address - base))
@@ -142,9 +139,9 @@ impl Memory {
     pub unsafe fn host_bytes(&self) -> Option<&[u8]> {
         match &self.kind {
             Kind::Device(_) | Kind::Mapped(_) => None,
-            // SAFETY: the buffer is owned by `self` and the caller excludes
-            // concurrent writers.
             Kind::Pinned(buffer) => {
+                // SAFETY: the buffer spans `len()` bytes and is owned by `self`, which
+                // the slice borrows; the caller excludes concurrent writers.
                 Some(unsafe { std::slice::from_raw_parts(buffer.as_ptr(), buffer.len()) })
             }
             Kind::Host(bytes) => Some(bytes),
@@ -157,7 +154,7 @@ impl Drop for Memory {
         if let Kind::Device(allocation) = &self.kind
             && allocation.handle_type().is_some()
         {
-            let mut registry = EXPORTABLE.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut registry = lock(&EXPORTABLE);
             // A new allocation may already reuse the address; remove only a
             // dead entry.
             if registry
@@ -205,7 +202,7 @@ impl Backing for Memory {
 /// checks that the window lies inside its allocation.
 ///
 /// A view and its clones are one tensor to Python: they share the torch
-/// tensor the view is wrapped as ([`Self::handle`]). A view derived from it
+/// tensor the view is wrapped as (`Self::handle`). A view derived from it
 /// (a prefix, a row, a region, a reshape) is another tensor, wrapped on its
 /// own; narrowing an axis to its whole extent returns the view itself.
 #[derive(Clone)]
@@ -575,7 +572,7 @@ impl StorageView {
 
     /// The view as a TVM-FFI tensor: a DLPack export retaining the
     /// allocation. Python callables receive the view's torch tensor instead
-    /// ([`Self::handle`]); a harness returns this export to its Python
+    /// (`Self::handle`); a harness returns this export to its Python
     /// caller.
     pub fn to_tensor(&self) -> Result<Tensor> {
         export(

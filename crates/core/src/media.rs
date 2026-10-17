@@ -16,8 +16,44 @@
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 use crate::SharedMemory;
+
+/// Why a shared-storage media export could not be claimed.
+///
+/// Operating-system failures carry their `io::Error` as the source, shared so
+/// that the error can be cloned with the call result that holds it.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum SharedMediaError {
+    /// The published length does not fit this host's address space.
+    #[error("generated media of {0} bytes is too large for this host")]
+    TooLarge(u64),
+    /// The locator is empty, has a `/` or a NUL in its name, or publishes
+    /// no bytes.
+    #[error("generated media has an invalid shared-storage locator")]
+    Locator,
+    /// The named object could not be opened.
+    #[error("failed to open generated media shared storage")]
+    Open(#[source] Arc<io::Error>),
+    /// The name could not be unlinked.
+    #[error("failed to claim generated media shared storage")]
+    Claim(#[source] Arc<io::Error>),
+    /// The object's size could not be read.
+    #[error("failed to inspect generated media shared storage")]
+    Inspect(#[source] Arc<io::Error>),
+    /// The object holds fewer bytes than its locator publishes.
+    #[error("generated media shared storage holds {extent} bytes, fewer than its {bytes}")]
+    Short {
+        /// Bytes the object holds.
+        extent: u64,
+        /// Bytes the locator publishes.
+        bytes: u64,
+    },
+    /// The published extent could not be mapped.
+    #[error("failed to map generated media shared storage")]
+    Map(#[source] Arc<io::Error>),
+}
 
 /// Read-only mapping of one claimed shared-memory media export.
 ///
@@ -30,10 +66,12 @@ pub struct SharedMedia {
     bytes: usize,
 }
 
-// The pointer refers to a `PROT_READ` mapping that no process writes after
-// export (the `open` contract) and that stays mapped until this value
-// drops, so moving or sharing it across threads cannot race.
+// SAFETY: the pointer refers to a `PROT_READ` mapping that no process writes
+// after export (the `open` contract) and that stays mapped until this value
+// drops, so moving it across threads cannot race.
 unsafe impl Send for SharedMedia {}
+// SAFETY: as for Send above; shared references only read the immutable
+// mapping, so access from several threads at once cannot race.
 unsafe impl Sync for SharedMedia {}
 
 impl SharedMedia {
@@ -52,42 +90,45 @@ impl SharedMedia {
     ///
     /// # Errors
     ///
-    /// Returns a message describing the first failed step.
+    /// Returns the [`SharedMediaError`] of the first failed step.
     ///
     /// # Safety
     ///
     /// The publisher must relinquish all writes and resizing before this call,
     /// and no process may modify the object while the mapping remains live.
-    pub unsafe fn open(name: &str, num_bytes: u64) -> Result<Self, String> {
-        let bytes = usize::try_from(num_bytes)
-            .map_err(|_| "generated media is too large for this host".to_string())?;
+    pub unsafe fn open(name: &str, num_bytes: u64) -> Result<Self, SharedMediaError> {
+        let bytes =
+            usize::try_from(num_bytes).map_err(|_| SharedMediaError::TooLarge(num_bytes))?;
 
         // Reject a malformed locator before touching any object: the name must
         // be one non-empty component (the leading `/` is added below), and a
         // export is never empty.
         if bytes == 0 || name.is_empty() || name.contains('/') {
-            return Err("generated media has an invalid shared-storage locator".to_string());
+            return Err(SharedMediaError::Locator);
         }
-        let canonical_name = CString::new(format!("/{name}"))
-            .map_err(|_| "generated media has an invalid shared-storage name".to_string())?;
+        let canonical_name =
+            CString::new(format!("/{name}")).map_err(|_| SharedMediaError::Locator)?;
         let file = SharedMemory::open(name, false)
-            .map_err(|error| format!("failed to open generated media shared storage: {error}"))?;
+            .map_err(|error| SharedMediaError::Open(Arc::new(error)))?;
 
         // Claim the name immediately; the descriptor retains the bytes even
         // if subsequent inspection or mapping fails.
+        // SAFETY: `canonical_name` is a NUL-terminated string that outlives the call.
         if unsafe { libc::shm_unlink(canonical_name.as_ptr()) } != 0 {
-            return Err(format!(
-                "failed to claim generated media shared storage: {}",
-                io::Error::last_os_error()
+            return Err(SharedMediaError::Claim(
+                Arc::new(io::Error::last_os_error()),
             ));
         }
 
         let extent = file
             .metadata()
-            .map_err(|error| format!("failed to inspect generated media shared storage: {error}"))?
+            .map_err(|error| SharedMediaError::Inspect(Arc::new(error)))?
             .len();
         if extent < num_bytes {
-            return Err("generated media shared storage is shorter than its locator".to_string());
+            return Err(SharedMediaError::Short {
+                extent,
+                bytes: num_bytes,
+            });
         }
 
         // SAFETY: descriptor names a readable shared-storage object of at least `bytes` bytes.
@@ -102,10 +143,7 @@ impl SharedMedia {
             )
         };
         if address == libc::MAP_FAILED {
-            return Err(format!(
-                "failed to map generated media shared storage: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(SharedMediaError::Map(Arc::new(io::Error::last_os_error())));
         }
         Ok(Self { address, bytes })
     }

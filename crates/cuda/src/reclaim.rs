@@ -22,11 +22,11 @@
 //! worker calls it last during shutdown.
 
 use std::sync::mpsc::{self, Sender, SyncSender};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use crate::driver::driver;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 const CU_STREAM_CAPTURE_MODE_RELAXED: i32 = 2;
 
@@ -41,7 +41,7 @@ enum Message {
 static FAILURES: Mutex<(usize, Option<Error>)> = Mutex::new((0, None));
 
 fn record(error: Error) {
-    let mut failures = FAILURES.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut failures = lock(&FAILURES);
     failures.0 += 1;
     failures.1.get_or_insert(error);
 }
@@ -112,7 +112,7 @@ pub fn flush() -> Result<()> {
         }
     }
 
-    let mut failures = FAILURES.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut failures = lock(&FAILURES);
     let (failed, first) = std::mem::take(&mut *failures);
     match first {
         Some(first) => Err(Error::Reclaim {
