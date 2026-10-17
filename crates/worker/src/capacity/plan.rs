@@ -176,6 +176,9 @@ pub(crate) struct Report {
     pub endpoint: WorkerEndpoint,
     pub device: String,
     pub transfer_backends: Vec<String>,
+    /// The rank publishes device products over CUDA VMM, which keeps an
+    /// export pool on its primary device.
+    pub device_exports: bool,
     pub fabric_handles: bool,
     pub attention_backend: String,
     pub supported_calls: Vec<CallKind>,
@@ -322,6 +325,7 @@ impl TokenLayout {
         queue_depth: usize,
         facts: &TokenFacts,
     ) -> Result<Self> {
+        let device_exports = report.device_exports;
         let mut info = base_info(report, config, queue_depth)?;
         let latent_bytes = facts
             .latent
@@ -358,11 +362,12 @@ impl TokenLayout {
             config.max_request_pool_size,
             product_scalar_bytes(),
             feature_bytes,
+            device_exports,
         )?;
         let mut fixed = BTreeMap::new();
         fixed.insert(
             config.device,
-            info.buffer_pool_bytes + arena.device_product_bytes + latent_bytes,
+            info.buffer_pool_bytes + arena.deferred_device_bytes() + latent_bytes,
         );
         info.host_lane_capacity = narrow(arena.host_lane_inflight, "host lane capacity")?;
         Ok(Self {
@@ -441,8 +446,11 @@ impl TokenLayout {
         let num_units = u32::try_from(capacity.num_units)
             .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
         self.info.prefix_cache = Some(cache.info(num_units));
-        // The arena's slot counts are independent of cache capacity; only its
-        // transfer byte reservation follows the fitted pool.
+        // The arena's slot counts and storage are independent of cache
+        // capacity; only its transfer byte budget follows the fitted pool,
+        // since one read may carry a whole pool's export. The budget is
+        // accounting: cache exports name the pages where they lie and
+        // occupy no storage of their own.
         self.arena.transfer_bytes = (capacity.num_units * cache.unit_bytes)
             .max(self.feature_bytes)
             .max(1)
@@ -473,6 +481,7 @@ pub(crate) fn request_layout(
     media: &MediaFacts,
     host_components: bool,
 ) -> Result<Plan> {
+    let device_exports = report.device_exports;
     let mut info = base_info(report, config, queue_depth)?;
     let slots = info.request_slots as usize;
     info.max_unresolved_calls = narrow(
@@ -496,6 +505,7 @@ pub(crate) fn request_layout(
         product_scalar_bytes(),
         media.local_product_bytes,
         media.artifact_import_regions,
+        device_exports,
     )?;
     info.host_lane_capacity = if host_components {
         1
@@ -515,12 +525,13 @@ pub(crate) fn request_layout(
 }
 
 /// This rank's storage for every candidate slot count from `minimum` to
-/// `maximum`: state, retained products, the product store and the latent
-/// pool of each count.
+/// `maximum`: state, retained products, the product store with its export
+/// pool (when `device_exports`) and the latent pool of each count.
 pub(crate) fn slot_requirements(
     config: &WorkerConfig,
     queue_depth: usize,
     media: &MediaFacts,
+    device_exports: bool,
     minimum: usize,
     maximum: usize,
 ) -> Result<Vec<u64>> {
@@ -534,6 +545,7 @@ pub(crate) fn slot_requirements(
             product_scalar_bytes(),
             media.local_product_bytes,
             0,
+            device_exports,
         )?;
         let latent_bytes = match media.stored_latent() {
             Some(plan) => {
@@ -555,7 +567,7 @@ pub(crate) fn slot_requirements(
         };
         requirements.push(
             count as u64 * (media.state_bytes + media.local_product_bytes)
-                + arena.device_product_bytes
+                + arena.deferred_device_bytes()
                 + latent_bytes,
         );
     }
@@ -585,6 +597,7 @@ mod tests {
             },
             device: "cuda:0".into(),
             transfer_backends: vec!["local".into()],
+            device_exports: false,
             fabric_handles: false,
             attention_backend: "auto".into(),
             supported_calls: vec![CallKind::Forward(uniserve_ipc::ForwardMode::Prefill)],
@@ -758,7 +771,7 @@ mod tests {
             stores_latent: false,
             artifact_import_regions: 0,
         };
-        let requirements = slot_requirements(&config, 12, &media, 2, 4).unwrap();
+        let requirements = slot_requirements(&config, 12, &media, false, 2, 4).unwrap();
         assert_eq!(requirements.len(), 3);
         assert!(requirements.windows(2).all(|pair| pair[0] < pair[1]));
         let plan = request_layout(
@@ -818,8 +831,9 @@ mod tests {
         // Only the denoising rank stores the pool.
         assert_eq!(denoising.latent, Some(pool));
         assert_eq!(other.latent, None);
-        let requirement =
-            |stores_latent| slot_requirements(&config, 12, &facts(stores_latent), 2, 2).unwrap()[0];
+        let requirement = |stores_latent| {
+            slot_requirements(&config, 12, &facts(stores_latent), false, 2, 2).unwrap()[0]
+        };
         assert!(requirement(false) < requirement(true));
     }
 }

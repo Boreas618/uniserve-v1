@@ -120,16 +120,39 @@ pub(crate) fn request_tensor_window(depth: usize, slots: usize) -> Result<usize>
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArenaCapacity {
     pub tensor_store: usize,
+    /// Device bytes the product store's relay arenas may take.
     pub device_product_bytes: u64,
+    /// The rank's transfer byte budget: bytes every export and read holds
+    /// until it retires, whether or not it occupies storage of its own.
     pub transfer_bytes: u64,
     pub transfer_tickets: usize,
+    /// Device bytes of the CUDA VMM export pool of the primary device, where
+    /// the relay arenas lie; zero for a rank that exports no device product
+    /// over CUDA VMM ([`export_pool_bytes`]).
+    pub export_pool_bytes: u64,
     pub host_lane_inflight: usize,
+}
+
+/// Device bytes of a CUDA VMM export pool beside `relay_bytes` of relay
+/// arenas.
+///
+/// The pool holds copies of the device products that do not lie in an
+/// exportable allocation. Cache pages, frozen cache exports, buffer-pool
+/// products and latent pages are exportable allocations, exported where they
+/// lie, so the pool never holds them and does not grow with them. What
+/// remains are the product store's relay scalars: at least one byte and at
+/// most eight each, so `relay_bytes` bounds how many are live, and each
+/// live scalar has at most one export, copied into a chunk of its own.
+pub(crate) fn export_pool_bytes(relay_bytes: u64) -> u64 {
+    crate::transfer::vmm::pool::pool_bytes(relay_bytes, size_of::<i64>())
 }
 
 impl ArenaCapacity {
     /// Tensor storage keeps six products per call and one batch beyond the
     /// submitted window until its last reader retires. Scalar backing comes
     /// from the numerical store's dtype schema, in bytes per product slot.
+    /// `device_exports` states whether the rank exports device products over
+    /// CUDA VMM.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_tokens(
         depth: usize,
@@ -137,23 +160,32 @@ impl ArenaCapacity {
         requests: usize,
         scalar_bytes: u64,
         transfer_bytes_per_read: u64,
+        device_exports: bool,
     ) -> Result<Self> {
         let window = call_window(depth, calls)?;
         let slots = depth * calls;
         let tensor_store = 6 * (slots + calls);
         let transfer_tickets = slots.min(256);
+        let device_product_bytes = product_bytes(tensor_store, requests, window, scalar_bytes);
 
         Ok(Self {
             tensor_store,
-            device_product_bytes: product_bytes(tensor_store, requests, window, scalar_bytes),
+            device_product_bytes,
             transfer_bytes: transfer_bytes_per_read.max(1) * transfer_tickets as u64,
             transfer_tickets,
+            export_pool_bytes: if device_exports {
+                export_pool_bytes(device_product_bytes)
+            } else {
+                0
+            },
             host_lane_inflight: 256,
         })
     }
 
     /// A media rank retains every local product in full. Read tickets also
     /// cover assembly across all producing ranks, including stateless ranks.
+    /// `device_exports` states whether the rank exports device products over
+    /// CUDA VMM.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_requests(
         depth: usize,
@@ -163,18 +195,31 @@ impl ArenaCapacity {
         scalar_bytes: u64,
         product_bytes_per_request: u64,
         concurrent_imports: usize,
+        device_exports: bool,
     ) -> Result<Self> {
         let window = request_tensor_window(depth, requests)?;
         let slots = (depth * calls).max(requests * concurrent_imports);
         let tensor_store = 6 * (slots + calls);
+        let device_product_bytes = product_bytes(tensor_store, requests, window, scalar_bytes);
 
         Ok(Self {
             tensor_store,
-            device_product_bytes: product_bytes(tensor_store, requests, window, scalar_bytes),
+            device_product_bytes,
             transfer_bytes: (requests as u64 * product_bytes_per_request).max(1),
             transfer_tickets: ranks.max(slots.min(256)),
+            export_pool_bytes: if device_exports {
+                export_pool_bytes(device_product_bytes)
+            } else {
+                0
+            },
             host_lane_inflight: requests * (window + 1),
         })
+    }
+
+    /// Device bytes the rank allocates on the primary device on first use,
+    /// beside what startup allocates: the relay arenas and the export pool.
+    pub(crate) fn deferred_device_bytes(&self) -> u64 {
+        self.device_product_bytes + self.export_pool_bytes
     }
 }
 

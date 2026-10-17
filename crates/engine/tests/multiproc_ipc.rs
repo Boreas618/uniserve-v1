@@ -3375,19 +3375,33 @@ fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Re
 }
 
 /// A real model's request continues on another worker from the prefix cache it
-/// installed: the target's greedy continuation of a prompt equals the
-/// source's token for token, since the installed pages hold the source's
-/// bytes. `UNISERVE_KV_INSTALL_MODEL` names the checkpoint and
+/// installed and the token the source sampled: the target's greedy
+/// continuation of a prompt equals the source's token for token, since the
+/// installed pages hold the source's bytes. Cache and token cross over shared
+/// memory and over CUDA VMM. Over CUDA VMM the source's pages are read where
+/// they lie, and the token, a relay scalar outside exportable storage, is
+/// copied into the source's export pool beside its cache pool of a served
+/// model's scale. `UNISERVE_KV_INSTALL_MODEL` names the checkpoint and
 /// `UNISERVE_KV_INSTALL_PROMPT` the prompt's token ids (a JSON list).
 #[test]
 #[ignore = "requires a CUDA device and the checkpoint UNISERVE_KV_INSTALL_MODEL names"]
 fn a_model_continues_greedily_from_installed_cache() -> anyhow::Result<()> {
+    // One mechanism at a time: each pair of workers holds two copies of the
+    // model on the device.
+    for edges in ["source->target=shm", "source->target=cuda_vmm"] {
+        continue_greedily_from_installed_cache(edges).with_context(|| edges.to_owned())?;
+    }
+    Ok(())
+}
+
+/// Prefill a prompt on the source, export its cache and its sampled token to
+/// the target over `edges`, install both there, and compare both workers'
+/// greedy continuations, the target's starting from the imported token.
+fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
     use uniserve_engine::{WorkerExecutor, WorkerId};
 
     let model = std::env::var("UNISERVE_KV_INSTALL_MODEL")?;
     let prompt: Vec<u32> = serde_json::from_str(&std::env::var("UNISERVE_KV_INSTALL_PROMPT")?)?;
-    // Shared memory reaches the target on this host.
-    let edges = "source->target=shm";
     let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
         let mut args = single_rank_args(worker_id, QUEUE_DEPTH);
         for rank in &mut args.ranks {
@@ -3481,34 +3495,110 @@ fn a_model_continues_greedily_from_installed_cache() -> anyhow::Result<()> {
 
     // Greedy continuations of the same prefix on both workers.
     let mut tokens = std::collections::BTreeMap::new();
+    let mut last = None;
     for (worker, unit, base) in [("source", 1, 10), ("target", 7, 20)] {
         let mut token = first;
         let mut sequence = Vec::new();
         for step in 0..4_u32 {
             let batch_id = u64::from(base + step);
-            let mut decode = token_batch(
-                batch_id,
-                batch_id,
-                key,
-                None,
-                CallId::new(batch_id, 0),
-                CallKind::Forward(ForwardMode::Decode),
-                &[token],
-                UnitId(unit),
-                n + step,
-            );
-            decode.calls[0].coordinates.logical_position = n + step;
-            executor.submit(place(decode, worker, Vec::new()))?;
-            let decoded = poll_logical(&mut executor)?.context("decode did not complete")?;
-            assert_eq!(decoded.results[0].output.status, CallStatus::Ok);
-            token = decoded.results[0].output.committed_tokens[0];
+            let (decoded, sampled) =
+                decode_step(&mut executor, worker, key, batch_id, token, unit, n + step)?;
+            token = decoded.committed_tokens[0];
             sequence.push(token);
+            if worker == "source" {
+                last = Some((token, sampled));
+            }
         }
         tokens.insert(worker, sequence);
+    }
+    let (last, sampled) = last.context("the source decoded")?;
+
+    // The source publishes its last token and the target copies it into its
+    // own relay; one more step on each worker continues from that token, the
+    // target's reading it from the device.
+    let published = TensorRef {
+        producer_call_id: CallId::new(14, 0),
+        generation: 14 * 4 + 1,
+        ..sampled.clone()
+    };
+    let publish = token_transfer(key, CallId::new(14, 0), "model", &sampled, &published);
+    executor.submit(place(
+        Batch::new(14, Vec::new(), vec![publish]),
+        "source",
+        Vec::new(),
+    ))?;
+    let exported = poll_logical(&mut executor)?.context("token export did not complete")?;
+    assert_eq!(exported.results[0].output.status, CallStatus::Ok);
+    let imported = TensorRef {
+        producer_call_id: CallId::new(24, 0),
+        generation: 24 * 4 + 1,
+        ..published.clone()
+    };
+    let copy = token_transfer(key, CallId::new(24, 0), "model", &published, &imported);
+    executor.submit(place(
+        Batch::new(24, Vec::new(), vec![copy]),
+        "target",
+        Vec::new(),
+    ))?;
+    let copied = poll_logical(&mut executor)?.context("token import did not complete")?;
+    assert_eq!(copied.results[0].output.status, CallStatus::Ok);
+
+    let position = n + 4;
+    let (source, _) = decode_step(&mut executor, "source", key, 15, last, 1, position)?;
+    let mut decode = decode_batch(key, 25, 0, 7, position);
+    decode.calls[0].input_token_ids.clear();
+    decode.calls[0].predicate = Some(imported);
+    executor.submit(place(decode, "target", Vec::new()))?;
+    let target = poll_logical(&mut executor)?.context("decode did not complete")?;
+    assert_eq!(target.results[0].output.status, CallStatus::Ok);
+    for (worker, output) in [("source", &source), ("target", &target.results[0].output)] {
+        if let Some(sequence) = tokens.get_mut(worker) {
+            sequence.push(output.committed_tokens[0]);
+        }
     }
     assert_eq!(tokens["source"], tokens["target"]);
     executor.close()?;
     Ok(())
+}
+
+/// A one-token decode of `key` at `position` on `worker`, in batch and call
+/// `batch_id`, over the request's unit `unit`.
+fn decode_batch(key: RequestKey, batch_id: u64, token: u32, unit: u32, position: u32) -> Batch {
+    let mut decode = token_batch(
+        batch_id,
+        batch_id,
+        key,
+        None,
+        CallId::new(batch_id, 0),
+        CallKind::Forward(ForwardMode::Decode),
+        &[token],
+        UnitId(unit),
+        position,
+    );
+    decode.calls[0].coordinates.logical_position = position;
+    decode
+}
+
+/// Run [`decode_batch`] on `worker` and return its output and the token
+/// product it published.
+fn decode_step(
+    executor: &mut uniserve_engine::WorkerExecutor,
+    worker: &str,
+    key: RequestKey,
+    batch_id: u64,
+    token: u32,
+    unit: u32,
+    position: u32,
+) -> anyhow::Result<(uniserve_ipc::RequestOutput, TensorRef)> {
+    let decode = decode_batch(key, batch_id, token, unit, position);
+    let sampled = decode.calls[0]
+        .token_output
+        .clone()
+        .context("a decode samples a token")?;
+    executor.submit(place(decode, worker, Vec::new()))?;
+    let decoded = poll_logical(executor)?.context("decode did not complete")?;
+    assert_eq!(decoded.results[0].output.status, CallStatus::Ok);
+    Ok((decoded.results[0].output.clone(), sampled))
 }
 
 /// Launch arguments of a one-rank stub worker on the first visible CUDA

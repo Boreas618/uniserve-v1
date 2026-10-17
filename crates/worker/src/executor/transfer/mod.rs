@@ -102,7 +102,7 @@ impl TransferRuntime {
                 devices.first().copied(),
                 queue_depth.max(1) * 2,
                 max_calls.max(1),
-            ),
+            )?,
         })
     }
 
