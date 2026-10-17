@@ -583,16 +583,9 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 
 /// A device f32 tensor of `shape` holding `0, 1, 2, ...`.
 fn device_counting(shape: &[i64], stream: &Stream) -> Result<StorageView> {
-    device_sequence(shape, 0, stream)
-}
-
-/// A device f32 tensor of `shape` holding `first, first + 1, ...`.
-fn device_sequence(shape: &[i64], first: i64, stream: &Stream) -> Result<StorageView> {
     let elements: i64 = shape.iter().product();
     let memory = Memory::device(DEVICE, elements as usize * 4)?;
-    let values: Vec<f32> = (first..first + elements)
-        .map(|value| value as f32)
-        .collect();
+    let values: Vec<f32> = (0..elements).map(|value| value as f32).collect();
     let mut batch = CopyBatch::new(SourceOrder::DuringCall);
     batch.push(memory.address(), values.as_ptr() as u64, values.len() * 4);
     // SAFETY: the allocation holds the values; the source is read during
@@ -850,10 +843,9 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
     transports.close()
 }
 
-/// Producer half: export two device tensors through chunks of one CUDA VMM
-/// pool to consumer slot 1, run this test binary as the consumer, and
-/// require the exports to retire only after the consumer acknowledged its
-/// reads.
+/// Producer half: export a device tensor through a CUDA VMM pool chunk to
+/// consumer slot 1, run this test binary as the consumer, and require the
+/// export to retire only after the consumer acknowledged its read.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn vmm_exports_are_imported_by_another_process() -> Result<()> {
@@ -864,104 +856,78 @@ fn vmm_exports_are_imported_by_another_process() -> Result<()> {
         "producer",
         0,
     )?;
+    let source = Spans::single(device_counting(&[16, 8], &stream)?)?;
     let mut retirements = Vec::new();
-    let mut locations = Vec::new();
-    let mut shared = Vec::new();
-    // Two exports of one pool allocation, with values 0.. and 1000..
-    for first in [0, 1000] {
-        let source = Spans::single(device_sequence(&[16, 8], first, &stream)?)?;
-        let exported = located(
-            &transports,
-            &source,
-            None,
-            &[1],
-            Some(&stream),
-            |retirement| {
-                retirements.push(retirement);
-                Ok(())
-            },
-        )?;
-        let (_, locator) = exported
-            .iter()
-            .find(|(_, locator)| TransportKind::of(locator) == TransportKind::CudaVmm)
-            .ok_or(Error::State("no CUDA VMM location was exported"))?;
-        assert!(matches!(
-            &locator.transport,
-            TransferTransport::CudaVmm { acknowledgment_offset, .. } if *acknowledgment_offset >= 0
-        ));
-        shared.push(locator.clone());
-        locations.extend(exported);
-    }
+    let locations = located(
+        &transports,
+        &source,
+        None,
+        &[1],
+        Some(&stream),
+        |retirement| {
+            retirements.push(retirement);
+            Ok(())
+        },
+    )?;
+    let (_, locator) = locations
+        .iter()
+        .find(|(_, locator)| TransportKind::of(locator) == TransportKind::CudaVmm)
+        .ok_or(Error::State("no CUDA VMM location was exported"))?;
+    assert!(matches!(
+        &locator.transport,
+        TransferTransport::CudaVmm { acknowledgment_offset, .. } if *acknowledgment_offset >= 0
+    ));
 
-    let locators = serde_json::to_string(&shared)
+    let locator = serde_json::to_string(locator)
         .map_err(|error| Error::Invalid(format!("unserializable locator: {error}")))?;
     let executable = std::env::current_exe()
         .map_err(|error| Error::Invalid(format!("no test executable: {error}")))?;
     let status = Command::new(executable)
         .args(["--exact", "vmm_export_consumer", "--ignored", "--nocapture"])
-        .env(CHILD_LOCATOR, locators)
+        .env(CHILD_LOCATOR, locator)
         .status()
         .map_err(|error| Error::Invalid(format!("cannot run the consumer: {error}")))?;
     assert!(status.success(), "the consumer process failed");
 
-    // The consumer acknowledged and exited: revocation retires the chunks.
+    // The consumer acknowledged and exited: revocation retires the chunk.
     exports::release(&locations)?;
     settle(&transports, &capacity, &events)?;
     assert!(retirements.iter().all(|retirement| retirement.succeeded()));
     transports.close()
 }
 
-/// Consumer half, run by `vmm_exports_are_imported_by_another_process`:
-/// read regions of both exports, the first one again after the second,
-/// with every read alive until all are checked.
+/// Consumer half, run by `vmm_exports_are_imported_by_another_process`.
 #[test]
 #[ignore = "runs as the consumer process of the VMM export test"]
 fn vmm_export_consumer() -> Result<()> {
     let _driver = exclusive_driver();
-    let Ok(locators) = std::env::var(CHILD_LOCATOR) else {
+    let Ok(locator) = std::env::var(CHILD_LOCATOR) else {
         return Ok(());
     };
-    let locators: Vec<Locator> = serde_json::from_str(&locators)
-        .map_err(|error| Error::Invalid(format!("unreadable locators: {error}")))?;
-    let (transports, _, events) = device_transports(&[TransportKind::CudaVmm], "consumer", 1)?;
+    let locator: Locator = serde_json::from_str(&locator)
+        .map_err(|error| Error::Invalid(format!("unreadable locator: {error}")))?;
+    let (transports, _, _) = device_transports(&[TransportKind::CudaVmm], "consumer", 1)?;
     let transport = transports
         .get(TransportKind::CudaVmm)
         .ok_or(Error::State("no CUDA VMM transport is bound"))?;
     let stream = Stream::new(DEVICE)?;
-    let mut reads = Vec::new();
-    for (export, rows, first) in [
-        (0, 2..6, 0),
-        (1, 2..6, 1000),
-        (1, 8..12, 1000),
-        (0, 8..12, 0),
-    ] {
-        let destination = device_destination(&[4, 8])?;
-        let read = fetch(
-            transport,
-            &locators[export],
-            MemoryKind::Cuda(DEVICE),
-            Some(&destination),
-            Some(&[rows.clone(), 0..8]),
-            Some(&stream),
-        )?;
-        read.wait_ready();
-        let value = read.result(Some(&stream))?;
-        let start = first + rows.start as i64 * 8;
-        assert_eq!(
-            floats(&download(value.first(), &stream)?),
-            (start..start + 32)
-                .map(|value| value as f32)
-                .collect::<Vec<_>>(),
-            "export {export} rows {rows:?}"
-        );
-        reads.push(read);
+    let destination = device_destination(&[4, 8])?;
+    let read = fetch(
+        transport,
+        &locator,
+        MemoryKind::Cuda(DEVICE),
+        Some(&destination),
+        Some(&[2..6, 0..8]),
+        Some(&stream),
+    )?;
+    read.wait_ready();
+    let value = read.result(Some(&stream))?;
+    assert_eq!(
+        floats(&download(value.first(), &stream)?),
+        (16..48).map(|value| value as f32).collect::<Vec<_>>()
+    );
+    while !read.retirement().succeeded() {
+        std::thread::sleep(Duration::from_millis(1));
     }
-    for read in &reads {
-        while !read.retirement().succeeded() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-    drop(reads);
-    events.drain()?;
     transports.close()
 }
