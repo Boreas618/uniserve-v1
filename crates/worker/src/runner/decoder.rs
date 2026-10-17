@@ -1200,9 +1200,14 @@ impl VideoDecoder {
     ) -> Result<()> {
         let stream = self.stream.clone();
         let issue = job.on(Some(&stream));
-        self.latent.zero(issue)?;
-        self.rows.zero(issue)?;
-        self.retained.zero(issue)?;
+        // SAFETY: the decoder's own inputs, kept until it closes after its
+        // stream drained; only its forwards read them, recorded behind the
+        // fills on the same stream.
+        unsafe {
+            self.latent.zero(issue)?;
+            self.rows.zero(issue)?;
+            self.retained.zero(issue)?;
+        }
         // No shape is captured before every shape is warmed: the forward
         // is the eager call.
         self.forward(shape, rows, longest, false, job)?;
@@ -1322,7 +1327,10 @@ impl VideoDecoder {
         let rows = (window.len() / 8) as u64;
         let slot_overlap = self.overlap.slot("video_overlap", slot as u32)?;
         let overlap_bytes = self.retained.numel() * self.retained.dtype().bytes() as u64;
-        self.rows.prefix(rows as i64)?.upload(&window, issue)?;
+        // SAFETY: the decoder's window rows, kept until it closes after its
+        // stream drained; the forwards reading them run on `issue`'s stream,
+        // the earlier ones before this write and this unit's after it.
+        unsafe { self.rows.prefix(rows as i64)?.upload(&window, issue) }?;
         // The two copies write disjoint tensors, so they need no order
         // between them.
         let mut inputs = CopyBatch::new(SourceOrder::Stream);
@@ -1477,7 +1485,10 @@ impl AudioDecoder {
     pub(crate) fn warm(&mut self, units: TrackUnits, rows: u64, job: &Job) -> Result<()> {
         let stream = self.stream.clone();
         let issue = job.on(Some(&stream));
-        self.latent.zero(issue)?;
+        // SAFETY: the decoder's own latent input, kept until it closes after
+        // its stream drained; only its forwards read it, recorded behind the
+        // fill on the same stream.
+        unsafe { self.latent.zero(issue) }?;
         // No units are captured before every unit is warmed: the forward is
         // the eager call.
         self.forward(units, rows, false, job)?;

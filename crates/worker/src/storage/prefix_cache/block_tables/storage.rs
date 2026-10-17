@@ -210,30 +210,26 @@ impl BlockTableStorage {
     /// the device. Commit the update on the host after this succeeds.
     pub fn install(&self, update: &BlockTableUpdate, stream: impl Issue) -> Result<()> {
         let width = self.width as usize;
-        let mut payload: Vec<i32> = Vec::with_capacity(
-            update.rows.len() * width + update.start_values.len() + update.length_values.len(),
-        );
-        let mut entries = Vec::new();
-        for ((row, &table), &slot) in update
-            .rows
-            .iter()
-            .zip(&update.row_tables)
-            .zip(&update.row_slots)
-        {
-            if row.len() > width || table >= self.tables as usize {
+        // One word per first page and extent, besides the rows.
+        let words = update.starts.len() + update.extents.len();
+        let mut payload: Vec<i32> = Vec::with_capacity(update.rows.len() * width + words);
+        let mut entries = Vec::with_capacity(update.rows.len() + words);
+        for row in &update.rows {
+            let ((slot, _), table) = &update.tables[row.table];
+            if table.pages() > width || row.target >= self.tables as usize {
                 return Err(Error::Invalid("block-table row exceeds its table".into()));
             }
-            self.require_slot(slot)?;
-            entries.push((self.row_address(table as u32, slot), payload.len(), width));
-            payload.extend(row.iter().map(|&unit| unit as i32));
-            payload.resize(payload.len() + width - row.len(), 0);
+            self.require_slot(*slot)?;
+            entries.push((
+                self.row_address(row.target as u32, *slot),
+                payload.len(),
+                width,
+            ));
+            let end = payload.len() + width;
+            payload.extend(table.row_units(row.position).map(|unit| unit as i32));
+            payload.resize(end, 0);
         }
-        for ((&group, &slot), &value) in update
-            .start_groups
-            .iter()
-            .zip(&update.start_slots)
-            .zip(&update.start_values)
-        {
+        for &(group, slot, value) in &update.starts {
             if group >= self.groups {
                 return Err(Error::Invalid("block-table group is out of range".into()));
             }
@@ -242,7 +238,7 @@ impl BlockTableStorage {
             entries.push((self.entry(&self.start_pages, index), payload.len(), 1));
             payload.push(value as i32);
         }
-        for (&slot, &value) in update.length_slots.iter().zip(&update.length_values) {
+        for &(slot, value) in &update.extents {
             self.require_slot(slot)?;
             entries.push((
                 self.entry(&self.alloced_lens, u64::from(slot)),

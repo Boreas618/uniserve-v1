@@ -852,7 +852,10 @@ impl EncoderRunner {
                     )?;
                     // Rows past an image keep earlier values, which only
                     // padding reads; they start finite.
-                    pixels.zero(stream.as_ref())?;
+                    // SAFETY: a new allocation the encoder keeps until it
+                    // closes after its stream drained; its forwards run
+                    // behind the fill on that stream.
+                    unsafe { pixels.zero(stream.as_ref()) }?;
                     packed = Some(PackedVision {
                         capacity: capacity as usize,
                         pixels,
@@ -1319,9 +1322,15 @@ impl EncoderRunner {
         for chunk in shapes.chunks(capacity) {
             let slots = chunk.len();
             let layout = packed_grids(chunk, slots, max_patches, vision.downsample)?;
-            grids
-                .prefix(2 * slots as i64)?
-                .upload(grid_bytes(&layout).as_slice(), issue)?;
+            // SAFETY: the encoder's grid input, kept until it closes after
+            // its stream drained; the forwards reading it run on `issue`'s
+            // stream, the earlier ones before this write and this chunk's
+            // after it.
+            unsafe {
+                grids
+                    .prefix(2 * slots as i64)?
+                    .upload(grid_bytes(&layout).as_slice(), issue)
+            }?;
 
             // Each image's prepared patch rows go to the front of its slot:
             // host-prepared rows are copied there, and a resident image is
@@ -1468,7 +1477,10 @@ impl EncoderRunner {
             .iter()
             .flat_map(|token| token.to_ne_bytes())
             .collect();
-        text.tokens.upload(&bytes, issue)?;
+        // SAFETY: the text encoder's token input, kept until it closes after
+        // its stream drained; the forwards reading it run on `issue`'s
+        // stream, the earlier ones before this write and this one after it.
+        unsafe { text.tokens.upload(&bytes, issue) }?;
         let (features, final_stage) = (text.features.clone(), text.final_stage);
 
         let runner = Argument::Handle(self.methods.runner.clone());
@@ -1640,7 +1652,10 @@ impl EncoderRunner {
             }
             (EncoderInfo::Text(_), _, Some(text)) => {
                 // Every capacity encodes the zero prompt.
-                text.tokens.zero(job.on(self.stream.as_ref()))?;
+                // SAFETY: the text encoder's token input, kept until it closes
+                // after its stream drained; only the warm forwards read it,
+                // recorded behind the fill on the same stream.
+                unsafe { text.tokens.zero(job.on(self.stream.as_ref())) }?;
                 for &capacity in self.text_capacities.iter().rev() {
                     forwards.push((
                         EncoderGraph::Text { capacity },
@@ -1656,10 +1671,15 @@ impl EncoderRunner {
             if let (EncoderGraph::Packed { slots }, Some(grids), Some(packed)) =
                 (key, &grids, &self.packed)
             {
-                packed
-                    .grids
-                    .prefix(2 * slots as i64)?
-                    .upload(grids, recorded.on(self.stream.as_ref()))?;
+                // SAFETY: the encoder's grid input, kept until it closes after
+                // its stream drained; the warm forwards reading it run on its
+                // stream, each job performed before the next writes.
+                unsafe {
+                    packed
+                        .grids
+                        .prefix(2 * slots as i64)?
+                        .upload(grids, recorded.on(self.stream.as_ref()))
+                }?;
             }
             let mode = self.forward(key, arguments, pool.map(Arc::as_ref), &recorded)?;
             let mut completion = perform(recorded)?;
