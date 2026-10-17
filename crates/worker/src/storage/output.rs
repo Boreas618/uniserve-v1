@@ -559,7 +559,6 @@ impl OutputBuffer {
         Ok(timing)
     }
 
-
     pub(crate) fn discard(&mut self, row: usize) {
         if let Some(observed) = self.rows.get_mut(row)
             && !std::mem::replace(observed, true)
@@ -867,7 +866,12 @@ mod tests {
                 values.len(),
             );
         }
-        StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[values.len() as i64])
+        StorageView::contiguous(
+            memory as Arc<dyn Backing>,
+            0,
+            DType::I64,
+            &[values.len() as i64],
+        )
     }
 
     /// Lease `words` words of `pool` for a one-row batch, with `value`
@@ -878,11 +882,10 @@ mod tests {
         value: i64,
     ) -> Result<Arc<Mutex<OutputBuffer>>> {
         let lease = pool.lease(1, words, &[], false)?;
-        lease.lock().unwrap_or_else(PoisonError::into_inner).capture(
-            &column(&vec![value; words])?,
-            None,
-            &EventPool::default(),
-        )?;
+        lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .capture(&column(&vec![value; words])?, None, &EventPool::default())?;
         Ok(lease)
     }
 
