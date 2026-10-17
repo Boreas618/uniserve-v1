@@ -621,7 +621,9 @@ pub(crate) struct WorkerProcessOptions {
     /// Repeatable JSON descriptor for a configuration-static execution lane.
     #[arg(long = "lane")]
     pub lanes: Vec<LaneConfig>,
-    /// GPU computation capture policy. Full rejects unavailable capture; off disables all graphs.
+    /// GPU computation capture policy. Auto captures graphs unless serving does not capture the
+    /// attention provider's calls, and then runs eagerly; full rejects that provider; off disables
+    /// all graphs.
     #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
     pub graph_policy: String,
     #[arg(long, hide = true)]

@@ -609,8 +609,11 @@ class Backend(_Backend):
         return result
 
     def prepare(self, **kwargs):
+        # The layer's description, without the borrowed resources.
         arguments = {
-            key: value for key, value in kwargs.items() if key != "workspace"
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"workspace", "plans"}
         }
         providers, requirements = self._requirements(arguments)
         if not providers:

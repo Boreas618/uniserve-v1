@@ -890,6 +890,7 @@ class ExecutionContext:
         "_operators",
         "_merged",
         "_attention",
+        "_attention_plans",
         "_vsa",
         "_vsa_operators",
         "_moe",
@@ -907,6 +908,10 @@ class ExecutionContext:
     # module id, or branch key -> prepared merged operator
     _merged: dict[int | MergedKey, MatmulBinding]
     _attention: dict[int, AttentionBinding]
+    # Launch plans every attention call site shares, keyed by the provider
+    # (layer shape and batch signature); the layers of one forward bind the
+    # same batch, so a host-planning provider plans it once.
+    _attention_plans: dict[tuple, Any]
     _vsa: dict[int, VsaBinding]
     # (device, dtype, heads, head_dim, pattern) -> (provider name, operator)
     _vsa_operators: dict[tuple, tuple[str, Any]]
@@ -1304,6 +1309,7 @@ class ExecutionContext:
             self._context_transport,
             table,
             derive_host_lengths=self.derive_host_lengths,
+            plans=self._attention_plans,
         )
         self._attention[id(layer)] = binding
         if size is not None:

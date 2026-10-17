@@ -24,7 +24,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use uniserve_core::{Canvas, CanvasSampling, ComponentConfig};
 
-use crate::LaneConfig;
+use crate::{AttentionBackend, LaneConfig};
 
 /// The command that starts one rank with the interpreter `python`.
 ///
@@ -169,8 +169,8 @@ pub struct LaunchDescriptor {
     /// Fraction of device memory this rank may hold, in (0, 1].
     pub cache_memory_fraction: f64,
     pub cache_token_capacity: Option<u64>,
-    /// Attention backend name.
-    pub attention_backend: String,
+    /// Attention provider selection of the rank's model.
+    pub attention_backend: AttentionBackend,
     pub block_size: Option<u32>,
     pub max_batch_calls: u32,
     pub max_batch_tokens: u32,
