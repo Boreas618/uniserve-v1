@@ -655,6 +655,14 @@ def attention_backend(loaded: Loaded) -> str:
     return loaded.attention_backend
 
 
+def attention_captures(loaded: Loaded) -> bool:
+    """Whether serving captures the loaded attention provider's calls.
+
+    See ``uniserve.backends.attention.Backend.captures``.
+    """
+    return bool(loaded.attention.captures)
+
+
 def weight_formats(loaded: Loaded) -> list[str]:
     """The storage formats of the loaded parameters, sorted.
 

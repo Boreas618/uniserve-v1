@@ -120,6 +120,8 @@ pub(crate) struct LoadedModel {
     pub(crate) video_decoder: bool,
     /// The attention backend the model was loaded with.
     pub(crate) attention_backend: String,
+    /// Whether serving captures that backend's calls in CUDA graphs.
+    pub(crate) attention_captures: bool,
 }
 
 impl LoadedModel {
@@ -197,7 +199,7 @@ impl LoadedModel {
                 world,
                 Any::from(attention_ranks),
                 Any::from(expert_dedicated),
-                text(execution.attention_backend.as_deref().unwrap_or("auto")),
+                text(execution.attention_backend.as_str()),
                 Any::from(attention.workspace_size as i64),
                 text(&attention.decode_backend),
                 text(&attention.prefill_backend),
@@ -210,12 +212,15 @@ impl LoadedModel {
         let backend: tvm_ffi::String =
             Interpreter::import(&format!("{LOADING}.attention_backend"))?
                 .call_as(&[handle.view()])?;
+        let captures = Interpreter::import(&format!("{LOADING}.attention_captures"))?
+            .call_as::<bool>(&[handle.view()])?;
         Ok(Self {
             handle,
             model_name: description.model_name,
             declarations: description.declarations,
             video_decoder: description.video_decoder,
             attention_backend: backend.as_str().to_owned(),
+            attention_captures: captures,
         })
     }
 
