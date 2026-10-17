@@ -7,9 +7,11 @@
 
 use std::ops::Range;
 
-use uniserve_cuda::{CopyBatch, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async};
+use uniserve_cuda::{
+    CopyBatch, DeviceId, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async,
+};
 
-use crate::ffi::{DType, Device};
+use crate::ffi::{DType, MemoryKind};
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
 
@@ -22,7 +24,7 @@ pub struct Spans {
 }
 
 impl Spans {
-    pub fn new(views: Vec<StorageView>) -> Result<Self> {
+    pub(crate) fn new(views: Vec<StorageView>) -> Result<Self> {
         let Some(first) = views.first() else {
             return Err(Error::Invalid("a tensor needs at least one span".into()));
         };
@@ -54,16 +56,16 @@ impl Spans {
         &self.views[0]
     }
 
-    pub fn dtype(&self) -> DType {
+    pub(crate) fn dtype(&self) -> DType {
         self.first().dtype()
     }
 
-    pub fn device(&self) -> Device {
+    pub(crate) fn device(&self) -> MemoryKind {
         self.first().device()
     }
 
     /// The logical shape: summed leading extents and the shared trailing axes.
-    pub fn shape(&self) -> Vec<u64> {
+    pub(crate) fn shape(&self) -> Vec<u64> {
         let mut shape: Vec<u64> = self
             .first()
             .shape()
@@ -81,7 +83,7 @@ impl Spans {
 
     /// The pieces of each span that `region` (in logical coordinates)
     /// touches, each in its own span's coordinates. No data moves.
-    pub fn region(&self, region: &[Range<u64>]) -> Result<Self> {
+    pub(crate) fn region(&self, region: &[Range<u64>]) -> Result<Self> {
         let shape = self.shape();
         if region.len() != shape.len()
             || region
@@ -116,7 +118,12 @@ impl Spans {
     /// Validate a complete destination before it is split into reads: its
     /// representation must match, and no two destination elements may share
     /// storage, since separate shard reads write them concurrently.
-    pub fn validate_destination(&self, shape: &[u64], dtype: DType, device: Device) -> Result<()> {
+    pub(crate) fn validate_destination(
+        &self,
+        shape: &[u64],
+        dtype: DType,
+        device: MemoryKind,
+    ) -> Result<()> {
         if self.dtype() != dtype || self.device() != device || self.shape() != shape {
             return Err(Error::Invalid(
                 "transfer destination disagrees with the exported representation".into(),
@@ -140,7 +147,7 @@ impl Spans {
 
     /// Plan copies of `source` into `self`, walking both partitions together
     /// and splitting at span boundaries on either side.
-    pub fn plan_copy(&self, source: &Self, plan: &mut StridedCopy) -> Result<()> {
+    pub(crate) fn plan_copy(&self, source: &Self, plan: &mut StridedCopy) -> Result<()> {
         if self.shape() != source.shape() || self.dtype() != source.dtype() {
             return Err(Error::Invalid(
                 "transfer partitions have different logical representations".into(),
@@ -177,12 +184,9 @@ impl Spans {
 
 /// A planner for copies between two operands of `device`'s address space,
 /// or of host memory when `device` is `None`.
-pub fn copy_planner(device: Option<i32>, order: SourceOrder) -> Result<StridedCopy> {
+pub(crate) fn copy_planner(device: Option<DeviceId>, order: SourceOrder) -> Result<StridedCopy> {
     match device {
-        Some(device) => Ok(StridedCopy::for_device(
-            uniserve_cuda::DeviceId(device),
-            order,
-        )?),
+        Some(device) => Ok(StridedCopy::for_device(device, order)?),
         None => Ok(StridedCopy::new(order, usize::MAX)),
     }
 }
@@ -198,9 +202,13 @@ pub fn copy_planner(device: Option<i32>, order: SourceOrder) -> Result<StridedCo
 /// # Safety
 /// Both operands stay valid, and the destination is not accessed by other
 /// work, until `stream` reaches the copies.
-pub unsafe fn submit_copy(destination: &Spans, source: &Spans, stream: &Stream) -> Result<()> {
+pub(crate) unsafe fn submit_copy(
+    destination: &Spans,
+    source: &Spans,
+    stream: &Stream,
+) -> Result<()> {
     match (destination.device(), source.device()) {
-        (Device::Cuda(target), Device::Cuda(origin)) if target != origin => {
+        (MemoryKind::Cuda(target), MemoryKind::Cuda(origin)) if target != origin => {
             // Without a pitch every planned copy is one contiguous run.
             let mut plan = StridedCopy::new(SourceOrder::Stream, 0);
             destination.plan_copy(source, &mut plan)?;
@@ -211,7 +219,7 @@ pub unsafe fn submit_copy(destination: &Spans, source: &Spans, stream: &Stream) 
             Ok(())
         }
         _ => {
-            let mut plan = copy_planner(Some(stream.device().0), SourceOrder::Stream)?;
+            let mut plan = copy_planner(Some(stream.device()), SourceOrder::Stream)?;
             destination.plan_copy(source, &mut plan)?;
             // SAFETY: forwarded from the caller.
             unsafe { plan.submit(stream) }.map_err(Error::from)
@@ -224,7 +232,7 @@ pub unsafe fn submit_copy(destination: &Spans, source: &Spans, stream: &Stream) 
 /// # Safety
 /// Every planned operand is host memory that stays valid, and that no other
 /// thread or device accesses, for the duration of the call.
-pub unsafe fn copy_on_host(plan: &StridedCopy) {
+pub(crate) unsafe fn copy_on_host(plan: &StridedCopy) {
     // SAFETY: forwarded from the caller.
     unsafe {
         copy_linear(plan.linear());
@@ -306,21 +314,31 @@ mod tests {
     #[test]
     fn destinations_reject_aliasing_but_accept_interleaved_pages() -> Result<()> {
         let memory: Arc<dyn Backing> = Memory::host(16 * 4);
-        let grid = StorageView::contiguous(Arc::clone(&memory), 0, DType::F32, &[4, 4])?;
-        let interleaved = Spans::new(vec![grid.region(&[0..4, 0..2])?.permute(&[1, 0])?])?;
-        interleaved.validate_destination(&[2, 4], DType::F32, Device::Cpu)?;
+        // Columns of a [4, 4] grid viewed as rows: `[columns, 4]` with
+        // strides `[1, 4]`, starting at the first column's element.
+        let columns = |first: usize, count: i64| {
+            StorageView::strided(
+                Arc::clone(&memory),
+                first * 4,
+                DType::F32,
+                &[count, 4],
+                &[1, 4],
+            )
+        };
+        let interleaved = Spans::new(vec![columns(0, 2)?])?;
+        interleaved.validate_destination(&[2, 4], DType::F32, MemoryKind::Host)?;
 
-        let even = grid.region(&[0..4, 0..1])?.permute(&[1, 0])?;
-        let odd = grid.region(&[0..4, 1..2])?.permute(&[1, 0])?;
+        let even = columns(0, 1)?;
+        let odd = columns(1, 1)?;
         Spans::new(vec![even.clone(), odd])?.validate_destination(
             &[2, 4],
             DType::F32,
-            Device::Cpu,
+            MemoryKind::Host,
         )?;
         let aliased = Spans::new(vec![even.clone(), even])?;
         assert!(
             aliased
-                .validate_destination(&[2, 4], DType::F32, Device::Cpu)
+                .validate_destination(&[2, 4], DType::F32, MemoryKind::Host)
                 .is_err()
         );
         Ok(())

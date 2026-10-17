@@ -197,9 +197,9 @@ struct Recorded {
     /// How the method runs at every capacity its expert step can be agreed
     /// at; one entry of no capacity without an expert step.
     modes: Vec<(Option<usize>, GraphMode)>,
-    /// How each `readout` of a slot chunk runs, in job order, with the
-    /// bucket of one that is captured.
-    readouts: Vec<(GraphMode, Option<ShapeKey>)>,
+    /// The buckets of the slot-chunk `readout`s the job captures, in job
+    /// order; their graphs are stored at completion.
+    captured: Vec<ShapeKey>,
     /// Storage of the forward's own that the job's copies read. The job
     /// ends with a read of it, which waits for those copies, so it is
     /// returned with this value at completion.
@@ -452,12 +452,12 @@ impl DiffusionLMRunner {
     }
 
     /// Apply the completion of the job that ran `recorded`: store the
-    /// graphs its captures produced and count how its methods ran.
+    /// graphs its captures produced and report how its forward ran.
     fn complete(&mut self, recorded: Recorded, completion: &mut Completion) -> Result<Executed> {
         let Recorded {
             key,
             modes,
-            readouts,
+            captured,
             own,
             tokens,
             padded_tokens,
@@ -479,14 +479,8 @@ impl DiffusionLMRunner {
         if mode == GraphMode::Capture {
             store(key, capacity)?;
         }
-        for (_, captured) in &readouts {
-            if let Some(key) = captured {
-                store(*key, None)?;
-            }
-        }
-        self.graphs.record(mode);
-        for (mode, _) in readouts {
-            self.graphs.record(mode);
+        for key in captured {
+            store(key, None)?;
         }
         if own.is_some() {
             // The read that waited for the copies out of `own`.
@@ -648,7 +642,7 @@ impl DiffusionLMRunner {
             function: &self.functions.attend,
             plan: Some(&plan),
         };
-        let mut readouts = Vec::new();
+        let mut captured = Vec::new();
         let mut own = None;
         let modes = if graph && local {
             let modes = self.step(&attending, &attend, None, expert, extent, job)?;
@@ -677,7 +671,6 @@ impl DiffusionLMRunner {
                         // and a bucket this job already captures is stored
                         // only at its completion.
                         job.call(self.methods.call(&self.functions.readout, arguments));
-                        readouts.push((GraphMode::Eager, None));
                     } else {
                         let reading = Method {
                             key: &key,
@@ -687,8 +680,8 @@ impl DiffusionLMRunner {
                         let mode = self.method(&reading, None, arguments, job, job)?;
                         if mode == GraphMode::Capture {
                             capturing.insert(key);
+                            captured.push(key);
                         }
-                        readouts.push((mode, (mode == GraphMode::Capture).then_some(key)));
                     }
                     sink(window..end, &values.prefix((end - window) as i64)?)?;
                 }
@@ -738,7 +731,7 @@ impl DiffusionLMRunner {
         Ok(Recorded {
             key,
             modes,
-            readouts,
+            captured,
             own,
             tokens,
             padded_tokens,
@@ -855,7 +848,7 @@ impl DiffusionLMRunner {
         Ok(Recorded {
             key,
             modes,
-            readouts: Vec::new(),
+            captured: Vec::new(),
             own: None,
             tokens: live * length,
             padded_tokens: padded * length,
@@ -1085,7 +1078,6 @@ impl DiffusionLMRunner {
             self.segments = self.segments.max(graph.segments());
             self.graphs.insert(key, None, graph)?;
         }
-        self.graphs.record(mode);
         Ok(())
     }
 

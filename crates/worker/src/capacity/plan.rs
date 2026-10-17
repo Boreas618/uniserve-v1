@@ -35,7 +35,7 @@ use crate::storage::CachePlan;
 use crate::{Error, Result};
 
 /// Product scalar banks keep one value of every protocol dtype per slot.
-pub fn product_scalar_bytes() -> u64 {
+pub(crate) fn product_scalar_bytes() -> u64 {
     [
         DType::U8,
         DType::I16,
@@ -52,7 +52,7 @@ pub fn product_scalar_bytes() -> u64 {
 
 /// Bytes one product slot of a component's outputs retains: every output's
 /// largest extent, aligned to 256 bytes.
-pub fn product_bytes(outputs: &[OutputInfo]) -> u64 {
+pub(crate) fn product_bytes(outputs: &[OutputInfo]) -> u64 {
     outputs
         .iter()
         .map(|output| {
@@ -66,7 +66,7 @@ pub fn product_bytes(outputs: &[OutputInfo]) -> u64 {
 ///
 /// A preset size is used unchanged and needs no agreement: every rank was
 /// launched with it. `readable` plans the pool for one candidate size.
-pub fn page_size(
+pub(crate) fn page_size(
     preset: Option<usize>,
     mut readable: impl FnMut(usize) -> Result<bool>,
     group: &HostGroup,
@@ -92,7 +92,7 @@ pub fn page_size(
 /// `requirements[i]` is this rank's storage for `minimum + i` slots. Every
 /// rank tests the same candidates, because a smaller slot count can lengthen
 /// the output horizon, so reducing local maxima would miss a common fit.
-pub fn request_slots(
+pub(crate) fn request_slots(
     requirements: &[u64],
     minimum: usize,
     available: u64,
@@ -121,7 +121,7 @@ pub fn request_slots(
 
 /// Device dimensions of one latent pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LatentPlan {
+pub(crate) struct LatentPlan {
     pub request_pool_size: usize,
     /// Pages including the reserved sentinel page.
     pub num_pages: usize,
@@ -135,7 +135,7 @@ pub struct LatentPlan {
 impl LatentPlan {
     /// The pool of an image flow: pages of `block_size` units holding the
     /// longest image (or the configured token budget, when larger).
-    pub fn image(
+    pub(crate) fn image(
         slots: usize,
         max_tokens: usize,
         cache_token_capacity: Option<usize>,
@@ -158,7 +158,7 @@ impl LatentPlan {
         }
     }
 
-    pub fn bytes(&self) -> Result<u64> {
+    pub(crate) fn bytes(&self) -> Result<u64> {
         latent_pool_bytes(
             self.request_pool_size,
             self.num_pages,
@@ -171,7 +171,7 @@ impl LatentPlan {
 }
 
 /// Model-independent values of the report.
-pub struct Report {
+pub(crate) struct Report {
     pub model_name: String,
     pub endpoint: WorkerEndpoint,
     pub device: String,
@@ -187,7 +187,7 @@ pub struct Report {
 
 /// Media-timeline facts of a video model.
 #[derive(Debug, Clone, PartialEq)]
-pub struct MediaFacts {
+pub(crate) struct MediaFacts {
     pub num_steps: u32,
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Device bytes of one request's state buffers.
@@ -214,7 +214,7 @@ impl MediaFacts {
 }
 
 /// Inputs of the token layout taken from the loaded model.
-pub struct TokenFacts {
+pub(crate) struct TokenFacts {
     /// The model has an image processor (it encodes request images).
     pub image_processor: bool,
     /// Bytes of one encoded image's vision features.
@@ -226,7 +226,7 @@ pub struct TokenFacts {
 }
 
 /// The resolved capacity of a rank.
-pub struct Plan {
+pub(crate) struct Plan {
     pub info: WorkerInfo,
     pub arena: ArenaCapacity,
     /// Fixed bytes by device, beside the cache pool.
@@ -257,7 +257,7 @@ impl Plan {
 
     /// Bound calls by the captured graphs a token runtime holds. Zero leaves
     /// a kind bounded by `max_batch_calls` alone.
-    pub fn bound_graph_calls(&mut self, prefill: u32, decode: u32) {
+    pub(crate) fn bound_graph_calls(&mut self, prefill: u32, decode: u32) {
         self.info.max_prefill_calls = prefill.min(self.info.max_batch_calls);
         self.info.max_decode_calls = decode.min(self.info.max_batch_calls);
     }
@@ -306,7 +306,7 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
 }
 
 /// A token worker's layout before the cache pool is fitted.
-pub struct TokenLayout {
+pub(crate) struct TokenLayout {
     info: WorkerInfo,
     arena: ArenaCapacity,
     fixed: BTreeMap<Device, u64>,
@@ -316,7 +316,7 @@ pub struct TokenLayout {
 
 impl TokenLayout {
     /// Size the buffer pool, product store and latent pool.
-    pub fn new(
+    pub(crate) fn new(
         report: Report,
         config: &WorkerConfig,
         queue_depth: usize,
@@ -357,7 +357,6 @@ impl TokenLayout {
             config.max_batch_calls,
             config.max_request_pool_size,
             product_scalar_bytes(),
-            latent_bytes,
             feature_bytes,
         )?;
         let mut fixed = BTreeMap::new();
@@ -375,12 +374,12 @@ impl TokenLayout {
         })
     }
 
-    pub fn info(&self) -> &WorkerInfo {
+    pub(crate) fn info(&self) -> &WorkerInfo {
         &self.info
     }
 
     /// Record fixed storage a capability runtime allocates on `device`.
-    pub fn reserve(&mut self, device: Device, bytes: u64) {
+    pub(crate) fn reserve(&mut self, device: Device, bytes: u64) {
         *self.fixed.entry(device).or_default() += bytes;
     }
 
@@ -392,7 +391,7 @@ impl TokenLayout {
     /// it instead. `total_bytes` is the device's total memory, zero on CPU.
     /// `unit_overhead` is device storage other owners keep per unit (unit
     /// index columns), charged with each unit.
-    pub fn fit_cache(
+    pub(crate) fn fit_cache(
         &mut self,
         cache: &CachePlan,
         unit_overhead: u64,
@@ -451,7 +450,7 @@ impl TokenLayout {
         Ok(capacity)
     }
 
-    pub fn finish(self, config: &WorkerConfig, cache: Option<Arc<CachePlan>>) -> Plan {
+    pub(crate) fn finish(self, config: &WorkerConfig, cache: Option<Arc<CachePlan>>) -> Plan {
         let physical_buffer_pool_bytes = self.info.buffer_pool_bytes;
         let mut plan = Plan {
             info: self.info,
@@ -467,7 +466,7 @@ impl TokenLayout {
 }
 
 /// The layout of a media worker, sized by its request slots.
-pub fn request_layout(
+pub(crate) fn request_layout(
     report: Report,
     config: &WorkerConfig,
     queue_depth: usize,
@@ -489,11 +488,6 @@ pub fn request_layout(
         info.latent_page_units = narrow(plan.page_units, "latent page units")?;
         info.latent_pages = narrow(plan.num_pages, "latent pages")?;
     }
-    let latent_bytes = media
-        .stored_latent()
-        .map(|plan| plan.bytes())
-        .transpose()?
-        .unwrap_or(0);
     let arena = ArenaCapacity::for_requests(
         queue_depth,
         info.max_batch_calls as usize,
@@ -502,7 +496,6 @@ pub fn request_layout(
         product_scalar_bytes(),
         media.local_product_bytes,
         media.artifact_import_regions,
-        latent_bytes,
     )?;
     info.host_lane_capacity = if host_components {
         1
@@ -524,7 +517,7 @@ pub fn request_layout(
 /// This rank's storage for every candidate slot count from `minimum` to
 /// `maximum`: state, retained products, the product store and the latent
 /// pool of each count.
-pub fn slot_requirements(
+pub(crate) fn slot_requirements(
     config: &WorkerConfig,
     queue_depth: usize,
     media: &MediaFacts,
@@ -540,7 +533,6 @@ pub fn slot_requirements(
             config.world_size,
             product_scalar_bytes(),
             media.local_product_bytes,
-            0,
             0,
         )?;
         let latent_bytes = match media.stored_latent() {
@@ -572,6 +564,7 @@ pub fn slot_requirements(
 
 #[cfg(test)]
 mod tests {
+    use uniserve_cuda::DeviceId;
     use uniserve_ipc::{DimBound, ShapeBound};
 
     use super::*;
@@ -677,7 +670,7 @@ mod tests {
     fn the_cache_pool_takes_the_grant_left_after_reservations() {
         let gib = 1u64 << 30;
         let config = WorkerConfig {
-            device: Device::Cuda(0),
+            device: Device::Cuda(DeviceId(0)),
             max_batch_calls: 8,
             max_batch_tokens: 2048,
             max_request_pool_size: 8,
@@ -691,8 +684,8 @@ mod tests {
             latent: None,
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
-        let fixed_before = layout.fixed[&Device::Cuda(0)];
-        layout.reserve(Device::Cuda(0), gib);
+        let fixed_before = layout.fixed[&Device::Cuda(DeviceId(0))];
+        layout.reserve(Device::Cuda(DeviceId(0)), gib);
         let cache = cache();
         let capacity = layout
             .fit_cache(&cache, 0, &config, 100 * gib, &group())

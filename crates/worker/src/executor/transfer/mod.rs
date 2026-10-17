@@ -51,14 +51,15 @@ use uniserve_ipc::{
 };
 
 use super::backend::{WorkerBackend, WorkerBatch};
-use super::batch::{Batch, Failure, Launched, Opening, Stage, fail, lock};
+use super::batch::{Batch, Failure, Launched, Opening, Stage, fail};
 use super::image::ImageParts;
 use super::inputs::{Inputs, component_device};
 use super::products::Publications;
 use crate::error::WorkerError;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job, Recorder};
+use crate::lock;
 use crate::request::RequestPool;
 use crate::storage::{OutputPool, ProductBuffer, ProductExport};
 use crate::stream::Streams;
@@ -71,7 +72,7 @@ use prefix_cache::{Exporting, Installation, Published};
 /// imports run on, and its output storage.
 pub(crate) struct TransferRuntime {
     /// The lane stream serving each call kind on each CUDA device.
-    streams: HashMap<(CallKind, i32), Stream>,
+    streams: HashMap<(CallKind, DeviceId), Stream>,
     outputs: OutputPool,
 }
 
@@ -81,7 +82,7 @@ impl TransferRuntime {
     /// in flight.
     pub(crate) fn start(
         streams: &Streams,
-        devices: &[i32],
+        devices: &[DeviceId],
         kinds: &[CallKind],
         queue_depth: usize,
         max_calls: usize,
@@ -89,7 +90,7 @@ impl TransferRuntime {
         let mut served = HashMap::new();
         for &device in devices {
             for &kind in kinds {
-                if let Some(stream) = streams.stream_for(kind, DeviceId(device)) {
+                if let Some(stream) = streams.stream_for(kind, device) {
                     served.insert((kind, device), stream.stream()?.clone());
                 }
             }
@@ -106,8 +107,8 @@ impl TransferRuntime {
     }
 
     /// The stream serving `kind` calls on `device`; none for host devices.
-    pub(crate) fn stream(&self, kind: CallKind, device: Device) -> Result<Option<Stream>> {
-        let Device::Cuda(index) = device else {
+    pub(crate) fn stream(&self, kind: CallKind, device: MemoryKind) -> Result<Option<Stream>> {
+        let MemoryKind::Cuda(index) = device else {
             return Ok(None);
         };
         let stream = self.streams.get(&(kind, index)).ok_or_else(|| {
@@ -118,8 +119,6 @@ impl TransferRuntime {
         })?;
         Ok(Some(stream.clone()))
     }
-
-    pub(crate) fn set_wake(&self, _wake: Option<uniserve_ipc::Wake>) {}
 
     /// Release output storage after the lanes drained.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -186,7 +185,7 @@ fn placement(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
     kind: CallKind,
-) -> Result<(Option<i32>, Option<Stream>)> {
+) -> Result<(Option<DeviceId>, Option<Stream>)> {
     let first = plan
         .calls
         .first()
@@ -211,7 +210,7 @@ fn placement(
         Ok((device, stream))
     } else {
         let device = component_device(backend, &first.component)?;
-        Ok((device.cuda_index(), backend.transfer_stream(kind, device)?))
+        Ok((device.cuda(), backend.transfer_stream(kind, device)?))
     }
 }
 
@@ -221,7 +220,7 @@ fn open(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
     kind: CallKind,
-    device: Option<i32>,
+    device: Option<DeviceId>,
     stream: Option<&Stream>,
     job: &Job,
 ) -> Result<Opening> {
@@ -258,7 +257,7 @@ fn record(
     inputs: &Inputs,
     kind: CallKind,
     opening: Opening,
-    device: Option<i32>,
+    device: Option<DeviceId>,
     stream: Option<&Stream>,
     job: &Job,
 ) -> Pending {
@@ -531,7 +530,7 @@ impl<'a> TransferBatch<'a> {
     }
 
     /// The device the batch's products live on.
-    pub(super) fn target(&self) -> crate::ffi::Device {
+    pub(super) fn target(&self) -> crate::ffi::MemoryKind {
         self.recorded.batch.target()
     }
 

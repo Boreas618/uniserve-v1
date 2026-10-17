@@ -19,19 +19,19 @@ type Destinations = HashMap<(RequestKey, String), (BufferId, u32)>;
 
 /// Resident cache transfers and the bases of incremental transfers.
 #[derive(Default)]
-pub struct TransferBases {
+pub(crate) struct TransferBases {
     resident: HashMap<BufferId, Arc<CacheTransfer>>,
     destination_bases: Destinations,
     installed_bases: Destinations,
 }
 
 impl TransferBases {
-    pub fn resident(&self, buffer: BufferId) -> Option<&Arc<CacheTransfer>> {
+    pub(crate) fn resident(&self, buffer: BufferId) -> Option<&Arc<CacheTransfer>> {
         self.resident.get(&buffer)
     }
 
     /// Borrow a conditioning export covered by the request's installed keys and values.
-    pub fn validate_conditioning(
+    pub(crate) fn validate_conditioning(
         &self,
         request: RequestKey,
         buffer: BufferId,
@@ -62,7 +62,7 @@ impl TransferBases {
 
     /// The latest extent sent to this destination, retained even after its
     /// descriptor is released. The receiver already owns that prefix.
-    pub fn destination_base(
+    pub(crate) fn destination_base(
         &self,
         request: RequestKey,
         destination: &str,
@@ -74,7 +74,7 @@ impl TransferBases {
 
     /// Check the destination's accepted prefix before copying an incremental
     /// transfer into its assigned physical pages.
-    pub fn validate_install(&self, transfer: &CacheTransfer) -> Result<()> {
+    pub(crate) fn validate_install(&self, transfer: &CacheTransfer) -> Result<()> {
         let installed = self
             .installed_bases
             .get(&(transfer.source.owner, transfer.destination.clone()))
@@ -85,7 +85,7 @@ impl TransferBases {
     /// Check all touched versions before any resource owner commits. Updates
     /// to one destination must form a chain in batch order; rejection leaves
     /// both resident descriptors and accepted bases unchanged.
-    pub fn validate_exports(
+    pub(crate) fn validate_exports(
         &self,
         exports: &[(BufferId, CacheTransfer)],
         installations: &[(BufferId, BufferId, CacheTransfer)],
@@ -128,7 +128,7 @@ impl TransferBases {
 
     /// Commit an already checked batch. The executor must leave this
     /// directory unchanged between validation and the shared resource commit.
-    pub fn apply_exports(
+    pub(crate) fn apply_exports(
         &mut self,
         exports: Vec<(BufferId, CacheTransfer)>,
         installations: Vec<(BufferId, BufferId, CacheTransfer)>,
@@ -154,7 +154,7 @@ impl TransferBases {
 
     /// Remove consumed descriptors and return their buffers for revocation.
     /// Physical exports and transfer bases have independent lifetimes.
-    pub fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Vec<BufferId> {
+    pub(crate) fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Vec<BufferId> {
         let calls: HashSet<_> = calls.iter().copied().collect();
         let mut released = Vec::new();
         self.resident.retain(|buffer, _| {
@@ -170,7 +170,7 @@ impl TransferBases {
 
     /// Forget a retired request epoch after its physical accesses have
     /// drained; other epochs of its request id keep their entries.
-    pub fn drop_request(&mut self, request: RequestKey) {
+    pub(crate) fn drop_request(&mut self, request: RequestKey) {
         self.resident.retain(|buffer, _| buffer.owner != request);
         self.destination_bases
             .retain(|(owner, _), _| *owner != request);
@@ -180,7 +180,7 @@ impl TransferBases {
 
     /// Forget transfer descriptions and bases when the cache owner closes.
     /// Physical access retirement is independent and must already be drained.
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.resident.clear();
         self.destination_bases.clear();
         self.installed_bases.clear();

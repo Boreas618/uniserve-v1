@@ -435,11 +435,6 @@ impl ServingRuntime {
         &self.engine
     }
 
-    /// Returns the fetcher that resolves request image references.
-    pub fn image_fetcher(&self) -> &media::ImageFetcher {
-        &self.images
-    }
-
     /// Returns an aggregate point-in-time metrics snapshot.
     ///
     /// `active` is read from the request registry at call time; the other fields are

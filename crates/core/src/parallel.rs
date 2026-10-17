@@ -221,15 +221,6 @@ impl ComponentConfig {
         Ok(())
     }
 
-    /// First pipeline-stage input ranks, in component order.
-    pub fn input_ranks(&self) -> &[usize] {
-        if self.distribution.is_some() {
-            &self.ranks
-        } else {
-            &self.ranks[..self.ranks.len() / self.parallel_config.pipeline_parallel_size]
-        }
-    }
-
     /// Final-stage output ranks with tensor replicas counted once.
     pub fn output_ranks(&self) -> Vec<usize> {
         if self.distribution.is_some() {

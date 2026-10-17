@@ -4,40 +4,17 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use uniserve_ipc::{
-    Batch as BatchPlan, Channel, IpcError, RequestKind, WorkerInfo, WorkerRequest, WorkerResponse,
-    WorkerResponseError,
-};
+use uniserve_ipc::{Channel, IpcError, RequestKind, WorkerInfo, WorkerRequest, WorkerResponse};
 
-use crate::{Backend, Batch, BatchResult, Error, Executor, Submission};
+use crate::error::WorkerError;
+use crate::executor::backend::WorkerBatch;
+use crate::{Batch, Error, Executor, Submission};
 
 const EXPERT_POLL: Duration = Duration::from_micros(200);
 // Keep a rank with open requests available for its engine's next batch before
 // joining an empty expert step. The engine needs time to consume the result
 // and schedule its next batch even when it still has admitted requests.
 const OWN_STEP_WAIT: Duration = Duration::from_millis(8);
-
-/// Numerical values and resource observations needed by the rank service.
-/// Request correlation, admission, polling and shutdown remain in Service.
-pub trait ServiceBackend: Backend<Output = BatchResult> {
-    fn batch(&self, plan: Arc<BatchPlan>) -> Result<Self::Batch, Self::Error>;
-    fn response_error(
-        &self,
-        kind: RequestKind,
-        error: Self::Error,
-    ) -> Result<WorkerResponseError, Self::Error>;
-
-    fn has_open_requests(&self) -> Result<bool, Self::Error>;
-    fn awaiting_acknowledgment(&self) -> Result<bool, Self::Error>;
-
-    /// Participate in the expert union's next step without an own forward.
-    /// The join is submitted and not waited for: `None` while it is in
-    /// flight, which the first call starts; once it completed, the next
-    /// call returns (ran a step, group released), and the call after that
-    /// starts the next join. Closing ranks continue participating until
-    /// every peer leaves the group.
-    fn join_expert_step(&mut self, leaving: bool) -> Result<Option<(bool, bool)>, Self::Error>;
-}
 
 enum PendingResponse {
     Ready(Box<WorkerResponse>),
@@ -50,8 +27,8 @@ enum PendingResponse {
 /// Borrows a worker's executor and channel for one synchronous serving run.
 /// All channel waits run on the caller's thread; completion wakes interrupt
 /// them without advancing execution on a callback thread.
-pub struct Service<'a, B: ServiceBackend> {
-    executor: &'a mut Executor<B>,
+pub(crate) struct Service<'a> {
+    executor: &'a mut Executor,
     channel: &'a mut Channel,
     info: WorkerInfo,
     experts: bool,
@@ -61,9 +38,9 @@ pub struct Service<'a, B: ServiceBackend> {
     last_result: Instant,
 }
 
-impl<'a, B: ServiceBackend> Service<'a, B> {
-    pub fn new(
-        executor: &'a mut Executor<B>,
+impl<'a> Service<'a> {
+    pub(crate) fn new(
+        executor: &'a mut Executor,
         channel: &'a mut Channel,
         info: WorkerInfo,
         experts: bool,
@@ -83,7 +60,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
 
     /// Drain accepted results before acknowledging Close. A fatal result stops
     /// admission too, while preserving responses already owed to the engine.
-    pub fn run(&mut self) -> Result<(), B::Error> {
+    pub(crate) fn run(&mut self) -> Result<(), WorkerError> {
         loop {
             let advanced = self.executor.advance()?;
             if self.send_ready()? || advanced {
@@ -157,14 +134,14 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
         }
     }
 
-    fn awaits_own_step(&self) -> Result<bool, B::Error> {
+    fn awaits_own_step(&self) -> Result<bool, WorkerError> {
         Ok(self.executor.backend().has_open_requests()?
             && (!self.pending.is_empty()
                 || self.executor.has_work()
                 || self.last_result.elapsed() < OWN_STEP_WAIT))
     }
 
-    fn accept(&mut self, request: WorkerRequest) -> Result<(), B::Error> {
+    fn accept(&mut self, request: WorkerRequest) -> Result<(), WorkerError> {
         let pending = match request {
             WorkerRequest::Close { message_id } => {
                 self.closing = true;
@@ -179,11 +156,8 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
             }
             WorkerRequest::Submit { message_id, batch } => {
                 let batch = Arc::from(batch);
-                let admitted = self
-                    .executor
-                    .backend()
-                    .batch(Arc::clone(&batch))
-                    .and_then(|data| self.executor.admit(Batch::from_plan(&batch, data), false));
+                let data = WorkerBatch::new(Arc::clone(&batch));
+                let admitted = self.executor.admit(Batch::from_plan(&batch, data), false);
                 match admitted {
                     Ok(submission) => PendingResponse::Batch {
                         message_id,
@@ -199,7 +173,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
         Ok(())
     }
 
-    fn send_ready(&mut self) -> Result<bool, B::Error> {
+    fn send_ready(&mut self) -> Result<bool, WorkerError> {
         // A pending transfer or host task must not hold up independent results.
         for index in 0..self.pending.len() {
             let mut media = Vec::new();
@@ -244,8 +218,8 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
     fn error_response(
         &self,
         message_id: Option<u64>,
-        error: B::Error,
-    ) -> Result<WorkerResponse, B::Error> {
+        error: WorkerError,
+    ) -> Result<WorkerResponse, WorkerError> {
         Ok(WorkerResponse::Error {
             message_id,
             error: self
@@ -255,7 +229,7 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
         })
     }
 
-    fn respond(&mut self, response: &WorkerResponse) -> Result<(), B::Error> {
+    fn respond(&mut self, response: &WorkerResponse) -> Result<(), WorkerError> {
         self.channel
             .send(response)
             .map_err(|e| self.channel_error(e))
@@ -264,20 +238,18 @@ impl<'a, B: ServiceBackend> Service<'a, B> {
     /// Block until a request, a completion wake or the timeout. Fails once
     /// the head's connection has closed: it is the head's liveness, and
     /// nothing this rank computes can be delivered after it.
-    fn wait(&mut self, timeout: Duration) -> Result<(), B::Error> {
+    fn wait(&mut self, timeout: Duration) -> Result<(), WorkerError> {
         self.channel
             .wait(timeout)
             .map_err(|e| self.channel_error(e))
     }
 
-    fn channel_error(&self, error: IpcError) -> B::Error {
-        self.executor
-            .backend()
-            .error(Error::Transport(error.to_string()))
+    fn channel_error(&self, error: IpcError) -> WorkerError {
+        WorkerError::classify(Error::Transport(error.to_string()), None)
     }
 }
 
-impl<B: ServiceBackend> Drop for Service<'_, B> {
+impl Drop for Service<'_> {
     fn drop(&mut self) {
         self.executor.set_completion_wake(None);
     }

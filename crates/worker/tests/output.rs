@@ -1,9 +1,12 @@
+//! Output readback of host captures: token words, logprob scores and
+//! byte captures.
+
 use std::sync::Arc;
 
 use uniserve_core::TokenLogprob;
 use uniserve_worker::ffi::{Backing, DType};
-use uniserve_worker::storage::memory::{Memory, StorageView};
-use uniserve_worker::{EventPool, LogprobLayout, OutputBuffer, OutputStorage, Result};
+use uniserve_worker::storage::{LogprobLayout, Memory, OutputBuffer, OutputStorage, StorageView};
+use uniserve_worker::{EventPool, Result};
 
 /// A host column holding `values`, as a CPU lane's sampler produces it.
 fn column<T: Copy>(values: &[T], dtype: DType) -> Result<StorageView> {

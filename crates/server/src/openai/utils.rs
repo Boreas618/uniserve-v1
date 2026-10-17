@@ -24,20 +24,6 @@ pub fn check_model_served(model: &str, served_model_name: &str) -> Result<(), Ap
     Ok(())
 }
 
-/// Rejects `stream_options` supplied without `stream=true`.
-pub fn check_stream_options_requires_stream(
-    stream_options_present: bool,
-    stream: bool,
-) -> Result<(), ApiError> {
-    if stream_options_present && !stream {
-        return Err(ApiError::invalid_request(
-            "stream_options are only supported when stream=true.",
-            Some("stream_options"),
-        ));
-    }
-    Ok(())
-}
-
 /// Rejects a `prompt_logprobs` value outside the supported range.
 ///
 /// Valid values are any non-negative integer or the sentinel `-1` (full

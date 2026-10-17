@@ -21,29 +21,28 @@ use uniserve_cuda::{DeviceGuard, DeviceId, Event, SourceOrder, Stream, memset_d3
 use uniserve_ipc::Locator;
 
 use super::export_table::SourceGrant;
-use super::pool::{ReadBackend, TransferPool, TransferRead};
+use super::pool::{TransferPool, TransferRead};
 use super::{
-    Capacity, Notify, Retirement, Spans, TransferTicket, copy_on_host, copy_planner, notify,
-    submit_copy,
+    Notify, ReadReservation, Retirement, Spans, TransferCapacity, TransferTicket, copy_on_host,
+    copy_planner, notify, submit_copy,
 };
-use crate::ffi::{Backing, DType, Device};
+use crate::ffi::{Backing, DType, MemoryKind};
 use crate::host::HostTask;
-use crate::storage::memory::{Memory, StorageView, parse_dtype};
+use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Outcome, Result};
 
-pub(crate) type ReadPool = TransferPool<NativeRead>;
 pub(crate) type BorrowedReads = Mutex<Option<HashMap<usize, Weak<Read>>>>;
 
 struct ReadState {
-    ticket: TransferTicket<Spans, Error, Notify>,
+    ticket: TransferTicket,
     /// A process-local reader's admission to the producer's export.
     source: Option<SourceGrant>,
     /// A borrowed read's credit, returned when its consumers finish.
-    credit: Option<Arc<Capacity>>,
+    credit: Option<Arc<TransferCapacity>>,
     /// Storage an undrained copy may still address.
     retained: Vec<Box<dyn Any + Send>>,
-    work: Option<Weak<HostTask<TransferRead<NativeRead>>>>,
+    work: Option<Weak<HostTask<TransferRead>>>,
     /// The read's task was handed to its transport thread.
     started: bool,
 }
@@ -79,17 +78,12 @@ impl Read {
     }
 
     /// Whether a result or an error is consumable.
-    pub fn ready(&self) -> bool {
+    pub(crate) fn ready(&self) -> bool {
         self.lock().ticket.ready()
     }
 
-    /// Whether physical access ended successfully.
-    pub fn retired(&self) -> bool {
-        self.lock().ticket.retired()
-    }
-
     /// Whether the read retired; an error when its completion is unknown.
-    pub fn retirement_ready(&self) -> Result<bool> {
+    pub(crate) fn retirement_ready(&self) -> Result<bool> {
         self.lock().ticket.retirement_ready()
     }
 
@@ -107,7 +101,7 @@ impl Read {
     }
 
     /// Run `callback` once physical access ended.
-    pub fn add_retirement_callback(&self, callback: Notify) {
+    pub(crate) fn add_retirement_callback(&self, callback: Notify) {
         let immediate = self.retirement().subscribe(callback);
         if let Some(callback) = immediate {
             callback();
@@ -151,7 +145,7 @@ impl Read {
             Outcome::Cancelled => return Err(Error::Resource("transfer read was cancelled")),
         };
         if state.ticket.producer().is_some() {
-            let Device::Cuda(device) = value.device() else {
+            let MemoryKind::Cuda(device) = value.device() else {
                 return Err(Error::Invariant(
                     "a fenced transfer result is not device memory".into(),
                 ));
@@ -159,7 +153,7 @@ impl Read {
             let consumer = stream.stream().ok_or_else(|| {
                 Error::Invalid("a device transfer result requires a consuming stream".into())
             })?;
-            if consumer.device().0 != device {
+            if consumer.device() != device {
                 return Err(Error::Invalid(
                     "transfer consumer stream is on another device".into(),
                 ));
@@ -220,11 +214,11 @@ impl Read {
         Ok(())
     }
 
-    fn set_work(&self, work: &Arc<HostTask<TransferRead<NativeRead>>>) {
+    fn set_work(&self, work: &Arc<HostTask<TransferRead>>) {
         self.lock().work = Some(Arc::downgrade(work));
     }
 
-    fn set_credit(&self, capacity: Arc<Capacity>) {
+    fn set_credit(&self, capacity: Arc<TransferCapacity>) {
         self.lock().credit = Some(capacity);
     }
 
@@ -368,20 +362,20 @@ impl Drop for Read {
 
 /// A storage owner's reference to one read: the read itself (to cancel or
 /// close it) and its physical retirement signal (to decide reuse).
-pub struct ReadRef {
+pub(crate) struct ReadRef {
     read: Arc<Read>,
     retirement: Arc<Retirement>,
 }
 
 impl ReadRef {
-    pub fn new(read: &Arc<Read>) -> Self {
+    pub(crate) fn new(read: &Arc<Read>) -> Self {
         Self {
             read: Arc::clone(read),
             retirement: read.retirement(),
         }
     }
 
-    pub fn read(&self) -> &Arc<Read> {
+    pub(crate) fn read(&self) -> &Arc<Read> {
         &self.read
     }
 }
@@ -397,8 +391,8 @@ impl std::ops::Deref for ReadRef {
 /// Per-thread copy streams and page-locked staging of one transport's reads.
 pub(crate) struct ReadContext {
     pub(crate) events: Arc<EventPool>,
-    streams: Mutex<HashMap<(ThreadId, i32), Arc<Stream>>>,
-    staging: Mutex<HashMap<(ThreadId, i32), Arc<Memory>>>,
+    streams: Mutex<HashMap<(ThreadId, DeviceId), Arc<Stream>>>,
+    staging: Mutex<HashMap<(ThreadId, DeviceId), Arc<Memory>>>,
 }
 
 impl ReadContext {
@@ -411,13 +405,13 @@ impl ReadContext {
     }
 
     /// The calling thread's copy stream on `device`.
-    fn stream(&self, device: i32) -> Result<Arc<Stream>> {
+    fn stream(&self, device: DeviceId) -> Result<Arc<Stream>> {
         let key = (std::thread::current().id(), device);
         let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(stream) = streams.get(&key) {
             return Ok(Arc::clone(stream));
         }
-        let stream = Arc::new(Stream::new(DeviceId(device))?);
+        let stream = Arc::new(Stream::new(device)?);
         streams.insert(key, Arc::clone(&stream));
         Ok(stream)
     }
@@ -425,11 +419,11 @@ impl ReadContext {
     /// The calling thread's page-locked staging of at least `bytes` for
     /// `device` copies. A read drains its stream before returning, so the
     /// thread's next read may reuse it; an undrained read takes it over.
-    fn staging(&self, device: i32, bytes: usize) -> Result<Arc<Memory>> {
+    fn staging(&self, device: DeviceId, bytes: usize) -> Result<Arc<Memory>> {
         let key = (std::thread::current().id(), device);
         let mut staging = self.staging.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(memory) = staging.get(&key)
-            && memory.len() >= bytes
+            && memory.bytes() >= bytes
         {
             return Ok(Arc::clone(memory));
         }
@@ -438,7 +432,7 @@ impl ReadContext {
         Ok(memory)
     }
 
-    fn forget_staging(&self, device: i32) {
+    fn forget_staging(&self, device: DeviceId) {
         let key = (std::thread::current().id(), device);
         self.staging
             .lock()
@@ -491,15 +485,11 @@ pub(crate) struct NativeRead {
     pub(crate) context: Arc<ReadContext>,
 }
 
-impl ReadBackend for NativeRead {
-    type Value = Spans;
-    type Error = Error;
-    type Callback = Notify;
-
-    fn with_ticket<T>(
-        &self,
-        action: impl FnOnce(&mut TransferTicket<Spans, Error, Notify>) -> T,
-    ) -> T {
+impl NativeRead {
+    /// Run `action` on the read's ticket under its lock, waking result
+    /// waiters when the ticket became consumable. `action` invokes no
+    /// observer and no numerical code.
+    pub(crate) fn with_ticket<T>(&self, action: impl FnOnce(&mut TransferTicket) -> T) -> T {
         let mut state = self.read.lock();
         let result = action(&mut state.ticket);
         let ready = state.ticket.ready();
@@ -510,7 +500,9 @@ impl ReadBackend for NativeRead {
         result
     }
 
-    fn read(&self) -> Result<()> {
+    /// Perform the read. It returns after physical access ended; when that
+    /// cannot be established it marks the ticket undrained and fails.
+    pub(crate) fn read(&self) -> Result<()> {
         match &self.call {
             ReadCall::Copy {
                 source,
@@ -532,31 +524,17 @@ impl ReadBackend for NativeRead {
         }
     }
 
-    fn release(&self) -> Result<()> {
+    /// Release local source ownership after the read's physical accesses
+    /// ended. This also runs for a queued read withdrawn before it ran.
+    pub(crate) fn release(&self) -> Result<()> {
         self.read.release_source()
-    }
-
-    fn notify(callbacks: Vec<Notify>) {
-        notify(callbacks);
-    }
-
-    fn wake(callback: &Notify) {
-        callback();
-    }
-
-    fn error(error: Error) -> Error {
-        error
-    }
-
-    fn report(error: Error) {
-        tracing::warn!(target: "uniserve_worker.transfer", "transfer read cleanup failed: {error}");
     }
 }
 
 /// The device whose stream copies between `source` and `destination`.
-fn copy_device(source: &Spans, destination: &Spans) -> Option<i32> {
+fn copy_device(source: &Spans, destination: &Spans) -> Option<DeviceId> {
     match (destination.device(), source.device()) {
-        (Device::Cuda(device), _) | (_, Device::Cuda(device)) => Some(device),
+        (MemoryKind::Cuda(device), _) | (_, MemoryKind::Cuda(device)) => Some(device),
         _ => None,
     }
 }
@@ -589,7 +567,7 @@ impl NativeRead {
 
         let stream = self.context.stream(device)?;
         let copied = (|| -> Result<()> {
-            let _device = DeviceGuard::new(DeviceId(device))?;
+            let _device = DeviceGuard::new(device)?;
             if let Some(word) = acknowledgment {
                 // Claim before either handoff wait, so the producer cannot
                 // reuse the chunk while this copy is waiting to begin.
@@ -621,7 +599,7 @@ impl NativeRead {
             Error::Shared(shared)
         });
 
-        let drained = DeviceGuard::new(DeviceId(device))
+        let drained = DeviceGuard::new(device)
             .map_err(Error::from)
             .and_then(|_device| stream.synchronize().map_err(Error::from));
         if let Err(error) = drained {
@@ -648,7 +626,7 @@ impl NativeRead {
         destination: &Spans,
         release: impl FnOnce(),
     ) -> Result<()> {
-        let Device::Cuda(device) = destination.device() else {
+        let MemoryKind::Cuda(device) = destination.device() else {
             let mut plan = copy_planner(None, SourceOrder::Stream)?;
             destination.plan_copy(source, &mut plan)?;
             // SAFETY: host operands retained by this read and its locator.
@@ -688,7 +666,7 @@ pub(super) fn payload(
     offset: usize,
     locator: &Locator,
 ) -> Result<Spans> {
-    let dtype: DType = parse_dtype(&locator.dtype)?;
+    let dtype: DType = DType::parse(&locator.dtype)?;
     let shape: Vec<i64> = locator.shape.iter().map(|&extent| extent as i64).collect();
     Spans::single(StorageView::contiguous(backing, offset, dtype, &shape)?)
 }
@@ -698,11 +676,11 @@ pub(super) fn payload(
 /// [`Read::start`], once that fence's record is made. On failure the task
 /// is withdrawn.
 pub(crate) fn submit(
-    pool: &Arc<ReadPool>,
+    pool: &Arc<TransferPool>,
     backend: NativeRead,
     nbytes: u64,
     stream: impl Issue,
-    reservation: Option<&super::ReadReservation<Notify>>,
+    reservation: Option<&ReadReservation>,
 ) -> Result<Arc<Read>> {
     if let Some(error) = pool.error() {
         return Err(Error::Shared(error));
@@ -718,11 +696,11 @@ pub(crate) fn submit(
 
     let submitted = (|| -> Result<()> {
         read.set_work(&task);
-        if let Device::Cuda(device) = destination_device {
+        if let MemoryKind::Cuda(device) = destination_device {
             let submitting = stream.stream().ok_or_else(|| {
                 Error::Invalid("a device read destination requires its submitting stream".into())
             })?;
-            if submitting.device().0 != device {
+            if submitting.device() != device {
                 return Err(Error::Invalid(
                     "a read's submitting stream is on another device".into(),
                 ));
@@ -730,7 +708,6 @@ pub(crate) fn submit(
             read.prepare_copy(stream)?;
         }
         if let Some(wake) = pool.completion_wake() {
-            let wake: Notify = Arc::new(move || wake());
             read.add_done_callback(Arc::clone(&wake));
             read.add_retirement_callback(wake);
         }
@@ -750,16 +727,15 @@ pub(crate) fn submit(
 /// the source grant until it closes.
 pub(crate) fn borrow(
     read: &Arc<Read>,
-    capacity: &Arc<Capacity>,
+    capacity: &Arc<TransferCapacity>,
     spans: Spans,
     producer: Option<Arc<Event>>,
-    reservation: Option<&super::ReadReservation<Notify>>,
-    wake: Option<Arc<Notify>>,
+    reservation: Option<&ReadReservation>,
+    wake: Option<Notify>,
 ) -> Result<()> {
     capacity.take_read(reservation)?;
     read.set_credit(Arc::clone(capacity));
     if let Some(wake) = wake {
-        let wake: Notify = Arc::new(move || wake());
         read.add_done_callback(Arc::clone(&wake));
         read.add_retirement_callback(wake);
     }
@@ -787,7 +763,7 @@ mod tests {
             };
             let classified = WorkerError::classify(error, None);
             assert_eq!(classified.code, ErrorCode::ResourceError);
-            assert_eq!(classified.message(), "transfer read was cancelled");
+            assert_eq!(classified.response().message, "transfer read was cancelled");
         }
         Ok(())
     }

@@ -5,7 +5,6 @@ use std::sync::{Arc, PoisonError};
 
 use tvm_ffi::{Any, AnyView};
 
-use indexmap::IndexMap;
 use uniserve_cuda::nccl::{self, Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
 
@@ -20,15 +19,13 @@ const NATIVE_COLLECTIVES: &str = "uniserve.distributed.collectives.NativeCollect
 ///
 /// Synchronous operations run on the computation stream. Asynchronous
 /// operations run on a transfer stream forked from it, which shares its SM
-/// partition; consumers join them by event. Registered window backing lives
-/// through communicator retirement, independently of the execution contexts
-/// and graphs borrowing it.
-pub struct StreamCommunicator<T> {
+/// partition; consumers join them by event.
+pub(crate) struct StreamCommunicator {
     device: DeviceId,
-    resources: Option<Resources<T>>,
+    resources: Option<Resources>,
 }
 
-struct Resources<T> {
+struct Resources {
     communicator: Communicator,
     // The owner's stream, which synchronous operations run on.
     computation: Stream,
@@ -36,11 +33,9 @@ struct Resources<T> {
     // The latest asynchronous operation not yet joined on the computation
     // stream. Synchronous operations order themselves after it.
     pending: Option<Arc<Event>>,
-    // Registered `(address, bytes)` windows and the owners of their memory.
-    windows: IndexMap<(u64, usize), T>,
 }
 
-impl<T> StreamCommunicator<T> {
+impl StreamCommunicator {
     /// Every group member calls this once, with the same distributed unique ID.
     ///
     /// Communicators of full-device streams use NCCL's copy-engine algorithms
@@ -48,7 +43,7 @@ impl<T> StreamCommunicator<T> {
     ///
     /// The communicator shares `owner`'s stream and keeps submitting to it
     /// until [`Self::close`].
-    pub fn new(owner: &CUDAStream, size: i32, rank: i32, id: &UniqueId) -> Result<Self> {
+    pub(crate) fn new(owner: &CUDAStream, size: i32, rank: i32, id: &UniqueId) -> Result<Self> {
         let device = owner.device();
         let computation = owner.stream()?.clone();
 
@@ -74,37 +69,32 @@ impl<T> StreamCommunicator<T> {
                 computation,
                 transfer,
                 pending: None,
-                windows: IndexMap::new(),
             }),
         })
     }
 
     /// The device the communicator's streams run on.
-    pub fn device(&self) -> DeviceId {
+    pub(crate) fn device(&self) -> DeviceId {
         self.device
     }
 
     /// Members of the communicator.
-    pub fn size(&self) -> Result<usize> {
+    pub(crate) fn size(&self) -> Result<usize> {
         Ok(self.resources()?.communicator.size() as usize)
     }
 
     /// This member's backend rank.
-    pub fn rank(&self) -> Result<i32> {
+    pub(crate) fn rank(&self) -> Result<i32> {
         Ok(self.resources()?.communicator.rank())
     }
 
-    pub fn transfer_stream(&self) -> Result<usize> {
-        self.resources()?.transfer.handle()
-    }
-
-    fn resources(&self) -> Result<&Resources<T>> {
+    fn resources(&self) -> Result<&Resources> {
         self.resources
             .as_ref()
             .ok_or(Error::State("computation collective is closed"))
     }
 
-    fn resources_mut(&mut self) -> Result<&mut Resources<T>> {
+    fn resources_mut(&mut self) -> Result<&mut Resources> {
         self.resources
             .as_mut()
             .ok_or(Error::State("computation collective is closed"))
@@ -144,7 +134,7 @@ impl<T> StreamCommunicator<T> {
     }
 
     /// Orders `consumer` after an asynchronous operation's completion.
-    pub fn join(&mut self, event: &Arc<Event>, consumer: &Stream) -> Result<()> {
+    pub(crate) fn join(&mut self, event: &Arc<Event>, consumer: &Stream) -> Result<()> {
         consumer.wait_event(event)?;
 
         let resources = self.resources_mut()?;
@@ -167,7 +157,7 @@ impl<T> StreamCommunicator<T> {
     /// # Safety
     /// Input and output spans must hold the declared elements on this device
     /// and remain alive through the submitted operation and graph replays.
-    pub unsafe fn all_gather(
+    pub(crate) unsafe fn all_gather(
         &mut self,
         output: u64,
         input: u64,
@@ -194,7 +184,7 @@ impl<T> StreamCommunicator<T> {
     ///
     /// # Safety
     /// Each span holds `count` elements per rank and outlives all device uses.
-    pub unsafe fn all_to_all(
+    pub(crate) unsafe fn all_to_all(
         &mut self,
         output: u64,
         input: u64,
@@ -218,7 +208,7 @@ impl<T> StreamCommunicator<T> {
 
     /// # Safety
     /// The in-place tensor holds `count` elements and outlives device uses.
-    pub unsafe fn all_reduce(
+    pub(crate) unsafe fn all_reduce(
         &mut self,
         data: u64,
         count: usize,
@@ -233,7 +223,7 @@ impl<T> StreamCommunicator<T> {
 
     /// # Safety
     /// The in-place tensor holds `count` elements and outlives device uses.
-    pub unsafe fn broadcast(
+    pub(crate) unsafe fn broadcast(
         &mut self,
         data: u64,
         count: usize,
@@ -251,7 +241,7 @@ impl<T> StreamCommunicator<T> {
     /// # Safety
     /// Input holds `count` elements per rank and output holds `count` elements.
     /// Both remain allocated through device reads and writes.
-    pub unsafe fn reduce_scatter(
+    pub(crate) unsafe fn reduce_scatter(
         &mut self,
         output: u64,
         input: u64,
@@ -266,7 +256,7 @@ impl<T> StreamCommunicator<T> {
 
     /// # Safety
     /// The span holds `count` elements until its transfer and graph uses finish.
-    pub unsafe fn send(
+    pub(crate) unsafe fn send(
         &mut self,
         data: u64,
         count: usize,
@@ -281,7 +271,7 @@ impl<T> StreamCommunicator<T> {
 
     /// # Safety
     /// The destination holds `count` elements until its transfer and graph uses finish.
-    pub unsafe fn recv(
+    pub(crate) unsafe fn recv(
         &mut self,
         data: u64,
         count: usize,
@@ -296,7 +286,7 @@ impl<T> StreamCommunicator<T> {
 
     /// Group matching point-to-point operations into one NCCL submission.
     /// The group is ended even when `call` fails.
-    pub fn grouped<R>(&mut self, call: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
+    pub(crate) fn grouped<R>(&mut self, call: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
         let mut outcome = None;
         nccl::group(|| {
             outcome = Some(call(self));
@@ -310,28 +300,10 @@ impl<T> StreamCommunicator<T> {
         })
     }
 
-    /// Retain one symmetric allocation through all contexts sharing this stream.
-    ///
-    /// # Safety
-    /// `backing` keeps the VMM allocation `[data, data + bytes)` live; every rank
-    /// registers matching windows in the same order, outside graph capture.
-    pub unsafe fn register(&mut self, data: u64, bytes: usize, backing: T) -> Result<()> {
-        let resources = self.resources_mut()?;
-        if resources.windows.contains_key(&(data, bytes)) {
-            return Ok(());
-        }
-
-        // SAFETY: forwarded from the caller; `backing` is retained below until
-        // the communicator is destroyed or its resources are leaked.
-        unsafe { resources.communicator.register_window(data, bytes) }?;
-        resources.windows.insert((data, bytes), backing);
-        Ok(())
-    }
-
     /// Close collectively after all borrowed graph and tensor accesses retire.
     /// Aborted execution retains handles, mappings and streams until process exit.
     #[allow(clippy::mem_forget)]
-    pub fn close(&mut self, aborted: bool) -> Result<()> {
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let Some(resources) = self.resources.take() else {
             return Ok(());
         };
@@ -340,50 +312,37 @@ impl<T> StreamCommunicator<T> {
             computation: _,
             mut transfer,
             pending: _,
-            windows,
         } = resources;
 
-        // Without a completed destroy, the communicator, its window backing,
-        // its transfer stream and its context reference stay alive until
-        // process exit.
-        let retain = |transfer: CUDAStream, windows: IndexMap<(u64, usize), T>| {
-            std::mem::forget(transfer);
-            std::mem::forget(windows);
-        };
+        // Without a completed destroy, the communicator, its transfer stream
+        // and its context reference stay alive until process exit.
+        let retain = |transfer: CUDAStream| std::mem::forget(transfer);
 
         if aborted {
             std::mem::forget(communicator);
-            retain(transfer, windows);
+            retain(transfer);
             return Ok(());
         }
 
         if let Err(error) = transfer.synchronize() {
             std::mem::forget(communicator);
-            retain(transfer, windows);
+            retain(transfer);
             return Err(error);
         }
-        // Deregisters every window, then destroys the communicator. A failure
-        // leaks the communicator's remaining resources.
+        // A failed destroy leaks the communicator's remaining resources.
         if let Err(error) = communicator.destroy() {
-            retain(transfer, windows);
+            retain(transfer);
             return Err(error.into());
         }
         if let Err(error) = transfer.close(false) {
-            retain(transfer, windows);
+            retain(transfer);
             return Err(error);
         }
         Ok(())
     }
-
-    /// Visit backing references held by a foreign-language resource owner.
-    pub fn backings(&self) -> impl Iterator<Item = &T> {
-        self.resources
-            .iter()
-            .flat_map(|resources| resources.windows.values())
-    }
 }
 
-impl<T> Drop for StreamCommunicator<T> {
+impl Drop for StreamCommunicator {
     fn drop(&mut self) {
         // Implicit destruction cannot enter a collective that peers may never
         // reach. Normal callers explicitly close after retiring graph readers.
@@ -392,7 +351,7 @@ impl<T> Drop for StreamCommunicator<T> {
 }
 
 /// The worker's ranks and the mesh groups its components communicate over.
-pub struct PeerGroup<'a> {
+pub(crate) struct PeerGroup<'a> {
     /// Host collectives over the worker's ranks; member `i` is rank `i`.
     pub group: &'a super::host::HostGroup,
     /// Each component's multi-member mesh groups on this rank.
@@ -405,7 +364,7 @@ impl PeerGroup<'_> {
     /// group's members. `None` when the component communicates over no
     /// group, and on the host: a host component has no stream, and its
     /// collectives run on the component's host process groups.
-    pub fn stream_collectives(
+    pub(crate) fn stream_collectives(
         &self,
         component: &str,
         device: Device,
@@ -441,7 +400,7 @@ pub struct CollectiveGroup {
 
 struct GroupComm {
     group: CollectiveGroup,
-    comm: Arc<std::sync::Mutex<StreamCommunicator<()>>>,
+    comm: Arc<std::sync::Mutex<StreamCommunicator>>,
 }
 
 /// NCCL communicators bound to one binding's stream, one per mesh group its
@@ -518,14 +477,10 @@ impl StreamCollectives {
         Ok(bound)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
-    }
-
     /// Every group's collectives on this stream, as the list of
     /// `NativeCollectives` an execution context routes its communicators'
     /// collectives to.
-    pub fn natives(&self) -> Result<Any> {
+    pub(crate) fn natives(&self) -> Result<Any> {
         let construct = Interpreter::import(NATIVE_COLLECTIVES)?;
         let natives = self
             .groups
@@ -608,11 +563,11 @@ fn bytes_of(kind: DataType) -> usize {
     }
 }
 
-fn comm_size(comm: &StreamCommunicator<()>) -> Result<usize> {
+fn comm_size(comm: &StreamCommunicator) -> Result<usize> {
     comm.size()
 }
 
-fn comm_rank(comm: &StreamCommunicator<()>) -> Result<i32> {
+fn comm_rank(comm: &StreamCommunicator) -> Result<i32> {
     comm.rank()
 }
 
@@ -681,7 +636,7 @@ impl CollectiveFunctions {
 }
 
 fn functions(group: &GroupComm) -> CollectiveFunctions {
-    type Call = dyn Fn(&mut StreamCommunicator<()>, &[AnyView<'_>]) -> Result<Any>;
+    type Call = dyn Fn(&mut StreamCommunicator, &[AnyView<'_>]) -> Result<Any>;
     let mut ranks: Vec<usize> = group.group.ranks.clone();
     ranks.sort_unstable();
     let ranks = Arc::new(ranks);
@@ -709,7 +664,7 @@ fn functions(group: &GroupComm) -> CollectiveFunctions {
     let started = |asynchronous_all_to_all: bool| {
         let tokens = Arc::clone(&tokens);
         Box::new(
-            move |comm: &mut StreamCommunicator<()>, args: &[AnyView<'_>]| -> Result<Any> {
+            move |comm: &mut StreamCommunicator, args: &[AnyView<'_>]| -> Result<Any> {
                 let [output, value] = args else {
                     return Err(Error::Invalid("takes an output and a value".into()));
                 };
@@ -738,7 +693,7 @@ fn functions(group: &GroupComm) -> CollectiveFunctions {
     let joined = {
         let tokens = Arc::clone(&tokens);
         Box::new(
-            move |comm: &mut StreamCommunicator<()>, args: &[AnyView<'_>]| -> Result<Any> {
+            move |comm: &mut StreamCommunicator, args: &[AnyView<'_>]| -> Result<Any> {
                 let [token, stream] = args else {
                     return Err(Error::Invalid("wait takes a token and a stream".into()));
                 };

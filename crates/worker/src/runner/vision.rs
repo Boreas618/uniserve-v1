@@ -24,14 +24,14 @@ use crate::{Error, Result};
 
 /// How features enter the sequence (`uniserve.processing.FeatureLayout`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FeatureLayout {
+pub(crate) enum FeatureLayout {
     Direct,
     Framed,
 }
 
 /// The position coordinates of inserted features (`PositionLayout`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PositionLayout {
+pub(crate) enum PositionLayout {
     Temporal,
     TemporalSpatial,
     Sequential,
@@ -39,7 +39,7 @@ pub enum PositionLayout {
 
 /// A model's feature injection policy, with its marker tokens resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FeatureInjection {
+pub(crate) struct FeatureInjection {
     pub layout: FeatureLayout,
     pub positions: PositionLayout,
     pub start_token: Option<u32>,
@@ -49,14 +49,14 @@ pub struct FeatureInjection {
 /// The positions of a block's slots: one axis, or the three rotary axes
 /// (temporal, row, column).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BlockPositions {
+pub(crate) enum BlockPositions {
     Linear(Vec<i64>),
     Spatial([Vec<i64>; 3]),
 }
 
 /// One vision block's slots.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VisionBlock {
+pub(crate) struct VisionBlock {
     /// Token ids: markers, and placeholder 1 at feature slots.
     pub token_ids: Vec<i64>,
     /// The feature slots, whose embeddings the features replace.
@@ -65,12 +65,8 @@ pub struct VisionBlock {
 }
 
 impl VisionBlock {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.token_ids.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.token_ids.is_empty()
     }
 }
 
@@ -87,7 +83,7 @@ impl FeatureInjection {
     /// `Invalid` when the block has no features, a required marker token is
     /// unresolved, or the feature count does not divide the patch grid into
     /// a square pooling.
-    pub fn block(
+    pub(crate) fn block(
         &self,
         feature_tokens: usize,
         conditioning_position: u64,

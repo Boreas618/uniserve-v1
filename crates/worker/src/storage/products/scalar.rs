@@ -1,7 +1,7 @@
 //! Scalar products and their writes.
 
 use super::*;
-use crate::ffi::{DType, Device};
+use crate::ffi::{DType, MemoryKind};
 use crate::storage::memory::StorageView;
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
@@ -9,24 +9,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use uniserve_cuda::{CopyBatch, SourceOrder};
 
-/// A scalar written into a one-element product.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Scalar {
-    Int(i64),
-    Float(f64),
-}
-
-/// A one-element value's bits in `dtype` and their width in bytes.
-pub(super) fn scalar_bits(value: Scalar, dtype: DType) -> Result<(u64, usize)> {
-    let float = match value {
-        Scalar::Int(value) => value as f64,
-        Scalar::Float(value) => value,
-    };
-    let integer = match value {
-        Scalar::Int(value) => value,
-        // Float fills of integer storage truncate toward zero.
-        Scalar::Float(value) => value as i64,
-    };
+/// The bits of the integer `integer` stored as one element of `dtype`, and
+/// their width in bytes.
+pub(super) fn scalar_bits(integer: i64, dtype: DType) -> Result<(u64, usize)> {
+    let float = integer as f64;
     Ok(match dtype {
         DType::Bool => (u64::from(float != 0.0), 1),
         DType::U8 => (u64::from(integer as u8), 1),
@@ -96,7 +82,7 @@ pub(super) fn bf16_bits(value: f32) -> u16 {
 impl ProductStore {
     /// Copy one scalar per product from a contiguous source column of the
     /// products' dtype, in one batched copy on the producer `stream`.
-    pub fn write_scalars(
+    pub(crate) fn write_scalars(
         &self,
         writes: &[ProductBuffer],
         values: &StorageView,
@@ -143,7 +129,7 @@ impl ProductStore {
             );
         }
         match first.device() {
-            Device::Cuda(_) => {
+            MemoryKind::Cuda(_) => {
                 if stream.stream().is_none() {
                     return Err(Error::Invalid(
                         "a device product write requires its producer stream".into(),
@@ -165,12 +151,12 @@ impl ProductStore {
         Ok(targets)
     }
 
-    /// Fill a one-element product with `value` (its bit pattern in the
-    /// product's dtype) on the producer `stream`.
+    /// Fill a one-element product with the integer `value` (its bit pattern
+    /// in the product's dtype) on the producer `stream`.
     pub fn write_scalar(
         &self,
         buffer: &ProductBuffer,
-        value: Scalar,
+        value: i64,
         stream: impl Issue,
     ) -> Result<StorageView> {
         let state = lock(&self.state);
@@ -194,7 +180,7 @@ impl ProductStore {
                 count: 1,
             });
         match view.device() {
-            Device::Cuda(_) => {
+            MemoryKind::Cuda(_) => {
                 if stream.stream().is_none() {
                     return Err(Error::Invalid(
                         "a device product write requires its producer stream".into(),
@@ -238,10 +224,10 @@ mod tests {
 
     #[test]
     fn scalar_bits_follow_the_storage_dtype() -> Result<()> {
-        assert_eq!(scalar_bits(Scalar::Int(-1), DType::I32)?, (0xffff_ffff, 4));
-        assert_eq!(scalar_bits(Scalar::Float(2.9), DType::I64)?, (2, 8));
-        assert_eq!(scalar_bits(Scalar::Int(1), DType::F32)?, (0x3f80_0000, 4));
-        assert!(scalar_bits(Scalar::Int(1), DType::F8E4M3).is_err());
+        assert_eq!(scalar_bits(-1, DType::I32)?, (0xffff_ffff, 4));
+        assert_eq!(scalar_bits(-2, DType::I64)?, (u64::MAX - 1, 8));
+        assert_eq!(scalar_bits(1, DType::F32)?, (0x3f80_0000, 4));
+        assert!(scalar_bits(1, DType::F8E4M3).is_err());
         Ok(())
     }
 }

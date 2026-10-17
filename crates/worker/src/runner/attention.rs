@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 
 use crate::ffi::{Backing, DType};
 use crate::storage::PrefixCache;
@@ -30,12 +30,12 @@ use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// Host sections of `row_columns` before the per-table page counts.
-pub const ROW_SECTIONS: usize = 6;
+pub(crate) const ROW_SECTIONS: usize = 6;
 
 /// The capacity of a runner's attention metadata: rows, tokens, numerical
 /// tables and the widest page width a row selects from one table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AttentionCapacity {
+pub(crate) struct AttentionCapacity {
     pub rows: usize,
     pub tokens: usize,
     pub tables: usize,
@@ -44,7 +44,7 @@ pub struct AttentionCapacity {
 
 impl AttentionCapacity {
     /// Words of the packed host columns.
-    pub fn row_words(&self) -> usize {
+    pub(crate) fn row_words(&self) -> usize {
         (ROW_SECTIONS + self.tables) * (self.rows + 1) + self.tokens
     }
 }
@@ -52,7 +52,7 @@ impl AttentionCapacity {
 /// One runner's attention metadata on the host: the packed row column its
 /// Python half gathers from, and the host mirrors of the last staged
 /// forward's rows, which an eager forward and a capture read.
-pub struct AttentionMetadata {
+pub(crate) struct AttentionMetadata {
     pub capacity: AttentionCapacity,
     /// `int64 [row_words]` on the runner's device.
     row_columns: StorageView,
@@ -71,9 +71,9 @@ pub struct AttentionMetadata {
 impl AttentionMetadata {
     /// Allocate the packed row column on `device` (host memory when
     /// `None`), zeroed on `stream`.
-    pub fn allocate(
+    pub(crate) fn allocate(
         capacity: AttentionCapacity,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
         let words = capacity.row_words();
@@ -96,7 +96,7 @@ impl AttentionMetadata {
         })
     }
 
-    pub fn row_columns(&self) -> &StorageView {
+    pub(crate) fn row_columns(&self) -> &StorageView {
         &self.row_columns
     }
 
@@ -105,7 +105,7 @@ impl AttentionMetadata {
     /// `stream`, and keep the forward's host mirrors. `widths` fixes each
     /// table's page width (a captured graph's configured widths); `None`
     /// uses the rows' own.
-    pub fn stage(
+    pub(crate) fn stage(
         &mut self,
         rows: &[AttentionRow],
         prefix_cache: &mut PrefixCache,
@@ -176,7 +176,7 @@ impl AttentionMetadata {
 
 /// Pack rows into the `row_columns` layout (see the module table), with
 /// sections `stride` words apart and room for `tokens` token rows.
-pub fn pack_rows(
+pub(crate) fn pack_rows(
     rows: &[AttentionRow],
     pages: &[TablePages],
     stride: usize,

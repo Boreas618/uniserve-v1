@@ -25,8 +25,8 @@ struct Call {
     last: Option<usize>,
 }
 
-struct State<T> {
-    backing: Option<T>,
+struct State {
+    backing: Option<WeightStorage>,
     calls: Vec<Call>,
     closed: bool,
 }
@@ -36,24 +36,24 @@ struct State<T> {
 /// The numerical backend supplies immutable source mappings and destination
 /// views. Calls serialize on their execution stream. External events protect
 /// both copy-before-read and read-before-overwrite across CUDA graph segments.
-pub struct WeightPrefetch<T> {
+pub(crate) struct WeightPrefetch {
     device: DeviceId,
     layers: HashMap<usize, usize>,
     copies: Vec<CopyBatch>,
     stream: Stream,
     ready: [Event; 2],
     consumed: [Event; 2],
-    state: Mutex<State<T>>,
+    state: Mutex<State>,
 }
 
-impl<T> WeightPrefetch<T> {
+impl WeightPrefetch {
     /// Copy tuples are `(peer, destination, source, bytes)`, grouped by layer.
     /// `backing` retains every allocation used by those addresses.
-    pub fn new(
-        device: i32,
+    pub(crate) fn new(
+        device: DeviceId,
         layers: Vec<usize>,
         copies: Vec<Vec<(usize, usize, usize, usize)>>,
-        backing: T,
+        backing: WeightStorage,
     ) -> Result<Self> {
         if layers.len() != copies.len() || layers.is_empty() {
             return Err(Error::Invalid(
@@ -69,14 +69,14 @@ impl<T> WeightPrefetch<T> {
         };
 
         Ok(Self {
-            device: DeviceId(device),
+            device,
             layers: layers
                 .into_iter()
                 .enumerate()
                 .map(|(i, layer)| (layer, i))
                 .collect(),
             copies: copies.into_iter().map(plan).collect(),
-            stream: Stream::new(DeviceId(device))?,
+            stream: Stream::new(device)?,
             ready: std::array::from_fn(|_| external()),
             consumed: std::array::from_fn(|_| external()),
             state: Mutex::new(State {
@@ -87,17 +87,13 @@ impl<T> WeightPrefetch<T> {
         })
     }
 
-    fn state(&self) -> MutexGuard<'_, State<T>> {
+    fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The device the weights and their copy stream live on.
-    pub fn device(&self) -> DeviceId {
+    pub(crate) fn device(&self) -> DeviceId {
         self.device
-    }
-
-    pub fn contains(&self, module: usize) -> bool {
-        self.layers.contains_key(&module)
     }
 
     fn index(&self, module: usize) -> Result<usize> {
@@ -107,7 +103,7 @@ impl<T> WeightPrefetch<T> {
             .ok_or_else(|| Error::Invalid("module has no prefetched expert weights".into()))
     }
 
-    pub fn begin(&self) -> Result<()> {
+    pub(crate) fn begin(&self) -> Result<()> {
         let mut state = self.state();
         if state.closed {
             return Err(Error::State("DWDP weight owner is closed"));
@@ -117,7 +113,7 @@ impl<T> WeightPrefetch<T> {
     }
 
     /// Join a speculative tail copy even if the call omitted its last layer.
-    pub fn end(&self, compute: &Stream) -> Result<()> {
+    pub(crate) fn end(&self, compute: &Stream) -> Result<()> {
         let last = self
             .state()
             .calls
@@ -131,14 +127,14 @@ impl<T> WeightPrefetch<T> {
     }
 
     /// `submit` either copies now or records a copy between graph segments.
-    /// It runs outside the state lock and may call back into this owner.
-    /// Callback errors retain their backend type in the inner result.
-    pub fn before<E>(
+    /// It runs outside the state lock and may call back into this owner; its
+    /// failure is returned as is.
+    pub(crate) fn before(
         &self,
         module: usize,
         compute: &Stream,
-        mut submit: impl FnMut(usize) -> std::result::Result<(), E>,
-    ) -> Result<std::result::Result<(), E>> {
+        mut submit: impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
         let index = self.index(module)?;
         let (started, queued) = {
             let mut state = self.state();
@@ -158,10 +154,8 @@ impl<T> WeightPrefetch<T> {
             }
         }
 
-        if queued != Some(index)
-            && let Err(error) = self.prefetch(index, &mut submit)?
-        {
-            return Ok(Err(error));
+        if queued != Some(index) {
+            self.prefetch(index, &mut submit)?;
         }
 
         compute.wait_event(&self.ready[index % 2])?;
@@ -175,14 +169,10 @@ impl<T> WeightPrefetch<T> {
         if let Some(next) = next {
             return self.prefetch(next, &mut submit);
         }
-        Ok(Ok(()))
+        Ok(())
     }
 
-    fn prefetch<E>(
-        &self,
-        index: usize,
-        submit: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-    ) -> Result<std::result::Result<(), E>> {
+    fn prefetch(&self, index: usize, submit: &mut impl FnMut(usize) -> Result<()>) -> Result<()> {
         let mut state = self.state();
         let call = state
             .calls
@@ -190,10 +180,10 @@ impl<T> WeightPrefetch<T> {
             .ok_or(Error::State("DWDP expert call requires an active context"))?;
         call.last = Some(index);
         drop(state);
-        Ok(submit(index))
+        submit(index)
     }
 
-    pub fn after(&self, module: usize, compute: &Stream) -> Result<()> {
+    pub(crate) fn after(&self, module: usize, compute: &Stream) -> Result<()> {
         let index = self.index(module)?;
         self.consumed[index % 2].record(compute)?;
         Ok(())
@@ -201,7 +191,7 @@ impl<T> WeightPrefetch<T> {
 
     /// Replay a recorded peer read, preserving the same two-slot dependencies
     /// as eager execution. No host synchronization is performed.
-    pub fn copy(&self, index: usize) -> Result<()> {
+    pub(crate) fn copy(&self, index: usize) -> Result<()> {
         if self.state().closed {
             return Err(Error::State("DWDP weight owner is closed"));
         }
@@ -220,7 +210,7 @@ impl<T> WeightPrefetch<T> {
 
     /// The caller retires numerical readers first. Drain the copy stream and
     /// return backing for destruction outside owner locks and binding borrows.
-    pub fn close(&self) -> Result<Option<T>> {
+    pub(crate) fn close(&self) -> Result<Option<WeightStorage>> {
         let mut state = self.state();
         if state.backing.is_none() {
             return Ok(None);
@@ -234,13 +224,9 @@ impl<T> WeightPrefetch<T> {
         self.stream.synchronize()?;
         Ok(self.state().backing.take())
     }
-
-    pub fn visit<R>(&self, visit: impl FnOnce(&T) -> R) -> Option<R> {
-        self.state().backing.as_ref().map(visit)
-    }
 }
 
-impl<T> Drop for WeightPrefetch<T> {
+impl Drop for WeightPrefetch {
     #[expect(
         clippy::mem_forget,
         reason = "unknown copy completion must retain peer mappings"
@@ -282,7 +268,7 @@ fn plan(copies: Vec<(usize, usize, usize, usize)>) -> CopyBatch {
 
 /// One sharded expert-weight field of one layer: this rank's contiguous
 /// shard of `rows` experts (the field's leading axis), on the device.
-pub struct ShardField {
+pub(crate) struct ShardField {
     /// The field's name, unique within its layer (`up_gate.values`).
     pub name: String,
     /// Device address and bytes of this rank's shard.
@@ -293,7 +279,7 @@ pub struct ShardField {
 /// Storage that must outlive every copy and every reader of the composite
 /// weight views: published shards, reusable remote slots and the composite
 /// mappings.
-pub struct WeightStorage {
+pub(crate) struct WeightStorage {
     published: Vec<crate::transfer::PeerStorage>,
     slots: Vec<uniserve_cuda::DeviceAllocation>,
     composites: Vec<std::sync::Arc<crate::storage::memory::Memory>>,
@@ -313,8 +299,8 @@ pub struct WeightStorage {
 /// are copied once at setup; every other remote byte is copied before its
 /// layer computes. Only setup is collective: inference waits on local copy
 /// and compute events alone.
-pub struct ExpertWeights {
-    prefetch: WeightPrefetch<WeightStorage>,
+pub(crate) struct ExpertWeights {
+    prefetch: WeightPrefetch,
     /// Bytes of resident pages, reusable slots and per-invocation copies.
     pub resident_bytes: usize,
     pub buffer_bytes: usize,
@@ -330,9 +316,9 @@ impl ExpertWeights {
     /// copies run on `stream`, which is drained before returning. On
     /// failure every mapping is retained until the process exits, because
     /// peers may already read published pages.
-    pub fn build(
+    pub(crate) fn build(
         group: &super::host::HostGroup,
-        device: i32,
+        device: DeviceId,
         node: &str,
         layers: &[Vec<ShardField>],
         stream: &Stream,
@@ -371,7 +357,7 @@ impl ExpertWeights {
     #[expect(clippy::type_complexity, reason = "one setup's complete result")]
     fn map(
         group: &super::host::HostGroup,
-        device: i32,
+        device: DeviceId,
         node: &str,
         layers: &[Vec<ShardField>],
         stream: &Stream,
@@ -390,7 +376,7 @@ impl ExpertWeights {
         use crate::storage::memory::{Memory, StorageView};
 
         let (rank, size) = (group.rank(), group.size());
-        let page = DeviceAllocation::granularity(DeviceId(device))?;
+        let page = DeviceAllocation::granularity(device)?;
         let mut slots: HashMap<(usize, String, &'static str, usize), usize> = HashMap::new();
         let mut copies = Vec::with_capacity(layers.len());
         let mut views = Vec::with_capacity(layers.len());
@@ -444,11 +430,9 @@ impl ExpertWeights {
                     let slot = match slots.get(&key) {
                         Some(&slot) => slot,
                         None => {
-                            storage.slots.push(DeviceAllocation::exportable(
-                                DeviceId(device),
-                                length,
-                                &[],
-                            )?);
+                            storage
+                                .slots
+                                .push(DeviceAllocation::exportable(device, length, &[])?);
                             buffer_bytes += length;
                             slots.insert(key, storage.slots.len() - 1);
                             storage.slots.len() - 1
@@ -530,17 +514,17 @@ impl ExpertWeights {
     }
 
     /// The device the weights live on.
-    pub fn device(&self) -> DeviceId {
+    pub(crate) fn device(&self) -> DeviceId {
         self.prefetch.device()
     }
 
     /// Open one invocation.
-    pub fn begin(&self) -> Result<()> {
+    pub(crate) fn begin(&self) -> Result<()> {
         self.prefetch.begin()
     }
 
     /// Close one invocation on `compute`, joining a speculative tail copy.
-    pub fn end(&self, compute: &Stream) -> Result<()> {
+    pub(crate) fn end(&self, compute: &Stream) -> Result<()> {
         self.prefetch.end(compute)
     }
 
@@ -552,7 +536,7 @@ impl ExpertWeights {
     /// [`copy`](Self::copy) of `index` and begin the next segment. The order
     /// matters: the wait for this layer's slots is captured after the
     /// segment boundary that submits their copy.
-    pub fn before(
+    pub(crate) fn before(
         &self,
         layer: usize,
         compute: &Stream,
@@ -565,22 +549,22 @@ impl ExpertWeights {
             } else {
                 self.prefetch.copy(index)
             }
-        })?
+        })
     }
 
     /// Release layer `layer`'s slots after its last reader on `compute`.
-    pub fn after(&self, layer: usize, compute: &Stream) -> Result<()> {
+    pub(crate) fn after(&self, layer: usize, compute: &Stream) -> Result<()> {
         self.prefetch.after(layer, compute)
     }
 
     /// Submit one recorded copy (graph replay between segments).
-    pub fn copy(&self, index: usize) -> Result<()> {
+    pub(crate) fn copy(&self, index: usize) -> Result<()> {
         self.prefetch.copy(index)
     }
 
     /// Drain the copy stream and release the storage after every reader and
     /// graph retired.
-    pub fn close(&self) -> Result<()> {
+    pub(crate) fn close(&self) -> Result<()> {
         drop(self.prefetch.close()?);
         Ok(())
     }
@@ -652,7 +636,7 @@ impl DwdpManager {
             return Err(Error::Unsupported("DWDP requires CUDA peer memory".into()));
         };
         let stream = match streams.lanes() {
-            [] => streams.preparation(DeviceId(device)),
+            [] => streams.preparation(device),
             [lane] => Some(&lane.stream),
             _ => {
                 return Err(Error::Unsupported(

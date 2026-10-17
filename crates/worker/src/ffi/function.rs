@@ -37,13 +37,13 @@ impl Function {
     }
 
     /// The table or binding key this function was resolved from.
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
     /// Call with packed arguments. A Python exception becomes
     /// [`Error::Numerical`] naming this function.
-    pub fn call(&self, args: &[AnyView<'_>]) -> Result<Any> {
+    pub(crate) fn call(&self, args: &[AnyView<'_>]) -> Result<Any> {
         interpreter::call(&self.inner, args).map_err(|error| Error::numerical(&self.name, &error))
     }
 
@@ -65,11 +65,6 @@ impl Function {
     pub fn call_values(&self, args: &[Any]) -> Result<Any> {
         let views: Vec<AnyView<'_>> = args.iter().map(AnyView::from).collect();
         self.call(&views)
-    }
-
-    /// The function as a value, to pass to another function.
-    pub fn to_any(&self) -> Any {
-        Any::from(self.inner.clone())
     }
 }
 
@@ -93,12 +88,12 @@ pub struct DeferredCall {
 unsafe impl Send for DeferredCall {}
 
 impl DeferredCall {
-    pub fn new(function: Function, args: Vec<Any>) -> Self {
+    pub(crate) fn new(function: Function, args: Vec<Any>) -> Self {
         Self { function, args }
     }
 
     /// Make the call and drop the result.
-    pub fn invoke(self) -> Result<()> {
+    pub(crate) fn invoke(self) -> Result<()> {
         self.function.call_values(&self.args).map(drop)
     }
 }
@@ -121,7 +116,7 @@ pub fn integers(value: Any) -> std::result::Result<Vec<i64>, tvm_ffi::Error> {
 }
 
 /// Convert a list of strings.
-pub fn texts(value: Any) -> std::result::Result<Vec<String>, tvm_ffi::Error> {
+pub(crate) fn texts(value: Any) -> std::result::Result<Vec<String>, tvm_ffi::Error> {
     let values: Array<tvm_ffi::String> = Array::try_from(value)?;
     Ok(values
         .iter()
@@ -130,7 +125,9 @@ pub fn texts(value: Any) -> std::result::Result<Vec<String>, tvm_ffi::Error> {
 }
 
 /// A list of strings as a TVM-FFI array.
-pub fn strings<S: AsRef<str>>(values: impl IntoIterator<Item = S>) -> Array<tvm_ffi::String> {
+pub(crate) fn strings<S: AsRef<str>>(
+    values: impl IntoIterator<Item = S>,
+) -> Array<tvm_ffi::String> {
     values
         .into_iter()
         .map(|value| tvm_ffi::String::from(value.as_ref()))
@@ -143,6 +140,6 @@ pub fn integer_list(values: impl IntoIterator<Item = i64>) -> Array<Any> {
 }
 
 /// A list of arbitrary values as a TVM-FFI array.
-pub fn list(values: impl IntoIterator<Item = Any>) -> Array<Any> {
+pub(crate) fn list(values: impl IntoIterator<Item = Any>) -> Array<Any> {
     values.into_iter().collect()
 }

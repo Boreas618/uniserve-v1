@@ -7,8 +7,8 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use uniserve_cuda::{DeviceId, Stream};
-use uniserve_worker::parallel::{MicrobatchCall, MicrobatchLanes};
-use uniserve_worker::{Error, yield_microbatch};
+use uniserve_worker::Error;
+use uniserve_worker::parallel::{MicrobatchCall, MicrobatchLanes, yield_microbatch};
 
 fn streams(count: usize) -> (Stream, Vec<Stream>) {
     let parent = Stream::new(DeviceId(0)).unwrap();

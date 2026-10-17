@@ -44,7 +44,7 @@ use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::batch::{
-    Batch, Failure, Launched, Opening, Stage, StreamOrder, fail, lock, unsupported,
+    Batch, Failure, Launched, Opening, Stage, StreamOrder, fail, unsupported,
 };
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::lane::{Completion, Job};
@@ -53,7 +53,7 @@ use crate::request::RequestPool;
 use crate::storage::{PrefixCache, ProductBuffer, ProductStore};
 use crate::stream::EventPool;
 use crate::worker::RankStorage;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// What a batch borrows from the rank.
 struct Context<'a> {

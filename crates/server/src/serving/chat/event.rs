@@ -135,14 +135,6 @@ impl AssistantMessage {
         .filter(|text: &String| !text.is_empty())
     }
 
-    /// Returns whether this assistant message contains any non-empty reasoning text blocks.
-    pub fn has_reasoning(&self) -> bool {
-        self.content.iter().any(|block| match block {
-            AssistantContentBlock::Reasoning { text } => !text.is_empty(),
-            _ => false,
-        })
-    }
-
     /// Returns finalized assistant tool calls in encounter order.
     pub fn tool_calls(&self) -> impl Iterator<Item = &AssistantToolCall> {
         self.content

@@ -174,7 +174,7 @@ impl Interpreter {
         clippy::expect_used,
         reason = "the work stores its result before the handoff completes"
     )]
-    pub fn execute<T>(work: impl FnOnce() -> T) -> T {
+    pub(crate) fn execute<T>(work: impl FnOnce() -> T) -> T {
         let mut work = Some(work);
         let mut result = None;
         on_python_thread(&mut || result = work.take().map(|work| work()));

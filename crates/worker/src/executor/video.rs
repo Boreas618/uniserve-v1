@@ -22,9 +22,9 @@
 //!    the commit (the end of the input leases, the executed calls' flags,
 //!    the seal of the lease) after every owner validated its update.
 //! 4. From that job's completion, [`MediaBatch::apply_commit`] publishes
-//!    the exports the forwards issued, applies the trajectory commits
-//!    ([`Trajectories`]), makes the writes visible and the calls pending:
-//!    the commit point. A failure before it retires everything the batch
+//!    the exports the forwards issued, applies the trajectory commits to
+//!    the video denoiser's latent pool, makes the writes visible and the
+//!    calls pending: the commit point. A failure before it retires everything the batch
 //!    reserved in a job behind what it recorded, and the batch's calls fail;
 //!    a failure at or past it is fatal.
 //! 5. The launched batch materializes once its output fences completed and
@@ -42,6 +42,7 @@ use uniserve_ipc::{
     ForwardStats, MediaCall, TensorRef, WorkerInfo,
 };
 
+use crate::config::Device;
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::PendingOutput;
@@ -51,13 +52,14 @@ use crate::executor::inputs::Inputs;
 use crate::executor::products::{
     OutputShape, Placement, ProductOwners, Publications, bind_outputs, export,
 };
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::host::HostTask;
 use crate::host::task::{MediaTask, TaskOutput};
 use crate::lane::{Completion, Job};
 use crate::request::RequestPool;
 use crate::request::video::VideoRequests;
 use crate::runner::decoder::runners::DecoderRunners;
+use crate::runner::denoiser::DenoiserRunner;
 use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::ConditionSetup;
 use crate::runner::encoder::runners::EncoderRunners;
@@ -87,14 +89,6 @@ pub(crate) enum Publication {
     },
     /// The finished MP4, delivered by the component's output rank.
     Media,
-}
-
-/// The latent pool a batch's trajectory commits apply to.
-pub(crate) trait Trajectories {
-    /// Check every commit before any becomes visible.
-    fn validate(&self, updates: &[LatentUpdate]) -> Result<()>;
-    /// Make the checked commits visible.
-    fn apply(&mut self, updates: &[LatentUpdate]);
 }
 
 /// What a call contributes to its media batch's forward, beside the state
@@ -175,7 +169,7 @@ impl MediaBatch {
     }
 
     /// The device the batch's products live on.
-    pub(crate) fn target(&self) -> Device {
+    pub(crate) fn target(&self) -> MemoryKind {
         self.batch.target()
     }
 
@@ -225,7 +219,7 @@ impl MediaBatch {
         plan: &BatchPlan,
         storage: &RankStorage,
         requests: &RequestPool,
-        trajectories: Option<&dyn Trajectories>,
+        trajectories: Option<&DenoiserRunner>,
         job: &Job,
     ) -> std::result::Result<(), Failure> {
         let failed = Failure::new(PHASE);
@@ -258,7 +252,7 @@ impl MediaBatch {
         plan: &BatchPlan,
         tensors: &ProductStore,
         requests: &mut RequestPool,
-        trajectories: Option<&mut dyn Trajectories>,
+        trajectories: Option<&mut DenoiserRunner>,
     ) -> std::result::Result<(), Failure> {
         let failed = Failure::new(PHASE);
         for state in &mut self.batch.calls {
@@ -673,7 +667,7 @@ fn record(
         ))));
     };
     let (device, stream) = match parts.placement(media_kind(first), &first.component) {
-        Ok((device, stream)) => (device.cuda_index(), stream),
+        Ok((device, stream)) => (device.cuda(), stream),
         Err(error) => return Ok(Step::Failed(failed(error))),
     };
 
@@ -741,7 +735,7 @@ fn record(
                 .denoisers
                 .video
                 .as_ref()
-                .map(|denoiser| &denoiser.runner as &dyn Trajectories);
+                .map(|denoiser| &denoiser.runner);
             media.issue_commit(plan, parts.storage, parts.requests, trajectories, &job)
         });
     Ok(match recorded {
@@ -907,7 +901,7 @@ pub(crate) fn complete(
                     .denoisers
                     .video
                     .as_mut()
-                    .map(|denoiser| &mut denoiser.runner as &mut dyn Trajectories);
+                    .map(|denoiser| &mut denoiser.runner);
                 match media.apply_commit(plan, &parts.storage.tensors, parts.requests, trajectories)
                 {
                     Ok(()) => Done::Launched(Box::new(media.launch())),

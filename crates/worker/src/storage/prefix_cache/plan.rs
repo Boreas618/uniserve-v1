@@ -18,7 +18,6 @@ use tvm_ffi::Any;
 
 use crate::ffi::{DType, Handle, Interpreter, integers, texts};
 use crate::storage::GroupShape;
-use crate::storage::memory::parse_dtype;
 use crate::{Error, Result};
 
 /// The library module of the cache functions.
@@ -57,11 +56,11 @@ pub struct CacheGroupPlan {
 
 impl CacheGroupPlan {
     /// Bytes one token of one layer's key (or value) occupies.
-    pub fn row_bytes(&self) -> u64 {
+    pub(crate) fn row_bytes(&self) -> u64 {
         u64::from(self.num_kv_heads) * u64::from(self.head_dim) * self.dtype.bytes() as u64
     }
 
-    pub fn shape(&self) -> Result<GroupShape> {
+    pub(crate) fn shape(&self) -> Result<GroupShape> {
         GroupShape::new(self.page_tokens, self.units_per_page, self.window)
     }
 }
@@ -82,7 +81,7 @@ pub struct CachePlan {
 impl CachePlan {
     /// Plan `loaded`'s unit pool for `block_size`-token pages of the widest
     /// rows (`cache_plan`). `prefix_cache_dtype` is `None` for the compute dtype.
-    pub fn plan(
+    pub(crate) fn plan(
         loaded: &Handle,
         block_size: usize,
         prefix_cache_dtype: Option<&str>,
@@ -93,7 +92,7 @@ impl CachePlan {
 
     /// Whether the attention `backend` reads every resident layer's pages of
     /// `loaded`'s pool with `block_size`-token pages (`reads_pages`).
-    pub fn reads_pages(
+    pub(crate) fn reads_pages(
         loaded: &Handle,
         backend: &str,
         block_size: usize,
@@ -143,7 +142,7 @@ impl CachePlan {
         let dtypes = |method: &str| -> Result<Vec<DType>> {
             names(method)?
                 .iter()
-                .map(|name| parse_dtype(name))
+                .map(|name| DType::parse(name))
                 .collect()
         };
 
@@ -208,19 +207,14 @@ impl CachePlan {
     /// Whether groups store different element types: stale bytes of one type
     /// need not decode as finite values of another, so recycled units are
     /// zeroed completely.
-    pub fn mixed_types(&self) -> bool {
+    pub(crate) fn mixed_types(&self) -> bool {
         self.groups
             .iter()
             .any(|group| group.dtype != self.groups[0].dtype)
     }
 
-    /// Block tables: one per (group, unit position in a page), group-major.
-    pub fn tables(&self) -> u32 {
-        self.groups.iter().map(|group| group.units_per_page).sum()
-    }
-
     /// The largest page of any group: a unit's whole token range.
-    pub fn unit_tokens(&self) -> u32 {
+    pub(crate) fn unit_tokens(&self) -> u32 {
         self.groups
             .iter()
             .map(|group| group.page_tokens)
@@ -228,12 +222,12 @@ impl CachePlan {
             .unwrap_or(0)
     }
 
-    pub fn group_shapes(&self) -> Result<Vec<GroupShape>> {
+    pub(crate) fn group_shapes(&self) -> Result<Vec<GroupShape>> {
         self.groups.iter().map(CacheGroupPlan::shape).collect()
     }
 
     /// The compute dtype cache exports declare.
-    pub fn compute_dtype(&self) -> DType {
+    pub(crate) fn compute_dtype(&self) -> DType {
         self.groups[0].compute_dtype
     }
 
@@ -265,7 +259,7 @@ impl CachePlan {
     /// Elements `E` and scale entries `S` of the largest group page, which
     /// size a cache import workspace: `E = page_tokens * layers * heads * dim`
     /// and `S = page_tokens * layers * heads`, maximized over groups.
-    pub fn page_extents(&self) -> (u64, u64) {
+    pub(crate) fn page_extents(&self) -> (u64, u64) {
         self.groups
             .iter()
             .fold((0, 0), |(elements, scales), group| {

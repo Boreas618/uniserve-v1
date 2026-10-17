@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use tvm_ffi::Any;
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 
 use super::expert_union::ExpertUnion;
 use super::microbatches::{MicrobatchCall, turn};
@@ -22,7 +22,7 @@ use crate::{Error, Result};
 
 /// The library's graph capture functions (`uniserve.cuda_graph`).
 #[derive(Clone)]
-pub struct GraphFunctions {
+pub(crate) struct GraphFunctions {
     /// `capture_begin(pool, stream, device) -> capture`.
     pub begin: Function,
     /// `capture_end(capture) -> [graph, executables]`.
@@ -33,7 +33,7 @@ pub struct GraphFunctions {
 
 impl GraphFunctions {
     /// The capture functions of the library's `uniserve.cuda_graph`.
-    pub fn import() -> Result<Self> {
+    pub(crate) fn import() -> Result<Self> {
         Ok(Self {
             begin: Interpreter::import("uniserve.cuda_graph.capture_begin")?,
             end: Interpreter::import("uniserve.cuda_graph.capture_end")?,
@@ -44,11 +44,11 @@ impl GraphFunctions {
     /// Capture whatever `body` submits on `stream` (and on streams forked
     /// from it and joined back before it returns) into one graph in `pool`.
     /// A failed body still ends the capture, discarding the partial graph.
-    pub fn capture(
+    pub(crate) fn capture(
         &self,
         pool: &Handle,
         stream: usize,
-        device: i32,
+        device: DeviceId,
         body: impl FnOnce() -> Result<()>,
     ) -> Result<CUDAGraph> {
         self.capture_with_peers(pool, &[], stream, device, body)
@@ -57,24 +57,24 @@ impl GraphFunctions {
     /// [`Self::capture`] of work whose modules also run on other devices
     /// (a generation tower): `peers` pairs each such device with the pool
     /// receiving the work's allocations there.
-    pub fn capture_with_peers(
+    pub(crate) fn capture_with_peers(
         &self,
         pool: &Handle,
-        peers: &[(i32, Handle)],
+        peers: &[(DeviceId, Handle)],
         stream: usize,
-        device: i32,
+        device: DeviceId,
         body: impl FnOnce() -> Result<()>,
     ) -> Result<CUDAGraph> {
         let peers = crate::ffi::list(peers.iter().map(|(device, pool)| {
             Any::from(crate::ffi::list([
-                Any::from(i64::from(*device)),
+                Any::from(i64::from(device.0)),
                 pool.to_any(),
             ]))
         }));
         let capture = Handle::new(self.begin.call_values(&[
             pool.to_any(),
             Any::from(stream as i64),
-            Any::from(i64::from(device)),
+            Any::from(i64::from(device.0)),
             Any::from(peers),
         ])?)?;
         let ran = body();
@@ -95,7 +95,7 @@ impl GraphFunctions {
 }
 
 /// One captured join per step capacity.
-pub struct JoinGraphs {
+pub(crate) struct JoinGraphs {
     graphs: BTreeMap<usize, CUDAGraph>,
     functions: GraphFunctions,
 }
@@ -106,12 +106,12 @@ impl JoinGraphs {
     /// that is a collective step, so every rank of the union warms the same
     /// capacities at the same point of its startup. Capture itself issues
     /// no communication.
-    pub fn capture(
+    pub(crate) fn capture(
         capacities: &[usize],
         warm: bool,
         pool: &Handle,
         stream: usize,
-        device: i32,
+        device: DeviceId,
         join: &dyn Fn(usize) -> Result<()>,
         functions: &GraphFunctions,
     ) -> Result<Self> {
@@ -143,12 +143,12 @@ impl JoinGraphs {
     }
 
     /// Join a step of `capacity` tokens per rank on `stream`.
-    pub fn launch(&self, capacity: usize, stream: &Stream) -> Result<()> {
+    pub(crate) fn launch(&self, capacity: usize, stream: &Stream) -> Result<()> {
         self.graph(capacity)?.launch(stream)
     }
 
     /// The captured join of `capacity`, which another thread can launch.
-    pub fn graph(&self, capacity: usize) -> Result<&CUDAGraph> {
+    pub(crate) fn graph(&self, capacity: usize) -> Result<&CUDAGraph> {
         self.graphs.get(&capacity).ok_or_else(|| {
             Error::Invalid(format!(
                 "no captured expert join serves step capacity {capacity}"
@@ -156,18 +156,14 @@ impl JoinGraphs {
         })
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.graphs.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.graphs.is_empty()
     }
 
     /// Release the graphs after every stream they were launched on drained. An
     /// aborted close keeps them (and the storage they address) until exit.
     #[allow(clippy::mem_forget)]
-    pub fn close(&mut self, aborted: bool) -> Result<()> {
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let graphs = std::mem::take(&mut self.graphs);
         if aborted {
             std::mem::forget(graphs);

@@ -26,16 +26,16 @@ use uniserve_core::ComponentConfig;
 use crate::{Error, Result};
 
 /// Host components own no numerical method and no process group.
-pub const HOST_COMPONENTS: [&str; 3] = ["media_reader", "video_codec", "muxer"];
+pub(crate) const HOST_COMPONENTS: [&str; 3] = ["media_reader", "video_codec", "muxer"];
 
-pub fn is_host_component(name: &str) -> bool {
+pub(crate) fn is_host_component(name: &str) -> bool {
     HOST_COMPONENTS.contains(&name)
 }
 
 /// An ordered mathematical topology: `ranks` laid out row-major over
 /// `shape`, with one name per axis.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mesh {
+pub(crate) struct Mesh {
     /// Logical (process-world) ranks in topology order.
     pub ranks: Vec<usize>,
     pub shape: Vec<usize>,
@@ -43,7 +43,7 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    pub fn new(ranks: Vec<usize>, dimensions: &[(&str, usize)]) -> Result<Self> {
+    pub(crate) fn new(ranks: Vec<usize>, dimensions: &[(&str, usize)]) -> Result<Self> {
         let shape: Vec<usize> = dimensions.iter().map(|(_, size)| *size).collect();
         if shape.iter().product::<usize>() != ranks.len() || shape.contains(&0) {
             return Err(Error::Invalid(
@@ -73,7 +73,7 @@ impl Mesh {
 
     /// Fibers of `selection` in topology order, each ordered by the selected
     /// axes' coordinates in selection order. This is `DeviceMesh.members`.
-    pub fn members(&self, selection: &[String]) -> Result<Vec<Vec<usize>>> {
+    pub(crate) fn members(&self, selection: &[String]) -> Result<Vec<Vec<usize>>> {
         let varying = selection
             .iter()
             .map(|axis| {
@@ -112,7 +112,7 @@ impl Mesh {
 
 /// One torch group every rank creates, in plan order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupEntry {
+pub(crate) struct GroupEntry {
     /// Physical (torch world) ranks, sorted.
     pub members: Vec<usize>,
     /// Create with local synchronization: only members synchronize, which
@@ -124,7 +124,7 @@ pub struct GroupEntry {
 
 /// A communicator of one bound mesh that this rank belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MeshGroup {
+pub(crate) struct MeshGroup {
     /// Selected axes; empty for the rank-local selection.
     pub axes: Vec<String>,
     /// Physical members in logical (fiber) order.
@@ -135,7 +135,7 @@ pub struct MeshGroup {
 
 impl MeshGroup {
     /// The communicator name: axes joined by `.`, or `local`.
-    pub fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         if self.axes.is_empty() {
             "local".to_owned()
         } else {
@@ -146,7 +146,7 @@ impl MeshGroup {
 
 /// A mesh this rank binds, with the communicators it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MeshBinding {
+pub(crate) struct MeshBinding {
     pub mesh: Mesh,
     /// This rank's world rank (it may be outside `mesh.ranks`).
     pub rank: usize,
@@ -156,7 +156,7 @@ pub struct MeshBinding {
 
 /// One component's process groups on this rank.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ComponentGroups {
+pub(crate) struct ComponentGroups {
     pub name: String,
     /// Whether this rank runs the component.
     pub member: bool,
@@ -168,13 +168,13 @@ pub struct ComponentGroups {
 
 /// The rank's complete group-creation plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupPlan {
+pub(crate) struct GroupPlan {
     pub entries: Vec<GroupEntry>,
     pub components: Vec<ComponentGroups>,
 }
 
 /// Inputs that fix the plan; identical on every rank except `rank`.
-pub struct PlanInputs<'a> {
+pub(crate) struct PlanInputs<'a> {
     /// This rank's world rank.
     pub rank: usize,
     /// Physical rank of each world rank (the torch ranks of this instance).
@@ -193,7 +193,7 @@ impl GroupPlan {
     /// Fails with "rank has no configured component" only after the complete
     /// plan exists, so the caller can still create every group and release
     /// its peers before refusing.
-    pub fn components(inputs: &PlanInputs<'_>) -> Result<(Self, bool)> {
+    pub(crate) fn components(inputs: &PlanInputs<'_>) -> Result<(Self, bool)> {
         let mut plan = Self {
             entries: Vec::new(),
             components: Vec::new(),

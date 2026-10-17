@@ -5,7 +5,8 @@ mod events;
 mod issue;
 
 pub(crate) use events::Deferral;
-pub use events::{Deferred, EventPool, Submitter};
+pub(crate) use events::Deferred;
+pub use events::EventPool;
 pub(crate) use issue::HostFunction;
 pub use issue::{Fill, Issue, RowFill};
 
@@ -44,7 +45,6 @@ pub(crate) unsafe fn external(device: DeviceId, handle: usize) -> Result<Stream>
 pub struct CUDAStream {
     device: DeviceId,
     stream: Option<Stream>,
-    sm_count: u32,
     partitioned: bool,
     /// The fence [`Self::wait`] orders this stream after a producer with.
     /// One event serves every wait: a wait captures the record made just
@@ -54,13 +54,11 @@ pub struct CUDAStream {
 
 impl CUDAStream {
     fn new(device: DeviceId, stream: Stream) -> Result<Self> {
-        let sm_count = stream.sm_count()?;
         let partitioned = stream.is_partitioned()?;
 
         Ok(Self {
             device,
             stream: Some(stream),
-            sm_count,
             partitioned,
             ingress: Event::new(EventFlags::default()),
         })
@@ -73,31 +71,23 @@ impl CUDAStream {
     }
 
     /// Allocate the configured SM partitions from one disjoint split tree.
-    pub fn partition(device: DeviceId, counts: &[u32]) -> Result<Vec<Self>> {
+    pub(crate) fn partition(device: DeviceId, counts: &[u32]) -> Result<Vec<Self>> {
         Stream::partition(device, counts)?
             .into_iter()
             .map(|stream| Self::new(device, stream))
             .collect()
     }
 
-    pub fn fork(&self) -> Result<Self> {
+    pub(crate) fn fork(&self) -> Result<Self> {
         Self::new(self.device, self.stream()?.fork()?)
     }
 
-    pub fn device(&self) -> DeviceId {
+    pub(crate) fn device(&self) -> DeviceId {
         self.device
     }
 
-    pub fn sm_count(&self) -> u32 {
-        self.sm_count
-    }
-
-    pub fn full_device(&self) -> bool {
+    pub(crate) fn full_device(&self) -> bool {
         !self.partitioned
-    }
-
-    pub fn closed(&self) -> bool {
-        self.stream.is_none()
     }
 
     pub fn handle(&self) -> Result<usize> {
@@ -117,7 +107,7 @@ impl CUDAStream {
     /// the stream's one ingress fence and enqueues the wait on that record,
     /// and a second wait recording between the two would replace the
     /// producer this one waits for.
-    pub fn wait(&mut self, producer: &Stream) -> Result<()> {
+    pub(crate) fn wait(&mut self, producer: &Stream) -> Result<()> {
         let stream = self.stream()?;
         if stream.raw() == producer.raw() {
             return Ok(());
@@ -140,7 +130,7 @@ impl CUDAStream {
     /// component sharing the handle has dropped its clone. Failed collective
     /// execution retains resources until process exit.
     #[allow(clippy::mem_forget)]
-    pub fn close(&mut self, aborted: bool) -> Result<()> {
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         // A closed stream keeps an unrecorded fence, which holds no driver
         // event.
         let unrecorded = Event::new(EventFlags::default());
@@ -173,7 +163,7 @@ impl Drop for CUDAStream {
 /// devices, and the module and microbatch streams capability runtimes fork
 /// from a lane. They close in dependency order: preparation, modules,
 /// microbatches, lanes, devices, each newest first.
-pub struct Streams {
+pub(crate) struct Streams {
     /// The configured lanes, or the one lane of a rank without them.
     lanes: Vec<Lane>,
     /// Where the lanes post their completions; the rank's job queues take
@@ -191,11 +181,8 @@ pub struct Streams {
 
 impl Streams {
     /// Create the streams of `devices`.
-    pub fn create(config: &WorkerConfig, devices: &[Device]) -> Result<Self> {
-        let cuda: Vec<DeviceId> = devices
-            .iter()
-            .filter_map(|device| device.cuda_index().map(DeviceId))
-            .collect();
+    pub(crate) fn create(config: &WorkerConfig, devices: &[Device]) -> Result<Self> {
+        let cuda: Vec<DeviceId> = devices.iter().filter_map(|device| device.cuda()).collect();
         let (posted, completions) = crossbeam_channel::unbounded();
         let mut streams = Self {
             lanes: Vec::new(),
@@ -253,7 +240,7 @@ impl Streams {
     }
 
     /// The configured lanes; empty for a rank without them.
-    pub fn lanes(&self) -> &[Lane] {
+    pub(crate) fn lanes(&self) -> &[Lane] {
         if self.configured() { &self.lanes } else { &[] }
     }
 
@@ -264,13 +251,13 @@ impl Streams {
 
     /// The job queue of every lane with the call kinds it serves, for the
     /// executor, which submits each forward to its lane.
-    pub fn job_queues(&self) -> JobQueues {
+    pub(crate) fn job_queues(&self) -> JobQueues {
         JobQueues::of(&self.lanes, self.posted.clone(), self.completions.clone())
     }
 
     /// The stream of the lane serving `kind`, or `device`'s full-device
     /// stream without configured lanes.
-    pub fn stream_for(&self, kind: CallKind, device: DeviceId) -> Option<&CUDAStream> {
+    pub(crate) fn stream_for(&self, kind: CallKind, device: DeviceId) -> Option<&CUDAStream> {
         if self.configured() {
             return self
                 .lanes
@@ -292,7 +279,7 @@ impl Streams {
     }
 
     /// The startup preparation stream of `device`.
-    pub fn preparation(&self, device: DeviceId) -> Option<&CUDAStream> {
+    pub(crate) fn preparation(&self, device: DeviceId) -> Option<&CUDAStream> {
         self.preparation
             .iter()
             .find(|stream| stream.device() == device)
@@ -300,7 +287,7 @@ impl Streams {
 
     /// Fork the stream serving `kind` for a module that runs beside it.
     /// With lanes, exactly one lane must serve the kind.
-    pub fn fork_module(&mut self, kind: CallKind, device: DeviceId) -> Result<&CUDAStream> {
+    pub(crate) fn fork_module(&mut self, kind: CallKind, device: DeviceId) -> Result<&CUDAStream> {
         let matching: Vec<&CUDAStream> = if self.configured() {
             self.lanes
                 .iter()
@@ -327,7 +314,7 @@ impl Streams {
     }
 
     /// Fork the first lane (or device stream) for one more microbatch.
-    pub fn fork_microbatch(&mut self) -> Result<&CUDAStream> {
+    pub(crate) fn fork_microbatch(&mut self) -> Result<&CUDAStream> {
         let origin = self
             .lanes
             .first()
@@ -341,13 +328,13 @@ impl Streams {
     }
 
     /// The owned stream whose handle is `handle`.
-    pub fn owner(&self, handle: usize) -> Option<&CUDAStream> {
+    pub(crate) fn owner(&self, handle: usize) -> Option<&CUDAStream> {
         self.iter()
             .find(|stream| stream.handle().is_ok_and(|raw| raw == handle))
     }
 
     /// Every owned stream, for synchronization before teardown.
-    pub fn iter(&self) -> impl Iterator<Item = &CUDAStream> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &CUDAStream> {
         self.preparation
             .iter()
             .chain(&self.modules)
@@ -361,7 +348,7 @@ impl Streams {
     /// before returning the first failure. No job is in flight unless the
     /// close is aborted: the worker drained the lanes
     /// ([`JobQueues::drain`]).
-    pub fn close(&mut self, aborted: bool) -> Result<()> {
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let mut failure = None;
         let mut close = |stream: &mut CUDAStream| {
             if let Err(error) = stream.close(aborted) {

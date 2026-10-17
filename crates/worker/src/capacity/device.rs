@@ -15,7 +15,7 @@ use crate::ffi::Function;
 use crate::{Error, Result};
 
 /// Per-process device storage measurements.
-pub struct DeviceBudget {
+pub(crate) struct DeviceBudget {
     nvml: Nvml,
     /// `torch.cuda.synchronize(device)` and `torch.cuda.empty_cache()`,
     /// called before a measurement so blocks freed by completed work are
@@ -26,7 +26,7 @@ pub struct DeviceBudget {
 
 /// A device's storage grant and its free bytes, at one measurement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Budget {
+pub(crate) struct Budget {
     /// Bytes the rank may still allocate on the device.
     pub available: u64,
     /// Bytes the device reports free.
@@ -38,7 +38,7 @@ pub struct Budget {
 }
 
 impl DeviceBudget {
-    pub fn new(synchronize: Function, empty_cache: Function) -> Result<Self> {
+    pub(crate) fn new(synchronize: Function, empty_cache: Function) -> Result<Self> {
         Ok(Self {
             nvml: Nvml::init()?,
             synchronize,
@@ -51,24 +51,24 @@ impl DeviceBudget {
     ///
     /// Fails when NVML attributes no usage on the device to this process, as
     /// inside a PID namespace NVML does not report.
-    pub fn process_bytes(&self, device: i32) -> Result<u64> {
+    pub(crate) fn process_bytes(&self, device: DeviceId) -> Result<u64> {
         self.synchronize
-            .invoke(&[(&tvm_ffi::Any::from(i64::from(device))).into()])?;
+            .invoke(&[(&tvm_ffi::Any::from(i64::from(device.0))).into()])?;
         self.empty_cache.invoke(&[])?;
         self.nvml
-            .process_memory(DeviceId(device))
+            .process_memory(device)
             .map_err(|error| match error {
                 uniserve_cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
-                    "NVML reports no device storage for this process on cuda:{device}"
+                    "NVML reports no device storage for this process on {device}"
                 )),
                 error => Error::Cuda(error),
             })
     }
 
     /// The storage grant on `device` for a rank allowed `fraction` of it.
-    pub fn budget(&self, device: i32, fraction: f64) -> Result<Budget> {
+    pub(crate) fn budget(&self, device: DeviceId, fraction: f64) -> Result<Budget> {
         let process = self.process_bytes(device)?;
-        let memory = DeviceId(device).memory_info()?;
+        let memory = device.memory_info()?;
         Ok(Budget {
             available: grant(memory.total, fraction, process, memory.free),
             free: memory.free,
@@ -79,12 +79,12 @@ impl DeviceBudget {
 }
 
 /// Total memory of a CUDA device, in bytes.
-pub fn total_bytes(device: i32) -> Result<u64> {
-    Ok(DeviceId(device).memory_info()?.total)
+pub(crate) fn total_bytes(device: DeviceId) -> Result<u64> {
+    Ok(device.memory_info()?.total)
 }
 
 /// `min(max(0, ⌊total × fraction⌋ − process), free)`.
-pub fn grant(total: u64, fraction: f64, process: u64, free: u64) -> u64 {
+pub(crate) fn grant(total: u64, fraction: f64, process: u64, free: u64) -> u64 {
     let limit = (total as f64 * fraction) as u64;
     limit.saturating_sub(process).min(free)
 }

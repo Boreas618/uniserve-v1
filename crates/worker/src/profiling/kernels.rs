@@ -25,7 +25,7 @@ use crate::{Error, Result};
 const TAG: &str = "uniserve-kernel-table";
 
 /// The log target the kernel table is written under.
-pub const TARGET: &str = "uniserve_worker.execution.model_executor";
+pub(crate) const TARGET: &str = "uniserve_worker.execution.model_executor";
 
 /// The library function rendering the kernel table.
 const TABLE: &str = "uniserve.profiling.kernel_table";
@@ -33,11 +33,11 @@ const TABLE: &str = "uniserve.profiling.kernel_table";
 /// One operator's kernel record, as a runner's `kernels` method reports it:
 /// a JSON object text the rank passes on unread.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KernelRecord(String);
+pub(crate) struct KernelRecord(String);
 
 impl KernelRecord {
     /// Take the record `value` that `owner` reported.
-    pub fn new(owner: impl Into<String>, value: Any) -> Result<Self> {
+    pub(crate) fn new(owner: impl Into<String>, value: Any) -> Result<Self> {
         tvm_ffi::String::try_from(value)
             .map(|text| Self(text.as_str().to_owned()))
             .map_err(|error| Error::numerical(&owner.into(), &error))
@@ -57,14 +57,14 @@ pub(crate) type KernelCalls = (String, String, Vec<MethodCall>);
 /// The records of each runner label, with the runner's device name. Runners
 /// sharing a label report under it together.
 #[derive(Clone)]
-pub struct KernelRecords {
+pub(crate) struct KernelRecords {
     table: Function,
     runners: IndexMap<String, (String, Vec<KernelRecord>)>,
 }
 
 impl KernelRecords {
     /// An empty report that renders through the library's table function.
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             table: Interpreter::import(TABLE)?,
             runners: IndexMap::new(),
@@ -72,7 +72,7 @@ impl KernelRecords {
     }
 
     /// An empty report rendering like this one.
-    pub fn empty(&self) -> Self {
+    pub(crate) fn empty(&self) -> Self {
         Self {
             table: self.table.clone(),
             runners: IndexMap::new(),
@@ -81,7 +81,7 @@ impl KernelRecords {
 
     /// Add one runner's records under `label` (its component and module
     /// path).
-    pub fn add(&mut self, label: &str, device: &str, records: &[KernelRecord]) {
+    pub(crate) fn add(&mut self, label: &str, device: &str, records: &[KernelRecord]) {
         self.runners
             .entry(label.to_owned())
             .or_insert_with(|| (device.to_owned(), Vec::new()))
@@ -92,7 +92,7 @@ impl KernelRecords {
     /// Merge a newer report; returns whether any label's records changed.
     /// A label the newer report has no records for keeps its last ones, as
     /// a retired runner reports none.
-    pub fn merge(&mut self, current: Self) -> bool {
+    pub(crate) fn merge(&mut self, current: Self) -> bool {
         let mut changed = false;
         for (label, (device, records)) in current.runners {
             if records.is_empty() {
@@ -144,7 +144,7 @@ impl KernelRecords {
 
     /// The table for `stage`, as the library renders it from the records:
     /// a call made now, which its caller waits for (startup).
-    pub fn table(&self, stage: &str, rank: usize, device: &str) -> Result<String> {
+    pub(crate) fn table(&self, stage: &str, rank: usize, device: &str) -> Result<String> {
         let rendered = self.table_call(stage, rank, device).invoke()?;
         tvm_ffi::String::try_from(rendered)
             .map(|table| table.as_str().to_owned())
@@ -152,7 +152,7 @@ impl KernelRecords {
     }
 
     /// Log the table at INFO.
-    pub fn log(&self, stage: &str, rank: usize, device: &str) -> Result<()> {
+    pub(crate) fn log(&self, stage: &str, rank: usize, device: &str) -> Result<()> {
         tracing::info!(target: TARGET, "{TAG} {}", self.table(stage, rank, device)?);
         Ok(())
     }
@@ -176,7 +176,7 @@ enum Pending {
 /// rendered and logged. Each step is a call submitted to the Python thread
 /// and taken up at its completion: none is waited for, and a step that
 /// fails is logged and fails no batch.
-pub struct KernelWatch {
+pub(crate) struct KernelWatch {
     choices: Function,
     /// The count the report in `records` was made at.
     last: i64,
@@ -192,7 +192,7 @@ pub struct KernelWatch {
 impl KernelWatch {
     /// A watch that reports changes from `records`, the startup report,
     /// made when `choices` returned `last`.
-    pub fn new(
+    pub(crate) fn new(
         choices: Function,
         last: i64,
         records: KernelRecords,

@@ -12,21 +12,12 @@ use uniserve_cuda::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
 
 use super::grants::DescriptorGrants;
 use super::handle::AllocationHandle;
+use crate::parallel::host::HostGroup;
 use crate::storage::memory::Memory;
 use crate::{Error, Result};
 
 /// The export name under which a rank serves its peer allocation.
 const PEER_EXPORT: &str = "peer-storage";
-
-/// The host collectives a peer allocation needs from its group.
-pub trait PeerExchange {
-    /// This rank's position in the group.
-    fn rank(&self) -> usize;
-    /// Every member's `payload`, in rank order.
-    fn all_gather(&self, payload: &[u8]) -> Result<Vec<Vec<u8>>>;
-    /// Wait until every member reached this point.
-    fn barrier(&self) -> Result<()>;
-}
 
 /// A member's published handle: `node \0 endpoint \0 handle`, the
 /// member's host, the grant socket serving its descriptor, and its
@@ -60,7 +51,7 @@ fn decode(node: &str, payload: &[u8]) -> Result<ShareableHandle> {
 }
 
 /// This rank's exportable allocation and the mapping of every member's.
-pub struct PeerStorage {
+pub(crate) struct PeerStorage {
     local: Arc<Memory>,
     peers: Arc<Memory>,
     bytes: usize,
@@ -68,13 +59,14 @@ pub struct PeerStorage {
 
 impl PeerStorage {
     /// Allocate `bytes` (rounded up to the allocation granularity) on
-    /// `device` and map every member's allocation, collectively over
-    /// `group`. `node` identifies this host.
-    pub fn allocate(
-        device: i32,
+    /// `device` and map every member's allocation, collectively over the
+    /// host `group`, whose connections carry the handles. `node`
+    /// identifies this host.
+    pub(crate) fn allocate(
+        device: DeviceId,
         bytes: usize,
         node: &str,
-        group: &dyn PeerExchange,
+        group: &HostGroup,
     ) -> Result<Self> {
         let local = Memory::exportable(device, bytes, &[])?;
         let allocation: &DeviceAllocation = local
@@ -99,7 +91,7 @@ impl PeerStorage {
             ShareableHandle::Fabric(_) => None,
         };
 
-        let payloads = group.all_gather(&encode(node, &handle, &endpoint))?;
+        let payloads = group.all_gather_bytes(&encode(node, &handle, &endpoint))?;
         let handles = payloads
             .iter()
             .enumerate()
@@ -127,7 +119,7 @@ impl PeerStorage {
         let handles = handles?;
         barrier?;
 
-        let peers = Memory::mapped(PeerMapping::peers(DeviceId(device), &handles, rounded)?);
+        let peers = Memory::mapped(PeerMapping::peers(device, &handles, rounded)?);
         Ok(Self {
             local,
             peers,
@@ -136,16 +128,16 @@ impl PeerStorage {
     }
 
     /// This rank's allocation.
-    pub fn local(&self) -> &Arc<Memory> {
+    pub(crate) fn local(&self) -> &Arc<Memory> {
         &self.local
     }
 
     /// Every member's allocation, `bytes_each()` apart in rank order.
-    pub fn peers(&self) -> &Arc<Memory> {
+    pub(crate) fn peers(&self) -> &Arc<Memory> {
         &self.peers
     }
 
-    pub fn bytes_each(&self) -> usize {
+    pub(crate) fn bytes_each(&self) -> usize {
         self.bytes
     }
 }

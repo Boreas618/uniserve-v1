@@ -11,7 +11,7 @@ use crate::{Error, Result};
 mod attention;
 mod storage;
 
-pub use attention::{AttentionRow, TablePages, table_pages};
+pub(crate) use attention::{AttentionRow, TablePages, table_pages};
 pub use storage::BlockTableStorage;
 
 /// Page dimensions needed to address one cache group.
@@ -25,7 +25,7 @@ pub struct GroupShape {
 impl GroupShape {
     /// Installed tables retain the complete reservation, including history
     /// that a sliding-window reader no longer selects.
-    pub fn resident_width(&self, max_sequence_tokens: u64) -> u64 {
+    pub(crate) fn resident_width(&self, max_sequence_tokens: u64) -> u64 {
         max_sequence_tokens
             .max(1)
             .div_ceil(u64::from(self.page_tokens))
@@ -33,7 +33,7 @@ impl GroupShape {
 
     /// A windowed call selects its history and queries plus the partial page
     /// at their starting offset. Full attention selects the whole sequence.
-    pub fn table_width(&self, max_sequence_tokens: u64, max_query_tokens: u64) -> u64 {
+    pub(crate) fn table_width(&self, max_sequence_tokens: u64, max_query_tokens: u64) -> u64 {
         let resident = self.resident_width(max_sequence_tokens);
         self.window.map_or(resident, |window| {
             resident.min(
@@ -68,12 +68,12 @@ pub struct GroupTable {
 }
 
 impl GroupTable {
-    pub fn end_page(&self) -> u64 {
+    pub(crate) fn end_page(&self) -> u64 {
         u64::from(self.start_page) + self.units.len() as u64 / u64::from(self.shape.units_per_page)
     }
 
     /// The physical units at one position in each logical page.
-    pub fn row(&self, position: usize) -> Vec<u32> {
+    pub(crate) fn row(&self, position: usize) -> Vec<u32> {
         self.units
             .iter()
             .skip(position)
@@ -84,7 +84,7 @@ impl GroupTable {
 
     /// Map absolute tokens to `(unit, token offset, token count)` intervals.
     /// Every unit in a page holds these tokens for its own subset of layers.
-    pub fn spans(&self, mut start: u64, mut length: u64) -> Result<Vec<(u32, u32, u32)>> {
+    pub(crate) fn spans(&self, mut start: u64, mut length: u64) -> Result<Vec<(u32, u32, u32)>> {
         let tokens = u64::from(self.shape.page_tokens);
         let units = self.shape.units_per_page as usize;
         let end = start.checked_add(length);
@@ -177,18 +177,14 @@ impl BlockTables {
         })
     }
 
-    pub fn first_table(&self) -> &[usize] {
-        &self.first_table
-    }
-
-    pub fn groups(&self) -> &[GroupShape] {
+    pub(crate) fn groups(&self) -> &[GroupShape] {
         &self.groups
     }
 
     /// Resolve physical writes before an import starts. Existing prefix pages
     /// keep their addresses and initialization; only newly assigned units reset.
     /// This does not install the tables or change their visible lengths.
-    pub fn import_spans(
+    pub(crate) fn import_spans(
         &self,
         slot: u32,
         tables: &[Arc<GroupTable>],
@@ -419,20 +415,20 @@ impl BlockTables {
         self.lengths.extend(update.lengths);
     }
 
-    pub fn table(&self, slot: u32, group: u32) -> Result<Arc<GroupTable>> {
+    pub(crate) fn table(&self, slot: u32, group: u32) -> Result<Arc<GroupTable>> {
         self.tables
             .get(&(slot, group))
             .cloned()
             .ok_or_else(|| Error::Invalid("request slot has no installed block table".into()))
     }
 
-    pub fn allocated_length(&self, slot: u32) -> u32 {
+    pub(crate) fn allocated_length(&self, slot: u32) -> u32 {
         self.lengths.get(&slot).copied().unwrap_or(0)
     }
 
     /// Resolve one request's visible prefix against every installed cache group.
     /// The returned capacity is the common extent, including sliding windows.
-    pub fn coordinates(&self, slot: u32, visible: u64) -> Result<(u32, u64, u32)> {
+    pub(crate) fn coordinates(&self, slot: u32, visible: u64) -> Result<(u32, u64, u32)> {
         for group in 0..self.groups.len() as u32 {
             if !self.tables.contains_key(&(slot, group)) {
                 return Err(Error::Invalid(
@@ -452,7 +448,7 @@ impl BlockTables {
 
     /// Validate releases together so an invalid slot cannot partially clear
     /// device or host rows. Duplicate slots require only one device write.
-    pub fn release_slots(&self, slots: &[u32]) -> Result<Vec<u32>> {
+    pub(crate) fn release_slots(&self, slots: &[u32]) -> Result<Vec<u32>> {
         if slots
             .iter()
             .any(|&slot| slot == 0 || slot > self.request_pool_size)
@@ -480,17 +476,17 @@ impl BlockTables {
         }
     }
 
-    pub fn retain_prefix(&mut self, request: RequestKey, slot: u32) {
+    pub(crate) fn retain_prefix(&mut self, request: RequestKey, slot: u32) {
         self.prefixes.entry(request).or_default().insert(slot);
     }
 
-    pub fn prefix_slots(&self, request: RequestKey) -> Vec<u32> {
+    pub(crate) fn prefix_slots(&self, request: RequestKey) -> Vec<u32> {
         self.prefixes
             .get(&request)
             .map_or_else(Vec::new, |slots| slots.iter().copied().collect())
     }
 
-    pub fn release_prefixes(&mut self, request: RequestKey, slots: &[u32]) {
+    pub(crate) fn release_prefixes(&mut self, request: RequestKey, slots: &[u32]) {
         self.release(slots);
         if let Some(tracked) = self.prefixes.get_mut(&request) {
             for slot in slots {
@@ -502,7 +498,7 @@ impl BlockTables {
         }
     }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.tables.clear();
         self.lengths.clear();
         self.prefixes.clear();

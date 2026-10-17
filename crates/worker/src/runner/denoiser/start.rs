@@ -7,8 +7,8 @@ use super::runners::DenoiserRunners;
 use super::{Conditioning, DenoiserRunner};
 use crate::config::placement::Placed;
 use crate::executor::video::extent;
-use crate::ffi::{Device, Interpreter};
-use crate::runner::component::{Component, DENOISER_GRAPHS, VideoSetup, placed_device};
+use crate::ffi::{DType, Interpreter};
+use crate::runner::component::{Component, DENOISER_GRAPHS, VideoSetup, cuda_device};
 use crate::{Error, Result};
 
 impl DenoiserRunners {
@@ -22,14 +22,14 @@ impl DenoiserRunners {
         let (loaded, model, config) = (setup.loaded, setup.model, setup.config);
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
-        let device = placed_device(placed);
+        let device = placed.device;
         let envelope = setup
             .capacity
             .envelope
             .clone()
             .ok_or_else(|| Error::Invariant("a denoising rank has no slot state".into()))?;
         let (stream, scratch) = setup.stream(MediaCall::Denoising, device)?;
-        let graph_pool = setup.graph_pool(DENOISER_GRAPHS, &placed.name, device)?;
+        let graph_pool = setup.graph_pool(DENOISER_GRAPHS, device)?;
         // The conditioner's call runs on one pipeline stage; only a rank of
         // that stage holds its module and constructs its runners.
         let holds = Interpreter::import("uniserve.runner.encoder.EncoderRunner.holds")?;
@@ -72,20 +72,15 @@ impl DenoiserRunners {
                     path: call.path.clone(),
                     capacities: plan.text_capacities.clone(),
                     width,
-                    dtype: crate::storage::memory::parse_dtype(features.dtype.storage_name())?,
+                    dtype: DType::from(features.dtype),
                 })
             })
             .transpose()?;
-        let Device::Cuda(index) = device else {
-            return Err(Error::Unsupported(
-                "the video denoiser computes on CUDA".into(),
-            ));
-        };
         let runner = DenoiserRunner::video(crate::runner::denoiser::DenoiserSetup {
             loaded,
             component: &placed.name,
             stream,
-            device: index,
+            device: cuda_device(device)?,
             maximum: plan.maximum,
             envelope,
             pages: setup.capacity.pages,

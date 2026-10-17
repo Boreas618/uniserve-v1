@@ -5,18 +5,18 @@
 
 mod collectives;
 mod expert_union;
-pub mod experts;
+pub(crate) mod experts;
 pub mod host;
-pub mod joins;
+pub(crate) mod joins;
 mod microbatches;
-pub mod topology;
+pub(crate) mod topology;
 mod weight_prefetch;
-pub mod world;
+pub(crate) mod world;
 
-pub use collectives::{CollectiveGroup, PeerGroup, StreamCollectives, StreamCommunicator};
+pub(crate) use collectives::PeerGroup;
+pub use collectives::{CollectiveFunctions, CollectiveGroup, StreamCollectives};
 pub(crate) use expert_union::{ExpertStart, ExpertUnion, ExpertWarmup};
-pub use experts::{Agreement, ExpertExchange, ExpertParallel, ExpertPlan, ExpertTransport};
+pub use experts::{Agreement, ExpertParallel, ExpertTransport};
 pub(crate) use microbatches::MicrobatchForward;
-pub use microbatches::{MicrobatchCall, MicrobatchLanes, Microbatches, yield_microbatch};
+pub use microbatches::{MicrobatchCall, MicrobatchLanes, yield_microbatch};
 pub(crate) use weight_prefetch::DwdpManager;
-pub use weight_prefetch::{ExpertWeights, ShardField, WeightPrefetch, WeightStorage};

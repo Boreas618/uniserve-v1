@@ -178,14 +178,14 @@ impl Bounds {
 /// The stream serving the runner's calls on `device`: the configured lane
 /// serving token denoising, or the device stream.
 fn stream(streams: &Streams, device: Device) -> Result<Option<Stream>> {
-    let Some(index) = device.cuda_index() else {
+    let Some(index) = device.cuda() else {
         return Ok(None);
     };
     let mut serving = streams.lanes().iter().filter(|lane| lane.serves(KIND));
     let stream = match (serving.next(), serving.next()) {
         (Some(lane), None) => lane.stream.stream()?.clone(),
         (None, _) if streams.lanes().is_empty() => streams
-            .stream_for(KIND, DeviceId(index))
+            .stream_for(KIND, index)
             .ok_or(Error::State("diffusion LM calls have no execution stream"))?
             .stream()?
             .clone(),
@@ -215,7 +215,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) components: &'a mut Components,
     /// The shared work areas of the rank's streams.
     pub(crate) scratches: &'a mut Scratches,
-    pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
+    pub(crate) graphs: &'a mut GraphStorage,
     /// The device's startup stream, which zeroes new storage.
     pub(crate) preparation: Option<&'a Stream>,
     /// The worker's ranks and the mesh groups the model communicates over.
@@ -256,7 +256,7 @@ struct Planned {
     component: String,
     path: String,
     device: Device,
-    cuda: Option<i32>,
+    cuda: Option<DeviceId>,
     facts: Facts,
     bounds: Bounds,
     sampling: Option<CanvasSampling>,
@@ -290,7 +290,7 @@ impl DiffusionLMRunner {
 
         let mut planned = Vec::new();
         for (component, path, device) in placed {
-            let cuda = device.cuda_index();
+            let cuda = device.cuda();
             let facts = Facts::read(
                 startup.model.handle(),
                 &path,
@@ -430,7 +430,6 @@ impl DiffusionLMRunner {
                         startup.graphs,
                         &Interpreter::import("uniserve.cuda_graph.pool")?,
                         key,
-                        owner.clone(),
                         &[ordinal],
                         None,
                     )?
@@ -502,7 +501,7 @@ pub(crate) fn reserved_bytes(
     request_slots: usize,
     cache: &CachePlan,
 ) -> Result<u64> {
-    let cuda = config.device.cuda_index().is_some();
+    let cuda = config.device.cuda().is_some();
     let mut bytes = 0;
     for (_, path, _) in placed(components)? {
         let facts = Facts::read(model.handle(), &path, experts.0, experts.1)?;

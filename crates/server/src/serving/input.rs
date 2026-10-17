@@ -40,11 +40,6 @@ pub enum ModalitySelection {
 }
 
 impl ModalitySelection {
-    /// Returns whether text output is requested.
-    pub const fn includes_text(self) -> bool {
-        matches!(self, Self::Text | Self::TextAndImage)
-    }
-
     /// Returns whether image output is requested.
     pub const fn includes_image(self) -> bool {
         matches!(self, Self::Image | Self::TextAndImage)

@@ -4,7 +4,7 @@
 //! [`WorkerError`] with a stable [`ErrorCode`], fatality, phase and the calls
 //! it affects, and the service sends its [`WorkerResponseError`] form. The
 //! codes are a wire contract: the engine matches on them (for example it
-//! escalates `SchedulerBug` and `InvariantViolation` like fatal errors).
+//! escalates `InvariantViolation` like a fatal error).
 
 use uniserve_ipc::{ErrorCallIdentity, WorkerResponseError};
 
@@ -77,42 +77,36 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     UnsupportedCall,
-    UnsupportedControl,
     InvalidDescriptor,
     UnsupportedSetup,
-    ResourceLeaseViolation,
     InputError,
     ComputeError,
     ResourceError,
     InvariantViolation,
     FatalWorkerFailure,
-    SchedulerBug,
 }
 
 impl ErrorCode {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::UnsupportedCall => "UnsupportedCall",
-            Self::UnsupportedControl => "UnsupportedControl",
             Self::InvalidDescriptor => "InvalidDescriptor",
             Self::UnsupportedSetup => "UnsupportedSetup",
-            Self::ResourceLeaseViolation => "ResourceLeaseViolation",
             Self::InputError => "InputError",
             Self::ComputeError => "ComputeError",
             Self::ResourceError => "ResourceError",
             Self::InvariantViolation => "InvariantViolation",
             Self::FatalWorkerFailure => "FatalWorkerFailure",
-            Self::SchedulerBug => "SchedulerBug",
         }
     }
 
     /// A failure of this kind leaves the rank unsafe to serve further work.
-    pub const fn fatal(self) -> bool {
+    pub(crate) const fn fatal(self) -> bool {
         matches!(self, Self::InvariantViolation | Self::FatalWorkerFailure)
     }
 
     /// Failures worth a full traceback in the rank's log.
-    pub const fn traces(self) -> bool {
+    pub(crate) const fn traces(self) -> bool {
         matches!(
             self,
             Self::ComputeError
@@ -181,7 +175,7 @@ struct ErrorDetail {
 
 impl WorkerError {
     /// A failure with an explicit code and its default fatality.
-    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             fatal: code.fatal(),
@@ -231,40 +225,28 @@ impl WorkerError {
         classified
     }
 
-    pub fn message(&self) -> &str {
-        &self.detail.message
-    }
-
-    pub fn phase(&self) -> Option<&str> {
-        self.detail.phase.as_deref()
-    }
-
-    pub fn route(&self) -> Option<&str> {
-        self.detail.route.as_deref()
-    }
-
-    pub fn calls(&self) -> &[ErrorCallIdentity] {
+    pub(crate) fn calls(&self) -> &[ErrorCallIdentity] {
         &self.detail.calls
     }
 
-    pub fn traceback(&self) -> Option<&str> {
+    pub(crate) fn traceback(&self) -> Option<&str> {
         self.detail.traceback.as_deref()
     }
 
     /// Name the phase that failed, unless one is already named.
-    pub fn with_phase(mut self, phase: impl Into<String>) -> Self {
+    pub(crate) fn with_phase(mut self, phase: impl Into<String>) -> Self {
         self.detail.phase.get_or_insert_with(|| phase.into());
         self
     }
 
     /// Name the batch's call kind, unless one is already named.
-    pub fn with_route(mut self, route: impl Into<String>) -> Self {
+    pub(crate) fn with_route(mut self, route: impl Into<String>) -> Self {
         self.detail.route.get_or_insert_with(|| route.into());
         self
     }
 
     /// Name the affected calls, unless some are already named.
-    pub fn with_calls(mut self, calls: Vec<ErrorCallIdentity>) -> Self {
+    pub(crate) fn with_calls(mut self, calls: Vec<ErrorCallIdentity>) -> Self {
         if self.detail.calls.is_empty() {
             self.detail.calls = calls;
         }
@@ -272,14 +254,14 @@ impl WorkerError {
     }
 
     /// Record a failure observed while cleaning up after this one.
-    pub fn note(&mut self, cleanup: &WorkerError) {
+    pub(crate) fn note(&mut self, cleanup: &WorkerError) {
         self.detail
             .notes
             .push(format!("cleanup failed: {}", cleanup.detail.message));
     }
 
     /// The wire form sent to the engine.
-    pub fn response(&self) -> WorkerResponseError {
+    pub(crate) fn response(&self) -> WorkerResponseError {
         WorkerResponseError {
             message: self.detail.message.clone(),
             code: Some(self.code.as_str().to_owned()),
@@ -381,7 +363,7 @@ fn kind_code(error: &Error) -> ErrorCode {
 /// remaining kinds are the ones TVM-FFI itself reports when a value that
 /// crossed into Rust cannot be converted: a wrong type, a missing key,
 /// an index out of range or a value out of range.
-pub fn numerical_code(kind: &str) -> ErrorCode {
+pub(crate) fn numerical_code(kind: &str) -> ErrorCode {
     match kind {
         "UnsupportedSetup" => ErrorCode::UnsupportedSetup,
         "OutOfMemory" => ErrorCode::ResourceError,
@@ -419,7 +401,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::FatalWorkerFailure);
         assert!(error.fatal);
         assert_eq!(
-            error.message(),
+            error.response().message,
             "decode: text.forward: CUDA out of memory after an illegal memory access"
         );
         assert_eq!(error.traceback(), Some("Traceback"));
@@ -486,7 +468,7 @@ mod tests {
         let cancelled = std::sync::Arc::new(Error::Resource("transfer read was cancelled"));
         let observed = WorkerError::classify(Error::Shared(cancelled), None);
         assert_eq!(observed.code, ErrorCode::ResourceError);
-        assert_eq!(observed.message(), "transfer read was cancelled");
+        assert_eq!(observed.response().message, "transfer read was cancelled");
 
         let failed = std::sync::Arc::new(numerical("OutOfMemory", "tried to allocate"));
         let observed = WorkerError::classify(Error::Shared(failed), Some("decode"));

@@ -49,7 +49,7 @@ pub(crate) struct ImageProcessing {
 
 /// An image denoiser's latent layout (`ImageDenoiser`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageDenoiserLayout {
+pub(crate) struct ImageDenoiserLayout {
     pub patch_size: u32,
     pub latent_channels: u32,
     /// Output pixels per latent patch on each spatial axis.
@@ -67,7 +67,7 @@ pub struct ImageDenoiserLayout {
 impl ImageDenoiserLayout {
     /// Latent patch rows of a `height` x `width` image
     /// (`ImageDenoiser.latent_shape`).
-    pub fn latent_rows(&self, height: u32, width: u32) -> Result<u32> {
+    pub(crate) fn latent_rows(&self, height: u32, width: u32) -> Result<u32> {
         let rows = (height / self.downsample) * (width / self.downsample);
         if rows == 0 {
             return Err(Error::Invalid(
@@ -78,12 +78,12 @@ impl ImageDenoiserLayout {
     }
 
     /// Values per latent patch row.
-    pub fn width(&self) -> u32 {
+    pub(crate) fn width(&self) -> u32 {
         self.patch_size * self.patch_size * self.latent_channels
     }
 
     /// Tokens of an image's sequence: its latent rows and framing.
-    pub fn sequence_length(&self, height: u32, width: u32) -> Result<u32> {
+    pub(crate) fn sequence_length(&self, height: u32, width: u32) -> Result<u32> {
         Ok(self.latent_rows(height, width)? + self.framing_tokens)
     }
 
@@ -91,7 +91,12 @@ impl ImageDenoiserLayout {
     /// (rows: temporal, row, column). The temporal axis is `temporal`
     /// everywhere, framing tokens included; the spatial axes hold each
     /// latent patch's raster coordinates, and framing tokens zero.
-    pub fn positions(&self, height: u32, width: u32, temporal: u64) -> Result<[Vec<i64>; 3]> {
+    pub(crate) fn positions(
+        &self,
+        height: u32,
+        width: u32,
+        temporal: u64,
+    ) -> Result<[Vec<i64>; 3]> {
         let count = self.sequence_length(height, width)? as usize;
         let columns = (width / self.downsample) as usize;
         let first = if self.framing_tokens == 0 { 0 } else { 1 };
@@ -108,7 +113,7 @@ impl ImageDenoiserLayout {
     /// ingest or feedback prefill): the image's positions one past the
     /// conditioning position, with the opening framing token at it and the
     /// closing one `ROPE_ADVANCE` past it.
-    pub fn conditioning_positions(
+    pub(crate) fn conditioning_positions(
         &self,
         height: u32,
         width: u32,
