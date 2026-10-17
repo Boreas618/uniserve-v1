@@ -895,12 +895,13 @@ class CausalLMRunner:
 
     def _select(
         self,
-        candidates: torch.Tensor,
+        logits: torch.Tensor,
         first: int,
         row_counts: Sequence[int],
         drafts: Sequence[int],
         terminal_prefixes: Sequence[int],
         parameters: int,
+        width: int,
         top_ks: Sequence[int],
         top_p_rows: Sequence[int],
         min_p_rows: Sequence[int],
@@ -930,9 +931,13 @@ class CausalLMRunner:
         transition: torch.Tensor,
         logprobs: torch.Tensor,
     ) -> None:
-        """Shape, sample and write one group's global candidate rows."""
+        """Shape, sample and write one group's global candidate rows.
+
+        ``width`` is the top-k sampler's candidate width, which rows with a
+        top-k width at most it share (``shape_logits``'s ``candidates``).
+        """
         first, parameters = int(first), int(parameters)
-        rows = int(candidates.shape[0])
+        rows = int(logits.shape[0])
 
         # Each penalized row counts its slot's committed tokens and the
         # draft tokens before it; the committed counts change only at
@@ -956,13 +961,14 @@ class CausalLMRunner:
                 )
 
         selection = select_categorical(
-            candidates,
+            logits,
             draws[parameters : parameters + rows],
             params[parameters : parameters + rows],
             self._active(tasks, first, len(row_counts)),
             row_counts=row_counts,
             drafts=drafts,
             terminal_prefixes=terminal_prefixes,
+            candidates=int(width),
             top_ks=top_ks,
             top_p_rows=top_p_rows,
             min_p_rows=min_p_rows,
@@ -1000,6 +1006,7 @@ class CausalLMRunner:
         first: int,
         rows: Sequence[int],
         parameters: int,
+        candidates: int,
         top_ks: Sequence[int],
         top_p_rows: Sequence[int],
         min_p_rows: Sequence[int],
@@ -1037,6 +1044,9 @@ class CausalLMRunner:
         zero temperature.
 
         Args:
+            candidates: The top-k sampler's candidate width; a task whose
+                top-k width is at most it keeps the candidates that sampler
+                (:meth:`sample_top_k`) keeps.
             top_ks: Per task, its top-k width, or zero without one.
             top_p_rows: Tasks with a nucleus cutoff below one and no top-k
                 width.
@@ -1068,6 +1078,7 @@ class CausalLMRunner:
                 (),
                 (0,) * len(rows),
                 parameters,
+                candidates,
                 top_ks,
                 top_p_rows,
                 min_p_rows,
@@ -1107,6 +1118,7 @@ class CausalLMRunner:
         drafts: Sequence[int],
         terminal_prefixes: Sequence[int],
         parameters: int,
+        candidates: int,
         top_ks: Sequence[int],
         top_p_rows: Sequence[int],
         min_p_rows: Sequence[int],
@@ -1160,16 +1172,17 @@ class CausalLMRunner:
         tasks; the other arguments are those of :meth:`sample`.
         """
         with torch.inference_mode(), self._context.activate():
-            candidates = self._project(
+            projected = self._project(
                 hidden, logit_rows[: int(count)], int(count), None
             )
             self._select(
-                self._group(candidates, rows, row_counts),
+                self._group(projected, rows, row_counts),
                 first,
                 row_counts,
                 drafts,
                 terminal_prefixes,
                 parameters,
+                candidates,
                 top_ks,
                 top_p_rows,
                 min_p_rows,

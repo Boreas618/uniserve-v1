@@ -253,6 +253,7 @@ def select_categorical(
     row_counts: Sequence[int],
     drafts: Sequence[int],
     terminal_prefixes: Sequence[int],
+    candidates: int,
     top_ks: Sequence[int],
     top_p_rows: Sequence[int],
     min_p_rows: Sequence[int],
@@ -296,6 +297,7 @@ def select_categorical(
     work, valid = shape_logits(
         logits.float(),
         params,
+        candidates=candidates,
         top_ks=top_ks,
         top_p_rows=top_p_rows,
         min_p_rows=min_p_rows,
@@ -435,6 +437,7 @@ def shape_logits(
     work: torch.Tensor,
     params: torch.Tensor,
     *,
+    candidates: int,
     top_ks: Sequence[int],
     top_p_rows: Sequence[int] = (),
     min_p_rows: Sequence[int] = (),
@@ -459,6 +462,8 @@ def shape_logits(
         work: ``[rows, vocab]`` logits.
         params: ``[rows, PARAMETER_COLUMNS]`` float parameters
             (:mod:`uniserve.sampling.top_k`).
+        candidates: The top-k sampler's candidate width: a row whose top-k
+            width is at most this keeps the candidates that sampler keeps.
         top_ks: Per row, its top-k width, or zero without one.
         top_p_rows: Rows with a nucleus cutoff below one and no top-k width.
         min_p_rows: Rows with a minimum-probability cutoff.
@@ -516,18 +521,34 @@ def shape_logits(
     # A zero temperature divides by one; callers select those rows by argmax.
     work.div_(temperature_divisors(params).unsqueeze(1))
 
-    # Top-k truncation; top-p applies within each retained top-k set, so rows
-    # sharing a width are truncated in one gather/sort pass. The candidates
-    # are shared with ``sample_top_k``, so both paths keep the same tokens.
+    # Top-k truncation; top-p applies within each retained top-k set. Rows
+    # whose width is at most ``candidates`` keep their candidates as the
+    # top-k sampler (``sample_top_k``) does: the shared candidate width, then
+    # each row's own width. Both selectors therefore keep the same tokens,
+    # including the order among equal logits at a cutoff. Wider rows sharing
+    # a width are truncated in one gather/sort pass of that width.
+    narrow = [
+        index
+        for index, top_k in enumerate(top_ks)
+        if 0 < int(top_k) <= candidates
+    ]
     widths: dict[int, list[int]] = defaultdict(list)
     for index, top_k in enumerate(top_ks):
-        if int(top_k) > 0:
+        if int(top_k) > candidates:
             widths[int(top_k)].append(index)
-    for top_k, members in widths.items():
+    # Each group: its gather width, its rows and, for the narrow rows, each
+    # row's own width.
+    groups: list[tuple[int, list[int], torch.Tensor | None]] = [
+        (width, members, None) for width, members in widths.items()
+    ]
+    if narrow:
+        own = [int(top_ks[index]) for index in narrow]
+        groups.append((candidates, narrow, _index(own, device)))
+    for width, members, own_widths in groups:
         selected = _index(members, device)
         subset = work.index_select(0, selected)
         top_p = params.index_select(0, selected)[:, TOP_P]
-        ordered, tokens = top_k_candidates(subset, top_k, top_p)
+        ordered, tokens = top_k_candidates(subset, width, top_p, own_widths)
         truncated = torch.full_like(subset, float("-inf"))
         truncated.scatter_(1, tokens, ordered)
         work.index_copy_(0, selected, truncated)
