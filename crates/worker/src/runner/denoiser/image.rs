@@ -865,10 +865,13 @@ pub(crate) struct DenoiseResume {
 /// branches each step evaluates, so the steps are recorded once they are
 /// known.
 ///
-/// FIXME: no test and no reference request reaches this boundary. A rank
-/// opens the trajectories it denoises when it prepares their latents; one
-/// it did not prepare arrives only as a transferred trajectory, which the
-/// stub rank's tests and the image harness do not build.
+/// A rank opens a trajectory when it prepares its latent, so a denoising
+/// reaches this boundary for a trajectory whose committed version was
+/// transferred from the rank that prepared it: its head placed the
+/// preparation and the denoising on different workers. The engine's
+/// scheduler keeps a request's image calls on the replica that holds its
+/// state, so its own plans open every trajectory at its preparation; the
+/// engine's multiprocess tests place the two on different workers.
 pub(crate) struct PlanResume {
     /// Each active call's trajectory, admitted image and conditioning
     /// coordinates.

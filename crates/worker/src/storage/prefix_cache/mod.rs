@@ -295,7 +295,7 @@ impl PrefixCache {
 
     /// Keep `slot`, a guidance prefix slot `request` reads, until the
     /// request releases its prefixes.
-    pub(crate) fn retain_prefix(&mut self, request: RequestKey, slot: u32) {
+    pub fn retain_prefix(&mut self, request: RequestKey, slot: u32) {
         self.tables.retain_prefix(request, slot);
     }
 
@@ -326,7 +326,7 @@ impl PrefixCache {
     }
 
     /// Bind the unit resets to another stream (one per executing lane).
-    pub(crate) fn bind_units(&self, stream: Option<&Stream>) -> Result<UnitColumn> {
+    pub fn bind_units(&self, stream: Option<&Stream>) -> Result<UnitColumn> {
         UnitColumn::bind(&self.planes, stream)
     }
 
@@ -341,7 +341,7 @@ impl PrefixCache {
 
     /// Prepare newly assigned units for a new owner on `column`'s stream.
     /// Fails if an export, import or execution still overlaps any of them.
-    pub(crate) fn recycle(
+    pub fn recycle(
         &mut self,
         units: &[u32],
         column: &UnitColumn,
@@ -358,7 +358,7 @@ impl PrefixCache {
 
     /// Clear released slots' rows on `stream` (ordered after every batch
     /// that read them) and forget them on the host.
-    pub(crate) fn release_slots(&mut self, slots: &[u32], stream: impl Issue) -> Result<()> {
+    pub fn release_slots(&mut self, slots: &[u32], stream: impl Issue) -> Result<()> {
         let slots = self.tables.release_slots(slots)?;
         self.storage.clear(&slots, stream)?;
         self.tables.release(&slots);
@@ -380,7 +380,7 @@ impl PrefixCache {
     }
 
     /// Clear every guidance prefix slot `request` still holds.
-    pub(crate) fn release_request_prefixes(
+    pub fn release_request_prefixes(
         &mut self,
         request: RequestKey,
         stream: impl Issue,
@@ -548,7 +548,7 @@ impl PrefixCache {
 
     /// Give up an import: cancel its reads and release its destination once
     /// its physical accesses retire.
-    pub(crate) fn abandon_import(&mut self, import: &PendingImport) -> Result<()> {
+    pub fn abandon_import(&mut self, import: &PendingImport) -> Result<()> {
         if let Some(task) = &import.task {
             task.cancel(false)?;
         }
