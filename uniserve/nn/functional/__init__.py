@@ -38,6 +38,7 @@ from ._norm import (
     scaled_residual_layer_norm_absmax,
     scaled_residual_rms_norm_,
     scaled_residual_rms_norm_absmax_,
+    scaled_residual_rms_norm_nvfp4_,
     weighted_rms_norm,
     weighted_rms_norm_absmax,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "scaled_residual_layer_norm_absmax",
     "scaled_residual_rms_norm_",
     "scaled_residual_rms_norm_absmax_",
+    "scaled_residual_rms_norm_nvfp4_",
     "silu_and_mul",
     "softcap",
     "swiglu",
