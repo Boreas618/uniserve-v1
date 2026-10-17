@@ -42,6 +42,8 @@ pub(crate) mod inputs;
 pub(crate) mod lifecycle;
 mod pending;
 pub(crate) mod products;
+#[cfg(test)]
+pub(crate) mod tests;
 pub(crate) mod transfer;
 pub(crate) mod video;
 

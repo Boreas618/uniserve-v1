@@ -953,3 +953,65 @@ pub(crate) fn decodes_video(capabilities: impl IntoIterator<Item = Capability>) 
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
+
+    use super::StreamOrder;
+    use crate::{Error, Result};
+
+    /// Blocks `stream` in a host function until the returned sender is
+    /// used, so the work queued behind it on any stream that waits for it
+    /// stays incomplete meanwhile.
+    fn hold(stream: &Stream) -> Result<mpsc::Sender<()>> {
+        let (release, released) = mpsc::channel::<()>();
+        stream.launch_host_fn(move || {
+            let _ = released.recv();
+        })?;
+        Ok(release)
+    }
+
+    /// An event capturing the work issued on `stream` so far.
+    fn mark(stream: &Stream) -> Result<Arc<Event>> {
+        let event = Arc::new(Event::new(EventFlags::default()));
+        event.record(stream)?;
+        Ok(event)
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_batch_waits_for_the_previous_batch_recorded_on_another_stream() -> Result<()> {
+        let device = DeviceId(0);
+        let first = Stream::new(device)?;
+        let second = Stream::new(device)?;
+        let mut order = StreamOrder::default();
+        let release = hold(&first)?;
+
+        // Before any batch recorded its end, a batch waits for nothing: its
+        // work completes while the other stream is held.
+        order.wait(&second)?;
+        let unordered = mark(&second)?;
+        second.synchronize()?;
+        assert!(unordered.query()?);
+
+        // A batch that ended on the held stream holds up the next batch on
+        // the other stream until the held work completed.
+        order.record(&first)?;
+        order.wait(&second)?;
+        let ordered = mark(&second)?;
+        std::thread::sleep(Duration::from_millis(50));
+        let waited = !ordered.query()?;
+        release
+            .send(())
+            .map_err(|_| Error::State("the held stream was released already"))?;
+        second.synchronize()?;
+        assert!(waited, "the batch did not wait for the previous one");
+        assert!(ordered.query()?);
+        first.synchronize()?;
+        Ok(())
+    }
+}
