@@ -1,12 +1,14 @@
 //! Bounded host output storage and per-batch readback lifetimes.
 //!
-//! A lane's batch results are copied device-to-host into one page-locked
-//! word buffer per batch: integer token columns from the front, raw byte
-//! captures from the back. The copies are ordered on the producing streams
+//! A lane's batch results are copied device-to-host into the batch's range
+//! of the lane's page-locked word arena, which the lane allocates when it
+//! starts: integer token columns from the front of the range, raw byte
+//! captures from its back. The copies are ordered on the producing streams
 //! and fenced by events; the host reads the words only after those fences
 //! complete, widening narrower token columns to 64 bits on the host.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -23,28 +25,48 @@ mod logprobs;
 
 pub use logprobs::LogprobLayout;
 
-/// One batch's host words: page-locked for CUDA lanes, pageable for CPU
-/// lanes. Only storage is reused; each batch receives a distinct
-/// [`OutputBuffer`] and completion signal.
+/// One batch's host words: `words` 64-bit words from word `offset` of
+/// `memory`, page-locked for CUDA lanes and pageable for CPU lanes. Only
+/// storage is reused; each batch receives a distinct [`OutputBuffer`] and
+/// completion signal.
 pub struct OutputStorage {
     memory: Arc<Memory>,
+    offset: usize,
     words: usize,
 }
 
 impl OutputStorage {
-    /// Host storage for `words` 64-bit words, pinned for `device`'s copies.
+    /// Host storage of its own for `words` 64-bit words, pinned for
+    /// `device`'s copies.
     pub fn allocate(device: Option<DeviceId>, words: usize) -> Result<Self> {
-        let bytes = words.max(1) * size_of::<i64>();
-        let memory = match device {
-            Some(device) => Memory::pinned(device, bytes)?,
-            None => Memory::host(bytes),
-        };
-        Ok(Self { memory, words })
+        Ok(Self {
+            memory: words_memory(device, words)?,
+            offset: 0,
+            words,
+        })
+    }
+
+    pub fn words(&self) -> usize {
+        self.words
+    }
+
+    /// Byte offset of the first word in `memory`.
+    fn byte_offset(&self) -> usize {
+        self.offset * size_of::<i64>()
     }
 
     fn address(&self) -> u64 {
-        self.memory.address()
+        self.memory.address() + self.byte_offset() as u64
     }
+}
+
+/// Host memory for `words` 64-bit words, pinned for `device`'s copies.
+fn words_memory(device: Option<DeviceId>, words: usize) -> Result<Arc<Memory>> {
+    let bytes = words.max(1) * size_of::<i64>();
+    Ok(match device {
+        Some(device) => Memory::pinned(device, bytes)?,
+        None => Memory::host(bytes),
+    })
 }
 
 struct DeviceEvents {
@@ -172,8 +194,14 @@ impl OutputBuffer {
         }
         let count = source.numel() as usize;
         let offset = self.reserve_bytes(count)?;
-        let memory: Arc<dyn Backing> = Arc::clone(&self.storage()?.memory) as Arc<dyn Backing>;
-        let capture = StorageView::contiguous(memory, offset, DType::U8, source.shape())?;
+        let storage = self.storage()?;
+        let memory: Arc<dyn Backing> = Arc::clone(&storage.memory) as Arc<dyn Backing>;
+        let capture = StorageView::contiguous(
+            memory,
+            storage.byte_offset() + offset,
+            DType::U8,
+            source.shape(),
+        )?;
         self.copy(source, capture.address(), stream, events)?;
         Ok(capture)
     }
@@ -531,6 +559,7 @@ impl OutputBuffer {
         Ok(timing)
     }
 
+
     pub(crate) fn discard(&mut self, row: usize) {
         if let Some(observed) = self.rows.get_mut(row)
             && !std::mem::replace(observed, true)
@@ -620,49 +649,63 @@ fn record(pool: &EventPool, stream: impl Issue, timing: bool) -> Result<Arc<Even
 /// A batch's output buffer, shared by its pending results and the pool.
 pub(crate) type OutputLease = Arc<Mutex<OutputBuffer>>;
 
-/// Bounded output storage of one lane. Storage is reused only after every
-/// lease using it retired: its copies finished, every row was observed or
-/// the batch abandoned, and no CPU reader holds a byte capture.
+/// Bounded output storage of one lane: one host word arena, allocated when
+/// the lane starts, that every batch leases exactly its words from.
+///
+/// The arena is `blocks` blocks of `block_words` words, the largest lease.
+/// A lease lies within one block, first fit, so while fewer than `blocks`
+/// leases are live some block is entirely free and any lease fits: `blocks`
+/// is the number of the largest batches the lane holds at once, and smaller
+/// batches share blocks. A lease's range is reused only after the lease
+/// retired: its copies finished, every row was observed or the batch
+/// abandoned, and no CPU reader holds a byte capture.
 pub(crate) struct OutputPool {
-    device: Option<DeviceId>,
-    capacity: usize,
-    max_words: usize,
-    active: Vec<OutputLease>,
-    available: Vec<OutputStorage>,
+    /// Released by [`Self::finish_close`].
+    arena: Option<Arc<Memory>>,
+    blocks: usize,
+    block_words: usize,
+    /// Live leases and their word ranges in the arena.
+    active: Vec<(OutputLease, Range<usize>)>,
     closed: bool,
 }
 
 impl OutputPool {
-    /// `capacity` leases of at most `max_words` words, pinned for `device`
-    /// copies (pageable for a CPU lane).
-    pub(crate) fn new(device: Option<DeviceId>, capacity: usize, max_words: usize) -> Self {
-        Self {
-            device,
-            capacity,
-            max_words,
+    /// `blocks` blocks of `block_words` words, pinned for `device` copies
+    /// (pageable for a CPU lane), allocated now so that no batch allocates
+    /// host memory.
+    pub(crate) fn new(device: Option<DeviceId>, blocks: usize, block_words: usize) -> Result<Self> {
+        let blocks = blocks.max(1);
+        let words = blocks
+            .checked_mul(block_words)
+            .ok_or(Error::Resource("lane output storage overflows"))?;
+        Ok(Self {
+            arena: Some(words_memory(device, words)?),
+            blocks,
+            block_words,
             active: Vec::new(),
-            available: Vec::new(),
             closed: false,
-        }
+        })
     }
 
-    /// Recycle the storage of retired leases; returns how many retired.
+    /// Recycle the ranges of retired leases; returns how many retired.
     pub(crate) fn reap(&mut self) -> usize {
         let mut retired = 0;
         let mut index = 0;
         while index < self.active.len() {
             let mut buffer = self.active[index]
+                .0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if !buffer.retired() {
                 index += 1;
                 continue;
             }
-            if let Some(storage) = buffer.storage.take() {
-                self.available.push(storage);
-            }
+            // The range returns to the arena with its entry below; a result
+            // that retains the consumed lease keeps its timing and decoded
+            // values, not the words.
+            buffer.storage = None;
             // Released event objects can now be reused even if a result retains
-            // its consumed lease. Timing and decoded values remain per lease.
+            // its consumed lease.
             buffer.devices.clear();
             drop(buffer);
             self.active.swap_remove(index);
@@ -671,8 +714,8 @@ impl OutputPool {
         retired
     }
 
-    /// Lease storage for a batch of `rows` result rows and `words` capture
-    /// words, reusing retired storage or allocating the lane's maximum.
+    /// Lease `words` capture words for a batch of `rows` result rows from
+    /// the arena, after recycling retired leases.
     pub(crate) fn lease(
         &mut self,
         rows: usize,
@@ -680,10 +723,11 @@ impl OutputPool {
         devices: &[DeviceId],
         timing: bool,
     ) -> Result<OutputLease> {
-        if self.closed {
+        let Some(arena) = self.arena.as_ref().filter(|_| !self.closed) else {
             return Err(Error::Resource("output pool is closed"));
-        }
-        if words > self.max_words {
+        };
+        let arena = Arc::clone(arena);
+        if words > self.block_words {
             return Err(Error::Resource(
                 "lane output exceeds its startup storage bound",
             ));
@@ -694,19 +738,45 @@ impl OutputPool {
             ));
         }
         self.reap();
-        if self.active.len() >= self.capacity {
-            return Err(Error::Resource("all lane output leases are active"));
-        }
+        let offset = self
+            .place(words)
+            .ok_or(Error::Resource("all lane output storage is leased"))?;
 
-        let storage = match self.available.pop() {
-            Some(storage) => storage,
-            None => OutputStorage::allocate(self.device, self.max_words)?,
+        let storage = OutputStorage {
+            memory: arena,
+            offset,
+            words,
         };
         let lease = Arc::new(Mutex::new(OutputBuffer::new(
             storage, rows, devices, timing,
         )));
-        self.active.push(Arc::clone(&lease));
+        self.active
+            .push((Arc::clone(&lease), offset..offset + words));
         Ok(lease)
+    }
+
+    /// The first word of the first gap of at least `words` words inside one
+    /// block, in arena order.
+    fn place(&self, words: usize) -> Option<usize> {
+        let mut ranges: Vec<&Range<usize>> = self.active.iter().map(|(_, range)| range).collect();
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut ranges = ranges.into_iter().peekable();
+        for block in 0..self.blocks {
+            let end = (block + 1) * self.block_words;
+            let mut cursor = block * self.block_words;
+            // Leases never cross a block boundary, so the ranges starting in
+            // this block also end in it.
+            while let Some(range) = ranges.next_if(|range| range.start < end) {
+                if range.start - cursor >= words {
+                    return Some(cursor);
+                }
+                cursor = range.end;
+            }
+            if end - cursor >= words {
+                return Some(cursor);
+            }
+        }
+        None
     }
 
     pub(crate) fn begin_close(&mut self) {
@@ -714,10 +784,10 @@ impl OutputPool {
     }
 
     /// Release storage only after shutdown has drained its device writes.
-    /// Leases still referenced by results keep their own storage alive.
+    /// Leases still referenced by results keep the arena alive.
     pub(crate) fn finish_close(&mut self) {
         self.active.clear();
-        self.available.clear();
+        self.arena = None;
     }
 }
 
@@ -773,6 +843,95 @@ impl crate::executor::lifecycle::RequestStorage for OutputPool {
     fn close(&mut self, _aborted: bool) -> Result<()> {
         self.begin_close();
         self.finish_close();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use super::{OutputBuffer, OutputPool};
+    use crate::ffi::{Backing, DType};
+    use crate::storage::memory::{Memory, StorageView};
+    use crate::{EventPool, Result};
+
+    /// A host column holding `values`, as a CPU lane's sampler produces it.
+    fn column(values: &[i64]) -> Result<StorageView> {
+        let memory = Memory::host(size_of_val(values));
+        // SAFETY: fresh host memory of exactly this size, owned by the test.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr(),
+                memory.address() as *mut i64,
+                values.len(),
+            );
+        }
+        StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[values.len() as i64])
+    }
+
+    /// Lease `words` words of `pool` for a one-row batch, with `value`
+    /// captured in each word.
+    fn lease_filled(
+        pool: &mut OutputPool,
+        words: usize,
+        value: i64,
+    ) -> Result<Arc<Mutex<OutputBuffer>>> {
+        let lease = pool.lease(1, words, &[], false)?;
+        lease.lock().unwrap_or_else(PoisonError::into_inner).capture(
+            &column(&vec![value; words])?,
+            None,
+            &EventPool::default(),
+        )?;
+        Ok(lease)
+    }
+
+    /// Complete a leased batch and give its words back: its copies finished
+    /// and its row was observed.
+    fn retire(lease: &Arc<Mutex<OutputBuffer>>) -> Result<Vec<i64>> {
+        let mut buffer = lease.lock().unwrap_or_else(PoisonError::into_inner);
+        // Host captures are sealed on no stream.
+        buffer.seal::<&uniserve_cuda::Stream>(&[], &EventPool::default())?;
+        buffer.copies_finished();
+        buffer.readback()?;
+        let words = buffer.read_tokens(0, buffer.storage()?.words())?.to_vec();
+        buffer.discard(0);
+        Ok(words)
+    }
+
+    #[test]
+    fn a_lane_holds_its_largest_batches_at_once_and_smaller_ones_share_its_storage() -> Result<()> {
+        // Storage for two of the lane's largest batches, of eight words each.
+        let mut pool = OutputPool::new(None, 2, 8)?;
+        assert!(pool.lease(1, 9, &[], false).is_err());
+
+        // Two of the largest batches at once; a third waits for one to retire.
+        let first = lease_filled(&mut pool, 8, 1)?;
+        let second = lease_filled(&mut pool, 8, 2)?;
+        assert!(pool.lease(1, 1, &[], false).is_err());
+        assert_eq!(retire(&first)?, [1; 8]);
+        let third = lease_filled(&mut pool, 8, 3)?;
+        assert_eq!(retire(&second)?, [2; 8]);
+        assert_eq!(retire(&third)?, [3; 8]);
+
+        // Batches take their own words only: sixteen batches of one word fill
+        // the storage of the two largest, each keeping its own value.
+        let small = (0..16)
+            .map(|value| lease_filled(&mut pool, 1, value))
+            .collect::<Result<Vec<_>>>()?;
+        assert!(pool.lease(1, 1, &[], false).is_err());
+        for (value, lease) in small.iter().enumerate() {
+            assert_eq!(retire(lease)?, [value as i64]);
+        }
+
+        // A small batch still live leaves room for one of the largest.
+        let small = lease_filled(&mut pool, 3, 4)?;
+        let large = lease_filled(&mut pool, 8, 5)?;
+        assert!(pool.lease(1, 8, &[], false).is_err());
+        assert_eq!(retire(&small)?, [4; 3]);
+        let other = lease_filled(&mut pool, 8, 6)?;
+        assert_eq!(retire(&large)?, [5; 8]);
+        assert_eq!(retire(&other)?, [6; 8]);
         Ok(())
     }
 }

@@ -456,7 +456,7 @@ impl DiffusionLMRunner {
             let max_calls = config.max_batch_calls.max(1);
             let words = (max_calls * (1 + facts.sequence_length))
                 .max(startup.max_payload_bytes.div_ceil(4));
-            let outputs = OutputPool::new(cuda, startup.queue_depth.max(1) + 1, words);
+            let outputs = OutputPool::new(cuda, startup.queue_depth.max(1) + 1, words)?;
             runners.push(Self {
                 index,
                 graphs: GraphTable::new(owner.clone(), methods.graphs.release.clone()),

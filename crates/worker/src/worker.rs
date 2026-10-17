@@ -393,7 +393,7 @@ impl Worker {
                     denoisers,
                     decoders,
                     media,
-                    crate::OutputPool::new(device, leases, words),
+                    crate::OutputPool::new(device, leases, words).map_err(phase("storage"))?,
                 ))
             }
             _ => None,
@@ -572,7 +572,7 @@ impl Worker {
         if let Some(budget) = &self.budget {
             checks::startup(
                 &self.config,
-                self.plan.arena.device_product_bytes,
+                self.plan.arena.deferred_device_bytes(),
                 |_| 0,
                 budget,
             )
@@ -706,7 +706,7 @@ impl Worker {
             };
             // Product storage lives on the primary device only.
             let products = if device == self.config.device {
-                self.plan.arena.device_product_bytes
+                self.plan.arena.deferred_device_bytes()
             } else {
                 0
             };
@@ -875,7 +875,7 @@ fn allocate_storage(
             .map(|&slot| slot as usize)
             .collect(),
         cross_host_consumers: launch.ipc.products_cross_hosts,
-        vmm_pool_bytes: plan.arena.transfer_bytes,
+        vmm_pool_bytes: plan.arena.export_pool_bytes,
     };
     let exports = launch
         .data_plane
@@ -1156,6 +1156,7 @@ fn plan(
         endpoint: endpoint(&launch.worker_id, config.rank)?,
         device: config.device.to_string(),
         transfer_backends: launch.data_plane.backends.clone(),
+        device_exports: exports_device_products(launch),
         fabric_handles,
         attention_backend: model.attention_backend.clone(),
         supported_calls: supported,
@@ -1294,6 +1295,15 @@ fn plan(
     Ok((plan, None))
 }
 
+/// Whether the rank publishes device products over CUDA VMM.
+fn exports_device_products(launch: &WorkerLaunch) -> bool {
+    launch
+        .data_plane
+        .exports
+        .iter()
+        .any(|name| name == TransportKind::CudaVmm.name())
+}
+
 /// The layout of a video rank: request slots sized by every rank's storage
 /// for that many resident requests, agreed over the group.
 #[allow(clippy::too_many_arguments)]
@@ -1340,6 +1350,7 @@ fn video_layout(
             config,
             queue_depth,
             &facts,
+            exports_device_products(launch),
             minimum,
             maximum,
         )?;

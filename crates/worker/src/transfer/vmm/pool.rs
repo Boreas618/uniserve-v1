@@ -15,6 +15,22 @@ use crate::{DescriptorGrants, Error, Result};
 pub(crate) const HEADER_BYTES: usize = ACK_SLOTS * size_of::<u32>();
 pub(crate) const CHUNK_ALIGNMENT: usize = 512;
 
+/// Bytes of the chunk holding a payload of `bytes`: the reader-word header
+/// and the payload, rounded up to [`CHUNK_ALIGNMENT`].
+fn chunk_bytes(bytes: usize) -> Option<usize> {
+    bytes
+        .checked_add(HEADER_BYTES)
+        .and_then(|value| value.checked_add(CHUNK_ALIGNMENT - 1))
+        .map(|value| value / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
+}
+
+/// Bytes of a pool that holds `count` payloads of at most `bytes` each at
+/// once, every payload in its own chunk.
+pub(crate) fn pool_bytes(count: u64, bytes: usize) -> u64 {
+    let chunk = chunk_bytes(bytes).unwrap_or(usize::MAX) as u64;
+    count.saturating_mul(chunk)
+}
+
 /// An immutable byte range. The payload follows the remote-reader header.
 pub(crate) struct PoolChunk {
     pub(crate) offset: usize,
@@ -121,11 +137,8 @@ impl VmmPool {
                 "a pool chunk needs a positive length".into(),
             ));
         }
-        let span = bytes
-            .checked_add(HEADER_BYTES)
-            .and_then(|value| value.checked_add(CHUNK_ALIGNMENT - 1))
-            .map(|value| value / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
-            .ok_or_else(|| Error::Invalid("VMM payload is too large".into()))?;
+        let span =
+            chunk_bytes(bytes).ok_or_else(|| Error::Invalid("VMM payload is too large".into()))?;
         let Some(offset) = self.free_offset(span) else {
             return Ok(None);
         };

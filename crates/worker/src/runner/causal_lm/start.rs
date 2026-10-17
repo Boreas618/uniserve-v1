@@ -23,6 +23,7 @@ use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::batch::StreamOrder;
 use crate::ffi::{DType, Handle, Interpreter};
 use crate::request::decode_state::DecodeState;
+use crate::runner::causal_lm::runners::COMPLETION_FIELDS;
 use crate::runner::causal_lm::{
     CausalLMRunner, Construction, Dimensions, RunnerParts, TableShape, methods, model_dtype,
 };
@@ -554,11 +555,17 @@ impl CausalLMRunners {
             experts.bind_joins(&owners)?;
         }
 
-        // Completion fields plus payload words per call, as the engine
-        // bounds each call's completion bytes.
+        // A batch leases its calls' completion fields and one payload word
+        // per four bytes the engine bounds each call's completion by
+        // (`TokenBatch::lease`). The batch reports every call's payload in
+        // one result message of at most `max_payload_bytes`, so its payload
+        // words are bounded by the message's, plus one word of rounding per
+        // call.
         let max_calls = config.max_batch_calls.max(1);
-        let words = max_calls * (4 + startup.max_payload_bytes.div_ceil(4));
-        let outputs = OutputPool::new(cuda, startup.queue_depth.max(1) * max_calls, words);
+        let words = max_calls * (COMPLETION_FIELDS + 1) + startup.max_payload_bytes.div_ceil(4);
+        // Storage for the largest batch of each batch in flight, and of one
+        // whose result was reported before its lease retired.
+        let outputs = OutputPool::new(cuda, startup.queue_depth.max(1) + 1, words)?;
         if let Some(stream) = startup.preparation {
             stream.synchronize()?;
         }
