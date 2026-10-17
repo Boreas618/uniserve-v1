@@ -106,11 +106,10 @@ class AttentionRowExchange:
     def chunks(self) -> Iterator[tuple[slice, torch.Tensor]]:
         """Restore head vectors through borrowed receive storage.
 
-        The runtime registers that storage as an NCCL window only for a
-        layer with a context partition; under plain Ulysses it is an
-        ordinary allocation. Consumers exhaust this iterator before the
-        execution owner reuses its backing. Projection callbacks enqueue all
-        row writes before consumers receive a chunk.
+        Only plain Ulysses layers exchange rows here, and their receive
+        storage is an ordinary allocation. Consumers exhaust this iterator
+        before the execution owner reuses its backing. Projection callbacks
+        enqueue all row writes before consumers receive a chunk.
         """
         group = self.parallel.ulysses_group
         rows = self.tensor.shape[0] // group.size
@@ -142,7 +141,7 @@ class ParallelAttention(torch.nn.Module):
 
     Ulysses partitions heads over the complete sequence. A context binding
     gathers every owner's K/V into each rank, which is what an attention
-    kernel reads fastest: the copy engines move the rows once, where reading
+    kernel reads fastest: one NCCL gather moves the rows once, where reading
     a peer's storage inside the kernel pays for every tile it touches. Compute
     backends retain their mask, selection and softmax semantics. The runtime
     owns communication storage.

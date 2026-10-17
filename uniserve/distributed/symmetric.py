@@ -1,9 +1,12 @@
-"""Peer-mapped storage for direct library use.
+"""Peer-mapped storage over ``torch.distributed`` symmetric memory.
 
-The serving worker allocates symmetric workspaces itself and binds every
-member's mapping (``{name}.peer{index}``). A library caller without the
-worker maps them through ``torch.distributed`` symmetric memory over the
-communicator's NCCL process group.
+Execution contexts back every symmetric workspace field with this storage,
+in serving and in direct library use alike: the Ulysses output storage of
+attention with a context partition. Torch allocates it through NCCL and maps
+every member's allocation over the communicator's NCCL process group, which
+registers it as a window of that group's communicator. Members store into
+one another's mappings directly; no NCCL collective takes this storage as an
+operand.
 """
 
 from __future__ import annotations

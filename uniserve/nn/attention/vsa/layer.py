@@ -528,8 +528,8 @@ class Attention(nn.Module):
             )
             if owners > 1:
                 # This path computes its own head shards and restores rows
-                # with a copy-engine exchange, so it borrows its own
-                # destination rather than the group's peer storage.
+                # with an NCCL exchange, so it borrows its own destination
+                # rather than the group's peer storage.
                 assert parallel is not None
                 local_output = parallel.output_destination(q).view_as(q)
                 exchange = AttentionRowExchange(

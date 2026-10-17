@@ -70,10 +70,6 @@ def _options(backend: str, device: torch.device) -> dict[str, Any]:
     if backend == "nccl":
         pg = dist.ProcessGroupNCCL.Options()
         pg.use_pg_for_symm_mem_rendezvous = True
-        # NCCL chooses an eligible algorithm for each operation and topology;
-        # zero-CTA is a preference, not a claim about a mesh axis.
-        # torch's stub declares neither the policy field nor its constant.
-        pg.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO  # type: ignore[attr-defined]
         options["pg_options"] = pg
     if device.type == "cuda" and (
         backend == "nccl" or "cuda:nccl" in backend.split(",")
