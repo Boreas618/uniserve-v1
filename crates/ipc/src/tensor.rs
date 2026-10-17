@@ -264,8 +264,11 @@ pub enum TransferTransport {
         /// Publishing worker endpoint.
         endpoint: String,
         /// Stable export identity: exactly 32 bytes long (the producer
-        /// uses a hex UUID). It also keys the producer's descriptor grant
-        /// when `allocation_handle` is a process descriptor.
+        /// writes its number of the exported allocation and the export's
+        /// number as 16 hex digits each, so consumers share one mapping of
+        /// an allocation across its exports). It also keys the producer's
+        /// descriptor grant when `allocation_handle` is a process
+        /// descriptor.
         export_id: String,
         /// Exported allocation size in bytes.
         storage_size_bytes: u64,

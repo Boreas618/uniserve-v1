@@ -23,6 +23,7 @@ use uniserve_cuda::{DeviceId, Event, Stream};
 use uniserve_ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
 
 use super::backing::TransportBuffer;
+use super::channel::ChannelBytes;
 use super::export_table::ExportTable;
 use super::pool::TransferPool;
 use super::read::{self, BorrowedReads, NativeRead, Read, ReadCall, ReadContext};
@@ -31,7 +32,6 @@ use super::{
     ByteReservation, Notify, ReadReservation, Retirement, Spans, TransferCapacity, notify,
 };
 use crate::ffi::{DType, MemoryKind};
-use crate::storage::memory::Memory;
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result};
 
@@ -176,7 +176,7 @@ pub(crate) enum Staged {
     Channel {
         /// The location without its payload.
         locator: Locator,
-        staging: Arc<Memory>,
+        staging: ChannelBytes,
         bytes: usize,
     },
     /// A CUDA VMM export fenced by a readiness event. A same-host reader
@@ -255,10 +255,13 @@ impl Transport {
             workers,
             &format!("uniserve-{}-read", kind.name()),
         )?);
+        // The rank's transfer budget bounds the bytes its concurrent reads
+        // stage, and so the free staging the transport keeps.
+        let staging_bytes = capacity.capacity() as usize;
         Ok(Self {
             source: options.source.clone(),
             capacity,
-            context: ReadContext::new(Arc::clone(&events)),
+            context: ReadContext::new(Arc::clone(&events), staging_bytes),
             events,
             reads,
             borrowed: Arc::new(Mutex::new(Some(HashMap::new()))),
@@ -391,7 +394,7 @@ impl Transport {
                 locator,
                 staging,
                 bytes,
-            } => super::channel::locate(locator, &staging, bytes),
+            } => super::channel::locate(locator, staging, bytes),
             Staged::Fenced {
                 locator,
                 ready,

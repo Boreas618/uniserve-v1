@@ -384,7 +384,7 @@ impl GroupCopy<'_> {
         Ok(())
     }
 
-    fn close(reads: Vec<Arc<Read>>) -> Result<()> {
+    fn close(reads: &[Arc<Read>]) -> Result<()> {
         reads.iter().try_for_each(Read::close)
     }
 
@@ -400,6 +400,9 @@ impl GroupCopy<'_> {
         let pages = (spans.len() / rows) as u64;
 
         // Bound physical fan-out by one layer, regardless of model depth.
+        // The previous layer's reads are kept until this layer's are issued:
+        // reads alive at once share their imports of the source storage.
+        let mut previous: Vec<Arc<Read>> = Vec::new();
         for (column, layer) in self.axes[0].clone().enumerate() {
             let selected: Vec<_> = spans
                 .iter()
@@ -446,8 +449,10 @@ impl GroupCopy<'_> {
                 }
             }
             self.consume(&reads)?;
-            Self::close(reads)?;
+            Self::close(&reads)?;
+            drop(std::mem::replace(&mut previous, reads));
         }
+        drop(previous);
 
         backend.importer.require_active(&backend.write)?;
         let units: Vec<u32> = spans.iter().map(|&(unit, _, _)| unit).collect();
@@ -474,6 +479,9 @@ impl GroupCopy<'_> {
         );
         let rows = table.shape.units_per_page as usize;
 
+        // As for direct reads, the previous span's reads are kept until this
+        // span's are issued.
+        let mut previous: Vec<Arc<Read>> = Vec::new();
         let mut position = start;
         while position < end {
             let page = position / page_tokens;
@@ -549,9 +557,11 @@ impl GroupCopy<'_> {
                 AnyView::from(&arguments.8),
                 AnyView::from(&units),
             ])?;
-            Self::close(reads)?;
+            Self::close(&reads)?;
+            drop(std::mem::replace(&mut previous, reads));
             position += count;
         }
+        drop(previous);
         Ok(())
     }
 }

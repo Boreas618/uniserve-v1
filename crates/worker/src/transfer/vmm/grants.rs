@@ -16,7 +16,8 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags, SocketAddrUnix, bind, recvmsg, sendmsg_addr,
 };
 
-const REQUEST_BYTES: usize = 32;
+/// Bytes of an export name a grant is registered and requested under.
+pub(super) const EXPORT_NAME_BYTES: usize = 32;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 type Descriptors = Arc<Mutex<Option<HashMap<String, Arc<OwnedFd>>>>>;
@@ -123,7 +124,7 @@ fn address(endpoint: &str) -> io::Result<SocketAddr> {
 }
 
 fn request(export: &str) -> io::Result<&[u8]> {
-    if export.len() != REQUEST_BYTES {
+    if export.len() != EXPORT_NAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "descriptor requests require a 32-byte export name",
@@ -150,7 +151,7 @@ fn serve(socket: UnixDatagram, stop: UnixStream, descriptors: Descriptors) -> io
         }
 
         // The extra byte distinguishes oversized requests from a full name.
-        let mut name = [0; REQUEST_BYTES + 1];
+        let mut name = [0; EXPORT_NAME_BYTES + 1];
         let (count, peer) = match socket.recv_from(&mut name) {
             Ok(received) => received,
             Err(error)
@@ -163,7 +164,7 @@ fn serve(socket: UnixDatagram, stop: UnixStream, descriptors: Descriptors) -> io
             }
             Err(error) => return Err(error),
         };
-        let descriptor = if count == REQUEST_BYTES {
+        let descriptor = if count == EXPORT_NAME_BYTES {
             let registered = descriptors.lock().unwrap_or_else(|e| e.into_inner());
             std::str::from_utf8(&name[..count])
                 .ok()

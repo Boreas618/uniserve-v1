@@ -10,7 +10,9 @@
 //!
 //! Dense exports alias the live pages, which the cache manager protects from
 //! writes until the export retires. FP8 exports are frozen into staging
-//! first, because a later append can grow a page's scale and re-encode it.
+//! first, because a later append can grow a page's scale and re-encode it:
+//! one allocation per cache group holds every value and scale view the
+//! group freezes.
 
 use std::sync::Arc;
 
@@ -38,33 +40,76 @@ fn pages(start: u64, end: u64, page_tokens: u64) -> Vec<(u64, u32, u32)> {
     pages
 }
 
-/// Staging for frozen exports: exportable memory of the pool's device, which
-/// a CUDA VMM export names where it lies and local peer devices may address,
-/// or host memory for a CPU pool.
-fn staging(planes: &CachePlanes, bytes: usize) -> Result<Arc<Memory>> {
-    match planes.device() {
-        Some(device) => Memory::exportable(device, bytes.max(1), &Memory::peers(device)?),
-        None => Ok(Memory::host(bytes.max(1))),
-    }
+/// Byte alignment of each view frozen into a group's staging.
+const FROZEN_ALIGNMENT: usize = 256;
+
+fn aligned(bytes: usize) -> usize {
+    bytes.div_ceil(FROZEN_ALIGNMENT) * FROZEN_ALIGNMENT
 }
 
-/// Copy `source` into a new contiguous staging tensor, in `stream`'s order.
-fn freeze(planes: &CachePlanes, source: &Spans, stream: impl Issue) -> Result<Spans> {
-    let shape: Vec<i64> = source.shape().iter().map(|&extent| extent as i64).collect();
-    let memory = staging(planes, source.nbytes() as usize)?;
-    let target = Spans::single(StorageView::contiguous(
-        memory as Arc<dyn Backing>,
-        0,
-        source.dtype(),
-        &shape,
-    )?)?;
-    let mut plan = copy_planner(planes.device(), SourceOrder::Stream)?;
-    target.plan_copy(source, &mut plan)?;
-    // SAFETY: the staging is retained by the export's spans until it
-    // retires; the pages are protected by the export reservation. Without
-    // a stream both are host operands of this export and the pool.
-    unsafe { stream.copy_strided(&plan) }?;
-    Ok(target)
+/// One cache group's staging for frozen (FP8) views of an export: a single
+/// allocation, sized for every view the group freezes and carved in
+/// order. Exportable memory of the pool's device, which a CUDA VMM export
+/// names where it lies and local peer devices may address, or host memory
+/// for a CPU pool. The export holds it until its issuer performed the copies
+/// into and out of it ([`CacheExport`]); an export that reads it in place
+/// retains a carved view of it until that export retires.
+struct Frozen {
+    memory: Arc<Memory>,
+    used: usize,
+}
+
+impl Frozen {
+    fn allocate(planes: &CachePlanes, bytes: usize) -> Result<Self> {
+        let memory = match planes.device() {
+            Some(device) => Memory::exportable(device, bytes.max(1), &Memory::peers(device)?)?,
+            None => Memory::host(bytes.max(1)),
+        };
+        Ok(Self { memory, used: 0 })
+    }
+
+    /// The offset of the next `bytes` of the staging.
+    fn carve(&mut self, bytes: usize) -> Result<usize> {
+        let offset = self.used;
+        if offset + bytes > self.memory.bytes() {
+            return Err(Error::Invariant(
+                "frozen cache views exceed their staging".into(),
+            ));
+        }
+        self.used = aligned(offset + bytes);
+        Ok(offset)
+    }
+
+    /// A contiguous view of the next bytes of the staging.
+    fn view(&mut self, dtype: DType, shape: &[i64]) -> Result<Spans> {
+        let elements: i64 = shape.iter().product();
+        let offset = self.carve(elements as usize * dtype.bytes())?;
+        Spans::single(StorageView::contiguous(
+            Arc::clone(&self.memory) as Arc<dyn Backing>,
+            offset,
+            dtype,
+            shape,
+        )?)
+    }
+
+    /// Copy `source` into the next view of the staging, in `stream`'s order.
+    fn freeze(
+        &mut self,
+        planes: &CachePlanes,
+        source: &Spans,
+        stream: impl Issue,
+    ) -> Result<Spans> {
+        let shape: Vec<i64> = source.shape().iter().map(|&extent| extent as i64).collect();
+        let target = self.view(source.dtype(), &shape)?;
+        let mut plan = copy_planner(planes.device(), SourceOrder::Stream)?;
+        target.plan_copy(source, &mut plan)?;
+        // SAFETY: the staging is retained by the export's spans until it
+        // retires; the pages are protected by the export reservation.
+        // Without a stream both are host operands of this export and the
+        // pool.
+        unsafe { stream.copy_strided(&plan) }?;
+        Ok(target)
+    }
 }
 
 /// One group's export inputs.
@@ -82,6 +127,12 @@ pub struct CacheExport {
     transfer: CacheTransfer,
     /// The exports of each tensor of each group, in the transfer's order.
     exports: Vec<Vec<Vec<Exports>>>,
+    /// The staging FP8 views were frozen into. The issuer's work copies
+    /// into it and, for a mechanism that carries the bytes (shared memory,
+    /// the rank channel), out of it; a job performs those copies later, and
+    /// such an export does not retain the staging. The staging is released
+    /// with this value, once that work was performed.
+    staging: Vec<Arc<Memory>>,
 }
 
 impl CacheExport {
@@ -101,6 +152,7 @@ impl CacheExport {
             buffer,
             mut transfer,
             exports,
+            staging,
         } = self;
         let mut locations: Vec<Location> = Vec::new();
         let mut result = Ok(());
@@ -137,6 +189,9 @@ impl CacheExport {
             accesses.release_exports(&[buffer]);
             return Err(error);
         }
+        // The issuer's copies out of the staging were performed; exports
+        // that read it in place retain their own views of it.
+        drop(staging);
         Ok((transfer, locations))
     }
 
@@ -150,6 +205,7 @@ impl CacheExport {
             .flatten()
             .for_each(Exports::revoke);
         accesses.release_exports(&[self.buffer]);
+        drop(self.staging);
     }
 }
 
@@ -226,6 +282,7 @@ pub(crate) fn export(
     // attempt: the copies a job recorded for those accepted before the
     // failure address storage their revocation gives back.
     let mut exports = Vec::new();
+    let mut staging = Vec::new();
     let result = stream.attempt(|| -> Result<()> {
         for (index, (group, table)) in transfer.groups.iter_mut().zip(&selected).enumerate() {
             let export = GroupExport {
@@ -244,6 +301,7 @@ pub(crate) fn export(
                 consumers,
                 stream,
                 &mut exports[index],
+                &mut staging,
             )?;
         }
         Ok(())
@@ -252,6 +310,7 @@ pub(crate) fn export(
         buffer,
         transfer,
         exports,
+        staging,
     };
     if let Err(error) = result {
         export.revoke(accesses);
@@ -273,6 +332,7 @@ fn export_group(
     consumers: &[usize],
     stream: impl Issue,
     exports: &mut Vec<Vec<Exports>>,
+    staging: &mut Vec<Arc<Memory>>,
 ) -> Result<Vec<TensorTransfer>> {
     let count = export.visible - export.start;
     if count == 0 {
@@ -289,15 +349,14 @@ fn export_group(
     );
     let mut retain = |retirement| accesses.retain_export(buffer, retirement);
 
-    let mut tensors = Vec::new();
+    // The layers in unit position `row` of every page are one consecutive
+    // run of `columns` layers, exported as one tensor per mechanism: the
+    // locator count follows the group's units per page, never the model's
+    // depth.
+    let rows = table.shape.units_per_page;
+    let mut sources = Vec::new();
     for field in 0..2 {
-        exports.push(Vec::new());
-        let field_exports = exports.len() - 1;
-        // The layers in unit position `row` of every page are one
-        // consecutive run of `columns` layers, exported as one tensor per
-        // mechanism: the locator count follows the group's units per page,
-        // never the model's depth.
-        for row in 0..table.shape.units_per_page {
+        for row in 0..rows {
             let units = table.row(row as usize);
             let views = pages
                 .iter()
@@ -306,10 +365,38 @@ fn export_group(
                     planes.page(field, export.index, unit, offset, length)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let mut source = Spans::new(views)?;
-            if plan.quantized {
-                source = freeze(planes, &source, stream)?;
-            }
+            sources.push(Spans::new(views)?);
+        }
+    }
+    // One scale per (unit, column, field) and touched page.
+    let scale_bytes = pages.len() * columns as usize * 4;
+    let mut frozen = if plan.quantized {
+        let bytes = sources
+            .iter()
+            .map(|source| aligned(source.nbytes() as usize))
+            .sum::<usize>()
+            + 2 * rows as usize * aligned(scale_bytes);
+        let frozen = Frozen::allocate(planes, bytes)?;
+        staging.push(Arc::clone(&frozen.memory));
+        Some(frozen)
+    } else {
+        None
+    };
+
+    let mut tensors = Vec::new();
+    let mut sources = sources.into_iter();
+    // Keys, then values, in the order `sources` holds them.
+    for _ in 0..2 {
+        exports.push(Vec::new());
+        let field_exports = exports.len() - 1;
+        for row in 0..rows {
+            let source = sources
+                .next()
+                .ok_or_else(|| Error::Invariant("a cache row has no source".into()))?;
+            let source = match &mut frozen {
+                Some(frozen) => frozen.freeze(planes, &source, stream)?,
+                None => source,
+            };
             // The offset places this run inside the group's transfer at the
             // run's first layer and this rank's first KV head.
             let offset = [
@@ -339,23 +426,24 @@ fn export_group(
         });
     }
 
-    if plan.quantized {
-        // One scale per (unit, column, field): published rows are
-        // [page, K/V, layers, head group], frozen like the values. A rank's
-        // head group is its KV-head offset divided by its local head count.
+    if let Some(frozen) = &mut frozen {
+        // Published rows are [page, K/V, layers, head group], frozen like
+        // the values. A rank's head group is its KV-head offset divided by
+        // its local head count.
         exports.push(Vec::new());
         let scale_exports = exports.len() - 1;
         for field in 0..2 {
-            for row in 0..table.shape.units_per_page {
+            for row in 0..rows {
                 let units = table.row(row as usize);
-                let memory = staging(planes, pages.len() * columns as usize * 4)?;
+                let source =
+                    frozen.view(DType::F32, &[pages.len() as i64, 1, i64::from(columns), 1])?;
+                let base = source.first().address();
                 let mut batch = CopyBatch::new(SourceOrder::Stream);
                 for (index, &(page, _, _)) in pages.iter().enumerate() {
                     let unit = units[(page - u64::from(table.start_page)) as usize];
                     for column in 0..columns {
                         batch.push(
-                            memory.address()
-                                + ((index * columns as usize + column as usize) * 4) as u64,
+                            base + ((index * columns as usize + column as usize) * 4) as u64,
                             planes.scale_address(field, column, unit)?,
                             4,
                         );
@@ -365,12 +453,6 @@ fn export_group(
                 // scales are protected by the export reservation. Without a
                 // stream both are host operands of a CPU pool.
                 unsafe { stream.copy(&batch) }?;
-                let source = Spans::single(StorageView::contiguous(
-                    memory as Arc<dyn Backing>,
-                    0,
-                    DType::F32,
-                    &[pages.len() as i64, 1, i64::from(columns), 1],
-                )?)?;
                 let offset = [
                     0,
                     field as u64,

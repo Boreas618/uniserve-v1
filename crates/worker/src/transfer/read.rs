@@ -9,6 +9,9 @@
 //! Copies run on transfer-pool threads, on one ordinary (non-partitioned)
 //! stream per thread and device: on an SM-partition stream the driver takes
 //! copies of mapped peer windows only one call each (`uniserve_cuda::copy`).
+//! A thread submits a device copy and its fences and moves on: no host
+//! wait orders a copy. The read's [`PhysicalAccess`] is retired once its
+//! last fence completed, by the transfer pool's retirement thread.
 
 use super::{ACKNOWLEDGED, CLAIMED};
 use std::any::Any;
@@ -22,13 +25,14 @@ use uniserve_ipc::Locator;
 
 use super::export_table::SourceGrant;
 use super::pool::{TransferPool, TransferRead};
+use super::staging::Staging;
 use super::{
     Notify, ReadReservation, Retirement, Spans, TransferCapacity, TransferTicket, copy_on_host,
     copy_planner, notify, submit_copy,
 };
 use crate::ffi::{Backing, DType, MemoryKind};
 use crate::host::HostTask;
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::{Error, EventPool, Outcome, Result};
 
@@ -42,6 +46,13 @@ struct ReadState {
     credit: Option<Arc<TransferCapacity>>,
     /// Storage an undrained copy may still address.
     retained: Vec<Box<dyn Any + Send>>,
+    /// The submitted device work of a copy, until the transfer pool takes it
+    /// to retire it.
+    access: Option<PhysicalAccess>,
+    /// Imported storage of another process the read reached (a mapping, the
+    /// producer's fence), kept while the read lives: reads of one storage
+    /// alive at once share one import.
+    imports: Vec<Arc<dyn Any + Send + Sync>>,
     work: Option<Weak<HostTask<TransferRead>>>,
     /// The read's task was handed to its transport thread.
     started: bool,
@@ -66,6 +77,8 @@ impl Read {
                 source: None,
                 credit: None,
                 retained: Vec::new(),
+                access: None,
+                imports: Vec::new(),
                 work: None,
                 started: false,
             }),
@@ -287,6 +300,16 @@ impl Read {
         state.retained.extend(retained);
     }
 
+    /// Keep `import` while the read lives.
+    pub(crate) fn retain_import(&self, import: Arc<dyn Any + Send + Sync>) {
+        self.lock().imports.push(import);
+    }
+
+    /// The device work a copy submitted, which its retirement waits for.
+    pub(crate) fn take_access(&self) -> Option<PhysicalAccess> {
+        self.lock().access.take()
+    }
+
     pub(crate) fn release_source(&self) -> Result<()> {
         let (source, credit) = {
             let mut state = self.lock();
@@ -388,19 +411,22 @@ impl std::ops::Deref for ReadRef {
     }
 }
 
-/// Per-thread copy streams and page-locked staging of one transport's reads.
+/// Per-thread copy streams and the page-locked staging of one transport.
 pub(crate) struct ReadContext {
     pub(crate) events: Arc<EventPool>,
     streams: Mutex<HashMap<(ThreadId, DeviceId), Arc<Stream>>>,
-    staging: Mutex<HashMap<(ThreadId, DeviceId), Arc<Memory>>>,
+    /// Staging of host reads into device destinations and of channel
+    /// exports; a read's lease returns when the read retires.
+    pub(crate) staging: Arc<Staging>,
 }
 
 impl ReadContext {
-    pub(crate) fn new(events: Arc<EventPool>) -> Arc<Self> {
+    /// `staging_bytes` bounds the free staging the transport keeps.
+    pub(crate) fn new(events: Arc<EventPool>, staging_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
             events,
             streams: Mutex::new(HashMap::new()),
-            staging: Mutex::new(HashMap::new()),
+            staging: Staging::new(staging_bytes),
         })
     }
 
@@ -416,37 +442,10 @@ impl ReadContext {
         Ok(stream)
     }
 
-    /// The calling thread's page-locked staging of at least `bytes` for
-    /// `device` copies. A read drains its stream before returning, so the
-    /// thread's next read may reuse it; an undrained read takes it over.
-    fn staging(&self, device: DeviceId, bytes: usize) -> Result<Arc<Memory>> {
-        let key = (std::thread::current().id(), device);
-        let mut staging = self.staging.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(memory) = staging.get(&key)
-            && memory.bytes() >= bytes
-        {
-            return Ok(Arc::clone(memory));
-        }
-        let memory = Memory::pinned(device, bytes.max(1).next_power_of_two())?;
-        staging.insert(key, Arc::clone(&memory));
-        Ok(memory)
-    }
-
-    fn forget_staging(&self, device: DeviceId) {
-        let key = (std::thread::current().id(), device);
-        self.staging
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key);
-    }
-
-    /// Release streams after every reader thread joined.
+    /// Release streams after every reader thread joined and every read
+    /// retired.
     pub(crate) fn clear(&self) {
         self.streams
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        self.staging
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
@@ -539,20 +538,83 @@ fn copy_device(source: &Spans, destination: &Spans) -> Option<DeviceId> {
     }
 }
 
+/// How the device a CUDA VMM read's source is mapped on takes part in its
+/// copy: a stream of that device waits for the producer's interprocess
+/// fence (no stream of another device may wait on it), and this reader's
+/// acknowledgment word is claimed before the copy and acknowledged after it.
+pub(crate) struct ImportOrder {
+    pub(crate) device: DeviceId,
+    pub(crate) producer: Option<Arc<Event>>,
+    pub(crate) acknowledgment: Option<u64>,
+}
+
+/// A copy's submitted device work: every device access of the read
+/// precedes `fence`, the last of `fences`. Until that fence completed the
+/// read keeps `operands` (every storage the work addresses), one pool
+/// reference of each fence, and the streams the work runs on.
+pub(crate) struct PhysicalAccess {
+    fence: Arc<Event>,
+    fences: Vec<Arc<Event>>,
+    streams: Vec<Arc<Stream>>,
+    operands: Vec<Box<dyn Any + Send>>,
+}
+
+impl PhysicalAccess {
+    /// Wait on the host for the work to complete, then release what it
+    /// kept. When completion cannot be established the read keeps all of
+    /// it, marked undrained, and this fails.
+    pub(crate) fn retire(self, read: &NativeRead) -> Result<()> {
+        let Self {
+            fence,
+            fences,
+            mut streams,
+            mut operands,
+        } = self;
+        if let Err(error) = fence.synchronize() {
+            let stream = streams.remove(0);
+            operands.push(Box::new(streams));
+            operands.push(Box::new(fences));
+            read.read.mark_undrained(stream, None, operands);
+            return Err(error.into());
+        }
+        drop(operands);
+        let events = &read.context.events;
+        fences.iter().try_for_each(|fence| events.release(fence, 1))
+    }
+
+    /// Give the work up unobserved: the read keeps all of it, marked
+    /// undrained.
+    pub(crate) fn abandon(self, read: &NativeRead) {
+        let Self {
+            fence,
+            fences,
+            mut streams,
+            mut operands,
+        } = self;
+        let stream = streams.remove(0);
+        operands.push(Box::new((fence, fences, streams)));
+        read.read.mark_undrained(stream, None, operands);
+    }
+}
+
 impl NativeRead {
     /// Copy `source` into `destination` and complete the read with it.
     ///
     /// A device copy runs on this thread's stream after the destination's
-    /// handoff fence and the producer's fence, claims and acknowledges a VMM
-    /// chunk around it when `acknowledgment` names a reader word, exposes its
-    /// fence, and drains the stream before returning: the transfer task
-    /// retires only after the drain. A failed drain retains every operand.
+    /// handoff fence and the producer's fence; `import` adds the ordering of
+    /// a mapped VMM source. The read's result is fenced by an event of the
+    /// copy stream, so consumers order their streams after it without a
+    /// host wait. No host wait orders the copy either: the submitted work
+    /// and every operand it addresses (with `retained`) become the read's
+    /// [`PhysicalAccess`], which the transfer pool retires once it
+    /// completed. A copy that fails after submitting work drains it here;
+    /// a failed drain retains every operand.
     pub(crate) fn copy(
         &self,
         source: &Spans,
         destination: &Spans,
         producer: Option<Arc<Event>>,
-        acknowledgment: Option<u64>,
+        import: Option<ImportOrder>,
         retained: Vec<Box<dyn Any + Send>>,
     ) -> Result<()> {
         self.read.require_active()?;
@@ -565,61 +627,147 @@ impl NativeRead {
             return self.read.complete(destination.clone(), None);
         };
 
+        let events = &self.context.events;
         let stream = self.context.stream(device)?;
-        let copied = (|| -> Result<()> {
+        // The source's device takes part through its own stream of this
+        // thread when it is not the copy's device.
+        let peer = match &import {
+            Some(order) if order.device != device => Some(self.context.stream(order.device)?),
+            _ => None,
+        };
+        let (word, mapped) = import.as_ref().map_or((None, None), |order| {
+            (order.acknowledgment, order.producer.as_ref())
+        });
+        // Pool fences of this copy, each with one retained reference, in
+        // submission order: the last one follows all of the copy's work.
+        let mut fences: Vec<Arc<Event>> = Vec::new();
+
+        let submitted = (|| -> Result<()> {
+            // The claim precedes either handoff wait in stream order, so the
+            // producer cannot reuse the chunk while this copy waits to
+            // begin; no host wait is needed for it to land first.
+            let claimed = match &peer {
+                Some(peer) => {
+                    let _device = DeviceGuard::new(peer.device())?;
+                    if let Some(word) = word {
+                        // SAFETY: the word lies in the mapped chunk header
+                        // the read's source spans retain.
+                        unsafe { memset_d32(word, CLAIMED, 1, peer) }?;
+                    }
+                    if let Some(producer) = mapped {
+                        peer.wait_event(producer)?;
+                    }
+                    let claimed = events.fence(peer.as_ref(), false)?;
+                    fences.push(Arc::clone(&claimed));
+                    Some(claimed)
+                }
+                None => None,
+            };
+
             let _device = DeviceGuard::new(device)?;
-            if let Some(word) = acknowledgment {
-                // Claim before either handoff wait, so the producer cannot
-                // reuse the chunk while this copy is waiting to begin.
-                // SAFETY: the word lies in the mapped chunk header retained by
-                // this read.
+            if peer.is_none()
+                && let Some(word) = word
+            {
+                // SAFETY: as for the claim on the source's device.
                 unsafe { memset_d32(word, CLAIMED, 1, &stream) }?;
-                stream.synchronize()?;
             }
             self.read.lock().ticket.wait_for_copy(&stream)?;
-            if let Some(producer) = &producer {
-                stream.wait_event(producer)?;
+            let mapped = mapped.filter(|_| peer.is_none()).map(Arc::as_ref);
+            for fence in [producer.as_deref(), mapped, claimed.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                stream.wait_event(fence)?;
             }
 
-            // SAFETY: the read retains both operands until the stream drains
-            // below, or forever if it cannot.
+            // SAFETY: the read retains both operands until its physical
+            // access retires, or forever if that cannot be established.
             unsafe { submit_copy(destination, source, &stream) }?;
-            if let Some(word) = acknowledgment {
+            if peer.is_none()
+                && let Some(word) = word
+            {
                 // SAFETY: as for the claim.
                 unsafe { memset_d32(word, ACKNOWLEDGED, 1, &stream) }?;
             }
-            let completed = self.context.events.acquire(device, false, false)?;
-            self.context.events.record(&completed, stream.as_ref())?;
+            let completed = events.fence(stream.as_ref(), false)?;
+            fences.push(Arc::clone(&completed));
+
+            if let (Some(peer), Some(word)) = (&peer, word) {
+                // Acknowledge on the source's device once the copy is done.
+                let _device = DeviceGuard::new(peer.device())?;
+                peer.wait_event(&completed)?;
+                // SAFETY: as for the claim.
+                unsafe { memset_d32(word, ACKNOWLEDGED, 1, peer) }?;
+                fences.push(events.fence(peer.as_ref(), false)?);
+            }
             self.read.complete(destination.clone(), Some(completed))
         })();
-        // The read's waiters and this call's caller observe one failure.
-        let copied = copied.map_err(|error| {
-            let shared = Arc::new(error);
-            self.read.fail(Arc::clone(&shared));
-            Error::Shared(shared)
-        });
 
-        let drained = DeviceGuard::new(device)
-            .map_err(Error::from)
-            .and_then(|_device| stream.synchronize().map_err(Error::from));
-        if let Err(error) = drained {
-            // Unknown physical completion is not cancellation: keep the
-            // stream, fences and every operand with the read.
-            let mut kept: Vec<Box<dyn Any + Send>> =
-                vec![Box::new(source.clone()), Box::new(destination.clone())];
-            kept.extend(retained);
-            self.read
-                .mark_undrained(Arc::clone(&stream), producer, kept);
-            return Err(match copied {
-                Ok(()) => error,
-                Err(cause) => Error::Transport(format!("{error}; copy failed: {cause}")),
-            });
+        let mut operands: Vec<Box<dyn Any + Send>> =
+            vec![Box::new(source.clone()), Box::new(destination.clone())];
+        operands.extend(retained);
+        operands.extend(import.map(|order| Box::new(order) as Box<dyn Any + Send>));
+        let streams: Vec<Arc<Stream>> = std::iter::once(stream).chain(peer).collect();
+
+        let last = fences.last().cloned();
+        match (submitted, last) {
+            (Ok(()), Some(fence)) => {
+                self.read.lock().access = Some(PhysicalAccess {
+                    fence,
+                    fences,
+                    streams,
+                    operands,
+                });
+                Ok(())
+            }
+            (submitted, _) => {
+                let error = submitted
+                    .err()
+                    .unwrap_or_else(|| Error::Invariant("a submitted copy has no fence".into()));
+                // The read's waiters and this call's caller observe one
+                // failure.
+                let shared = Arc::new(error);
+                self.read.fail(Arc::clone(&shared));
+                if let Err(drained) = self.drain(streams, producer, fences, operands) {
+                    return Err(Error::Transport(format!(
+                        "{drained}; copy failed: {shared}"
+                    )));
+                }
+                Err(Error::Shared(shared))
+            }
         }
-        copied
     }
 
-    /// Stage host bytes for a device destination: host-copy `source` into
-    /// this thread's page-locked staging, then copy staging to `destination`.
+    /// Wait on the host for the streams of a failed copy, which may have
+    /// submitted part of its work, and release its fences. Unknown physical
+    /// completion is not cancellation: the read then keeps the streams,
+    /// fences and every operand.
+    fn drain(
+        &self,
+        mut streams: Vec<Arc<Stream>>,
+        producer: Option<Arc<Event>>,
+        fences: Vec<Arc<Event>>,
+        mut operands: Vec<Box<dyn Any + Send>>,
+    ) -> Result<()> {
+        let drained = streams.iter().try_for_each(|stream| -> Result<()> {
+            let _device = DeviceGuard::new(stream.device())?;
+            stream.synchronize()?;
+            Ok(())
+        });
+        if let Err(error) = drained {
+            let stream = streams.remove(0);
+            operands.push(Box::new(streams));
+            operands.push(Box::new(fences));
+            self.read.mark_undrained(stream, producer, operands);
+            return Err(error);
+        }
+        let events = &self.context.events;
+        fences.iter().try_for_each(|fence| events.release(fence, 1))
+    }
+
+    /// Stage host bytes for a device destination: host-copy `source` into a
+    /// page-locked staging lease, then copy the lease to `destination`. The
+    /// lease returns to the transport's staging when the read retires.
     pub(super) fn copy_from_host(
         &self,
         source: &Spans,
@@ -636,7 +784,10 @@ impl NativeRead {
         };
 
         let shape: Vec<i64> = source.shape().iter().map(|&extent| extent as i64).collect();
-        let staging = self.context.staging(device, source.nbytes() as usize)?;
+        let staging = self
+            .context
+            .staging
+            .lease(device, source.nbytes() as usize)?;
         let staged = Spans::single(StorageView::contiguous(
             Arc::clone(&staging) as Arc<dyn Backing>,
             0,
@@ -645,18 +796,13 @@ impl NativeRead {
         )?)?;
         let mut plan = copy_planner(None, SourceOrder::Stream)?;
         staged.plan_copy(source, &mut plan)?;
-        // SAFETY: the staging belongs to this thread and no device copy uses
-        // it: the thread's previous read drained its stream.
+        // SAFETY: no device copy uses a leased block: a block returns to the
+        // staging only after the read that copied from it retired.
         unsafe { copy_on_host(&plan) };
         // The private copy ends the source claim before device DMA begins.
         release();
 
-        let copied = self.copy(&staged, destination, None, None, Vec::new());
-        if self.read.lock().ticket.undrained() {
-            // The undrained copy retains the staging; never reuse it.
-            self.context.forget_staging(device);
-        }
-        copied
+        self.copy(&staged, destination, None, None, vec![Box::new(staging)])
     }
 }
 

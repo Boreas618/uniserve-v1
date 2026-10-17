@@ -10,14 +10,16 @@ use std::sync::Arc;
 
 use uniserve_cuda::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
 
-use super::grants::DescriptorGrants;
+use super::grants::{DescriptorGrants, EXPORT_NAME_BYTES};
 use super::handle::AllocationHandle;
 use crate::parallel::host::HostGroup;
 use crate::storage::memory::Memory;
 use crate::{Error, Result};
 
-/// The export name under which a rank serves its peer allocation.
-const PEER_EXPORT: &str = "peer-storage";
+/// The export name under which a rank serves its peer allocation; a grant
+/// name has exactly [`EXPORT_NAME_BYTES`] bytes.
+const PEER_EXPORT: &str = "uniserve-peer-storage-allocation";
+const _: () = assert!(PEER_EXPORT.len() == EXPORT_NAME_BYTES);
 
 /// A member's published handle: `node \0 endpoint \0 handle`, the
 /// member's host, the grant socket serving its descriptor, and its
@@ -50,6 +52,25 @@ fn decode(node: &str, payload: &[u8]) -> Result<ShareableHandle> {
     handle.import(endpoint, PEER_EXPORT)
 }
 
+/// The grant socket name a member publishes with `handle`, and the grants
+/// serving its descriptor to the other members of its host; none for a
+/// fabric handle, which travels as bytes.
+fn serve(handle: &ShareableHandle) -> Result<(String, Option<DescriptorGrants>)> {
+    let endpoint = format!("uniserve-peer-{}", uuid::Uuid::new_v4().simple());
+    let grants = match handle {
+        ShareableHandle::Descriptor(fd) => {
+            let grants = DescriptorGrants::new(&endpoint)
+                .map_err(|error| Error::Transport(error.to_string()))?;
+            grants
+                .register(PEER_EXPORT, fd.as_raw_fd())
+                .map_err(|error| Error::Transport(error.to_string()))?;
+            Some(grants)
+        }
+        ShareableHandle::Fabric(_) => None,
+    };
+    Ok((endpoint, grants))
+}
+
 /// This rank's exportable allocation and the mapping of every member's.
 pub(crate) struct PeerStorage {
     local: Arc<Memory>,
@@ -78,18 +99,7 @@ impl PeerStorage {
             .ok_or_else(|| Error::Invariant("peer storage is exportable".into()))?;
 
         // Serve a descriptor until every member imported it.
-        let endpoint = format!("uniserve-peer-{}", uuid::Uuid::new_v4().simple());
-        let grants = match &handle {
-            ShareableHandle::Descriptor(fd) => {
-                let grants = DescriptorGrants::new(&endpoint)
-                    .map_err(|error| Error::Transport(error.to_string()))?;
-                grants
-                    .register(PEER_EXPORT, fd.as_raw_fd())
-                    .map_err(|error| Error::Transport(error.to_string()))?;
-                Some(grants)
-            }
-            ShareableHandle::Fabric(_) => None,
-        };
+        let (endpoint, grants) = serve(&handle)?;
 
         let payloads = group.all_gather_bytes(&encode(node, &handle, &endpoint))?;
         let handles = payloads
@@ -168,6 +178,39 @@ mod tests {
 
         assert!(decode("node-a", b"node-a\0uniserve-peer-x").is_err());
         assert!(decode("node-a", b"node-a\0uniserve-peer-x\0abc").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_descriptor_reaches_members_of_its_host_through_the_grant() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // Any open file stands in for an allocation's process descriptor:
+        // the grant passes the descriptor, not the allocation.
+        let file = std::fs::File::open("/dev/null")
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        let published = file
+            .metadata()
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        let handle = ShareableHandle::Descriptor(file.into());
+        let (endpoint, grants) = serve(&handle)?;
+        assert!(grants.is_some(), "a descriptor is served by a grant");
+
+        // A member of the same host imports the descriptor from the grant.
+        let ShareableHandle::Descriptor(received) =
+            decode("node-a", &encode("node-a", &handle, &endpoint))?
+        else {
+            return Err(Error::State(
+                "a descriptor payload imported as a fabric handle",
+            ));
+        };
+        let received = std::fs::File::from(received)
+            .metadata()
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        assert_eq!(
+            (received.dev(), received.ino()),
+            (published.dev(), published.ino())
+        );
         Ok(())
     }
 }
