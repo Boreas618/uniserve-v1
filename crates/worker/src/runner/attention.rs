@@ -83,7 +83,10 @@ impl AttentionMetadata {
             None => Memory::host(bytes),
         };
         let row_columns = StorageView::contiguous(memory, 0, DType::I64, &[words as i64])?;
-        row_columns.zero(stream)?;
+        // SAFETY: a new allocation the metadata keeps until its runner closes
+        // after its stream drained; its gathers run behind the fill on that
+        // stream.
+        unsafe { row_columns.zero(stream) }?;
         Ok(Self {
             capacity,
             row_columns,
@@ -156,7 +159,10 @@ impl AttentionMetadata {
             .collect::<Result<Vec<_>>>()?;
         let words = pack_rows(rows, &pages, capacity.rows + 1, capacity.tokens);
         let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
-        self.row_columns.upload(&bytes, stream)?;
+        // SAFETY: the runner's packed column, kept until it closes after its
+        // stream drained; the gathers reading it run on `stream`, the
+        // earlier forwards' before this write and this forward's after it.
+        unsafe { self.row_columns.upload(&bytes, stream) }?;
 
         let mut starts = vec![0; pages.len() * rows.len()];
         for (table, selected) in pages.iter().enumerate() {

@@ -508,7 +508,18 @@ impl StorageView {
     /// the work `stream` issued before (it has a stream exactly for device
     /// memory). The source is read before the call returns, so the caller
     /// may reuse it at once.
-    pub(crate) fn upload(&self, bytes: &[u8], stream: impl Issue) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// The write runs when `stream` runs it: during the call for host
+    /// memory without a stream, after the stream's earlier work on a
+    /// stream, when the job runs for a job's recorder. Until it ran, nothing
+    /// reads or writes the destination bytes except work ordered after it
+    /// (behind it on `stream`, or behind a fence of `stream`), and the
+    /// view's allocation keeps a reference: the caller retires the write
+    /// before dropping the allocation's last reference, as for any device
+    /// access.
+    pub(crate) unsafe fn upload(&self, bytes: &[u8], stream: impl Issue) -> Result<()> {
         if !self.is_contiguous() || bytes.len() as u64 > self.nbytes() {
             return Err(Error::Invariant(
                 "an upload writes a prefix of a contiguous view".to_owned(),
@@ -525,14 +536,21 @@ impl StorageView {
 
         let mut batch = CopyBatch::new(SourceOrder::DuringCall);
         batch.push(self.address(), bytes.as_ptr() as u64, bytes.len());
-        // SAFETY: the destination lies in this view, whose readers the
-        // caller orders; the pageable source is consumed during the call.
+        // SAFETY: the destination lies in this view; the caller keeps it
+        // allocated and unaccessed until the copy ran. The pageable source
+        // is consumed during the call.
         unsafe { stream.copy(&batch) }
     }
 
     /// Zero this contiguous view, in the order of what `stream` issues for
     /// device memory (a stream at once, or a job's recorder).
-    pub(crate) fn zero(&self, stream: impl Issue) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::upload`], over the whole view: until the fill ran, no
+    /// access that is not ordered after it reads or writes the view, and
+    /// the view's allocation keeps a reference.
+    pub(crate) unsafe fn zero(&self, stream: impl Issue) -> Result<()> {
         if !self.is_contiguous() {
             return Err(Error::Invariant(
                 "only a contiguous view is zeroed".to_owned(),
@@ -543,8 +561,8 @@ impl StorageView {
                 "fills use a stream exactly for device memory".to_owned(),
             ));
         }
-        // SAFETY: the bytes lie in this view, which its owner keeps until
-        // the fill ran.
+        // SAFETY: the bytes lie in this view, which the caller keeps
+        // allocated and unaccessed until the fill ran.
         unsafe {
             stream.fill(Fill {
                 address: self.address(),

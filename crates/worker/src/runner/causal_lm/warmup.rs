@@ -446,8 +446,16 @@ impl CausalLMRunners {
                 dimensions.dtype,
                 &[FEATURES as i64, dimensions.hidden as i64],
             )?;
+            // The zeroing job waits for its stream: a lane posts a job's
+            // completion once it issued the job's work, so without the wait
+            // the fill could still be pending when `block_on` returns.
             let zeroed = Job::new();
-            features.zero(zeroed.on(stream))?;
+            // SAFETY: a new allocation, which nothing else addresses yet;
+            // the `block_on` below waits for the zeroing job, whose wait for
+            // the stream follows the fill, so the fill ran before the warm
+            // forwards read `features` and before it is dropped.
+            unsafe { features.zero(zeroed.on(stream)) }?;
+            zeroed.on(stream).synchronize()?;
             lanes
                 .block_on(kind, zeroed, BLOCK_ON_TIMEOUT)?
                 .check()

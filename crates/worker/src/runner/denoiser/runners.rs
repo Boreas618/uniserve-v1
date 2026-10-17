@@ -158,7 +158,10 @@ impl DenoiserRunners {
         let stream = denoiser.stream().cloned();
 
         let before = Job::new();
-        samples.zero(before.on(stream.as_ref()))?;
+        // SAFETY: the latent cache keeps its workspace past this warmup,
+        // whose jobs are performed in order before it returns; nothing else
+        // uses the workspace before serving starts.
+        unsafe { samples.zero(before.on(stream.as_ref())) }?;
         let scratch =
             install_scratch(prefix_cache, &[length as usize], before.on(stream.as_ref()))?;
         perform(lanes, before)?;
@@ -224,9 +227,14 @@ impl DenoiserRunners {
         let stream = denoiser.stream().cloned();
         let before = Job::new();
         // Captured samples start from zeros, as fresh scratch pages do.
-        workspace
-            .narrow(0, 0, i64::from(padded) * shape.images as i64)?
-            .zero(before.on(stream.as_ref()))?;
+        // SAFETY: the latent cache keeps its workspace past the capture,
+        // whose jobs are performed in order before it returns; nothing else
+        // uses the workspace before serving starts.
+        unsafe {
+            workspace
+                .narrow(0, 0, i64::from(padded) * shape.images as i64)?
+                .zero(before.on(stream.as_ref()))
+        }?;
         let prefix = CAPTURE_PREFIX;
         let mut rows = Vec::with_capacity(shape.images * shape.branches);
         for image in 0..shape.images {

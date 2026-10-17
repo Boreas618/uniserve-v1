@@ -2,7 +2,7 @@
 
 use std::hash::Hash;
 
-use indexmap::IndexMap;
+use indexmap::{Equivalent, IndexMap};
 
 use super::CUDAGraph;
 use crate::ffi::Function;
@@ -11,6 +11,18 @@ use crate::{Error, Result};
 /// Routed-expert token capacity a graph was captured for; `None` for a
 /// runner without disaggregated experts.
 pub(crate) type Capacity = Option<usize>;
+
+/// A graph's key and capacity, borrowed: a lookup that clones no key. It
+/// hashes as the owned `(key, capacity)` pair does, since a tuple and a
+/// derived struct hash their fields in order.
+#[derive(Hash)]
+struct Slot<'a, K>(&'a K, Capacity);
+
+impl<K: Eq> Equivalent<(K, Capacity)> for Slot<'_, K> {
+    fn equivalent(&self, (key, capacity): &(K, Capacity)) -> bool {
+        self.0 == key && self.1 == *capacity
+    }
+}
 
 /// What a runner does with a graph key.
 pub(crate) enum Lookup<'a> {
@@ -34,7 +46,7 @@ pub(crate) struct GraphTable<K> {
     sealed: bool,
 }
 
-impl<K: Clone + Eq + Hash + std::fmt::Debug> GraphTable<K> {
+impl<K: Eq + Hash + std::fmt::Debug> GraphTable<K> {
     /// An empty table whose graphs `release` drops.
     pub(crate) fn new(owner: impl Into<String>, release: Function) -> Self {
         Self {
@@ -48,7 +60,7 @@ impl<K: Clone + Eq + Hash + std::fmt::Debug> GraphTable<K> {
     /// Resolve a configured graph shape. After [`Self::seal`] a missing graph
     /// is an error: startup captured every shape serving can select.
     pub(crate) fn lookup(&self, key: &K, capacity: Capacity) -> Result<Lookup<'_>> {
-        match self.graphs.get(&(key.clone(), capacity)) {
+        match self.graphs.get(&Slot(key, capacity)) {
             Some(graph) => Ok(Lookup::Replay(graph)),
             None if self.sealed => Err(Error::Invalid(format!(
                 "{}: configured graph bucket {key:?} (capacity {capacity:?}) is not resident",
@@ -63,7 +75,7 @@ impl<K: Clone + Eq + Hash + std::fmt::Debug> GraphTable<K> {
     pub(crate) fn insert(&mut self, key: K, capacity: Capacity, graph: CUDAGraph) -> Result<()> {
         let refusal = if self.sealed {
             Some("graphs are captured only before the runner is sealed".to_owned())
-        } else if self.graphs.contains_key(&(key.clone(), capacity)) {
+        } else if self.contains(&key, capacity) {
             Some(format!("graph bucket {key:?} was already captured"))
         } else {
             None
@@ -77,7 +89,7 @@ impl<K: Clone + Eq + Hash + std::fmt::Debug> GraphTable<K> {
     }
 
     pub(crate) fn contains(&self, key: &K, capacity: Capacity) -> bool {
-        self.graphs.contains_key(&(key.clone(), capacity))
+        self.graphs.contains_key(&Slot(key, capacity))
     }
 
     /// Keys in capture order.

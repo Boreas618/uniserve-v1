@@ -1,6 +1,7 @@
 //! Shared CUDA event leases and deferred storage release.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::Instant;
@@ -102,8 +103,21 @@ struct State {
 ///
 /// At shutdown nobody takes completions: [`drain`](Self::drain) and
 /// [`close`](Self::close) wait for the events on the host, with a deadline.
+///
+/// The lock guards bookkeeping only. A record, which calls the driver or
+/// appends to a job, is booked under the lock and made outside it. This is
+/// the design's failure handling (section 10), not a matter of speed: a
+/// driver call that does not return stops only the thread that made it,
+/// and a `cuEventRecord` that hung under this lock would also stop the
+/// control thread, which takes it for every fence and every completion it
+/// hands over.
 pub struct EventPool {
     state: Mutex<State>,
+    /// Records booked under the lock and not made yet. Incremented under
+    /// the lock while the pool is open, so [`close`](Self::close), which
+    /// stops the pool under the lock, waits for exactly the records booked
+    /// before it.
+    recording: AtomicUsize,
 }
 
 impl Default for EventPool {
@@ -119,6 +133,7 @@ impl Default for EventPool {
                 wake: None,
                 submitter: None,
             }),
+            recording: AtomicUsize::new(0),
         }
     }
 }
@@ -161,50 +176,27 @@ impl EventPool {
     ) -> Result<Arc<Event>> {
         let mut state = self.lock();
         require_open(&state)?;
-
-        let available = state
-            .available
-            .entry((device, timing, interprocess))
-            .or_default();
-        // A caller may retain an event object after releasing its lease.
-        // Reuse only when the pool is its last owner, preserving that observation.
-        let reusable = available
-            .iter()
-            .position(|event| Arc::strong_count(event) == 1);
-        let event = reusable
-            .map(|index| available.swap_remove(index))
-            .unwrap_or_else(|| {
-                Arc::new(Event::new(EventFlags {
-                    timing,
-                    interprocess,
-                    external: false,
-                }))
-            });
-        state.active.insert(
-            key(&event),
-            ActiveEvent {
-                event: Arc::clone(&event),
-                device,
-                references: 0,
-                recorded: false,
-                queued: None,
-            },
-        );
-        Ok(event)
+        Ok(book(&mut state, device, (timing, interprocess), 0, false))
     }
 
     /// Records this lease once on `stream`.
     pub(crate) fn record(&self, event: &Arc<Event>, stream: impl Issue) -> Result<()> {
-        let mut state = self.lock();
-        require_open(&state)?;
         let device = producer(&stream)?;
-        let active = require(&mut state, event, device)?;
-        if active.recorded {
-            return Err(invariant("device event was recorded more than once"));
+        {
+            let mut state = self.lock();
+            require_open(&state)?;
+            let active = require(&mut state, event, device)?;
+            if active.recorded {
+                return Err(invariant("device event was recorded more than once"));
+            }
+            active.recorded = true;
+            self.recording.fetch_add(1, Ordering::Relaxed);
         }
-        stream.record(event)?;
-        active.recorded = true;
-        Ok(())
+        self.make_record(event, stream, |state| {
+            if let Some(active) = state.active.get_mut(&key(event)) {
+                active.recorded = false;
+            }
+        })
     }
 
     pub(crate) fn retain(&self, event: &Arc<Event>, device: DeviceId, count: usize) -> Result<()> {
@@ -218,13 +210,42 @@ impl EventPool {
     }
 
     /// Acquire, record on `stream` and retain one reference: the fence of
-    /// work just submitted to `stream`.
+    /// work just submitted to `stream`, booked in one lock section and
+    /// recorded after it.
     pub(crate) fn fence(&self, stream: impl Issue, interprocess: bool) -> Result<Arc<Event>> {
         let device = producer(&stream)?;
-        let event = self.acquire(device, false, interprocess)?;
-        self.record(&event, stream)?;
-        self.retain(&event, device, 1)?;
+        let event = {
+            let mut state = self.lock();
+            require_open(&state)?;
+            let event = book(&mut state, device, (false, interprocess), 1, true);
+            self.recording.fetch_add(1, Ordering::Relaxed);
+            event
+        };
+        // Nobody else holds the lease yet. A failed record made nothing:
+        // the lease leaves the pool with its event, whose driver state is
+        // not reused.
+        self.make_record(&event, stream, |state| {
+            state.active.remove(&key(&event));
+        })?;
         Ok(event)
+    }
+
+    /// Make the record of `event` that was booked under the lock, outside
+    /// it, then end the booking. A failed record is first undone in the
+    /// books with `undo`.
+    fn make_record(
+        &self,
+        event: &Arc<Event>,
+        stream: impl Issue,
+        undo: impl FnOnce(&mut State),
+    ) -> Result<()> {
+        let recorded = stream.record(event);
+        if recorded.is_err() {
+            undo(&mut self.lock());
+        }
+        // Release: whoever observes the count drop also observes the record.
+        self.recording.fetch_sub(1, Ordering::Release);
+        recorded
     }
 
     /// Returns references after their last device access completed, which
@@ -442,19 +463,30 @@ impl EventPool {
     /// still release afterwards. A lease that did not complete in time
     /// fails the close and keeps the pool's storage.
     pub(crate) fn close(&self) -> Result<()> {
-        let events: Vec<_> = {
+        {
             let mut state = self.lock();
             if state.status == Status::Open {
                 state.status = Status::Closing;
             }
-            state
-                .active
-                .values()
-                .filter(|active| active.recorded)
-                .map(|active| Arc::clone(&active.event))
-                .collect()
-        };
+        }
         let deadline = Instant::now() + DRAIN_LIMIT;
+        // Records booked before the pool stopped are made outside its lock;
+        // the drain below waits on them once they are made.
+        while self.recording.load(Ordering::Acquire) > 0 {
+            if Instant::now() >= deadline {
+                return Err(Error::Resource(
+                    "device event records did not finish within the drain limit",
+                ));
+            }
+            std::thread::yield_now();
+        }
+        let events: Vec<_> = self
+            .lock()
+            .active
+            .values()
+            .filter(|active| active.recorded)
+            .map(|active| Arc::clone(&active.event))
+            .collect();
         for event in events {
             drain_event(&event, deadline)?;
         }
@@ -630,6 +662,47 @@ fn submit_waiting(state: &mut State, deferral: Deferral) -> Result<()> {
     }
     let _ = events;
     Ok(())
+}
+
+/// Book a lease of `device` with `flags` (timing, interprocess) holding
+/// `references`, `recorded` when its record is made right after the lock is
+/// released: a returned event, or a new one.
+fn book(
+    state: &mut State,
+    device: DeviceId,
+    (timing, interprocess): (bool, bool),
+    references: usize,
+    recorded: bool,
+) -> Arc<Event> {
+    let available = state
+        .available
+        .entry((device, timing, interprocess))
+        .or_default();
+    // A caller may retain an event object after releasing its lease.
+    // Reuse only when the pool is its last owner, preserving that observation.
+    let reusable = available
+        .iter()
+        .position(|event| Arc::strong_count(event) == 1);
+    let event = reusable
+        .map(|index| available.swap_remove(index))
+        .unwrap_or_else(|| {
+            Arc::new(Event::new(EventFlags {
+                timing,
+                interprocess,
+                external: false,
+            }))
+        });
+    state.active.insert(
+        key(&event),
+        ActiveEvent {
+            event: Arc::clone(&event),
+            device,
+            references,
+            recorded,
+            queued: None,
+        },
+    );
+    event
 }
 
 /// Run every owner and return the first failure.
