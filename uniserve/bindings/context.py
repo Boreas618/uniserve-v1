@@ -1105,9 +1105,6 @@ class ExecutionContext:
                 "head_dim": head_dim,
                 "dtype": dtype,
             }
-            # Registered symmetric windows belong to stream-bound
-            # communicators, which the parallel runtime supplies; independent
-            # buffers use the ordinary collective path.
             output = self._bind_output(parallel, **options)
             context = self._bind_context(parallel, **options, block_size=64)
             self._vsa_transport[key] = (output, context)
