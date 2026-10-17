@@ -47,6 +47,8 @@ class AttentionBinding:
     metadata. ``table`` is the prefix-cache table holding this layer's
     state, whose entry of each ``AttentionBatch`` the layer reads; ``None``
     means the layer has no cache table and reads a single-entry batch.
+    Operators are prepared per query dtype and compute in the dtype the
+    bound cache's pages require (``CachePages.compute_dtype``).
     ``derive_host_lengths`` states whether a plan that needs host sequence
     lengths or table start pages the batch lacks may read them from the
     device (see ``_sequences.host_lengths``); without it the batch must
@@ -76,6 +78,10 @@ class AttentionBinding:
         self.table = table
         self.derive_host_lengths = derive_host_lengths
         self.device, self.dtype, self.allocate = device, dtype, allocate
+        self.pages = (
+            None if cache is None else attention_backend.CachePages.of(cache)
+        )
+        # Operators by query dtype.
         self.operators = {}
         # Name of the provider each prepared dtype's operator belongs to.
         self.providers = {}
@@ -145,7 +151,9 @@ class AttentionBinding:
             "num_heads": self.module.local_heads,
             "num_kv_heads": self.module.local_kv_heads,
             "head_dim": self.module.head_dim,
-            "dtype": dtype,
+            "dtype": dtype
+            if self.pages is None
+            else self.pages.compute_dtype(dtype),
             "size": size,
             "cache": self.cache,
             "window": self.module.window,
@@ -162,10 +170,11 @@ class AttentionBinding:
         return operator
 
     def kernels(self):
-        """Describe the kernels serving this call site, one per dtype.
+        """Describe the kernels serving this call site, one per query dtype.
 
-        Each record carries the layer's local head counts, head dimension,
-        history window and cache storage, the prepared ``provider`` and the
+        Each record's ``dtype`` is the dtype its operator computes in. It
+        carries the layer's local head counts, head dimension, history
+        window and cache storage, the prepared ``provider`` and the
         provider serving each input class the call site has met
         (``inputs``; see ``Operator.selections``). A provider other than
         automatic selection serves every input itself. A call site that
@@ -200,7 +209,7 @@ class AttentionBinding:
         return [
             {
                 **layer,
-                "dtype": str(dtype).removeprefix("torch."),
+                "dtype": str(operator.dtype).removeprefix("torch."),
                 "cache": cache,
                 "provider": self.providers[dtype],
                 "inputs": dict(operator.selections()),
@@ -343,14 +352,25 @@ class AttentionBinding:
             self._bound.add(q.dtype)
             self._bound_batches[q.dtype] = batch
 
+        # An operator over pages of the other half precision computes in
+        # theirs: it takes the queries and current K/V converted, and its
+        # output is converted back to the query dtype.
+        query_dtype = q.dtype
+        converted = operator.dtype != query_dtype
+        if converted:
+            q, k, v = (tensor.to(operator.dtype) for tensor in (q, k, v))
         result = operator(
             q,
             k,
             v,
             batch,
             scale=scale,
-            out=out if plan is None else torch.empty_like(q),
+            out=out if plan is None and not converted else torch.empty_like(q),
         )
+        if converted:
+            result = (
+                out.copy_(result) if plan is None else result.to(query_dtype)
+            )
         return (
             result
             if plan is None

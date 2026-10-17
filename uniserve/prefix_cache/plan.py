@@ -299,7 +299,8 @@ def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
 
     ``plan`` is a ``cache_plan`` result. Each resident cache layer is read
     by the attention layer naming it; the backend must serve that reader's
-    head shape, window and compute dtype on its group's pages.
+    head shape and window on its group's pages, in the dtype the reader
+    computes in over them (``CachePages.compute_dtype``).
 
     Raises:
         ValueError: A resident cache layer has no attention reader.
@@ -331,7 +332,7 @@ def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
                 num_kv_heads=reader.local_kv_heads,
                 head_dim=reader.head_dim,
                 window=reader.window,
-                dtype=layouts[name].compute_dtype,
+                dtype=pages.compute_dtype(layouts[name].compute_dtype),
                 pages=pages,
             ):
                 return False

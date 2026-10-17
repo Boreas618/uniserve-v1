@@ -478,7 +478,7 @@ impl ImageOwners {
             device,
             startup.queue_depth.max(1) * 2,
             max_calls + max_pixel_words,
-        );
+        )?;
         let host = HostLane::new(
             startup.host_capacity.max(HOST_WORKERS),
             HOST_WORKERS,

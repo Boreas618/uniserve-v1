@@ -42,6 +42,21 @@ class CachePages:
             state.block_size, key.dtype, isinstance(key, QuantizedTensor)
         )
 
+    def compute_dtype(self, dtype: torch_lib.dtype) -> torch_lib.dtype:
+        """Return the dtype attention over these pages computes in.
+
+        ``dtype`` is the layer's query dtype. Attention kernels read pages
+        that store their query dtype, so a layer whose dense pages store the
+        other half precision attends in the pages' dtype: its queries and
+        current keys and values are converted to it before the kernel and
+        its output back to ``dtype`` after it. Encoded FP8 pages and other
+        dtypes keep ``dtype``.
+        """
+        half = {torch_lib.float16, torch_lib.bfloat16}
+        if self.quantized or dtype not in half or self.dtype not in half:
+            return dtype
+        return self.dtype
+
 
 class Operator:
     """One layer invocation's backend state and borrowed numerical resources.
