@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use uniserve_cuda::nccl::{Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
+use uniserve_cuda::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
     Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, Pitched,
@@ -695,7 +695,7 @@ fn single_rank_communicators_run_collectives() {
     let data = DeviceAllocation::linear(DEVICE, 16).unwrap();
     let host = PinnedBuffer::new(DEVICE, 16).unwrap();
     let id = UniqueId::new().unwrap();
-    let mut communicator = Communicator::init(DEVICE, 1, 0, &id, CtaPolicy::Default).unwrap();
+    let mut communicator = Communicator::init(DEVICE, 1, 0, &id).unwrap();
     assert_eq!((communicator.rank(), communicator.size()), (0, 1));
 
     // SAFETY: the buffers outlive the synchronization below.

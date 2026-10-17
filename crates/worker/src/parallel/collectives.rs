@@ -1,11 +1,11 @@
-//! Stream-ordered NCCL collectives and registered window lifetime.
+//! Stream-ordered NCCL collectives.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError};
 
 use tvm_ffi::{Any, AnyView};
 
-use uniserve_cuda::nccl::{self, Communicator, CtaPolicy, DataType, ReduceOp, UniqueId};
+use uniserve_cuda::nccl::{self, Communicator, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
 
 use crate::config::Device;
@@ -38,21 +38,12 @@ struct Resources {
 impl StreamCommunicator {
     /// Every group member calls this once, with the same distributed unique ID.
     ///
-    /// Communicators of full-device streams use NCCL's copy-engine algorithms
-    /// for registered windows; SM-partitioned streams use its CTA algorithms.
-    ///
     /// The communicator shares `owner`'s stream and keeps submitting to it
     /// until [`Self::close`].
     pub(crate) fn new(owner: &CUDAStream, size: i32, rank: i32, id: &UniqueId) -> Result<Self> {
         let device = owner.device();
         let computation = owner.stream()?.clone();
-
-        let policy = if owner.full_device() {
-            CtaPolicy::Zero
-        } else {
-            CtaPolicy::Default
-        };
-        let communicator = Communicator::init(device, size, rank, id, policy)?;
+        let communicator = Communicator::init(device, size, rank, id)?;
 
         let transfer = match owner.fork() {
             Ok(stream) => stream,

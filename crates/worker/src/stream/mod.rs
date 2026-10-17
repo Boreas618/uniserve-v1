@@ -45,7 +45,6 @@ pub(crate) unsafe fn external(device: DeviceId, handle: usize) -> Result<Stream>
 pub struct CUDAStream {
     device: DeviceId,
     stream: Option<Stream>,
-    partitioned: bool,
     /// The fence [`Self::wait`] orders this stream after a producer with.
     /// One event serves every wait: a wait captures the record made just
     /// before it, and exclusive access keeps two waits from interleaving.
@@ -53,41 +52,34 @@ pub struct CUDAStream {
 }
 
 impl CUDAStream {
-    fn new(device: DeviceId, stream: Stream) -> Result<Self> {
-        let partitioned = stream.is_partitioned()?;
-
-        Ok(Self {
+    fn new(device: DeviceId, stream: Stream) -> Self {
+        Self {
             device,
             stream: Some(stream),
-            partitioned,
             ingress: Event::new(EventFlags::default()),
-        })
+        }
     }
 
     /// Own a new non-blocking stream on `device`'s full device, in its
     /// primary context.
     pub fn create(device: DeviceId) -> Result<Self> {
-        Self::new(device, Stream::new(device)?)
+        Ok(Self::new(device, Stream::new(device)?))
     }
 
     /// Allocate the configured SM partitions from one disjoint split tree.
     pub(crate) fn partition(device: DeviceId, counts: &[u32]) -> Result<Vec<Self>> {
-        Stream::partition(device, counts)?
+        Ok(Stream::partition(device, counts)?
             .into_iter()
             .map(|stream| Self::new(device, stream))
-            .collect()
+            .collect())
     }
 
     pub(crate) fn fork(&self) -> Result<Self> {
-        Self::new(self.device, self.stream()?.fork()?)
+        Ok(Self::new(self.device, self.stream()?.fork()?))
     }
 
     pub(crate) fn device(&self) -> DeviceId {
         self.device
-    }
-
-    pub(crate) fn full_device(&self) -> bool {
-        !self.partitioned
     }
 
     pub fn handle(&self) -> Result<usize> {
