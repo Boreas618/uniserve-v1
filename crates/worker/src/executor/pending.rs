@@ -140,9 +140,11 @@ impl PendingOutput {
         Ok(())
     }
 
-    /// Move ownership into the batch result while execution resources close.
-    pub(crate) fn take_media(&mut self) -> Option<MediaSource> {
-        self.media.take()
+    /// The call's wire output, the products it exports and its generated
+    /// media, moved into its batch's result while execution resources
+    /// close: the media's receiver then holds its unlink responsibility.
+    pub(crate) fn into_parts(self) -> (RequestOutput, Vec<TensorExport>, Option<MediaSource>) {
+        (self.output, self.products, self.media)
     }
 
     pub(crate) fn discard_media(&mut self) {
@@ -676,11 +678,10 @@ mod tests {
         assert!(!readable(&second.name, second.bytes));
 
         // Delivery hands the accepted result's bytes to their reader.
-        output
-            .take_media()
+        let (_, _, media) = output.into_parts();
+        media
             .ok_or(Error::State("the accepted media result was lost"))?
             .into_locator();
-        drop(output);
         // SAFETY: the delivered bytes are immutable.
         let media = unsafe { SharedMedia::open(&first.name, first.bytes) }
             .map_err(|error| Error::Invalid(error.to_string()))?;
@@ -696,17 +697,17 @@ mod tests {
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             let locator = source.locator();
             output.set_media(source)?;
+            let (completion, products, media) = output.into_parts();
             let mut result = BatchResult {
                 output: BatchOutput {
                     batch_id: 1,
-                    completions: vec![output.output.clone()],
-                    products: Vec::new(),
+                    completions: vec![completion],
+                    products,
                     worker_exec_us: None,
                     forward_stats: None,
                 },
-                media: output.take_media().into_iter().collect(),
+                media: media.into_iter().collect(),
             };
-            drop(output);
 
             if delivered {
                 for source in result.media.drain(..) {

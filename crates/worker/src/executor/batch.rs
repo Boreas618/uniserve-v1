@@ -696,9 +696,8 @@ pub(crate) fn materialize(
         launched.host = None;
     }
     lock(&launched.buffer).readback()?;
-    let mut completions = Vec::with_capacity(launched.outputs.len());
-    let mut products = Vec::new();
-    let mut media = Vec::new();
+    // Every call resolves against its request's accepted progress before
+    // any call of the batch is accepted.
     for output in &mut launched.outputs {
         let key = output.output.request_key;
         let parent = requests
@@ -719,16 +718,7 @@ pub(crate) fn materialize(
             output.output.error_code = Some(ErrorCode::ComputeError);
             output.progress = parent;
             buffer.discard(output.row);
-            completions.push(output.output.clone());
-            continue;
         }
-        let completion = output.result()?;
-        // Only a successful call publishes its products.
-        if completion.status == CallStatus::Ok {
-            products.extend_from_slice(output.products());
-        }
-        completions.push(completion.clone());
-        media.extend(output.take_media());
     }
     for output in &launched.outputs {
         if output.resolved() {
@@ -736,6 +726,25 @@ pub(crate) fn materialize(
         } else {
             output.cancel(requests)?;
         }
+    }
+
+    // The calls' results move into the batch's output: the launched batch
+    // ends here. A call whose materialization failed reports its error
+    // status alone, and only a successful call publishes its products.
+    let outputs = std::mem::take(&mut launched.outputs);
+    let mut completions = Vec::with_capacity(outputs.len());
+    let mut products = Vec::new();
+    let mut media = Vec::new();
+    for output in outputs {
+        let resolved = output.resolved();
+        let (completion, exports, source) = output.into_parts();
+        if resolved {
+            if completion.status == CallStatus::Ok {
+                products.extend(exports);
+            }
+            media.extend(source);
+        }
+        completions.push(completion);
     }
     let mut stats = std::mem::take(&mut launched.stats);
     let elapsed = launched.started.elapsed().as_micros() as u64;
@@ -956,13 +965,16 @@ pub(crate) fn decodes_video(capabilities: impl IntoIterator<Item = Capability>) 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
+    use uniserve_core::{RequestId, SamplingParams};
     use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
+    use uniserve_ipc::{ArRequestParams, BufferAllocation, NewRequest, RequestKey, ShapeBound};
 
-    use super::StreamOrder;
-    use crate::{Error, Result};
+    use super::*;
+    use crate::storage::BufferPool;
 
     /// Blocks `stream` in a host function until the returned sender is
     /// used, so the work queued behind it on any stream that waits for it
@@ -1013,5 +1025,184 @@ mod tests {
         assert!(ordered.query()?);
         first.synchronize()?;
         Ok(())
+    }
+
+    const HOST: MemoryKind = MemoryKind::Host;
+
+    fn key(request: u64) -> RequestKey {
+        RequestKey::new(1, RequestId(request), 1)
+    }
+
+    /// A text request in the slot of its id (slots count from one).
+    fn admission(request: u64) -> NewRequest {
+        NewRequest {
+            request_key: key(request),
+            request_pool_idx: request as u32,
+            ar: Some(ArRequestParams {
+                sampling: SamplingParams::default(),
+                negative_token_ids: Vec::new(),
+                finish_token_ids: Vec::new(),
+                initial_position: 0,
+                canvas: None,
+            }),
+            image: None,
+            diffusion: None,
+            video: None,
+            prompt_token_ids: Vec::new(),
+            input_images: 0,
+        }
+    }
+
+    /// The host-gated predicate the request's previous call produced.
+    fn predicate(request: u64) -> TensorRef {
+        TensorRef {
+            request_key: key(request),
+            producer_call_id: CallId::new(1, request as u32),
+            output_index: 0,
+            generation: 1,
+            dtype: DType::U8,
+            shape_bound: ShapeBound::default(),
+        }
+    }
+
+    /// A prefill call of the request in batch 2, gated by `predicate`.
+    fn call(request: u64, predicate: Option<TensorRef>) -> Call {
+        Call {
+            request_key: key(request),
+            call_id: CallId::new(2, request as u32),
+            coordinates: Default::default(),
+            component: "text".into(),
+            code: CallKind::Forward(ForwardMode::Prefill),
+            bounds: Default::default(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            consumer_slots: Vec::new(),
+            token_input: None,
+            token_output: None,
+            vision_inputs: Vec::new(),
+            latent_feature_input: None,
+            encoder_output: None,
+            latent_input: None,
+            latent_output: None,
+            image_input: None,
+            image_output: None,
+            completion_output: None,
+            transition_output: None,
+            predicate,
+            rng: None,
+            sampling_state: None,
+            input_token_ids: Vec::new(),
+            readout: None,
+            canvas: None,
+            input_image: None,
+            cache_input: None,
+            cache_output: None,
+        }
+    }
+
+    /// Commit `value` as the one byte of `product` in host storage.
+    fn publish(store: &ProductStore, product: &TensorRef, offset: u64, value: u8) -> Result<()> {
+        let allocations = HashMap::from([(
+            product.buffer_id(),
+            BufferAllocation {
+                buffer: product.buffer_id(),
+                offset,
+                bytes: 1,
+            },
+        )]);
+        let mut bound = store.bind_outputs(
+            &[(product.clone(), HOST)],
+            OutputPlacement {
+                allocations: Some(&allocations),
+                ..OutputPlacement::default()
+            },
+        )?;
+        let buffer = bound.remove(0);
+        // SAFETY: the product's own host byte, without readers.
+        unsafe { *(buffer.view().address() as *mut u8) = value };
+        store.produced(&buffer, &[], None, None)?;
+        store.commit_writes(std::slice::from_ref(&buffer))
+    }
+
+    /// Open a batch of one call per request, each gated by a predicate
+    /// holding the request's byte of `values` (`None`: no predicate), and
+    /// apply the opening job's completion.
+    fn open(values: &[Option<u8>]) -> Result<Opening> {
+        let mut requests = RequestPool::new(values.len())?;
+        let store = ProductStore::new(
+            8,
+            1024,
+            1024,
+            vec![HOST],
+            values.len() + 1,
+            1,
+            BufferPool::allocate(1024, false, &[HOST])?,
+            EventPool::new(),
+        )?;
+        let mut calls = Vec::new();
+        for (request, value) in (1..).zip(values) {
+            requests.start(admission(request))?;
+            let gate = match value {
+                Some(value) => {
+                    let product = predicate(request);
+                    publish(&store, &product, request * 64, *value)?;
+                    Some(product)
+                }
+                None => None,
+            };
+            calls.push(call(request, gate));
+        }
+        let plan = BatchPlan::new(2, Vec::new(), calls);
+
+        let job = Job::new();
+        let mut opening = Opening::open(
+            &mut requests,
+            &store,
+            &WorkerInfo::default(),
+            0,
+            &plan,
+            None,
+            job.on(None),
+            |_| true,
+        )?;
+        assert_eq!(
+            opening.reads_predicates(),
+            values.iter().any(Option::is_some)
+        );
+        let mut completion = job.perform().check().map_err(|failure| failure.error)?;
+        opening.predicates(&mut completion)?;
+        Ok(opening)
+    }
+
+    #[test]
+    fn a_batch_skips_exactly_the_calls_whose_predicate_is_false() -> Result<()> {
+        let opening = open(&[Some(1), Some(0), None, Some(0), Some(1)])?;
+        let active: Vec<bool> = opening.calls().iter().map(|state| state.active).collect();
+        assert_eq!(active, [true, false, true, false, true]);
+        let statuses: Vec<CallStatus> = opening
+            .calls()
+            .iter()
+            .map(|state| state.output.output.status)
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                CallStatus::Ok,
+                CallStatus::Predicated,
+                CallStatus::Ok,
+                CallStatus::Predicated,
+                CallStatus::Ok
+            ]
+        );
+
+        // A batch without host-gated predicates has nothing to read.
+        let opening = open(&[None, None])?;
+        assert!(opening.calls().iter().all(|state| state.active));
+        Ok(())
+    }
+
+    #[test]
+    fn a_predicate_that_is_no_canonical_boolean_fails_the_batch() {
+        assert!(matches!(open(&[Some(1), Some(2)]), Err(Error::Invalid(_))));
     }
 }
