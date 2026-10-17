@@ -360,6 +360,18 @@ impl JobQueues {
     /// the rank serves, the control thread starts a job and takes its
     /// completion ([`Self::start`], [`Self::take`]). Completions of other
     /// jobs that arrive meanwhile are kept for [`Self::take`].
+    ///
+    /// A completion, here as anywhere, says that the lane performed the
+    /// job: it issued the job's stream work in order, ran its calls and
+    /// made its reads and waits. It does not say that the device finished
+    /// the work issued. Memory the job's device work addresses may be read
+    /// on the host, written again outside the stream's order or released
+    /// after the completion only behind something that waited for the
+    /// device: a read of the job (which waits for its stream), a wait for
+    /// the stream the job recorded after that work
+    /// ([`crate::stream::Issue::synchronize`] on its recorder), the events
+    /// the job completes after ([`Job::after`]), or the fences that retire
+    /// the storage ([`crate::EventPool`]).
     pub(crate) fn block_on(
         &self,
         kind: CallKind,
@@ -372,7 +384,8 @@ impl JobQueues {
 
     /// Wait until every lane performed the jobs submitted to it so far, at
     /// most `timeout`: before the owners those jobs address are closed.
-    /// Like [`Self::block_on`], for a rank that is not serving.
+    /// Like [`Self::block_on`], for a rank that is not serving; performed is
+    /// not finished, so the caller then synchronizes the streams.
     pub(crate) fn drain(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut last = Vec::new();

@@ -468,6 +468,14 @@ impl CausalLMRunners {
                 }]
             };
             let (text, mixed, alone) = (text.clone(), mixed.clone(), alone.clone());
+            // The warm forwards read `features` on `stream` after their jobs
+            // posted their completions. `features` is dropped only after
+            // `warmup_bucket` returned, whose last job synchronizes `stream`
+            // behind them (`release_scratch`, through `ScratchUnits::finish`):
+            // `cuStreamSynchronize` returns once the device completed every
+            // task issued to the stream, so no read is pending when the drop
+            // queues the allocation's `cuMemFree`, whose own implicit
+            // synchronization the driver does not promise.
             self.warmup_bucket(
                 lanes,
                 kind,
