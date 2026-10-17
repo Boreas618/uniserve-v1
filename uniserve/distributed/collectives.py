@@ -176,8 +176,9 @@ def all_gather_into_tensor(
     """Gather equal contributions into ``output`` in backend rank order."""
     with _launch_range("all_gather", group_name):
         group = process_group(group_name)
-        # In-place AllGather registers one stable allocation for both source
-        # and destination. Symmetric workspaces can then use NCCL copy engines.
+        # The gather runs in place: this rank's block of ``output`` receives
+        # its contribution first. ``output`` is never a registered NCCL
+        # window, so NCCL gathers with its kernel algorithms.
         local = output.view(-1).narrow(
             0, group.rank() * input.numel(), input.numel()
         )

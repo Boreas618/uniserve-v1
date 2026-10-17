@@ -93,9 +93,10 @@ def produce_exchange(
     """Exchange equal peer payloads and return their deferred completion.
 
     Physical buffers have a leading member axis. Producer and consumer
-    views use logical member order. Contiguous registered buffers permit
-    NCCL's zero-CTA AlltoAll; tensor layout and numerical work belong to
-    the caller. Both buffers must remain live until completion is consumed.
+    views use logical member order. Contiguous buffers let one NCCL
+    AlltoAll carry every peer payload; tensor layout and numerical work
+    belong to the caller. Both buffers must remain live until completion
+    is consumed.
     """
     if (
         source.ndim < 2
