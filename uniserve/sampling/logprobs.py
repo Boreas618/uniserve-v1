@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .upload import upload
+
 
 @dataclass(frozen=True, slots=True)
 class LogprobRequest:
@@ -115,11 +117,13 @@ def logprob_details(
         # Rows with fewer requested ids keep zero-padding columns; the host
         # layout records how many leading columns are real.
         padded = [
-            list(request.token_ids)
-            + [0] * (max_requested - len(request.token_ids))
+            token
             for request in requests
+            for token in request.token_ids
+            + (0,) * (max_requested - len(request.token_ids))
         ]
-        candidates = torch.tensor(padded, dtype=torch.long, device=device)
+        (candidates,) = upload(device, padded)
+        candidates = candidates.view(count, max_requested)
         candidate_values = scores.gather(1, candidates)
         candidate_ranks = torch.stack(
             tuple(

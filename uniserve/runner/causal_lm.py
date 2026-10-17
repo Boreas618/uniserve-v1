@@ -81,6 +81,7 @@ from uniserve.sampling.select import (
 )
 from uniserve.sampling.state import commit as commit_state
 from uniserve.sampling.top_k import sample_top_k
+from uniserve.sampling.upload import upload
 
 __all__ = ["CausalLMRunner"]
 
@@ -745,14 +746,13 @@ class CausalLMRunner:
         if contiguous:
             return self._gathered(logits[first : first + total])
         # Tasks of one sampler may own rows anywhere in the forward.
-        selected = torch.tensor(
+        (selected,) = upload(
+            logits.device,
             [
                 int(row) + index
                 for row, count in zip(rows, counts, strict=True)
                 for index in range(int(count))
             ],
-            dtype=torch.long,
-            device=logits.device,
         )
         return self._gathered(logits.index_select(0, selected))
 
@@ -944,16 +944,9 @@ class CausalLMRunner:
         # commit.
         counts = None
         if len(penalty_rows):
-            counts = self._penalty_counts.index_select(
-                0,
-                torch.tensor(
-                    list(penalty_slots), dtype=torch.long, device=self._device
-                ),
-            )
+            slots, tokens = upload(self._device, penalty_slots, penalty_drafts)
+            counts = self._penalty_counts.index_select(0, slots)
             if len(penalty_drafts):
-                tokens = torch.tensor(
-                    list(penalty_drafts), dtype=torch.long, device=self._device
-                )
                 counts.reshape(-1).index_put_(
                     (tokens,),
                     torch.ones_like(tokens, dtype=counts.dtype),
