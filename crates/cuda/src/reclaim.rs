@@ -1,10 +1,10 @@
 //! Deferred release of device and pinned host memory.
 //!
-//! Dropping a [`crate::DeviceAllocation`], [`crate::PeerMapping`],
-//! [`crate::PinnedBuffer`] or [`crate::nccl::Buffer`] makes no CUDA call on
-//! the dropping thread. The release (`cuMemFree`, `cuMemUnmap` +
-//! `cuMemAddressFree` + `cuMemRelease`, `cuMemFreeHost`, `ncclMemFree`) is
-//! queued to one process-wide reclaimer thread instead, because:
+//! Dropping a [`crate::DeviceAllocation`], [`crate::PeerMapping`] or
+//! [`crate::PinnedBuffer`] makes no CUDA call on the dropping thread. The
+//! release (`cuMemFree`, `cuMemUnmap` + `cuMemAddressFree` + `cuMemRelease`,
+//! `cuMemFreeHost`) is queued to one process-wide reclaimer thread instead,
+//! because:
 //!
 //! - the last reference may drop inside a DLPack deleter while the Python GIL
 //!   is held, and `cuMemFree`/`cuMemFreeHost` may synchronize the device,

@@ -1,16 +1,16 @@
-//! Device storage of the latent pool: page banks, step workspace, page
-//! table and per-slot timesteps.
+//! Device storage of the latent pool: page banks, step workspace and
+//! per-slot timesteps.
 //!
 //! [`LatentPool`](super::LatentPool) decides page ownership and trajectory
 //! visibility; this owner holds the memory the numerical denoising steps
-//! bind once and the native writes the pool's decisions need (page-table
-//! uploads, timestep fills). Page 0 is padding and request slots are 1-based.
+//! bind once and the native writes the pool's decisions need (timestep
+//! fills). Page 0 is padding and request slots are 1-based.
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d8};
+use uniserve_cuda::{DeviceId, Stream, memset_d8};
 
-use crate::ffi::{Backing, DType, Device};
+use crate::ffi::{Backing, DType, MemoryKind};
 use crate::storage::memory::{Memory, StorageView};
 use crate::stream::{Fill, Issue};
 use crate::transfer::Spans;
@@ -27,13 +27,11 @@ pub struct LatentStorage {
     pages: StorageView,
     /// `[capacity_units, width]` contiguous step values, when declared.
     step: Option<StorageView>,
-    /// `i64 [num_pages - 1]`: the pages of the batch's bound step values.
-    page_table: StorageView,
     /// `f32 [request_pool_size + 1, 1]`.
     timesteps: StorageView,
 }
 
-fn allocate(device: Option<i32>, bytes: usize) -> Result<Arc<dyn Backing>> {
+fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Backing>> {
     Ok(match device {
         Some(device) => Memory::device(device, bytes.max(1))?,
         None => Memory::host(bytes.max(1)),
@@ -45,7 +43,7 @@ fn allocate(device: Option<i32>, bytes: usize) -> Result<Arc<dyn Backing>> {
 /// CUDA VMM export names the pages where they lie, whatever the pool's size.
 /// Every local peer device may address them, because readers on those
 /// devices in this process copy from the pages directly.
-fn allocate_banks(device: Option<i32>, bytes: usize) -> Result<Arc<dyn Backing>> {
+fn allocate_banks(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Backing>> {
     Ok(match device {
         Some(device) => Memory::exportable(device, bytes.max(1), &Memory::peers(device)?)?,
         None => Memory::host(bytes.max(1)),
@@ -53,27 +51,6 @@ fn allocate_banks(device: Option<i32>, bytes: usize) -> Result<Arc<dyn Backing>>
 }
 
 impl LatentStorage {
-    /// Device bytes of a pool's storage.
-    pub fn bytes(
-        request_pool_size: u32,
-        num_pages: u32,
-        page_units: u32,
-        width: u32,
-        dtype: DType,
-        with_step: bool,
-    ) -> u64 {
-        let element = dtype.bytes() as u64;
-        let units = u64::from(num_pages) * u64::from(page_units) * u64::from(width);
-        let step = if with_step {
-            u64::from(num_pages.saturating_sub(1)) * u64::from(page_units) * u64::from(width)
-        } else {
-            0
-        };
-        (2 * units + step) * element
-            + u64::from(num_pages.saturating_sub(1)) * 8
-            + (u64::from(request_pool_size) + 1) * 4
-    }
-
     /// Allocate a pool's storage with zeroed banks (reset on `stream`, which
     /// is synchronized before returning).
     #[expect(clippy::too_many_arguments, reason = "the pool's complete geometry")]
@@ -84,7 +61,7 @@ impl LatentStorage {
         width: u32,
         dtype: DType,
         with_step: bool,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
         if num_pages < 2 || page_units == 0 || width == 0 || request_pool_size == 0 {
@@ -122,12 +99,6 @@ impl LatentStorage {
                 StorageView::contiguous(memory, 0, dtype, &[capacity_units, width_i])
             })
             .transpose()?;
-        let page_table = StorageView::contiguous(
-            allocate(device, (pages_count - 1) as usize * 8)?,
-            0,
-            DType::I64,
-            &[pages_count - 1],
-        )?;
         let timesteps = StorageView::contiguous(
             allocate(device, (request_pool_size as usize + 1) * 4)?,
             0,
@@ -152,39 +123,17 @@ impl LatentStorage {
             request_pool_size,
             pages,
             step,
-            page_table,
             timesteps,
         })
     }
 
-    pub fn num_pages(&self) -> u32 {
-        self.num_pages
-    }
-
     /// The element type of latent values.
-    pub fn dtype(&self) -> DType {
+    pub(crate) fn dtype(&self) -> DType {
         self.pages.dtype()
     }
 
-    pub fn page_units(&self) -> u32 {
-        self.page_units
-    }
-
-    /// The bound storage keyed as numerical bindings receive it.
-    pub fn views(&self) -> Vec<(String, StorageView)> {
-        let mut views = vec![
-            ("pages".to_owned(), self.pages.clone()),
-            ("page_table".to_owned(), self.page_table.clone()),
-            ("timesteps".to_owned(), self.timesteps.clone()),
-        ];
-        if let Some(step) = &self.step {
-            views.push(("step".to_owned(), step.clone()));
-        }
-        views
-    }
-
     /// One page of `bank` as `[page_units, width]` units.
-    pub fn page(&self, bank: u8, page: u32) -> Result<StorageView> {
+    pub(crate) fn page(&self, bank: u8, page: u32) -> Result<StorageView> {
         if bank > 1 || page == 0 || page >= self.num_pages {
             return Err(Error::Invalid("latent page is outside the pool".into()));
         }
@@ -194,34 +143,23 @@ impl LatentStorage {
     }
 
     /// Values per latent unit.
-    pub fn width(&self) -> u32 {
+    pub(crate) fn width(&self) -> u32 {
         self.width
     }
 
     /// The per-slot timesteps `[request_pool_size + 1, 1]` float32.
-    pub fn timesteps(&self) -> &StorageView {
+    pub(crate) fn timesteps(&self) -> &StorageView {
         &self.timesteps
     }
 
     /// The contiguous step workspace `[capacity_units, width]`, when
     /// declared.
-    pub fn step(&self) -> Option<&StorageView> {
+    pub(crate) fn step(&self) -> Option<&StorageView> {
         self.step.as_ref()
     }
 
-    /// Both banks' pages flattened to rows: `[2 * num_pages, page_units * width]`.
-    pub fn page_rows(&self) -> Result<StorageView> {
-        self.pages.reshape(
-            self.pages.dtype(),
-            &[
-                2 * i64::from(self.num_pages),
-                i64::from(self.page_units) * i64::from(self.width),
-            ],
-        )
-    }
-
     /// A bank's consecutive pages as `[pages * page_units, width]` units.
-    pub fn bank_view(&self, bank: u8, first: u32, count: u32) -> Result<StorageView> {
+    pub(crate) fn bank_view(&self, bank: u8, first: u32, count: u32) -> Result<StorageView> {
         if bank > 1 || first == 0 || count == 0 || first + count > self.num_pages {
             return Err(Error::Invalid(
                 "latent bank view requires consecutive pool pages".into(),
@@ -265,45 +203,14 @@ impl LatentStorage {
         Spans::new(views)
     }
 
-    /// The step-workspace range of `count` pages starting at page-table
-    /// offset `offset`, as `[count * page_units, width]`.
-    pub fn step_view(&self, offset: u32, count: u32) -> Result<StorageView> {
-        let step = self
-            .step
-            .as_ref()
-            .ok_or_else(|| Error::Invalid("latent storage has no step workspace".into()))?;
-        let units = i64::from(self.page_units);
-        step.narrow(0, i64::from(offset) * units, i64::from(count) * units)
-    }
-
-    /// Write `pages` into the page table at `offset`, in the order of what
-    /// `issue` issues. The ids are read during the call, so the host never
-    /// waits on the device.
-    pub fn upload_pages(&self, offset: u32, pages: &[u32], issue: impl Issue) -> Result<()> {
-        if u64::from(offset) + pages.len() as u64 > u64::from(self.num_pages - 1)
-            || pages
-                .iter()
-                .any(|&page| page == 0 || page >= self.num_pages)
-        {
-            return Err(Error::Invalid(
-                "latent page table update exceeds its pool".into(),
-            ));
-        }
-        let ids: Vec<i64> = pages.iter().map(|&page| i64::from(page)).collect();
-        let destination = self.page_table.address() + u64::from(offset) * 8;
-        require_issuer(self.page_table.device(), issue)?;
-
-        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-        batch.push(destination, ids.as_ptr() as u64, ids.len() * 8);
-        // SAFETY: the destination lies in the page table, which this value
-        // owns and whose readers the caller orders; the pageable source is
-        // consumed during the call.
-        unsafe { issue.copy(&batch) }
-    }
-
     /// Set slot `slot`'s timestep to `value`, in the order of what `issue`
     /// issues.
-    pub fn fill_timestep(&self, slot: u32, value: f32, issue: impl Issue) -> Result<StorageView> {
+    pub(crate) fn fill_timestep(
+        &self,
+        slot: u32,
+        value: f32,
+        issue: impl Issue,
+    ) -> Result<StorageView> {
         if slot == 0 || slot > self.request_pool_size {
             return Err(Error::Invalid("latent slot is outside the pool".into()));
         }
@@ -326,8 +233,8 @@ impl LatentStorage {
 
 /// Latent storage on a device is written on a stream of that device, host
 /// storage without one.
-fn require_issuer(device: Device, issue: impl Issue) -> Result<()> {
-    if matches!(device, Device::Cuda(_)) == issue.stream().is_some() {
+fn require_issuer(device: MemoryKind, issue: impl Issue) -> Result<()> {
+    if matches!(device, MemoryKind::Cuda(_)) == issue.stream().is_some() {
         Ok(())
     } else {
         Err(Error::Invalid(
@@ -341,12 +248,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_pages_spans_and_tables_follow_the_pool_layout() -> Result<()> {
+    fn host_pages_spans_and_timesteps_follow_the_pool_layout() -> Result<()> {
         let storage = LatentStorage::allocate(2, 4, 2, 3, DType::F32, true, None, None)?;
-        assert_eq!(
-            LatentStorage::bytes(2, 4, 2, 3, DType::F32, true),
-            (2 * 4 * 2 * 3 + 3 * 2 * 3) * 4 + 3 * 8 + 3 * 4
-        );
 
         let spans = storage.spans(1, &[3, 1], 3)?;
         assert_eq!(spans.shape(), vec![3, 3]);
@@ -354,13 +257,6 @@ mod tests {
         assert!(storage.spans(0, &[0], 1).is_err());
         assert_eq!(storage.bank_view(0, 1, 2)?.shape(), &[4, 3]);
         assert!(storage.bank_view(0, 3, 2).is_err());
-
-        storage.upload_pages(1, &[2, 3], None)?;
-        // SAFETY: host table of the test.
-        let table =
-            unsafe { std::slice::from_raw_parts(storage.page_table.address() as *const i64, 3) };
-        assert_eq!(&table[1..], &[2, 3]);
-        assert!(storage.upload_pages(2, &[1, 2], None).is_err());
 
         let row = storage.fill_timestep(2, 0.5, None)?;
         // SAFETY: host column of the test.

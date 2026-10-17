@@ -19,13 +19,13 @@ use crate::{Error, Result};
 
 /// The installed policy. Dropping it leaves the handlers installed: a rank
 /// keeps its disposition until it exits.
-pub struct Signals {
+pub(crate) struct Signals {
     serving: Arc<AtomicBool>,
 }
 
 impl Signals {
     /// Install the startup disposition for SIGINT and SIGTERM.
-    pub fn install() -> Result<Self> {
+    pub(crate) fn install() -> Result<Self> {
         let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
             .map_err(|error| Error::Transport(format!("signal pipe: {error}")))?;
         // The write end lives for the process: handlers may run until exit.
@@ -53,7 +53,7 @@ impl Signals {
     }
 
     /// Switch to the serving disposition: signals are logged and ignored.
-    pub fn serving(&self) {
+    pub(crate) fn serving(&self) {
         self.serving.store(true, Ordering::Release);
     }
 }

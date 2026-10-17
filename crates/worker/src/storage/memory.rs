@@ -25,7 +25,7 @@ use uniserve_cuda::{
 };
 
 use crate::ffi::{
-    Backing, DType, Device, Function, Handle, Interpreter, Tensor, contiguous_strides, export,
+    Backing, DType, Function, Handle, Interpreter, MemoryKind, Tensor, contiguous_strides, export,
 };
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
@@ -52,8 +52,8 @@ static EXPORTABLE: Mutex<BTreeMap<u64, Weak<Memory>>> = Mutex::new(BTreeMap::new
 
 impl Memory {
     /// Device memory on `device`. Contents are uninitialized.
-    pub fn device(device: i32, bytes: usize) -> Result<Arc<Self>> {
-        let allocation = DeviceAllocation::linear(DeviceId(device), bytes)?;
+    pub fn device(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
+        let allocation = DeviceAllocation::linear(device, bytes)?;
         Ok(Arc::new(Self {
             kind: Kind::Device(allocation),
         }))
@@ -63,9 +63,12 @@ impl Memory {
     /// read-write access for `device` and every device in `access`. The
     /// length is rounded up to the allocation granularity. Contents are
     /// uninitialized.
-    pub fn exportable(device: i32, bytes: usize, access: &[i32]) -> Result<Arc<Self>> {
-        let access: Vec<_> = access.iter().map(|&peer| DeviceId(peer)).collect();
-        let allocation = DeviceAllocation::exportable(DeviceId(device), bytes, &access)?;
+    pub(crate) fn exportable(
+        device: DeviceId,
+        bytes: usize,
+        access: &[DeviceId],
+    ) -> Result<Arc<Self>> {
+        let allocation = DeviceAllocation::exportable(device, bytes, access)?;
         let address = allocation.address();
         let memory = Arc::new(Self {
             kind: Kind::Device(allocation),
@@ -80,10 +83,10 @@ impl Memory {
     /// Every other visible device that can address `device`'s memory: the
     /// devices an exportable allocation grants access to, so in-process
     /// readers on those devices can copy from it.
-    pub fn peers(device: i32) -> Result<Vec<i32>> {
+    pub(crate) fn peers(device: DeviceId) -> Result<Vec<DeviceId>> {
         let mut peers = Vec::new();
-        for peer in 0..DeviceId::count()? {
-            if peer != device && DeviceId(peer).can_access_peer(DeviceId(device))? {
+        for peer in (0..DeviceId::count()?).map(DeviceId) {
+            if peer != device && peer.can_access_peer(device)? {
                 peers.push(peer);
             }
         }
@@ -92,8 +95,8 @@ impl Memory {
 
     /// Page-locked host memory usable as a CUDA copy source or destination
     /// for `device`. Contents are uninitialized.
-    pub fn pinned(device: i32, bytes: usize) -> Result<Arc<Self>> {
-        let buffer = PinnedBuffer::new(DeviceId(device), bytes)?;
+    pub fn pinned(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
+        let buffer = PinnedBuffer::new(device, bytes)?;
         Ok(Arc::new(Self {
             kind: Kind::Pinned(buffer),
         }))
@@ -106,23 +109,15 @@ impl Memory {
         })
     }
 
-    /// Adopt an existing device allocation, for example an exportable VMM
-    /// allocation created by a transport.
-    pub fn from_device(allocation: DeviceAllocation) -> Arc<Self> {
-        Arc::new(Self {
-            kind: Kind::Device(allocation),
-        })
-    }
-
     /// Adopt a mapping of exported device memory.
-    pub fn mapped(mapping: PeerMapping) -> Arc<Self> {
+    pub(crate) fn mapped(mapping: PeerMapping) -> Arc<Self> {
         Arc::new(Self {
             kind: Kind::Mapped(mapping),
         })
     }
 
     /// The device allocation, `None` for host memory and mappings.
-    pub fn allocation(&self) -> Option<&DeviceAllocation> {
+    pub(crate) fn allocation(&self) -> Option<&DeviceAllocation> {
         match &self.kind {
             Kind::Device(allocation) => Some(allocation),
             _ => None,
@@ -131,11 +126,11 @@ impl Memory {
 
     /// The live exportable allocation containing `address`, with the
     /// address's byte offset inside it.
-    pub fn exportable_containing(address: u64) -> Option<(Arc<Self>, u64)> {
+    pub(crate) fn exportable_containing(address: u64) -> Option<(Arc<Self>, u64)> {
         let registry = EXPORTABLE.lock().unwrap_or_else(PoisonError::into_inner);
         let (&base, memory) = registry.range(..=address).next_back()?;
         let memory = memory.upgrade()?;
-        (address < base + memory.len() as u64).then(|| (memory, address - base))
+        (address < base + memory.bytes() as u64).then(|| (memory, address - base))
     }
 
     /// The allocation's host-visible bytes. `None` for device memory.
@@ -176,12 +171,12 @@ impl Drop for Memory {
 }
 
 impl Backing for Memory {
-    fn device(&self) -> Device {
+    fn device(&self) -> MemoryKind {
         match &self.kind {
-            Kind::Device(allocation) => Device::Cuda(allocation.device().0),
-            Kind::Mapped(mapping) => Device::Cuda(mapping.device().0),
-            Kind::Pinned(_) => Device::CudaHost,
-            Kind::Host(_) => Device::Cpu,
+            Kind::Device(allocation) => MemoryKind::Cuda(allocation.device()),
+            Kind::Mapped(mapping) => MemoryKind::Cuda(mapping.device()),
+            Kind::Pinned(_) => MemoryKind::PinnedHost,
+            Kind::Host(_) => MemoryKind::Host,
         }
     }
 
@@ -194,62 +189,13 @@ impl Backing for Memory {
         }
     }
 
-    fn len(&self) -> usize {
+    fn bytes(&self) -> usize {
         match &self.kind {
             Kind::Device(allocation) => allocation.len(),
             Kind::Mapped(mapping) => mapping.len(),
             Kind::Pinned(buffer) => buffer.len(),
             Kind::Host(bytes) => bytes.len(),
         }
-    }
-}
-
-/// The stable storage name of an element type, as transfer locators and the
-/// Python interface spell it (torch names without the `torch.` prefix).
-pub fn dtype_name(dtype: DType) -> &'static str {
-    match dtype {
-        DType::Bool => "bool",
-        DType::U8 => "uint8",
-        DType::I8 => "int8",
-        DType::I16 => "int16",
-        DType::I32 => "int32",
-        DType::I64 => "int64",
-        DType::U32 => "uint32",
-        DType::F16 => "float16",
-        DType::BF16 => "bfloat16",
-        DType::F32 => "float32",
-        DType::F64 => "float64",
-        DType::F8E4M3 => "float8_e4m3fn",
-        DType::F8E5M2 => "float8_e5m2",
-    }
-}
-
-/// Parse a storage name produced by [`dtype_name`].
-pub fn parse_dtype(name: &str) -> Result<DType> {
-    let name = name.trim_start_matches("torch.");
-    Ok(match name {
-        "bool" => DType::Bool,
-        "uint8" => DType::U8,
-        "int8" => DType::I8,
-        "int16" => DType::I16,
-        "int32" => DType::I32,
-        "int64" => DType::I64,
-        "uint32" => DType::U32,
-        "float16" => DType::F16,
-        "bfloat16" => DType::BF16,
-        "float32" => DType::F32,
-        "float64" => DType::F64,
-        "float8_e4m3fn" => DType::F8E4M3,
-        "float8_e5m2" => DType::F8E5M2,
-        _ => return Err(Error::Invalid(format!("unknown element type {name:?}"))),
-    })
-}
-
-/// The transfer-locator spelling of a device (`cuda:<index>` or `cpu`).
-pub fn device_name(device: Device) -> String {
-    match device {
-        Device::Cuda(index) => format!("cuda:{index}"),
-        Device::Cpu | Device::CudaHost => "cpu".to_owned(),
     }
 }
 
@@ -276,7 +222,7 @@ pub struct StorageView {
 
 /// An owned copy operand: a view's address, element width, shape and
 /// element strides in the form [`uniserve_cuda::StridedCopy`] plans.
-pub struct CopyOperand {
+pub(crate) struct CopyOperand {
     address: u64,
     element_bytes: usize,
     shape: Vec<u64>,
@@ -284,7 +230,7 @@ pub struct CopyOperand {
 }
 
 impl CopyOperand {
-    pub fn strided(&self) -> Strided<'_> {
+    pub(crate) fn strided(&self) -> Strided<'_> {
         Strided {
             address: self.address,
             element_bytes: self.element_bytes,
@@ -305,7 +251,7 @@ impl StorageView {
         Self::strided(memory, offset, dtype, shape, &contiguous_strides(shape))
     }
 
-    pub fn strided(
+    pub(crate) fn strided(
         memory: Arc<dyn Backing>,
         offset: usize,
         dtype: DType,
@@ -344,7 +290,7 @@ impl StorageView {
 
     /// A whole allocation viewed as `[len / dtype.bytes()]` elements.
     pub fn whole(memory: Arc<dyn Backing>, dtype: DType) -> Result<Self> {
-        let elements = memory.len() / dtype.bytes();
+        let elements = memory.bytes() / dtype.bytes();
         Self::contiguous(memory, 0, dtype, &[elements as i64])
     }
 
@@ -354,11 +300,11 @@ impl StorageView {
     }
 
     /// Byte offset of the first element inside the allocation.
-    pub fn offset(&self) -> usize {
+    pub(crate) fn offset(&self) -> usize {
         self.offset
     }
 
-    pub fn device(&self) -> Device {
+    pub(crate) fn device(&self) -> MemoryKind {
         self.memory.device()
     }
 
@@ -370,7 +316,7 @@ impl StorageView {
         &self.shape
     }
 
-    pub fn strides(&self) -> &[i64] {
+    pub(crate) fn strides(&self) -> &[i64] {
         &self.strides
     }
 
@@ -389,7 +335,7 @@ impl StorageView {
     }
 
     /// Bytes of the addressed elements, excluding strided gaps.
-    pub fn nbytes(&self) -> u64 {
+    pub(crate) fn nbytes(&self) -> u64 {
         self.numel() * self.dtype.bytes() as u64
     }
 
@@ -415,18 +361,18 @@ impl StorageView {
             .map(|(&extent, &stride)| (extent - 1) * stride)
             .sum();
         let bytes = (last as usize + 1) * self.dtype.bytes();
-        if self.offset + bytes > self.memory.len() {
+        if self.offset + bytes > self.memory.bytes() {
             return Err(Error::Invariant(format!(
                 "a view of {bytes} bytes at offset {} exceeds its {}-byte allocation",
                 self.offset,
-                self.memory.len()
+                self.memory.bytes()
             )));
         }
         Ok(bytes)
     }
 
     /// The leading `count` entries along dimension 0.
-    pub fn prefix(&self, count: i64) -> Result<Self> {
+    pub(crate) fn prefix(&self, count: i64) -> Result<Self> {
         let extent = *self
             .shape
             .first()
@@ -441,7 +387,7 @@ impl StorageView {
 
     /// Elements `[start, start + length)` of `axis`. The whole axis is this
     /// view itself.
-    pub fn narrow(&self, axis: usize, start: i64, length: i64) -> Result<Self> {
+    pub(crate) fn narrow(&self, axis: usize, start: i64, length: i64) -> Result<Self> {
         let extent = *self
             .shape
             .get(axis)
@@ -462,7 +408,7 @@ impl StorageView {
     }
 
     /// The view at `index` of `axis`, with that axis removed.
-    pub fn select(&self, axis: usize, index: i64) -> Result<Self> {
+    pub(crate) fn select(&self, axis: usize, index: i64) -> Result<Self> {
         let row = self.narrow(axis, index, 1)?;
         let (mut shape, mut strides) = (row.shape, row.strides);
         shape.remove(axis);
@@ -471,7 +417,7 @@ impl StorageView {
     }
 
     /// The per-axis `[start, end)` region of this view.
-    pub fn region(&self, region: &[Range<u64>]) -> Result<Self> {
+    pub(crate) fn region(&self, region: &[Range<u64>]) -> Result<Self> {
         if region.len() != self.shape.len() {
             return Err(Error::Invalid(
                 "a region needs one range per view axis".to_owned(),
@@ -487,28 +433,8 @@ impl StorageView {
         Ok(view)
     }
 
-    /// The same elements with axes reordered: axis `i` of the result is axis
-    /// `order[i]` of this view.
-    pub fn permute(&self, order: &[usize]) -> Result<Self> {
-        let mut seen = vec![false; self.shape.len()];
-        if order.len() != self.shape.len()
-            || order
-                .iter()
-                .any(|&axis| axis >= seen.len() || std::mem::replace(&mut seen[axis], true))
-        {
-            return Err(Error::Invariant(
-                "a permutation names every axis once".to_owned(),
-            ));
-        }
-        Ok(self.derive(
-            self.offset,
-            order.iter().map(|&axis| self.shape[axis]).collect(),
-            order.iter().map(|&axis| self.strides[axis]).collect(),
-        ))
-    }
-
     /// The same bytes reinterpreted as a contiguous `shape` of `dtype`.
-    pub fn reshape(&self, dtype: DType, shape: &[i64]) -> Result<Self> {
+    pub(crate) fn reshape(&self, dtype: DType, shape: &[i64]) -> Result<Self> {
         if !self.is_contiguous() {
             return Err(Error::Invariant(
                 "only contiguous views can be reshaped".to_owned(),
@@ -524,7 +450,7 @@ impl StorageView {
     }
 
     /// The view as a strided copy operand.
-    pub fn operand(&self) -> CopyOperand {
+    pub(crate) fn operand(&self) -> CopyOperand {
         CopyOperand {
             address: self.address(),
             element_bytes: self.dtype.bytes(),
@@ -535,7 +461,7 @@ impl StorageView {
 
     /// The maximal contiguous byte intervals the view addresses, in address
     /// order. Axes whose stride equals the run below them fold into the run.
-    pub fn intervals(&self) -> Vec<Range<u64>> {
+    pub(crate) fn intervals(&self) -> Vec<Range<u64>> {
         if self.shape.contains(&0) {
             return Vec::new();
         }
@@ -582,7 +508,7 @@ impl StorageView {
     /// the work `stream` issued before (it has a stream exactly for device
     /// memory). The source is read before the call returns, so the caller
     /// may reuse it at once.
-    pub fn upload(&self, bytes: &[u8], stream: impl Issue) -> Result<()> {
+    pub(crate) fn upload(&self, bytes: &[u8], stream: impl Issue) -> Result<()> {
         if !self.is_contiguous() || bytes.len() as u64 > self.nbytes() {
             return Err(Error::Invariant(
                 "an upload writes a prefix of a contiguous view".to_owned(),
@@ -591,7 +517,7 @@ impl StorageView {
         if bytes.is_empty() {
             return Ok(());
         }
-        if matches!(self.device(), Device::Cuda(_)) != stream.stream().is_some() {
+        if matches!(self.device(), MemoryKind::Cuda(_)) != stream.stream().is_some() {
             return Err(Error::Invariant(
                 "uploads use a stream exactly for device memory".to_owned(),
             ));
@@ -606,13 +532,13 @@ impl StorageView {
 
     /// Zero this contiguous view, in the order of what `stream` issues for
     /// device memory (a stream at once, or a job's recorder).
-    pub fn zero(&self, stream: impl Issue) -> Result<()> {
+    pub(crate) fn zero(&self, stream: impl Issue) -> Result<()> {
         if !self.is_contiguous() {
             return Err(Error::Invariant(
                 "only a contiguous view is zeroed".to_owned(),
             ));
         }
-        if matches!(self.device(), Device::Cuda(_)) != stream.stream().is_some() {
+        if matches!(self.device(), MemoryKind::Cuda(_)) != stream.stream().is_some() {
             return Err(Error::Invariant(
                 "fills use a stream exactly for device memory".to_owned(),
             ));
@@ -658,7 +584,7 @@ impl StorageView {
     /// caller drops the references it makes for a call ([`Handle::to_any`])
     /// before the view or on the Python thread, so that the view's own
     /// reference is the last one and is released on the Python thread.
-    pub fn handle(&self) -> Result<&Handle> {
+    pub(crate) fn handle(&self) -> Result<&Handle> {
         if let Some(handle) = self.tensor.get() {
             return Ok(handle);
         }
@@ -710,10 +636,10 @@ mod tests {
     }
 
     #[test]
-    fn regions_select_and_permute_address_the_same_elements() -> Result<()> {
+    fn regions_select_and_transposes_address_the_same_elements() -> Result<()> {
         let memory: Arc<dyn Backing> = Memory::host(4 * 6 * 4);
         let base = memory.address();
-        let grid = StorageView::contiguous(memory, 0, DType::F32, &[4, 6])?;
+        let grid = StorageView::contiguous(Arc::clone(&memory), 0, DType::F32, &[4, 6])?;
 
         let window = grid.region(&[1..3, 2..5])?;
         assert_eq!(window.shape(), &[2, 3]);
@@ -728,9 +654,9 @@ mod tests {
             (column.shape(), column.strides()),
             (&[4_i64][..], &[6_i64][..])
         );
-        let transposed = grid.permute(&[1, 0])?;
+        let transposed = StorageView::strided(memory, 0, DType::F32, &[6, 4], &[1, 6])?;
         assert_eq!(transposed.shape(), &[6, 4]);
-        // A permutation addresses the same bytes: one contiguous interval.
+        // A transposed view addresses the same bytes: one contiguous interval.
         assert_eq!(transposed.intervals(), vec![base..base + 96]);
         assert!(grid.region(&[0..5, 0..6]).is_err());
         Ok(())
@@ -745,9 +671,9 @@ mod tests {
             DType::F8E4M3,
             DType::F64,
         ] {
-            assert_eq!(parse_dtype(dtype_name(dtype))?, dtype);
+            assert_eq!(DType::parse(dtype.name())?, dtype);
         }
-        assert!(parse_dtype("complex64").is_err());
+        assert!(DType::parse("complex64").is_err());
         Ok(())
     }
 }

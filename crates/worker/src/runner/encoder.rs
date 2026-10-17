@@ -75,7 +75,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, VideoCondition};
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use uniserve_ipc::{Batch as BatchPlan, CallKind, ForwardStats, MediaCall};
 
 use crate::config::Device;
@@ -108,7 +108,7 @@ const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
 /// The largest packed vision slot count: it bounds retained activations
 /// independently of the admitted batch size. Larger batches replay full
 /// chunks and then their exact remaining slot count.
-pub const MAX_PACKED_IMAGES: usize = 16;
+pub(crate) const MAX_PACKED_IMAGES: usize = 16;
 
 /// The image transform a preparation applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +120,7 @@ pub enum Tower {
 }
 
 impl Tower {
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Vit => "vit",
             Self::Vae => "vae",
@@ -131,7 +131,7 @@ impl Tower {
 /// What preparing an image produces besides its pixels, known before them
 /// (`EncoderRunner.image_facts`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageFacts {
+pub(crate) struct ImageFacts {
     /// `[patches, row]` for a patch tower, `[channels, height, width]`
     /// otherwise.
     pub shape: Vec<i64>,
@@ -185,20 +185,15 @@ impl ImageFacts {
         })
     }
 
-    /// Patch rows of a packed image (`rows * columns`).
-    pub fn patches(&self) -> Option<u32> {
-        self.grid.map(|[rows, columns]| rows * columns)
-    }
-
     /// Values of the prepared pixels.
-    pub fn elements(&self) -> i64 {
+    pub(crate) fn elements(&self) -> i64 {
         self.shape.iter().product()
     }
 }
 
 /// Where an image's pixels are.
 #[derive(Clone, Debug)]
-pub enum ImagePixels {
+pub(crate) enum ImagePixels {
     /// Prepared on the host into a block of the encoder's pinned pool
     /// ([`ImagePreparation::prepare`]).
     Host(StorageView),
@@ -213,8 +208,8 @@ pub enum ImagePixels {
 /// One image ready for an encoder: its facts and its pixels.
 #[derive(Clone, Debug)]
 pub struct PreparedImage {
-    pub facts: ImageFacts,
-    pub pixels: ImagePixels,
+    pub(crate) facts: ImageFacts,
+    pub(crate) pixels: ImagePixels,
 }
 
 /// The image policy's preparation functions over a loaded model:
@@ -236,10 +231,6 @@ impl ImagePreparation {
             facts: function("image_facts")?,
             prepare: function("prepare_image")?,
         })
-    }
-
-    pub fn loaded(&self) -> &Handle {
-        &self.loaded
     }
 
     /// Decode and transform one inline request image on the calling (host)
@@ -323,7 +314,7 @@ impl ImagePreparation {
 
 /// The text workload an encoder's execution context is prepared for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextSize {
+pub(crate) struct TextSize {
     pub tokens: usize,
     pub rows: usize,
 }
@@ -350,7 +341,7 @@ pub struct VisionEncoder {
 
 impl VisionEncoder {
     /// Feature rows of one packed slot.
-    pub fn slot_tokens(&self) -> Option<u32> {
+    pub(crate) fn slot_tokens(&self) -> Option<u32> {
         self.max_patches
             .map(|patches| patches / (self.downsample * self.downsample))
     }
@@ -489,7 +480,7 @@ impl EncoderInfo {
     /// The text size the encoder's execution context prepares its
     /// operators for: the most rows one numerical call passes through its
     /// projections. A latent encoder's convolutions need none.
-    pub fn context_size(&self, config: &EncoderConfig) -> Option<TextSize> {
+    pub(crate) fn context_size(&self, config: &EncoderConfig) -> Option<TextSize> {
         match self {
             Self::Vision(vision) => Some(match vision.max_patches {
                 Some(max_patches) => {
@@ -529,7 +520,7 @@ impl EncoderInfo {
 /// Images take the leading slots in order. This is
 /// `PatchEncoder.packed_grids`, which the captured encode reads from device
 /// memory.
-pub fn packed_grids(
+pub(crate) fn packed_grids(
     shapes: &[[u32; 2]],
     slots: usize,
     max_patches: u32,
@@ -594,7 +585,7 @@ fn image_rows(facts: &ImageFacts, patch_size: u32) -> usize {
 /// The text capacity a prompt of `tokens` is encoded at: the smallest
 /// configured capacity holding it, or the prompt's own length without
 /// configured capacities.
-pub fn text_capacity(capacities: &[usize], tokens: usize) -> Result<usize> {
+pub(crate) fn text_capacity(capacities: &[usize], tokens: usize) -> Result<usize> {
     if tokens == 0 {
         return Err(Error::Invalid("text encoding requires a token".into()));
     }
@@ -610,7 +601,7 @@ pub fn text_capacity(capacities: &[usize], tokens: usize) -> Result<usize> {
 
 /// The vision tokens of a prompt, for a text encoder that places them.
 #[derive(Clone, Copy, Debug)]
-pub struct PromptVision<'a> {
+pub(crate) struct PromptVision<'a> {
     /// `(time, height, width)` patch grids of the prompt's image blocks, in
     /// prompt order.
     pub image_grids: &'a [[u32; 3]],
@@ -637,7 +628,7 @@ pub struct EncoderConfig {
 
 /// A graph an encoder replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum EncoderGraph {
+pub(crate) enum EncoderGraph {
     /// A packed vision encode of this many slots.
     Packed { slots: usize },
     /// A text-only encode at this capacity.
@@ -925,7 +916,7 @@ impl EncoderRunner {
             stream,
             methods,
             packed,
-            pinned: PinnedPool::new(device.cuda_index()),
+            pinned: PinnedPool::new(device.cuda()),
             resident,
             noise,
             text: None,
@@ -1006,7 +997,7 @@ impl EncoderRunner {
             stream: Some(stream),
             methods,
             packed: None,
-            pinned: PinnedPool::new(device.cuda_index()),
+            pinned: PinnedPool::new(device.cuda()),
             resident: None,
             noise: None,
             text,
@@ -1016,10 +1007,6 @@ impl EncoderRunner {
             context: None,
             conditions: None,
         })
-    }
-
-    pub fn info(&self) -> EncoderInfo {
-        self.info
     }
 
     /// The host blocks inline images for this runner are prepared into.
@@ -1037,23 +1024,18 @@ impl EncoderRunner {
         }
     }
 
-    pub fn device(&self) -> Device {
+    pub(crate) fn device(&self) -> Device {
         self.device
     }
 
     /// The runner's stream; `None` on the host.
-    pub fn stream(&self) -> Option<&Stream> {
+    pub(crate) fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
-    }
-
-    /// Images one packed numerical call encodes; `None` when unpacked.
-    pub fn packed_capacity(&self) -> Option<usize> {
-        self.packed.as_ref().map(|packed| packed.capacity)
     }
 
     /// The identity of the runner's graph pool owner: the address of its
     /// packed grids, which no other runner shares. `None` when unpacked.
-    pub fn graph_key(&self) -> Option<usize> {
+    pub(crate) fn graph_key(&self) -> Option<usize> {
         self.packed
             .as_ref()
             .map(|packed| packed.grids.address() as usize)
@@ -1526,13 +1508,13 @@ impl EncoderRunner {
                 arguments.push(Argument::Tensor(positions.clone()));
                 arguments.push(Argument::Tensor(rows.clone()));
                 job.call(MethodCall::new(&encode, arguments));
-                self.count(GraphMode::Eager)
+                GraphMode::Eager
             }
             // Without configured capacities a prompt is encoded at its
             // exact length, which no graph serves.
             None if self.text_capacities.is_empty() => {
                 job.call(MethodCall::new(&encode, arguments));
-                self.count(GraphMode::Eager)
+                GraphMode::Eager
             }
             None => self.forward(EncoderGraph::Text { capacity }, arguments, None, job)?,
         };
@@ -1564,15 +1546,6 @@ impl EncoderRunner {
         })
     }
 
-    /// Count a forward of `mode` in the graph table, when the encoder has
-    /// one; returns the mode.
-    fn count(&mut self, mode: GraphMode) -> GraphMode {
-        if let Some(table) = &mut self.graphs {
-            table.record(mode);
-        }
-        mode
-    }
-
     /// Record in `job` the forward of `key`, whose `encode` takes
     /// `arguments`, on the encoder's stream: the launch of the key's
     /// captured graph, or the eager call. Startup's capture passes the
@@ -1584,7 +1557,7 @@ impl EncoderRunner {
         &mut self,
         key: EncoderGraph,
         arguments: Vec<Argument>,
-        pool: Option<&GraphPool<Handle>>,
+        pool: Option<&GraphPool>,
         job: &Job,
     ) -> Result<GraphMode> {
         let stream = self.stream.clone();
@@ -1620,9 +1593,6 @@ impl EncoderRunner {
                 }
             }
         };
-        if mode != GraphMode::Capture {
-            self.count(mode);
-        }
         Ok(mode)
     }
 
@@ -1637,7 +1607,7 @@ impl EncoderRunner {
     /// the same forwards run once, so lazy initialization precedes serving.
     pub(crate) fn capture_with(
         &mut self,
-        pool: Option<&Arc<GraphPool<Handle>>>,
+        pool: Option<&Arc<GraphPool>>,
         check: &mut dyn FnMut() -> Result<()>,
         perform: &mut dyn FnMut(Job) -> Result<Completion>,
     ) -> Result<()> {
@@ -1708,7 +1678,6 @@ impl EncoderRunner {
                 .as_mut()
                 .ok_or_else(|| Error::Invariant("encoder has no graph table".into()))?
                 .insert(key, None, graph)?;
-            self.count(GraphMode::Capture);
         }
         self.capturing = pool.is_some();
         Ok(())
@@ -1719,7 +1688,7 @@ impl EncoderRunner {
     /// [`Self::encode`] performs its job.
     pub fn capture(
         &mut self,
-        pool: Option<&Arc<GraphPool<Handle>>>,
+        pool: Option<&Arc<GraphPool>>,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
         self.capture_with(pool, check, &mut |job| {
@@ -2045,7 +2014,7 @@ pub(crate) struct TextSetup<'a> {
     pub(crate) component: &'a str,
     /// The component's root module path.
     pub(crate) path: &'a str,
-    pub(crate) device: i32,
+    pub(crate) device: DeviceId,
     pub(crate) stream: Stream,
     /// The stream's shared work areas, a Python `Scratch`.
     pub(crate) scratch: Handle,
@@ -2616,14 +2585,14 @@ pub(crate) fn tower(call: MediaCall) -> Result<Tower> {
 pub(crate) fn image_placement(
     image: &ImageParts<'_>,
     plan: &BatchPlan,
-) -> Result<(Option<i32>, Option<Stream>, usize)> {
+) -> Result<(Option<DeviceId>, Option<Stream>, usize)> {
     let first = plan
         .calls
         .first()
         .ok_or_else(|| Error::Invariant("an image batch has calls".into()))?;
     let runner = &image.encoders.image[image.encoders.route(&first.component, first.code)?];
     let stream = runner.stream().cloned();
-    Ok((runner.device().cuda_index(), stream, 0))
+    Ok((runner.device().cuda(), stream, 0))
 }
 
 /// An image encoding between two of its jobs.

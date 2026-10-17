@@ -13,7 +13,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::ffi::DType;
-use crate::host::{HostAction, HostTask};
+use crate::host::HostAction;
 use crate::runner::encoder::{ImagePreparation, PreparedImage, Tower};
 use crate::storage::memory::StorageView;
 use crate::storage::{OutputLease, PinnedPool};
@@ -118,22 +118,6 @@ impl ImageTask {
 
 impl HostAction for ImageTask {
     type Output = ImageResult;
-    type Error = Error;
-    type Callback = Box<dyn FnOnce() + Send>;
-    type Wake = uniserve_ipc::Wake;
-
-    fn ready(&self) -> Result<bool> {
-        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
-        match &*work {
-            ImageWork::Prepare { .. } => Ok(true),
-            // Encoding reads host bytes only after their copy completed.
-            ImageWork::Encode { lease, .. } => Ok(lease
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .ready_at()
-                .is_some()),
-        }
-    }
 
     fn run(&self) -> Result<ImageResult> {
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
@@ -177,40 +161,9 @@ impl HostAction for ImageTask {
         Ok(())
     }
 
-    fn input_outcome(&self) -> Option<Outcome<Error>> {
+    fn input_outcome(&self) -> Outcome {
         // Inputs are host bytes the task owns or a completed copy.
-        Some(Outcome::Success(()))
-    }
-
-    fn defer_release(_: Arc<HostTask<Self>>) -> Result<()> {
-        Err(Error::Invariant(
-            "image host work has no deferred input".into(),
-        ))
-    }
-
-    fn notify(callbacks: Vec<Self::Callback>) {
-        for callback in callbacks {
-            callback();
-        }
-    }
-
-    fn wake(wake: &uniserve_ipc::Wake) {
-        wake.wake();
-    }
-
-    fn report(error: Error) {
-        tracing::error!(target: "uniserve_worker.execution", "image host work failed: {error}");
-    }
-
-    fn error(error: Error) -> Error {
-        error
-    }
-
-    fn note_cleanup(_: &mut Error, cleanup: Error) {
-        tracing::error!(
-            target: "uniserve_worker.execution",
-            "image host work cleanup also failed: {cleanup}"
-        );
+        Outcome::Success(())
     }
 }
 

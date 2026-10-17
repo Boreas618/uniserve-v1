@@ -6,6 +6,7 @@ use crate::ffi::{Function, Handle, Interpreter};
 use crate::runner::methods::{Argument, Methods};
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
+use uniserve_cuda::DeviceId;
 
 const RUNNER: &str = "uniserve.runner.causal_lm.CausalLMRunner";
 
@@ -72,7 +73,7 @@ pub(crate) struct Construction<'a> {
     /// The causal LM's module path in the model.
     pub(crate) path: &'a str,
     /// The CUDA ordinal the forwards compute on; `None` on the host.
-    pub(crate) device: Option<i32>,
+    pub(crate) device: Option<DeviceId>,
     pub(crate) stream: usize,
     /// The stream's shared scratch (`Scratches`).
     pub(crate) scratch: Handle,
@@ -105,7 +106,8 @@ pub(crate) fn construct(construction: &Construction<'_>) -> Result<Methods> {
     let mut arguments = vec![
         Argument::Handle(construction.loaded.clone()),
         Argument::Text(construction.path.to_owned()),
-        Argument::Integer(i64::from(construction.device.unwrap_or(-1))),
+        // The Python half takes the CUDA ordinal, `-1` for the host.
+        Argument::Integer(construction.device.map_or(-1, |device| i64::from(device.0))),
         construction.stream.into(),
         Argument::Handle(construction.scratch.clone()),
         Argument::Handle(construction.cache.clone()),

@@ -18,12 +18,14 @@
 //! denoiser's rope advance when it completes a feedback.
 
 use std::sync::Arc;
+use uniserve_cuda::DeviceId;
 
 use uniserve_ipc::{Call, ForwardBatch};
 
 use crate::executor::PendingOutput;
 use crate::executor::image::ImageParts;
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
+use crate::lane::Recorder;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};
 use crate::runner::denoiser::image::ConditionRow;
@@ -32,7 +34,6 @@ use crate::runner::denoiser::image_model::ROPE_ADVANCE;
 use crate::runner::vision::{BlockPositions, PositionLayout, VisionBlock};
 use crate::storage::memory::StorageView;
 use crate::storage::{BlockTables, Metadata, ProductRead, ProductStore};
-use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// How a media call's rows advance its request.
@@ -56,19 +57,19 @@ pub(super) struct Media {
 }
 
 /// What a media call borrows from the rank.
-pub(super) struct Sources<'a, I> {
+pub(super) struct Sources<'a> {
     pub(super) tensors: &'a ProductStore,
     pub(super) image: Option<&'a ImageParts<'a>>,
     pub(super) tables: &'a BlockTables,
-    pub(super) device: Option<i32>,
+    pub(super) device: Option<DeviceId>,
     /// What the batch issues its stream work to: the stream that consumes
     /// the features waits on their producers.
-    pub(super) stream: I,
+    pub(super) stream: Recorder<'a>,
     /// The request's admitted input images.
     pub(super) input_images: u32,
 }
 
-impl<I> Sources<'_, I> {
+impl Sources<'_> {
     /// Whether rows carry three rotary axes
     /// ([`crate::runner::denoiser::image_model::ImageModel::spatial_positions`]).
     fn spatial(&self) -> bool {
@@ -84,12 +85,7 @@ struct Feature {
     width: u32,
 }
 
-fn consume(
-    sources: &Sources<'_, impl Issue>,
-    call: &Call,
-    index: usize,
-    latent: bool,
-) -> Result<Feature> {
+fn consume(sources: &Sources<'_>, call: &Call, index: usize, latent: bool) -> Result<Feature> {
     let reference = if latent {
         call.latent_feature_input.as_ref()
     } else {
@@ -99,7 +95,7 @@ fn consume(
     let read = sources.tensors.consume(
         reference,
         call.call_id,
-        Some(sources.device.map_or(Device::Cpu, Device::Cuda)),
+        Some(sources.device.map_or(MemoryKind::Host, MemoryKind::Cuda)),
         sources.stream,
     )?;
     match read.metadata() {
@@ -165,7 +161,7 @@ fn narrow(value: u64) -> Result<u32> {
 /// A vision block row of `feature` at `position` after `prefix` visible
 /// tokens; returns the row and the block's features.
 fn vision_row(
-    sources: &Sources<'_, impl Issue>,
+    sources: &Sources<'_>,
     feature: &Feature,
     slot: u32,
     prefix: u64,
@@ -265,7 +261,7 @@ pub(super) fn block_row(
 /// of the call, which must match its rows. A call that `scores` its prompt
 /// projects every text token and each block's last token.
 pub(super) fn context(
-    sources: &Sources<'_, impl Issue>,
+    sources: &Sources<'_>,
     call: &Call,
     output: &PendingOutput,
     slot: u32,
@@ -372,7 +368,7 @@ pub(super) fn context(
 /// The row of a visual-state prefill: one vision block closing an image,
 /// or a latent feature's conditioning.
 pub(super) fn visual(
-    sources: &Sources<'_, impl Issue>,
+    sources: &Sources<'_>,
     call: &Call,
     output: &PendingOutput,
     slot: u32,

@@ -37,8 +37,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
-use uniserve_ipc::{BufferId, CallKind, ForwardMode, ForwardStats, RequestKey, Wake};
+use uniserve_cuda::{DeviceId, Stream};
+use uniserve_ipc::{BufferId, CallKind, ForwardMode, ForwardStats, RequestKey};
 
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
@@ -406,7 +406,7 @@ impl CausalLMRunners {
     pub(crate) fn placement(
         &self,
         component: &str,
-    ) -> Result<(Option<i32>, Option<Stream>, usize)> {
+    ) -> Result<(Option<DeviceId>, Option<Stream>, usize)> {
         let (lane, _) = self.prefill_lane(component)?;
         let runner = &self.runners[lane];
         let stream = runner.stream().cloned();
@@ -493,8 +493,6 @@ impl CausalLMRunners {
             .flatten()
             .ok_or_else(|| Error::Invariant("the prefix evaluation did not run".into()))
     }
-
-    pub(crate) fn set_wake(&self, _wake: Option<Wake>) {}
 
     /// Each runner's kernel-table label, device name and the call that
     /// lists the kernels its operators selected.

@@ -9,22 +9,29 @@
 //!
 //! The library also exports the video request rules of `uniserve-core` to
 //! the Python library, which plans MiniMax-H3 requests with them.
+//!
+//! Besides that entry point the crate exposes only what its integration
+//! tests (`tests/`), its test harnesses (`examples/`) and its benchmark drive:
+//! the launch configuration and registration, the interpreter and DLPack
+//! export, the storage owners, the transfer mechanisms, the host groups and
+//! collectives, and the image runners. Everything else is internal to the
+//! rank runtime.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-pub mod capacity;
+mod capacity;
 mod completion;
 pub mod config;
 mod cuda_graph;
-pub mod error;
-pub mod executor;
+mod error;
+mod executor;
 pub mod ffi;
 mod host;
-pub mod lane;
+mod lane;
 pub mod launch;
 mod logging;
 pub mod parallel;
-pub mod profiling;
+mod profiling;
 mod request;
 mod rules;
 mod runner;
@@ -33,64 +40,40 @@ mod service;
 pub mod storage;
 mod stream;
 pub mod transfer;
-pub mod warmup;
-pub mod worker;
+mod warmup;
+mod worker;
 
 pub use completion::{Completion, Outcome};
-pub use config::WorkerConfig;
-pub use cuda_graph::{
-    CUDAGraph, Capacity, GraphCounts, GraphMode, GraphPool, GraphPools, GraphStorage, GraphTable,
-    Lookup, bucket, capture_order, graph_storage_budget_bytes, reserve_pools,
-};
+pub use cuda_graph::GraphPool;
 pub use error::{Error, ErrorCode, Result, WorkerError};
-pub use executor::{
-    Backend, Batch, BatchInputs, BatchResult, Executor, InputReady, InputWait, PendingOutput,
-    Submission, request_output,
-};
-pub use host::{HostAction, HostLane, HostTask};
-pub use parallel::{
-    ExpertExchange, Microbatches, StreamCommunicator, WeightPrefetch, yield_microbatch,
-};
-pub use request::diffusion::{
-    Branch, BranchSet, BranchSource, Coordinates, ForwardSlot, GuidancePlan, ImageTrajectory,
-    Prefix, PrefixFill, Trajectories,
-};
-pub use request::{Request, RequestPool, RequestProgress};
 pub use runner::ImageSetup;
-pub use runner::attention::{AttentionCapacity, AttentionMetadata, ROW_SECTIONS, pack_rows};
 pub use runner::decoder::{DecodeImage, DecoderRunner};
-pub use runner::denoiser::DenoiserRunner;
-pub use runner::denoiser::image::{
-    ConditionRow, DenoiseRow, DiffusionCapacity, DiffusionShape, DiffusionStorage, IntegrateRow,
-    Predicted,
-};
-pub use runner::denoiser::image_model::ImageDenoiserLayout;
 pub use runner::encoder::{
-    Encoded, EncoderConfig, EncoderGraph, EncoderInfo, EncoderRunner, ImageFacts, ImagePixels,
-    ImagePreparation, LatentEncoder, MAX_PACKED_IMAGES, PreparedImage, PromptVision, TextEncoder,
-    Tower, VisionEncoder, packed_grids, text_capacity,
+    Encoded, EncoderConfig, EncoderInfo, EncoderRunner, ImagePreparation, LatentEncoder,
+    PreparedImage, TextEncoder, Tower, VisionEncoder,
 };
-pub use runner::vision::{
-    BlockPositions, FeatureInjection, FeatureLayout, PositionLayout, VisionBlock,
+pub use stream::{CUDAStream, EventPool, Fill, Issue, RowFill};
+
+pub(crate) use executor::{Batch, Executor, Submission};
+pub(crate) use host::HostTask;
+pub(crate) use request::{RequestPool, RequestProgress};
+pub(crate) use storage::{
+    BlockTables, BufferBinding, LatentPool, LatentStorage, LatentUpdate, OutputBuffer, OutputPool,
+    ProductBuffer, ProductRead, ProductStore,
 };
-pub use runner::{ModelBatch, ModelRunners, TokenSelection};
-pub use sampling::{SamplingPath, TOKEN_CONTINUATION_BIT, TOKEN_VALUE_MASK, finish_token_ids};
-pub use service::{Service, ServiceBackend};
-pub use storage::{
-    AttentionRow, BlockTableStorage, BlockTableUpdate, BlockTables, BufferBinding, BufferPool,
-    CachePlan, CachePlanes, GroupShape, GroupTable, HostBuffers, LatentExport, LatentImport,
-    LatentPool, LatentStorage, LatentUpdate, LogprobLayout, OutputBuffer, OutputPool,
-    OutputStorage, PinnedBlock, PinnedPool, PrefixCache, ProductBuffer, ProductRead, ProductStore,
-    RequestSlots, TablePages, UnitColumn, table_pages,
-};
-pub use stream::{CUDAStream, Deferred, EventPool, Fill, Issue, RowFill, Submitter};
-pub use transfer::{
-    BufferRegistry, CacheImport, CacheImporter, DescriptorGrants, ImportBackend, ImportCopy,
-    PeerStorage, Read, ReadBackend, ReadRegion, ReadReservation, RegisteredBuffer,
-    SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead, Spans, TransferCapacity,
-    TransferPool, TransferRead, TransferTicket, Transport, TransportKind, TransportOptions,
-    Transports, fetch_descriptor, plan_reads,
-};
+pub(crate) use transfer::DescriptorGrants;
+
+/// Lock `mutex`, keeping the state a panicking holder left.
+///
+/// Every build profile sets `panic = "abort"`, so a holder's panic ends the
+/// rank before another thread observes the poisoned lock. Only test builds,
+/// which ignore that setting and unwind, reach the recovery; it returns the
+/// guard rather than raising a second panic in the thread that locks next.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The library's exported entry point, `main(argv, import) -> int`.
 ///

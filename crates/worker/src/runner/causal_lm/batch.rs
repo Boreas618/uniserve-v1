@@ -17,14 +17,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{Batch as BatchPlan, DType, ForwardMode, RequestKey, TensorRef};
 
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, CausalLMRunners};
 use crate::executor::batch::{Batch, Launched};
 use crate::executor::image::ImageParts;
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
@@ -33,7 +33,7 @@ use crate::runner::denoiser::image_model::GridKey;
 use crate::runner::vision::PositionLayout;
 use crate::sampling::SamplingControls;
 use crate::storage::Metadata;
-use crate::storage::{OutputPlacement, ProductBuffer, Scalar};
+use crate::storage::{OutputPlacement, ProductBuffer};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
@@ -73,7 +73,7 @@ pub(crate) struct Opening {
     group: usize,
     /// The group's lane stream.
     stream: Option<Stream>,
-    device: Option<i32>,
+    device: Option<DeviceId>,
     mode: ForwardMode,
     calls: crate::executor::batch::Opening<TokenCall>,
 }
@@ -420,7 +420,7 @@ impl<'a> TokenBatch<'a> {
             .zip(&self.batch.calls)
             .map(|(call, state)| (call.request_key, state.slot))
             .collect();
-        let mut groups: indexmap::IndexMap<(DType, String), Vec<(TensorRef, Device)>> =
+        let mut groups: indexmap::IndexMap<(DType, String), Vec<(TensorRef, MemoryKind)>> =
             indexmap::IndexMap::new();
         for (call, state) in plan.calls.iter().zip(&self.batch.calls) {
             if !call.outputs.is_empty()
@@ -483,9 +483,7 @@ impl<'a> TokenBatch<'a> {
                 .into_iter()
                 .flatten()
             {
-                self.storage
-                    .tensors
-                    .write_scalar(write, Scalar::Int(0), stream)?;
+                self.storage.tensors.write_scalar(write, 0, stream)?;
             }
         }
         Ok(())

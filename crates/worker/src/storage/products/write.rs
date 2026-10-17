@@ -1,8 +1,8 @@
 //! Binding a batch's outputs and writing products.
 
 use super::*;
-use crate::ffi::Device;
-use crate::storage::memory::{StorageView, device_name};
+use crate::ffi::MemoryKind;
+use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::transfer::{Spans, copy_planner};
 use crate::{Error, Result};
@@ -27,7 +27,7 @@ pub struct OutputPlacement<'a> {
 
 /// Production ends a numerical write; commit makes its value discoverable.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum WriteState {
+pub(crate) enum WriteState {
     Reserved,
     Deferred,
     Produced,
@@ -35,7 +35,7 @@ pub enum WriteState {
 }
 
 impl WriteState {
-    pub fn produced(self) -> bool {
+    pub(crate) fn produced(self) -> bool {
         matches!(self, Self::Produced | Self::Committed)
     }
 }
@@ -45,7 +45,7 @@ impl ProductStore {
     /// bound by this call.
     pub fn bind_output_groups(
         &self,
-        groups: &[Vec<(TensorRef, Device)>],
+        groups: &[Vec<(TensorRef, MemoryKind)>],
         placement: OutputPlacement<'_>,
     ) -> Result<Vec<Vec<ProductBuffer>>> {
         let mut state = lock(&self.state);
@@ -70,7 +70,7 @@ impl ProductStore {
     /// allocations, or scalar outputs into relay lanes.
     pub fn bind_outputs(
         &self,
-        bindings: &[(TensorRef, Device)],
+        bindings: &[(TensorRef, MemoryKind)],
         placement: OutputPlacement<'_>,
     ) -> Result<Vec<ProductBuffer>> {
         let mut state = lock(&self.state);
@@ -78,9 +78,9 @@ impl ProductStore {
     }
 
     /// Reserve encoder features in their pool allocations.
-    pub fn reserve_features(
+    pub(crate) fn reserve_features(
         &self,
-        bindings: &[(TensorRef, Device)],
+        bindings: &[(TensorRef, MemoryKind)],
         allocations: &HashMap<BufferId, BufferAllocation>,
         placement: OutputPlacement<'_>,
     ) -> Result<Vec<ProductBuffer>> {
@@ -99,7 +99,7 @@ impl ProductStore {
     pub(super) fn bind_group(
         &self,
         state: &mut State,
-        bindings: &[(TensorRef, Device)],
+        bindings: &[(TensorRef, MemoryKind)],
         placement: OutputPlacement<'_>,
     ) -> Result<Vec<ProductBuffer>> {
         if bindings.is_empty() {
@@ -151,7 +151,7 @@ impl ProductStore {
     pub(super) fn bind_persistent(
         &self,
         state: &mut State,
-        bindings: &[(TensorRef, Device)],
+        bindings: &[(TensorRef, MemoryKind)],
         allocations: &HashMap<BufferId, BufferAllocation>,
         placement: OutputPlacement<'_>,
         feature: bool,
@@ -185,7 +185,7 @@ impl ProductStore {
                     ));
                 }
             }
-            native.push((id, device_name(*device)));
+            native.push((id, *device));
             candidates.push((reference, *device, allocation));
         }
         state.validate_bindings(&native, feature)?;
@@ -213,7 +213,7 @@ impl ProductStore {
                     let mut pool = lock(&self.buffer_pool);
                     let (binding, arena) = pool.bind(
                         allocation,
-                        &device_name(device),
+                        device,
                         shape_bytes(storage_shape, dtype)?,
                         dtype.bytes() as u64,
                     )?;
@@ -271,18 +271,6 @@ impl ProductStore {
         Ok(())
     }
 
-    /// The bound view a producer writes before declaring it produced.
-    pub fn producer_view(&self, buffer: &ProductBuffer) -> Result<StorageView> {
-        let state = lock(&self.state);
-        state.require_buffer(buffer)?;
-        if lock(buffer).state.produced() {
-            return Err(Error::Invariant(
-                "device product was published more than once".into(),
-            ));
-        }
-        Ok(buffer.view())
-    }
-
     /// Publish a value the producer wrote into the bound view: `shape` is
     /// the value's actual shape, fenced behind what the producer `stream`
     /// issued.
@@ -306,7 +294,7 @@ impl ProductStore {
 
     /// Copy `value` into the product's bound view (no copy when `value` is
     /// that view) in the producer `stream`'s order, then fence it.
-    pub fn write(
+    pub(crate) fn write(
         &self,
         buffer: &ProductBuffer,
         value: &StorageView,
@@ -393,7 +381,7 @@ impl ProductStore {
             let destination = Spans::single(view.clone())?;
             let source = Spans::single(value.clone())?;
             match (view.device(), value.device()) {
-                (Device::Cuda(device), _) | (_, Device::Cuda(device)) => {
+                (MemoryKind::Cuda(device), _) | (_, MemoryKind::Cuda(device)) => {
                     if stream.stream().is_none() {
                         return Err(Error::Invalid(
                             "a device product write requires its producer stream".into(),
@@ -432,7 +420,7 @@ impl ProductStore {
         lock(write).defer()
     }
 
-    pub fn validate_writes(&self, writes: &[ProductBuffer]) -> Result<()> {
+    pub(crate) fn validate_writes(&self, writes: &[ProductBuffer]) -> Result<()> {
         lock(&self.state).validate_writes(writes)
     }
 

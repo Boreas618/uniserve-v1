@@ -4,7 +4,7 @@ use super::*;
 use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::transfer::exports::{self, Exports, Location};
-use crate::transfer::{ReadRef, Retirement, Spans, Transports};
+use crate::transfer::{Retirement, Spans, Transports};
 use crate::{Error, Result};
 use std::ops::Range;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ pub struct ProductExport {
 impl ProductExport {
     /// Revoke the locations of an export that is not published, once the
     /// issuer it was made with performed its work.
-    pub fn revoke(self) {
+    pub(crate) fn revoke(self) {
         self.exports.into_iter().for_each(Exports::revoke);
     }
 }
@@ -44,27 +44,20 @@ pub(super) fn same_locations(left: &[Location], right: &[Location]) -> bool {
 
 impl ProductStore {
     /// Retain an export's physical retirement on its source buffer.
-    pub fn retain_export(&self, write: &ProductBuffer, retirement: Arc<Retirement>) -> Result<()> {
+    pub(crate) fn retain_export(
+        &self,
+        write: &ProductBuffer,
+        retirement: Arc<Retirement>,
+    ) -> Result<()> {
         let state = lock(&self.state);
         state.require_buffer(write)?;
         lock(write).retain_export(retirement);
         Ok(())
     }
 
-    /// Retain a read writing into a not-yet-produced buffer.
-    pub fn retain_transfer(
-        &self,
-        write: &ProductBuffer,
-        read: &Arc<crate::transfer::Read>,
-    ) -> Result<()> {
-        let state = lock(&self.state);
-        state.require_buffer(write)?;
-        lock(write).retain_transfer(ReadRef::new(read))
-    }
-
     /// Check that `buffer` registers no export locations other than
     /// `locations`.
-    pub fn validate_exports(&self, buffer: BufferId, locations: &[Location]) -> Result<()> {
+    pub(crate) fn validate_exports(&self, buffer: BufferId, locations: &[Location]) -> Result<()> {
         match lock(&self.exports).get(&buffer) {
             Some(existing) if !same_locations(existing, locations) => Err(Error::Invalid(
                 "buffer already has different export locations".into(),
@@ -75,7 +68,11 @@ impl ProductStore {
 
     /// Record a committed product's export locations, revoked when the
     /// buffer is released. A buffer keeps one set of locations.
-    pub fn register_exports(&self, buffer: BufferId, locations: Vec<Location>) -> Result<()> {
+    pub(crate) fn register_exports(
+        &self,
+        buffer: BufferId,
+        locations: Vec<Location>,
+    ) -> Result<()> {
         let mut exports = lock(&self.exports);
         if let Some(existing) = exports.get(&buffer) {
             if !same_locations(existing, &locations) {
@@ -295,7 +292,7 @@ impl ProductStore {
 
     /// Revoke every registered export location (shutdown); the transports
     /// retire them once their readers finished.
-    pub fn revoke_exports(&self) -> Result<()> {
+    pub(crate) fn revoke_exports(&self) -> Result<()> {
         let revoked: Vec<_> = lock(&self.exports)
             .drain()
             .flat_map(|(_, locations)| locations)

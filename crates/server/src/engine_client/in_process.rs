@@ -138,21 +138,6 @@ impl EngineClient {
         Self::from_cores(cores)
     }
 
-    /// Starts an engine over an executor and explicit command waker.
-    pub fn connect_with_executor_and_waker(
-        config: uniserve_engine::EngineConfig,
-        executor: Box<dyn Executor>,
-        command_waker: uniserve_core::CommandWaker,
-    ) -> Result<Self> {
-        let core =
-            EngineCore::with_executor_and_waker(config, executor, command_waker).map_err(|e| {
-                Error::ClientClosed {
-                    message: format!("failed to start the UniServe engine: {e:?}"),
-                }
-            })?;
-        Self::from_cores(vec![core])
-    }
-
     /// Wraps initialized engine cores with request tracking and periodic
     /// statistics export.
     ///
@@ -261,15 +246,6 @@ impl EngineClient {
     /// Returns the worker's effective model dtype.
     pub fn model_dtype(&self) -> ModelDtype {
         self.first().model_dtype()
-    }
-
-    /// Returns the allocatable paged-KV units the schedulers plan against,
-    /// summed over the replicas.
-    pub fn total_cache_units(&self) -> u64 {
-        self.cores
-            .iter()
-            .map(|core| u64::from(core.info().cache_usable_units()))
-            .sum()
     }
 
     /// Returns whether the engine can accept requests: whether any replica's

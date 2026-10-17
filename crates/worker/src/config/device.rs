@@ -7,44 +7,55 @@
 
 use std::collections::BTreeMap;
 
-use super::DescriptorError;
+use uniserve_cuda::DeviceId;
 
-/// A device a rank computes on.
+use super::DescriptorError;
+use crate::ffi::MemoryKind;
+
+/// A device a rank computes on, parsed once from the launch descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Device {
     Cpu,
-    /// A CUDA ordinal within the process's visible devices.
-    Cuda(i32),
+    /// A CUDA device within the process's visible devices.
+    Cuda(DeviceId),
 }
 
 impl Device {
     /// Parse a torch device name. `option` names the launch setting in errors.
-    pub fn parse(value: &str, option: &str) -> Result<Self, DescriptorError> {
+    pub(crate) fn parse(value: &str, option: &str) -> Result<Self, DescriptorError> {
         let invalid =
             || DescriptorError::new(format!("{option} must name a torch device, got {value:?}"));
         match value.trim() {
             "cpu" => Ok(Self::Cpu),
-            "cuda" => Ok(Self::Cuda(0)),
+            "cuda" => Ok(Self::Cuda(DeviceId(0))),
             name => {
                 let index = name.strip_prefix("cuda:").ok_or_else(invalid)?;
                 let index = index.parse::<i32>().map_err(|_| invalid())?;
                 if index < 0 {
                     return Err(invalid());
                 }
-                Ok(Self::Cuda(index))
+                Ok(Self::Cuda(DeviceId(index)))
             }
         }
     }
 
-    pub fn is_cuda(self) -> bool {
+    pub(crate) fn is_cuda(self) -> bool {
         matches!(self, Self::Cuda(_))
     }
 
-    /// The CUDA ordinal, if this is a CUDA device.
-    pub fn cuda_index(self) -> Option<i32> {
+    /// The CUDA device, if this is one.
+    pub(crate) fn cuda(self) -> Option<DeviceId> {
         match self {
             Self::Cpu => None,
-            Self::Cuda(index) => Some(index),
+            Self::Cuda(device) => Some(device),
+        }
+    }
+
+    /// The memory a binding on this device computes in.
+    pub(crate) fn memory(self) -> MemoryKind {
+        match self {
+            Self::Cpu => MemoryKind::Host,
+            Self::Cuda(device) => MemoryKind::Cuda(device),
         }
     }
 }
@@ -53,7 +64,7 @@ impl std::fmt::Display for Device {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cpu => formatter.write_str("cpu"),
-            Self::Cuda(index) => write!(formatter, "cuda:{index}"),
+            Self::Cuda(device) => write!(formatter, "{device}"),
         }
     }
 }
@@ -62,7 +73,10 @@ impl std::fmt::Display for Device {
 ///
 /// The only key is `tower=text:<device>;gen:<device>`. The text tower must
 /// be the rank's device and the generation tower a different one.
-pub fn generation_device(mesh: &str, device: Device) -> Result<Option<Device>, DescriptorError> {
+pub(crate) fn generation_device(
+    mesh: &str,
+    device: Device,
+) -> Result<Option<Device>, DescriptorError> {
     if mesh.trim().is_empty() {
         return Ok(None);
     }
@@ -128,11 +142,11 @@ mod tests {
     fn bare_cuda_names_the_first_visible_device() {
         assert_eq!(
             Device::parse("cuda", "--device").ok(),
-            Some(Device::Cuda(0))
+            Some(Device::Cuda(DeviceId(0)))
         );
         assert_eq!(
             Device::parse("cuda:3", "--device").ok(),
-            Some(Device::Cuda(3))
+            Some(Device::Cuda(DeviceId(3)))
         );
         assert_eq!(Device::parse("cpu", "--device").ok(), Some(Device::Cpu));
         assert!(Device::parse("tpu", "--device").is_err());
@@ -141,10 +155,10 @@ mod tests {
 
     #[test]
     fn tower_placement_requires_a_distinct_generation_device() {
-        let text = Device::Cuda(0);
+        let text = Device::Cuda(DeviceId(0));
         assert_eq!(
             generation_device("tower=text:cuda:0;gen:cuda:1", text).ok(),
-            Some(Some(Device::Cuda(1)))
+            Some(Some(Device::Cuda(DeviceId(1))))
         );
         assert!(generation_device("tower=gen:cuda:0", text).is_err());
         assert!(generation_device("tower=text:cuda:1;gen:cuda:2", text).is_err());

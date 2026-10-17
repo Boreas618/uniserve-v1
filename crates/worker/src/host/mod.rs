@@ -6,4 +6,4 @@ pub(crate) mod mux;
 pub(crate) mod reader;
 pub(crate) mod task;
 
-pub use lane::{HostAction, HostLane, HostTask};
+pub(crate) use lane::{HostAction, HostLane, HostTask};

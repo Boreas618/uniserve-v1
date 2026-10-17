@@ -1,8 +1,8 @@
 //! Products imported from other ranks and workers.
 
 use super::*;
-use crate::ffi::Device;
-use crate::storage::memory::{StorageView, device_name, parse_dtype};
+use crate::ffi::{DType, MemoryKind};
+use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::transfer::{ReadRef, Spans, Transports, fetch};
 use crate::{Error, Result};
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use uniserve_ipc::{TensorRef, TensorTransfer, subtract_region};
 
 pub(super) struct StoredImport {
-    pub(super) state: Mutex<TensorImport<ProductBuffer, ReadRef>>,
+    pub(super) state: Mutex<TensorImport>,
     pub(super) destination: StorageView,
     pub(super) metadata: Option<Metadata>,
 }
@@ -23,7 +23,7 @@ pub(super) struct StoredImport {
 pub(super) struct ImportHandle(pub(super) Arc<StoredImport>);
 
 impl Deref for ImportHandle {
-    type Target = Mutex<TensorImport<ProductBuffer, ReadRef>>;
+    type Target = Mutex<TensorImport>;
 
     fn deref(&self) -> &Self::Target {
         &self.0.state
@@ -46,15 +46,15 @@ pub(super) fn import_read(imported: &ImportHandle) -> Arc<ProductRead> {
 }
 
 /// Missing coverage materialized once and shared by its concurrent readers.
-pub(crate) struct TensorImport<B, T> {
-    pub buffer: B,
-    pub tickets: Vec<T>,
+pub(crate) struct TensorImport {
+    pub buffer: ProductBuffer,
+    pub tickets: Vec<ReadRef>,
     pub users: usize,
     pub committed: bool,
 }
 
-impl<B, T> TensorImport<B, T> {
-    pub(crate) fn new(buffer: B, tickets: Vec<T>, committed: bool) -> Self {
+impl TensorImport {
+    pub(crate) fn new(buffer: ProductBuffer, tickets: Vec<ReadRef>, committed: bool) -> Self {
         Self {
             buffer,
             tickets,
@@ -63,10 +63,7 @@ impl<B, T> TensorImport<B, T> {
         }
     }
 
-    pub(crate) fn share<C>(&mut self)
-    where
-        B: Deref<Target = Mutex<Buffer<T, C>>>,
-    {
+    pub(crate) fn share(&mut self) {
         lock(&self.buffer).readers += 1;
         self.users += 1;
     }
@@ -84,7 +81,7 @@ impl ProductStore {
         &self,
         reference: &TensorRef,
         tensor: &TensorTransfer,
-        device: Device,
+        device: MemoryKind,
         transports: &Transports,
         placement: OutputPlacement<'_>,
         metadata: Option<Metadata>,
@@ -133,7 +130,7 @@ impl ProductStore {
                         "product import requires a live published generation".into(),
                     ));
                 }
-                if device_name(device) != value.device || views.metadata != metadata {
+                if device != value.device || views.metadata != metadata {
                     return Err(Error::Invalid(
                         "product import conflicts with resident ownership".into(),
                     ));
@@ -204,7 +201,7 @@ impl ProductStore {
             .locations
             .first()
             .ok_or_else(|| Error::Invalid("tensor transfer has no locations".into()))
-            .and_then(|location| parse_dtype(&location.dtype))?;
+            .and_then(|location| DType::parse(&location.dtype))?;
         if destination.dtype() != source_dtype {
             if existing.is_none() {
                 lock(&buffer).released = true;
@@ -281,13 +278,6 @@ impl ProductStore {
         lease.imported.clone().ok_or_else(|| {
             Error::Invariant("closed or ordinary tensor read is not an import".into())
         })
-    }
-
-    /// Order `stream` after an import's reads (which must be ready) and its
-    /// buffer's producer, propagating read failures.
-    pub fn wait_import(&self, read: &ProductRead, stream: impl Issue) -> Result<()> {
-        let state = lock(&self.state);
-        Self::wait_imported(&state, read, stream)
     }
 
     pub(super) fn wait_imported(

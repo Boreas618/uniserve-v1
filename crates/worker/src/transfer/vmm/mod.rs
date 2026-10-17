@@ -13,13 +13,13 @@ mod handle;
 mod peer;
 pub(crate) mod pool;
 
-pub use grants::{DescriptorGrants, fetch_descriptor};
-pub use peer::{PeerExchange, PeerStorage};
+pub(crate) use grants::DescriptorGrants;
+pub(crate) use peer::PeerStorage;
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use uniserve_cuda::{
     DeviceGuard, DeviceId, Event, IpcEventHandle, PeerMapping, ShareableHandle, SourceOrder,
@@ -31,11 +31,11 @@ use super::backing::{CudaSource, SharedPool, TransportBuffer};
 use super::export_table::ExportTable;
 use super::read::{NativeRead, ReadCall};
 use super::transport::{Staged, read_destination};
-use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Notify, Spans, copy_planner};
-use crate::ffi::{Backing, Device};
-use crate::storage::memory::{Memory, StorageView, parse_dtype};
+use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Spans, copy_planner};
+use crate::ffi::{Backing, DType, MemoryKind};
+use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Issue;
-use crate::{Error, EventPool, Result};
+use crate::{Error, EventPool, Result, lock};
 use handle::AllocationHandle;
 use pool::VmmPool;
 
@@ -74,13 +74,9 @@ pub(crate) struct CudaExports {
     pub(crate) slot: usize,
     cross_host: bool,
     pool_bytes: usize,
-    pools: Mutex<HashMap<i32, Arc<DevicePool>>>,
+    pools: Mutex<HashMap<DeviceId, Arc<DevicePool>>>,
     grants: Mutex<Option<Arc<DescriptorGrants>>>,
     failed: Mutex<Option<FailedExport>>,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl CudaExports {
@@ -110,7 +106,7 @@ impl CudaExports {
 
     /// Device spans of one allocation sharing one stride.
     pub(crate) fn validate(source: &Spans) -> Result<()> {
-        let Device::Cuda(_) = source.device() else {
+        let MemoryKind::Cuda(_) = source.device() else {
             return Err(Error::Invalid(
                 "cuda_vmm transport requires a CUDA tensor".into(),
             ));
@@ -133,7 +129,7 @@ impl CudaExports {
         source: &Spans,
         issue: impl Issue,
         consumers: &[usize],
-        bytes: ByteReservation<Notify>,
+        bytes: ByteReservation,
         events: &EventPool,
         locate: impl FnOnce(TransferTransport) -> Result<Locator>,
     ) -> Result<Exported> {
@@ -142,7 +138,7 @@ impl CudaExports {
                 "a device export requires its producer stream".into(),
             ));
         }
-        let Device::Cuda(device) = source.device() else {
+        let MemoryKind::Cuda(device) = source.device() else {
             return Err(Error::Invalid(
                 "cuda_vmm transport requires a CUDA tensor".into(),
             ));
@@ -168,7 +164,7 @@ impl CudaExports {
                     if let ShareableHandle::Descriptor(fd) = shareable {
                         state.descriptor = Some(fd);
                     }
-                    (source.clone(), handle, memory.len() as u64, offset)
+                    (source.clone(), handle, memory.bytes() as u64, offset)
                 }
                 None => {
                     let pool = self.pool(device)?;
@@ -180,7 +176,7 @@ impl CudaExports {
                     let memory = Arc::clone(lock(&pool.pool).backing()?);
                     // Readers map the whole allocation, whose length the
                     // driver rounded up to its granularity.
-                    let storage_bytes = memory.len() as u64;
+                    let storage_bytes = memory.bytes() as u64;
                     let backing = memory as Arc<dyn Backing>;
                     let shape: Vec<i64> =
                         source.shape().iter().map(|&extent| extent as i64).collect();
@@ -331,7 +327,7 @@ impl CudaExports {
         state.bytes.take().map_or(Ok(()), ByteReservation::release)
     }
 
-    fn pool(&self, device: i32) -> Result<Arc<DevicePool>> {
+    fn pool(&self, device: DeviceId) -> Result<Arc<DevicePool>> {
         if let Some(pool) = lock(&self.pools).get(&device) {
             return Ok(Arc::clone(pool));
         }
@@ -349,7 +345,7 @@ impl CudaExports {
             ShareableHandle::Fabric(_) => None,
         };
         let address = memory.address() as usize;
-        let capacity = memory.len();
+        let capacity = memory.bytes();
         // SAFETY: the pool retains `memory`, which maps `capacity` writable
         // bytes at `address`; producer streams outlive the transport.
         let pool = unsafe { VmmPool::new(memory, device, address, capacity) }?;
@@ -454,7 +450,7 @@ impl CudaExports {
         &self,
         source: &WorkerEndpoint,
         locator: &Locator,
-        device: Device,
+        device: MemoryKind,
         destination: Option<&Spans>,
         region: Option<&[Range<u64>]>,
     ) -> Result<ReadCall> {
@@ -472,7 +468,7 @@ impl CudaExports {
                 "a device product crosses hosts only as a fabric handle".into(),
             ));
         }
-        if !matches!(device, Device::Cuda(_)) {
+        if !matches!(device, MemoryKind::Cuda(_)) {
             return Err(Error::Invalid(
                 "CUDA VMM destination must be a CUDA device".into(),
             ));
@@ -509,7 +505,7 @@ impl Drop for CudaExports {
 #[derive(Default)]
 struct ExportState {
     /// The export's bytes, which its backing takes once constructed.
-    bytes: Option<ByteReservation<Notify>>,
+    bytes: Option<ByteReservation>,
     event: Option<Arc<Event>>,
     copied: Option<Spans>,
     allocation: Option<(SharedPool, Arc<super::vmm::pool::PoolChunk>)>,
@@ -564,7 +560,7 @@ struct Imported {
     spans: Spans,
     event: Option<Arc<Event>>,
     acknowledgment: Option<u64>,
-    device: i32,
+    device: DeviceId,
 }
 
 /// One read of a CUDA VMM export.
@@ -579,11 +575,6 @@ pub(crate) struct CudaRead {
     pub(crate) same_node: bool,
 }
 
-/// The CUDA ordinal of a locator's `cuda:<index>` device, if any.
-fn locator_device(locator: &Locator) -> Option<i32> {
-    locator.device.strip_prefix("cuda:")?.parse().ok()
-}
-
 impl CudaRead {
     pub(crate) fn destination(&self) -> &Spans {
         &self.destination
@@ -591,12 +582,12 @@ impl CudaRead {
 
     pub(crate) fn run(&self, read: &NativeRead) -> Result<()> {
         read.read.require_active()?;
-        let Device::Cuda(device) = self.destination.device() else {
+        let MemoryKind::Cuda(device) = self.destination.device() else {
             return Err(Error::Invalid(
                 "CUDA VMM destination must be a CUDA device".into(),
             ));
         };
-        let _guard = DeviceGuard::new(DeviceId(device))?;
+        let _guard = DeviceGuard::new(device)?;
 
         let (mut mapped, mut event, acknowledgment, import_device) = if self.local {
             let (buffer, grant) = ExportTable::acquire_read(&self.locator)?;
@@ -607,7 +598,7 @@ impl CudaRead {
             // wait on (the driver faults), so treat that device as the
             // import device.
             let source = match spans.device() {
-                Device::Cuda(source) => source,
+                MemoryKind::Cuda(source) => source,
                 _ => device,
             };
             (spans, buffer.event(), None, source)
@@ -648,7 +639,7 @@ impl CudaRead {
     /// Map the exported allocation on a device that can read it and view
     /// its spans. Returns the spans, the producer's ready event, the
     /// address of this reader's acknowledgment word and the import device.
-    fn import(&self, device: i32) -> Result<Imported> {
+    fn import(&self, device: DeviceId) -> Result<Imported> {
         let TransferTransport::CudaVmm {
             endpoint,
             export_id,
@@ -669,16 +660,16 @@ impl CudaRead {
 
         let mut import_device = device;
         if self.same_node
-            && let Some(source) = locator_device(&self.locator)
+            && let MemoryKind::Cuda(source) = MemoryKind::from_locator(&self.locator.device)
             && source != device
-            && !DeviceId(device).can_access_peer(DeviceId(source))?
+            && !device.can_access_peer(source)?
         {
             import_device = source;
         }
 
         let handle = AllocationHandle::decode(allocation_handle)?.import(endpoint, export_id)?;
         let mapping = Memory::mapped(PeerMapping::import(
-            DeviceId(import_device),
+            import_device,
             &handle,
             *storage_size_bytes as usize,
         )?);
@@ -686,7 +677,7 @@ impl CudaRead {
         // longer needed.
         drop(handle);
 
-        let dtype = parse_dtype(&self.locator.dtype)?;
+        let dtype = DType::parse(&self.locator.dtype)?;
         if storage_offsets_bytes
             .iter()
             .any(|offset| offset % dtype.bytes() as u64 != 0)
@@ -731,7 +722,7 @@ impl CudaRead {
                 Error::Invalid("CUDA IPC event handle must contain 64 bytes".into())
             })?;
             Some(Arc::new(Event::open_ipc(
-                DeviceId(import_device),
+                import_device,
                 &IpcEventHandle(bytes),
             )?))
         };
@@ -745,9 +736,15 @@ impl CudaRead {
 
     /// Write this reader's acknowledgment word on the import device and wait
     /// for it, for reads whose copy runs on another device.
-    fn acknowledge(&self, read: &NativeRead, device: i32, word: u64, state: u32) -> Result<()> {
-        let _device = DeviceGuard::new(DeviceId(device))?;
-        let stream = Stream::new(DeviceId(device))?;
+    fn acknowledge(
+        &self,
+        read: &NativeRead,
+        device: DeviceId,
+        word: u64,
+        state: u32,
+    ) -> Result<()> {
+        let _device = DeviceGuard::new(device)?;
+        let stream = Stream::new(device)?;
         // SAFETY: the word lies in the mapping the read's source spans retain.
         unsafe { memset_d32(word, state, 1, &stream) }?;
         if let Err(error) = stream.synchronize() {

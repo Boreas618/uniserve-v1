@@ -1,23 +1,21 @@
 //! Cache import destinations and conversion workspaces retained through physical reads.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use uniserve_ipc::{BufferId, RequestKey};
 
-use crate::{Completion, Error, Result};
+use super::read::ReadRef;
+use crate::{Error, Result};
 
 mod backend;
 mod copy;
 
-pub(crate) use backend::{CacheImportBackend, ImportTask, Retired};
-pub use backend::{ImportEntry, ImportWorkspace};
-pub use copy::{ImportBackend, ImportCopy};
+pub(crate) use backend::{ImportCopy, ImportEntry, ImportWorkspace, Retired};
 
-struct ImportState<T, W> {
-    reads: Vec<Arc<T>>,
-    workspace: Option<Arc<W>>,
+struct ImportState {
+    reads: Vec<Arc<ReadRef>>,
+    workspace: Option<Arc<ImportWorkspace>>,
     started: bool,
     finished: bool,
     drained: bool,
@@ -26,15 +24,15 @@ struct ImportState<T, W> {
 }
 
 /// One destination held until adoption or abandonment and all physical access
-/// finishes. T borrows a read's retirement; W is the import workspace.
-pub struct CacheImport<T, W> {
-    pub buffer: BufferId,
-    pub request_pool_idx: usize,
-    state: Mutex<ImportState<T, W>>,
+/// finishes: the reads writing it and the workspace converting into it.
+pub(crate) struct CacheImport {
+    pub(crate) buffer: BufferId,
+    pub(crate) request_pool_idx: usize,
+    state: Mutex<ImportState>,
 }
 
-impl<T, W> CacheImport<T, W> {
-    pub fn new(buffer: BufferId, request_pool_idx: usize, copy: bool) -> Self {
+impl CacheImport {
+    pub(crate) fn new(buffer: BufferId, request_pool_idx: usize, copy: bool) -> Self {
         Self {
             buffer,
             request_pool_idx,
@@ -50,11 +48,11 @@ impl<T, W> CacheImport<T, W> {
         }
     }
 
-    pub fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         self.lock().cancelled
     }
 
-    pub fn released(&self) -> bool {
+    pub(crate) fn released(&self) -> bool {
         self.lock().released
     }
 
@@ -83,38 +81,34 @@ impl<T, W> CacheImport<T, W> {
         }
     }
 
-    pub fn workspace(&self) -> Option<Arc<W>> {
-        self.lock().workspace.clone()
-    }
-
     /// Register every started read, including one racing cancellation. The
     /// caller cancels it after unlocking when this returns true.
-    pub fn retain(&self, read: Arc<T>) -> bool {
+    pub(crate) fn retain(&self, read: Arc<ReadRef>) -> bool {
         let mut state = self.lock();
         state.reads.push(read);
         state.cancelled
     }
 
-    fn lock(&self) -> MutexGuard<'_, ImportState<T, W>> {
+    fn lock(&self) -> MutexGuard<'_, ImportState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-struct PoolState<I, W> {
-    imports: HashMap<BufferId, I>,
-    available: VecDeque<Arc<W>>,
+struct PoolState {
+    imports: HashMap<BufferId, ImportEntry>,
+    available: VecDeque<Arc<ImportWorkspace>>,
     closed: bool,
 }
 
-/// Share a bounded set of import workspaces among host tasks.
-/// I retains an import owner and dereferences its stable state.
-pub struct CacheImporter<I, W> {
-    state: Mutex<PoolState<I, W>>,
+/// Share a bounded set of import workspaces among host tasks, and retain
+/// every reserved import until its physical accesses ended.
+pub(crate) struct CacheImporter {
+    state: Mutex<PoolState>,
     available: Condvar,
 }
 
-impl<I, W> CacheImporter<I, W> {
-    pub fn new(workspaces: Vec<Arc<W>>) -> Self {
+impl CacheImporter {
+    pub(crate) fn new(workspaces: Vec<Arc<ImportWorkspace>>) -> Self {
         Self {
             state: Mutex::new(PoolState {
                 imports: HashMap::new(),
@@ -125,27 +119,22 @@ impl<I, W> CacheImporter<I, W> {
         }
     }
 
-    pub fn require_retired(&self) -> Result<()> {
+    pub(crate) fn require_retired(&self) -> Result<()> {
         if !self.lock().imports.is_empty() {
             return Err(Error::Resource("cache imports still own physical storage"));
         }
         Ok(())
     }
 
-    fn lock(&self) -> MutexGuard<'_, PoolState<I, W>> {
+    fn lock(&self) -> MutexGuard<'_, PoolState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
 
-impl<T, I, W> CacheImporter<I, W>
-where
-    I: Deref<Target = CacheImport<T, W>>,
-{
     /// Reserve native cache intervals and register their owner in one critical
     /// section. The reservation callback performs no foreign or device work.
-    pub fn reserve(
+    pub(crate) fn reserve(
         &self,
-        write: I,
+        write: ImportEntry,
         reserve_destination: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let mut state = self.lock();
@@ -159,16 +148,9 @@ where
         Ok(())
     }
 
-    pub fn owns(&self, write: &CacheImport<T, W>) -> bool {
-        self.lock()
-            .imports
-            .get(&write.buffer)
-            .is_some_and(|active| std::ptr::eq(&**active, write))
-    }
-
     /// The backend first observes successful copy-task completion. Physical
     /// transport accesses may outlive that result and continue to hold pages.
-    pub fn adopt(&self, write: &CacheImport<T, W>) -> Result<()> {
+    pub(crate) fn adopt(&self, write: &CacheImport) -> Result<()> {
         let state = self.lock();
         let owned = state
             .imports
@@ -186,7 +168,7 @@ where
 
     /// Wait only on an import lane, never on the request execution thread.
     /// Cancellation and shutdown wake blocked workspace borrowers.
-    pub fn acquire(&self, write: &CacheImport<T, W>) -> Result<Arc<W>> {
+    pub(crate) fn acquire(&self, write: &CacheImport) -> Result<Arc<ImportWorkspace>> {
         let mut state = self.lock();
         loop {
             if state.closed || write.cancelled() {
@@ -203,14 +185,14 @@ where
         }
     }
 
-    pub fn require_active(&self, write: &CacheImport<T, W>) -> Result<()> {
+    pub(crate) fn require_active(&self, write: &CacheImport) -> Result<()> {
         if self.lock().closed || write.cancelled() {
             return Err(Error::Resource("cache import was cancelled"));
         }
         Ok(())
     }
 
-    pub fn abandon(&self, write: &CacheImport<T, W>) -> Vec<Arc<T>> {
+    pub(crate) fn abandon(&self, write: &CacheImport) -> Vec<Arc<ReadRef>> {
         let state = self.lock();
         let reads = if state
             .imports
@@ -226,26 +208,30 @@ where
         reads
     }
 
-    pub fn release(&self, buffers: &HashSet<BufferId>) -> Vec<Arc<T>> {
+    pub(crate) fn release(&self, buffers: &HashSet<BufferId>) -> Vec<Arc<ReadRef>> {
         self.cancel_matching(|buffer| buffers.contains(&buffer), false)
     }
 
-    pub fn cancel_requests(
+    pub(crate) fn cancel_requests(
         &self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
-    ) -> Vec<Arc<T>> {
+    ) -> Vec<Arc<ReadRef>> {
         self.cancel_matching(
             |buffer| requests.contains(&buffer.owner) && !retained.contains(&buffer),
             false,
         )
     }
 
-    pub fn stop(&self) -> Vec<Arc<T>> {
+    pub(crate) fn stop(&self) -> Vec<Arc<ReadRef>> {
         self.cancel_matching(|_| true, true)
     }
 
-    fn cancel_matching(&self, selected: impl Fn(BufferId) -> bool, close: bool) -> Vec<Arc<T>> {
+    fn cancel_matching(
+        &self,
+        selected: impl Fn(BufferId) -> bool,
+        close: bool,
+    ) -> Vec<Arc<ReadRef>> {
         let mut state = self.lock();
         state.closed |= close;
         let reads = state
@@ -261,10 +247,7 @@ where
 
     /// Return retired owners for completion notification after unlocking.
     /// Failed or cancelled physical completions continue to retain their reads.
-    pub fn reap<E, C>(&self) -> Vec<I>
-    where
-        T: Deref<Target = Completion<E, C>>,
-    {
+    pub(crate) fn reap(&self) -> Vec<ImportEntry> {
         let mut retired_reads = Vec::new();
         let mut retired = Vec::new();
         {
@@ -304,7 +287,7 @@ where
     }
 }
 
-fn cancel<T, W>(write: &CacheImport<T, W>) -> Vec<Arc<T>> {
+fn cancel(write: &CacheImport) -> Vec<Arc<ReadRef>> {
     let mut state = write.lock();
     state.cancelled = true;
     state.released = true;

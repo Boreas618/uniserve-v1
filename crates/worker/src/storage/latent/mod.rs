@@ -19,10 +19,9 @@ mod memory;
 mod pages;
 
 pub use memory::LatentStorage;
-pub use pages::{LatentExport, LatentImport, LatentPool, LatentUpdate};
+pub(crate) use pages::{LatentExport, LatentImport, LatentPool, LatentUpdate};
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use uniserve_cuda::{CopyBatch, SourceOrder};
 
 use uniserve_ipc::{BufferId, LatentParams, RequestKey};
@@ -31,12 +30,7 @@ use crate::executor::batch::StreamOrder;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::storage::memory::StorageView;
 use crate::stream::Issue;
-use crate::transfer::{ReadRef, Retirement};
 use crate::{Error, Result};
-
-/// The latent pool of a rank: imports retain their transport reads,
-/// exports their locations' retirements.
-pub(crate) type Pool = LatentPool<Arc<LatentImport<ReadRef>>, Arc<LatentExport<Arc<Retirement>>>>;
 
 /// A trajectory's place in the step workspace for one call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,13 +52,13 @@ impl Scratch {
 
 /// The image latent cache of a rank: its pool's pages and their memory.
 pub(crate) struct LatentCache {
-    pub(crate) pool: Pool,
+    pub(crate) pool: LatentPool,
     pub(crate) storage: LatentStorage,
     order: StreamOrder,
 }
 
 impl LatentCache {
-    pub(crate) fn new(pool: Pool, storage: LatentStorage) -> Self {
+    pub(crate) fn new(pool: LatentPool, storage: LatentStorage) -> Self {
         Self {
             pool,
             storage,

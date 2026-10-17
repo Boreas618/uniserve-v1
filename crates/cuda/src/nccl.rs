@@ -1,4 +1,4 @@
-//! Stream-ordered NCCL communicators and NCCL-allocated buffers.
+//! Stream-ordered NCCL communicators.
 
 mod ffi;
 
@@ -6,8 +6,7 @@ use std::ffi::c_void;
 
 use ffi::{Handle, RawUniqueId, api};
 
-use crate::driver::in_context;
-use crate::{DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
+use crate::{DeviceId, Error, PrimaryContext, Result, Stream};
 
 /// The 128-byte rendezvous token every rank of a communicator initializes
 /// with. Rank 0 creates it and the worker distributes it to its peers.
@@ -88,8 +87,7 @@ impl CtaPolicy {
 /// order on every rank; group several with [`group`].
 ///
 /// Release is explicit because it is collective: [`Communicator::destroy`]
-/// deregisters windows and destroys the communicator once every rank's work
-/// retired, and [`Communicator::abort`] tears it down locally after a
+/// destroys the communicator once every rank's work retired, and [`Communicator::abort`] tears it down locally after a
 /// failure. Dropping a communicator that was neither destroyed nor aborted
 /// leaks it deliberately: an implicit destroy could wait forever for peers
 /// that never arrive, and an abort could free resources that captured graphs
@@ -99,13 +97,6 @@ pub struct Communicator {
     context: PrimaryContext,
     rank: i32,
     size: i32,
-    windows: Vec<Window>,
-}
-
-struct Window {
-    address: u64,
-    bytes: usize,
-    raw: Handle,
 }
 
 // SAFETY: a communicator may be used from any one thread at a time; NCCL
@@ -157,7 +148,6 @@ impl Communicator {
             context,
             rank,
             size,
-            windows: Vec::new(),
         })
     }
 
@@ -377,48 +367,7 @@ impl Communicator {
         api.check(status, "ncclRecv")
     }
 
-    /// Registers `[address, address + bytes)` as a symmetric window
-    /// (`NCCL_WIN_COLL_SYMMETRIC`). Registering the same range twice is a
-    /// no-op. Windows are deregistered by [`Self::destroy`].
-    ///
-    /// # Safety
-    /// The range is VMM-backed (for example a [`Buffer`]) and stays allocated
-    /// until the communicator is destroyed or aborted. Every rank registers
-    /// matching windows in the same order, outside graph capture.
-    pub unsafe fn register_window(&mut self, address: u64, bytes: usize) -> Result<()> {
-        const NCCL_WIN_COLL_SYMMETRIC: i32 = 0x01;
-
-        if self
-            .windows
-            .iter()
-            .any(|window| window.address == address && window.bytes == bytes)
-        {
-            return Ok(());
-        }
-        let api = api()?;
-        let register = api.window_register.clone()?;
-        let mut raw = std::ptr::null_mut();
-        // SAFETY: the caller guarantees the range; NCCL writes one window.
-        let status = unsafe {
-            register(
-                self.raw,
-                pointer(address),
-                bytes,
-                &mut raw,
-                NCCL_WIN_COLL_SYMMETRIC,
-            )
-        };
-        api.check(status, "ncclCommWindowRegister")?;
-
-        self.windows.push(Window {
-            address,
-            bytes,
-            raw,
-        });
-        Ok(())
-    }
-
-    /// Deregisters every window and destroys the communicator. Collective:
+    /// Destroys the communicator. Collective:
     /// every rank calls it after all work using the communicator, including
     /// graphs that captured it, has retired. On failure the communicator's
     /// remaining resources are leaked.
@@ -426,20 +375,12 @@ impl Communicator {
         let api = api()?;
         let _guard = self.context.enter()?;
 
-        for window in &self.windows {
-            let deregister = api.window_deregister.clone()?;
-            // SAFETY: the window was registered on this communicator.
-            api.check(
-                unsafe { deregister(self.raw, window.raw) },
-                "ncclCommWindowDeregister",
-            )?;
-        }
         // SAFETY: the communicator is owned and destroyed once.
         api.check(unsafe { (api.comm_destroy)(self.raw) }, "ncclCommDestroy")
     }
 
     /// Tears down this rank's communicator without waiting for peers, aborting
-    /// its pending operations. Windows need no deregistration.
+    /// its pending operations.
     pub fn abort(self) -> Result<()> {
         let api = api()?;
         let _guard = self.context.enter()?;
@@ -465,69 +406,4 @@ pub fn group<R>(submit: impl FnOnce() -> Result<R>) -> Result<R> {
     let value = result?;
     ended?;
     Ok(value)
-}
-
-/// Device memory from `ncclMemAlloc`: VMM-backed and suitable for symmetric
-/// window registration.
-///
-/// Dropping queues `ncclMemFree` to the [`crate::reclaim`]er; the owner
-/// guarantees that no device work and no live window still use the buffer.
-pub struct Buffer {
-    context: PrimaryContext,
-    address: u64,
-    bytes: usize,
-}
-
-impl Buffer {
-    pub fn new(device: DeviceId, bytes: usize) -> Result<Self> {
-        if bytes == 0 {
-            return Err(Error::invalid("an allocation needs a positive length"));
-        }
-        let api = api()?;
-        let allocate = api.mem_alloc.clone()?;
-        // Fail before allocating if the release entry point is missing.
-        api.mem_free.clone()?;
-        let context = PrimaryContext::retain(device)?;
-        let _guard = context.enter()?;
-
-        let mut raw = std::ptr::null_mut();
-        // SAFETY: NCCL writes the base of a new allocation on the current device.
-        api.check(unsafe { allocate(&mut raw, bytes) }, "ncclMemAlloc")?;
-
-        Ok(Self {
-            context,
-            address: raw as u64,
-            bytes,
-        })
-    }
-
-    pub fn device(&self) -> DeviceId {
-        self.context.device()
-    }
-
-    pub fn address(&self) -> u64 {
-        self.address
-    }
-
-    pub fn len(&self) -> usize {
-        self.bytes
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        let (context, address) = (self.context.clone(), self.address);
-        reclaim::defer(move || {
-            let api = api()?;
-            let free = api.mem_free.clone()?;
-            in_context(context.raw(), |_| {
-                // SAFETY: the allocation is owned and freed once.
-                api.check(unsafe { free(pointer(address)) }, "ncclMemFree")
-            })
-        });
-    }
 }

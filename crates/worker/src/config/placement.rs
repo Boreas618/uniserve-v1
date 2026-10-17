@@ -29,7 +29,7 @@ use crate::{Error, Result};
 /// A model capability, reported as the tag of the base class a call's
 /// module is an instance of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Capability {
+pub(crate) enum Capability {
     CausalLm,
     DiffusionLm,
     Denoiser,
@@ -48,7 +48,7 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::CausalLm,
         Self::DiffusionLm,
         Self::Denoiser,
@@ -66,7 +66,7 @@ impl Capability {
         Self::AudioDecoder,
     ];
 
-    pub const fn tag(self) -> &'static str {
+    pub(crate) const fn tag(self) -> &'static str {
         match self {
             Self::CausalLm => "causal_lm",
             Self::DiffusionLm => "diffusion_lm",
@@ -86,7 +86,7 @@ impl Capability {
         }
     }
 
-    pub fn from_tag(tag: &str) -> Option<Self> {
+    pub(crate) fn from_tag(tag: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|capability| capability.tag() == tag)
@@ -95,7 +95,7 @@ impl Capability {
 
 /// Which pipeline stages run a call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage {
+pub(crate) enum Stage {
     All,
     First,
     Last,
@@ -103,7 +103,7 @@ pub enum Stage {
 
 /// The numerical runner family that serves a call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum RunnerKind {
+pub(crate) enum RunnerKind {
     Text,
     Diffusion,
     DiffusionLM,
@@ -111,20 +111,9 @@ pub enum RunnerKind {
     Encoder,
 }
 
-/// What an encoder call produces, which fixes its input preparation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncoderKind {
-    Text,
-    Vision,
-    VideoCondition,
-    AudioCondition,
-    Latent,
-    Conditioning,
-}
-
 /// One declared numerical call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CallDecl {
+pub(crate) struct CallDecl {
     /// Module path within the model; empty for the root.
     pub path: String,
     pub method: String,
@@ -133,12 +122,12 @@ pub struct CallDecl {
 }
 
 impl CallDecl {
-    pub fn is(&self, capability: Capability) -> bool {
+    pub(crate) fn is(&self, capability: Capability) -> bool {
         self.capabilities.contains(&capability)
     }
 
     /// The call kinds this call serves, first matching capability per method.
-    pub fn kinds(&self) -> BTreeSet<CallKind> {
+    pub(crate) fn kinds(&self) -> BTreeSet<CallKind> {
         use CallKind::{Forward, Media};
         use MediaCall::*;
 
@@ -202,7 +191,7 @@ impl CallDecl {
     }
 
     /// The runner family that serves this call's module, if any.
-    pub fn runner(&self) -> Option<RunnerKind> {
+    pub(crate) fn runner(&self) -> Option<RunnerKind> {
         if self.is(Capability::CausalLm) {
             Some(RunnerKind::Text)
         } else if self.is(Capability::Denoiser) {
@@ -233,27 +222,10 @@ impl CallDecl {
             None
         }
     }
-
-    /// The encoder family of an encoder call.
-    pub fn encoder(&self) -> EncoderKind {
-        if self.is(Capability::TextEncoder) {
-            EncoderKind::Text
-        } else if self.is(Capability::PatchEncoder) {
-            EncoderKind::Vision
-        } else if self.is(Capability::VideoEncoder) {
-            EncoderKind::VideoCondition
-        } else if self.is(Capability::AudioEncoder) {
-            EncoderKind::AudioCondition
-        } else if self.is(Capability::PatchAutoencoder) {
-            EncoderKind::Latent
-        } else {
-            EncoderKind::Conditioning
-        }
-    }
 }
 
 /// Call kinds of the host components, which own no numerical method.
-pub fn host_kinds(name: &str) -> &'static [MediaCall] {
+pub(crate) fn host_kinds(name: &str) -> &'static [MediaCall] {
     match name {
         "media_reader" => &[MediaCall::MediaReading],
         "video_codec" => &[MediaCall::VideoEncoding],
@@ -264,7 +236,7 @@ pub fn host_kinds(name: &str) -> &'static [MediaCall] {
 
 /// Every declared component and its calls, in declaration order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Declarations {
+pub(crate) struct Declarations {
     entries: IndexMap<String, Vec<CallDecl>>,
     /// Axis selections each component's calls communicate over; empty for a
     /// component whose mesh this rank does not place.
@@ -290,7 +262,7 @@ impl Declarations {
     /// A call no runner can execute (other than a runner's helper methods)
     /// is refused. A model that reconstructs video also declares the host
     /// components that encode and assemble its units.
-    pub fn read(description: &Handle) -> Result<Self> {
+    pub(crate) fn read(description: &Handle) -> Result<Self> {
         let call = |method: &str, component: Option<&str>| -> Result<Any> {
             let mut arguments = vec![description.to_any()];
             if let Some(component) = component {
@@ -364,7 +336,7 @@ impl Declarations {
 
     /// Check calls and add the host components a video model needs. The
     /// components communicate over no axes.
-    pub fn new(mut entries: IndexMap<String, Vec<CallDecl>>) -> Result<Self> {
+    pub(crate) fn new(mut entries: IndexMap<String, Vec<CallDecl>>) -> Result<Self> {
         for call in entries.values().flatten() {
             if call.kinds().is_empty() && !call.auxiliary() {
                 return Err(Error::Unsupported(format!(
@@ -388,22 +360,22 @@ impl Declarations {
         })
     }
 
-    pub fn names(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
     }
 
-    pub fn calls(&self, name: &str) -> &[CallDecl] {
+    pub(crate) fn calls(&self, name: &str) -> &[CallDecl] {
         self.entries.get(name).map_or(&[], Vec::as_slice)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &[CallDecl])> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &[CallDecl])> {
         self.entries
             .iter()
             .map(|(name, calls)| (name.as_str(), calls.as_slice()))
     }
 
     /// Any call of any component has `capability`.
-    pub fn has(&self, capability: Capability) -> bool {
+    pub(crate) fn has(&self, capability: Capability) -> bool {
         self.entries
             .values()
             .flatten()
@@ -412,7 +384,7 @@ impl Declarations {
 
     /// Check a deployment's placement against the declarations, before any
     /// process group exists.
-    pub fn validate(&self, placements: &BTreeMap<String, ComponentConfig>) -> Result<()> {
+    pub(crate) fn validate(&self, placements: &BTreeMap<String, ComponentConfig>) -> Result<()> {
         let unknown: Vec<&String> = placements
             .keys()
             .filter(|name| !self.entries.contains_key(name.as_str()))
@@ -471,7 +443,7 @@ impl Declarations {
     }
 
     /// The call kinds of one component.
-    pub fn component_kinds(&self, name: &str) -> BTreeSet<CallKind> {
+    pub(crate) fn component_kinds(&self, name: &str) -> BTreeSet<CallKind> {
         if is_host_component(name) {
             return host_kinds(name)
                 .iter()
@@ -484,7 +456,7 @@ impl Declarations {
 
     /// Call kinds the components in `held` serve, with tensor transfer and,
     /// for a causal LM, cache export and install.
-    pub fn supported(&self, held: &[&str]) -> BTreeSet<CallKind> {
+    pub(crate) fn supported(&self, held: &[&str]) -> BTreeSet<CallKind> {
         let mut result = BTreeSet::from([CallKind::Transfer(TransferMode::Tensor)]);
         for &name in held {
             result.extend(self.component_kinds(name));
@@ -505,7 +477,7 @@ impl Declarations {
     /// The unique component serving each media call among `held`.
     /// Ambiguous media calls have no route; latent preparation must share
     /// the denoiser's component.
-    pub fn routes(&self, held: &[&str]) -> Result<BTreeMap<MediaCall, String>> {
+    pub(crate) fn routes(&self, held: &[&str]) -> Result<BTreeMap<MediaCall, String>> {
         let mut owners = BTreeMap::<MediaCall, Vec<&str>>::new();
         for &name in held {
             for kind in self.component_kinds(name) {
@@ -535,7 +507,7 @@ impl Declarations {
 
     /// Module paths this rank must read from the checkpoint: every path its
     /// placed components call.
-    pub fn resident(
+    pub(crate) fn resident(
         &self,
         rank: usize,
         placements: &BTreeMap<String, ComponentConfig>,
@@ -551,7 +523,7 @@ impl Declarations {
     /// Axis selections per component for the group plan: the selections
     /// its calls communicate over, plus `tp` for a causal LM, whose sampling
     /// needs it even with replicated logits.
-    pub fn selections(&self) -> BTreeMap<String, BTreeSet<Vec<String>>> {
+    pub(crate) fn selections(&self) -> BTreeMap<String, BTreeSet<Vec<String>>> {
         self.entries
             .iter()
             .map(|(name, calls)| {
@@ -567,7 +539,7 @@ impl Declarations {
     /// Outermost declared paths of a component: a path nested in another
     /// declared path is bound by its parent's traversal, and the empty path
     /// (the model root) contains every other path.
-    pub fn roots(&self, name: &str) -> Vec<String> {
+    pub(crate) fn roots(&self, name: &str) -> Vec<String> {
         let paths: BTreeSet<&str> = self
             .calls(name)
             .iter()
@@ -587,7 +559,7 @@ impl Declarations {
 }
 
 /// One component placed on this rank.
-pub struct Placed {
+pub(crate) struct Placed {
     pub name: String,
     pub config: ComponentConfig,
     /// Declared calls; empty for a host component.
@@ -604,30 +576,30 @@ pub struct Placed {
 }
 
 impl Placed {
-    pub fn host(&self) -> bool {
+    pub(crate) fn host(&self) -> bool {
         is_host_component(&self.name)
     }
 
     /// The runner families serving this component's calls.
-    pub fn runners(&self) -> BTreeSet<RunnerKind> {
+    pub(crate) fn runners(&self) -> BTreeSet<RunnerKind> {
         self.calls.iter().filter_map(CallDecl::runner).collect()
     }
 
-    pub fn has(&self, capability: Capability) -> bool {
+    pub(crate) fn has(&self, capability: Capability) -> bool {
         self.calls.iter().any(|call| call.is(capability))
     }
 }
 
 /// The components placed on this rank.
 #[derive(Default)]
-pub struct Components {
+pub(crate) struct Components {
     placed: Vec<Placed>,
 }
 
 impl Components {
     /// Record the components of `declarations` placed on this rank.
     /// `meshes` supplies each member component's mesh and unit ring.
-    pub fn new(
+    pub(crate) fn new(
         declarations: &Declarations,
         placements: &BTreeMap<String, ComponentConfig>,
         rank: usize,
@@ -654,23 +626,16 @@ impl Components {
         Self { placed }
     }
 
-    pub fn placed(&self) -> &[Placed] {
+    pub(crate) fn placed(&self) -> &[Placed] {
         &self.placed
     }
 
-    pub fn get(&self, name: &str) -> Option<&Placed> {
+    pub(crate) fn get(&self, name: &str) -> Option<&Placed> {
         self.placed.iter().find(|placed| placed.name == name)
     }
 
-    /// Components serving `kind` on this rank.
-    pub fn serving(&self, kind: CallKind) -> impl Iterator<Item = &Placed> {
-        self.placed
-            .iter()
-            .filter(move |placed| placed.kinds.contains(&kind))
-    }
-
     /// Components a runner family serves on this rank.
-    pub fn for_runner(&self, runner: RunnerKind) -> impl Iterator<Item = &Placed> {
+    pub(crate) fn for_runner(&self, runner: RunnerKind) -> impl Iterator<Item = &Placed> {
         self.placed
             .iter()
             .filter(move |placed| placed.runners().contains(&runner))
@@ -678,7 +643,7 @@ impl Components {
 
     /// Whether this rank holds a host component (media reading, video
     /// encoding or muxing).
-    pub fn holds_host(&self) -> bool {
+    pub(crate) fn holds_host(&self) -> bool {
         self.placed
             .iter()
             .any(|placed| !host_kinds(&placed.name).is_empty())
@@ -686,7 +651,7 @@ impl Components {
 
     /// Whether every held component is a host component or has no calls,
     /// so the rank needs no numerical weights.
-    pub fn host_only(&self) -> bool {
+    pub(crate) fn host_only(&self) -> bool {
         self.placed
             .iter()
             .all(|placed| placed.host() || placed.calls.is_empty())

@@ -148,10 +148,10 @@ pub(crate) struct Capture {
     /// The pool of each other device the method's modules run on (a
     /// generation tower), with its device; empty for a method on one
     /// device.
-    pub(crate) peers: Vec<(i32, Handle)>,
+    pub(crate) peers: Vec<(DeviceId, Handle)>,
     /// The raw handle and device of the stream the method issues on.
     pub(crate) stream: usize,
-    pub(crate) device: i32,
+    pub(crate) device: DeviceId,
     pub(crate) method: MethodCall,
     /// Where the method's graph breaks are noted while it is captured.
     pub(crate) breaks: Option<GraphBreaks>,
@@ -201,7 +201,7 @@ pub(crate) struct Failure {
 /// Whoever built the job applies its results in the order it recorded their
 /// operations: each accessor takes the next one of its kind.
 #[derive(Default)]
-pub struct Completion {
+pub(crate) struct Completion {
     /// The graph of each capture.
     captured: VecDeque<CUDAGraph>,
     /// The bytes of each output read.
@@ -869,7 +869,7 @@ impl Issue for Recorder<'_> {
 
 /// Names a job from its submission to its completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct JobId(pub(super) u64);
+pub(crate) struct JobId(pub(super) u64);
 
 /// What a lane's execution thread receives.
 enum Message {
@@ -884,7 +884,7 @@ enum Message {
 /// The submitting end of a lane's job queue. Only the control thread
 /// submits.
 #[derive(Clone)]
-pub struct JobQueue {
+pub(crate) struct JobQueue {
     messages: Sender<Message>,
 }
 

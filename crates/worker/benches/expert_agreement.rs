@@ -15,9 +15,8 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use uniserve_worker::parallel::ExpertParallel;
-use uniserve_worker::parallel::experts::ExpertTransport;
 use uniserve_worker::parallel::host::{HostGroup, Rendezvous};
+use uniserve_worker::parallel::{ExpertParallel, ExpertTransport};
 
 const MEMBER: &str = "UNISERVE_AGREEMENT_MEMBER";
 const ADDRESS: &str = "UNISERVE_AGREEMENT_ADDRESS";

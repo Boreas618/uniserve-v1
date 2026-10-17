@@ -22,9 +22,11 @@ mod arguments;
 mod registration;
 mod signals;
 
-pub use arguments::{Arguments, USAGE};
-pub use registration::{HeadWatch, register};
-pub use signals::Signals;
+pub use arguments::Arguments;
+pub(crate) use arguments::USAGE;
+pub(crate) use registration::HeadWatch;
+pub use registration::register;
+pub(crate) use signals::Signals;
 
 use crate::config::{DescriptorError, resolve};
 use crate::error::WorkerError;
@@ -32,7 +34,7 @@ use crate::ffi::Interpreter;
 use crate::worker::Worker;
 
 /// Run the rank and return its exit status.
-pub fn main(argv: &[String], import: tvm_ffi::Function) -> i64 {
+pub(crate) fn main(argv: &[String], import: tvm_ffi::Function) -> i64 {
     crate::logging::init();
     // Installed first: Python's own SIGINT handler would raise inside a
     // library call.

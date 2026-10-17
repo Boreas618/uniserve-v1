@@ -18,7 +18,7 @@ use crate::{Error, Result};
 /// Cache lengths and logical positions count tokens. `flow_step` counts solver
 /// steps; `rng_counter` counts draws in the request's sampling stream.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct RequestProgress {
+pub(crate) struct RequestProgress {
     pub logical_position: u64,
     pub rng_counter: u64,
     pub flow_step: u64,
@@ -43,12 +43,13 @@ struct RequestState {
     retired: bool,
 }
 
-/// One admitted epoch, retained by result observers even after slot reuse.
+/// One admitted epoch of a request slot.
 ///
-/// Only its pool changes execution state. Borrowers may inspect progress from
-/// completion threads; no foreign callback runs while the state is locked.
+/// Only its pool changes execution state; a batch that binds its calls to
+/// the request reads its progress. No foreign callback runs while the state
+/// is locked.
 #[derive(Debug)]
-pub struct Request {
+pub(crate) struct Request {
     admission: NewRequest,
     state: Mutex<RequestState>,
 }
@@ -74,19 +75,19 @@ impl Request {
         }
     }
 
-    pub fn admission(&self) -> &NewRequest {
+    pub(crate) fn admission(&self) -> &NewRequest {
         &self.admission
     }
 
-    pub fn key(&self) -> RequestKey {
+    pub(crate) fn key(&self) -> RequestKey {
         self.admission.request_key
     }
 
-    pub fn slot(&self) -> usize {
+    pub(crate) fn slot(&self) -> usize {
         self.admission.request_pool_idx as usize
     }
 
-    pub fn progress(&self) -> Result<RequestProgress> {
+    pub(crate) fn progress(&self) -> Result<RequestProgress> {
         Ok(self.state()?.progress)
     }
 
@@ -94,18 +95,14 @@ impl Request {
     /// encoding: its latent encodings recorded before it. A request's
     /// encodings are recorded in their call order, so the index does not
     /// depend on batching.
-    pub fn posterior_draw(&self) -> Result<u64> {
+    pub(crate) fn posterior_draw(&self) -> Result<u64> {
         let mut state = self.state()?;
         let index = state.posterior_draws;
         state.posterior_draws += 1;
         Ok(index)
     }
 
-    pub fn closed(&self) -> Result<bool> {
-        Ok(self.state()?.closed)
-    }
-
-    pub fn retired(&self) -> Result<bool> {
+    pub(crate) fn retired(&self) -> Result<bool> {
         Ok(self.state()?.retired)
     }
 
@@ -117,7 +114,7 @@ impl Request {
 }
 
 /// Own scheduler-assigned slots and advance their admitted request epochs.
-pub struct RequestPool {
+pub(crate) struct RequestPool {
     // Slot zero belongs to inactive graph rows.
     slots: Vec<Option<u64>>,
     requests: HashMap<u64, Arc<Request>>,
@@ -125,7 +122,7 @@ pub struct RequestPool {
 }
 
 impl RequestPool {
-    pub fn new(capacity: usize) -> Result<Self> {
+    pub(crate) fn new(capacity: usize) -> Result<Self> {
         if capacity == 0 {
             return Err(Error::Invalid(
                 "request-pool capacity must be positive".into(),
@@ -139,26 +136,26 @@ impl RequestPool {
         })
     }
 
-    pub fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.slots.len() - 1
     }
 
-    pub fn get(&self, request_id: u64) -> Result<&Arc<Request>> {
+    pub(crate) fn get(&self, request_id: u64) -> Result<&Arc<Request>> {
         self.peek(request_id)
             .ok_or_else(|| Error::Invalid(format!("unknown request {request_id}")))
     }
 
-    pub fn peek(&self, request_id: u64) -> Option<&Arc<Request>> {
+    pub(crate) fn peek(&self, request_id: u64) -> Option<&Arc<Request>> {
         self.requests.get(&request_id)
     }
 
-    pub fn request_ids(&self) -> Vec<u64> {
+    pub(crate) fn request_ids(&self) -> Vec<u64> {
         let mut ids: Vec<_> = self.requests.keys().copied().collect();
         ids.sort_unstable();
         ids
     }
 
-    pub fn has_open_requests(&self) -> Result<bool> {
+    pub(crate) fn has_open_requests(&self) -> Result<bool> {
         for request in self.requests.values() {
             let state = request.state()?;
             if !state.closed && !state.retired {
@@ -170,7 +167,7 @@ impl RequestPool {
 
     /// Install an admission at its assigned slot; identical retries retain
     /// progress. A different epoch may replace only a retired occupant.
-    pub fn start(&mut self, admission: NewRequest) -> Result<Option<usize>> {
+    pub(crate) fn start(&mut self, admission: NewRequest) -> Result<Option<usize>> {
         let key = admission.request_key;
         let slot = self.validate_slot(admission.request_pool_idx as usize)?;
 
@@ -210,7 +207,10 @@ impl RequestPool {
     }
 
     /// Bind numerical rows to distinct, live request epochs and slots.
-    pub fn bind_calls(&self, calls: &[(RequestKey, CallId, usize)]) -> Result<Vec<Arc<Request>>> {
+    pub(crate) fn bind_calls(
+        &self,
+        calls: &[(RequestKey, CallId, usize)],
+    ) -> Result<Vec<Arc<Request>>> {
         let mut keys = HashSet::new();
         let mut slots = HashSet::new();
         let mut requests = Vec::with_capacity(calls.len());
@@ -253,7 +253,7 @@ impl RequestPool {
 
     /// Check the complete submission before reserving any pending call.
     /// Each tuple names the request, call, and whether it advances request state.
-    pub fn validate_pending(&self, calls: &[(RequestKey, CallId, bool)]) -> Result<()> {
+    pub(crate) fn validate_pending(&self, calls: &[(RequestKey, CallId, bool)]) -> Result<()> {
         let mut seen = HashSet::new();
         for &(key, id, _) in calls {
             let request = self.get(key.request_id.0)?;
@@ -268,7 +268,7 @@ impl RequestPool {
     }
 
     /// Reserve all calls together in their submission order.
-    pub fn add_pending(&mut self, calls: &[(RequestKey, CallId, bool)]) -> Result<()> {
+    pub(crate) fn add_pending(&mut self, calls: &[(RequestKey, CallId, bool)]) -> Result<()> {
         self.validate_pending(calls)?;
         for &(key, id, advances) in calls {
             self.get(key.request_id.0)?
@@ -281,7 +281,7 @@ impl RequestPool {
 
     /// Follow the last submitted state call, or the accepted admission root.
     /// Independent video encoders and transfers have no state predecessor.
-    pub fn predecessor(&self, key: RequestKey, advances: bool) -> Result<Option<CallId>> {
+    pub(crate) fn predecessor(&self, key: RequestKey, advances: bool) -> Result<Option<CallId>> {
         let Some(request) = self.peek(key.request_id.0) else {
             return Ok(None);
         };
@@ -305,7 +305,7 @@ impl RequestPool {
     /// Queued steps can precede device completion, so these coordinates are
     /// distinct from accepted progress. A new epoch starts without a canvas;
     /// its device banks are initialized by step zero before their first read.
-    pub fn advance_canvas(&self, key: RequestKey, step: CanvasStep) -> Result<()> {
+    pub(crate) fn advance_canvas(&self, key: RequestKey, step: CanvasStep) -> Result<()> {
         let request = self.get(key.request_id.0)?;
         let mut state = request.state()?;
         if request.key() != key || state.retired {
@@ -338,7 +338,7 @@ impl RequestPool {
 
     /// Retire one call's pending state. Stale epochs and duplicate results
     /// cannot affect a reused slot; late results cannot regress progress.
-    pub fn apply_result(
+    pub(crate) fn apply_result(
         &mut self,
         key: RequestKey,
         id: CallId,
@@ -369,7 +369,7 @@ impl RequestPool {
         Ok(())
     }
 
-    pub fn cancel_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Result<()> {
+    pub(crate) fn cancel_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Result<()> {
         for &(key, id) in calls {
             if let Some(request) = self
                 .peek(key.request_id.0)
@@ -383,7 +383,7 @@ impl RequestPool {
         Ok(())
     }
 
-    pub fn finish(&mut self, key: RequestKey) -> Result<()> {
+    pub(crate) fn finish(&mut self, key: RequestKey) -> Result<()> {
         if let Some(request) = self
             .peek(key.request_id.0)
             .filter(|request| request.key() == key)
@@ -393,7 +393,7 @@ impl RequestPool {
         Ok(())
     }
 
-    pub fn retirement_ready(&self, key: RequestKey) -> Result<bool> {
+    pub(crate) fn retirement_ready(&self, key: RequestKey) -> Result<bool> {
         match self
             .peek(key.request_id.0)
             .filter(|request| request.key() == key)
@@ -405,7 +405,7 @@ impl RequestPool {
 
     /// Mark a closed epoch reusable after its physical readers have drained.
     /// The execution owner must finish device and host writes before calling.
-    pub fn retire(&mut self, request_id: u64) -> Result<()> {
+    pub(crate) fn retire(&mut self, request_id: u64) -> Result<()> {
         let mut state = self.get(request_id)?.state()?;
         if !state.closed || !state.pending.is_empty() {
             return Err(Error::State(
@@ -417,14 +417,14 @@ impl RequestPool {
     }
 
     /// Remove the pool's reference after the execution owner releases a request.
-    pub fn remove(&mut self, request_id: u64) {
+    pub(crate) fn remove(&mut self, request_id: u64) {
         if let Some(request) = self.requests.remove(&request_id) {
             self.slots[request.slot()] = None;
         }
     }
 
     /// Release request references after the execution owner has drained work.
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.closed = true;
         self.requests.clear();
         self.slots.fill(None);
@@ -440,5 +440,159 @@ impl RequestPool {
             )));
         }
         Ok(slot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uniserve_core::{DiffusionSamplingParams, RequestId, SamplingParams, VideoTask};
+    use uniserve_ipc::{ArRequestParams, VideoAdmission};
+
+    use super::*;
+
+    fn admission(id: u64, epoch: u64, slot: u32) -> NewRequest {
+        NewRequest {
+            request_key: RequestKey::new(1, RequestId(id), epoch),
+            request_pool_idx: slot,
+            ar: Some(ArRequestParams {
+                sampling: SamplingParams::default(),
+                negative_token_ids: Vec::new(),
+                finish_token_ids: Vec::new(),
+                initial_position: 5,
+                canvas: None,
+            }),
+            image: None,
+            diffusion: None,
+            video: None,
+            prompt_token_ids: Vec::new(),
+            input_images: 0,
+        }
+    }
+
+    #[test]
+    fn predecessors_follow_submission_order_and_skip_independent_work() -> Result<()> {
+        for order in [[1, 2], [2, 1]] {
+            let mut pool = RequestPool::new(1)?;
+            let request = NewRequest {
+                ar: None,
+                diffusion: Some(DiffusionSamplingParams {
+                    num_frames: 1,
+                    video_units: 1,
+                    num_inference_steps: 3,
+                    seed: 0,
+                    width: 16,
+                    height: 16,
+                }),
+                video: Some(VideoAdmission {
+                    task: VideoTask::T2va,
+                    text_tags: vec![1],
+                    conditions: Vec::new(),
+                }),
+                prompt_token_ids: vec![1],
+                ..admission(7, 1, 1)
+            };
+            let key = request.request_key;
+            pool.start(request)?;
+            assert_eq!(pool.predecessor(key, true)?, Some(CallId::new(0, 0)));
+
+            let [first, second] = order.map(|batch| CallId::new(batch, 0));
+            pool.add_pending(&[(key, first, true), (key, second, true)])?;
+            assert_eq!(pool.predecessor(key, true)?, Some(second));
+            assert_eq!(pool.predecessor(key, false)?, None);
+
+            pool.apply_result(key, second, CallStatus::Predicated, None)?;
+            assert_eq!(pool.predecessor(key, true)?, Some(first));
+            pool.apply_result(key, first, CallStatus::Ok, None)?;
+            assert_eq!(pool.predecessor(key, true)?, Some(first));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_admission_preserves_both_resident_slots() -> Result<()> {
+        let mut pool = RequestPool::new(2)?;
+        let first = admission(7, 1, 1);
+        let second = admission(8, 1, 2);
+        pool.start(first.clone())?;
+        pool.finish(first.request_key)?;
+        pool.retire(7)?;
+        pool.start(second.clone())?;
+
+        // Replacing the first epoch would be legal, but its requested
+        // destination still belongs to the second request. Neither
+        // admission may be evicted.
+        assert!(pool.start(admission(7, 2, 2)).is_err());
+        assert_eq!(pool.get(7)?.admission(), &first);
+        assert_eq!(pool.get(8)?.admission(), &second);
+        assert_eq!(pool.start(first)?, None);
+        assert_eq!(pool.start(second)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_reused_slot_starts_its_epoch_at_the_admitted_position() -> Result<()> {
+        let mut pool = RequestPool::new(1)?;
+        let first = admission(7, 1, 1);
+        let key = first.request_key;
+        pool.start(first)?;
+        let call = CallId::new(1, 0);
+        pool.add_pending(&[(key, call, true)])?;
+        pool.apply_result(
+            key,
+            call,
+            CallStatus::Ok,
+            Some(RequestProgress {
+                logical_position: 9,
+                rng_counter: 4,
+                cache_computed_len: 9,
+                cache_visible_len: 9,
+                prompt_logits_ready: true,
+                ..RequestProgress::default()
+            }),
+        )?;
+        assert_eq!(pool.get(7)?.progress()?.logical_position, 9);
+        pool.finish(key)?;
+        pool.retire(7)?;
+        pool.start(admission(7, 2, 1))?;
+
+        let current = pool.get(7)?;
+        assert_eq!(current.progress()?.logical_position, 5);
+        assert!(!current.retired()?);
+        Ok(())
+    }
+
+    #[test]
+    fn canvas_steps_follow_submission_and_restart_on_slot_reuse() -> Result<()> {
+        let mut pool = RequestPool::new(1)?;
+        let first = admission(7, 1, 1);
+        let key = first.request_key;
+        pool.start(first)?;
+        assert!(
+            pool.advance_canvas(key, CanvasStep { block: 0, step: 1 })
+                .is_err()
+        );
+        pool.advance_canvas(key, CanvasStep { block: 0, step: 0 })?;
+        assert!(
+            pool.advance_canvas(key, CanvasStep { block: 0, step: 0 })
+                .is_err()
+        );
+        pool.advance_canvas(key, CanvasStep { block: 0, step: 1 })?;
+        pool.advance_canvas(key, CanvasStep { block: 1, step: 0 })?;
+
+        pool.finish(key)?;
+        pool.retire(7)?;
+        let second = admission(7, 2, 1);
+        let next = second.request_key;
+        pool.start(second)?;
+        assert!(
+            pool.advance_canvas(key, CanvasStep { block: 1, step: 1 })
+                .is_err()
+        );
+        assert!(
+            pool.advance_canvas(next, CanvasStep { block: 0, step: 1 })
+                .is_err()
+        );
+        pool.advance_canvas(next, CanvasStep { block: 0, step: 0 })?;
+        Ok(())
     }
 }

@@ -8,21 +8,22 @@
 //! share it.
 
 use std::collections::BTreeMap;
+use uniserve_cuda::DeviceId;
 
 use crate::Result;
 use crate::ffi::{Handle, Interpreter};
 
-/// One Python `Scratch` per stream handle and device ordinal (`-1` for the
+/// One Python `Scratch` per stream handle and CUDA device (`None` for the
 /// host).
 #[derive(Default)]
 pub(crate) struct Scratches {
-    scratches: BTreeMap<(usize, i32), Handle>,
+    scratches: BTreeMap<(usize, Option<DeviceId>), Handle>,
 }
 
 impl Scratches {
     /// The scratch of `stream` on `device`, created at its first use.
-    pub(crate) fn get(&mut self, stream: usize, device: Option<i32>) -> Result<Handle> {
-        let key = (stream, device.unwrap_or(-1));
+    pub(crate) fn get(&mut self, stream: usize, device: Option<DeviceId>) -> Result<Handle> {
+        let key = (stream, device);
         if let Some(scratch) = self.scratches.get(&key) {
             return Ok(scratch.clone());
         }

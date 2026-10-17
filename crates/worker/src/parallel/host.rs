@@ -30,7 +30,7 @@ use crate::{Error, Result};
 
 /// How long startup waits for every member to join the mesh: torch's
 /// default collective timeout.
-pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Messages at most this long are written before reading without a helper
 /// thread: the kernel's socket buffers absorb them, so concurrent sends from
@@ -38,7 +38,7 @@ pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 const INLINE_SEND_BYTES: usize = 32 << 10;
 
 /// The widest record [`HostGroup::all_gather_fixed`] carries.
-pub const FIXED_RECORD_BYTES: usize = 56;
+pub(crate) const FIXED_RECORD_BYTES: usize = 56;
 
 const CONNECT_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -72,7 +72,7 @@ impl Rendezvous {
     /// # Safety
     /// `fd` is an open listening TCP socket that nothing else in this process
     /// owns; the returned value closes it.
-    pub unsafe fn inherited(address: impl Into<String>, fd: RawFd) -> Result<Self> {
+    pub(crate) unsafe fn inherited(address: impl Into<String>, fd: RawFd) -> Result<Self> {
         // SAFETY: forwarded from the caller.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         // The launcher cleared close-on-exec only for this process's exec;
@@ -80,10 +80,6 @@ impl Rendezvous {
         rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::CLOEXEC)
             .map_err(|error| Error::Transport(format!("rendezvous socket: {error}")))?;
         Ok(Self::serve(address, TcpListener::from(owned)))
-    }
-
-    pub fn address(&self) -> &str {
-        &self.address
     }
 }
 
@@ -99,7 +95,7 @@ pub struct HostGroup {
 
 impl HostGroup {
     /// A group of one member, which needs no connections.
-    pub fn single(rank: usize) -> Self {
+    pub(crate) fn single(rank: usize) -> Self {
         Self {
             rank: 0,
             ranks: vec![rank],
@@ -223,21 +219,21 @@ impl HostGroup {
     }
 
     /// This member's index.
-    pub fn rank(&self) -> usize {
+    pub(crate) fn rank(&self) -> usize {
         self.rank
     }
 
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.ranks.len()
     }
 
     /// Members' global ranks, in member order.
-    pub fn ranks(&self) -> &[usize] {
+    pub(crate) fn ranks(&self) -> &[usize] {
         &self.ranks
     }
 
     /// Bound every subsequent read and write; `None` waits indefinitely.
-    pub fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         for stream in self.peers.iter().flatten() {
             stream
                 .set_read_timeout(timeout)
@@ -250,7 +246,7 @@ impl HostGroup {
     /// The members at indices `members` of this group, sharing its
     /// connections. Every member of this group must call it, and only the
     /// selected members use the result.
-    pub fn subgroup(&self, members: &[usize]) -> Result<Self> {
+    pub(crate) fn subgroup(&self, members: &[usize]) -> Result<Self> {
         let rank = members
             .iter()
             .position(|&member| member == self.rank)
@@ -271,7 +267,7 @@ impl HostGroup {
     }
 
     /// Every member's bytes, in member order.
-    pub fn all_gather_bytes(&self, value: &[u8]) -> Result<Vec<Vec<u8>>> {
+    pub(crate) fn all_gather_bytes(&self, value: &[u8]) -> Result<Vec<Vec<u8>>> {
         let peers: Vec<(usize, &TcpStream)> = self
             .peers
             .iter()
@@ -317,7 +313,7 @@ impl HostGroup {
     /// [`FIXED_RECORD_BYTES`]. Each record travels to each peer as one write
     /// of its length prefix and payload, so a small record such as an expert
     /// step agreement occupies one TCP segment per peer.
-    pub fn all_gather_fixed(&self, local: &[u8], records: &mut [u8]) -> Result<()> {
+    pub(crate) fn all_gather_fixed(&self, local: &[u8], records: &mut [u8]) -> Result<()> {
         let width = local.len();
         if width > FIXED_RECORD_BYTES || records.len() != width * self.size() {
             return Err(Error::Invalid(format!(
@@ -359,7 +355,7 @@ impl HostGroup {
     }
 
     /// `root`'s bytes on every member. Only `root` supplies `value`.
-    pub fn broadcast_bytes(&self, value: Option<&[u8]>, root: usize) -> Result<Vec<u8>> {
+    pub(crate) fn broadcast_bytes(&self, value: Option<&[u8]>, root: usize) -> Result<Vec<u8>> {
         if root >= self.size() {
             return Err(Error::Invalid(
                 "broadcast root is outside the host group".into(),
@@ -382,23 +378,18 @@ impl HostGroup {
     }
 
     /// Wait until every member reaches the barrier.
-    pub fn barrier(&self) -> Result<()> {
+    pub(crate) fn barrier(&self) -> Result<()> {
         self.all_gather_bytes(&[]).map(drop)
     }
 
     /// Element-wise minimum of every member's integers.
-    pub fn all_reduce_min(&self, values: &[i64]) -> Result<Vec<i64>> {
+    pub(crate) fn all_reduce_min(&self, values: &[i64]) -> Result<Vec<i64>> {
         self.all_reduce(values, i64::min)
-    }
-
-    /// Element-wise maximum of every member's integers.
-    pub fn all_reduce_max(&self, values: &[i64]) -> Result<Vec<i64>> {
-        self.all_reduce(values, i64::max)
     }
 
     /// Split into groups of members with equal `color`, ordered by
     /// `(key, member)`. Every member calls it.
-    pub fn split(&self, color: i64, key: i64) -> Result<Self> {
+    pub(crate) fn split(&self, color: i64, key: i64) -> Result<Self> {
         let encoded: Vec<u8> = [color, key]
             .iter()
             .flat_map(|value| value.to_le_bytes())
@@ -446,22 +437,6 @@ impl HostGroup {
             .get(member)
             .and_then(Option::as_deref)
             .ok_or_else(|| Error::Invariant(format!("host group has no connection to {member}")))
-    }
-}
-
-/// Peer-mapped storage (`crate::transfer::PeerStorage`) publishes its
-/// handles over the group's connections.
-impl crate::transfer::PeerExchange for HostGroup {
-    fn rank(&self) -> usize {
-        self.rank
-    }
-
-    fn all_gather(&self, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
-        self.all_gather_bytes(payload)
-    }
-
-    fn barrier(&self) -> Result<()> {
-        HostGroup::barrier(self)
     }
 }
 
@@ -581,7 +556,7 @@ fn read_frame(stream: &TcpStream) -> Result<Vec<u8>> {
 /// Bind a listener on the interface a rendezvous address names, for a
 /// service whose address members learn through the host group (for
 /// example a torch store). Returns the listener and the address to publish.
-pub fn bind_beside(rendezvous: &str) -> Result<(TcpListener, String)> {
+pub(crate) fn bind_beside(rendezvous: &str) -> Result<(TcpListener, String)> {
     let (host, _) = rendezvous
         .rsplit_once(':')
         .ok_or_else(|| Error::Invalid("rendezvous address must be host:port".into()))?;
@@ -693,14 +668,10 @@ mod tests {
     fn reductions_agree_on_every_member() {
         let results = group(3, |group| {
             let values = [10 - group.rank() as i64, group.rank() as i64 * 7];
-            (
-                group.all_reduce_min(&values).unwrap(),
-                group.all_reduce_max(&values).unwrap(),
-            )
+            group.all_reduce_min(&values).unwrap()
         });
-        for (minimum, maximum) in results {
+        for minimum in results {
             assert_eq!(minimum, vec![8, 0]);
-            assert_eq!(maximum, vec![10, 14]);
         }
     }
 

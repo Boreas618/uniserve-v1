@@ -27,13 +27,13 @@ type Descriptors = Arc<Mutex<Option<HashMap<String, Arc<OwnedFd>>>>>;
 /// Registration duplicates the descriptor. Revocation removes that owned
 /// reference, while an in-flight reply retains its own borrow until sendmsg
 /// has passed a reference to the receiver. No Python callbacks are involved.
-pub struct DescriptorGrants {
+pub(crate) struct DescriptorGrants {
     descriptors: Descriptors,
     worker: Mutex<Option<(UnixStream, JoinHandle<io::Result<()>>)>>,
 }
 
 impl DescriptorGrants {
-    pub fn new(endpoint: &str) -> io::Result<Self> {
+    pub(crate) fn new(endpoint: &str) -> io::Result<Self> {
         let socket = UnixDatagram::bind_addr(&address(endpoint)?)?;
         socket.set_nonblocking(true)?;
         let (shutdown, stop) = UnixStream::pair()?;
@@ -50,7 +50,7 @@ impl DescriptorGrants {
     }
 
     /// Retain an allocation until revocation. The caller keeps ownership of fd.
-    pub fn register(&self, export: &str, fd: RawFd) -> io::Result<()> {
+    pub(crate) fn register(&self, export: &str, fd: RawFd) -> io::Result<()> {
         request(export)?;
 
         // SAFETY: fcntl validates the caller's descriptor and returns a new
@@ -71,7 +71,7 @@ impl DescriptorGrants {
     }
 
     /// Refuse later requests; already received descriptors remain usable.
-    pub fn release(&self, export: &str) {
+    pub(crate) fn release(&self, export: &str) {
         let mut registered = self.descriptors.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(table) = registered.as_mut() {
             table.remove(export);
@@ -79,7 +79,7 @@ impl DescriptorGrants {
     }
 
     /// Revoke registrations and join the service thread, including when idle.
-    pub fn close(&self) -> io::Result<()> {
+    pub(crate) fn close(&self) -> io::Result<()> {
         let mut worker = self.worker.lock().unwrap_or_else(|e| e.into_inner());
         let Some((shutdown, handle)) = worker.take() else {
             return Ok(());
@@ -104,7 +104,7 @@ impl Drop for DescriptorGrants {
 
 /// Receive an owned descriptor. The caller closes it after importing the
 /// allocation; CUDA's import retains its own allocation reference.
-pub fn fetch_descriptor(endpoint: &str, export: &str) -> io::Result<OwnedFd> {
+pub(crate) fn fetch_descriptor(endpoint: &str, export: &str) -> io::Result<OwnedFd> {
     let request = request(export)?;
     let socket = UnixDatagram::unbound()?;
     socket.set_read_timeout(Some(TIMEOUT))?;

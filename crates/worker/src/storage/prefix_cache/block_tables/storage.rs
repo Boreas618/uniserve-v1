@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d32};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 
 use super::{BlockTableUpdate, GroupShape};
 use crate::ffi::{Backing, DType};
@@ -28,7 +28,7 @@ const ALIGNMENT: usize = 256;
 /// stream-ordered and never issued on a capturing stream.
 pub struct BlockTableStorage {
     memory: Arc<Memory>,
-    device: Option<i32>,
+    device: Option<DeviceId>,
     rows: u32,
     tables: u32,
     groups: u32,
@@ -64,7 +64,7 @@ fn layout(rows: usize, tables: usize, groups: usize, width: usize) -> ([usize; 6
 impl BlockTableStorage {
     /// Device bytes of the tables of `groups` with `request_pool_size` slots
     /// and `width` pages per table.
-    pub fn bytes(groups: &[GroupShape], request_pool_size: u32, width: u32) -> u64 {
+    pub(crate) fn bytes(groups: &[GroupShape], request_pool_size: u32, width: u32) -> u64 {
         let tables: u32 = groups.iter().map(|group| group.units_per_page).sum();
         layout(
             request_pool_size as usize + 1,
@@ -81,7 +81,7 @@ impl BlockTableStorage {
         groups: &[GroupShape],
         request_pool_size: u32,
         width: u32,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
         if groups.is_empty() || request_pool_size == 0 || width == 0 {
@@ -163,26 +163,10 @@ impl BlockTableStorage {
         Ok(storage)
     }
 
-    pub fn unit_tables(&self) -> &StorageView {
-        &self.unit_tables
-    }
-
-    pub fn start_pages(&self) -> &StorageView {
-        &self.start_pages
-    }
-
-    pub fn alloced_lens(&self) -> &StorageView {
-        &self.alloced_lens
-    }
-
     /// Per-slot verified cache lengths; the decode state reads and advances
     /// them as well.
-    pub fn verified_lengths(&self) -> &StorageView {
+    pub(crate) fn verified_lengths(&self) -> &StorageView {
         &self.verified_lengths
-    }
-
-    pub fn table_shapes(&self) -> &StorageView {
-        &self.table_shapes
     }
 
     /// The tables keyed as numerical bindings receive them.
@@ -373,7 +357,7 @@ mod tests {
         ];
         let storage = BlockTableStorage::allocate(&groups, 2, 3, None, None)?;
         assert_eq!(
-            read(storage.table_shapes()),
+            read(&storage.table_shapes),
             vec![0, 4, -1, 1, 8, 8, 1, 8, 8]
         );
 
@@ -397,21 +381,21 @@ mod tests {
         storage.install(&update, None)?;
         tables.commit(update);
 
-        let units = read(storage.unit_tables());
+        let units = read(&storage.unit_tables);
         // Table 0 (group 0), slot 2: the full row.
         assert_eq!(&units[2 * 3..3 * 3], &[5, 6, 7]);
         // Tables 1 and 2 hold group 1's two unit positions, zero-padded.
         assert_eq!(&units[(3 + 2) * 3..(3 + 3) * 3], &[8, 0, 0]);
         assert_eq!(&units[(6 + 2) * 3..(6 + 3) * 3], &[9, 0, 0]);
-        assert_eq!(read(storage.start_pages()), vec![0, 0, 0, 0, 0, 1]);
-        assert_eq!(read(storage.alloced_lens()), vec![0, 0, 12]);
+        assert_eq!(read(&storage.start_pages), vec![0, 0, 0, 0, 0, 1]);
+        assert_eq!(read(&storage.alloced_lens), vec![0, 0, 12]);
 
         storage.set_verified(2, 7, None)?;
         assert_eq!(read(storage.verified_lengths()), vec![0, 0, 7]);
         storage.clear(&[2], None)?;
-        assert!(read(storage.unit_tables()).iter().all(|&unit| unit == 0));
+        assert!(read(&storage.unit_tables).iter().all(|&unit| unit == 0));
         assert!(
-            read(storage.alloced_lens())
+            read(&storage.alloced_lens)
                 .iter()
                 .all(|&length| length == 0)
         );

@@ -14,7 +14,7 @@
 //! | Graph executable | [`GraphExec`] (borrowed) | by its owner |
 //! | Device memory | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
 //! | Host memory | [`PinnedBuffer`] (deferred), [`HostRegistration`] (synchronous) | on drop |
-//! | NCCL | [`nccl::Communicator`], [`nccl::Buffer`] | explicit `destroy` / deferred |
+//! | NCCL | [`nccl::Communicator`] | explicit `destroy` |
 //! | NVML | [`Nvml`] | `nvmlShutdown` on drop |
 //!
 //! Device addresses are plain `u64` values (`CUdeviceptr`, unified with host
@@ -78,7 +78,6 @@ mod tests {
         shared::<PinnedBuffer>();
         shared::<HostRegistration>();
         shared::<Nvml>();
-        shared::<nccl::Buffer>();
         movable::<nccl::Communicator>();
     }
 }

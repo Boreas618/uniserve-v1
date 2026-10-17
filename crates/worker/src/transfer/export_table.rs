@@ -17,19 +17,30 @@ use super::{Retirement, notify};
 use crate::host::HostLane;
 use crate::{Error, EventPool, Result};
 
+/// A registered export's identity within its endpoint.
 #[derive(Clone, Eq, Hash, PartialEq)]
-enum SourceKey {
+pub(crate) enum SourceKey {
     Local(u64),
     Shm(String),
     Cuda(String),
 }
 
+/// A registered export: its immutable locator and its physical backing.
 pub(crate) struct Source {
     locator: Arc<Locator>,
     buffer: Arc<TransportBuffer>,
 }
 
-type Table = BufferRegistry<SourceKey, Source, Arc<Retirement>>;
+impl Source {
+    pub(crate) fn new(locator: Locator, buffer: Arc<TransportBuffer>) -> Self {
+        Self {
+            locator: Arc::new(locator),
+            buffer,
+        }
+    }
+}
+
+type Table = BufferRegistry;
 
 static ENDPOINTS: LazyLock<Mutex<HashMap<String, Weak<ExportTable>>>> =
     LazyLock::new(Mutex::default);
@@ -109,7 +120,7 @@ impl ExportTable {
         state: &'a mut Table,
         key: &SourceKey,
         locator: &Locator,
-    ) -> Result<&'a mut RegisteredBuffer<Source, Arc<Retirement>>> {
+    ) -> Result<&'a mut RegisteredBuffer> {
         let buffer = state
             .get_mut(key)
             .ok_or_else(|| Error::Invalid("buffer is no longer registered".into()))?;
@@ -129,10 +140,7 @@ impl ExportTable {
         self.remove_finished();
         self.lock().register(
             key,
-            Source {
-                locator: Arc::new(locator),
-                buffer,
-            },
+            Source::new(locator, buffer),
             Arc::new(Retirement::default()),
         )
     }
@@ -279,7 +287,7 @@ impl ExportTable {
                 return Ok(());
             };
             let Some((source, retirement)) =
-                registered.begin_reclaim(|source| Ok::<_, Error>(source.buffer.settled()))?
+                registered.begin_reclaim(|source| Ok(source.buffer.settled()))?
             else {
                 return Ok(());
             };

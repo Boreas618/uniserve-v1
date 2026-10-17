@@ -20,7 +20,7 @@ use uniserve_ipc::{Batch as BatchPlan, Call, DimBound, TensorRef, TransferTransp
 
 use crate::executor::products::{OutputShape, Placement, bind_outputs, supplied};
 use crate::executor::video::{MediaBatch, Parts, Publication, product_name};
-use crate::ffi::{Device, Function, Handle, Interpreter};
+use crate::ffi::{Function, Handle, Interpreter, MemoryKind};
 use crate::host::mux::{MuxFunctions, read_unit};
 use crate::host::reader::{ConditionProducts, ConditionReader, ReaderFunctions};
 use crate::host::task::{MediaTask, UnitFrames};
@@ -126,7 +126,7 @@ fn bind_host(
             shape,
             region,
         }],
-        Device::Cpu,
+        MemoryKind::Host,
         placement,
     )?
     .into_iter()

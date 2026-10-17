@@ -36,7 +36,7 @@ use super::flag;
 
 /// Window settings read from the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileConfig {
+pub(crate) struct ProfileConfig {
     pub output_dir: PathBuf,
     pub prefix: String,
     pub activities: Vec<String>,
@@ -49,7 +49,7 @@ pub struct ProfileConfig {
 
 impl ProfileConfig {
     /// Read the settings through `value`; `None` when profiling is off.
-    pub fn from_env(value: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+    pub(crate) fn from_env(value: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
         let Some(directory) =
             value("UNISERVE_TORCH_PROFILER_DIR").filter(|value| !value.is_empty())
         else {
@@ -105,7 +105,7 @@ enum Phase {
 }
 
 /// The step counter and the window.
-pub struct Profiler {
+pub(crate) struct Profiler {
     config: ProfileConfig,
     start: Function,
     stop: Function,
@@ -130,17 +130,17 @@ pub struct Profiler {
 }
 
 impl Profiler {
-    pub fn new(
+    pub(crate) fn new(
         config: ProfileConfig,
         start: Function,
         stop: Function,
-        device: Option<i32>,
+        device: Option<DeviceId>,
     ) -> Self {
         Self {
             config,
             start,
             stop,
-            device: device.map(DeviceId),
+            device,
             seen: 0,
             captured: 0,
             first: 0,
@@ -389,7 +389,7 @@ impl Profiler {
     /// executor has drained and the rank no longer serves, so the calls are
     /// made here and waited for. A job of the window still in flight is not
     /// waited for.
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         if self.active {
             self.finish();
         }

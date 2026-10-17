@@ -23,16 +23,18 @@
 use std::sync::Arc;
 
 use tvm_ffi::Any;
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 
 use super::plan::CachePlan;
-use crate::ffi::{Backing, DType, DeferredCall, Device, Function, Handle, Interpreter, strings};
+use crate::ffi::{
+    Backing, DType, DeferredCall, Function, Handle, Interpreter, MemoryKind, strings,
+};
 use crate::storage::memory::{Memory, StorageView};
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
 
 /// The two K/V fields, in storage order.
-pub const FIELDS: [&str; 2] = ["key", "value"];
+pub(crate) const FIELDS: [&str; 2] = ["key", "value"];
 
 /// The bit pattern of `1.0f32`, the neutral FP8 scale.
 const UNIT_SCALE: u32 = 0x3F80_0000;
@@ -40,7 +42,7 @@ const UNIT_SCALE: u32 = 0x3F80_0000;
 /// The pool's storage on one device (or host memory for CPU lanes).
 pub struct CachePlanes {
     plan: Arc<CachePlan>,
-    device: Option<i32>,
+    device: Option<DeviceId>,
     num_units: u32,
     values: [Arc<Memory>; 2],
     scales: Option<[Arc<Memory>; 2]>,
@@ -51,7 +53,7 @@ pub struct CachePlanes {
     fields: Vec<(String, StorageView)>,
 }
 
-fn allocate(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
+fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Memory>> {
     match device {
         Some(device) => Memory::device(device, bytes),
         None => Ok(Memory::host(bytes)),
@@ -63,7 +65,7 @@ fn allocate(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
 /// pages where they lie, whatever the pool's size. Every local peer device
 /// may address them, because readers on those devices in this process copy
 /// from the pages directly.
-fn allocate_values(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
+fn allocate_values(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Memory>> {
     match device {
         Some(device) => Memory::exportable(device, bytes, &Memory::peers(device)?),
         None => Ok(Memory::host(bytes)),
@@ -71,17 +73,12 @@ fn allocate_values(device: Option<i32>, bytes: usize) -> Result<Arc<Memory>> {
 }
 
 impl CachePlanes {
-    /// Device bytes of a pool of `num_units` units.
-    pub fn bytes(plan: &CachePlan, num_units: u32) -> u64 {
-        plan.unit_bytes * u64::from(num_units)
-    }
-
     /// Allocate and reset a pool of `num_units` units (the sentinel
     /// included): values and flags zero, scales one. On a device the resets
     /// run on `stream`, which is synchronized before returning.
     pub fn allocate(
         plan: Arc<CachePlan>,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         num_units: u32,
         stream: Option<&Stream>,
     ) -> Result<Self> {
@@ -144,15 +141,15 @@ impl CachePlanes {
         Ok(planes)
     }
 
-    pub fn plan(&self) -> &Arc<CachePlan> {
+    pub(crate) fn plan(&self) -> &Arc<CachePlan> {
         &self.plan
     }
 
-    pub fn device(&self) -> Option<i32> {
+    pub(crate) fn device(&self) -> Option<DeviceId> {
         self.device
     }
 
-    pub fn num_units(&self) -> u32 {
+    pub(crate) fn num_units(&self) -> u32 {
         self.num_units
     }
 
@@ -172,7 +169,7 @@ impl CachePlanes {
 
     /// The pool's unit fields as the library's cache classes take them: the
     /// list of their names, then one tensor per field.
-    pub fn field_arguments(&self) -> Result<Vec<Any>> {
+    pub(crate) fn field_arguments(&self) -> Result<Vec<Any>> {
         let names = strings(self.fields.iter().map(|(name, _)| name));
         let mut arguments = vec![Any::from(names)];
         for (_, view) in &self.fields {
@@ -268,7 +265,7 @@ impl CachePlanes {
     /// Tokens `[offset, offset + count)` of one layer: column `column` of
     /// `unit`, as a contiguous `[count, 1, heads, dim]` group-dtype view
     /// matching one layer of a transfer's `[tokens, layers, heads, dim]`.
-    pub fn layer_tokens(
+    pub(crate) fn layer_tokens(
         &self,
         field: usize,
         group: usize,
@@ -300,7 +297,7 @@ impl CachePlanes {
     }
 
     /// One unit's FP8 scale of `field` in `column`, as `[1, 1, 1, 1]`.
-    pub fn scale(&self, field: usize, column: u32, unit: u32) -> Result<StorageView> {
+    pub(crate) fn scale(&self, field: usize, column: u32, unit: u32) -> Result<StorageView> {
         self.require_unit(unit)?;
         let scales = self
             .scales
@@ -315,7 +312,7 @@ impl CachePlanes {
     }
 
     /// The address of one unit's FP8 scale of `field` in `column`.
-    pub fn scale_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
+    pub(crate) fn scale_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         Ok(self.scale(field, column, unit)?.address())
     }
 
@@ -353,76 +350,6 @@ impl CachePlanes {
         }
         Ok(())
     }
-
-    /// Plan copies of every byte of `units` (planes, flags, scales) between
-    /// the pool and a snapshot buffer laid out unit-major. `save` copies
-    /// pool to snapshot, otherwise snapshot to pool.
-    fn snapshot_copies(&self, units: &[u32], snapshot: u64, save: bool) -> Result<CopyBatch> {
-        let mut batch = CopyBatch::new(SourceOrder::Stream);
-        let mut cursor = snapshot;
-        let mut push = |pool: u64, bytes: usize| {
-            if save {
-                batch.push(cursor, pool, bytes);
-            } else {
-                batch.push(pool, cursor, bytes);
-            }
-            cursor += bytes as u64;
-        };
-        for &unit in units {
-            self.require_unit(unit)?;
-            for field in 0..2 {
-                for column in 0..self.plan.columns {
-                    let cell = self.cell(column, unit);
-                    push(
-                        self.values[field].address() + cell * self.plan.plane_bytes,
-                        self.plan.plane_bytes as usize,
-                    );
-                    push(self.initialized[field].address() + cell, 1);
-                    if let Some(scales) = &self.scales {
-                        push(scales[field].address() + cell * 4, 4);
-                    }
-                }
-            }
-        }
-        Ok(batch)
-    }
-}
-
-/// The saved bytes of a set of units, restored after a capture that wrote
-/// them (prefill graph warmup writes real cache pages).
-pub struct UnitSnapshot {
-    units: Vec<u32>,
-    memory: Arc<Memory>,
-}
-
-impl UnitSnapshot {
-    /// Copy every byte of `units` into a new snapshot on `stream`. The
-    /// snapshot is consistent once the stream reaches the copy.
-    pub fn save(planes: &CachePlanes, units: &[u32], stream: &Stream) -> Result<Self> {
-        let mut units = units.to_vec();
-        units.sort_unstable();
-        units.dedup();
-        let device = planes
-            .device
-            .ok_or_else(|| Error::Invalid("unit snapshots serve device pools".into()))?;
-        let memory = Memory::device(device, units.len().max(1) * planes.plan.unit_bytes as usize)?;
-        let batch = planes.snapshot_copies(&units, memory.address(), true)?;
-        // SAFETY: the snapshot and the pool stay alive until `restore`
-        // drains the stream; distinct units never overlap.
-        unsafe { batch.submit(stream) }?;
-        Ok(Self { units, memory })
-    }
-
-    /// Restore the saved bytes on `stream` and drain it, releasing the
-    /// snapshot.
-    pub fn restore(self, planes: &CachePlanes, stream: &Stream) -> Result<()> {
-        let batch = planes.snapshot_copies(&self.units, self.memory.address(), false)?;
-        stream.synchronize()?;
-        // SAFETY: as for `save`; the stream is drained before the snapshot drops.
-        unsafe { batch.submit(stream) }?;
-        stream.synchronize()?;
-        Ok(())
-    }
 }
 
 /// One stream's binding of the scattered unit resets: a Rust-owned column of
@@ -430,7 +357,7 @@ impl UnitSnapshot {
 ///
 /// A column is reused only in its stream's order: an upload for the next
 /// operation is ordered after the previous operation's kernels.
-pub struct UnitColumn {
+pub(crate) struct UnitColumn {
     units: StorageView,
     stream: Option<usize>,
     /// The library's `UnitResets` over the column and the pool's fields.
@@ -446,7 +373,7 @@ const UNIT_RESETS: &str = "uniserve.prefix_cache.units.UnitResets";
 impl UnitColumn {
     /// Allocate a column for `planes` and construct the library's
     /// `UnitResets` over it on `stream` (`None` for a CPU pool).
-    pub fn bind(planes: &CachePlanes, stream: Option<&Stream>) -> Result<Self> {
+    pub(crate) fn bind(planes: &CachePlanes, stream: Option<&Stream>) -> Result<Self> {
         let count = i64::from(planes.num_units);
         let memory = allocate(planes.device, planes.num_units as usize * 8)?;
         let units = StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[count])?;
@@ -491,7 +418,7 @@ impl UnitColumn {
             // SAFETY: the ids are read during the call; the column write is
             // ordered on the stream after the previous operation that read
             // it.
-            Device::Cuda(_) if stream.stream().is_some() => unsafe { stream.copy(&batch) }?,
+            MemoryKind::Cuda(_) if stream.stream().is_some() => unsafe { stream.copy(&batch) }?,
             // SAFETY: a host column is written in its issuer's order, after
             // the previous operation that read it.
             _ => unsafe { stream.host().copy(&batch) }?,
@@ -519,7 +446,12 @@ impl UnitColumn {
     }
 
     /// Reset `units` completely: values zero, flags clear, scales one.
-    pub fn zero(&self, planes: &CachePlanes, units: &[u32], stream: impl Issue) -> Result<()> {
+    pub(crate) fn zero(
+        &self,
+        planes: &CachePlanes,
+        units: &[u32],
+        stream: impl Issue,
+    ) -> Result<()> {
         self.apply(&self.zero, planes, units, stream)
     }
 
@@ -528,7 +460,12 @@ impl UnitColumn {
     /// single-dtype unquantized pool needs no device work, a quantized one
     /// resets flags and scales, and a mixed-dtype pool is zeroed because
     /// stale bytes of one type need not decode as finite values of another.
-    pub fn recycle(&self, planes: &CachePlanes, units: &[u32], stream: impl Issue) -> Result<()> {
+    pub(crate) fn recycle(
+        &self,
+        planes: &CachePlanes,
+        units: &[u32],
+        stream: impl Issue,
+    ) -> Result<()> {
         if planes.plan.mixed_types() {
             self.zero(planes, units, stream)
         } else if planes.plan.quantized {
@@ -540,7 +477,7 @@ impl UnitColumn {
 
     /// Commit transferred values and scales of whole units: set both
     /// fields' initialization flags in every column.
-    pub fn mark_initialized(
+    pub(crate) fn mark_initialized(
         &self,
         planes: &CachePlanes,
         units: &[u32],

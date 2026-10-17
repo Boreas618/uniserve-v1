@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::{Canvas, ConditionTiles, VideoCondition};
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use uniserve_ipc::{
     Batch as BatchPlan, Call, DimBound, LatentParams, OutputInfo, RasterAxes, ShapeBound,
     VideoDenoiserInfo,
@@ -53,7 +53,7 @@ use crate::config::placement::{Capability, Declarations};
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::executor::products::{OutputShape, Placement, bind_outputs};
-use crate::executor::video::{MediaBatch, Trajectories};
+use crate::executor::video::MediaBatch;
 use crate::executor::video::{Parts, latent_params, product_name, stream_of};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list, integers};
 use crate::lane::{Capture, Completion, Job};
@@ -62,8 +62,7 @@ use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{VideoLayout, VideoSize};
 use crate::runner::denoiser::image::ImageDenoiser;
 use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
-use crate::storage::latent::Pool;
-use crate::storage::memory::{Memory, StorageView, parse_dtype};
+use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{RequestSlots, SlotField};
 use crate::stream::{Fill, Issue};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
@@ -380,10 +379,13 @@ struct Layout {
 /// The transient layouts a new one displaced ([`DenoiserRunner::ask_layout`]):
 /// their constants are released when this is dropped, behind the job that
 /// drained the stream.
-pub(crate) struct Evicted(#[expect(dead_code, reason = "held until it is dropped")] Vec<Layout>);
+pub(crate) struct Evicted {
+    /// Held, never read, until the value is dropped.
+    _layouts: Vec<Layout>,
+}
 
 /// The runner of one denoiser of a model.
-pub struct DenoiserRunner {
+pub(crate) struct DenoiserRunner {
     /// The component the runner serves, naming it in messages.
     owner: String,
     device: Device,
@@ -451,7 +453,7 @@ pub(crate) struct VideoDenoiser {
     storage: LatentStorage,
     /// The requests' trajectories. A video trajectory stays on its rank:
     /// its final latents leave as tensor products.
-    pool: Pool,
+    pool: LatentPool,
     layouts: Vec<Option<Layout>>,
     ids: HashMap<VideoLayout, usize>,
     /// Transient layout ids, least recently used first.
@@ -459,7 +461,7 @@ pub(crate) struct VideoDenoiser {
     transient_capacity: usize,
     graphs: GraphTable<usize>,
     /// The graph pool captures allocate in; `None` serves steps eagerly.
-    pool_handle: Option<Arc<GraphPool<Handle>>>,
+    pool_handle: Option<Arc<GraphPool>>,
 }
 
 /// The text conditioner a denoising rank holds.
@@ -478,7 +480,7 @@ pub(crate) struct DenoiserSetup<'a> {
     pub(crate) loaded: &'a Handle,
     pub(crate) component: &'a str,
     pub(crate) stream: Stream,
-    pub(crate) device: i32,
+    pub(crate) device: DeviceId,
     pub(crate) maximum: VideoLayout,
     pub(crate) envelope: StateEnvelope,
     pub(crate) pages: SamplePages,
@@ -489,7 +491,7 @@ pub(crate) struct DenoiserSetup<'a> {
     pub(crate) attention: String,
     /// The stream's shared work areas, a Python `Scratch`.
     pub(crate) scratch: Handle,
-    pub(crate) graph_pool: Option<Arc<GraphPool<Handle>>>,
+    pub(crate) graph_pool: Option<Arc<GraphPool>>,
     pub(crate) transient_layouts: usize,
 }
 
@@ -645,20 +647,20 @@ impl DenoiserRunner {
     }
 
     /// The device the runner computes on.
-    pub fn device(&self) -> Device {
+    pub(crate) fn device(&self) -> Device {
         self.device
     }
 
     /// The runner's stream; `None` for an image denoiser on the host.
-    pub fn stream(&self) -> Option<&Stream> {
+    pub(crate) fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
     }
 
-    /// The CUDA ordinal and stream of a video denoiser, which always
+    /// The CUDA device and stream of a video denoiser, which always
     /// computes on CUDA.
-    fn cuda(&self) -> Result<(i32, Stream)> {
+    fn cuda(&self) -> Result<(DeviceId, Stream)> {
         match (self.device, &self.stream) {
-            (Device::Cuda(ordinal), Some(stream)) => Ok((ordinal, stream.clone())),
+            (Device::Cuda(device), Some(stream)) => Ok((device, stream.clone())),
             _ => Err(Error::Invariant(format!(
                 "{}: a video denoiser computes on a CUDA stream",
                 self.owner
@@ -667,7 +669,7 @@ impl DenoiserRunner {
     }
 
     /// Graphs of the denoiser's steps captured so far.
-    pub fn captured(&self) -> usize {
+    pub(crate) fn captured(&self) -> usize {
         match &self.family {
             Family::Video(video) => video.graphs.len(),
             Family::Image(image) => image.graphs.len(),
@@ -675,7 +677,7 @@ impl DenoiserRunner {
     }
 
     /// Refuse further captures: serving replays what startup captured.
-    pub fn seal(&mut self) {
+    pub(crate) fn seal(&mut self) {
         match &mut self.family {
             Family::Video(video) => {
                 video.graphs.seal();
@@ -703,7 +705,7 @@ impl DenoiserRunner {
     }
 
     /// The kernels the operators of the denoiser's Python runners selected.
-    pub fn kernels(&self) -> Result<Vec<KernelRecord>> {
+    pub(crate) fn kernels(&self) -> Result<Vec<KernelRecord>> {
         list_kernels(self.kernel_calls())
     }
 
@@ -711,7 +713,7 @@ impl DenoiserRunner {
     /// runner's streams. An aborted close keeps everything device work may
     /// still address until the process exits. Every release is attempted;
     /// the first failure is returned.
-    pub fn close(&mut self, aborted: bool) -> Result<()> {
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let mut failure = None;
         let mut keep = |result: Result<()>| {
             if let Err(error) = result {
@@ -835,7 +837,7 @@ impl DenoiserRunner {
                 Argument::Integers(key.values().to_vec()),
             ],
         ));
-        Ok(Evicted(evicted))
+        Ok(Evicted { _layouts: evicted })
     }
 
     /// Keep transient layout `key` as the job of [`Self::ask_layout`]
@@ -1347,7 +1349,6 @@ impl DenoiserRunner {
     ) -> Result<()> {
         let video = self.family.video_mut()?;
         video.graphs.insert(id, None, completion.captured()?)?;
-        video.graphs.record(GraphMode::Capture);
         Ok(())
     }
 
@@ -1423,7 +1424,6 @@ impl DenoiserRunner {
             conditioner
                 .graphs
                 .insert(capacity, None, completion.captured()?)?;
-            conditioner.graphs.record(GraphMode::Capture);
         }
         Ok(())
     }
@@ -1573,7 +1573,7 @@ impl VideoDenoiser {
         &mut self,
         stream: &Stream,
         capacity: u32,
-        capture: Option<(&GraphFunctions, i32)>,
+        capture: Option<(&GraphFunctions, DeviceId)>,
         job: &Job,
     ) -> Result<GraphMode> {
         let pool = self.pool_handle.as_ref();
@@ -1612,9 +1612,6 @@ impl VideoDenoiser {
                 GraphMode::Eager
             }
         };
-        if mode != GraphMode::Capture {
-            conditioner.graphs.record(mode);
-        }
         Ok(mode)
     }
 
@@ -1649,7 +1646,7 @@ impl VideoDenoiser {
         methods: &Methods,
         stream: &Stream,
         id: usize,
-        capture: Option<(&GraphFunctions, i32)>,
+        capture: Option<(&GraphFunctions, DeviceId)>,
         job: &Job,
     ) -> Result<GraphMode> {
         let mode = match (self.graphs.lookup(&id, None), capture, &self.pool_handle) {
@@ -1678,9 +1675,6 @@ impl VideoDenoiser {
                 GraphMode::Eager
             }
         };
-        if mode != GraphMode::Capture {
-            self.graphs.record(mode);
-        }
         Ok(mode)
     }
 }
@@ -1948,16 +1942,6 @@ pub(crate) fn denoise(
             .export(owners, call, output, &write, false, issue)?;
     }
     Ok(())
-}
-
-impl Trajectories for DenoiserRunner {
-    fn validate(&self, updates: &[crate::LatentUpdate]) -> Result<()> {
-        DenoiserRunner::validate(self, updates)
-    }
-
-    fn apply(&mut self, updates: &[crate::LatentUpdate]) {
-        DenoiserRunner::apply(self, updates);
-    }
 }
 
 const DENOISER: &str = "uniserve.runner.denoiser.DenoiserRunner";
@@ -2272,7 +2256,7 @@ impl VideoModel {
             let (function, value) = fact("sample_dtype")?;
             let name = tvm_ffi::String::try_from(value)
                 .map_err(|error| Error::numerical(function.name(), &error))?;
-            parse_dtype(name.as_str())?
+            DType::parse(name.as_str())?
         };
         let rows = integer("max_sequence_rows")?;
         let facts = VideoFacts {
@@ -2506,7 +2490,7 @@ impl VideoModel {
                 Ok(StateField {
                     sample: self.facts.modalities.contains(&name),
                     name,
-                    dtype: parse_dtype(&dtype)?,
+                    dtype: DType::parse(&dtype)?,
                     elements: extent(elements),
                 })
             })
@@ -2605,7 +2589,7 @@ impl VideoModel {
         let dtype = &self.methods.overlap_dtype;
         let name = tvm_ffi::String::try_from(self.decoder(dtype, arguments())?)
             .map_err(|error| Error::numerical(dtype.name(), &error))?;
-        Ok((count.max(0) as u64, parse_dtype(name.as_str())?))
+        Ok((count.max(0) as u64, DType::parse(name.as_str())?))
     }
 
     /// Frames of each media unit of a video of `frames` frames.
@@ -2729,20 +2713,11 @@ impl VideoModel {
                     Error::Unsupported(format!("result {component}.{name} has an invalid extent"))
                 })
             };
-            let dtype = [
-                uniserve_ipc::DType::U8,
-                uniserve_ipc::DType::I16,
-                uniserve_ipc::DType::I32,
-                uniserve_ipc::DType::I64,
-                uniserve_ipc::DType::F16,
-                uniserve_ipc::DType::BF16,
-                uniserve_ipc::DType::F32,
-            ]
-            .into_iter()
-            .find(|dtype| dtype.storage_name() == dtypes[index])
-            .ok_or_else(|| {
-                Error::Unsupported(format!("result {component}.{name} has no protocol dtype"))
-            })?;
+            let dtype = DType::from_name(&dtypes[index])
+                .and_then(|dtype| uniserve_ipc::DType::try_from(dtype).ok())
+                .ok_or_else(|| {
+                    Error::Unsupported(format!("result {component}.{name} has no protocol dtype"))
+                })?;
             let dims = extents
                 .by_ref()
                 .take(ranks[index] as usize)

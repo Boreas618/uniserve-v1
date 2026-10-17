@@ -330,20 +330,6 @@ impl ImageTrigger {
         }
     }
 
-    /// Returns the token sequence that opens a branch during ordinary decode.
-    pub fn generated_suffix(&self) -> Option<&[u32]> {
-        match self {
-            Self::Token { token_id } => Some(std::slice::from_ref(token_id)),
-            Self::Suffix { token_ids } => Some(token_ids),
-            Self::Disabled | Self::RoundCloseThenSuffix { .. } => None,
-        }
-    }
-
-    /// Returns whether the trigger is evaluated when an understanding round closes.
-    pub fn requires_round_close(&self) -> bool {
-        matches!(self, Self::RoundCloseThenSuffix { .. })
-    }
-
     /// Returns token identifiers that close a trigger-evaluated round.
     pub fn round_close_token_ids(&self) -> &[u32] {
         match self {

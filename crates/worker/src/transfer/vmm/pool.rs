@@ -8,6 +8,7 @@ use uniserve_cuda::{
     CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream,
 };
 
+use crate::storage::memory::Memory;
 use crate::stream::{Fill, Issue};
 use crate::{DescriptorGrants, Error, Result};
 
@@ -46,8 +47,8 @@ impl Drop for Allocation {
 /// `backing` retains the exportable allocation the pool places chunks in.
 /// Reader words are copied on a private stream. Polling observes a completed
 /// snapshot and never waits for device work on the host.
-pub(crate) struct VmmPool<B> {
-    backing: Option<B>,
+pub(crate) struct VmmPool {
+    backing: Option<Arc<Memory>>,
     device: DeviceId,
     address: usize,
     capacity: usize,
@@ -64,27 +65,27 @@ pub(crate) struct VmmPool<B> {
     failed: bool,
 }
 
-impl<B> VmmPool<B> {
+impl VmmPool {
     /// The mapping must cover `capacity` writable bytes on `device` and remain
     /// valid as long as `backing` is held. Construction performs no device copy.
     ///
     /// # Safety
     /// `address` must identify that mapping.
     pub(crate) unsafe fn new(
-        backing: B,
-        device: i32,
+        backing: Arc<Memory>,
+        device: DeviceId,
         address: usize,
         capacity: usize,
     ) -> Result<Self> {
         Ok(Self {
             backing: Some(backing),
-            device: DeviceId(device),
+            device,
             address,
             capacity,
             watermark: 0,
             allocations: BTreeMap::new(),
             initializers: Vec::new(),
-            stream: Stream::new(DeviceId(device))?,
+            stream: Stream::new(device)?,
             completion: Event::new(EventFlags::default()),
             observed: Vec::new(),
             readback: Vec::new(),
@@ -93,7 +94,7 @@ impl<B> VmmPool<B> {
         })
     }
 
-    pub(crate) fn backing(&self) -> Result<&B> {
+    pub(crate) fn backing(&self) -> Result<&Arc<Memory>> {
         self.backing
             .as_ref()
             .ok_or(Error::State("VMM pool is closed"))
@@ -369,7 +370,7 @@ impl<B> VmmPool<B> {
 
     /// The caller ends all local and remote uses before closing the pool.
     /// Drain owned readback and return numerical backing outside owner locks.
-    pub(crate) fn close(&mut self) -> Result<Option<B>> {
+    pub(crate) fn close(&mut self) -> Result<Option<Arc<Memory>>> {
         if self.backing.is_none() {
             return Ok(None);
         }
@@ -387,7 +388,7 @@ impl<B> VmmPool<B> {
     }
 }
 
-impl<B> Drop for VmmPool<B> {
+impl Drop for VmmPool {
     #[expect(
         clippy::mem_forget,
         reason = "unknown device completion must retain both DMA mappings"

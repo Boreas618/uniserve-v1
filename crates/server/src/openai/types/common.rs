@@ -30,7 +30,6 @@ impl StringOrArray {
         }
     }
 
-    #[allow(unused)]
     /// Converts the value into an owned string vector.
     pub fn into_vec(self) -> Vec<String> {
         match self {
