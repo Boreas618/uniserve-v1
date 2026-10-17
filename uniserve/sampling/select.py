@@ -25,7 +25,9 @@ which rows take a shaping stage, and token sets as scatter indices
 ``row * vocab + token`` into the group's ``[rows, vocab]`` logits, with
 out-of-vocabulary and repeated tokens already removed. Per-task token sets
 (finish and transition tokens) are row-major ``[tasks, width]`` matrices
-padded with -1.
+padded with -1. Each selector copies its lists to the device together
+(:func:`~uniserve.sampling.upload.upload`), without waiting for the
+forward that produced its logits.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from .top_k import (
     temperature_divisors,
     top_k_candidates,
 )
+from .upload import upload
 
 # Token relays carry continuation in bit 31 and the token in the low 31 bits.
 TOKEN_CONTINUATION_BIT = 1 << 31
@@ -90,16 +93,10 @@ class Selection:
 Broadcast = Callable[[torch.Tensor], object] | None
 
 
-def _index(values: Sequence[int], device: torch.device) -> torch.Tensor:
-    return torch.tensor(list(values), dtype=torch.long, device=device)
-
-
-def _member(tokens: torch.Tensor, ids: Sequence[int]) -> torch.Tensor:
-    """Whether each task's token is in its row of ``ids``."""
-    sets = torch.tensor(
-        list(ids), dtype=tokens.dtype, device=tokens.device
-    ).view(int(tokens.numel()), -1)
-    return tokens.unsqueeze(1).eq(sets).any(dim=1)
+def _member(tokens: torch.Tensor, sets: torch.Tensor) -> torch.Tensor:
+    """Whether each task's token is in its row of the flat ``sets`` matrix."""
+    rows = sets.view(int(tokens.numel()), -1)
+    return tokens.unsqueeze(1).eq(rows).any(dim=1)
 
 
 def decisions(
@@ -122,10 +119,10 @@ def decisions(
     row-major ``[tasks, width]`` with at least one column, padded with -1.
     """
     eligible = valid & active
-    forced = torch.tensor(
-        list(force_finish), dtype=torch.long, device=tokens.device
-    ).bool()
-    finish = forced | _member(tokens, finish_ids)
+    forced, finish_sets, transition_sets = upload(
+        tokens.device, force_finish, finish_ids, transition_ids
+    )
+    finish = forced.bool() | _member(tokens, finish_sets)
     if terminal is not None:
         finish = finish | terminal
     finish = finish & eligible
@@ -133,7 +130,7 @@ def decisions(
     tagged = tokens.to(torch.int64) | torch.where(
         continuation, TOKEN_CONTINUATION_BIT, 0
     )
-    transition = _member(tokens, transition_ids) & eligible
+    transition = _member(tokens, transition_sets) & eligible
     return finish, continuation, tagged, transition
 
 
@@ -164,9 +161,8 @@ def select_greedy(
     work = logits
     if len(suppressed):
         work = logits.to(dtype=torch.float32, copy=True)
-        work.reshape(-1).index_fill_(
-            0, _index(suppressed, work.device), float("-inf")
-        )
+        (indices,) = upload(work.device, suppressed)
+        work.reshape(-1).index_fill_(0, indices, float("-inf"))
     tokens = torch.argmax(work, dim=-1)
     valid = _valid(work)
     if broadcast is not None:
@@ -225,22 +221,6 @@ def select_top_k(
         zeros,
         zeros + 1,
         transition,
-    )
-
-
-def _logprobs(
-    work: torch.Tensor,
-    rows: torch.Tensor,
-    tokens: torch.Tensor,
-    logprob_tasks: Sequence[int],
-    logprob_requests: Sequence[LogprobRequest],
-) -> torch.Tensor:
-    selected = _index(logprob_tasks, work.device)
-    return logprob_details(
-        work,
-        rows.index_select(0, selected),
-        tokens.index_select(0, selected),
-        logprob_requests,
     )
 
 
@@ -320,54 +300,47 @@ def select_categorical(
         params[:, TEMPERATURE] > 0.0, sampled, torch.argmax(work, dim=-1)
     )
 
+    # Speculative acceptance over each task's candidate rows laid out as one
+    # ``[tasks, width]`` matrix, ``width`` the most rows of a task: a task's
+    # rows padded with its first row, and its draft tokens padded with -1,
+    # which no selection equals. The padding is never consumed: a task's
+    # emitted points stay within its own rows.
     counts = [int(count) for count in row_counts]
-    offsets, drafted = [], []
-    offset = taken = 0
+    tasks, width = len(counts), max(counts)
+    candidate_rows: list[int] = []
+    draft_tokens: list[int] = []
+    first = taken = 0
     for count in counts:
-        offsets.append(offset)
-        drafted.append(
-            tuple(int(token) for token in drafts[taken : taken + count - 1])
-        )
-        offset += count
+        candidate_rows.extend(first + index for index in range(count))
+        candidate_rows.extend((first,) * (width - count))
+        draft_tokens.extend(drafts[taken : taken + count - 1])
+        draft_tokens.extend((-1,) * (width - count))
+        first += count
         taken += count - 1
-    accepted_counts, point_counts, terminals = [], [], []
-    output_rows, terminal_tokens = [], []
-    for first, tokens_, prefix in zip(
-        offsets, drafted, terminal_prefixes, strict=True
-    ):
-        if tokens_:
-            draft = torch.tensor(tokens_, dtype=row_tokens.dtype, device=device)
-            matches = row_tokens[first : first + len(tokens_)] == draft
-            raw = torch.cumprod(matches.to(torch.long), dim=0).sum()
-        else:
-            draft = torch.empty((0,), dtype=row_tokens.dtype, device=device)
-            raw = torch.zeros((), dtype=torch.long, device=device)
-        prefix = int(prefix)
-        if not prefix:
-            accepted = raw
-            terminal = torch.zeros((), dtype=torch.bool, device=device)
-            terminal_token = torch.zeros(
-                (), dtype=row_tokens.dtype, device=device
-            )
-        else:
-            accepted = raw.clamp_max(prefix)
-            terminal = raw >= prefix
-            terminal_token = draft[prefix - 1]
-        accepted_counts.append(accepted)
-        point_counts.append(accepted + (~terminal).to(dtype=torch.long))
-        terminals.append(terminal)
-        output_rows.append(accepted + first)
-        terminal_tokens.append(terminal_token)
+    rows, proposed, prefixes, reporting = upload(
+        device, candidate_rows, draft_tokens, terminal_prefixes, logprob_tasks
+    )
+    rows = rows.view(tasks, width)
+    selections = row_tokens.index_select(0, rows.reshape(-1)).view(tasks, width)
+    matches = selections[:, :-1] == proposed.view(tasks, width - 1)
+    raw = torch.cumprod(matches.to(torch.long), dim=1).sum(dim=1)
 
-    output = torch.stack(output_rows)
-    terminal = torch.stack(terminals)
+    # Reaching a terminal prefix clamps acceptance to it. Its tasks matched
+    # every draft through the prefix, so their selection at the prefix's
+    # last row is that terminal draft token.
+    prefixed = prefixes > 0
+    terminal = prefixed & (raw >= prefixes)
+    accepted = torch.where(prefixed, torch.minimum(raw, prefixes), raw)
+    terminal_tokens = selections.gather(
+        1, (prefixes - 1).clamp_min(0).unsqueeze(1)
+    ).squeeze(1)
+    output = rows[:, 0] + accepted
     tokens = torch.where(
         terminal,
-        torch.stack(terminal_tokens),
-        row_tokens.index_select(0, output),
+        terminal_tokens,
+        selections.gather(1, accepted.unsqueeze(1)).squeeze(1),
     )
-    accepted = torch.stack(accepted_counts)
-    points = torch.stack(point_counts)
+    points = accepted + (~terminal).to(dtype=torch.long)
 
     # Broadcast the complete selection so every tensor-parallel rank
     # advances request state from identical speculative decisions.
@@ -387,17 +360,12 @@ def select_categorical(
         terminal = selection[3].to(dtype=torch.bool)
 
     # A task is valid only when every consumed speculative point retained a
-    # legal candidate under its sampling constraints.
-    task_valid = torch.stack(
-        tuple(
-            valid[first : first + count][
-                torch.arange(count, device=device) < points[index]
-            ].all()
-            for index, (count, first) in enumerate(
-                zip(counts, offsets, strict=True)
-            )
-        )
-    )
+    # legal candidate under its sampling constraints: its first ``points``
+    # rows.
+    positions = torch.arange(width, device=device)
+    consumed = positions.unsqueeze(0) < points.unsqueeze(1)
+    legal = valid.index_select(0, rows.reshape(-1)).view(tasks, width)
+    task_valid = (legal | ~consumed).all(dim=1)
     finish, continuation, tagged, transition = decisions(
         tokens,
         task_valid,
@@ -412,11 +380,11 @@ def select_categorical(
     # verification row before the output row scored.
     packed = None
     if len(logprob_tasks):
-        packed = _logprobs(
+        scored = output - terminal.to(dtype=torch.long)
+        packed = logprob_details(
             logits.float(),
-            output - terminal.to(dtype=torch.long),
-            tokens,
-            logprob_tasks,
+            scored.index_select(0, reporting),
+            tokens.index_select(0, reporting),
             logprob_requests,
         )
     return Selection(
@@ -484,71 +452,97 @@ def shape_logits(
     work = work.to(dtype=torch.float32, copy=True)
     device = work.device
 
-    # Allowed-token restriction masks every other vocabulary entry.
+    # Top-k truncation groups. Rows whose width is at most ``candidates``
+    # keep their candidates as the top-k sampler (``sample_top_k``) does:
+    # the shared candidate width, then each row's own width. Both selectors
+    # therefore keep the same tokens, including the order among equal logits
+    # at a cutoff. Wider rows sharing a width are truncated in one
+    # gather/sort pass of that width.
+    narrow = [
+        index
+        for index, top_k in enumerate(top_ks)
+        if 0 < int(top_k) <= candidates
+    ]
+    own = [int(top_ks[index]) for index in narrow]
+    widths: dict[int, list[int]] = defaultdict(list)
+    for index, top_k in enumerate(top_ks):
+        if int(top_k) > candidates:
+            widths[int(top_k)].append(index)
+
+    # Every list a stage indexes with, as one copy.
+    (
+        allowed_row_index,
+        allowed_index,
+        suppressed_index,
+        penalty_index,
+        bias_index,
+        top_p_index,
+        min_p_index,
+        typical_p_index,
+        narrow_index,
+        own_widths,
+        *wide_index,
+    ) = upload(
+        device,
+        allowed_rows,
+        allowed,
+        suppressed,
+        penalty_rows,
+        bias,
+        top_p_rows,
+        min_p_rows,
+        typical_p_rows,
+        narrow,
+        own,
+        *widths.values(),
+    )
+
+    # Allowed-token restriction masks every other vocabulary entry. The
+    # allowed entries are filled with a scalar: assigning one through an
+    # index (``mask[index] = True``) copies it to the device and waits.
     if len(allowed_rows):
         mask = torch.ones_like(work, dtype=torch.bool)
-        mask.index_fill_(0, _index(allowed_rows, device), False)
-        mask.reshape(-1)[_index(allowed, device)] = True
+        mask.index_fill_(0, allowed_row_index, False)
+        mask.reshape(-1).index_fill_(0, allowed_index, True)
         work.masked_fill_(~mask, float("-inf"))
 
     # Suppressed tokens are masked regardless of any other shaping.
     if len(suppressed):
-        work.reshape(-1).index_fill_(
-            0, _index(suppressed, device), float("-inf")
-        )
+        work.reshape(-1).index_fill_(0, suppressed_index, float("-inf"))
 
     # Penalties apply to tokens with a positive count (see ``penalize``).
     if len(penalty_rows) and penalty_counts is not None:
-        selected = _index(penalty_rows, device)
         work.index_copy_(
             0,
-            selected,
+            penalty_index,
             penalize(
-                work.index_select(0, selected),
-                params.index_select(0, selected),
+                work.index_select(0, penalty_index),
+                params.index_select(0, penalty_index),
                 penalty_counts,
             ),
         )
 
     # Logit bias adds per-token offsets on top of the penalized logits.
     if len(bias):
-        work.reshape(-1).index_put_(
-            (_index(bias, device),),
-            torch.tensor(list(bias_values), dtype=work.dtype, device=device),
-            accumulate=True,
-        )
+        (offsets,) = upload(device, bias_values, dtype=work.dtype)
+        work.reshape(-1).index_put_((bias_index,), offsets, accumulate=True)
 
     # A zero temperature divides by one; callers select those rows by argmax.
     work.div_(temperature_divisors(params).unsqueeze(1))
 
-    # Top-k truncation; top-p applies within each retained top-k set. Rows
-    # whose width is at most ``candidates`` keep their candidates as the
-    # top-k sampler (``sample_top_k``) does: the shared candidate width, then
-    # each row's own width. Both selectors therefore keep the same tokens,
-    # including the order among equal logits at a cutoff. Wider rows sharing
-    # a width are truncated in one gather/sort pass of that width.
-    narrow = [
-        index
-        for index, top_k in enumerate(top_ks)
-        if 0 < int(top_k) <= candidates
-    ]
-    widths: dict[int, list[int]] = defaultdict(list)
-    for index, top_k in enumerate(top_ks):
-        if int(top_k) > candidates:
-            widths[int(top_k)].append(index)
-    # Each group: its gather width, its rows and, for the narrow rows, each
-    # row's own width.
-    groups: list[tuple[int, list[int], torch.Tensor | None]] = [
-        (width, members, None) for width, members in widths.items()
+    # Top-k truncation; top-p applies within each retained top-k set. Each
+    # pass: its gather width, its rows and, for the narrow rows, each row's
+    # own width.
+    passes: list[tuple[int, torch.Tensor, torch.Tensor | None]] = [
+        (width, selected, None)
+        for width, selected in zip(widths, wide_index, strict=True)
     ]
     if narrow:
-        own = [int(top_ks[index]) for index in narrow]
-        groups.append((candidates, narrow, _index(own, device)))
-    for width, members, own_widths in groups:
-        selected = _index(members, device)
+        passes.append((candidates, narrow_index, own_widths))
+    for width, selected, row_widths in passes:
         subset = work.index_select(0, selected)
         top_p = params.index_select(0, selected)[:, TOP_P]
-        ordered, tokens = top_k_candidates(subset, width, top_p, own_widths)
+        ordered, tokens = top_k_candidates(subset, width, top_p, row_widths)
         truncated = torch.full_like(subset, float("-inf"))
         truncated.scatter_(1, tokens, ordered)
         work.index_copy_(0, selected, truncated)
@@ -556,10 +550,9 @@ def shape_logits(
     # Full-vocabulary top-p for rows without a top-k restriction. The token
     # that first crosses top_p is kept: each drop decision shifts right.
     if len(top_p_rows):
-        selected = _index(top_p_rows, device)
-        subset = work.index_select(0, selected)
+        subset = work.index_select(0, top_p_index)
         ordered, tokens = torch.sort(subset, dim=-1, descending=True)
-        top_p = params.index_select(0, selected)[:, TOP_P]
+        top_p = params.index_select(0, top_p_index)[:, TOP_P]
         cumulative = torch.softmax(ordered, dim=-1).cumsum(dim=-1)
         over = cumulative > top_p.unsqueeze(1)
         drop = torch.cat(
@@ -574,24 +567,22 @@ def shape_logits(
         ordered.masked_fill_(drop, float("-inf"))
         truncated = torch.full_like(subset, float("-inf"))
         truncated.scatter_(1, tokens, ordered)
-        work.index_copy_(0, selected, truncated)
+        work.index_copy_(0, top_p_index, truncated)
 
     # Min-p drops tokens below a fraction of the row maximum, compared in log
     # space so the shaped logits are used directly.
     if len(min_p_rows):
-        selected = _index(min_p_rows, device)
-        subset = work.index_select(0, selected)
-        min_p = params.index_select(0, selected)[:, MIN_P]
+        subset = work.index_select(0, min_p_index)
+        min_p = params.index_select(0, min_p_index)[:, MIN_P]
         threshold = subset.max(dim=-1).values + torch.log(min_p)
         subset.masked_fill_(subset < threshold.unsqueeze(1), float("-inf"))
-        work.index_copy_(0, selected, subset)
+        work.index_copy_(0, min_p_index, subset)
 
     # Typical-p keeps the tokens whose surprise is closest to the row entropy,
     # covering the requested probability mass.
     if len(typical_p_rows):
-        selected = _index(typical_p_rows, device)
-        subset = work.index_select(0, selected)
-        typical_p = params.index_select(0, selected)[:, TYPICAL_P]
+        subset = work.index_select(0, typical_p_index)
+        typical_p = params.index_select(0, typical_p_index)[:, TYPICAL_P]
         probs = torch.softmax(subset, dim=-1)
         log_probs = probs.log()
         entropy = -(probs * log_probs).nan_to_num(0.0).sum(dim=-1, keepdim=True)
@@ -611,7 +602,7 @@ def shape_logits(
         subset.scatter_(
             1, order, subset.gather(1, order).masked_fill(drop, float("-inf"))
         )
-        work.index_copy_(0, selected, subset)
+        work.index_copy_(0, typical_p_index, subset)
 
     return work, _valid(work)
 
