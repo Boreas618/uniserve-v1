@@ -372,7 +372,7 @@ impl WorkerProcessArgs {
                 .map(|value| value.as_str().to_owned()),
             cache_memory_fraction: self.cache_storage_fraction,
             cache_token_capacity: self.cache_token_capacity,
-            attention_backend: self.attention_backend.as_name(),
+            attention_backend: self.attention_backend.as_str().to_owned(),
             block_size: self.block_size,
             max_batch_calls: self.max_batch_calls,
             max_batch_tokens: self.max_batch_tokens,

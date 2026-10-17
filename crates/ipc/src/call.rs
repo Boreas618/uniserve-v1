@@ -161,103 +161,93 @@ pub enum CallKind {
     Transfer(TransferMode),
 }
 
-/// Configured or resolved worker attention implementation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Attention provider selection of a worker's model.
+///
+/// Every name but `auto` is a provider module of
+/// `uniserve.backends.attention`, whose `resolve` accepts exactly these
+/// names; the selected provider serves every attention call of the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AttentionBackend {
-    /// Lets the worker select a compatible backend.
+    /// Selects a native kernel for each call from the device and the
+    /// installed kernel libraries.
     Auto,
-    /// TensorRT-LLM multi-head attention.
-    TrtllmMha,
-    /// SGLang attention kernel.
-    SglKernel,
-    /// FlashInfer attention implementation.
-    FlashInfer,
-    /// FlashAttention implementation.
+    /// FlashAttention-2 kernels of the `flash_attn` library.
     FlashAttn,
-    /// CuTe DSL FlashAttention 4 implementation.
-    Fa4Cute,
-    /// PyTorch scaled dot-product attention.
-    TorchSdpa,
-    /// FastH3 variable-sparse attention for SM100 devices.
-    H3VsaSm100,
-    /// Ordered composition of two or more concrete backends.
-    Composite(Vec<AttentionBackend>),
+    /// FlashAttention-4 CuTe DSL kernels.
+    FlashAttn4,
+    /// FlashInfer's attention kernels.
+    FlashInfer,
+    /// UniServe's SM100 prefix-block kernels, which read non-causal paged
+    /// blocks, segmented prefixes and causal chunks of head dimension 512.
+    PrefixBlock,
+    /// SGLang's FlashAttention-3 build for SM90.
+    SglKernel,
+    /// Portable PyTorch scaled dot-product attention.
+    Torch,
+    /// TensorRT-LLM (trtllm-gen) paged kernels shipped with FlashInfer.
+    Trtllm,
 }
 
 impl AttentionBackend {
-    /// Returns the stable configuration name for this backend selection.
-    pub fn as_name(&self) -> String {
+    /// Every selection, in the order `--help` lists their names.
+    pub const ALL: [Self; 8] = [
+        Self::Auto,
+        Self::FlashAttn,
+        Self::FlashAttn4,
+        Self::FlashInfer,
+        Self::PrefixBlock,
+        Self::SglKernel,
+        Self::Torch,
+        Self::Trtllm,
+    ];
+
+    /// Returns the provider name the worker resolves.
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Auto => "auto".to_owned(),
-            Self::TrtllmMha => "trtllm_mha".to_owned(),
-            Self::SglKernel => "sgl_kernel".to_owned(),
-            Self::FlashInfer => "flashinfer".to_owned(),
-            Self::FlashAttn => "flash_attn".to_owned(),
-            Self::Fa4Cute => "fa4_cute".to_owned(),
-            Self::TorchSdpa => "torch_sdpa".to_owned(),
-            Self::H3VsaSm100 => "h3_vsa_sm100".to_owned(),
-            Self::Composite(backends) => backends
-                .iter()
-                .map(Self::as_name)
-                .collect::<Vec<_>>()
-                .join("+"),
+            Self::Auto => "auto",
+            Self::FlashAttn => "flash_attn",
+            Self::FlashAttn4 => "flash_attn_4",
+            Self::FlashInfer => "flashinfer",
+            Self::PrefixBlock => "prefix_block",
+            Self::SglKernel => "sgl_kernel",
+            Self::Torch => "torch",
+            Self::Trtllm => "trtllm",
         }
     }
 }
 
 impl std::str::FromStr for AttentionBackend {
-    /// Error returned when a backend expression is unsupported or malformed.
+    /// Error returned when a name selects no provider.
     type Err = AttentionBackendParseError;
 
-    /// Parses a single backend name or an ordered composite expression.
+    /// Parses a provider name.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.contains('+') {
-            let backends = value
-                .split('+')
-                .map(str::parse)
-                .collect::<Result<Vec<_>, _>>()?;
-            if backends.len() < 2
-                || backends
-                    .iter()
-                    .any(|backend| matches!(backend, Self::Auto | Self::Composite(_)))
-            {
-                return Err(AttentionBackendParseError(value.to_owned()));
-            }
-            return Ok(Self::Composite(backends));
-        }
-        match value {
-            "auto" => Ok(Self::Auto),
-            "trtllm_mha" => Ok(Self::TrtllmMha),
-            "sgl_kernel" => Ok(Self::SglKernel),
-            "flashinfer" => Ok(Self::FlashInfer),
-            "flash_attn" => Ok(Self::FlashAttn),
-            "fa4_cute" => Ok(Self::Fa4Cute),
-            "torch_sdpa" => Ok(Self::TorchSdpa),
-            "h3_vsa_sm100" => Ok(Self::H3VsaSm100),
-            _ => Err(AttentionBackendParseError(value.to_owned())),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|backend| backend.as_str() == value)
+            .ok_or_else(|| AttentionBackendParseError(value.to_owned()))
     }
 }
 
 impl std::fmt::Display for AttentionBackend {
-    /// Formats the backend using its stable configuration name.
+    /// Formats the backend as its provider name.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.as_name())
+        formatter.write_str(self.as_str())
     }
 }
 
 impl Serialize for AttentionBackend {
-    /// Serializes the backend as its stable configuration name.
+    /// Serializes the backend as its provider name.
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.as_name())
+        serializer.serialize_str(self.as_str())
     }
 }
 
 impl<'de> Deserialize<'de> for AttentionBackend {
-    /// Deserializes and validates a backend configuration name.
+    /// Deserializes and validates a provider name.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -267,9 +257,13 @@ impl<'de> Deserialize<'de> for AttentionBackend {
     }
 }
 
-/// Error returned for an unsupported attention backend name.
+/// Error returned for a name that selects no attention provider; its
+/// message lists the accepted names.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unsupported attention backend {0:?}")]
+#[error(
+    "unsupported attention backend {0:?}; accepted names are {names}",
+    names = AttentionBackend::ALL.map(AttentionBackend::as_str).join(", ")
+)]
 pub struct AttentionBackendParseError(String);
 
 impl CallKind {

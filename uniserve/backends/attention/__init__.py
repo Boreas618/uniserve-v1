@@ -380,6 +380,21 @@ class Backend:
         )
 
 
+# The providers selectable by name. Each names the module of this package
+# whose ``Backend`` it constructs, and that backend reports it as its
+# ``name``. ``uniserve serve --attention-backend`` accepts these names and
+# ``"auto"`` (the Rust ``uniserve_ipc::AttentionBackend``).
+_PROVIDERS = (
+    "flash_attn",
+    "flash_attn_4",
+    "flashinfer",
+    "prefix_block",
+    "sgl_kernel",
+    "torch",
+    "trtllm",
+)
+
+
 def resolve(
     backend: str | Backend, *, device: torch_lib.device, flashinfer=None
 ) -> Backend:
@@ -389,7 +404,16 @@ def resolve(
     FlashInfer factory's workspace grant for the TensorRT-LLM kernels that
     ship with FlashInfer. Any other name selects that provider for every
     call, including the FlashInfer, FlashAttention-2 and portable torch
-    providers that automatic selection never chooses on CUDA.
+    providers that automatic selection never chooses on CUDA: ``torch``,
+    ``flash_attn`` (FlashAttention-2), ``flash_attn_4`` (FlashAttention-4),
+    ``flashinfer``, ``trtllm`` (TensorRT-LLM), ``sgl_kernel`` (SGLang's
+    FlashAttention-3) or ``prefix_block`` (UniServe's prefix-block kernels).
+    A named provider serves only the calls its kernels compute and refuses
+    any other when a layer is prepared or bound.
+
+    Raises:
+        ValueError: ``backend`` names no provider; the message lists the
+            accepted names.
     """
     if isinstance(backend, Backend):
         return backend
@@ -399,16 +423,11 @@ def resolve(
 
         return _Auto(device, flashinfer=flashinfer)
 
-    if backend not in {
-        "torch",
-        "flash_attn",
-        "flash_attn_4",
-        "flashinfer",
-        "trtllm",
-        "sgl_kernel",
-        "prefix_block",
-    }:
-        raise ValueError(f"unknown attention backend {backend!r}")
+    if backend not in _PROVIDERS:
+        raise ValueError(
+            f"unknown attention backend {backend!r}; accepted names are "
+            + ", ".join(("auto", *_PROVIDERS))
+        )
 
     if backend == "flashinfer" and flashinfer is not None:
         return flashinfer

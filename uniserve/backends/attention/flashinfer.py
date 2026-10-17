@@ -157,6 +157,32 @@ class Config:
                 raise ValueError("FlashInfer split tile sizes must be positive")
 
 
+def _split_bytes(*, num_heads, num_kv_heads, head_dim, size, device):
+    """Bytes of the split-KV partial outputs of a layer's largest plan.
+
+    Every plan here enables CUDA graphs, so FlashInfer's FA2 planner splits
+    the keys of every query tile and reserves, for each query head, one
+    float partial output of ``head_dim`` values and one float log-sum-exp
+    per row of ``padded_batch_size * cta_tile_q`` rows in the float
+    workspace (``batch_prefill_tmp_v`` and ``batch_prefill_tmp_s`` of
+    ``PrefillPlan``; decode plans with tensor cores take the same plan). The
+    padded batch is the larger of the split bound, two CTAs per SM divided
+    among the KV heads, and the query tiles ``ceil(R * g / T) + B - 1`` that
+    ``R`` packed rows of ``B`` sequences occupy, ``g`` being the query group
+    size and the tile ``T`` at most 128 rows. A plan therefore needs at most
+    ``max(split * 128, R * g + 128 * B)`` rows, largest at the layer's
+    prepared token and sequence capacity ``size``.
+    """
+    group = num_heads // num_kv_heads
+    split = 2 * torch.cuda.get_device_properties(device).multi_processor_count
+    rows = max(
+        split // num_kv_heads * 128,
+        size.num_tokens * group + 128 * size.batch_size,
+    )
+    # Each of the two arrays starts at a 16-byte aligned offset.
+    return 4 * num_heads * rows * (head_dim + 1) + 2 * 16
+
+
 def _tensor_cores(config, num_heads, num_kv_heads):
     if config.use_tensor_core is not None:
         return config.use_tensor_core
@@ -903,9 +929,37 @@ class Backend(_Backend):
     def __init__(self, config: Config = Config()):
         self.config = config
 
-    def workspace_buffers(self, **kwargs):
+    def workspace_buffers(
+        self,
+        *,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        size,
+        cache,
+        window=None,
+    ):
+        # Every plan of a layer shares the float workspace in turn. The
+        # configured size is its floor; a layer whose capacity needs larger
+        # split-KV partial outputs (``_split_bytes``) declares those, since
+        # a plan cannot grow the workspace once it is bound.
+        device = (
+            cache.key.device
+            if cache is not None
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+        needed = _split_bytes(
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            size=size,
+            device=device,
+        )
         return {
-            "scratch": BufferConfig((self.config.workspace_size,), torch.uint8)
+            "scratch": BufferConfig(
+                (max(self.config.workspace_size, needed),), torch.uint8
+            )
         }
 
     def prepare(self, **kwargs):

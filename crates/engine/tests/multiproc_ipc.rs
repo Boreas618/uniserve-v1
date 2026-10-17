@@ -1901,7 +1901,7 @@ fn rank_group_args(max_message_bytes: usize) -> WorkerProcessArgs {
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
-        attention_backend: uniserve_ipc::AttentionBackend::TorchSdpa,
+        attention_backend: uniserve_ipc::AttentionBackend::Torch,
         transfer: Default::default(),
         ..config
     }
@@ -1952,7 +1952,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         prefix_cache_dtype: None,
         cache_memory_fraction: 0.7,
         cache_token_capacity: Some(4096),
-        attention_backend: "torch_sdpa".into(),
+        attention_backend: "torch".into(),
         block_size: Some(16),
         max_batch_calls: 8,
         max_batch_tokens: 256,
