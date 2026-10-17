@@ -12,8 +12,10 @@
 //! executor waits for no job: a lane that stopped making progress holds up
 //! the forwards behind its job, while the executor goes on admitting
 //! batches, revoking freed products, delivering the results of forwards
-//! that completed and returning to its caller. Two rules order forwards so
-//! that what a job needs has happened when the job is prepared:
+//! that completed and returning to its caller, which reports such a lane
+//! with the batch its job belongs to ([`Executor::batch_of`]). Two rules
+//! order forwards so that what a job needs has happened when the job is
+//! prepared:
 //!
 //! - a batch that follows another on a request, or reads what another
 //!   produces, starts once that batch's forward has completed: its host
@@ -285,6 +287,12 @@ impl Batch {
         }
     }
 
+    /// Whether `job` is the batch's job in flight: of its forward, its
+    /// input admission or its output wait.
+    fn awaits(&self, job: JobId) -> bool {
+        [self.forward, self.inputs, self.outputs].contains(&Some(job))
+    }
+
     fn fail(&mut self, backend: &mut WorkerBackend, error: WorkerError) {
         let _range = range(c"uniserve.worker.close", Some(self.id));
         let mut error = self.data.attribute(error);
@@ -503,9 +511,7 @@ impl Executor {
     /// is gone (closed, or failed and consumed) has nothing left to apply
     /// to.
     pub(crate) fn complete(&mut self, job: JobId, completion: Completion) {
-        let Some(batch) = self.batches.values_mut().find(|batch| {
-            batch.forward == Some(job) || batch.outputs == Some(job) || batch.inputs == Some(job)
-        }) else {
+        let Some(batch) = self.batches.values_mut().find(|batch| batch.awaits(job)) else {
             return;
         };
         if batch.forward == Some(job) {
@@ -531,6 +537,16 @@ impl Executor {
             }
             Err(error) => batch.fail(&mut self.backend, error),
         }
+    }
+
+    /// The batch job `job` belongs to, with its id: the batch whose
+    /// forward, input admission or output wait it is, while it is in
+    /// flight.
+    pub(crate) fn batch_of(&self, job: JobId) -> Option<(u64, &WorkerBatch)> {
+        self.batches
+            .values()
+            .find(|batch| batch.awaits(job))
+            .map(|batch| (batch.id, &batch.data))
     }
 
     /// Consume one completed result without submitting numerical work.

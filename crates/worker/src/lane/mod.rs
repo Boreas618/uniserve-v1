@@ -30,6 +30,12 @@
 //! after it stopped, a caller may wait for one job, with a deadline
 //! ([`JobQueues::block_on`], [`JobQueues::drain`]).
 //!
+//! Because every job is submitted and every completion taken here, the
+//! queues know which jobs each lane and the Python thread have been given
+//! and not completed, and since when ([`JobQueues::oldest`]): a lane that
+//! stays inside one job, such as a driver call that does not return, is
+//! seen from the control thread, which reports it to the head.
+//!
 //! The lanes' streams belong to the rank's [`Streams`](crate::stream::Streams),
 //! which starts the lanes and closes every stream in dependency order.
 
@@ -106,7 +112,18 @@ impl JobQueues {
                 (kinds, lane.jobs.clone())
             })
             .collect();
-        Self::new(queues, posted, completions)
+        // A configured lane is named by its id; the one lane of a rank
+        // without configured lanes by its thread's name.
+        let names = lanes
+            .iter()
+            .enumerate()
+            .map(|(index, lane)| {
+                lane.config
+                    .as_ref()
+                    .map_or_else(|| format!("lane-{index}"), |config| config.lane_id.clone())
+            })
+            .collect();
+        Self::new(queues, names, posted, completions)
     }
 }
 
@@ -133,6 +150,35 @@ struct Shared {
     /// Completions taken while another job was waited for, in arrival
     /// order.
     arrived: Mutex<VecDeque<(JobId, Completion)>>,
+    /// What each lane, by position, and then the Python thread have been
+    /// given and not completed. Changed only by the thread that submits
+    /// jobs and takes completions.
+    running: Mutex<Vec<Running>>,
+}
+
+/// The jobs one performer, a lane's execution thread or the Python thread,
+/// has been given and not completed, in submission order. A performer
+/// performs its jobs in that order, so the first is the one it is
+/// performing; a job whose completion waits for device events
+/// ([`Job::after`]) leaves its lane at once and may complete after the
+/// jobs behind it.
+struct Running {
+    /// The lane's name in a stall report; `None` for the Python thread.
+    lane: Option<String>,
+    /// Each job, when it was submitted and the runner method it calls.
+    jobs: VecDeque<(JobId, Instant, Option<String>)>,
+    /// When the last completion of one of its jobs arrived.
+    completed: Option<Instant>,
+}
+
+impl Running {
+    fn new(lane: Option<String>) -> Self {
+        Self {
+            lane,
+            jobs: VecDeque::new(),
+            completed: None,
+        }
+    }
 }
 
 impl Default for JobQueues {
@@ -140,16 +186,23 @@ impl Default for JobQueues {
     /// thread that submits it.
     fn default() -> Self {
         let (posted, completions) = crossbeam_channel::unbounded();
-        Self::new(Vec::new(), posted, completions)
+        Self::new(Vec::new(), Vec::new(), posted, completions)
     }
 }
 
 impl JobQueues {
+    /// The queues `queues` of the lanes named `names`, in the same order.
     fn new(
         queues: Vec<(Option<Vec<CallKind>>, JobQueue)>,
+        names: Vec<String>,
         posted: Sender<(JobId, Completion)>,
         completions: Receiver<(JobId, Completion)>,
     ) -> Self {
+        let running = names
+            .into_iter()
+            .map(|name| Running::new(Some(name)))
+            .chain([Running::new(None)])
+            .collect();
         Self {
             shared: Arc::new(Shared {
                 queues,
@@ -158,6 +211,7 @@ impl JobQueues {
                 wake: Mutex::new(None),
                 next: AtomicU64::new(0),
                 arrived: Mutex::new(VecDeque::new()),
+                running: Mutex::new(running),
             }),
         }
     }
@@ -167,6 +221,66 @@ impl JobQueues {
             .arrived
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn running(&self) -> std::sync::MutexGuard<'_, Vec<Running>> {
+        self.shared
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Note that job `id`, which calls `method`, was given to `performer`
+    /// (a lane's position; the lanes' count for the Python thread) now.
+    fn submitted(&self, performer: usize, id: JobId, method: Option<String>) {
+        if let Some(running) = self.running().get_mut(performer) {
+            running.jobs.push_back((id, Instant::now(), method));
+        }
+    }
+
+    /// Note that the completion of job `id` arrived now.
+    fn received(&self, id: JobId) {
+        let now = Instant::now();
+        for running in self.running().iter_mut() {
+            if let Some(position) = running.jobs.iter().position(|(job, ..)| *job == id) {
+                running.jobs.remove(position);
+                running.completed = Some(now);
+                return;
+            }
+        }
+    }
+
+    /// The job in flight that its performer, a lane or the Python thread,
+    /// has been performing longest, and since when: of each performer's
+    /// first job, timed from its submission or from the arrival of that
+    /// performer's last completion, whichever is later, the earliest.
+    /// `None` when no job is in flight.
+    ///
+    /// Only completions taken so far count, so a caller takes the ones
+    /// that arrived before it asks.
+    pub(crate) fn oldest(&self) -> Option<(JobId, Instant)> {
+        self.running()
+            .iter()
+            .filter_map(|running| {
+                let &(id, submitted, _) = running.jobs.front()?;
+                let since = running
+                    .completed
+                    .map_or(submitted, |completed| completed.max(submitted));
+                Some((id, since))
+            })
+            .min_by_key(|&(_, since)| since)
+    }
+
+    /// The lane performing job `id`, `None` for the Python thread, and the
+    /// runner method the job calls; `None` when the job is not in flight.
+    pub(crate) fn performing(&self, id: JobId) -> Option<(Option<String>, Option<String>)> {
+        self.running().iter().find_map(|running| {
+            running
+                .jobs
+                .iter()
+                .find(|(job, ..)| *job == id)
+                .map(|(_, _, method)| (running.lane.clone(), method.clone()))
+        })
     }
 
     /// The lane serving `kind`, by its position among the rank's lanes;
@@ -189,7 +303,9 @@ impl JobQueues {
         match self.lane(kind) {
             Some(lane) => {
                 let id = self.name();
+                let method = job.method();
                 self.shared.queues[lane].1.start(id, job, wake)?;
+                self.submitted(lane, id, method);
                 Ok(id)
             }
             None => Ok(self.call(job, wake)),
@@ -232,6 +348,7 @@ impl JobQueues {
             ))?
             .1
             .start(id, job, true)?;
+        self.submitted(lane, id, None);
         Ok(id)
     }
 
@@ -259,9 +376,10 @@ impl JobQueues {
     pub(crate) fn drain(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut last = Vec::new();
-        for (_, lane) in &self.shared.queues {
+        for (index, (_, lane)) in self.shared.queues.iter().enumerate() {
             let id = self.name();
             lane.start(id, Job::new(), false)?;
+            self.submitted(index, id, None);
             last.push(id);
         }
         for id in last {
@@ -282,7 +400,11 @@ impl JobQueues {
         drop(arrived);
 
         loop {
-            match self.shared.completions.recv_deadline(deadline) {
+            let received = self.shared.completions.recv_deadline(deadline);
+            if let Ok((job, _)) = &received {
+                self.received(*job);
+            }
+            match received {
                 Ok((job, completion)) if job == id => return Ok(completion),
                 Ok(other) => self.arrived().push_back(other),
                 Err(RecvTimeoutError::Timeout) => {
@@ -303,9 +425,12 @@ impl JobQueues {
     /// takes one.
     pub(crate) fn call(&self, calls: Job, wake: bool) -> JobId {
         let id = self.name();
+        let method = calls.method();
         let wake = if wake { self.wake().clone() } else { None };
         let post = job::Post::new(id, self.shared.posted.clone(), wake);
         Interpreter::submit(move || post.now(calls.perform()));
+        // The Python thread is the performer after the lanes.
+        self.submitted(self.shared.queues.len(), id, method);
         id
     }
 
@@ -325,7 +450,13 @@ impl JobQueues {
     /// another job was waited for, or one posted since.
     pub(crate) fn take(&self) -> Option<(JobId, Completion)> {
         let kept = self.arrived().pop_front();
-        kept.or_else(|| self.shared.completions.try_recv().ok())
+        kept.or_else(|| {
+            let posted = self.shared.completions.try_recv().ok();
+            if let Some((job, _)) = &posted {
+                self.received(*job);
+            }
+            posted
+        })
     }
 
     /// Fire `wake` behind every completion from now on, so the control
@@ -367,7 +498,12 @@ mod tests {
             jobs.run();
             std::thread::current().id()
         });
-        let queues = JobQueues::new(vec![(None, queue)], posted, completions);
+        let queues = JobQueues::new(
+            vec![(None, queue)],
+            vec!["lane-0".into()],
+            posted,
+            completions,
+        );
         (queues, thread)
     }
 

@@ -12,9 +12,9 @@
 //! every failing rank reports identically, while no succeeding rank holds an
 //! unjoined call, retires only its batch unless it is fatal, is coded as a
 //! scheduler bug or invariant violation, or failed a batch carrying a `Free`
-//! command (`join_rank_errors`); rank loss, protocol violations, and every
-//! other error replace the whole rank group (`recover_workers`) and
-//! invalidate every request resident on it.
+//! command (`join_rank_errors`); rank loss, a lane a rank reports stalled,
+//! protocol violations, and every other error replace the whole rank group
+//! (`recover_workers`) and invalidate every request resident on it.
 //!
 //! The module also launches groups: `spawn_all` starts every group's ranks,
 //! locally or through the host launchers in `launcher`, before any group
@@ -33,13 +33,6 @@ use anyhow::Context;
 use uniserve_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
 use crate::worker::WorkerProcessArgs;
-
-/// Maximum interval without rank progress before an in-flight batch is treated as failed.
-///
-/// Measured from `WorkerGroup::last_progress` and enforced only while a batch
-/// is pending. Expiry is an error that `poll_batch` answers by replacing the
-/// rank group.
-const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Every rank of one group, with the launchers that started the remote ones.
 type LaunchedGroup = (Vec<RankProcess>, Option<super::launcher::Launchers>);
@@ -274,7 +267,8 @@ pub struct WorkerGroup {
     /// whose identifier does not exceed it.
     last_batch_id: Option<u64>,
     /// Time of construction or of the last submission, joined result, or
-    /// group replacement, from which `NEXT_RESULT_DEADLINE` is measured.
+    /// group replacement, from which `WorkerProcessArgs::result_deadline`
+    /// is measured.
     last_progress: Instant,
     /// Admitted batches not yet retired, by batch identifier.
     pending_batches: BTreeMap<u64, PendingBatch>,
@@ -2013,8 +2007,10 @@ impl WorkerGroup {
     /// error that `join_rank_errors` retires with its batch is returned as is
     /// and the group stays usable. Any other error, including rank loss, a
     /// protocol violation, an agreed error `join_rank_errors` does not retire,
-    /// and an expired `NEXT_RESULT_DEADLINE`, replaces the rank group and
-    /// returns the recovery's `WorkerFailure`.
+    /// a lane a rank reports stalled, and an expired
+    /// `WorkerProcessArgs::result_deadline` (measured from the group's last
+    /// progress and enforced only while a batch is pending), replaces the
+    /// rank group and returns the recovery's `WorkerFailure`.
     pub fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         if self.closed {
             return Ok(None);
@@ -2059,10 +2055,10 @@ impl WorkerGroup {
     }
 
     fn check_progress_deadline(&self) -> anyhow::Result<()> {
+        let deadline = self.process_args.result_deadline;
         anyhow::ensure!(
-            self.pending_batches.is_empty() || self.last_progress.elapsed() < NEXT_RESULT_DEADLINE,
-            "cooperative workers produced no progress within {:?}",
-            NEXT_RESULT_DEADLINE
+            self.pending_batches.is_empty() || self.last_progress.elapsed() < deadline,
+            "cooperative workers produced no progress within {deadline:?}",
         );
         Ok(())
     }

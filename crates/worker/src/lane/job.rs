@@ -365,6 +365,26 @@ impl Job {
             .collect()
     }
 
+    /// The import path of the first runner method the job calls or
+    /// captures, which names the job when its lane is reported stalled;
+    /// `None` for a job that calls none (a graph launch, copies, waits).
+    pub(crate) fn method(&self) -> Option<String> {
+        self.operations
+            .borrow()
+            .iter()
+            .find_map(|operation| match operation {
+                Operation::Call(
+                    Call::Method(method)
+                    | Call::Returning(method)
+                    | Call::Handle(method)
+                    | Call::Values(method)
+                    | Call::Texts(method),
+                ) => Some(method.name().to_owned()),
+                Operation::Call(Call::Capture(capture)) => Some(capture.method.name().to_owned()),
+                _ => None,
+            })
+    }
+
     fn push(&self, operation: Operation) {
         self.operations.borrow_mut().push(operation);
     }

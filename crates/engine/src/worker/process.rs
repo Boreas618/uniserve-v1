@@ -11,7 +11,9 @@
 //! `terminate` retires the rank.
 //!
 //! A rank's connection is its liveness: the head treats a rank whose
-//! connection has closed as dead.
+//! connection has closed as dead. A rank whose lane stays inside one job
+//! reports it unasked (`WorkerResponse::Stalled`), and the head fails that
+//! rank as it fails a dead one.
 //!
 //! The host exchanges batch descriptors and bounded result values while
 //! tensors, cache pages, and latent storage remain worker-resident.
@@ -153,6 +155,7 @@ impl Default for WorkerProcessArgs {
             worker_id: "worker".into(),
             python: Self::default_python(),
             launcher_timeout: std::time::Duration::from_secs(120),
+            result_deadline: std::time::Duration::from_secs(300),
             model: String::new(),
             base_model: None,
             ranks: vec![crate::WorkerRank {
@@ -307,6 +310,9 @@ impl WorkerProcessArgs {
             products_cross_hosts: self.transfer.products_cross_hosts(&self.worker_id, rank),
             queue_depth: depth,
             ipc_payload_cap: max_payload,
+            // Half the group's deadline: see `WorkerProcessArgs::result_deadline`.
+            stall_bound_ms: u64::try_from((self.result_deadline / 2).as_millis())
+                .unwrap_or(u64::MAX),
             model: self.model.clone(),
             base_model: self.base_model.as_deref().map(path),
             device: self.ranks[rank as usize].device.clone(),
@@ -857,13 +863,18 @@ impl RankProcess {
     /// Drains ready responses and routes them into `ready`, and returns how
     /// many were routed.
     ///
-    /// A transport, execution, or routing error stops the scan and is
-    /// returned; responses routed before it stay in `ready`. The channel
-    /// reports its close, which is the rank's death, as an error only after
-    /// every response that arrived whole has been routed.
+    /// A transport, execution, or routing error, or a stall report, stops
+    /// the scan and is returned; responses routed before it stay in
+    /// `ready`. The channel reports its close, which is the rank's death,
+    /// as an error only after every response that arrived whole has been
+    /// routed.
     fn drain_ready(&mut self) -> anyhow::Result<usize> {
         let mut drained = 0usize;
         while let Some(response) = self.client.try_recv::<WorkerResponse>()? {
+            // A stall report answers no request: it fails the rank.
+            if let WorkerResponse::Stalled { stall } = response {
+                return Err(self.stalled(&stall));
+            }
             // A response answers the request whose identity it states.
             let message_id = response
                 .message_id()
@@ -925,6 +936,50 @@ impl RankProcess {
         );
         self.ready.push_back(Ok(report));
         Ok(())
+    }
+
+    /// Logs a lane the rank reports stalled and returns the failure of the
+    /// rank, which names the lane and the forward its job belongs to.
+    ///
+    /// The rank's lane stays inside one job, so the rank cannot complete
+    /// the batches behind it: the group fails it as it fails a lost rank.
+    fn stalled(&self, stall: &uniserve_ipc::Stall) -> anyhow::Error {
+        let lane = stall.lane.as_ref().map_or_else(
+            || "the Python thread".to_owned(),
+            |lane| format!("lane {lane}"),
+        );
+        let calls = stall
+            .calls
+            .iter()
+            .map(|call| format!("{}/{:?}", call.request_key.request_id.0, call.call_id))
+            .collect::<Vec<_>>();
+        tracing::error!(
+            rank = self.rank,
+            lane = %lane,
+            batch_id = ?stall.batch_id,
+            route = ?stall.route,
+            method = ?stall.method,
+            calls = ?calls,
+            running_ms = stall.running_ms,
+            "a rank reports a lane stalled inside one job"
+        );
+
+        let forward = match stall.batch_id {
+            Some(batch_id) => format!(
+                "a job of batch {batch_id} ({}, method {}, calls [{}])",
+                stall.route.as_deref().unwrap_or("no calls"),
+                stall.method.as_deref().unwrap_or("none"),
+                calls.join(", "),
+            ),
+            None => format!(
+                "a job of no batch (method {})",
+                stall.method.as_deref().unwrap_or("none")
+            ),
+        };
+        anyhow::anyhow!(
+            "{lane} stalled: it has performed {forward} for {:.1} s without completing it",
+            Duration::from_millis(stall.running_ms).as_secs_f64()
+        )
     }
 
     /// Returns the descriptors that signal this rank's progress: its

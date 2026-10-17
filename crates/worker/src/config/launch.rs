@@ -22,6 +22,9 @@ pub struct IpcConfig {
     pub queue_depth: usize,
     /// Largest frame payload, in bytes.
     pub max_payload_bytes: usize,
+    /// How long one job may run on a lane before the rank reports the lane
+    /// stalled.
+    pub stall_bound: std::time::Duration,
 }
 
 /// Where a group's ranks meet to form their host-collective mesh.
@@ -233,6 +236,11 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
     if descriptor.ipc_payload_cap == 0 {
         return Err(DescriptorError::new("--ipc-payload-cap must be positive"));
     }
+    if descriptor.stall_bound_ms == 0 {
+        return Err(DescriptorError::new(
+            "the lane stall bound must be positive",
+        ));
+    }
     let stub = descriptor.no_model;
     let model = text(Some(&descriptor.model));
     if stub && !descriptor.allow_stub {
@@ -264,6 +272,7 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
             products_cross_hosts: descriptor.products_cross_hosts,
             queue_depth: descriptor.queue_depth,
             max_payload_bytes: descriptor.ipc_payload_cap,
+            stall_bound: std::time::Duration::from_millis(descriptor.stall_bound_ms),
         },
         local_rank: descriptor.local_rank as usize,
         distributed_backend: text(descriptor.distributed_backend.as_deref()),

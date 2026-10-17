@@ -1,4 +1,12 @@
-//! Rank-channel admission, result delivery, and orderly worker shutdown.
+//! Rank-channel admission, result delivery, stall reports, and orderly
+//! worker shutdown.
+//!
+//! The control thread serves the channel here and never waits for a lane.
+//! Each wait for a request or a completion ends, at the latest, when the
+//! job in flight longest reaches the rank's stall bound: a lane that has
+//! stayed inside one job that long, such as a driver call that does not
+//! return, is reported to the head ([`WorkerResponse::Stalled`]) with the
+//! batch the job belongs to, and the channel goes on being served.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -36,6 +44,11 @@ pub(crate) struct Service<'a> {
     closing: bool,
     shutdown: Option<WorkerResponse>,
     last_result: Instant,
+    /// How long one job may run on a lane before the lane is reported.
+    stall_bound: Duration,
+    /// A stalled lane was reported. The head fails the rank on the report,
+    /// so it is made once.
+    stalled: bool,
 }
 
 impl<'a> Service<'a> {
@@ -44,6 +57,7 @@ impl<'a> Service<'a> {
         channel: &'a mut Channel,
         info: WorkerInfo,
         experts: bool,
+        stall_bound: Duration,
     ) -> Self {
         executor.set_completion_wake(Some(channel.wake()));
         Self {
@@ -55,6 +69,8 @@ impl<'a> Service<'a> {
             closing: false,
             shutdown: None,
             last_result: Instant::now(),
+            stall_bound,
+            stalled: false,
         }
     }
 
@@ -235,13 +251,54 @@ impl<'a> Service<'a> {
             .map_err(|e| self.channel_error(e))
     }
 
-    /// Block until a request, a completion wake or the timeout. Fails once
-    /// the head's connection has closed: it is the head's liveness, and
-    /// nothing this rank computes can be delivered after it.
+    /// Report a lane stalled past the bound, then block until a request, a
+    /// completion wake, the timeout or the moment the job in flight longest
+    /// reaches the bound. Fails once the head's connection has closed: it
+    /// is the head's liveness, and nothing this rank computes can be
+    /// delivered after it.
     fn wait(&mut self, timeout: Duration) -> Result<(), WorkerError> {
+        let timeout = match self.watch_lanes()? {
+            Some(until) => timeout.min(until),
+            None => timeout,
+        };
         self.channel
             .wait(timeout)
             .map_err(|e| self.channel_error(e))
+    }
+
+    /// Report the job a lane has performed for at least the stall bound,
+    /// once; otherwise return how long until the job in flight longest
+    /// reaches the bound. The pass that waits has taken every completion
+    /// posted before its `advance`, so a job still in flight then had not
+    /// completed.
+    fn watch_lanes(&mut self) -> Result<Option<Duration>, WorkerError> {
+        if self.stalled {
+            return Ok(None);
+        }
+        let Some((job, since)) = self.executor.backend().oldest_job() else {
+            return Ok(None);
+        };
+        let running = since.elapsed();
+        if running < self.stall_bound {
+            return Ok(Some(self.stall_bound - running));
+        }
+
+        let batch = self.executor.batch_of(job);
+        let stall = self.executor.backend().stall(job, running, batch);
+        tracing::error!(
+            target: "uniserve_worker.execution",
+            lane = stall.lane.as_deref().unwrap_or("the Python thread"),
+            batch_id = ?stall.batch_id,
+            route = ?stall.route,
+            method = ?stall.method,
+            calls = stall.calls.len(),
+            running_ms = stall.running_ms,
+            "a lane has stayed inside one job past the stall bound of {:?}; reporting it to the head",
+            self.stall_bound,
+        );
+        self.stalled = true;
+        self.respond(&WorkerResponse::Stalled { stall })?;
+        Ok(None)
     }
 
     fn channel_error(&self, error: IpcError) -> WorkerError {

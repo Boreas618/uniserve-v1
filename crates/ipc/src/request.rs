@@ -5,7 +5,9 @@
 //! request-response correlation identity: a rank answers a request under the
 //! identity it carried, and a transport that matches a response to its request
 //! reads the identity from the decoded envelope, taking `None` as zero. It is
-//! unrelated to the planned calls' [`CallId`] values inside a batch.
+//! unrelated to the planned calls' [`CallId`] values inside a batch. The one
+//! message a rank sends unasked, [`WorkerResponse::Stalled`], answers no
+//! request and carries no identity.
 
 use super::*;
 
@@ -122,6 +124,8 @@ pub enum ResponseKind {
     Ok,
     /// Structured worker failure.
     Error,
+    /// A lane whose job has not completed within the rank's stall bound.
+    Stalled,
 }
 
 /// Request and call identity attached to a worker error.
@@ -151,6 +155,33 @@ pub struct WorkerResponseError {
     pub route: Option<String>,
     /// Calls affected by the failure.
     pub calls: Vec<ErrorCallIdentity>,
+}
+
+/// A job one of a rank's lanes has performed for at least the rank's stall
+/// bound ([`LaunchDescriptor::stall_bound_ms`](crate::LaunchDescriptor)),
+/// as the rank's control thread observes it: the job was submitted and its
+/// completion has not arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stall {
+    /// The lane performing the job: its configured lane id, or `lane-0` for
+    /// the full-device lane of a rank without configured lanes. `None` when
+    /// the rank's Python thread performs it, as it does every job of a call
+    /// kind no lane serves (every job of a rank without a CUDA device).
+    pub lane: Option<String>,
+    /// The batch the job belongs to: the one whose forward, input
+    /// admission or output wait it is. `None` for a job of no batch, such
+    /// as a lifecycle command's work.
+    pub batch_id: Option<u64>,
+    /// Call kind of that batch (for example `prefill`).
+    pub route: Option<String>,
+    /// Import path of the runner method the job calls; `None` for a job
+    /// that calls none, such as a graph launch.
+    pub method: Option<String>,
+    /// The calls of that batch.
+    pub calls: Vec<ErrorCallIdentity>,
+    /// How long the job has run, in milliseconds: since its submission, or
+    /// since the lane completed the job before it, whichever is later.
+    pub running_ms: u64,
 }
 
 /// Worker-to-host response envelope.
@@ -183,6 +214,13 @@ pub enum WorkerResponse {
         /// Structured failure details.
         error: WorkerResponseError,
     },
+    /// Reports, unasked, a lane that stays inside one job. The rank's
+    /// control thread sends it once, and goes on serving the channel; the
+    /// head fails the rank on it.
+    Stalled {
+        /// The lane, the job's batch and how long the job has run.
+        stall: Stall,
+    },
 }
 
 impl WorkerResponse {
@@ -193,26 +231,31 @@ impl WorkerResponse {
             Self::Result { .. } => ResponseKind::Result,
             Self::Ok { .. } => ResponseKind::Ok,
             Self::Error { .. } => ResponseKind::Error,
+            Self::Stalled { .. } => ResponseKind::Stalled,
         }
     }
 
-    /// Returns the optional request-response correlation identity.
+    /// Returns the optional request-response correlation identity; `None`
+    /// for a stall report, which answers no request.
     pub const fn message_id(&self) -> Option<u64> {
         match self {
             Self::Info { message_id, .. }
             | Self::Result { message_id, .. }
             | Self::Ok { message_id }
             | Self::Error { message_id, .. } => *message_id,
+            Self::Stalled { .. } => None,
         }
     }
 
-    /// Replaces the request-response correlation identity (`message_id`).
+    /// Replaces the request-response correlation identity (`message_id`) of
+    /// a response; a stall report has none to replace.
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
             Self::Info { message_id, .. }
             | Self::Result { message_id, .. }
             | Self::Ok { message_id }
             | Self::Error { message_id, .. } => *message_id = value,
+            Self::Stalled { .. } => {}
         }
     }
 

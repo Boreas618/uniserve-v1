@@ -53,6 +53,9 @@ const WORLD_SIZE: usize = 2;
 const QUEUE_DEPTH: usize = 2;
 /// The stub model's image start token, the successor of 1001.
 const STUB_IMAGE_START: u32 = 151_670;
+/// The stub model's token whose forward on a CPU rank never returns
+/// (`uniserve.models.stub.STUB_STALL_TOKEN_ID`).
+const STUB_STALL: u32 = 151_669;
 /// Held across `EngineCore::new` in
 /// `unsupported_media_is_rejected_without_stopping_the_engine` and across the
 /// rank-group launch in `a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails`,
@@ -659,6 +662,157 @@ fn a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow::
         message.contains("47"),
         "the failure did not name the rank's exit: {message}"
     );
+    Ok(())
+}
+
+/// A rank whose lane stays inside one job reports the lane and the job's
+/// forward to its head, unasked, once the job has run for the launch's stall
+/// bound, and goes on serving its channel.
+#[test]
+fn a_stalled_lane_is_reported_while_its_rank_serves_on() -> anyhow::Result<()> {
+    use uniserve_ipc::{ErrorCallIdentity, WorkerRequest, WorkerResponse};
+
+    let directory = tempfile::tempdir()?;
+    let address = format!("unix:{}", directory.path().join("head.sock").display());
+    let descriptor = LaunchDescriptor {
+        stall_bound_ms: 500,
+        ..stub_launch_descriptor()
+    };
+    let (mut head, mut child) = RawHead::launch(&address, &descriptor)?;
+    let result = (|| -> anyhow::Result<()> {
+        let request = |mut request: WorkerRequest, message_id| {
+            request.set_call_id(Some(message_id));
+            request
+        };
+
+        // The prefill's forward embeds the stub's stalling token, so the
+        // job that runs it never completes.
+        let admission = text_admission(71, 1, 1)?;
+        let call_id = CallId::new(1, 0);
+        let stalling = token_batch(
+            1,
+            1,
+            admission.request_key,
+            Some(admission.clone()),
+            call_id,
+            CallKind::Forward(ForwardMode::Prefill),
+            &[STUB_STALL],
+            UnitId(1),
+            0,
+        );
+        head.send(&request(WorkerRequest::submit(stalling), 1))?;
+
+        // The report answers no request, so it carries no identity.
+        let report = head
+            .response(0, Duration::from_secs(60))?
+            .context("the stalled lane was not reported")?;
+        let WorkerResponse::Stalled { stall } = report else {
+            anyhow::bail!("the rank answered with {report:?}");
+        };
+        // A CPU rank has no lane: its Python thread performs every job.
+        anyhow::ensure!(stall.lane.is_none(), "{stall:?}");
+        anyhow::ensure!(stall.batch_id == Some(1), "{stall:?}");
+        anyhow::ensure!(stall.route.as_deref() == Some("prefill"), "{stall:?}");
+        anyhow::ensure!(stall.method.is_some(), "{stall:?}");
+        anyhow::ensure!(
+            stall.calls
+                == [ErrorCallIdentity {
+                    request_key: admission.request_key,
+                    call_id,
+                }],
+            "{stall:?}"
+        );
+        anyhow::ensure!(stall.running_ms >= 500, "{stall:?}");
+
+        // The control thread still serves the channel.
+        let info = head.send(&request(WorkerRequest::info(), 2))?;
+        let answered = head.response(info, Duration::from_secs(10))?;
+        anyhow::ensure!(
+            matches!(answered, Some(WorkerResponse::Info { .. })),
+            "the stalled rank did not answer Info: {answered:?}"
+        );
+        Ok(())
+    })();
+    // The rank's lane never returns, so the process is killed.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+/// A group whose rank reports a stalled lane fails the batch's requests with
+/// an error naming the lane and the forward, before its own result deadline,
+/// and is replaced by a group that serves.
+#[test]
+fn a_reported_stall_replaces_the_group_naming_the_lane() -> anyhow::Result<()> {
+    let mut args = single_rank_args("stalling", QUEUE_DEPTH);
+    // The rank reports a job that has run for half of this, 4 seconds.
+    args.result_deadline = Duration::from_secs(8);
+    let mut group = WorkerGroup::spawn(args)?;
+
+    let admission = text_admission(31, 1, 1)?;
+    let stalling = token_batch(
+        1,
+        1,
+        admission.request_key,
+        Some(admission),
+        CallId::new(1, 0),
+        CallKind::Forward(ForwardMode::Prefill),
+        &[STUB_STALL],
+        UnitId(1),
+        0,
+    );
+    group.submit_batch(stalling, &CallReaders::new())?;
+    let failure = group
+        .poll_batch(Duration::from_secs(30))
+        .expect_err("a stalled lane must fail its group");
+    let failure = failure
+        .downcast_ref::<WorkerFailure>()
+        .context("expected the group's replacement")?;
+    // The rank's report failed the group, not the group's own deadline,
+    // whose failure names no lane.
+    for named in ["the Python thread stalled", "batch 1 (prefill", "31/"] {
+        anyhow::ensure!(
+            failure.message.contains(named),
+            "the failure does not name {named:?}: {}",
+            failure.message
+        );
+    }
+    let requests = failure
+        .requests
+        .iter()
+        .map(|request| request.request_id.0)
+        .collect::<Vec<_>>();
+    assert_eq!(requests, [31]);
+
+    // The replacement serves the next request.
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !group.is_ready() {
+        anyhow::ensure!(
+            std::time::Instant::now() < ready_deadline,
+            "replacement did not become ready"
+        );
+        group.poll_batch(Duration::from_millis(100))?;
+    }
+    let admission = text_admission(32, 1, 1)?;
+    let served = execute(
+        &mut group,
+        token_batch(
+            2,
+            2,
+            admission.request_key,
+            Some(admission),
+            CallId::new(2, 0),
+            CallKind::Forward(ForwardMode::Prefill),
+            &[7, 8],
+            UnitId(1),
+            0,
+        ),
+    )?;
+    let record = &served.results[0].output;
+    assert_eq!(record.status, CallStatus::Ok);
+    // The stub's head maps 8 to 1000.
+    assert_eq!(record.committed_tokens, vec![1000]);
+    group.close()?;
     Ok(())
 }
 
@@ -1658,6 +1812,8 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         products_cross_hosts: false,
         queue_depth: 8,
         ipc_payload_cap: 1 << 20,
+        // Half the head's default result deadline, as the head states it.
+        stall_bound_ms: 150_000,
         model: String::new(),
         base_model: None,
         device: "cpu".into(),

@@ -593,8 +593,13 @@ impl Worker {
     }
 
     /// Serve the channel until the engine closes the rank or a fatal
-    /// response ends admission.
-    pub(crate) fn run(&mut self, channel: &mut Channel) -> std::result::Result<(), WorkerError> {
+    /// response ends admission, reporting a lane that stays inside one job
+    /// for `stall_bound`.
+    pub(crate) fn run(
+        &mut self,
+        channel: &mut Channel,
+        stall_bound: std::time::Duration,
+    ) -> std::result::Result<(), WorkerError> {
         self.warmup()?;
         let info = self.info.clone();
         let executor = self
@@ -604,7 +609,7 @@ impl Worker {
         // Ranks of an expert union join every step outside their own.
         let experts = executor.backend().experts().is_some();
         executor.backend().set_storage_wake(Some(channel.wake()));
-        let served = Service::new(executor, channel, info, experts).run();
+        let served = Service::new(executor, channel, info, experts, stall_bound).run();
         executor.backend().set_storage_wake(None);
         served
     }
