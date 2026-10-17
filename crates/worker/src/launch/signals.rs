@@ -76,9 +76,9 @@ fn dispatch(mut signals: std::fs::File, serving: &AtomicBool) {
         }
         if signal == libc::SIGINT {
             tracing::warn!(target: "uniserve_worker.launch", "worker interrupted; shutting down");
-            // SAFETY: _exit terminates without running destructors, which
-            // could wait on device work or peers a failed startup abandoned.
-            unsafe { libc::_exit(130) };
+            // Ending at once runs no destructor, which could wait on device
+            // work or peers a failed startup abandoned.
+            super::end(130);
         }
         // Restore the default disposition and deliver the signal again, so
         // the launcher observes a signal death.

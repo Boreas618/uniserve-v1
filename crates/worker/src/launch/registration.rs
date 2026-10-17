@@ -80,9 +80,7 @@ impl HeadWatch {
                         target: "uniserve_worker.launch",
                         "the head closed the connection while the rank was starting"
                     );
-                    // SAFETY: `_exit` ends the process without running any
-                    // handler, which is safe from any thread.
-                    unsafe { libc::_exit(1) };
+                    super::end(1);
                 }
             })
             .map_err(failed)?;

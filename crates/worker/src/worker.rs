@@ -72,7 +72,7 @@ use crate::runner::scratch::Scratches;
 use crate::runner::start::{
     ImageOwners, Startup as ImageStartup, reserved_bytes as image_reserved_bytes, start_video,
 };
-use crate::service::Service;
+use crate::service::{Ending, Service};
 use crate::storage::{BufferPool, CachePlan, GroupShape, PrefixCache, ProductStore};
 use crate::stream::{CUDAStream, EventPool, Streams};
 use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
@@ -596,13 +596,14 @@ impl Worker {
     }
 
     /// Serve the channel until the engine closes the rank or a fatal
-    /// response ends admission, reporting a lane that stays inside one job
-    /// for `stall_bound`.
+    /// response ends admission, or until the head's channel fails
+    /// ([`Ending`]), reporting a lane that stays inside one job for
+    /// `stall_bound`.
     pub(crate) fn run(
         &mut self,
         channel: &mut Channel,
         stall_bound: std::time::Duration,
-    ) -> std::result::Result<(), WorkerError> {
+    ) -> std::result::Result<Ending, WorkerError> {
         self.warmup()?;
         let info = self.info.clone();
         let executor = self

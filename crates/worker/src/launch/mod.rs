@@ -15,8 +15,15 @@
 //! | SIGINT before serving | 130 |
 //! | SIGTERM before serving | signal death |
 //! | the head's connection closing before serving | 1, at once |
-//! | startup or serving failure, or the head's connection closing while serving | 1, after an aborted close |
+//! | startup or serving failure | 1, after an aborted close |
+//! | the head's connection closing while serving with work in flight | 1, at once, from the control thread |
+//! | the head's connection closing while serving with nothing in flight | 1, after an aborted close and the destruction of the rank's device contexts |
 //! | close by the head, or after a fatal response | 0, after the rank's device contexts are destroyed |
+//!
+//! A rank that ends at once runs no teardown and does not destroy its
+//! device contexts ([`end`]). Every rank that does not close in order with
+//! its group removes the names of its CUDA driver's and NCCL's shared
+//! memory before it ends ([`release_names`]).
 
 mod arguments;
 mod registration;
@@ -31,6 +38,7 @@ pub(crate) use signals::Signals;
 use crate::config::{DescriptorError, resolve};
 use crate::error::WorkerError;
 use crate::ffi::Interpreter;
+use crate::service::Ending;
 use crate::worker::Worker;
 
 /// Run the rank and return its exit status.
@@ -92,9 +100,75 @@ impl<E: Into<WorkerError>> From<E> for Failure {
     }
 }
 
+/// Removes the names of the shared memory that this process's CUDA driver
+/// and NCCL keep in `/dev/shm`, for a rank that ends without destroying its
+/// communicators with its peers, or its device contexts.
+///
+/// The driver names its memory for the process
+/// ([`uniserve_ipc::launch::remove_event_memory`]); NCCL's names are random,
+/// and those still linked among this process's mappings are its own
+/// ([`uniserve_ipc::launch::NcclSegments`]). Removing a name leaves every
+/// mapping of the object, this process's and those its peers opened, valid
+/// until they end. The removal is best effort: the rank ends whatever it
+/// finds.
+fn release_names() {
+    // SAFETY: getuid and getpid have no preconditions.
+    let (uid, pid) = unsafe { (libc::getuid(), libc::getpid()) };
+    let _ = uniserve_ipc::launch::remove_event_memory(uid, pid as u32);
+    if let Ok(segments) = uniserve_ipc::launch::NcclSegments::mapped_by(None) {
+        let _ = segments.remove();
+    }
+}
+
+/// Ends the process at once with `status`, running no teardown: for a rank
+/// that cannot unwind from where its threads wait. Its device contexts and
+/// communicators are not destroyed, so the names of their shared memory
+/// are removed first ([`release_names`]).
+pub(crate) fn end(status: i32) -> ! {
+    release_names();
+    // SAFETY: `_exit` ends the process without running any handler, which
+    // is safe from any thread.
+    unsafe { libc::_exit(status) }
+}
+
+/// Reports a failed startup to the head on the channel the rank registered
+/// on, as the error that answers the head's request for its startup report.
+/// The head names the rank and returns its error, and may end the rank's
+/// group as soon as it has read it, before the rank logs the error itself.
+/// A failure to send leaves the head to notice the closed connection.
+fn report_startup_failure(channel: &mut uniserve_ipc::Channel, error: &WorkerError) {
+    let response = uniserve_ipc::WorkerResponse::Error {
+        message_id: None,
+        error: error.response(),
+    };
+    let _ = channel.send(&response).and_then(|()| channel.flush());
+}
+
+/// How the rank's life on the control thread ended.
+struct Ended {
+    outcome: std::result::Result<(), Failure>,
+    /// The worker closed in order with its group, which destroyed the
+    /// communicators it shares with its peers.
+    orderly: bool,
+    /// Nothing the rank issued can still run on its devices, so its device
+    /// contexts can be destroyed.
+    settled: bool,
+}
+
+impl<E: Into<Failure>> From<E> for Ended {
+    /// A failure before the rank served leaves nothing settled.
+    fn from(error: E) -> Self {
+        Self {
+            outcome: Err(error.into()),
+            orderly: false,
+            settled: false,
+        }
+    }
+}
+
 /// Run the rank on a control thread while the calling thread serves its
-/// Python calls, then destroy the rank's device contexts after an orderly
-/// close.
+/// Python calls, then destroy the rank's device contexts when nothing it
+/// issued can still run on them.
 fn run(
     arguments: &Arguments,
     import: tvm_ffi::Function,
@@ -104,7 +178,7 @@ fn run(
     let interpreter = Interpreter::start()?;
     let (finished, outcome) = crossbeam_channel::bounded(1);
 
-    std::thread::scope(|scope| {
+    let ended = std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("control".into())
             .spawn_scoped(scope, move || {
@@ -114,56 +188,118 @@ fn run(
             })
             .map_err(|error| crate::Error::Transport(format!("control thread: {error}")))?;
 
-        interpreter.run(&outcome).unwrap_or_else(|| {
-            Err(crate::Error::State("the control thread ended without a result").into())
-        })
+        Ok::<_, Failure>(interpreter.run(&outcome).unwrap_or_else(|| {
+            crate::Error::State("the control thread ended without a result").into()
+        }))
     })?;
+    if !ended.orderly {
+        // The communicators were not destroyed with the group's peers, and
+        // the contexts are destroyed below only when settled.
+        release_names();
+    }
+    if !ended.settled {
+        // Destroying a context waits for the work queued in it, and work an
+        // aborted close abandoned may never complete.
+        return ended.outcome;
+    }
 
-    // The worker closed in order and was dropped, the control thread has
-    // finished and this thread makes no Python call again, so nothing uses a
-    // device any more. PyTorch's references keep every context alive until
-    // the process ends, and the driver removes the shared memory behind a
-    // context's interprocess events only when the context is destroyed, not
-    // when the process exits: the contexts are destroyed here. A rank whose
-    // close was aborted skips this: destroying a context waits for the work
-    // queued in it, and work an aborted close abandons may never complete.
+    // The worker was closed and dropped, the control thread has finished
+    // and this thread makes no Python call again, so nothing uses a device
+    // any more, and nothing the rank issued still runs on one. PyTorch's
+    // references keep every context alive until the process ends, and the
+    // driver removes the shared memory behind a context's interprocess
+    // events only when the context is destroyed, not when the process exits:
+    // the contexts are destroyed here.
     // SAFETY: as above, nothing in the process uses a device after this.
-    let devices =
-        unsafe { uniserve_cuda::PrimaryContext::reset_all() }.map_err(crate::Error::from)?;
-    tracing::debug!(
-        target: "uniserve_worker.launch",
-        ?devices,
-        "destroyed the device contexts"
-    );
-    Ok(())
+    match unsafe { uniserve_cuda::PrimaryContext::reset_all() } {
+        Ok(devices) => tracing::debug!(
+            target: "uniserve_worker.launch",
+            ?devices,
+            "destroyed the device contexts"
+        ),
+        Err(error) => {
+            let error = Failure::from(crate::Error::from(error));
+            return ended.outcome.and(Err(error));
+        }
+    }
+    ended.outcome
 }
 
 /// The rank's life on the control thread: register with the head, start,
 /// warm up, serve and close.
-fn serve(arguments: &Arguments, signals: &Signals) -> std::result::Result<(), Failure> {
-    let (mut channel, descriptor) = register(arguments)?;
-    let launch = resolve(descriptor).map_err(Failure::Descriptor)?;
+///
+/// A close by the head is collective: the group's ranks retire the
+/// communicators and process groups they share together, so the close is
+/// orderly. Without the head no rank learns what its peers do, and a peer
+/// may have abandoned its work or stopped; an orderly close would wait on it
+/// for good, so the rank closes without waiting on device work or peers. Its
+/// devices are settled when the head closed it in order, or when the head's
+/// channel failed while nothing was in flight. When work was in flight, the
+/// process ends here at once.
+fn serve(arguments: &Arguments, signals: &Signals) -> Ended {
+    let (mut channel, descriptor) = match register(arguments) {
+        Ok(registered) => registered,
+        Err(error) => return error.into(),
+    };
+    let launch = match resolve(descriptor) {
+        Ok(launch) => launch,
+        Err(error) => return Failure::Descriptor(error).into(),
+    };
     channel.set_bound(launch.ipc.max_payload_bytes);
 
     // Until the service observes the connection, the head's close ends the
     // process from the watch's thread.
-    let hangup = channel
-        .hangup()
-        .map_err(|error| crate::Error::Transport(error.to_string()))?;
-    let mut starting = Some(HeadWatch::start(hangup)?);
+    let hangup = match channel.hangup() {
+        Ok(hangup) => hangup,
+        Err(error) => return crate::Error::Transport(error.to_string()).into(),
+    };
+    let mut starting = match HeadWatch::start(hangup) {
+        Ok(watch) => Some(watch),
+        Err(error) => return error.into(),
+    };
 
     let stall_bound = launch.ipc.stall_bound;
-    let mut worker = Worker::start(launch)?;
-    let served = worker.warmup().and_then(|()| {
+    let mut worker = match Worker::start(launch) {
+        Ok(worker) => worker,
+        Err(error) => {
+            report_startup_failure(&mut channel, &error);
+            return error.into();
+        }
+    };
+    let warmed = worker.warmup();
+    if let Err(error) = &warmed {
+        report_startup_failure(&mut channel, error);
+    }
+    let served = warmed.and_then(|()| {
         starting.take();
         signals.serving();
         worker.run(&mut channel, stall_bound)
     });
     // An orderly failure of the startup closes the rank below, not the watch.
     drop(starting);
-    let closed = worker.close(served.is_err());
+    let (served, orderly, settled) = match served {
+        Ok(Ending::Closed) => (Ok(()), true, true),
+        Ok(Ending::Orphaned(error)) => (Err(error), false, true),
+        Ok(Ending::Abandoned(error)) => {
+            // The Python thread may wait in the abandoned work for good,
+            // inside a device call behind a collective whose peer stopped,
+            // and an aborted close then waits with it: the rank can neither
+            // return through that thread nor close. The process ends from
+            // here, as the head watch ends a starting rank.
+            tracing::error!(target: "uniserve_worker.launch", "worker failed: {error}");
+            end(1);
+        }
+        Err(error) => (Err(error), false, false),
+    };
+    let closed = worker.close(!orderly);
     // The worker's readers retire before the connection is released.
     drop(worker);
     drop(channel);
-    Ok(served.and(closed)?)
+    // An orderly close that failed may have left work behind.
+    let settled = settled && (!orderly || closed.is_ok());
+    Ended {
+        outcome: served.and(closed).map_err(Failure::from),
+        orderly,
+        settled,
+    }
 }

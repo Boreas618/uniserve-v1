@@ -1,7 +1,7 @@
 //! Primary context retention and per-thread selection.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::driver::{Handle, driver};
 use crate::{DeviceId, Result};
@@ -80,13 +80,14 @@ impl PrimaryContext {
     ///
     /// Some driver state outlives the process unless its context is
     /// destroyed: the driver backs the interprocess events of a context with
-    /// a POSIX shared-memory object (`/dev/shm/cuda.shm.<uid>.<pid>.<n>`,
-    /// created by the first `cuEventCreate` with `CU_EVENT_INTERPROCESS`) and
-    /// unlinks it only when the context is destroyed. Destroying the events
-    /// does not unlink it, and neither does the process's exit, by `exit` or
-    /// `_exit`. A context the CUDA runtime retains (PyTorch's) is never
-    /// released before a rank process ends, so the rank destroys its
-    /// contexts as the last step of an orderly end.
+    /// a POSIX shared-memory object named for the process
+    /// (`/dev/shm/cuda.shm.<uid>.<pid>.<n>`, ids in hexadecimal; see
+    /// `uniserve_ipc::launch::remove_event_memory`), created by the first
+    /// `cuEventCreate` with `CU_EVENT_INTERPROCESS`, and unlinks it only when
+    /// the context is destroyed. Destroying the events does not unlink it, and neither does
+    /// the process's exit, by `exit` or `_exit`. A context the CUDA runtime
+    /// retains (PyTorch's) is never released before a rank process ends, so
+    /// the rank destroys its contexts as the last step of an orderly end.
     ///
     /// Releases queued on the reclaimer run first, since each needs its
     /// context. Destroying a context waits for the work queued in it, so the
@@ -146,6 +147,53 @@ impl PrimaryContext {
             }
         }
         outcome.map(|()| reset)
+    }
+
+    /// Arranges for [`Self::reset_all`] to run when this process exits by
+    /// `exit`: returning from `main` or `std::process::exit`, as a test
+    /// harness does once every test has completed and a Python interpreter
+    /// does after its finalization. The first interprocess event a process
+    /// creates calls this ([`crate::EventFlags::interprocess`]): such a
+    /// process would otherwise leave the events' shared memory behind, as
+    /// the CUDA runtime's convention of calling `cudaDeviceReset` before
+    /// exiting avoids. A rank never exits by `exit`: it destroys its contexts
+    /// itself when nothing it issued can still run, and ends by `_exit`.
+    ///
+    /// The driver is loaded first, so the exit handlers it registers as it
+    /// loads run after this one, while it still serves the reset. Later
+    /// calls register nothing more. A failure of the reset at exit is
+    /// reported on standard error.
+    ///
+    /// # Safety
+    ///
+    /// When the process exits, no thread uses a device any more, and the work
+    /// queued on every device can complete: the reset waits for it.
+    pub(crate) unsafe fn reset_all_at_exit() -> Result<()> {
+        static REGISTERED: OnceLock<bool> = OnceLock::new();
+
+        driver()?;
+        // SAFETY: registers a handler that takes no arguments and does not
+        // unwind; the caller's guarantee covers the reset it makes.
+        let registered = *REGISTERED.get_or_init(|| unsafe { libc::atexit(reset_at_exit) } == 0);
+        if registered {
+            Ok(())
+        } else {
+            Err(crate::Error::ExitHandler)
+        }
+    }
+}
+
+/// The exit handler [`PrimaryContext::reset_all_at_exit`] registers.
+extern "C" fn reset_at_exit() {
+    // SAFETY: the registrant guaranteed that nothing uses a device once the
+    // process exits.
+    if let Err(error) = unsafe { PrimaryContext::reset_all() } {
+        use std::io::Write;
+        // A closed standard error must not panic inside an exit handler.
+        let _ = writeln!(
+            std::io::stderr(),
+            "uniserve-cuda: destroying the device contexts at exit failed: {error}"
+        );
     }
 }
 
