@@ -13,7 +13,11 @@ class Config:
     """Checkpoint IO policy: encoding, read mode, concurrency and caching.
 
     Also integrity. mode selects eager full reads, per-shard layered reads,
-    or deterministic dummy values; prefetch defaults to mmap when unset.
+    or deterministic dummy values. prefetch, which defaults to mmap when
+    unset, reads every source file into the page cache before a reader's
+    first tensor read, on num_threads threads (8 when unset);
+    drop_cache_after_load evicts the source files' cached pages when the
+    reader closes.
     """
 
     format: Literal["auto", "safetensors", "pt"] = "auto"
