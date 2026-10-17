@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 
 use uniserve_ipc::{Batch, BatchCommand, BufferId, CallKind, RequestKey};
 
+use super::backend::Runtimes;
 use crate::lane::Job;
 use crate::request::RequestPool;
 use crate::{Error, Result};
@@ -192,15 +193,11 @@ impl Retirement {
     }
 
     /// Revoke explicitly freed products before the batch waits for storage.
-    pub(crate) fn admit(
-        &self,
-        storage: &mut [&mut dyn RequestStorage],
-        jobs: &LaneJobs,
-    ) -> Result<()> {
+    pub(crate) fn admit(&self, runtimes: &mut Runtimes, jobs: &LaneJobs) -> Result<()> {
         if self.buffers.is_empty() {
             return Ok(());
         }
-        for owner in storage.iter_mut() {
+        for owner in runtimes.owners() {
             owner.release_buffers(&self.buffers, jobs)?;
         }
         Ok(())
@@ -210,7 +207,7 @@ impl Retirement {
     pub(crate) fn begin(
         &mut self,
         requests: &RequestPool,
-        storage: &mut [&mut dyn RequestStorage],
+        runtimes: &mut Runtimes,
         jobs: &LaneJobs,
     ) -> Result<()> {
         if self.requests.is_empty() && self.buffers.is_empty() {
@@ -228,7 +225,7 @@ impl Retirement {
                     .is_some_and(|request| request.key() == *key)
             })
             .collect();
-        for owner in storage.iter_mut() {
+        for owner in runtimes.owners() {
             owner.release_requests(&self.requests, &self.retained, jobs)?;
             owner.release_buffers(&self.buffers, jobs)?;
         }
@@ -240,7 +237,7 @@ impl Retirement {
     pub(crate) fn poll(
         &mut self,
         requests: &mut RequestPool,
-        storage: &mut [&mut dyn RequestStorage],
+        runtimes: &mut Runtimes,
         jobs: &LaneJobs,
     ) -> Result<bool> {
         if self.complete {
@@ -251,7 +248,7 @@ impl Retirement {
                 return Ok(false);
             }
         }
-        for owner in storage.iter_mut() {
+        for owner in runtimes.owners() {
             if !owner.retirement_ready(&self.buffers, &self.requests, &self.retained)? {
                 return Ok(false);
             }
@@ -269,7 +266,7 @@ impl Retirement {
             }
         }
         if !slots.is_empty() {
-            for owner in storage.iter_mut() {
+            for owner in runtimes.owners() {
                 owner.retire_slots(&slots, jobs)?;
             }
         }
