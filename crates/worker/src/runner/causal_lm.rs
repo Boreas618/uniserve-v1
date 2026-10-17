@@ -184,9 +184,6 @@ enum Choice {
 /// step capacity.
 pub(crate) struct Staged {
     plan: Plan,
-    /// The tasks of each sampler; empty when no row samples.
-    sampling: Vec<SamplingGroup>,
-    prompt: PromptChunks,
     /// Vision features replace some of the tokens' embeddings.
     embedded: bool,
 }
@@ -348,11 +345,6 @@ impl CausalLMRunner {
         self.copy_columns(&plan, request, context.state, job)?;
         Ok(Staged {
             plan,
-            sampling: request
-                .sampling
-                .as_ref()
-                .map_or_else(Vec::new, |sampling| sampling.groups.to_vec()),
-            prompt: request.prompt.clone(),
             embedded: !request.embeddings.is_empty(),
         })
     }
@@ -449,11 +441,11 @@ impl CausalLMRunner {
         Ok(self.methods.call(&self.functions.plan_prefill, arguments))
     }
 
-    /// The eager methods that follow a staged forward: one sampling method
-    /// per group of tasks sharing a sampler (`verify` for a verification,
-    /// which projects every candidate position), and `prompt_logprobs` for
-    /// scored prompt chunks.
-    fn selection(&self, staged: &Staged) -> Result<Vec<MethodCall>> {
+    /// The eager methods that follow a staged forward, as `request` asks:
+    /// one sampling method per group of tasks sharing a sampler (`verify`
+    /// for a verification, which projects every candidate position), and
+    /// `prompt_logprobs` for scored prompt chunks.
+    fn selection(&self, staged: &Staged, request: &StepRequest<'_>) -> Result<Vec<MethodCall>> {
         let plan = &staged.plan;
         let outputs = [
             "tasks",
@@ -467,8 +459,12 @@ impl CausalLMRunner {
         // row whose top-k width is at most it the way the top-k sampler
         // does, so every sampler keeps the same tokens for it.
         let width = candidates(self.buffers.dimensions.vocab);
+        let groups = request
+            .sampling
+            .as_ref()
+            .map_or(&[][..], |sampling| sampling.groups);
         let mut calls = Vec::new();
-        for group in &staged.sampling {
+        for group in groups {
             // What decides finish and transition, and what a group that
             // reports logprobs or shapes its logits takes.
             let decisions = [
@@ -552,7 +548,7 @@ impl CausalLMRunner {
             calls.push(self.methods.call(method, arguments));
         }
 
-        let prompt = &staged.prompt;
+        let prompt = request.prompt;
         if !prompt.rows.is_empty() {
             let ids: Vec<&[u32]> = prompt.ids.iter().map(Vec::as_slice).collect();
             let mut arguments = vec![plan.logit_count.into()];
@@ -631,10 +627,15 @@ impl CausalLMRunner {
     }
 
     /// Record in `job` the eager selection of a staged forward's rows that
-    /// sample, verify drafts or score their prompt. It reads the logits the
-    /// forward left, at whatever capacity it ran.
-    pub(crate) fn select(&self, staged: &Staged, job: &Job) -> Result<()> {
-        for call in self.selection(staged)? {
+    /// sample, verify drafts or score their prompt, as `request` asks. It
+    /// reads the logits the forward left, at whatever capacity it ran.
+    pub(crate) fn select(
+        &self,
+        staged: &Staged,
+        request: &StepRequest<'_>,
+        job: &Job,
+    ) -> Result<()> {
+        for call in self.selection(staged, request)? {
             job.call(call);
         }
         Ok(())

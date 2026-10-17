@@ -330,7 +330,11 @@ impl SamplingMetadata {
                     params.extend_from_slice(&parameters(task.params, vocab));
                 }
                 if task.params.generated_logprobs_requested() {
-                    let (count, ids) = logprob_request(task.params, vocab);
+                    let (count, ids) = logprob_request(
+                        task.params.n_logprobs,
+                        &task.params.logprob_token_ids,
+                        vocab,
+                    );
                     layout.rows.push(local);
                     layout.max_count = layout.max_count.max(count);
                     layout.max_requested = layout.max_requested.max(ids.len());
@@ -460,11 +464,13 @@ impl RowSampling {
     }
 }
 
-/// Top count and deduplicated in-range ids a call reports per position.
-pub(crate) fn logprob_request(params: &SamplingParams, vocab: usize) -> (usize, Vec<u32>) {
-    let count = (params.n_logprobs as usize).min(vocab);
+/// Top count and deduplicated in-range ids a call reports per position,
+/// of its `count` top tokens and explicit `token_ids`: the generated
+/// tokens' (`n_logprobs`) or the prompt's (`n_prompt_logprobs`).
+pub(crate) fn logprob_request(count: u32, token_ids: &[u32], vocab: usize) -> (usize, Vec<u32>) {
+    let count = (count as usize).min(vocab);
     let mut ids = Vec::new();
-    for &id in &params.logprob_token_ids {
+    for &id in token_ids {
         if (id as usize) < vocab && !ids.contains(&id) {
             ids.push(id);
         }

@@ -410,7 +410,7 @@ impl CausalLMRunners {
         let create_pool = Interpreter::import("uniserve.cuda_graph.pool")?;
         let mut runners = Vec::new();
         let mut columns = Vec::new();
-        let mut routes = HashMap::new();
+        let mut routes: HashMap<String, HashMap<CallKind, usize>> = HashMap::new();
         let mut shared: HashMap<usize, usize> = HashMap::new();
         let mut collectives = Vec::new();
         let mut labels = Vec::new();
@@ -514,7 +514,8 @@ impl CausalLMRunners {
                 .ok_or_else(|| Error::Invariant("a text runner belongs to no group".into()))?;
             if groups[group][0] == runners.len() {
                 for &kind in &served {
-                    if routes.insert((component.clone(), kind), group).is_some() {
+                    let kinds = routes.entry(component.clone()).or_default();
+                    if kinds.insert(kind, group).is_some() {
                         return Err(Error::Invalid(format!(
                             "computation {component}.{} has multiple lane bindings",
                             kind.as_str()
