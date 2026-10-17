@@ -521,7 +521,6 @@ impl ExpertUnion {
             runtime.lanes = Some(lanes);
         }
         tracing::info!(
-            target: "uniserve_worker.launch",
             "expert union member {rank} of {size}: {} transport over {} layers, {microbatches} microbatches, {max_tokens} tokens per rank and step",
             transport.as_str(),
             runtime.layers.len(),
@@ -668,10 +667,7 @@ impl ExpertUnion {
             self.join_eager(capacity)?;
             steps += 1;
         }
-        tracing::info!(
-            target: "uniserve_worker.warmup",
-            "joined {steps} announced expert warmup steps"
-        );
+        tracing::info!("joined {steps} announced expert warmup steps");
         Ok(())
     }
 }

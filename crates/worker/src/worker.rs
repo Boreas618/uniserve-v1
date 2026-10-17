@@ -17,11 +17,14 @@
 //! 7. The executor and the profiler.
 //!
 //! [`Worker::warmup`] runs the warmup phases ([`crate::warmup`]),
-//! [`Worker::run`] serves the channel, and [`Worker::close`] releases owners
-//! in dependency order: execution, runners, streams, requests, the process
-//! world, then deferred device memory.
+//! [`Worker::run`] serves the channel, and [`Worker::close`] consumes the
+//! rank and releases its owners in dependency order: execution, runners,
+//! streams, requests, the process world, then deferred device memory. The
+//! launch closes every rank that started, unless the rank abandoned work
+//! its threads may wait in for good, which ends the process at once.
 
 mod loading;
+mod planning;
 mod storage;
 
 pub(crate) use loading::LoadedModel;
@@ -29,18 +32,14 @@ pub(crate) use storage::RankStorage;
 
 use std::collections::BTreeMap;
 
-use std::sync::Arc;
 use tvm_ffi::Any;
-use uniserve_core::ComponentConfig;
 
-use uniserve_cuda::{DeviceId, HandleType, PrimaryContext};
-use uniserve_ipc::{CallKind, Channel, ComponentInfo, ForwardMode, WorkerEndpoint, WorkerInfo};
+use uniserve_cuda::{DeviceId, PrimaryContext};
+use uniserve_ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
 
 use crate::capacity::checks;
 use crate::capacity::device::{DeviceBudget, total_bytes};
-use crate::capacity::plan::{LatentPlan, Plan, Report, TokenFacts, TokenLayout, page_size};
-use crate::capacity::video::VideoCapacity;
-use crate::config::placement::Capability;
+use crate::capacity::plan::Plan;
 use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::cuda_graph::reserve_pools;
@@ -49,7 +48,7 @@ use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::WorkerBackend;
 use crate::executor::transfer::TransferRuntime;
-use crate::ffi::{DType, Interpreter};
+use crate::ffi::Interpreter;
 use crate::lane::BLOCK_ON_TIMEOUT;
 use crate::parallel::world::{World, startup_timeout};
 use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, PeerGroup};
@@ -58,7 +57,7 @@ use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
 use crate::request::video::VideoRequests;
 use crate::runner::causal_lm::CausalLMRunners;
-use crate::runner::causal_lm::start::{Startup, TextBounds, expert_tokens, reserved_bytes};
+use crate::runner::causal_lm::start::{Startup, expert_tokens};
 use crate::runner::causal_lm::warmup::CausalLMWarmup;
 use crate::runner::component::VideoSetup;
 use crate::runner::decoder::warmup::DecoderWarmup;
@@ -66,19 +65,18 @@ use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::denoiser::warmup::DenoiserWarmup;
 use crate::runner::denoiser::{VideoModel, placed_denoiser};
 use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
-use crate::runner::encoder::EncoderInfo;
 use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
-use crate::runner::start::{
-    ImageOwners, Startup as ImageStartup, reserved_bytes as image_reserved_bytes, start_video,
-};
+use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
 use crate::service::{Ending, Service};
-use crate::storage::{BufferPool, CachePlan, GroupShape, PrefixCache, ProductStore};
-use crate::stream::{CUDAStream, EventPool, Streams};
-use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
+use crate::stream::{CUDAStream, Streams};
+use crate::transfer::TransportKind;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
 use loading::{ComponentMesh, Description, ExpertPartition, sequence_kind};
+
+use planning::{cache_width, log_capacity, plan};
+use storage::allocate_storage;
 
 /// One caching-allocator segment: device, graph pool id and bytes.
 type Segment = (DeviceId, (u64, u64), u64);
@@ -117,21 +115,20 @@ pub(crate) struct Worker {
     config: WorkerConfig,
     info: WorkerInfo,
     plan: Plan,
-    model: Option<LoadedModel>,
-    world: Option<World>,
+    model: LoadedModel,
+    world: World,
     budget: Option<DeviceBudget>,
     streams: Streams,
     graphs: GraphStorage,
     /// The shared work areas of every stream runners construct their
     /// execution contexts on.
     _scratches: Scratches,
-    executor: Option<Executor>,
+    executor: Executor,
     hooks: Vec<Box<dyn WarmupHooks>>,
     /// Retained for the rank's lifetime: torch, the driver owners and the
     /// reclaimer all use the device's primary context.
     context: Option<PrimaryContext>,
     warmed: bool,
-    closed: bool,
 }
 
 impl Worker {
@@ -490,22 +487,21 @@ impl Worker {
             hooks.push(Box::new(ExpertWarmup));
         }
 
-        tracing::info!(target: "uniserve_worker.launch", "loaded numerical model {}", model.model_name);
+        tracing::info!("loaded numerical model {}", model.model_name);
         Ok(Self {
             config,
             info,
             plan,
-            model: Some(model),
-            world: Some(world),
+            model,
+            world,
             budget,
             streams,
             graphs,
             _scratches: scratches,
-            executor: Some(executor),
+            executor,
             hooks,
             context,
             warmed: false,
-            closed: false,
         })
     }
 
@@ -514,10 +510,7 @@ impl Worker {
         if self.warmed {
             return Ok(());
         }
-        let executor = self
-            .executor
-            .as_mut()
-            .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
+        let executor = &mut self.executor;
         if executor.started() {
             return Err(Error::State("warmup must precede the first serving submission").into());
         }
@@ -534,10 +527,7 @@ impl Worker {
         if numerical && cuda {
             self.bind_graph_budgets().map_err(phase("warmup"))?;
         }
-        let executor = self
-            .executor
-            .as_mut()
-            .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
+        let executor = &mut self.executor;
         for hooks in &mut self.hooks {
             hooks.prepare(executor.backend_mut())?;
         }
@@ -562,10 +552,7 @@ impl Worker {
         }
         self.complete_startup()?;
 
-        let executor = self
-            .executor
-            .as_mut()
-            .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
+        let executor = &mut self.executor;
         if !executor.backend().requests().request_ids().is_empty() {
             return Err(Error::State("startup completed with resident requests").into());
         }
@@ -606,10 +593,7 @@ impl Worker {
     ) -> std::result::Result<Ending, WorkerError> {
         self.warmup()?;
         let info = self.info.clone();
-        let executor = self
-            .executor
-            .as_mut()
-            .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
+        let executor = &mut self.executor;
         // Ranks of an expert union join every step outside their own.
         let experts = executor.backend().experts().is_some();
         executor.backend().set_storage_wake(Some(channel.wake()));
@@ -621,10 +605,7 @@ impl Worker {
     /// Release every owner in dependency order. An aborted close never
     /// waits for device work or peers: it abandons what may still be in use
     /// until the process exits.
-    pub(crate) fn close(&mut self, aborted: bool) -> std::result::Result<(), WorkerError> {
-        if std::mem::replace(&mut self.closed, true) {
-            return Ok(());
-        }
+    pub(crate) fn close(mut self, aborted: bool) -> std::result::Result<(), WorkerError> {
         let mut failure: Option<WorkerError> = None;
         let mut record = |result: std::result::Result<(), WorkerError>| {
             if let Err(error) = result {
@@ -639,32 +620,31 @@ impl Worker {
             // The lanes first perform what is still queued on them (work
             // nobody waited for, like a lifecycle command's), so that no
             // job addresses an owner while it closes.
-            if let Some(executor) = &self.executor {
-                let drained = executor.backend().job_queues().drain(BLOCK_ON_TIMEOUT);
-                record(drained.map_err(WorkerError::from));
-            }
+            let drained = self.executor.backend().job_queues().drain(BLOCK_ON_TIMEOUT);
+            record(drained.map_err(WorkerError::from));
             for stream in self.streams.iter() {
                 record(stream.synchronize().map_err(WorkerError::from));
             }
         }
-        if let Some(mut executor) = self.executor.take() {
-            executor.backend_mut().close();
-            if !aborted {
-                record(executor.close());
-            }
-            // Each runner releases its graphs, then its execution context.
-            let closed = executor.backend_mut().close_runtimes(aborted);
-            record(closed.map_err(WorkerError::from));
-            // Transports retire after every context and graph using them;
-            // their close is collective over the expert union.
-            let closed = executor.backend_mut().close_experts(aborted);
-            record(closed.map_err(WorkerError::from));
-            let closed = executor.backend_mut().close_storage(aborted);
-            record(closed.map_err(WorkerError::from));
-            if aborted {
-                // Batches may still reference device work.
-                crate::leak(executor);
-            }
+        let mut executor = self.executor;
+        executor.backend_mut().close();
+        if !aborted {
+            record(executor.close());
+        }
+        // Each runner releases its graphs, then its execution context.
+        let closed = executor.backend_mut().close_runtimes(aborted);
+        record(closed.map_err(WorkerError::from));
+        // Transports retire after every context and graph using them;
+        // their close is collective over the expert union.
+        let closed = executor.backend_mut().close_experts(aborted);
+        record(closed.map_err(WorkerError::from));
+        let closed = executor.backend_mut().close_storage(aborted);
+        record(closed.map_err(WorkerError::from));
+        if aborted {
+            // Batches may still reference device work.
+            crate::leak(executor);
+        } else {
+            drop(executor);
         }
         self.graphs.close();
         if !aborted {
@@ -674,17 +654,17 @@ impl Worker {
             Interpreter::synchronize();
         }
         record(self.streams.close(aborted).map_err(WorkerError::from));
-        if let Some(mut world) = self.world.take() {
-            record(world.close(aborted).map_err(WorkerError::from));
-        }
+        let mut world = self.world;
+        record(world.close(aborted).map_err(WorkerError::from));
+        drop(world);
         if aborted {
-            crate::leak(self.model.take());
-            crate::leak(self.context.take());
+            crate::leak(self.model);
+            crate::leak(self.context);
         } else {
             // The model is released before the context its tensors live in.
-            self.model = None;
+            drop(self.model);
             Interpreter::synchronize();
-            self.context = None;
+            drop(self.context);
             // Every owner has drained its streams; deferred frees can run.
             record(
                 uniserve_cuda::reclaim::flush()
@@ -776,7 +756,6 @@ impl Worker {
                     .map_err(phase("warmup"))?;
                 let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
                 tracing::info!(
-                    target: crate::profiling::kernels::TARGET,
                     "device storage on {device}: {:.2} GiB held by this process at startup, {:.2} GiB of it reserved by the caching allocator and {:.2} GiB of that in graph pools",
                     gib(process),
                     gib(reserved as u64),
@@ -785,10 +764,7 @@ impl Worker {
             }
         }
 
-        let executor = self
-            .executor
-            .as_mut()
-            .ok_or_else(|| WorkerError::from(Error::State("the worker is closed")))?;
+        let executor = &mut self.executor;
         let mut records = KernelRecords::new().map_err(phase("warmup"))?;
         for (label, device, kernels) in executor.backend().kernels().map_err(phase("warmup"))? {
             records.add(&label, &device, &kernels);
@@ -836,146 +812,6 @@ impl Worker {
         self.graphs.seal();
         Ok(())
     }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        // A worker dropped without a close failed while starting or serving:
-        // its peers may be blocked, so nothing waits.
-        let _ = self.close(true);
-    }
-}
-
-/// Allocate the storage owners on the plan: device events, the product
-/// transports and the prefix cache of a text model, whose planes are reset on
-/// the device's preparation stream.
-fn allocate_storage(
-    launch: &WorkerLaunch,
-    config: &WorkerConfig,
-    plan: &Plan,
-    streams: &Streams,
-) -> Result<RankStorage> {
-    let events = EventPool::new();
-    let kinds = launch
-        .data_plane
-        .backends
-        .iter()
-        .map(|name| TransportKind::parse(name))
-        .collect::<Result<Vec<_>>>()?;
-    let capacity = Arc::new(TransferCapacity::new(
-        plan.arena.transfer_bytes,
-        plan.arena.transfer_tickets,
-    )?);
-    let options = TransportOptions {
-        source: plan.info.endpoint.clone(),
-        acknowledgment_slot: launch.ipc.acknowledgment_slot as usize,
-        host_slots: launch
-            .ipc
-            .host_slots
-            .iter()
-            .map(|&slot| slot as usize)
-            .collect(),
-        cross_host_consumers: launch.ipc.products_cross_hosts,
-        vmm_pool_bytes: plan.arena.export_pool_bytes,
-    };
-    let exports = launch
-        .data_plane
-        .exports
-        .iter()
-        .map(|name| TransportKind::parse(name))
-        .collect::<Result<Vec<_>>>()?;
-    let transports = Arc::new(
-        Transports::new(&kinds, capacity, Arc::clone(&events), &options)?.with_exports(&exports)?,
-    );
-
-    // Products: scheduler-placed buffers in the buffer pool and scalar relay
-    // lanes, one per request slot and unresolved call, on the primary
-    // device where every binding computes.
-    let devices = vec![config.device.memory()];
-    let physical = plan.physical_buffer_pool_bytes.max(1);
-    let buffer_pool =
-        BufferPool::allocate(physical, physical < plan.info.buffer_pool_bytes, &devices)?;
-    let tensors = ProductStore::new(
-        plan.arena.tensor_store,
-        plan.arena.device_product_bytes.max(1) as usize,
-        plan.info.encoder_entry_bytes.max(1) as usize,
-        devices,
-        plan.info.request_slots as usize,
-        plan.info.max_unresolved_calls as usize + 1,
-        buffer_pool,
-        Arc::clone(&events),
-    )?;
-
-    let device = config.device.cuda();
-    let preparation = device.and_then(|cuda| streams.preparation(cuda));
-    let prefix_cache = match (&plan.cache, &plan.info.prefix_cache) {
-        (Some(cache), Some(info)) => Some(PrefixCache::new(
-            Arc::clone(cache),
-            info.num_units,
-            plan.info.request_slots,
-            cache_width(&cache.group_shapes()?, config.max_sequence_tokens),
-            plan.info.max_unresolved_calls as usize,
-            device,
-            preparation.map(CUDAStream::stream).transpose()?,
-        )?),
-        _ => None,
-    };
-    if let Some(stream) = preparation {
-        stream.synchronize()?;
-    }
-    // Slot releases order after the token batches that read them.
-    let release_stream = match device {
-        Some(cuda) => streams
-            .stream_for(CallKind::Forward(ForwardMode::Decode), cuda)
-            .map(|stream| stream.stream().cloned())
-            .transpose()?,
-        None => None,
-    };
-    Ok(RankStorage::new(
-        events,
-        tensors,
-        transports,
-        prefix_cache,
-        release_stream,
-    ))
-}
-
-/// Block-table width that holds the longest admitted sequence in every
-/// group.
-fn cache_width(shapes: &[GroupShape], max_sequence_tokens: usize) -> u32 {
-    shapes
-        .iter()
-        .map(|shape| shape.resident_width(max_sequence_tokens as u64))
-        .max()
-        .unwrap_or(1)
-        .try_into()
-        .unwrap_or(u32::MAX)
-}
-
-/// Report the planned capacity once, for operators.
-fn log_capacity(config: &WorkerConfig, plan: &Plan) {
-    let info = &plan.info;
-    let prefix_cache = info.prefix_cache.as_ref().map_or_else(
-        || "no cache pool".to_owned(),
-        |cache| {
-            format!(
-                "{} cache units of {} bytes in {} groups",
-                cache.num_units,
-                cache.unit_bytes,
-                cache.groups.len()
-            )
-        },
-    );
-    tracing::info!(
-        target: "uniserve_worker.launch",
-        "planned capacity: {prefix_cache}, KV page size {} tokens, {} request slots, {} calls and {} tokens per batch, {} latent pages, {} buffer pool bytes",
-        config.block_size.unwrap_or(0),
-        info.request_slots,
-        info.max_batch_calls,
-        info.max_batch_tokens,
-        info.latent_pages,
-        info.buffer_pool_bytes,
-    );
 }
 
 /// This host's node name, the rank's node identity in transfers.
@@ -1027,278 +863,6 @@ fn endpoint(worker_id: &str, rank: usize) -> Result<WorkerEndpoint> {
     })
 }
 
-/// Bytes of the largest vision feature product the image policy admits: the
-/// feature rows of its largest image at the vision encoder's output width.
-/// Zero for a model without a vision encoder or an understanding transform.
-fn vision_feature_bytes(model: &LoadedModel, model_dtype: &str) -> Result<u64> {
-    let declarations = &model.declarations;
-    let Some(call) = declarations
-        .names()
-        .flat_map(|name| declarations.calls(name))
-        .find(|call| call.is(Capability::PatchEncoder))
-    else {
-        return Ok(0);
-    };
-    let dtype = DType::from_name(model_dtype)
-        .ok_or_else(|| Error::Unsupported(format!("unsupported model dtype {model_dtype:?}")))?;
-    let EncoderInfo::Vision(vision) = EncoderInfo::describe(model.handle(), &call.path, dtype)?
-    else {
-        return Ok(0);
-    };
-
-    // The encoder merges `downsample` patches on each axis into one feature.
-    let rows = u64::from(vision.image_patches / (vision.downsample * vision.downsample));
-    Ok(rows * u64::from(vision.output_size) * vision.output_dtype.bytes() as u64)
-}
-
-/// Resolve the rank's capacity on the loaded model.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the loaded rank's owners that capacity planning reads"
-)]
-fn plan(
-    launch: &WorkerLaunch,
-    config: &mut WorkerConfig,
-    model: &LoadedModel,
-    image: &ImageModel,
-    world: &World,
-    budget: Option<&DeviceBudget>,
-    components: &Components,
-    unit_columns: usize,
-    video: Option<&VideoModel>,
-) -> Result<(Plan, Option<VideoCapacity>)> {
-    let device = config.device;
-    if let (Device::Cuda(index), Some(budget)) = (device, budget) {
-        config.pool_storage_bytes = Some(
-            budget
-                .budget(index, config.cache_storage_fraction)?
-                .available as usize,
-        );
-    }
-
-    let declarations = &model.declarations;
-    let text = declarations.has(Capability::CausalLm);
-    let prefix_cache_dtype = config.prefix_cache_dtype.clone();
-    let block_size = page_size(
-        config.block_size,
-        |size| {
-            if text {
-                CachePlan::reads_pages(
-                    model.handle(),
-                    &model.attention_backend,
-                    size,
-                    prefix_cache_dtype.as_deref(),
-                )
-            } else {
-                Ok(true)
-            }
-        },
-        &world.host,
-    )?;
-    config.block_size = Some(block_size);
-
-    let dedicated = config.role == "experts";
-    let held: Vec<&str> = launch.components.keys().map(String::as_str).collect();
-    let supported: Vec<CallKind> = if dedicated {
-        Vec::new()
-    } else {
-        let declared = declarations.supported(&held);
-        CallKind::ALL
-            .into_iter()
-            .filter(|kind| declared.contains(kind) && launch.supported_calls.contains(kind))
-            .collect()
-    };
-    if supported.is_empty() && !dedicated {
-        return Err(Error::Unsupported(
-            "worker model implements none of the requested call kinds".into(),
-        ));
-    }
-    let media_components = if dedicated {
-        BTreeMap::new()
-    } else {
-        declarations
-            .routes(&held)?
-            .into_iter()
-            .filter(|(kind, _)| supported.contains(&CallKind::Media(*kind)))
-            .collect()
-    };
-    let capacity = match video {
-        Some(video) => {
-            let sampling = launch.components.contains_key(&video.denoiser);
-            let denoising = components.get(&video.denoiser).is_some();
-            let decoding = components
-                .placed()
-                .iter()
-                .any(|placed| placed.has(Capability::VideoDecoder));
-            Some(crate::capacity::video::plan(
-                video, config, sampling, denoising, decoding,
-            )?)
-        }
-        None => None,
-    };
-    let infos: Vec<ComponentInfo> = launch
-        .components
-        .iter()
-        .map(
-            |(name, config): (&String, &ComponentConfig)| ComponentInfo {
-                name: name.clone(),
-                config: config.clone(),
-                // Only a video model's components publish products.
-                outputs: capacity
-                    .as_ref()
-                    .and_then(|capacity| capacity.outputs.get(name).cloned())
-                    .unwrap_or_default(),
-            },
-        )
-        .collect();
-    let fabric_handles = match device {
-        Device::Cuda(cuda) => HandleType::probe(cuda)? == HandleType::Fabric,
-        Device::Cpu => false,
-    };
-    let report = Report {
-        model_name: model.model_name.clone(),
-        endpoint: endpoint(&launch.worker_id, config.rank)?,
-        device: config.device.to_string(),
-        transfer_backends: launch.data_plane.backends.clone(),
-        device_exports: exports_device_products(launch),
-        fabric_handles,
-        attention_backend: model.attention_backend.clone(),
-        supported_calls: supported,
-        media_components,
-        components: infos,
-        weight_formats: model.weight_formats()?,
-        activation_formats: model.activation_formats()?,
-    };
-    if let (Some(video), Some(capacity)) = (video, capacity) {
-        let plan = video_layout(
-            report,
-            config,
-            launch,
-            declarations,
-            components,
-            video,
-            &capacity,
-            budget,
-            &world.host,
-        )?;
-        return Ok((plan, Some(capacity)));
-    }
-
-    let element_bytes = DType::from_name(&config.model_dtype)
-        .map(DType::bytes)
-        .ok_or_else(|| {
-            Error::Unsupported(format!("unsupported latent dtype {:?}", config.model_dtype))
-        })?;
-    // The longest image sequence an image denoiser accepts, in latent rows.
-    let image_tokens = image
-        .denoiser
-        .map_or(0, |layout| layout.max_sequence_tokens as usize);
-    let latent = image.denoiser.map(|layout| {
-        LatentPlan::image(
-            config.max_request_pool_size,
-            image_tokens,
-            config.cache_token_capacity,
-            block_size,
-            layout.width() as usize,
-            element_bytes,
-        )
-    });
-    let token_facts = TokenFacts {
-        image_processor: image.processing.is_some(),
-        vision_feature_bytes: vision_feature_bytes(model, &config.model_dtype)?,
-        latent_feature_bytes: latent.map_or(0, |plan| {
-            image_tokens as u64 * plan.latent_width as u64 * element_bytes as u64
-        }),
-        latent,
-    };
-    let mut layout = TokenLayout::new(report, config, launch.ipc.queue_depth, &token_facts)?;
-    // Every rank of a worker holding a causal LM component keeps the same
-    // cache pool, including ranks that hold only its other components: the
-    // worker advertises token work for all of its ranks, and they agree on
-    // one pool capacity.
-    let holds_text = held.iter().any(|name| {
-        declarations
-            .calls(name)
-            .iter()
-            .any(|call| call.is(Capability::CausalLm))
-    });
-    let cache = if text && !dedicated && holds_text {
-        let cache = CachePlan::plan(model.handle(), block_size, prefix_cache_dtype.as_deref())?;
-        let total = match device {
-            Device::Cuda(index) => total_bytes(index)?,
-            Device::Cpu => 0,
-        };
-        // The cache's fixed storage beside its units: block tables, import
-        // scratch and one unit index column per import worker and lane.
-        let shapes = cache.group_shapes()?;
-        let width = cache_width(&shapes, config.max_sequence_tokens);
-        let import_capacity = layout.info().max_unresolved_calls as usize;
-        let fixed = PrefixCache::fixed_bytes(
-            &cache,
-            0,
-            layout.info().request_slots,
-            width,
-            import_capacity,
-            unit_columns,
-        )?;
-        layout.reserve(config.device, fixed);
-        // The text runners' columns and the slot continuation state.
-        layout.reserve(
-            config.device,
-            reserved_bytes(
-                model,
-                config,
-                layout.info().request_slots as usize,
-                &cache,
-                image.processing.is_some(),
-                unit_columns,
-            )?,
-        );
-        // The image denoiser's columns and the image decoder's staging.
-        if image.denoiser.is_some() {
-            layout.reserve(
-                config.device,
-                image_reserved_bytes(
-                    config,
-                    layout.info().request_slots as usize,
-                    image.denoiser.as_ref(),
-                ),
-            );
-        }
-        // The diffusion LM runners' buffers, banks and sampler workspaces.
-        layout.reserve(
-            config.device,
-            diffusion_lm::reserved_bytes(
-                model,
-                components,
-                expert_exchange(launch),
-                config,
-                layout.info().request_slots as usize,
-                &cache,
-            )?,
-        );
-        let columns = PrefixCache::import_workers(import_capacity) + unit_columns;
-        layout.fit_cache(&cache, 8 * columns as u64, config, total, &world.host)?;
-        Some(Arc::new(cache))
-    } else {
-        None
-    };
-    let mut plan = layout.finish(config, cache);
-    if let (Some(cache), Some(info)) = (&plan.cache, &plan.info.prefix_cache) {
-        // Batches never exceed the largest captured graph bucket.
-        let bounds = TextBounds::new(
-            config,
-            plan.info.request_slots as usize,
-            cache,
-            Some(info.num_units),
-            device.is_cuda(),
-        )?;
-        let (prefill, decode) = bounds.graph_calls();
-        plan.bound_graph_calls(prefill, decode);
-    }
-    Ok((plan, None))
-}
-
 /// The graph policy a rank serves with.
 ///
 /// `auto` captures CUDA graphs when serving captures the loaded attention
@@ -1317,7 +881,6 @@ fn graph_policy(configured: &str, model: &LoadedModel) -> Result<String> {
         )));
     }
     tracing::info!(
-        target: "uniserve_worker.launch",
         "graph policy auto serves every call eagerly: the {} attention provider's calls are not captured",
         model.attention_backend
     );
@@ -1331,74 +894,6 @@ fn exports_device_products(launch: &WorkerLaunch) -> bool {
         .exports
         .iter()
         .any(|name| name == TransportKind::CudaVmm.name())
-}
-
-/// The layout of a video rank: request slots sized by every rank's storage
-/// for that many resident requests, agreed over the group.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the placement, model and capacity facts a video rank's layout reads"
-)]
-fn video_layout(
-    report: Report,
-    config: &mut WorkerConfig,
-    launch: &WorkerLaunch,
-    declarations: &crate::config::placement::Declarations,
-    components: &Components,
-    video: &VideoModel,
-    capacity: &VideoCapacity,
-    budget: Option<&DeviceBudget>,
-    group: &crate::parallel::host::HostGroup,
-) -> Result<Plan> {
-    let queue_depth = launch.ipc.queue_depth;
-    let deployment: Vec<&str> = if config.deployment_components.is_empty() {
-        launch.components.keys().map(String::as_str).collect()
-    } else {
-        config
-            .deployment_components
-            .iter()
-            .map(String::as_str)
-            .collect()
-    };
-    let routes = declarations.routes(&deployment)?;
-    let held: std::collections::BTreeSet<String> = components
-        .placed()
-        .iter()
-        .map(|placed| placed.name.clone())
-        .collect();
-    let local = crate::capacity::video::local_product_bytes(&capacity.outputs, &routes, &held);
-    let codec_ranks = launch
-        .components
-        .get("video_codec")
-        .map(|component| component.ranks.len());
-    if let (Device::Cuda(index), Some(budget)) = (config.device, budget) {
-        let available = budget
-            .budget(index, config.cache_storage_fraction)?
-            .available;
-        let maximum = config.max_request_pool_size;
-        let minimum = config.min_request_pool_size.min(maximum).max(1);
-        let facts = capacity.facts(video, maximum, local, codec_ranks)?;
-        let requirements = crate::capacity::plan::slot_requirements(
-            config,
-            queue_depth,
-            &facts,
-            exports_device_products(launch),
-            minimum,
-            maximum,
-        )?;
-        let slots = crate::capacity::plan::request_slots(&requirements, minimum, available, group)?;
-        config.max_request_pool_size = slots;
-        config.max_batch_calls = config.max_batch_calls.min(slots);
-        config.max_batch_tokens = config.max_batch_tokens.min(slots);
-    }
-    let facts = capacity.facts(video, config.max_request_pool_size, local, codec_ranks)?;
-    crate::capacity::plan::request_layout(
-        report,
-        config,
-        queue_depth,
-        &facts,
-        components.holds_host(),
-    )
 }
 
 /// Whether routed experts use an expert exchange, and the attention ranks of

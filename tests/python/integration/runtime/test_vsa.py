@@ -13,7 +13,8 @@ from uniserve_kernels.attention.vsa_rows import pack_sparse_input_rows
 from tests.python.fixtures.vsa import reference_attention
 from uniserve import cuda_graph
 from uniserve.backends.attention import vsa as providers
-from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.nn.attention import vsa
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]

@@ -15,7 +15,8 @@ from torch.nn import functional as F
 from tests.python.fixtures.h3 import dmd_denoiser
 from tests.python.fixtures.vsa import reference_attention
 from uniserve import cuda_graph, loading
-from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
 from uniserve.models.minimax_h3 import (

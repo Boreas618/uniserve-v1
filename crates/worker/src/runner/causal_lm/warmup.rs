@@ -338,7 +338,6 @@ impl CausalLMRunners {
             }
             let runner = &self.runners[index];
             tracing::info!(
-                target: "uniserve_worker.warmup",
                 "captured {} text graphs: {} decode and {} prefill buckets",
                 runner.captured(),
                 runner.shapes().decode().len(),
@@ -514,7 +513,7 @@ impl CausalLMRunners {
                 },
             )?;
         }
-        tracing::info!(target: "uniserve_worker.warmup", "warmed text context prefills");
+        tracing::info!("warmed text context prefills");
         Ok(())
     }
 
@@ -659,7 +658,7 @@ fn tokens(scenarios: &mut Scenarios<'_>) -> std::result::Result<(), WorkerError>
     finish.collective_seq = sequence;
     scenarios.run(finish)?;
     scenarios.release(key);
-    tracing::info!(target: "uniserve_worker.warmup", "completed causal LM warmup");
+    tracing::info!("completed causal LM warmup");
     Ok(())
 }
 

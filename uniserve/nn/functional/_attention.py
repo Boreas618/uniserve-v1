@@ -16,7 +16,7 @@ def attention(
     """
     from uniserve.backends.attention import resolve
     from uniserve.backends.attention._sequences import host_lengths
-    from uniserve.bindings.context import TensorBuffers
+    from uniserve.bindings.workspace import TensorBuffers
     from uniserve.models.inputs import TextSize
     from uniserve.nn.attention.inputs import DenseInput
 
