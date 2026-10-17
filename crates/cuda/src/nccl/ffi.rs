@@ -23,62 +23,6 @@ pub(super) struct RawUniqueId {
     pub(super) bytes: [u8; 128],
 }
 
-/// `ncclConfig_t` from the NCCL 2.30 headers. Fields left at
-/// `NCCL_CONFIG_UNDEF_INT` keep NCCL's environment and topology tuning; the
-/// `size` and `version` fields let older libraries read the prefix they know.
-#[repr(C)]
-pub(super) struct Config {
-    size: usize,
-    magic: u32,
-    version: u32,
-    blocking: i32,
-    cga_cluster_size: i32,
-    min_ctas: i32,
-    max_ctas: i32,
-    net_name: *const c_char,
-    split_share: i32,
-    traffic_class: i32,
-    comm_name: *const c_char,
-    collnet_enable: i32,
-    cta_policy: i32,
-    shrink_share: i32,
-    nvls_ctas: i32,
-    channels_per_net_peer: i32,
-    nvlink_centric_sched: i32,
-    graph_usage_mode: i32,
-    rma_contexts: i32,
-    max_p2p_peers: i32,
-}
-
-const NCCL_CONFIG_UNDEF_INT: i32 = i32::MIN;
-
-impl Config {
-    pub(super) fn new(cta_policy: i32) -> Self {
-        Self {
-            size: size_of::<Self>(),
-            magic: 0xcafe_beef,
-            version: 23004,
-            blocking: NCCL_CONFIG_UNDEF_INT,
-            cga_cluster_size: NCCL_CONFIG_UNDEF_INT,
-            min_ctas: NCCL_CONFIG_UNDEF_INT,
-            max_ctas: NCCL_CONFIG_UNDEF_INT,
-            net_name: std::ptr::null(),
-            split_share: NCCL_CONFIG_UNDEF_INT,
-            traffic_class: NCCL_CONFIG_UNDEF_INT,
-            comm_name: std::ptr::null(),
-            collnet_enable: NCCL_CONFIG_UNDEF_INT,
-            cta_policy,
-            shrink_share: NCCL_CONFIG_UNDEF_INT,
-            nvls_ctas: NCCL_CONFIG_UNDEF_INT,
-            channels_per_net_peer: NCCL_CONFIG_UNDEF_INT,
-            nvlink_centric_sched: NCCL_CONFIG_UNDEF_INT,
-            graph_usage_mode: NCCL_CONFIG_UNDEF_INT,
-            rma_contexts: NCCL_CONFIG_UNDEF_INT,
-            max_p2p_peers: NCCL_CONFIG_UNDEF_INT,
-        }
-    }
-}
-
 type Collective = unsafe extern "C" fn(Handle, Handle, usize, i32, Handle, Handle) -> NcclResult;
 type Reduction =
     unsafe extern "C" fn(Handle, Handle, usize, i32, i32, Handle, Handle) -> NcclResult;
@@ -87,8 +31,8 @@ type PointToPoint = unsafe extern "C" fn(Handle, usize, i32, i32, Handle, Handle
 pub(super) struct Api {
     error_string: unsafe extern "C" fn(NcclResult) -> *const c_char,
     pub(super) get_unique_id: unsafe extern "C" fn(*mut RawUniqueId) -> NcclResult,
-    pub(super) comm_init_rank_config:
-        unsafe extern "C" fn(*mut Handle, i32, RawUniqueId, i32, *mut Config) -> NcclResult,
+    pub(super) comm_init_rank:
+        unsafe extern "C" fn(*mut Handle, i32, RawUniqueId, i32) -> NcclResult,
     pub(super) comm_destroy: unsafe extern "C" fn(Handle) -> NcclResult,
     pub(super) comm_abort: unsafe extern "C" fn(Handle) -> NcclResult,
     pub(super) all_reduce: Reduction,
@@ -133,7 +77,7 @@ pub(super) fn api() -> Result<&'static Api> {
             Ok(Api {
                 error_string: symbol(&library, "ncclGetErrorString")?,
                 get_unique_id: symbol(&library, "ncclGetUniqueId")?,
-                comm_init_rank_config: symbol(&library, "ncclCommInitRankConfig")?,
+                comm_init_rank: symbol(&library, "ncclCommInitRank")?,
                 comm_destroy: symbol(&library, "ncclCommDestroy")?,
                 comm_abort: symbol(&library, "ncclCommAbort")?,
                 all_reduce: symbol(&library, "ncclAllReduce")?,

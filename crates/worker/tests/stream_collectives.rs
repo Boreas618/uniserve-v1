@@ -1,7 +1,6 @@
 //! Stream collectives over native NCCL communicators, called through their
 //! TVM-FFI functions as numerical code calls them. The tests need two CUDA
-//! devices and the NCCL a worker process loads (PyTorch's, whose zero-CTA
-//! policy the communicators request); run them with
+//! devices and the NCCL a worker process loads (PyTorch's); run them with
 //! `LD_LIBRARY_PATH=<site-packages>/nvidia/nccl/lib cargo test -p
 //! uniserve-worker --test stream_collectives -- --ignored`.
 

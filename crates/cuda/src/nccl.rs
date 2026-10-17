@@ -58,28 +58,6 @@ pub enum ReduceOp {
     Avg = 4,
 }
 
-/// How NCCL assigns CTAs (`ncclConfig_t::CTAPolicy`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CtaPolicy {
-    /// NCCL's kernel-based algorithms. Communicators of SM-partitioned
-    /// (green-context) streams use this: green contexts cannot batch-copy
-    /// mapped peer windows on the deployed driver.
-    #[default]
-    Default,
-    /// Copy-engine algorithms for registered symmetric windows, leaving SMs
-    /// to computation. Used by communicators of full-device streams.
-    Zero,
-}
-
-impl CtaPolicy {
-    fn raw(self) -> i32 {
-        match self {
-            Self::Default => 0x00,
-            Self::Zero => 0x02,
-        }
-    }
-}
-
 /// One rank's NCCL communicator.
 ///
 /// Every operation is enqueued on the stream passed to it, which belongs to
@@ -87,11 +65,11 @@ impl CtaPolicy {
 /// order on every rank; group several with [`group`].
 ///
 /// Release is explicit because it is collective: [`Communicator::destroy`]
-/// destroys the communicator once every rank's work retired, and [`Communicator::abort`] tears it down locally after a
-/// failure. Dropping a communicator that was neither destroyed nor aborted
-/// leaks it deliberately: an implicit destroy could wait forever for peers
-/// that never arrive, and an abort could free resources that captured graphs
-/// still use.
+/// destroys the communicator once every rank's work retired, and
+/// [`Communicator::abort`] tears it down locally after a failure. Dropping a
+/// communicator that was neither destroyed nor aborted leaks it deliberately:
+/// an implicit destroy could wait forever for peers that never arrive, and an
+/// abort could free resources that captured graphs still use.
 pub struct Communicator {
     raw: Handle,
     context: PrimaryContext,
@@ -107,13 +85,12 @@ unsafe impl Send for Communicator {}
 impl Communicator {
     /// Joins communicator `id` as `rank` of `size` on `device`. Every rank
     /// calls this once with the same id; the call blocks until all joined.
-    pub fn init(
-        device: DeviceId,
-        size: i32,
-        rank: i32,
-        id: &UniqueId,
-        policy: CtaPolicy,
-    ) -> Result<Self> {
+    ///
+    /// The communicator takes NCCL's default configuration, which `NCCL_*`
+    /// environment variables tune. Its collectives run as NCCL kernels on
+    /// SMs: NCCL's copy-engine (zero-CTA) algorithms apply only to buffers
+    /// registered as symmetric windows, and this type registers none.
+    pub fn init(device: DeviceId, size: i32, rank: i32, id: &UniqueId) -> Result<Self> {
         if size <= 0 || !(0..size).contains(&rank) {
             return Err(Error::invalid(format!(
                 "rank {rank} is outside a communicator of {size} ranks"
@@ -124,18 +101,10 @@ impl Communicator {
         let _guard = context.enter()?;
 
         let mut raw = std::ptr::null_mut();
-        let mut config = ffi::Config::new(policy.raw());
-        // SAFETY: NCCL writes one communicator handle and reads the config.
-        let status = unsafe {
-            (api.comm_init_rank_config)(
-                &mut raw,
-                size,
-                RawUniqueId { bytes: id.0 },
-                rank,
-                &mut config,
-            )
-        };
-        if let Err(error) = api.check(status, "ncclCommInitRankConfig") {
+        // SAFETY: NCCL writes one communicator handle.
+        let status =
+            unsafe { (api.comm_init_rank)(&mut raw, size, RawUniqueId { bytes: id.0 }, rank) };
+        if let Err(error) = api.check(status, "ncclCommInitRank") {
             if !raw.is_null() {
                 // SAFETY: a partially initialized communicator is owned here.
                 let _ = unsafe { (api.comm_abort)(raw) };
