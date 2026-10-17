@@ -338,7 +338,7 @@ impl Drop for MuxSession {
         if let Some(container) = state.container.take()
             && let Err(error) = self.functions.close.invoke(&[container.view()])
         {
-            tracing::warn!(target: "uniserve_worker.media", "closing an unfinished container failed: {error}");
+            tracing::warn!("closing an unfinished container failed: {error}");
         }
     }
 }

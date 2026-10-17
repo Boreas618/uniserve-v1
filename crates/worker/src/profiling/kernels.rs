@@ -24,9 +24,6 @@ use crate::{Error, Result};
 
 const TAG: &str = "uniserve-kernel-table";
 
-/// The log target the kernel table is written under.
-pub(crate) const TARGET: &str = "uniserve_worker.execution.model_executor";
-
 /// The library function rendering the kernel table.
 const TABLE: &str = "uniserve.profiling.kernel_table";
 
@@ -153,7 +150,7 @@ impl KernelRecords {
 
     /// Log the table at INFO.
     pub(crate) fn log(&self, stage: &str, rank: usize, device: &str) -> Result<()> {
-        tracing::info!(target: TARGET, "{TAG} {}", self.table(stage, rank, device)?);
+        tracing::info!("{TAG} {}", self.table(stage, rank, device)?);
         Ok(())
     }
 }
@@ -269,12 +266,12 @@ impl KernelWatch {
             }
             Pending::Table => {
                 let table = completion.texts()?;
-                tracing::info!(target: TARGET, "{TAG} {}", table.concat());
+                tracing::info!("{TAG} {}", table.concat());
                 Ok(())
             }
         });
         if let Err(error) = applied {
-            tracing::warn!(target: "uniserve_worker.profiling", "kernel report failed: {error}");
+            tracing::warn!("kernel report failed: {error}");
         }
     }
 

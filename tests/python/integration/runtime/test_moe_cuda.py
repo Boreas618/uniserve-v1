@@ -12,7 +12,8 @@ from torch.nn import functional as F
 
 from uniserve import cuda_graph
 from uniserve.backends import moe as moe_backends
-from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.models import TextSize
 from uniserve.nn import functional
 from uniserve.nn.moe import FusedMoE

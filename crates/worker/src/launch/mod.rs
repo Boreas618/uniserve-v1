@@ -49,7 +49,7 @@ pub(crate) fn main(argv: &[String], import: tvm_ffi::Function) -> i64 {
     let signals = match Signals::install() {
         Ok(signals) => signals,
         Err(error) => {
-            tracing::error!(target: "uniserve_worker.launch", "worker failed: {error}");
+            tracing::error!("worker failed: {error}");
             return 1;
         }
     };
@@ -62,25 +62,19 @@ pub(crate) fn main(argv: &[String], import: tvm_ffi::Function) -> i64 {
         Err(error) => return usage(error),
     };
     if cfg!(debug_assertions) {
-        tracing::error!(
-            target: "uniserve_worker.launch",
-            "libuniserve_worker is a debug build; install a release build"
-        );
+        tracing::error!("libuniserve_worker is a debug build; install a release build");
         return 1;
     }
     match run(&arguments, import, &signals) {
         Ok(()) => {
-            tracing::info!(target: "uniserve_worker.launch", "worker shut down");
+            tracing::info!("worker shut down");
             0
         }
         Err(Failure::Descriptor(error)) => usage(error),
         Err(Failure::Worker(error)) => {
             match error.traceback() {
-                Some(traceback) => tracing::error!(
-                    target: "uniserve_worker.launch",
-                    "worker failed: {error}\n{traceback}"
-                ),
-                None => tracing::error!(target: "uniserve_worker.launch", "worker failed: {error}"),
+                Some(traceback) => tracing::error!("worker failed: {error}\n{traceback}"),
+                None => tracing::error!("worker failed: {error}"),
             }
             1
         }
@@ -212,11 +206,7 @@ fn run(
     // the contexts are destroyed here.
     // SAFETY: as above, nothing in the process uses a device after this.
     match unsafe { uniserve_cuda::PrimaryContext::reset_all() } {
-        Ok(devices) => tracing::debug!(
-            target: "uniserve_worker.launch",
-            ?devices,
-            "destroyed the device contexts"
-        ),
+        Ok(devices) => tracing::debug!(?devices, "destroyed the device contexts"),
         Err(error) => {
             let error = Failure::from(crate::Error::from(error));
             return ended.outcome.and(Err(error));
@@ -288,14 +278,14 @@ fn serve(arguments: &Arguments, signals: &Signals) -> Ended {
             // and an aborted close then waits with it: the rank can neither
             // return through that thread nor close. The process ends from
             // here, as the head watch ends a starting rank.
-            tracing::error!(target: "uniserve_worker.launch", "worker failed: {error}");
+            tracing::error!("worker failed: {error}");
             end(1);
         }
         Err(error) => (Err(error), false, false),
     };
+    // The worker's readers retire with it, before the connection is
+    // released.
     let closed = worker.close(!orderly);
-    // The worker's readers retire before the connection is released.
-    drop(worker);
     drop(channel);
     // An orderly close that failed may have left work behind.
     let settled = settled && (!orderly || closed.is_ok());

@@ -148,7 +148,7 @@ impl CacheExport {
         if let Err(error) = result {
             unlocated.into_iter().for_each(Exports::revoke);
             if let Err(cleanup) = exports::release(&locations) {
-                tracing::warn!(target: "uniserve_worker.transfer", "failed to revoke a failed KV export: {cleanup}");
+                tracing::warn!("failed to revoke a failed KV export: {cleanup}");
             }
             accesses.release_exports(&[buffer]);
             return Err(error);

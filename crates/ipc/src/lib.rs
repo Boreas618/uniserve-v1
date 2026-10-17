@@ -54,8 +54,8 @@ impl From<uniserve_core::ImageParamsError> for ValidationError {
 }
 
 // The validation macros below are textually scoped: they are visible only in
-// modules declared after them, which is how `call`, `info` and `tensor` use
-// them. Keep them above those `mod` declarations.
+// modules declared after them, which is how the message modules use them.
+// Keep them above those `mod` declarations.
 macro_rules! invalid_message {
     ($($arg:tt)*) => {
         ValidationError::message(format!($($arg)*))
@@ -94,16 +94,22 @@ pub use registration::{Registration, VERSION};
 // Message types are split by concern and re-exported flat at the crate root;
 // each module takes the shared imports through `use super::*` and the
 // validation macros through textual scope.
+mod batch;
 mod call;
+mod command;
 mod config;
 mod info;
+mod output;
 mod request;
 mod tensor;
+mod transfer;
 
+pub use batch::*;
 pub use call::*;
+pub use command::*;
 pub use config::{LaneConfig, LaneConfigError};
 pub use info::*;
+pub use output::*;
 pub use request::*;
 pub use tensor::*;
-#[cfg(test)]
-mod tests;
+pub use transfer::*;

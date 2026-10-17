@@ -18,7 +18,8 @@ from tests.python.fixtures.distributed import (
 )
 from tests.python.fixtures.h3 import WIDE
 from uniserve import cuda_graph
-from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.diffusion import DenoisingStep, normal_noise
 from uniserve.distributed import DeviceMesh, communication_axes
 from uniserve.models import LatentInput, TextSize

@@ -395,7 +395,7 @@ def evaluate(module, hidden, topk_ids, topk_weights, *, combine=True):
     The call owns its workspace for its duration; execution contexts bind a
     reusable operator instead.
     """
-    from uniserve.bindings.context import TensorBuffers
+    from uniserve.bindings.workspace import TensorBuffers
 
     provider = resolve("auto", module=module, device=hidden.device)
     size = TextSize(hidden.shape[0], 1)

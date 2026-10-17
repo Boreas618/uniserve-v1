@@ -11,7 +11,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve import cuda_graph
-from uniserve.bindings.context import ExecutionContext, Scratch
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import Scratch
 from uniserve.models import TextSize
 from uniserve.nn import Linear, MergedColumnParallelLinear
 from uniserve.nn.attention import (

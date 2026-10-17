@@ -929,10 +929,7 @@ impl HostStage for Encodings {
                     }
                 }
                 Some(Outcome::Failed(error)) => {
-                    tracing::error!(
-                        target: "uniserve_worker.execution",
-                        "image encoding failed: {error}"
-                    );
+                    tracing::error!("image encoding failed: {error}");
                     output.output.status = CallStatus::Error;
                     output.output.error_code = Some(ErrorCode::InvalidCall);
                 }

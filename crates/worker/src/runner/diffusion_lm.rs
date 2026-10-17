@@ -911,7 +911,6 @@ impl DiffusionLMRunner {
             }] += 1;
         }
         tracing::info!(
-            target: "uniserve_worker.warmup",
             "{}: captured {} graphs of up to {} segments: {} attend, {} readout and {} denoise buckets; attention launches are planned on the {}",
             self.owner,
             counts.iter().sum::<usize>(),

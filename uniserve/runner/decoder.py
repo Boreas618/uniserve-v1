@@ -21,7 +21,8 @@ from typing import Any, Protocol, cast
 
 import torch
 
-from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.errors import SetupError
 from uniserve.loading.rank import capability
 from uniserve.media import image, video
@@ -100,7 +101,7 @@ class DecoderRunner:
         stream: The CUDA stream handle every forward enqueues on.
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas
-            (``uniserve.bindings.context.Scratch``).
+            (``uniserve.bindings.workspace.Scratch``).
         size: ``[frames, width, height]`` of a video decoder's segment, or
             ``[latent_frames]`` of an audio decoder's track.
     """

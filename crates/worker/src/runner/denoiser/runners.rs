@@ -106,11 +106,7 @@ impl DenoiserRunners {
             let job = Job::new();
             job.on(denoiser.stream()).synchronize()?;
             perform(lanes, job)?;
-            tracing::info!(
-                target: "uniserve_worker.warmup",
-                "captured {} image denoising graphs",
-                denoiser.captured()
-            );
+            tracing::info!("captured {} image denoising graphs", denoiser.captured());
         }
         Ok(())
     }

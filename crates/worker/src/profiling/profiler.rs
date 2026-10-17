@@ -302,7 +302,6 @@ impl Profiler {
     /// Note that `phase` failed. A window that did not open is given up,
     /// and a torch profiler started for it is stopped.
     fn failed(&mut self, phase: Phase, error: &Error) {
-        const TARGET: &str = "uniserve_worker.profiling";
         match phase {
             Phase::Start | Phase::StartRange => {
                 self.active = false;
@@ -312,19 +311,17 @@ impl Profiler {
                     self.phases.push_back(Phase::Discard);
                 }
                 tracing::error!(
-                    target: TARGET,
                     "failed to start UniServe worker profiler; disabling this capture: {error}"
                 );
             }
             // The capture was given up already.
             Phase::Discard => {}
             Phase::StopRange => {
-                tracing::error!(target: TARGET, "failed to stop CUDA profiler: {error}");
+                tracing::error!("failed to stop CUDA profiler: {error}");
             }
-            Phase::Export => tracing::error!(
-                target: TARGET,
-                "failed to stop/export UniServe worker profiler: {error}"
-            ),
+            Phase::Export => {
+                tracing::error!("failed to stop/export UniServe worker profiler: {error}")
+            }
         }
     }
 

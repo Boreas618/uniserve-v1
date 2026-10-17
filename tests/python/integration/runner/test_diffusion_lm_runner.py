@@ -31,7 +31,8 @@ from tests.python.fixtures.checkpoints import (
     diffusion_gemma_checkpoint,
 )
 from uniserve import cuda_graph
-from uniserve.bindings.context import ExecutionContext, Scratch
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import Scratch
 from uniserve.diffusion import canvas as sampler
 from uniserve.loading import weights
 from uniserve.loading.rank import Loaded

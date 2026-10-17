@@ -68,14 +68,11 @@ fn dispatch(mut signals: std::fs::File, serving: &AtomicBool) {
             "SIGTERM"
         };
         if serving.load(Ordering::Acquire) {
-            tracing::info!(
-                target: "uniserve_worker.launch",
-                "ignoring {name}; the head shuts this rank down with its worker group"
-            );
+            tracing::info!("ignoring {name}; the head shuts this rank down with its worker group");
             continue;
         }
         if signal == libc::SIGINT {
-            tracing::warn!(target: "uniserve_worker.launch", "worker interrupted; shutting down");
+            tracing::warn!("worker interrupted; shutting down");
             // Ending at once runs no destructor, which could wait on device
             // work or peers a failed startup abandoned.
             super::end(130);

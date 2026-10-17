@@ -14,7 +14,8 @@ from typing import Any
 
 import torch
 
-from uniserve.bindings.context import ExecutionContext, Scratch
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import Scratch
 
 
 def execution_context(

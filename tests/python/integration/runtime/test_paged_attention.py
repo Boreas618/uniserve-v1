@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from uniserve.backends.attention.flashinfer import Backend, Config
-from uniserve.bindings.context import TensorBuffers
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.models import TextSize
 from uniserve.nn.attention import BlockTable, PagedInput, SequenceLengths
 

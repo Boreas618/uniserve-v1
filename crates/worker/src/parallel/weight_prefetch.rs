@@ -687,7 +687,6 @@ impl DwdpManager {
             })?;
         }
         tracing::info!(
-            target: "uniserve_worker.launch",
             "DWDP expert weights: {} layers, {} resident and {} slot bytes, {} bytes read per invocation",
             layers.len(),
             weights.resident_bytes,

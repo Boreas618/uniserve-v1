@@ -137,7 +137,7 @@ pub(crate) fn submit(
     if result.is_err() {
         for read in &submitted {
             if let Err(cleanup) = read.cancel() {
-                tracing::warn!(target: "uniserve_worker.transfer", "failed to cancel a read of a failed fetch: {cleanup}");
+                tracing::warn!("failed to cancel a read of a failed fetch: {cleanup}");
             }
         }
     }

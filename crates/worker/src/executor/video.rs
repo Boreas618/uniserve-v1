@@ -324,7 +324,7 @@ impl MediaBatch {
 fn withdraw(tasks: &[Arc<HostTask<MediaTask>>]) {
     for task in tasks {
         if let Err(error) = task.cancel(false) {
-            tracing::warn!(target: "uniserve_worker.media", "withdrawing a host media task failed: {error}");
+            tracing::warn!("withdrawing a host media task failed: {error}");
         }
     }
 }
@@ -402,7 +402,7 @@ impl HostCall {
             }
         }
         if let Some(message) = failure {
-            tracing::error!(target: "uniserve_worker.media", "host media call failed: {message}");
+            tracing::error!("host media call failed: {message}");
             output.output.status = CallStatus::Error;
             output.output.error_code = Some(ErrorCode::ComputeError);
             let writes: Vec<ProductBuffer> = match self.publication {

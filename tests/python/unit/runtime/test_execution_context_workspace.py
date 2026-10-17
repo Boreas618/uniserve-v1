@@ -3,7 +3,8 @@
 import pytest
 import torch
 
-from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.tensors import BufferConfig
 
 pytestmark = pytest.mark.unit

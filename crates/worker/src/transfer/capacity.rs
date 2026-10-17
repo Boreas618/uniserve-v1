@@ -183,7 +183,7 @@ impl Drop for ByteReservation {
             return;
         }
         if let Err(error) = self.capacity.release(self.bytes) {
-            tracing::warn!(target: "uniserve_worker.transfer", "failed to return transfer bytes: {error}");
+            tracing::warn!("failed to return transfer bytes: {error}");
         }
     }
 }
@@ -227,7 +227,7 @@ impl ReadReservation {
 impl Drop for ReadReservation {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
-            tracing::warn!(target: "uniserve_worker.transfer", "failed to return unused read credits: {error}");
+            tracing::warn!("failed to return unused read credits: {error}");
         }
     }
 }

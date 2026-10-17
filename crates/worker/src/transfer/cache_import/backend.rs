@@ -330,7 +330,7 @@ impl GroupCopy<'_> {
                 if let Some(retired) = retired.upgrade()
                     && let Err(error) = retired.reap()
                 {
-                    tracing::warn!(target: "uniserve_worker.transfer", "failed to retire KV imports: {error}");
+                    tracing::warn!("failed to retire KV imports: {error}");
                 }
             }));
             if cancelled {

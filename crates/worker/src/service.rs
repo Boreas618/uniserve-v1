@@ -109,13 +109,11 @@ impl<'a> Service<'a> {
         };
         if self.settled() {
             tracing::warn!(
-                target: "uniserve_worker.launch",
                 "the head's channel failed with nothing in flight; the rank closes without its peers"
             );
             return Ok(Ending::Orphaned(error));
         }
         tracing::warn!(
-            target: "uniserve_worker.launch",
             unfinished_batches = self.executor.has_work(),
             jobs_in_flight = self.executor.backend().oldest_job().is_some(),
             "the head's channel failed with work in flight, which the rank abandons"
@@ -352,7 +350,6 @@ impl<'a> Service<'a> {
         let batch = self.executor.batch_of(job);
         let stall = self.executor.backend().stall(job, running, batch);
         tracing::error!(
-            target: "uniserve_worker.execution",
             lane = stall.lane.as_deref().unwrap_or("the Python thread"),
             batch_id = ?stall.batch_id,
             route = ?stall.route,

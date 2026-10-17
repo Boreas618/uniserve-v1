@@ -94,7 +94,7 @@ class EncoderRunner:
         stream: The CUDA stream handle every forward enqueues on.
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas
-            (``uniserve.bindings.context.Scratch``).
+            (``uniserve.bindings.workspace.Scratch``).
         size: The size the operators are prepared for, flattened:
             ``[tokens, rows]`` of a text encoder's largest call (its own
             and its vision tower's, see :meth:`tower`), ``[rows, width]``

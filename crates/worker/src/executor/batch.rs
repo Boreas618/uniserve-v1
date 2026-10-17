@@ -642,7 +642,6 @@ pub(crate) fn fail(
     }
     let plan = Arc::clone(batch.shared_plan());
     tracing::warn!(
-        target: "uniserve_worker.execution",
         "batch {} failed: {error}{}",
         plan.batch_id,
         error
@@ -709,11 +708,7 @@ pub(crate) fn materialize(
         let mut buffer = lock(&launched.buffer);
         if let Err(error) = output.resolve(parent, &mut buffer) {
             // A malformed capture fails its call only.
-            tracing::error!(
-                target: "uniserve_worker.execution",
-                "{} result materialization failed: {error}",
-                launched.timer
-            );
+            tracing::error!("{} result materialization failed: {error}", launched.timer);
             output.output.status = CallStatus::Error;
             output.output.error_code = Some(ErrorCode::ComputeError);
             output.progress = parent;

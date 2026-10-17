@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from uniserve.bindings.context import Scratch
+from uniserve.bindings.workspace import Scratch
 from uniserve.media import image
 from uniserve.runner.decoder import DecoderRunner
 from uniserve.runner.denoiser import DenoiserRunner

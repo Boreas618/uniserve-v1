@@ -77,7 +77,8 @@ from typing import Any, Protocol, cast
 import torch
 
 from uniserve.bindings import capturing
-from uniserve.bindings.context import ExecutionContext, TensorBuffers
+from uniserve.bindings.context import ExecutionContext
+from uniserve.bindings.workspace import TensorBuffers
 from uniserve.diffusion import (
     Branch,
     DenoisingStep,
@@ -459,7 +460,7 @@ class DenoiserRunner:
         stream: The CUDA stream handle every forward enqueues on.
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas
-            (``uniserve.bindings.context.Scratch``).
+            (``uniserve.bindings.workspace.Scratch``).
         maximum: The largest layout, whose capacity the operators and the
             workspace are prepared for.
     """
