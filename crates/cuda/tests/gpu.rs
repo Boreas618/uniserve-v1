@@ -4,6 +4,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -12,8 +15,8 @@ use uniserve_cuda::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
     Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, Pitched,
-    PitchedBatch, SourceOrder, Stream, Strided, StridedCopy, memcpy_async, memset_d8, memset_d32,
-    reclaim,
+    PitchedBatch, PrimaryContext, SourceOrder, Stream, Strided, StridedCopy, memcpy_async,
+    memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -294,6 +297,93 @@ fn interprocess_events_export_and_open() {
     // export itself is what a peer receives.
     assert_ne!(handle.0, [0; 64]);
     stream.synchronize().unwrap();
+}
+
+/// Names the role of the process `interprocess_event_process` runs in.
+const EVENT_PROCESS: &str = "UNISERVE_CUDA_TEST_EVENT_PROCESS";
+
+/// The `/dev/shm` objects this process maps that still have a name.
+fn mapped_shared_memory() -> BTreeSet<String> {
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.find("/dev/shm/").map(|start| &line[start..]))
+        .filter(|path| !path.ends_with(" (deleted)"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A process that created interprocess events, destroyed its primary
+/// contexts and exited leaves none of the shared memory the driver mapped
+/// for those events, although another library's reference kept the context
+/// alive: the driver removes that memory with its context, and a process's
+/// exit alone does not.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn resetting_primary_contexts_releases_interprocess_event_memory() {
+    let _driver = exclusive_driver();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "interprocess_event_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(EVENT_PROCESS, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the event process failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mapped: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("mapped "))
+        .collect();
+    assert!(
+        !mapped.is_empty(),
+        "an interprocess event maps no shared memory: {stdout}"
+    );
+    for path in mapped {
+        assert!(!Path::new(path).exists(), "{path} outlived its process");
+    }
+}
+
+/// The process half of
+/// `resetting_primary_contexts_releases_interprocess_event_memory`: exports
+/// an interprocess event as a rank does, reports the shared memory that
+/// mapped, destroys its primary contexts and exits.
+#[test]
+#[ignore = "runs as the process of the interprocess event memory test"]
+fn interprocess_event_process() {
+    if std::env::var_os(EVENT_PROCESS).is_none() {
+        return;
+    }
+    // A reference this process never releases, as the CUDA runtime holds
+    // one in a rank: without it, the last owner's release below would
+    // destroy the context by itself.
+    let _runtime = std::mem::ManuallyDrop::new(PrimaryContext::retain(DEVICE).unwrap());
+    let stream = Stream::new(DEVICE).unwrap();
+    let before = mapped_shared_memory();
+    let event = Event::new(EventFlags {
+        interprocess: true,
+        ..EventFlags::default()
+    });
+    event.record(&stream).unwrap();
+    event.ipc_handle().unwrap();
+    stream.synchronize().unwrap();
+    for path in mapped_shared_memory().difference(&before) {
+        println!("mapped {path}");
+    }
+
+    drop(event);
+    drop(stream);
+    // SAFETY: this process uses no device after the reset.
+    let devices = unsafe { PrimaryContext::reset_all() }.unwrap();
+    assert!(devices.contains(&DEVICE));
 }
 
 #[test]

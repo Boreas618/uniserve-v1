@@ -217,6 +217,8 @@ driver_table! {
         get_error_string = "cuGetErrorString": fn(CuResult, *mut *const c_char);
         primary_ctx_retain = "cuDevicePrimaryCtxRetain": fn(*mut Handle, i32);
         primary_ctx_release = "cuDevicePrimaryCtxRelease_v2": fn(i32);
+        primary_ctx_get_state = "cuDevicePrimaryCtxGetState": fn(i32, *mut u32, *mut i32);
+        primary_ctx_reset = "cuDevicePrimaryCtxReset_v2": fn(i32);
         ctx_push = "cuCtxPushCurrent_v2": fn(Handle);
         ctx_pop = "cuCtxPopCurrent_v2": fn(*mut Handle);
         thread_exchange_capture_mode = "cuThreadExchangeStreamCaptureMode": fn(*mut i32);
@@ -310,11 +312,12 @@ unsafe fn symbol<T: Copy>(library: &Library, name: &'static str) -> Result<T> {
         })
 }
 
+/// The process driver table, set by the first [`driver`] call.
+static DRIVER: OnceLock<Result<Driver>> = OnceLock::new();
+
 /// Returns the process driver table, loading it and running `cuInit` on first
 /// use. A failed load is cached and returned to every caller.
 pub(crate) fn driver() -> Result<&'static Driver> {
-    static DRIVER: OnceLock<Result<Driver>> = OnceLock::new();
-
     DRIVER
         .get_or_init(|| {
             // The driver is installed under its stable system soname; no
@@ -333,6 +336,12 @@ pub(crate) fn driver() -> Result<&'static Driver> {
         })
         .as_ref()
         .map_err(Clone::clone)
+}
+
+/// Returns the process driver table if an earlier [`driver`] call loaded and
+/// initialized it, without loading it otherwise.
+pub(crate) fn initialized() -> Option<&'static Driver> {
+    DRIVER.get().and_then(|driver| driver.as_ref().ok())
 }
 
 impl Driver {

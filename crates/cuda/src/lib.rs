@@ -8,7 +8,7 @@
 //!
 //! | Resource | Owner | Release |
 //! | --- | --- | --- |
-//! | Primary context | [`PrimaryContext`], [`DeviceGuard`] | release / pop on drop |
+//! | Primary context | [`PrimaryContext`], [`DeviceGuard`] | release / pop on drop; destroyed at the process's end by [`PrimaryContext::reset_all`] |
 //! | Stream | [`Stream`], [`GreenContext`] (SM partitions) | `cuStreamDestroy` on drop |
 //! | Event | [`Event`] | `cuEventDestroy` on drop |
 //! | Graph executable | [`GraphExec`] (borrowed) | by its owner |
